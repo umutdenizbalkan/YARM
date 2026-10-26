@@ -40,6 +40,10 @@
  * supervisor entry after PRE is exactly the OBSERVED step's own.
  */
     .pushsection .text.yarm_smp3_witness, "ax", @progbits
+    /* KERNEL-NOFP1: everything in this section is a USER-MODE program the kernel copies
+     * into a task's address space and never executes; the final-image check accounts
+     * for it as one USER_PROGRAM region (scripts/check-kernel-nofp.py). */
+.Lyarm_nofp_user_smp3_witness_begin:
     .option push
     .option norelax
 
@@ -905,4 +909,13 @@ yarm_smp3_h_cap: .word 0x71717171
 yarm_smp3_h_end:
 
     .option pop
+.Lyarm_nofp_user_smp3_witness_end:
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad .Lyarm_nofp_user_smp3_witness_begin
+    .quad .Lyarm_nofp_user_smp3_witness_end
+    .asciz "USER_PROGRAM smp3_witness"
+    .balign 8
+    .popsection
     .popsection

@@ -376,7 +376,7 @@ REGION_KINDS = {"CODE16": "code16", "CODE32": "code32", "DATA": None}
 USER_PROGRAMS = {
     "x86_64": {"smp1_witness", "apsched_witness", "overtaken_witness", "vmi2_witness"},
     "aarch64": {"smp2_witness", "apsched_witness", "overtaken_witness"},
-    "riscv64": set(),
+    "riscv64": {"smp3_witness", "apsched_witness", "sr_replace_witness", "vmi_witness"},
 }
 FEATURE_IMPLIES = {"context1-clobber": {"context1-witness"}}
 

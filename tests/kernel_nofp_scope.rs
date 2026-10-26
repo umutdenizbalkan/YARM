@@ -28,21 +28,79 @@ const ARCH_MOD: &str = include_str!("../src/arch/mod.rs");
 
 /// Every source that records an audited exception or region.
 const RECORDING_SOURCES: &[(&str, &str)] = &[
-    ("x86_64/descriptor_tables.rs", include_str!("../src/arch/x86_64/descriptor_tables.rs")),
-    ("x86_64/context_switch.rs", include_str!("../src/arch/x86_64/context_switch.rs")),
+    (
+        "x86_64/descriptor_tables.rs",
+        include_str!("../src/arch/x86_64/descriptor_tables.rs"),
+    ),
+    (
+        "x86_64/context_switch.rs",
+        include_str!("../src/arch/x86_64/context_switch.rs"),
+    ),
     ("x86_64/boot.rs", include_str!("../src/arch/x86_64/boot.rs")),
-    ("x86_64/smp_trampoline.rs", include_str!("../src/arch/x86_64/smp_trampoline.rs")),
-    ("x86_64/context_witness.rs", include_str!("../src/arch/x86_64/context_witness.rs")),
-    ("x86_64/smp1_witness.S", include_str!("../src/arch/x86_64/smp1_witness.S")),
-    ("x86_64/apsched_witness.S", include_str!("../src/arch/x86_64/apsched_witness.S")),
-    ("x86_64/overtaken_witness.S", include_str!("../src/arch/x86_64/overtaken_witness.S")),
-    ("x86_64/vmi2_witness.S", include_str!("../src/arch/x86_64/vmi2_witness.S")),
-    ("aarch64/boot.rs", include_str!("../src/arch/aarch64/boot.rs")),
-    ("aarch64/context_switch.rs", include_str!("../src/arch/aarch64/context_switch.rs")),
-    ("aarch64/context_witness.rs", include_str!("../src/arch/aarch64/context_witness.rs")),
-    ("aarch64/smp2_witness.S", include_str!("../src/arch/aarch64/smp2_witness.S")),
-    ("aarch64/apsched_witness.S", include_str!("../src/arch/aarch64/apsched_witness.S")),
-    ("aarch64/overtaken_witness.S", include_str!("../src/arch/aarch64/overtaken_witness.S")),
+    (
+        "x86_64/smp_trampoline.rs",
+        include_str!("../src/arch/x86_64/smp_trampoline.rs"),
+    ),
+    (
+        "x86_64/context_witness.rs",
+        include_str!("../src/arch/x86_64/context_witness.rs"),
+    ),
+    (
+        "x86_64/smp1_witness.S",
+        include_str!("../src/arch/x86_64/smp1_witness.S"),
+    ),
+    (
+        "x86_64/apsched_witness.S",
+        include_str!("../src/arch/x86_64/apsched_witness.S"),
+    ),
+    (
+        "x86_64/overtaken_witness.S",
+        include_str!("../src/arch/x86_64/overtaken_witness.S"),
+    ),
+    (
+        "x86_64/vmi2_witness.S",
+        include_str!("../src/arch/x86_64/vmi2_witness.S"),
+    ),
+    (
+        "aarch64/boot.rs",
+        include_str!("../src/arch/aarch64/boot.rs"),
+    ),
+    (
+        "aarch64/context_switch.rs",
+        include_str!("../src/arch/aarch64/context_switch.rs"),
+    ),
+    (
+        "aarch64/context_witness.rs",
+        include_str!("../src/arch/aarch64/context_witness.rs"),
+    ),
+    (
+        "aarch64/smp2_witness.S",
+        include_str!("../src/arch/aarch64/smp2_witness.S"),
+    ),
+    (
+        "aarch64/apsched_witness.S",
+        include_str!("../src/arch/aarch64/apsched_witness.S"),
+    ),
+    (
+        "aarch64/overtaken_witness.S",
+        include_str!("../src/arch/aarch64/overtaken_witness.S"),
+    ),
+    (
+        "riscv64/smp3_witness.S",
+        include_str!("../src/arch/riscv64/smp3_witness.S"),
+    ),
+    (
+        "riscv64/apsched_witness.S",
+        include_str!("../src/arch/riscv64/apsched_witness.S"),
+    ),
+    (
+        "riscv64/sr_replace_witness.S",
+        include_str!("../src/arch/riscv64/sr_replace_witness.S"),
+    ),
+    (
+        "riscv64/vmi_witness.S",
+        include_str!("../src/arch/riscv64/vmi_witness.S"),
+    ),
 ];
 
 fn json_string(src: &str, key: &str) -> String {
@@ -94,7 +152,10 @@ fn user_targets_keep_their_fp_simd() {
 #[test]
 fn every_artifact_build_runs_the_final_image_check() {
     for (build, call) in [
-        (BUILD_X86, "common_verify_kernel_nofp \"x86_64\" \"$KERNEL_IMAGE\"\n"),
+        (
+            BUILD_X86,
+            "common_verify_kernel_nofp \"x86_64\" \"$KERNEL_IMAGE\"\n",
+        ),
         (
             BUILD_A64,
             "common_verify_kernel_nofp \"aarch64\" \"$KERNEL_ELF\" \"$KERNEL_BIN_IMAGE\"\n",
@@ -124,6 +185,13 @@ fn policy_kinds(arch: &str) -> BTreeSet<String> {
         .find(&format!("    \"{arch}\": {{"))
         .unwrap_or_else(|| panic!("policy for {arch}"));
     let rest = &CHECKER[start..];
+    if rest
+        .lines()
+        .next()
+        .is_some_and(|l| l.trim_end().ends_with("{},"))
+    {
+        return BTreeSet::new();
+    }
     let block = &rest[..rest.find("\n    },").expect("end of arch policy")];
     block
         .lines()
@@ -138,13 +206,26 @@ fn policy_kinds(arch: &str) -> BTreeSet<String> {
 
 fn recorded_kinds(prefix: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for (name, src) in RECORDING_SOURCES.iter().filter(|(n, _)| n.starts_with(prefix)) {
+    for (name, src) in RECORDING_SOURCES
+        .iter()
+        .filter(|(n, _)| n.starts_with(prefix))
+    {
+        let mut in_map = false;
         for line in src.lines() {
             let t = line.trim();
-            let kind = if let Some(r) = t.strip_prefix(".asciz \"") {
+            if t.starts_with(".pushsection .yarm_nofp_map") {
+                in_map = true;
+                continue;
+            }
+            if t == ".popsection" {
+                in_map = false;
+                continue;
+            }
+            let kind = if let Some(r) = t.strip_prefix(".asciz \"").filter(|_| in_map) {
                 r.split('"').next()
             } else if t.contains("nofp_map_record!(") {
-                t.rsplit_once(", \"").map(|(_, r)| r.trim_end_matches("\"),"))
+                t.rsplit_once(", \"")
+                    .map(|(_, r)| r.trim_end_matches("\"),"))
             } else {
                 None
             };
@@ -182,7 +263,16 @@ fn recorded_exception_kinds_match_the_checker_policy() {
             );
         }
     }
-    assert!(policy_kinds("riscv64").is_empty(), "RISC-V has no exceptions");
+    assert!(
+        policy_kinds("riscv64").is_empty(),
+        "RISC-V has no exceptions"
+    );
+    // RISC-V records only its embedded user programs, never an exception.
+    let rv = recorded_kinds("riscv64/");
+    assert_eq!(
+        rv.into_iter().collect::<Vec<_>>(),
+        vec!["USER_PROGRAM".to_string()]
+    );
     assert!(ARCH_MOD.contains("macro_rules! nofp_map_record"));
     assert!(ARCH_MOD.contains(".quad 0x3150464F4E4D5259"));
     assert!(CHECKER.contains("MAGIC = 0x3150464F4E4D5259"));
@@ -192,7 +282,10 @@ fn recorded_exception_kinds_match_the_checker_policy() {
 /// in a source is closed again by `nofp` / `nosimd`.
 #[test]
 fn aarch64_fp_simd_assembly_is_bracketed() {
-    for (name, src) in RECORDING_SOURCES.iter().filter(|(n, _)| n.starts_with("aarch64/")) {
+    for (name, src) in RECORDING_SOURCES
+        .iter()
+        .filter(|(n, _)| n.starts_with("aarch64/"))
+    {
         let count = |needle: &str| {
             src.lines()
                 .filter(|l| {

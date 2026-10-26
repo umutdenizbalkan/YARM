@@ -8,15 +8,23 @@
 /// audited FP/SIMD or FP-control range `[begin, end)` — two local labels around the exact
 /// instructions — and its kind; the checker holds the kind's purpose and the exact instructions it
 /// may contain. Records are only ever written next to the code they describe.
+// RISC-V records no exception, so the macro is unused there.
+#[allow(unused_macros)]
 macro_rules! nofp_map_record {
     ($begin:literal, $end:literal, $name:literal) => {
         concat!(
             ".pushsection .yarm_nofp_map, \"\", @progbits\n",
             ".balign 8\n",
             ".quad 0x3150464F4E4D5259\n",
-            ".quad ", $begin, "\n",
-            ".quad ", $end, "\n",
-            ".asciz \"", $name, "\"\n",
+            ".quad ",
+            $begin,
+            "\n",
+            ".quad ",
+            $end,
+            "\n",
+            ".asciz \"",
+            $name,
+            "\"\n",
             ".balign 8\n",
             ".popsection"
         )

@@ -63,6 +63,10 @@
  * entry points through `lla`, capabilities through literal words the kernel patches.
  */
     .pushsection .text.yarm_apsw_witness, "ax", @progbits
+    /* KERNEL-NOFP1: everything in this section is a USER-MODE program the kernel copies
+     * into a task's address space and never executes; the final-image check accounts
+     * for it as one USER_PROGRAM region (scripts/check-kernel-nofp.py). */
+.Lyarm_nofp_user_apsched_witness_begin:
     .option push
     .option norelax
 
@@ -974,4 +978,13 @@ yarm_apsw_cap_ep_d: .word 0x63636363
 yarm_apsw_end:
 
     .option pop
+.Lyarm_nofp_user_apsched_witness_end:
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad .Lyarm_nofp_user_apsched_witness_begin
+    .quad .Lyarm_nofp_user_apsched_witness_end
+    .asciz "USER_PROGRAM apsched_witness"
+    .balign 8
+    .popsection
     .popsection
