@@ -196017,9 +196017,20 @@ mod bl5b2_rx4_route_is_derived {
     #[test]
     fn exactly_one_route_must_attest_the_record_pm_replies_to() {
         let s = rx4();
+        // KERNEL-NOFP1: the record's generation is READ from PM's one resolution, never assumed
+        // to be 1 (a reused direct-route slot carries a later generation), and the live-object
+        // assertion is exact on the request's own record index AND generation.
         assert!(s.contains(
-            "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=1"
+            "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=[0-9]+( |\\$)"
         ));
+        assert!(s.contains("\"PM's cap resolves exactly once\""));
+        assert!(s.contains(
+            "\"^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=${u9rx4_rec_index:-NONE} generation=${u9rx4_rec_gen:-NONE}( |\\$)\""
+        ));
+        assert!(
+            !s.contains("generation=1( |"),
+            "the fresh-slot assumption is gone"
+        );
         assert!(s.contains(
             "u9rx4_queued_re=\"^IPCCALL_QUEUED_SPLIT_OK tid=2 endpoint=[0-9]+ endpoint_generation=[0-9]+ reply_cap=[0-9]+ ${u9rx4_rec} \""
         ));
