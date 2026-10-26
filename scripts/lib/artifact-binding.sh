@@ -55,8 +55,9 @@ _ab_objcopy() {
 _ab_invalidate() { # PATH... — remove artifacts and their records
   local p
   for p in "$@"; do
-    [[ -n "$p" ]] && rm -f "$p" "$p.provenance" "$p.nofp.txt"
+    if [[ -n "$p" ]]; then rm -f "$p" "$p.provenance" "$p.nofp.txt"; fi
   done
+  return 0
 }
 
 artifact_publish_kernel() {
@@ -74,7 +75,7 @@ artifact_publish_kernel() {
     return 1
   fi
   mkdir -p "$(dirname "$out_elf")"
-  [[ -n "$out_boot" ]] && mkdir -p "$(dirname "$out_boot")"
+  if [[ -n "$out_boot" ]]; then mkdir -p "$(dirname "$out_boot")"; fi
   stage_elf="${out_elf}.staging.$$"
   stage_boot="${out_boot:+${out_boot}.staging.$$}"
   report="${out_elf}.nofp.txt.staging.$$"
@@ -88,7 +89,7 @@ artifact_publish_kernel() {
     fi
   fi
   feats="$(_ab_py features --feature-args "$fargs" | sed -n 's/.* features=//p')"
-  [[ "$feats" == "none" ]] && feats=""
+  if [[ "$feats" == "none" ]]; then feats=""; fi
   if ! "$repo/scripts/check-kernel-nofp.sh" "$arch" "$stage_elf" "$feats" ${stage_boot:+"$stage_boot"} >"$report" 2>&1; then
     cat "$report"
     echo "[error][integrity] KERNEL-NOFP1: the $arch kernel failed the final-image FP/SIMD check; nothing was published"
@@ -97,7 +98,7 @@ artifact_publish_kernel() {
   fi
   grep -a "^NOFP_CHECK " "$report"
   mv -f "$stage_elf" "$out_elf"
-  [[ -n "$out_boot" ]] && mv -f "$stage_boot" "$out_boot"
+  if [[ -n "$out_boot" ]]; then mv -f "$stage_boot" "$out_boot"; fi
   mv -f "$report" "${out_elf}.nofp.txt"
   if ! _ab_py record-kernel --arch "$arch" --elf "$out_elf" ${out_boot:+--boot "$out_boot"} \
       --feature-args "$fargs" --target "$target" --profile "$profile" \
@@ -115,7 +116,7 @@ artifact_build_kernel() {
   spec="$(_ab_kernel_target "$arch")" || { echo "[error] ARTIFACT-BUILD: unknown arch $arch"; return 1; }
   read -r target profile tdir json <<<"$spec"
   local -a z=(-Z "build-std=core,alloc,compiler_builtins,panic_abort")
-  [[ "$json" == 1 ]] && z+=(-Z json-target-spec)
+  if [[ "$json" == 1 ]]; then z+=(-Z json-target-spec); fi
   # shellcheck disable=SC2086
   if ! (cd "$repo" && cargo build "${z[@]}" --target "$target" --profile "$profile" \
         $fargs -p yarm --bin kernel_boot); then

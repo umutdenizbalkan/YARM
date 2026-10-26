@@ -35,7 +35,7 @@ common_build_integrity_init() {
   local p
   for p in "$KERNEL_IMAGE" "${KERNEL_BIN_IMAGE:-}" "${KERNEL_ELF_IMAGE:-}" "$INITRAMFS_IMAGE" \
            "$INITRAMFS_IMAGE_ABS"; do
-    [[ -n "$p" ]] && rm -f "$p" "$p.provenance" "$p.nofp.txt" 2>/dev/null
+    if [[ -n "$p" ]]; then rm -f "$p" "$p.provenance" "$p.nofp.txt" 2>/dev/null; fi
   done
   rm -f "$OUT_DIR/artifact-manifest.txt" "$OUT_DIR/nofp-check.txt" 2>/dev/null || true
   [[ -n "${KERNEL_DEBUG_ELF:-}" ]] && rm -f "$KERNEL_DEBUG_ELF" 2>/dev/null || true
