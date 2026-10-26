@@ -73,6 +73,14 @@ if [[ "${REGRADE:-0}" == "1" ]]; then
   driver_status=$(grep -a -o '#HOST_SUMMARY .* status=[0-9]*' "$BOOT_LOG" | sed 's/.*status=//' | tail -1)
   driver_status=${driver_status:-9}
 else
+  # BUILD-GATES1: refuse before QEMU unless the pair is exactly the checked witness build.
+  source scripts/lib/artifact-binding.sh
+  if ! artifact_boot_guard x86_64 "$BUILD_DIR/kernel_boot.elf" "$BUILD_DIR/initramfs-core.cpio" \
+      "kernel=x86_64-uart-irq-witness" "initramfs=x86_64-uart-irq-witness" >"$LOGDIR/artifact-binding.txt" 2>&1; then
+    cat "$LOGDIR/artifact-binding.txt"
+    echo "X86_UART_IRQ_WITNESS_SEAL result=fail reason=artifact-binding"; exit 1
+  fi
+  cat "$LOGDIR/artifact-binding.txt"
   note "booting (dedicated socket serial, host injection on READY)"
   # shellcheck disable=SC2086
   python3 scripts/qemu-riscv64-uart-irq-driver.py --arch x86_64 \

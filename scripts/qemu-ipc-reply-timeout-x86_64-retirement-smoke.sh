@@ -62,14 +62,13 @@ BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
 # ── 2. Feature-ON kernel + integrity: it MUST carry the live marker literals ──
 if (( ! fail )); then
   note "building kernel_boot with --features $FEATURE"
-  cargo build -Z "build-std=${BUILD_STD}" -Z json-target-spec \
-    --target "$KTARGET" --profile "$KPROFILE" \
-    --no-default-features --features "$FEATURE" \
-    -p yarm --bin kernel_boot >"$LOGDIR/kbuild.log" 2>&1 \
+  # BUILD-GATES1: build and publish the feature kernel (no-FP checked, recorded) in one step.
+  source scripts/lib/artifact-binding.sh
+  artifact_build_kernel x86_64 "--no-default-features --features $FEATURE" build-x86_64/kernel_boot.elf \
+    >"$LOGDIR/kbuild.log" 2>&1 \
     || die "feature kernel_boot build failed (see $LOGDIR/kbuild.log)"
 fi
 if (( ! fail )); then
-  cp "$KELF" build-x86_64/kernel_boot.elf
   # BL5a-2b: `IPC_REPLY_BEATS_TIMEOUT_OK` used to be required here. Its only emitter is the broad
   # NR 7 arm, which no reply reaches since the direct route took NR 7 over, so the linker drops it
   # and this gate failed every build. The oracle's own literal is the causal gate, which the split
@@ -125,6 +124,7 @@ boot_mode() {
   local mode="$1" log="$2"
   env \
     KERNEL_IMAGE=build-x86_64/kernel_boot.elf \
+    ARTIFACT_REQUIRE="kernel=$FEATURE" \
     INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
     KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.x86_64_ipc_reply_timeout_oracle=${mode}" \
     QEMU_SMP=1 \

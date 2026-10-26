@@ -45,6 +45,20 @@ import sys
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 SUFFIX = ".provenance"
 VERSION = "1"
+# Compile-time environment read with `option_env!` — build configuration that is not a Cargo
+# feature — per artifact role: the kernel crate (`src/`) reads none; the server crates packed into
+# the initramfs (`crates/`) read these. A hosted test pins both lists against every `option_env!`
+# in the tree.
+COMPILE_ENV = {
+    "kernel": (),
+    "initramfs": ("SUPERVISOR_RESTART_TEST", "YARM_SUPERVISOR_RESTART_TEST"),
+}
+
+
+def compile_env(role):
+    """`NAME=VALUE;…` for the role's compile-time inputs set in the building command's env."""
+    got = [f"{n}={os.environ[n]}" for n in COMPILE_ENV[role] if os.environ.get(n)]
+    return ";".join(got) or "none"
 
 
 def sha256(path):
@@ -144,7 +158,7 @@ def common(arch, role, feature_args, target, profile, built_by):
     default, feats = feature_record(feature_args)
     return dict(yarm_provenance=VERSION, role=role, arch=arch, target=target, profile=profile,
                 cargo_feature_args=" ".join(feature_args.split()), default_features=default,
-                features=feats, built_by=built_by, **source_state())
+                features=feats, compile_env=compile_env(role), built_by=built_by, **source_state())
 
 
 def cmd_record_kernel(a):
@@ -223,7 +237,15 @@ def verify(arch, kernel, initramfs, requires):
                     problems.append(f"the no-FP report {rpt or '?'} is missing or changed")
                 elif rec.get("nofp_line", "") not in open(rpt).read():
                     problems.append(f"the no-FP report {rpt} does not hold the recorded result")
+    env_want = {"kernel": [], "initramfs": []}
+    exact = set()
     for req in requires:
+        m = re.fullmatch(r"(kernel|initramfs)@([A-Z0-9_]+=[A-Za-z0-9_.-]+)", req)
+        if m:
+            env_want[m.group(1)].append(m.group(2))
+    for req in requires:
+        if re.fullmatch(r"(kernel|initramfs)@([A-Z0-9_]+=[A-Za-z0-9_.-]+)", req):
+            continue
         m = re.fullmatch(r"(kernel|initramfs)([=:])([A-Za-z0-9_,.-]+)", req)
         if not m:
             problems.append(f"malformed requirement `{req}`")
@@ -232,6 +254,8 @@ def verify(arch, kernel, initramfs, requires):
         rec = recs.get(role)
         if rec is None:
             continue
+        if op == "=":
+            exact.add(role)
         have = rec.get("features", "")
         if op == "=":
             want_set = "none" if want == "none" else ",".join(sorted(set(want.split(","))))
@@ -242,6 +266,26 @@ def verify(arch, kernel, initramfs, requires):
         elif have != "all" and want not in have.split(","):
             problems.append(f"this run requires the {role} built with `{want}`; it was built "
                             f"with features={have or '?'}")
+    # Compile-time environment: `ROLE@NAME=V` requires it; an exact `ROLE=FEATS` requirement also
+    # means "and no compile-time input beyond the ones required".
+    for role in ("kernel", "initramfs"):
+        rec = recs.get(role)
+        if rec is None or (role not in exact and not env_want[role]):
+            continue
+        have = rec.get("compile_env", "")
+        have_set = set() if have == "none" else set(filter(None, have.split(";")))
+        if not have and (env_want[role] or role in exact):
+            problems.append(f"{role} record has no compile_env field")
+            continue
+        for w in env_want[role]:
+            if w not in have_set:
+                problems.append(f"this run requires the {role} built with {w}; it was built with "
+                                f"compile_env={have}")
+        if role in exact:
+            extra = sorted(have_set - set(env_want[role]))
+            if extra:
+                problems.append(f"this run requires the {role} built exactly as specified; it was "
+                                f"also built with {';'.join(extra)}")
     return problems, recs.get("kernel", {}), recs.get("initramfs", {})
 
 
@@ -253,6 +297,7 @@ def cmd_verify(a):
           f"kernel_resolved_features={k.get('resolved_features', 'none')} "
           f"kernel_nofp={k.get('nofp_result', 'none')} initramfs={a.initramfs} "
           f"initramfs_sha256={i.get('sha256', 'none')} initramfs_features={i.get('features', 'none')} "
+          f"initramfs_compile_env={i.get('compile_env', 'none')} "
           f"source={k.get('source_state', 'none')} required={','.join(a.require) or 'none'} "
           f"result={result}")
     for p in problems:

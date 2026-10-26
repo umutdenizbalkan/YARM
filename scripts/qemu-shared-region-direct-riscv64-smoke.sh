@@ -81,10 +81,10 @@ BOOTSTRAP_FEATURE_ARGS="$SERVER_FEATURE_ARGS" \
 # ── 2. Overlay: rebuild kernel_boot WITH the direct-oracle feature, re-objcopy the .bin ──
 if (( ! fail )); then
   note "rebuilding kernel_boot with --features $FEATURE"
-  cargo build -Z "build-std=${BUILD_STD}" \
-    --target "$KTARGET" --profile "$KPROFILE" \
-    --no-default-features --features "$FEATURE" \
-    -p yarm --bin kernel_boot >"$LOGDIR/kbuild.log" 2>&1 \
+  # BUILD-GATES1: build and publish the feature kernel (no-FP checked, recorded) in one step.
+  source scripts/lib/artifact-binding.sh
+  artifact_build_kernel riscv64 "--no-default-features --features $FEATURE" "${KBIN%.bin}.elf" "$KBIN" \
+    >"$LOGDIR/kbuild.log" 2>&1 \
     || die "feature kernel_boot build failed (see $LOGDIR/kbuild.log)"
 fi
 if (( ! fail )); then
@@ -95,10 +95,6 @@ if (( ! fail )); then
   else
     die "no objcopy available to produce raw kernel binary"
   fi
-fi
-if (( ! fail )); then
-  "$OBJCOPY" -O binary "$KELF" "$KBIN" >"$LOGDIR/objcopy.log" 2>&1 \
-    || die "objcopy of feature kernel failed (see $LOGDIR/objcopy.log)"
 fi
 if (( ! fail )); then
   # Artifact integrity: the feature kernel MUST carry the DIRECT retirement literal
@@ -129,16 +125,11 @@ fi
   echo "tree=$(git rev-parse HEAD^{tree}) head=$(git rev-parse HEAD) dirty=$(git status --porcelain | wc -l) kernel_feature=$FEATURE server_features=$SERVER_FEATURE_ARGS"
   sha256sum "$KBIN" build-riscv64/initramfs-core.cpio
 } >"$LOGDIR/artifact-identity.txt"
-source scripts/lib/artifact-binding.sh
-artifact_write_run_manifest "$LOGDIR/artifact-binding.txt" riscv64 "$KBIN" \
-  "--no-default-features --features $FEATURE" build-riscv64/initramfs-core.cpio \
-  build-riscv64/artifact-manifest.txt \
-  || { echo "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=riscv64 classes=1 result=fail reason=artifact_binding"; exit 1; }
 
 # ── 3. Boot ONE -smp 1 QEMU-virt with the oracle knob ──
 note "booting QEMU-virt -smp 1 with yarm.riscv_shared_region_direct_oracle=1"
 env \
-  ARTIFACT_MANIFEST="$LOGDIR/artifact-binding.txt" \
+  ARTIFACT_REQUIRE="kernel=$FEATURE initramfs:shared-region-offset-witness" \
   KERNEL_IMAGE="$KBIN" \
   INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio \
   KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.riscv_shared_region_direct_oracle=1" \

@@ -131,6 +131,18 @@ if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
   exit 2
 fi
 
+# BUILD-GATES1: refuse before QEMU unless the kernel/initramfs pair carries provenance and a
+# passed no-FP check for exactly these bytes.
+source "$(dirname "$0")/lib/artifact-binding.sh"
+if ! artifact_boot_guard "$ARCH" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" \
+    "kernel=none" \
+    "initramfs=none" \
+    "initramfs@SUPERVISOR_RESTART_TEST=1" \
+    "initramfs@YARM_SUPERVISOR_RESTART_TEST=1" >"$LOGFILE.artifact-binding.txt" 2>&1; then
+  cat "$LOGFILE.artifact-binding.txt"
+  exit 1
+fi
+cat "$LOGFILE.artifact-binding.txt"
 QEMU_CMD=(
   "$QEMU_BIN"
   -machine "$QEMU_MACHINE"

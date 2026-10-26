@@ -111,11 +111,8 @@ note "RUN_B: building feature-ON artifacts"
 BOOTSTRAP_FEATURE_ARGS="--no-default-features --features $FEATURE" \
   scripts/build-qemu-x86_64-artifacts.sh >"$LOGDIR/build-on.log" 2>&1 \
   || die "feature-on artifact build failed"
-cargo build -Z "build-std=${BUILD_STD}" -Z json-target-spec \
-  --target "$KTARGET" --profile "$KPROFILE" --no-default-features --features "$FEATURE" \
-  -p yarm --bin kernel_boot >"$LOGDIR/kbuild-on.log" 2>&1 \
-  || die "feature-on kernel build failed"
-cp "$KELF" build-x86_64/kernel_boot.elf 2>/dev/null || die "could not stage the feature-on image"
+# BUILD-GATES1: the artifact build above already built and published THE feature-on kernel (same
+# feature arguments), no-FP checked and recorded; it is booted as published, never rebuilt over.
 
 RAW="$LOGDIR/exit.raw.log"; CORE="$LOGDIR/exit.core.log"; NORM="$LOGDIR/exit.norm.log"
 fresh_log "$RAW" && fresh_log "$CORE" && fresh_log "$NORM" || true
@@ -123,6 +120,7 @@ fresh_log "$RAW" && fresh_log "$CORE" && fresh_log "$NORM" || true
 if (( ! fail )); then
   note "RUN_B: one fresh -smp 1 boot with the exit oracle armed"
   env KERNEL_IMAGE=build-x86_64/kernel_boot.elf \
+      ARTIFACT_REQUIRE="kernel=$FEATURE initramfs=$FEATURE" \
       INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
       KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.x86_64_exit_current_task_oracle=1" \
       QEMU_SMP=1 QEMU_SINGLE_BOOT=1 LOGFILE="$RAW" SMOKE_LOG="$CORE" \

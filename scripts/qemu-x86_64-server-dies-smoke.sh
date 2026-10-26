@@ -59,11 +59,9 @@ BASE_CMDLINE=${BASE_CMDLINE:-"console=ttyS0 rdinit=/init"}
 # the first attempt.
 serverdies_stage_boot_artifacts() {
   ./scripts/build-qemu-x86_64-artifacts.sh >"$LOGDIR/stage.log" 2>&1 || return 1
-  cargo +nightly build -Z build-std="$BUILD_STD" -Z json-target-spec \
-    --target "$KTARGET" --profile "$KPROFILE" --no-default-features \
-    --features "$FEATURE" -p yarm --bin kernel_boot >>"$LOGDIR/stage.log" 2>&1 || return 1
-  [[ -f "$KELF" ]] || { echo "[serverdies] missing feature-on kernel: $KELF"; return 1; }
-  cp "$KELF" "$BOOT_KERNEL" || return 1
+  # BUILD-GATES1: built and published through the shared path (no-FP check + provenance).
+  artifact_build_kernel x86_64 "--no-default-features --features $FEATURE" \
+    "$BOOT_KERNEL" >>"$LOGDIR/stage.log" 2>&1 || return 1
   [[ -f "$BOOT_INITRD" ]] || { echo "[serverdies] missing initramfs: $BOOT_INITRD"; return 1; }
   # The booted image MUST be the oracle-on one.
   #

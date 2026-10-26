@@ -179,6 +179,9 @@ arch_elf()     { case "$1" in
 esac; }
 arch_feature() { echo "${1/x86_64/x86}-ipc-reply-timeout-oracle" | sed 's/^aarch64-/aarch64-/;s/^riscv64-/riscv64-/'; }
 
+# shellcheck source=lib/artifact-binding.sh
+source scripts/lib/artifact-binding.sh
+
 build_kernel() {
   # $1 arch, $2 "on"|"off", $3 log
   local arch="$1" mode="$2" log="$3"
@@ -203,15 +206,17 @@ build_arch() {
     "scripts/build-qemu-${arch}-artifacts.sh" >"$LOGDIR/build-$arch.log" 2>&1 \
     || { die "[$arch] base artifact build failed (see $LOGDIR/build-$arch.log)"; return 1; }
 
-  build_kernel "$arch" on "$LOGDIR/kbuild-$arch.log" \
-    || { die "[$arch] feature kernel build failed (see $LOGDIR/kbuild-$arch.log)"; return 1; }
+  # BUILD-GATES1: the feature-ON boot kernel is built and published (no-FP checked, recorded) in
+  # one step, over the base build's kernel; the core smoke refuses anything else.
+  local -a pub
   case "$arch" in
-    x86_64)  cp "$elf" build-x86_64/kernel_boot.elf ;;
-    aarch64) "$OBJCOPY" -O binary "$elf" build-aarch64/yarm-aarch64.bin >/dev/null 2>&1 \
-               || { die "[$arch] objcopy failed"; return 1; } ;;
-    riscv64) "$OBJCOPY" -O binary "$elf" build-riscv64/yarm-riscv64.bin >/dev/null 2>&1 \
-               || { die "[$arch] objcopy failed"; return 1; } ;;
+    x86_64)  pub=(build-x86_64/kernel_boot.elf) ;;
+    aarch64) pub=(build-aarch64/yarm-aarch64.elf build-aarch64/yarm-aarch64.bin) ;;
+    riscv64) pub=(build-riscv64/yarm-riscv64.elf build-riscv64/yarm-riscv64.bin) ;;
   esac
+  artifact_build_kernel "$arch" "--no-default-features --features $(arch_feature "$arch")" "${pub[@]}" \
+    >"$LOGDIR/kbuild-$arch.log" 2>&1 \
+    || { die "[$arch] feature kernel build failed (see $LOGDIR/kbuild-$arch.log)"; return 1; }
 
   # The feature-OFF build reuses the same target path, so it OVERWRITES `$elf`. The
   # feature-ON boot image was already copied out above and is untouched.
@@ -254,6 +259,7 @@ boot_cell() {
   case "$arch" in
     x86_64)
       env KERNEL_IMAGE=build-x86_64/kernel_boot.elf \
+          ARTIFACT_REQUIRE="kernel=$(arch_feature x86_64) initramfs=none" \
           INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
           KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.x86_64_ipc_reply_timeout_oracle=${mode}" \
           QEMU_SMP=1 QEMU_SINGLE_BOOT=1 LOGFILE="$log" SMOKE_LOG="$core" \
@@ -265,6 +271,7 @@ boot_cell() {
       ;;
     aarch64)
       env KERNEL_IMAGE=build-aarch64/yarm-aarch64.bin \
+          ARTIFACT_REQUIRE="kernel=$(arch_feature aarch64) initramfs=none" \
           INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio \
           KERNEL_CMDLINE="yarm.aarch64_ipc_reply_timeout_oracle=${mode}" \
           QEMU_SMP=1 QEMU_SINGLE_BOOT=1 QEMU_SMOKE_STRICT=0 LOGFILE="$log" \
@@ -273,6 +280,7 @@ boot_cell() {
       ;;
     riscv64)
       env KERNEL_IMAGE=build-riscv64/yarm-riscv64.bin \
+          ARTIFACT_REQUIRE="kernel=$(arch_feature riscv64) initramfs=none" \
           INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio \
           KERNEL_CMDLINE="yarm.riscv_ipc_reply_timeout_oracle=${mode}" \
           QEMU_SMP=1 QEMU_SINGLE_BOOT=1 QEMU_SMOKE_STRICT=0 LOGFILE="$log" \

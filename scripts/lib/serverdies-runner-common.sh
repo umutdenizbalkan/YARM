@@ -208,6 +208,21 @@ IPC_SERVER_DEATH_OK
 PROD
 }
 
+# ── boot guard (BUILD-GATES1 §3) ──────────────────────────────────────────────────────
+# shellcheck source=scripts/lib/artifact-binding.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/artifact-binding.sh"
+
+# Refuses before QEMU starts unless the staged pair is exactly the checked oracle-on kernel and
+# the feature-free initramfs the artifact script recorded.
+serverdies_boot_guard() {
+  local rc
+  artifact_boot_guard "$ARCH_TAG" "$BOOT_KERNEL" "$BOOT_INITRD" \
+    "kernel=$FEATURE" "initramfs=none" >"$LOGDIR/artifact-binding.txt" 2>&1
+  rc=$?
+  cat "$LOGDIR/artifact-binding.txt"
+  return "$rc"
+}
+
 # ── raw-image staging (QEMU-BASELINE1 §4) ─────────────────────────────────────────────
 # The AArch64 and RISC-V ports boot a raw binary objcopy'd from the kernel ELF, exactly as their
 # artifact scripts publish it: QEMU hands a raw AArch64 image the DTB that locates the initrd,
@@ -219,18 +234,11 @@ PROD
 serverdies_stage_raw_image() {
   local arch=$1 image=$2 initrd=$3 syms
   ./scripts/build-qemu-${arch}-artifacts.sh >"$LOGDIR/stage.log" 2>&1 || return 1
-  cargo +nightly build -Z build-std="$BUILD_STD" -Z json-target-spec \
-    --target "$KTARGET" --profile "$KPROFILE" --no-default-features \
-    --features "$FEATURE" -p yarm --bin kernel_boot >>"$LOGDIR/stage.log" 2>&1 || return 1
-  [[ -f "$KELF" ]] || { echo "[serverdies] missing feature-on kernel: $KELF"; return 1; }
-  rm -f "$image"
-  if command -v llvm-objcopy >/dev/null 2>&1; then
-    llvm-objcopy -O binary "$KELF" "$image" || return 1
-  elif command -v rust-objcopy >/dev/null 2>&1; then
-    rust-objcopy -O binary "$KELF" "$image" || return 1
-  else
-    echo "[serverdies] no objcopy available to produce $image"; return 1
-  fi
+  # BUILD-GATES1: the oracle-on kernel is built and published through the shared path, which
+  # no-FP-checks the final ELF and raw image and records their provenance; a failure removes
+  # the image rather than leaving the feature-off one bootable.
+  artifact_build_kernel "$arch" "--no-default-features --features $FEATURE" \
+    "${image%.bin}.elf" "$image" >>"$LOGDIR/stage.log" 2>&1 || return 1
   [[ -s "$initrd" ]] || { echo "[serverdies] missing initramfs: $initrd"; return 1; }
   # Materialized, not piped into `grep -q`: see the x86_64 runner for the pipefail inversion.
   syms=$(strings -a "$image")
@@ -281,6 +289,7 @@ serverdies_run_b_live_cell() {
 
   local log="$LOGDIR/run-b.log"
   rm -f "$log"
+  serverdies_boot_guard || { die "RUN_B artifact binding refused the boot set"; return; }
   note "boot cmdline: ${SELECTOR}=server-dies"
   if ! serverdies_boot_once "$log"; then
     die "RUN_B boot did not complete"

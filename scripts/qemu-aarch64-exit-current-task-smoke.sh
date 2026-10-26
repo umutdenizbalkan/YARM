@@ -142,13 +142,8 @@ if (( ! fail )); then
     || die "feature-on artifact build failed"
 fi
 if (( ! fail )); then
-  note "RUN_B: building feature-ON kernel"
-  cargo build -Z "build-std=${BUILD_STD}" -Z json-target-spec \
-    --target "$KTARGET" --profile "$KPROFILE" \
-    --no-default-features --features "$FEATURE" \
-    -p yarm --bin kernel_boot >"$LOGDIR/kbuild-on.log" 2>&1 \
-    || die "feature-on kernel build failed"
-  "$OBJCOPY" -O binary "$KELF" "$KBIN" >/dev/null 2>&1 || die "objcopy of feature-on kernel failed"
+  # BUILD-GATES1: the artifact build above already built and published THE feature-on kernel (same
+  # feature arguments) as ELF + raw image, no-FP checked and recorded; it is booted as published.
   fresh_artifact "$KBIN"
   fresh_artifact build-aarch64/initramfs-core.cpio
 fi
@@ -177,6 +172,7 @@ fi
 if (( ! fail )); then
   note "RUN_B: one fresh -smp 1 boot with the AArch64 exit oracle armed"
   env KERNEL_IMAGE="$KBIN" \
+      ARTIFACT_REQUIRE="kernel=$FEATURE initramfs=$FEATURE" \
       INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio \
       KERNEL_CMDLINE="yarm.aarch64_exit_current_task_oracle=1" \
       QEMU_SMP=1 QEMU_SINGLE_BOOT=1 QEMU_SMOKE_STRICT=0 \

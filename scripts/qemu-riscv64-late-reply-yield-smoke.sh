@@ -26,7 +26,6 @@ LOGDIR=${LOGDIR:-/tmp/qemu-riscv64-late-reply-yield}
 TIMEOUT_SECS=${TIMEOUT_SECS:-90}
 FEATURE=riscv64-ipc-reply-timeout-oracle
 BUILD="$LOGDIR/build"
-KELF=target/riscv64gc-unknown-none-elf/release/kernel_boot
 KBIN="$BUILD/yarm-riscv64-oracle.bin"
 BOOT_LOG="$LOGDIR/boot.log"
 mkdir -p "$LOGDIR"
@@ -36,24 +35,17 @@ rm -rf "$BUILD"
 OUT_DIR="$BUILD" BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
   scripts/build-qemu-riscv64-artifacts.sh >"$LOGDIR/build.log" 2>&1 \
   || { seal "result=fail reason=base_build"; exit 1; }
-cargo build -Z build-std=core,alloc,compiler_builtins,panic_abort \
-  --target riscv64gc-unknown-none-elf --profile release \
-  --no-default-features --features "$FEATURE" -p yarm --bin kernel_boot >"$LOGDIR/kbuild.log" 2>&1 \
-  || { seal "result=fail reason=kernel_build"; exit 1; }
-llvm-objcopy -O binary "$KELF" "$KBIN" || { seal "result=fail reason=objcopy"; exit 1; }
+# BUILD-GATES1: the oracle kernel is built and published (ELF + raw image, no-FP checked, with its
+# own provenance record) in one step; the core smoke refuses it unless it is exactly that build.
+source scripts/lib/artifact-binding.sh
+artifact_build_kernel riscv64 "--no-default-features --features $FEATURE" "${KBIN%.bin}.elf" "$KBIN" \
+  >"$LOGDIR/kbuild.log" 2>&1 || { seal "result=fail reason=kernel_build"; exit 1; }
 {
   echo "tree=$(git rev-parse HEAD^{tree}) head=$(git rev-parse HEAD) dirty=$(git status --porcelain | wc -l) feature=$FEATURE"
   sha256sum "$KBIN" "$BUILD/initramfs-core.cpio"
 } >"$LOGDIR/artifact-identity.txt"
 
-# BL5c: the oracle kernel is built outside the artifact build, so the run binds it explicitly: the
-# kernel with the feature it was built with, the initramfs carried over from its build's manifest.
-source scripts/lib/artifact-binding.sh
-artifact_write_run_manifest "$LOGDIR/artifact-binding.txt" riscv64 "$KBIN" \
-  "--no-default-features --features $FEATURE" "$BUILD/initramfs-core.cpio" "$BUILD/artifact-manifest.txt" \
-  || { seal "result=fail reason=artifact_binding"; exit 1; }
-
-ARTIFACT_MANIFEST="$LOGDIR/artifact-binding.txt" \
+ARTIFACT_REQUIRE="kernel=$FEATURE initramfs=none" \
 KERNEL_IMAGE="$KBIN" INITRAMFS_IMAGE="$BUILD/initramfs-core.cpio" \
 KERNEL_CMDLINE="yarm.riscv_ipc_reply_timeout_oracle=timeout-wins" QEMU_SINGLE_BOOT=1 \
 TIMEOUT_SECS="$TIMEOUT_SECS" QEMU_SMOKE_STRICT=1 LOGFILE="$BOOT_LOG" \

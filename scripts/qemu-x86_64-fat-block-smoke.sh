@@ -77,6 +77,15 @@ rm -f "$LOGFILE"
 # ---------------------------------------------------------------------------
 # QEMU command — adds virtio-blk device backed by FAT image.
 # ---------------------------------------------------------------------------
+# BUILD-GATES1: refuse before QEMU unless the kernel/initramfs pair carries provenance and a
+# passed no-FP check for exactly these bytes.
+source "$(dirname "$0")/lib/artifact-binding.sh"
+if ! artifact_boot_guard x86_64 "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" \
+    "kernel=none" >"$LOGFILE.artifact-binding.txt" 2>&1; then
+  cat "$LOGFILE.artifact-binding.txt"
+  exit 1
+fi
+cat "$LOGFILE.artifact-binding.txt"
 QEMU_CMD=(
   qemu-system-x86_64
   -machine "$QEMU_MACHINE"

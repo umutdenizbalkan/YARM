@@ -79,15 +79,13 @@ if (( ! fail && ! SELF_TEST )); then OBJCOPY=$(objcopy_tool) || die "no objcopy 
 # ── 2. Feature-ON kernel + integrity: it MUST carry the AArch64 retirement literals ──
 if (( ! fail && ! SELF_TEST )); then
   note "building kernel_boot with --features $FEATURE"
-  cargo build -Z "build-std=${BUILD_STD}" \
-    --target "$KTARGET" --profile "$KPROFILE" \
-    --no-default-features --features "$FEATURE" \
-    -p yarm --bin kernel_boot >"$LOGDIR/kbuild.log" 2>&1 \
+  # BUILD-GATES1: build and publish the feature kernel (no-FP checked, recorded) in one step.
+  source scripts/lib/artifact-binding.sh
+  artifact_build_kernel riscv64 "--no-default-features --features $FEATURE" "${KBIN%.bin}.elf" "$KBIN" \
+    >"$LOGDIR/kbuild.log" 2>&1 \
     || die "feature kernel_boot build failed (see $LOGDIR/kbuild.log)"
 fi
 if (( ! fail && ! SELF_TEST )); then
-  "$OBJCOPY" -O binary "$KELF" "$KBIN" >"$LOGDIR/objcopy.log" 2>&1 \
-    || die "objcopy of feature kernel failed (see $LOGDIR/objcopy.log)"
   # The AArch64 kernel carries the arch=riscv64 attribution + the class literal.
   rg -a -q "riscv64" "$KBIN" || die "feature kernel missing riscv64 attribution"
   rg -a -q "class=IpcReplyTimeout" "$KBIN" || die "feature kernel missing IpcReplyTimeout class literal"
@@ -153,6 +151,7 @@ boot_mode() {
   local mode="$1" log="$2" tag="${3:-$1}"
   env \
     KERNEL_IMAGE="$KBIN" \
+    ARTIFACT_REQUIRE="kernel=$FEATURE" \
     INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio \
     KERNEL_CMDLINE="yarm.riscv_ipc_reply_timeout_oracle=${mode}" \
     QEMU_SMP=1 \

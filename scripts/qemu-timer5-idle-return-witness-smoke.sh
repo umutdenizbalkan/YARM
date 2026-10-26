@@ -149,24 +149,15 @@ BOOTSTRAP_FEATURE_ARGS="--no-default-features --features $WITNESS_FEATURE" \
   "$BUILD_SCRIPT" >"$LOGDIR/build.log" 2>&1 || die "base artifact build failed"
 
 note "rebuilding kernel_boot with $FEATURE"
-JSON_SPEC_ARG=()
-[[ "$KTARGET" == *.json ]] && JSON_SPEC_ARG=(-Z json-target-spec)
-cargo build --no-default-features --features "$FEATURE" \
-  --target "$KTARGET" --profile "$KPROFILE" \
-  -Z build-std="$BUILD_STD" "${JSON_SPEC_ARG[@]}" \
-  -p yarm --bin kernel_boot \
-  >"$LOGDIR/kbuild.log" 2>&1 || die "feature kernel build failed"
-
-if [[ ! -f "$KELF" ]]; then
-  die "feature kernel ELF missing"
-elif (( NEEDS_OBJCOPY )); then
-  if command -v llvm-objcopy >/dev/null 2>&1; then OBJCOPY=llvm-objcopy
-  elif command -v rust-objcopy >/dev/null 2>&1; then OBJCOPY=rust-objcopy
-  else OBJCOPY=""; die "no objcopy available to produce the raw kernel image"; fi
-  [[ -n "$OBJCOPY" ]] && { "$OBJCOPY" -O binary "$KELF" "$DEST" >"$LOGDIR/objcopy.log" 2>&1 \
-    || die "objcopy of the feature kernel failed"; }
+# BUILD-GATES1: build and publish the feature kernel — ELF (and, on AArch64/RISC-V, the raw image
+# QEMU boots) — with its no-FP check and provenance, in one step.
+source scripts/lib/artifact-binding.sh
+if (( NEEDS_OBJCOPY )); then
+  artifact_build_kernel "$ARCH" "--no-default-features --features $FEATURE" "${DEST%.bin}.elf" "$DEST" \
+    >"$LOGDIR/kbuild.log" 2>&1 || die "feature kernel build failed"
 else
-  cp "$KELF" "$DEST" || die "feature kernel copy failed"
+  artifact_build_kernel "$ARCH" "--no-default-features --features $FEATURE" "$DEST" \
+    >"$LOGDIR/kbuild.log" 2>&1 || die "feature kernel build failed"
 fi
 KERNEL_IMAGE="$DEST"
 
@@ -187,6 +178,7 @@ STOP_ENV=()
 note "booting QEMU -smp $SMP with yarm.timer5_idle_return_witness=1 (shipped quantum)"
 env \
   KERNEL_IMAGE="$KERNEL_IMAGE" \
+  ARTIFACT_REQUIRE="kernel=$FEATURE initramfs=$WITNESS_FEATURE" \
   INITRAMFS_IMAGE="$INITRAMFS_IMAGE" \
   KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.timer5_idle_return_witness=1" \
   QEMU_SMP="$SMP" \

@@ -72,14 +72,13 @@ BOOTSTRAP_FEATURE_ARGS="$SERVER_FEATURE_ARGS" \
 # ── 2. Overlay: rebuild kernel_boot WITH the direct-oracle feature ──
 if (( ! fail )); then
   note "rebuilding kernel_boot with --features $FEATURE"
-  cargo build -Z "build-std=${BUILD_STD}" -Z json-target-spec \
-    --target "$KTARGET" --profile "$KPROFILE" \
-    --no-default-features --features "$FEATURE" \
-    -p yarm --bin kernel_boot >"$LOGDIR/kbuild.log" 2>&1 \
+  # BUILD-GATES1: build and publish the feature kernel (no-FP checked, recorded) in one step.
+  source scripts/lib/artifact-binding.sh
+  artifact_build_kernel x86_64 "--no-default-features --features $FEATURE" build-x86_64/kernel_boot.elf \
+    >"$LOGDIR/kbuild.log" 2>&1 \
     || die "feature kernel_boot build failed (see $LOGDIR/kbuild.log)"
 fi
 if (( ! fail )); then
-  cp "$KELF" build-x86_64/kernel_boot.elf
   # Artifact integrity: the feature kernel MUST carry the DIRECT retirement literal
   # (and must NOT carry an ENQUEUE class literal — enqueue stays disabled).
   if ! rg -a -q "class=IpcSendSharedRegionDirect" build-x86_64/kernel_boot.elf; then
@@ -101,16 +100,11 @@ fi
   echo "tree=$(git rev-parse HEAD^{tree}) head=$(git rev-parse HEAD) dirty=$(git status --porcelain | wc -l) kernel_feature=$FEATURE server_features=$SERVER_FEATURE_ARGS"
   sha256sum "build-x86_64/kernel_boot.elf" build-x86_64/initramfs-core.cpio
 } >"$LOGDIR/artifact-identity.txt"
-source scripts/lib/artifact-binding.sh
-artifact_write_run_manifest "$LOGDIR/artifact-binding.txt" x86_64 "build-x86_64/kernel_boot.elf" \
-  "--no-default-features --features $FEATURE" build-x86_64/initramfs-core.cpio \
-  build-x86_64/artifact-manifest.txt \
-  || { echo "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=x86_64 classes=1 result=fail reason=artifact_binding"; exit 1; }
 
 # ── 3. Boot ONE -smp 1 QEMU with the oracle knob ──
 note "booting QEMU -smp 1 with yarm.x86_64_shared_region_direct_oracle=1"
 env \
-  ARTIFACT_MANIFEST="$LOGDIR/artifact-binding.txt" \
+  ARTIFACT_REQUIRE="kernel=$FEATURE initramfs:shared-region-offset-witness" \
   KERNEL_IMAGE=build-x86_64/kernel_boot.elf \
   INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
   KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.x86_64_shared_region_direct_oracle=1" \

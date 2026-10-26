@@ -69,6 +69,15 @@ if [[ "${REGRADE:-0}" != "1" ]]; then
           -kernel "$BUILD_DIR/yarm-aarch64.bin" -initrd "$BUILD_DIR/initramfs-core.cpio"
           -append "yarm.sched_quantum_ticks=${QUANTUM:-2}")
   fi
+  # BUILD-GATES1: refuse before QEMU unless the pair is exactly the checked witness build.
+  if [[ "$ARCH" == x86_64 ]]; then _c1k="$BUILD_DIR/kernel_boot.elf"; else _c1k="$BUILD_DIR/yarm-aarch64.bin"; fi
+  source scripts/lib/artifact-binding.sh
+  if ! artifact_boot_guard "$ARCH" "$_c1k" "$BUILD_DIR/initramfs-core.cpio" \
+      "kernel=$FEATURES" "initramfs=$FEATURES" >"$LOGDIR/artifact-binding.txt" 2>&1; then
+    cat "$LOGDIR/artifact-binding.txt"
+    echo "CONTEXT1_WITNESS_SEAL arch=$ARCH result=fail reason=artifact-binding"; exit 1
+  fi
+  cat "$LOGDIR/artifact-binding.txt"
   echo "[context1-witness] booting: ${QEMU[*]}"
   echo "#HOST_QEMU ${QEMU[*]} $(${QEMU[0]} --version | head -1)" >"$BOOT_LOG.host"
   "${QEMU[@]}" -display none -monitor none -no-reboot -serial "file:$BOOT_LOG" &

@@ -121,8 +121,11 @@ elif (( OFFSET_SELECTION )); then
   CELL_FEATURES+=(shared-region-offset-witness)
 fi
 USERSPACE_FEATURES="--no-default-features"
+# BUILD-GATES1: the boot is refused unless the kernel and initramfs are exactly these builds.
+XFER2_REQUIRE="kernel=$FEATURE initramfs=none"
 if (( ${#CELL_FEATURES[@]} )); then
   USERSPACE_FEATURES="--no-default-features --features $(IFS=,; echo "${CELL_FEATURES[*]}")"
+  XFER2_REQUIRE="kernel=$FEATURE initramfs=$(IFS=,; echo "${CELL_FEATURES[*]}")"
 fi
 GRANT_OFFSET=0
 (( OFFSET_SELECTION )) && GRANT_OFFSET=4096
@@ -136,24 +139,15 @@ BOOTSTRAP_FEATURE_ARGS="$USERSPACE_FEATURES" \
   "$BUILD_SCRIPT" >"$LOGDIR/build.log" 2>&1 || die "base artifact build failed"
 
 note "rebuilding kernel_boot with $FEATURE"
-JSON_SPEC_ARG=()
-[[ "$KTARGET" == *.json ]] && JSON_SPEC_ARG=(-Z json-target-spec)
-cargo build --no-default-features --features "$FEATURE" \
-  --target "$KTARGET" --profile "$KPROFILE" \
-  -Z build-std="$BUILD_STD" "${JSON_SPEC_ARG[@]}" \
-  -p yarm --bin kernel_boot \
-  >"$LOGDIR/kbuild.log" 2>&1 || die "feature kernel build failed"
-
-if [[ ! -f "$KELF" ]]; then
-  die "feature kernel ELF missing"
-elif (( NEEDS_OBJCOPY )); then
-  if command -v llvm-objcopy >/dev/null 2>&1; then OBJCOPY=llvm-objcopy
-  elif command -v rust-objcopy >/dev/null 2>&1; then OBJCOPY=rust-objcopy
-  else OBJCOPY=""; die "no objcopy available to produce the raw kernel image"; fi
-  [[ -n "$OBJCOPY" ]] && { "$OBJCOPY" -O binary "$KELF" "$DEST" >"$LOGDIR/objcopy.log" 2>&1 \
-    || die "objcopy of the feature kernel failed"; }
+# BUILD-GATES1: build and publish the feature kernel — ELF (and, on AArch64/RISC-V, the raw image
+# QEMU boots) — with its no-FP check and provenance, in one step.
+source scripts/lib/artifact-binding.sh
+if (( NEEDS_OBJCOPY )); then
+  artifact_build_kernel "$ARCH" "--no-default-features --features $FEATURE" "${DEST%.bin}.elf" "$DEST" \
+    >"$LOGDIR/kbuild.log" 2>&1 || die "feature kernel build failed"
 else
-  cp "$KELF" "$DEST" || die "feature kernel copy failed"
+  artifact_build_kernel "$ARCH" "--no-default-features --features $FEATURE" "$DEST" \
+    >"$LOGDIR/kbuild.log" 2>&1 || die "feature kernel build failed"
 fi
 KERNEL_IMAGE="$DEST"
 
@@ -170,15 +164,11 @@ BUILD_DIR=$(dirname "$INITRAMFS_IMAGE")
   echo "tree=$(git rev-parse HEAD^{tree}) head=$(git rev-parse HEAD) dirty=$(git status --porcelain | wc -l) kernel_feature=$FEATURE userspace_features=$USERSPACE_FEATURES"
   sha256sum "$KERNEL_IMAGE" "$INITRAMFS_IMAGE"
 } >"$LOGDIR/artifact-identity.txt"
-source scripts/lib/artifact-binding.sh
-artifact_write_run_manifest "$LOGDIR/artifact-binding.txt" "$ARCH" "$KERNEL_IMAGE" \
-  "--no-default-features --features $FEATURE" "$INITRAMFS_IMAGE" "$BUILD_DIR/artifact-manifest.txt" \
-  || { echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH result=fail reason=artifact_binding"; exit 1; }
 
 note "booting QEMU -smp 1 with yarm.xfer2_grant_witness=1"
 env \
-  ARTIFACT_MANIFEST="$LOGDIR/artifact-binding.txt" \
   KERNEL_IMAGE="$KERNEL_IMAGE" \
+  ARTIFACT_REQUIRE="$XFER2_REQUIRE" \
   INITRAMFS_IMAGE="$INITRAMFS_IMAGE" \
   KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.xfer2_grant_witness=1" \
   QEMU_SMP=1 \

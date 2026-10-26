@@ -90,6 +90,18 @@ run_case() {
   return 0
 }
 
+# BUILD-GATES1: the kernel every case boots must be the checked, recorded default build. The
+# synthetic initramfs images below are this test's own inputs; the guard binds the kernel to the
+# recorded default initramfs it was published with.
+source "$(dirname "$0")/lib/artifact-binding.sh"
+if ! artifact_boot_guard x86_64 "$KERNEL_IMAGE" "$GOOD_INITRAMFS" "kernel=none" \
+    >"$LOGDIR/artifact-binding.txt" 2>&1; then
+  cat "$LOGDIR/artifact-binding.txt"
+  echo "[neg][error] artifact binding refused the kernel; not booting"
+  exit 1
+fi
+cat "$LOGDIR/artifact-binding.txt"
+
 # ── Case A: forced ZC-load fault via the default-off fault-injection knob. ──
 run_case forced_zc "$LOGDIR/a_forced_zc.log" \
   "BOOT_FATAL_INIT_ZC_LOAD_FAILED reason=fault_injection" \
