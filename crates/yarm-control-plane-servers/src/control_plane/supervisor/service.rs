@@ -1964,10 +1964,6 @@ pub fn run() {
     );
 }
 
-/// BUILD-GATES1 §4 witness: how many times the supervisor yields before its lifecycle query.
-#[cfg(feature = "u9rx4-reuse-witness")]
-const U9RX4_REUSE_WITNESS_YIELDS: u32 = 4096;
-
 #[cfg(not(test))]
 pub fn run() {
     yarm_user_rt::user_log!("SUP_RUN_ENTER");
@@ -1993,20 +1989,7 @@ pub fn run() {
             );
             // Query PM lifecycle table for the supervisor's own TID to establish
             // truthful supervision metadata before entering the event loop.
-            let supervisor_tid = startup.task_id;
-            // BUILD-GATES1 §4 WITNESS (default-off): give way before the query so init's PM calls
-            // reuse the reply-record slot first. The witness smoke grades whether reuse happened.
-            #[cfg(feature = "u9rx4-reuse-witness")]
-            {
-                let mut yields = 0u32;
-                while yields < U9RX4_REUSE_WITNESS_YIELDS {
-                    if yarm_user_rt::syscall::yield_now().is_err() {
-                        break;
-                    }
-                    yields += 1;
-                }
-                yarm_user_rt::user_log!("U9RX4_REUSE_WITNESS_YIELDED yields={}", yields);
-            }
+            let supervisor_tid = yarm_user_rt::u9rx4_reuse_witness_give_way!(startup.task_id);
             yarm_user_rt::user_log!("SUPERVISOR_LIFECYCLE_QUERY tid={}", supervisor_tid);
             match query_lifecycle_via_process_manager(process_manager_caps, supervisor_tid) {
                 Ok(Some(reply)) if reply.is_found() => {

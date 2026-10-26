@@ -206,14 +206,21 @@ fn the_reuse_witness_is_labeled_default_off_and_separately_graded() {
     let sup = include_str!(
         "../crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs"
     );
-    let gate = sup
-        .find("#[cfg(feature = \"u9rx4-reuse-witness\")]\n            {")
-        .expect("the yield is compiled only under the witness feature");
-    let query = sup
-        .find("yarm_user_rt::user_log!(\"SUPERVISOR_LIFECYCLE_QUERY tid={}\", supervisor_tid);")
-        .unwrap();
-    assert!(gate < query);
-    assert_eq!(sup.matches("u9rx4-reuse-witness").count(), 2);
+    // The call is the existing statement wrapped in a macro (no line added before any code), and
+    // the macro is defined at the very end of yarm-user-rt: a feature-off build is byte-identical.
+    assert!(sup.contains(
+        "let supervisor_tid = yarm_user_rt::u9rx4_reuse_witness_give_way!(startup.task_id);\n            yarm_user_rt::user_log!(\"SUPERVISOR_LIFECYCLE_QUERY tid={}\", supervisor_tid);"
+    ));
+    assert_eq!(sup.matches("u9rx4").count(), 1);
+    let rt = include_str!("../crates/yarm-user-rt/src/lib.rs");
+    let def = rt
+        .find("macro_rules! u9rx4_reuse_witness_give_way {")
+        .expect("macro");
+    assert!(
+        rt[def..].trim_end().ends_with("}};\n}"),
+        "the macro is the last item"
+    );
+    assert!(rt[def..].contains("#[cfg(feature = \"u9rx4-reuse-witness\")]"));
     for toml in [
         include_str!("../Cargo.toml"),
         include_str!("../crates/yarm-driver-servers/Cargo.toml"),

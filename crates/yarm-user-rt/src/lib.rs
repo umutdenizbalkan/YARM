@@ -2419,3 +2419,27 @@ mod tests {
         ]);
     }
 }
+
+/// BUILD-GATES1 §4 WITNESS (default-off; not production policy): evaluates to `$tid`. When the
+/// CALLING crate is built with its `u9rx4-reuse-witness` feature, it first yields 4096 times so
+/// that other callers of PM take and release the shared reply-record slot before the caller's own
+/// call, which then runs on a REUSED record. A macro, appended here, because it adds no code and
+/// moves no line anywhere when the feature is off: the feature-off build is byte-identical.
+/// `scripts/qemu-aarch64-u9rx4-reuse-witness-smoke.sh` grades whether reuse happened.
+#[macro_export]
+macro_rules! u9rx4_reuse_witness_give_way {
+    ($tid:expr) => {{
+        #[cfg(feature = "u9rx4-reuse-witness")]
+        {
+            let mut yields = 0u32;
+            while yields < 4096 {
+                if $crate::syscall::yield_now().is_err() {
+                    break;
+                }
+                yields += 1;
+            }
+            $crate::user_log!("U9RX4_REUSE_WITNESS_YIELDED yields={}", yields);
+        }
+        $tid
+    }};
+}

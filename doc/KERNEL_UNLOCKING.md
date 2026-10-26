@@ -1248,7 +1248,11 @@ ownership or ABI change: the production diff is a default-off witness feature (b
   AArch64: eight core boots at `-smp` 1/2/4/8 and a timer-contract boot all ran tid 2's query on
   record (0, 1). The default-off `u9rx4-reuse-witness` feature makes the supervisor yield before
   its query (4096 yields), so init's calls take the slot first. It is declared inert in the other
-  packages the build touches. `scripts/qemu-aarch64-u9rx4-reuse-witness-smoke.sh` builds it
+  packages the build touches. The yield lives in a macro appended at the end of `yarm-user-rt`,
+  and the supervisor wraps its existing statement in it. The first form, a cfg-gated block above
+  the query, moved two panic-location line numbers in the feature-off supervisor (candidate
+  `086af0ab`, see the qualification record). With the macro, the feature-off build is
+  byte-identical to base. `scripts/qemu-aarch64-u9rx4-reuse-witness-smoke.sh` builds it
   through the checked path and runs the unmodified strict core smoke. It grades two things
   separately:
   * the **premise**: tid 2's record has generation > 1, earlier generations were armed by other
