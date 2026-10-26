@@ -2539,7 +2539,15 @@ u9rx4_cap="${u9rx4_cap:-NONE}"
 # direct. Requiring the queued route's markers there failed a correct boot; accepting either route
 # by their absence would miss a lost one. So the record PM's reply resolves names the request, and
 # exactly ONE route must attest that record and PM's cap; that route's own obligations then apply.
-u9rx4_obj_line="$(printf '%s\n' "$u9rx4_log" | rg -a -m1 -e "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=1( |\$)" || true)"
+#
+# KERNEL-NOFP1: the record's GENERATION is an allocation detail too, read from the one resolution
+# of PM's cap, never assumed to be 1. A direct-route record slot is shared with init's earlier
+# direct calls, so when PM is already blocked (a timing outcome — first seen at -smp 4/8 once the
+# kernel stopped using SIMD) tid 2's request reuses slot 0 at generation 3. The liveness obligation
+# is unchanged and exact: the resolved object's index AND generation must be those of the record
+# the request itself committed (the route lines below are matched on that exact pair), and PM's
+# cap resolves exactly once in the whole boot.
+u9rx4_obj_line="$(printf '%s\n' "$u9rx4_log" | rg -a -m1 -e "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=[0-9]+( |\$)" || true)"
 u9rx4_rec_index="$(rg -o -m1 -e 'reply_index=[0-9]+' <<<"$u9rx4_obj_line" | tr -dc '0-9' || true)"
 u9rx4_rec_gen="$(rg -o -m1 -e ' generation=[0-9]+' <<<"$u9rx4_obj_line" | tr -dc '0-9' || true)"
 u9rx4_rec="record_index=${u9rx4_rec_index:-NONE} record_generation=${u9rx4_rec_gen:-NONE}"
@@ -2589,14 +2597,17 @@ fi
 u9rx4_require_one "PM decodes the lifecycle query" 'PM_LIFECYCLE_QUERY_RECV tid=2'
 u9rx4_require_one "PM replies successfully" 'PM_LIFECYCLE_QUERY_REPLY tid=2 found=1'
 # Stage 199D-DW2 (COMPOSITION): the subject here is that PM's reply RESOLVES against the LIVE
-# one-shot object -- witnessed caller (tid=3), witnessed cap (read above), live generation (1). The
+# one-shot object -- witnessed caller (tid=3), witnessed cap (read above), live generation (the
+# request's own record generation, read above and bound to the route that committed it). The
 # `reply_index` is the slot the allocator happened to hand out, not part of that subject, and any
 # co-armed proof that provisions an extra reply cap first (the 193D send-reply-cap oracle does
 # exactly that) shifts it. Anchoring on it made this assertion satisfiable only in the default
 # cell; matching tid + cap + generation and tolerating the slot keeps every part of the subject
 # and holds in every cell.
-u9rx4_require_one_re "the reply resolves against the live one-shot object" \
-  "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=1( |\$)"
+u9rx4_require_one_re "PM's cap resolves exactly once" \
+  "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=[0-9]+( |\$)"
+u9rx4_require_one_re "the reply resolves against the live one-shot object (the request's own record)" \
+  "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=${u9rx4_rec_index:-NONE} generation=${u9rx4_rec_gen:-NONE}( |\$)"
 # The one-shot is CONSUMED exactly once, on both sides, and the caller resumes once.
 u9rx4_require_one "the replier side of the one-shot is revoked once" \
   "IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=${u9rx4_cap} "
