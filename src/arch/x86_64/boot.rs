@@ -140,6 +140,7 @@ boot_stack_end:
 
     .section .text.boot32,"ax",@progbits
     .code32
+.Lyarm_nofp_boot32_begin:
     .global pvh_start32
     .type pvh_start32,@function
 pvh_start32:
@@ -232,7 +233,18 @@ pvh_start32:
     jz 4f
     or eax, 0x200000
 4:
+75:
     mov cr4, eax
+76:
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 75b
+    .quad 76b
+    .asciz "X86_CR4_WRITE"
+    .balign 8
+    .popsection
 
     mov ecx, 0xC0000080
     rdmsr
@@ -262,7 +274,18 @@ pvh_start32:
     // Clear CR0.EM, set CR0.PE | CR0.MP | CR0.PG.
     and eax, 0xFFFFFFFB
     or eax, 0x80000003
+75:
     mov cr0, eax
+76:
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 75b
+    .quad 76b
+    .asciz "X86_CR0_WRITE"
+    .balign 8
+    .popsection
 
     // Far-return into the LOW-VA 64-bit thunk.  long_mode_low_thunk's
     // symbol value fits in a 32-bit immediate because it lives in
@@ -290,6 +313,17 @@ uart_putc32:
     pop edx
     pop eax
     ret
+.Lyarm_nofp_boot32_end:
+    // The whole of .text.boot32 is 32-bit code: the check decodes it as such.
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad .Lyarm_nofp_boot32_begin
+    .quad .Lyarm_nofp_boot32_end
+    .asciz "CODE32 boot32"
+    .balign 8
+    .popsection
 
     // ===========================================================
     // .text.boot64_thunk — 64-bit code at LOW VA.

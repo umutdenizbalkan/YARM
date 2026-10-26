@@ -16,6 +16,12 @@
  * W's verdict is where it parks: the kernel witness reads it and emits the sealed summary.
  */
     .pushsection .text.yarm_ovt_witness, "ax", %progbits
+    /* KERNEL-NOFP1: everything in this section is a USER-MODE program the kernel copies
+     * into a task's address space and never executes; the final-image check accounts
+     * for it as one USER_PROGRAM region (scripts/check-kernel-nofp.py). */
+    .arch_extension fp
+    .arch_extension simd
+.Lyarm_nofp_user_overtaken_witness_begin:
 
     .set WAIT_VA, 0x20070000
     .set FAIL_VA, 0x20070040
@@ -184,4 +190,15 @@ ovt_k_go_timeout_end:
     .global yarm_ovt_k_end
 yarm_ovt_k_end:
 
+.Lyarm_nofp_user_overtaken_witness_end:
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad .Lyarm_nofp_user_overtaken_witness_begin
+    .quad .Lyarm_nofp_user_overtaken_witness_end
+    .asciz "USER_PROGRAM overtaken_witness"
+    .balign 8
+    .popsection
+    .arch_extension nosimd
+    .arch_extension nofp
     .popsection

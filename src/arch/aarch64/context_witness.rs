@@ -44,11 +44,24 @@ pub fn note_idle_divergence(cpu: usize) {
 }
 
 /// Count (and log the first few) EL0 entries whose kernel code would run under a non-kernel FPCR.
+///
+/// KERNEL-NOFP1: the FPCR read is an audited exception (`A64_CTX1_ENV_PROBE`); never inlined, so
+/// the witness image carries exactly one instance.
+#[inline(never)]
 pub fn check_kernel_env() {
     let fpcr: u64;
     // SAFETY: reads FPCR only.
     unsafe {
-        core::arch::asm!("mrs {}, fpcr", out(reg) fpcr, options(nomem, nostack, preserves_flags));
+        core::arch::asm!(
+            ".arch_extension fp",
+            "72:",
+            "mrs {}, fpcr",
+            "73:",
+            ".arch_extension nofp",
+            crate::arch::nofp_map_record!("72b", "73b", "A64_CTX1_ENV_PROBE"),
+            out(reg) fpcr,
+            options(nomem, nostack, preserves_flags)
+        );
     }
     crate::kernel::context_witness::note_kernel_env(fpcr == 0, fpcr, 0);
 }
@@ -70,7 +83,12 @@ static JUNK: Junk = {
 
 /// Overwrite every user-visible FP/SIMD register and the user-writable control/status state. See
 /// the module doc: interference, never a save or a restore.
+///
+/// KERNEL-NOFP1: an audited exception (`A64_CTX1_CLOBBER`); never inlined. The kernel is built
+/// soft-float, so the compiler never allocates or relies on a vector register and none can be
+/// named as an operand; the vector writes below therefore need no clobber declaration.
 #[cfg(feature = "context1-clobber")]
+#[inline(never)]
 pub fn clobber_user_visible_state() {
     // FPCR: round toward zero, flush-to-zero, default NaN. FPSR: every cumulative flag + QC.
     // NZCV: all four. TPIDR_EL0: a value no task is ever given.
@@ -83,6 +101,9 @@ pub fn clobber_user_visible_state() {
     // FP arithmetic and never reads TPIDR_EL0, so the junk cannot change a kernel result.
     unsafe {
         core::arch::asm!(
+            ".arch_extension fp",
+            ".arch_extension simd",
+            "72:",
             "ldp q0, q1, [{j}, #0]",
             "ldp q2, q3, [{j}, #32]",
             "ldp q4, q5, [{j}, #64]",
@@ -101,6 +122,10 @@ pub fn clobber_user_visible_state() {
             "ldp q30, q31, [{j}, #480]",
             "msr fpcr, {c}",
             "msr fpsr, {s}",
+            "73:",
+            ".arch_extension nosimd",
+            ".arch_extension nofp",
+            crate::arch::nofp_map_record!("72b", "73b", "A64_CTX1_CLOBBER"),
             "msr nzcv, {n}",
             "msr tpidr_el0, {t}",
             j = in(reg) &JUNK,
@@ -108,14 +133,6 @@ pub fn clobber_user_visible_state() {
             s = in(reg) fpsr,
             n = in(reg) nzcv,
             t = in(reg) tpidr,
-            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
-            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
-            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
-            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
             options(nostack, readonly),
         );
     }

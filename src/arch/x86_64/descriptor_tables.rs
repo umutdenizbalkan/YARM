@@ -323,7 +323,11 @@ pub(crate) fn load_production_idt_on_this_cpu() -> u64 {
 /// `CR0.NE=1` (native x87 errors), and `CR4.OSFXSR | OSXMMEXCPT` (synced from the boot CPU before
 /// SIPI). Then the kernel baseline: `fninit` and the kernel MXCSR. Returns whether the readback
 /// agrees.
+///
+/// KERNEL-NOFP1: the three FP-control operations below are audited exceptions, each recorded in
+/// `.yarm_nofp_map`. Never inlined, so the image carries exactly one instance of each.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[inline(never)]
 pub(crate) fn establish_fpu_control_on_this_cpu() -> bool {
     const CR0_MP: u64 = 1 << 1;
     const CR0_EM: u64 = 1 << 2;
@@ -336,16 +340,33 @@ pub(crate) fn establish_fpu_control_on_this_cpu() -> bool {
         let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
         cr0 = (cr0 & !(CR0_EM | CR0_TS)) | CR0_MP | CR0_NE;
-        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
+        core::arch::asm!(
+            "72:",
+            "mov cr0, {}",
+            "73:",
+            crate::arch::nofp_map_record!("72b", "73b", "X86_CR0_WRITE"),
+            in(reg) cr0,
+            options(nostack, preserves_flags)
+        );
         let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
         if cr4 & (CR4_OSFXSR | CR4_OSXMMEXCPT) != (CR4_OSFXSR | CR4_OSXMMEXCPT) {
             cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
-            core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+            core::arch::asm!(
+                "72:",
+                "mov cr4, {}",
+                "73:",
+                crate::arch::nofp_map_record!("72b", "73b", "X86_CR4_WRITE"),
+                in(reg) cr4,
+                options(nostack, preserves_flags)
+            );
         }
         core::arch::asm!(
+            "72:",
             "fninit",
             "ldmxcsr [rip + YARM_X86_KERNEL_MXCSR]",
+            "73:",
+            crate::arch::nofp_map_record!("72b", "73b", "X86_KERNEL_FP_ENV_INIT"),
             options(nostack, preserves_flags)
         );
         let (back0, back4): (u64, u64);
@@ -2035,13 +2056,35 @@ yarm_x86_common_trap_entry:
     // dispatcher's fifth argument; the matching FXRSTOR64 below is the last FP operation before
     // the return, after every kernel instruction.
     sub rsp, 512
+71:
     fxsave64 [rsp]
     fninit
     ldmxcsr [rip + YARM_X86_KERNEL_MXCSR]
+72:
+    // KERNEL-NOFP1: audited exception record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 71b
+    .quad 72b
+    .asciz "X86_TRAP_ENTRY_CAPTURE"
+    .balign 8
+    .popsection
     cld
     mov r8, rsp
     call yarm_x86_dispatch_trap_from_stub
+73:
     fxrstor64 [rsp]
+74:
+    // KERNEL-NOFP1: audited exception record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 73b
+    .quad 74b
+    .asciz "X86_TRAP_ENTRY_RESTORE"
+    .balign 8
+    .popsection
     mov rsp, r12
 
     pop r15
@@ -2227,13 +2270,35 @@ yarm_x86_lstar_entry:
     // QEMU-CONTEXT1 §2: as the common entry — capture x87/SSE first, then the kernel's own
     // control environment; restore after the dispatcher returns.
     sub rsp, 512
+71:
     fxsave64 [rsp]
     fninit
     ldmxcsr [rip + YARM_X86_KERNEL_MXCSR]
+72:
+    // KERNEL-NOFP1: audited exception record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 71b
+    .quad 72b
+    .asciz "X86_TRAP_ENTRY_CAPTURE"
+    .balign 8
+    .popsection
     cld
     mov r8, rsp
     call yarm_x86_dispatch_trap_from_stub
+73:
     fxrstor64 [rsp]
+74:
+    // KERNEL-NOFP1: audited exception record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 73b
+    .quad 74b
+    .asciz "X86_TRAP_ENTRY_RESTORE"
+    .balign 8
+    .popsection
     mov rsp, r12
 
     // Step 7 — restore all user GPRs and return via IRETQ.
@@ -3443,6 +3508,16 @@ core::arch::global_asm!(
 yarm_x86_enter_ring3:
     // QEMU-CONTEXT1 §2: a first entry starts from the architectural initial x87/SSE state.
     fxrstor64 [rip + YARM_X86_INITIAL_FXSAVE]
+71:
+    // KERNEL-NOFP1: audited exception record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad yarm_x86_enter_ring3
+    .quad 71b
+    .asciz "X86_FIRST_ENTRY_RESTORE"
+    .balign 8
+    .popsection
     mov r10, rdi
     mov r11, rsi
     mov rdi, rdx
@@ -3480,6 +3555,16 @@ core::arch::global_asm!(
 yarm_x86_resume_ring3:
     // QEMU-CONTEXT1 §2: the resumed task's own x87/SSE home (rsi), after the last Rust call.
     fxrstor64 [rsi]
+71:
+    // KERNEL-NOFP1: audited exception record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad yarm_x86_resume_ring3
+    .quad 71b
+    .asciz "X86_RESUME_RESTORE"
+    .balign 8
+    .popsection
     mov ax, 0x1b
     mov ds, ax
     mov es, ax

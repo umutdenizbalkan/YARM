@@ -38,6 +38,12 @@
  * an `svc`.
  */
     .pushsection .text.yarm_smp2_witness, "ax", %progbits
+    /* KERNEL-NOFP1: everything in this section is a USER-MODE program the kernel copies
+     * into a task's address space and never executes; the final-image check accounts
+     * for it as one USER_PROGRAM region (scripts/check-kernel-nofp.py). */
+    .arch_extension fp
+    .arch_extension simd
+.Lyarm_nofp_user_smp2_witness_begin:
 
     .set PAYLOAD, 0x20030000
     .set META, 0x20040000
@@ -903,4 +909,15 @@ yarm_smp2_h_cap: .word 0x71717171
     .global yarm_smp2_h_end
 yarm_smp2_h_end:
 
+.Lyarm_nofp_user_smp2_witness_end:
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad .Lyarm_nofp_user_smp2_witness_begin
+    .quad .Lyarm_nofp_user_smp2_witness_end
+    .asciz "USER_PROGRAM smp2_witness"
+    .balign 8
+    .popsection
+    .arch_extension nosimd
+    .arch_extension nofp
     .popsection

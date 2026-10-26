@@ -220,6 +220,7 @@ mv -f "${KERNEL_DEBUG_ELF}.staging.$$" "$KERNEL_DEBUG_ELF"
 common_verify_artifact_fresh "$KERNEL_IMAGE" "kernel image"
 common_verify_artifact_fresh "$INITRAMFS_IMAGE_ABS" "initramfs image"
 common_verify_kernel_markers "$KERNEL_IMAGE" "x86_64"
+common_verify_kernel_nofp "x86_64" "$KERNEL_IMAGE"
 common_write_manifest "x86_64" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE_ABS"
 common_emit_build_integrity_line "x86_64"
 

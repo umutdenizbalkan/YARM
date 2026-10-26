@@ -1,6 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+/// KERNEL-NOFP1 — one record of the kernel image's `.yarm_nofp_map` table, as asm template text.
+///
+/// The table is a non-loaded section (`""` flags: never part of a loaded segment) that the final-
+/// image check `scripts/check-kernel-nofp.py` reads from the ELF that boots. A record names one
+/// audited FP/SIMD or FP-control range `[begin, end)` — two local labels around the exact
+/// instructions — and its kind; the checker holds the kind's purpose and the exact instructions it
+/// may contain. Records are only ever written next to the code they describe.
+macro_rules! nofp_map_record {
+    ($begin:literal, $end:literal, $name:literal) => {
+        concat!(
+            ".pushsection .yarm_nofp_map, \"\", @progbits\n",
+            ".balign 8\n",
+            ".quad 0x3150464F4E4D5259\n",
+            ".quad ", $begin, "\n",
+            ".quad ", $end, "\n",
+            ".asciz \"", $name, "\"\n",
+            ".balign 8\n",
+            ".popsection"
+        )
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use nofp_map_record;
+
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 #[cfg(any(test, target_arch = "aarch64"))]

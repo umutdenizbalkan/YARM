@@ -165,6 +165,7 @@ mv -f "${KERNEL_BIN_IMAGE}.staging.$$" "$KERNEL_BIN_IMAGE"
 common_verify_artifact_fresh "$KERNEL_BIN_IMAGE" "kernel binary image"
 common_verify_artifact_fresh "$INITRAMFS_IMAGE_ABS" "initramfs image"
 common_verify_kernel_markers "$KERNEL_BIN_IMAGE" "aarch64"
+common_verify_kernel_nofp "aarch64" "$KERNEL_ELF" "$KERNEL_BIN_IMAGE"
 common_write_manifest "aarch64" "$KERNEL_BIN_IMAGE" "$INITRAMFS_IMAGE_ABS"
 common_emit_build_integrity_line "aarch64"
 

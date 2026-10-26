@@ -42,6 +42,10 @@
  *                    +0x40/+0x48 own W checked
  */
     .pushsection .text.yarm_smp1_witness, "ax", @progbits
+    /* KERNEL-NOFP1: everything in this section is a USER-MODE program the kernel copies
+     * into a task's address space and never executes; the final-image check accounts
+     * for it as one USER_PROGRAM region (scripts/check-kernel-nofp.py). */
+.Lyarm_nofp_user_smp1_witness_begin:
 
     .set SMP1_PAYLOAD, 0x20030000
     .set SMP1_META, 0x20040000
@@ -622,4 +626,13 @@ yarm_smp1_client_end:
     .global smp1s_l3_nr3_ret
     .global smp1c_l3_nr3_ret
 .endif
+.Lyarm_nofp_user_smp1_witness_end:
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad .Lyarm_nofp_user_smp1_witness_begin
+    .quad .Lyarm_nofp_user_smp1_witness_end
+    .asciz "USER_PROGRAM smp1_witness"
+    .balign 8
+    .popsection
     .popsection

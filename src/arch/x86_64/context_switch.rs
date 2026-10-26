@@ -17,7 +17,18 @@ core::arch::global_asm!(
     .global yarm_x86_switch_frame
     .type yarm_x86_switch_frame, @function
 yarm_x86_switch_frame:
+71:
     fxsave [rdi + 64]
+72:
+    // KERNEL-NOFP1: audited exception record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 71b
+    .quad 72b
+    .asciz "X86_SWITCH_SAVE"
+    .balign 8
+    .popsection
 
     mov [rdi + 16], rbx
     mov [rdi + 24], rbp
@@ -31,7 +42,18 @@ yarm_x86_switch_frame:
     lea rax, [rsp + 8]
     mov [rdi + 0], rax
 
+73:
     fxrstor [rsi + 64]
+74:
+    // KERNEL-NOFP1: audited exception record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 73b
+    .quad 74b
+    .asciz "X86_SWITCH_RESTORE"
+    .balign 8
+    .popsection
 
     mov rbx, [rsi + 16]
     mov rbp, [rsi + 24]
@@ -70,13 +92,18 @@ pub fn switch_frames(
     }
 }
 
-#[inline]
+/// KERNEL-NOFP1: an audited exception (`X86_SWITCH_FRAME_INIT`); never inlined, so the image
+/// carries exactly one instance.
+#[inline(never)]
 pub fn initialize_frame_fpu_state(frame: &mut ArchSwitchContext) {
     #[cfg(all(not(test), target_arch = "x86_64"))]
     unsafe {
         core::arch::asm!(
+            "72:",
             "fninit",
             "fxsave [{}]",
+            "73:",
+            crate::arch::nofp_map_record!("72b", "73b", "X86_SWITCH_FRAME_INIT"),
             in(reg) ((frame as *mut ArchSwitchContext as *mut u8).add(64)),
             options(nostack)
         );

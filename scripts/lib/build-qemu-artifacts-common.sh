@@ -128,6 +128,25 @@ common_verify_kernel_markers() {
   return "$rc"
 }
 
+# KERNEL-NOFP1: the final linked kernel must pass the final-image FP/SIMD check — ordinary kernel
+# code and its linked helpers use no FP/SIMD register or FP control state, and every audited
+# exception matches its policy (doc/SCHEDULING_CONTRACT.md §8.1). Fail closed: a violation, or any
+# inspection the checker could not complete, aborts the build with no published artifact. The
+# result line is kept next to the artifacts as `nofp-check.txt`.
+common_verify_kernel_nofp() {
+  local arch="$1" elf="$2" boot_image="${3:-}" feats out
+  feats="$(artifact_features_record "${BOOTSTRAP_FEATURE_ARGS:-}" | sed -n 's/.* features=//p')"
+  [[ "$feats" == "none" ]] && feats=""
+  out="${OUT_DIR:-.}/nofp-check.txt"
+  if scripts/check-kernel-nofp.sh "$arch" "$elf" "$feats" "$boot_image" >"$out" 2>&1; then
+    grep -a "^NOFP_CHECK " "$out"
+    return 0
+  fi
+  cat "$out"
+  echo "[error][integrity] KERNEL-NOFP1: the $arch kernel failed the final-image FP/SIMD check"
+  return 1
+}
+
 # Record commit + per-artifact hash/size/mtime to the manifest.
 #
 # BL5c: each artifact also records its ROLE and the cargo features it was built with, so a run can

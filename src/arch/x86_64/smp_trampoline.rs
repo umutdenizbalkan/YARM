@@ -248,7 +248,18 @@ yarm_ap_trampoline_start:
 
     mov eax, cr0
     or eax, 1
+75:
     mov cr0, eax
+76:
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 75b
+    .quad 76b
+    .asciz "X86_CR0_WRITE"
+    .balign 8
+    .popsection
 
     mov al, 'P'
     out dx, al
@@ -258,6 +269,44 @@ yarm_ap_trampoline_start:
     .byte 0xEA
     .long AP_PM_ENTRY
     .word 0x0008
+
+    // KERNEL-NOFP1: real-mode code up to here; the GDTR image and the GDT are data.
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad yarm_ap_trampoline_start
+    .quad ap_gdtr
+    .asciz "CODE16 ap_trampoline"
+    .balign 8
+    .popsection
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad ap_gdtr
+    .quad ap_protected_entry
+    .asciz "DATA ap_trampoline_gdt"
+    .balign 8
+    .popsection
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad ap_protected_entry
+    .quad ap_long_entry
+    .asciz "CODE32 ap_trampoline"
+    .balign 8
+    .popsection
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad yarm_ap_trampoline_handoff
+    .quad yarm_ap_trampoline_end
+    .asciz "DATA ap_trampoline_handoff"
+    .balign 8
+    .popsection
 
 ap_gdtr:
     .word AP_GDT_LIMIT
@@ -297,7 +346,18 @@ ap_protected_entry:
     //   5. far jump to 64-bit code selector
     mov eax, cr4
     or eax, (1 << 5)
+75:
     mov cr4, eax
+76:
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 75b
+    .quad 76b
+    .asciz "X86_CR4_WRITE"
+    .balign 8
+    .popsection
 
     mov al, 'A'        // after CR4.PAE
     out dx, al
@@ -330,7 +390,18 @@ ap_protected_entry:
 
     mov eax, cr0
     or eax, 0x80000000
+75:
     mov cr0, eax
+76:
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 75b
+    .quad 76b
+    .asciz "X86_CR0_WRITE"
+    .balign 8
+    .popsection
 
     mov al, 'X'        // after CR0.PG
     out dx, al
@@ -820,7 +891,10 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "mov rax, [rdi + 112]",
         "test rax, rax",
         "jz 63f",
+        "96:",
         "mov cr4, rax",
+        "97:",
+        crate::arch::nofp_map_record!("96b", "97b", "X86_CR4_WRITE"),
         "or dword ptr [rdi + 88], 32", // env: CR4_SYNCED
         "63:",
         // gs: canary store — proves higher-half .bss is writable on the AP under the

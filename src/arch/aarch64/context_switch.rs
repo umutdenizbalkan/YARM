@@ -30,10 +30,26 @@ yarm_aarch64_switch_frame:
     add sp, sp, #16
 
     // Save callee-saved SIMD q8..q15 into ArchSwitchContext::fxsave area.
+    // KERNEL-NOFP1: FP/SIMD is assembled only inside this audited range.
+    .arch_extension fp
+    .arch_extension simd
+71:
     stp q8, q9, [x0, #128]
     stp q10, q11, [x0, #160]
     stp q12, q13, [x0, #192]
     stp q14, q15, [x0, #224]
+72:
+    .arch_extension nosimd
+    .arch_extension nofp
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 71b
+    .quad 72b
+    .asciz "A64_SWITCH_SAVE"
+    .balign 8
+    .popsection
 
     // Save callee-saved GPRs x19..x30.
     str x25, [x0, #64]
@@ -55,10 +71,26 @@ yarm_aarch64_switch_frame:
     str x30, [x0, #8]
 
     // Restore callee-saved SIMD q8..q15 from next frame.
+    // KERNEL-NOFP1: FP/SIMD is assembled only inside this audited range.
+    .arch_extension fp
+    .arch_extension simd
+73:
     ldp q8, q9, [x1, #128]
     ldp q10, q11, [x1, #160]
     ldp q12, q13, [x1, #192]
     ldp q14, q15, [x1, #224]
+74:
+    .arch_extension nosimd
+    .arch_extension nofp
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 73b
+    .quad 74b
+    .asciz "A64_SWITCH_RESTORE"
+    .balign 8
+    .popsection
 
     // Restore callee-saved GPRs x19..x30.
     ldr x25, [x1, #64]

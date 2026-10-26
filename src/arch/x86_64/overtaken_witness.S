@@ -16,6 +16,10 @@
  * Everything is position-independent; strings are RIP-relative.
  */
     .pushsection .text.yarm_ovt_witness, "ax", @progbits
+    /* KERNEL-NOFP1: everything in this section is a USER-MODE program the kernel copies
+     * into a task's address space and never executes; the final-image check accounts
+     * for it as one USER_PROGRAM region (scripts/check-kernel-nofp.py). */
+.Lyarm_nofp_user_overtaken_witness_begin:
 
     .set OVT_WAIT, 0x20070000
     .set OVT_FAIL, 0x20070040
@@ -148,4 +152,13 @@ ovt_x86_k_go_timeout_end:
     .global yarm_ovt_x86_k_end
 yarm_ovt_x86_k_end:
 
+.Lyarm_nofp_user_overtaken_witness_end:
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad .Lyarm_nofp_user_overtaken_witness_begin
+    .quad .Lyarm_nofp_user_overtaken_witness_end
+    .asciz "USER_PROGRAM overtaken_witness"
+    .balign 8
+    .popsection
     .popsection

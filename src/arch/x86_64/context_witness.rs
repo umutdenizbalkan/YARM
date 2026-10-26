@@ -12,6 +12,10 @@
 //!   is lost here, deterministically, instead of only when some kernel code happened to touch it.
 
 /// Read MXCSR, FCW and RFLAGS.DF as the kernel sees them right now.
+///
+/// KERNEL-NOFP1: the two control reads are an audited exception (`X86_CTX1_ENV_PROBE`); never
+/// inlined, so the witness image carries exactly one instance.
+#[inline(never)]
 fn current_env() -> (u32, u16, bool) {
     let mut mxcsr: u32 = 0;
     let mut fcw: u16 = 0;
@@ -19,8 +23,11 @@ fn current_env() -> (u32, u16, bool) {
     // SAFETY: stores into two locals; no state is changed.
     unsafe {
         core::arch::asm!(
+            "72:",
             "stmxcsr [{m}]",
             "fnstcw [{c}]",
+            "73:",
+            crate::arch::nofp_map_record!("72b", "73b", "X86_CTX1_ENV_PROBE"),
             "pushfq",
             "pop {f}",
             m = in(reg) &mut mxcsr,
@@ -80,13 +87,17 @@ static JUNK: FxImage = junk_image();
 /// Overwrite x87 ST0..7, FCW, FSW/FTW, MXCSR and XMM0..15 with junk. See the module doc: this is
 /// the witness's interference, never a save or a restore.
 #[cfg(feature = "context1-clobber")]
+#[inline(never)]
 pub fn clobber_user_visible_state() {
     // SAFETY: FXRSTOR64 of a valid, 16-byte aligned image with reserved MXCSR bits clear. Every
     // register it writes is declared clobbered; the kernel performs no FP arithmetic, so the
     // junk control words cannot change the result of any kernel computation.
     unsafe {
         core::arch::asm!(
+            "72:",
             "fxrstor64 [{0}]",
+            "73:",
+            crate::arch::nofp_map_record!("72b", "73b", "X86_CTX1_CLOBBER"),
             in(reg) &JUNK,
             out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
             out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,

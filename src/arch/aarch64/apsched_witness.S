@@ -33,6 +33,12 @@
  * qN low = 64 + N, qN high = 96 + N.
  */
     .pushsection .text.yarm_apsw_witness, "ax", @progbits
+    /* KERNEL-NOFP1: everything in this section is a USER-MODE program the kernel copies
+     * into a task's address space and never executes; the final-image check accounts
+     * for it as one USER_PROGRAM region (scripts/check-kernel-nofp.py). */
+    .arch_extension fp
+    .arch_extension simd
+.Lyarm_nofp_user_apsched_witness_begin:
 
     .set MBX, 0x20070000
     .set BUF, 0x20080000
@@ -1125,4 +1131,15 @@ yarm_apsw_cap_ep_n: .word 0x64646464
     .global yarm_apsw_end
 yarm_apsw_end:
 
+.Lyarm_nofp_user_apsched_witness_end:
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad .Lyarm_nofp_user_apsched_witness_begin
+    .quad .Lyarm_nofp_user_apsched_witness_end
+    .asciz "USER_PROGRAM apsched_witness"
+    .balign 8
+    .popsection
+    .arch_extension nosimd
+    .arch_extension nofp
     .popsection

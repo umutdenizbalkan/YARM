@@ -114,7 +114,18 @@ yarm_aarch64_enter_el1_if_needed:
     msr HCR_EL2, x1
     // Clear common EL2 trap controls so EL1 sysreg/MMU setup does not trap
     // unexpectedly during early bring-up.
+75:
     msr CPTR_EL2, xzr
+76:
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 75b
+    .quad 76b
+    .asciz "A64_CPTR_EL2_WRITE"
+    .balign 8
+    .popsection
     msr HSTR_EL2, xzr
     msr MDCR_EL2, xzr
     mrs x1, CNTHCTL_EL2
@@ -122,7 +133,18 @@ yarm_aarch64_enter_el1_if_needed:
     msr CNTHCTL_EL2, x1
     msr CNTVOFF_EL2, xzr
     mov x1, #(3 << 20)
+75:
     msr CPACR_EL1, x1
+76:
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 75b
+    .quad 76b
+    .asciz "A64_CPACR_WRITE"
+    .balign 8
+    .popsection
     ldr x1, =0x30D00800
     msr SCTLR_EL1, x1
     isb
@@ -485,7 +507,18 @@ _start:
     b.ne 1f
     mov x0, #(1 << 31)
     msr HCR_EL2, x0
+75:
     msr CPTR_EL2, xzr
+76:
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 75b
+    .quad 76b
+    .asciz "A64_CPTR_EL2_WRITE"
+    .balign 8
+    .popsection
     msr HSTR_EL2, xzr
     msr MDCR_EL2, xzr
     mov x0, sp
@@ -4856,7 +4889,18 @@ yarm_aarch64_secondary_entry:
     /* QEMU-SMP2: FP/SIMD enabled before any compiled code runs, as the BSP's entry does; the
      * vector prologue saves q0..q31 on every exception. */
     mov x1, #(3 << 20)
+75:
     msr CPACR_EL1, x1
+76:
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 75b
+    .quad 76b
+    .asciz "A64_CPACR_WRITE"
+    .balign 8
+    .popsection
     isb
     /* AP-SCHED3 §B: x0 is the PSCI context id = the LOGICAL id the boot CPU planned for this CPU
      * (never MPIDR & 0xff). It indexes the stack pool, so it is bounds-checked first: 0 (the boot
@@ -4923,6 +4967,10 @@ yarm_aarch64_enter_user_mode_eret:
     bl yarm_aarch64_user_entry_marker_before_eret
     // QEMU-CONTEXT1 §2: a first entry starts from the architectural initial FP/SIMD state —
     // every vector register zero, FPCR/FPSR zero — installed after the last `bl`.
+    // KERNEL-NOFP1: FP/SIMD is assembled only inside this audited range.
+    .arch_extension fp
+    .arch_extension simd
+71:
     movi v0.2d, #0
     movi v1.2d, #0
     movi v2.2d, #0
@@ -4957,6 +5005,18 @@ yarm_aarch64_enter_user_mode_eret:
     movi v31.2d, #0
     msr fpcr, xzr
     msr fpsr, xzr
+72:
+    .arch_extension nosimd
+    .arch_extension nofp
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 71b
+    .quad 72b
+    .asciz "A64_FIRST_ENTRY_INIT"
+    .balign 8
+    .popsection
     isb
     mov x0, x21
     mov x1, x22
@@ -5151,6 +5211,10 @@ yarm_aarch64_vector_dispatch:
     // QEMU-CONTEXT1 §2: the whole FP/SIMD file and the user-writable FP/TLS control state are
     // captured HERE, before the first `bl` — any compiled code, the markers included, may use
     // q0..q31 and would otherwise destroy the interrupted state before it was saved.
+    // KERNEL-NOFP1: FP/SIMD is assembled only inside this audited range.
+    .arch_extension fp
+    .arch_extension simd
+71:
     stp q0, q1, [sp, #288]
     stp q2, q3, [sp, #320]
     stp q4, q5, [sp, #352]
@@ -5175,6 +5239,18 @@ yarm_aarch64_vector_dispatch:
     str x9, [sp, #816]
     // The kernel's own FP control environment: round to nearest, no flush-to-zero, no traps.
     msr fpcr, xzr
+72:
+    .arch_extension nosimd
+    .arch_extension nofp
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 71b
+    .quad 72b
+    .asciz "A64_VECTOR_CAPTURE"
+    .balign 8
+    .popsection
     ldr x0, [sp, #256]
     bl yarm_aarch64_vector_elr_marker
     bl yarm_aarch64_vector_first_marker
@@ -5203,6 +5279,10 @@ yarm_aarch64_vector_dispatch:
     bl yarm_aarch64_return_to_user_x0_marker
     // QEMU-CONTEXT1 §2: FP/SIMD and FP/TLS control state are restored only now, after the last
     // `bl` — nothing compiled runs between this and the `eret`.
+    // KERNEL-NOFP1: FP/SIMD is assembled only inside this audited range.
+    .arch_extension fp
+    .arch_extension simd
+71:
     ldp q0, q1, [sp, #288]
     ldp q2, q3, [sp, #320]
     ldp q4, q5, [sp, #352]
@@ -5223,6 +5303,18 @@ yarm_aarch64_vector_dispatch:
     msr fpcr, x9
     ldr x9, [sp, #808]
     msr fpsr, x9
+72:
+    .arch_extension nosimd
+    .arch_extension nofp
+    // KERNEL-NOFP1: audited exception/region record (scripts/check-kernel-nofp.py).
+    .pushsection .yarm_nofp_map, "", @progbits
+    .balign 8
+    .quad 0x3150464F4E4D5259
+    .quad 71b
+    .quad 72b
+    .asciz "A64_VECTOR_RESTORE"
+    .balign 8
+    .popsection
     ldr x9, [sp, #816]
     msr tpidr_el0, x9
     // Restore user GPRs.  No function calls after this point.
@@ -6958,7 +7050,14 @@ extern "C" fn yarm_aarch64_enable_fp_simd() {
         let mut cpacr_el1: u64;
         core::arch::asm!("mrs {0}, CPACR_EL1", out(reg) cpacr_el1, options(nomem, preserves_flags));
         cpacr_el1 |= (0b11u64) << 20;
-        core::arch::asm!("msr CPACR_EL1, {0}", in(reg) cpacr_el1, options(nomem, preserves_flags));
+        core::arch::asm!(
+            "72:",
+            "msr CPACR_EL1, {0}",
+            "73:",
+            crate::arch::nofp_map_record!("72b", "73b", "A64_CPACR_WRITE"),
+            in(reg) cpacr_el1,
+            options(nomem, preserves_flags)
+        );
         core::arch::asm!("isb", options(nomem, preserves_flags));
     }
 }
