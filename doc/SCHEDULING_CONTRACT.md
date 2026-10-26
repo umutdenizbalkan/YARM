@@ -1,7 +1,8 @@
 # YARM Scheduling Contract
 
 **Package:** SCHED-CONTRACT1, corrected by SCHED-CONTRACT1-CORRECTION (§13), with the overflow
-latch closed by SCHED-OVERFLOW1 (§15). **Baseline:** commit
+latch closed by SCHED-OVERFLOW1 (§15) and the kernel FP/SIMD rule implemented by KERNEL-NOFP1
+(§8.1, §8.2). **Baseline:** commit
 `635374140c59586b11ce1d3456fb77dffe1b059f` (tree `127827ce276d1a7038f61690e1a96141c40f5d2d`); the
 correction changes no production source. **Linked from:** `doc/KERNEL_UNLOCKING.md` §0.8.
 
@@ -230,8 +231,9 @@ Every port assumes that kernel-mode execution, when interrupted or faulting, is 
   * AArch64: 2 429 instructions reference `q`/`v` registers (`+neon`).
   * RISC-V: 0 instructions reference FP registers.
 
-  This is safe today only because the kernel is non-preemptive and user state is saved first.
-  The direction for removing it is decided in §8.1 (KERNEL-NOFP1).
+  This was safe only because the kernel is non-preemptive and user state is saved first.
+  **KERNEL-NOFP1 removed it** (§8.2). These counts are the baseline that package measured
+  against.
 
 ### 1.11 Logging on scheduling-critical paths
 
@@ -815,7 +817,7 @@ never by adding an alternative dispatcher selected by profile.
 | SC-KT-2 | Kernel continuation saved and resumed, distinct from the user `UserRegisterContext` | `yarm_x86_switch_frame` (callee-saved, `rsp`, `rip`) | `yarm_aarch64_switch_frame` | `yarm_riscv64_switch_frame` | **SPECIFIED → KTHREAD1** (cooperative switch exists on all three; production-dormant) |
 | SC-KT-3 | First entry: an explicit entry ABI (stack alignment, argument registers, return-to-exit) | `yarm_kernel_thread_switch_trampoline` (D6 proof) | not established | not established | **SPECIFIED → KTHREAD1** (canonical 202A already requires the ABI contract) |
 | SC-KT-4 | Asynchronous preemption of kernel mode. Not to be enabled before SCHED-LOCK1 (SC-LOCK-8) and KERNEL-NOFP1 (SC-FP-1). | none: masked kernel | none | none; S-mode traps other than idle halt | **SPECIFIED → KTHREAD1**, gated by SCHED-LOCK1 and KERNEL-NOFP1 |
-| SC-KT-5 | Kernel FP/SIMD state. **Direction decided: KERNEL-NOFP1 (§8.1).** Ordinary kernel code and its linked runtime helpers use no FP/SIMD registers, so a kernel thread carries no FP/SIMD state; audited context routines are the exceptions. | 22 755 XMM instructions today; `initialize_frame_fpu_state` exists for switch frames | 2 429 q/v instructions today | 0 | **SPECIFIED → KERNEL-NOFP1**. Implementation and cost measurement **outstanding** |
+| SC-KT-5 | Kernel FP/SIMD state. Ordinary kernel code and its linked runtime helpers use no FP/SIMD registers, so a kernel thread carries no FP/SIMD state; audited context routines are the exceptions (§8.2). | 0 in ordinary code (was 22 779 FP/SIMD-classified instructions) | 0 in ordinary code (was 2 547) | 0 | **ENFORCED by KERNEL-NOFP1** (final-image check on every artifact build) |
 | SC-KT-6 | Flags and TLS: the kernel's per-CPU base and flags are restored on a kernel-to-kernel switch | not traced in this package | not traced | not traced | **UNRESOLVED**: missing inventory of kernel per-CPU and TLS registers; owner KTHREAD1 |
 | SC-KT-7 | Interrupt nesting and safe preemption points: preemption only at points holding none of SC-BND-2's items | no nesting | no nesting | no nesting | **SPECIFIED → KTHREAD1** |
 | SC-KT-8 | No blocking or switching while a prohibited guard is held. Today non-hosted lock-rank tracking is placeholder-only (`doc/KERNEL_LOCKING.md`). A per-CPU held-guard count must make a switch under a guard fail closed. | `SpinLockIrqGuard` is `!Send`; no run-time check | same | same | **SPECIFIED → KTHREAD1** |
@@ -828,8 +830,8 @@ never by adding an alternative dispatcher selected by profile.
 
 ### 8.1 Kernel FP/SIMD direction: KERNEL-NOFP1, then FP-POLICY1
 
-* **SC-FP-1 — KERNEL-NOFP1: ordinary kernel code uses no FP/SIMD.** **SPECIFIED →
-  KERNEL-NOFP1** (the next implementation package).
+* **SC-FP-1 — KERNEL-NOFP1: ordinary kernel code uses no FP/SIMD.** **ENFORCED** (KERNEL-NOFP1,
+  §8.2).
   * Ordinary kernel code **and its linked runtime helpers** (compiler-generated `memcpy`,
     `memset` and similar builtins included) must not use FP/SIMD registers on any port.
   * **Audited exceptions** are the explicit architectural routines that *must* touch that state:
@@ -837,16 +839,19 @@ never by adding an alternative dispatcher selected by profile.
     * the user FP/SIMD save and restore of the eager policy (SC-KT-0);
     * any FP/SIMD context save and restore a later package adds.
 
-    Each exception is named by symbol in an allowlist and reviewed.
-* **SC-FP-2 — Qualification inspects the final linked images.** **SPECIFIED → KERNEL-NOFP1.**
+    Each exception is an exact address range recorded next to its code and reviewed; §8.2
+    lists them. A range is narrower than a symbol: it names the instructions, not the routine.
+* **SC-FP-2 — Qualification inspects the final linked images.** **ENFORCED** (KERNEL-NOFP1).
   * Qualification disassembles the final linked kernel image of every port.
   * Every instruction that reads or writes an FP/SIMD register must lie inside an audited
-    exception symbol.
+    exception range.
   * A blanket "zero FP/SIMD instructions anywhere" check is **wrong**: it would reject the
     required context routines. A source-level or flag-level check is **insufficient**: it would
     miss compiler-generated helpers.
-  * Today's baseline for that inspection is §1.10 (22 755 / 2 429 / 0).
-* **SC-FP-3 — Scope limits of KERNEL-NOFP1.** **SPECIFIED → KERNEL-NOFP1.**
+  * Today's baseline for that inspection is §1.10 (22 755 / 2 429 / 0). That count was of
+    register names. The checker's classification also counts x87 and implicit-state
+    instructions, which gives 22 779 / 2 547 / 0 on the same base images.
+* **SC-FP-3 — Scope limits of KERNEL-NOFP1.** **ENFORCED** (KERNEL-NOFP1 kept every one).
   * The current eager userspace FP/SIMD preservation and the exact continuation-owner
     authentication stay **unchanged**.
   * This contract prescribes no particular compiler flag, target feature string or
@@ -865,10 +870,138 @@ never by adding an alternative dispatcher selected by profile.
     * initialization: the register state a policy-enabled task starts from;
     * isolation: that no other task's FP/SIMD state is ever observable;
     * lifecycle: fork, exec, thread creation and policy change.
-* **SC-FP-5 — Outstanding.** **UNRESOLVED.**
-  * The implementation, the per-port mechanism, and the measured cost (code size and execution
-    time of the replacement helpers) are outstanding. Owner: KERNEL-NOFP1.
-  * Neither this decision nor its later implementation is a WCET or certification claim.
+* **SC-FP-5 — Cost and remaining limits.** **PARTLY RESOLVED.**
+  * The mechanism and the code-size and static-frame cost are measured (§8.2).
+  * Execution-time cost of the integer replacements on real hardware is **unmeasured**. Only
+    QEMU runs exist, and QEMU timing is not hardware timing. Owner: hardware bring-up.
+  * Neither this decision nor its implementation is a WCET or certification claim.
+
+### 8.2 KERNEL-NOFP1: what was implemented
+
+**Build rules (from the toolchain, not copied flags).** Each kernel target takes the
+configuration the toolchain ships for a soft-float kernel on that ISA:
+
+| Port | Kernel target | Change | User target |
+|---|---|---|---|
+| x86_64 | `targets/x86_64-yarm-none.json` | `features` and `rustc-abi` of the built-in `x86_64-unknown-none`: `-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,+soft-float`, `rustc-abi: softfloat`. It previously declared no features and so inherited SSE2 | unchanged (`-mmx,+sse2`) |
+| AArch64 | `targets/aarch64-yarm-none.json` | `features` and ABI of the built-in `aarch64-unknown-none-softfloat`: `-neon` (kept `-lse`), `abi`/`rustc-abi: softfloat` | unchanged (`+neon`) |
+| RISC-V | built-in `riscv64gc-unknown-none-elf` | **none**. The kernel never contained an FP or vector instruction. Changing the ABI to `lp64` would change the kernel's calling convention and ELF float ABI for no gain, so the rule is enforced on the final image instead | unchanged (soft-float `lp64`, FS/VS Off) |
+
+* `core`, `alloc` and `compiler_builtins` are rebuilt for the kernel target (`-Z build-std`), so
+  the linked runtime helpers follow the same configuration. This is what removed the SIMD from
+  `memcpy`/`memset`-class code, not only from handwritten Rust.
+* Calling conventions between kernel components are unchanged: every kernel component is built
+  with the same target. Userspace is built by its own targets, and the syscall ABI is
+  register-based (no FP registers cross it).
+* Toolchain: `rustc 1.101.0-nightly (32dba69d6 2026-10-09)`, LLVM 23.1.3. No toolchain change.
+* The toolchain reports one *future-incompatibility* note in `core` for these targets (its NEON
+  and SSE intrinsics enable features the soft-float ABI forbids). The built-in
+  `x86_64-unknown-none` and `aarch64-unknown-none-softfloat` targets produce the same note when
+  `core` is built from source. It is inherited, not introduced, and those intrinsics are never
+  linked (the image check proves it).
+
+**Audited exceptions.** Each is an exact range in the source, two local labels around the
+instructions, recorded in the image's non-loaded `.yarm_nofp_map` section (never part of a loaded
+segment). The checker holds, per kind, the exact ordered FP/control instructions the range may
+contain, a size bound, and the instance count. On AArch64 the assembler accepts FP/SIMD only
+inside these ranges (`.arch_extension fp/simd` … `nofp/nosimd`), so an FP/SIMD instruction anywhere
+else fails to build.
+
+| Kind | Instances | Exact FP/control instructions | Purpose |
+|---|---|---|---|
+| `X86_TRAP_ENTRY_CAPTURE` | 2 (common trap entry, `syscall` entry) | `fxsave64 [rsp]`, `fninit`, `ldmxcsr [YARM_X86_KERNEL_MXCSR]` | capture the interrupted x87/SSE state before any kernel instruction; install the kernel's own control environment |
+| `X86_TRAP_ENTRY_RESTORE` | 2 | `fxrstor64 [rsp]` | restore after the last kernel instruction |
+| `X86_FIRST_ENTRY_RESTORE` | 1 | `fxrstor64 [YARM_X86_INITIAL_FXSAVE]` | first ring-3 entry gets the architectural initial image |
+| `X86_RESUME_RESTORE` | 1 | `fxrstor64 [rsi]` | saved-frame resume installs the task's own home |
+| `X86_SWITCH_SAVE` / `X86_SWITCH_RESTORE` | 1 / 1 | `fxsave [rdi+64]` / `fxrstor [rsi+64]` | existing kernel switch-frame state (kept, not removed) |
+| `X86_SWITCH_FRAME_INIT` | 1 | `fninit`, `fxsave [reg]` | seed a new switch frame's area from the reset state |
+| `X86_KERNEL_FP_ENV_INIT` | 1 | `fninit`, `ldmxcsr [YARM_X86_KERNEL_MXCSR]` | per-CPU kernel control environment |
+| `X86_CR0_WRITE` / `X86_CR4_WRITE` | 4 / 4 | `mov crN, reg` | boot, AP trampoline (16/32-bit), AP CR4 sync, per-CPU FP control (EM/TS/MP/NE, OSFXSR/OSXMMEXCPT) |
+| `A64_VECTOR_CAPTURE` | 1 | `stp q0..q31` (16), `mrs fpcr`, `mrs fpsr`, `msr fpcr, xzr` | capture before the first `bl`; kernel FPCR |
+| `A64_VECTOR_RESTORE` | 1 | `ldp q0..q31` (16), `msr fpcr`, `msr fpsr` | restore after the last `bl` |
+| `A64_FIRST_ENTRY_INIT` | 1 | `movi v0..v31, #0` (32), `msr fpcr, xzr`, `msr fpsr, xzr` | first EL0 entry: architectural zero state |
+| `A64_SWITCH_SAVE` / `A64_SWITCH_RESTORE` | 1 / 1 | `stp`/`ldp q8..q15` (4 each) | existing kernel switch-frame state (kept) |
+| `A64_CPACR_WRITE` | 3 | `msr cpacr_el1, xN` | FPEN so the vector prologue may capture user state (BSP, secondaries, Rust helper) |
+| `A64_CPTR_EL2_WRITE` | 1 | `msr cptr_el2, xzr` | EL2 boot: FP accesses not trapped to EL2 |
+| `X86_CTX1_ENV_PROBE`, `A64_CTX1_ENV_PROBE` | 1 each, `context1-witness` only | `stmxcsr`, `fnstcw` / `mrs fpcr` | the CONTEXT1 witness reads the kernel's FP environment |
+| `X86_CTX1_CLOBBER`, `A64_CTX1_CLOBBER` | 1 each, `context1-clobber` only | `fxrstor64 [reg]` / `ldp q0..q31`, `msr fpcr`, `msr fpsr` | the CONTEXT1 witness's deliberate interference |
+
+RISC-V has **no** exception: any FP or vector instruction anywhere in its kernel fails.
+
+**Regions** (also in the map, so every byte is decoded or accounted):
+
+* x86 `.text.boot32` is decoded as 32-bit code. The AP trampoline is decoded as 16-bit code,
+  then data (GDTR/GDT), then 32-bit code, then 64-bit code, then data (the handoff block).
+* Witness **user programs** embedded in the kernel's text (`smp1`, `apsched`, `overtaken`, `vmi2`
+  on x86; `smp2`, `apsched`, `overtaken` on AArch64; `smp3`, `apsched`, `sr_replace`, `vmi` on
+  RISC-V) are `USER_PROGRAM` regions. The kernel copies them into user address spaces and never
+  executes them; they may use FP/SIMD as user code. Only the names in the checker's list are
+  accepted.
+
+**The check** (`scripts/check-kernel-nofp.py`, run by `scripts/check-kernel-nofp.sh`):
+
+* It reads the ELF that boots. For AArch64 and RISC-V it also proves that the raw image QEMU
+  loads equals that ELF's loadable bytes.
+* It decodes **every** executable byte in its mode, zero blocks included: GNU objdump for x86,
+  LLVM objdump for AArch64 and RISC-V, with F/D/V/Zfh decoding enabled. The instructions must
+  tile each region exactly.
+* AArch64 literal pools are accounted as data through the assembler's mapping symbols. Data
+  sections inside executable segments (`.rodata`) are reported, not decoded.
+* Classification covers:
+  * FP/SIMD/vector register operands;
+  * x87/FP/vector mnemonics;
+  * implicit-state instructions (`fxsave`, `ldmxcsr`, `xsave*`, `emms`, `vzeroupper`, …);
+  * FP control state (MXCSR, FCW, FPCR/FPSR, `fcsr`/`frm`/`fflags`, vector CSRs);
+  * FP-enable writes (CR0, CR4, XCR0, `clts`, `lmsw`; CPACR_EL1/CPTR_ELx).
+* An undecodable byte, a gap, an unknown record, a missing disassembler, a wrong instance count
+  or an instruction outside its exception's exact list is a **failure**, never a pass.
+* The result line binds the verdict to the image SHA-256, the features, the toolchain and the
+  disassembler.
+* It runs at the end of all three QEMU artifact builds (`common_verify_kernel_nofp`), which fail
+  closed. `tests/kernel_nofp_scope.rs` pins the target configuration, the build gate, the
+  agreement between recorded kinds and the policy, and the AArch64 brackets.
+
+**What is unchanged:**
+
+* the eager user FP/SIMD capture before compiled code and restore after it;
+* the kernel's own control environment (x87 reset, MXCSR `0x1F80`, FPCR 0);
+* exact continuation-owner authentication;
+* first entry, fork, thread creation, TLS, exit and slot-reuse behaviour;
+* flags and general-register preservation;
+* the switch-frame FP areas;
+* user instruction sets and the syscall ABI.
+
+There is no `USES_FP` optimisation, no conditional save, no lazy ownership and no first-use
+allocation; those belong to FP-POLICY1 and KTHREAD1.
+
+**Cost (default kernels, base `91030225` against the candidate; static, from the images).**
+
+| Port | `.text` | `.rodata` | FP/SIMD in ordinary code | static frames |
+|---|---|---|---|---|
+| x86_64 | 1 317 130 → 1 220 790 B (−7.3%) | −0.4% | 22 779 → 0 | largest frame unchanged (262 744 B, `remove_asid_root`); sum over the 928 functions in both builds 818 283 → 755 465 B |
+| AArch64 | 905 296 → 885 740 B (−2.2%) | −0.3% | 2 547 → 0 | largest 5 388 416 → 5 388 352 B (`init_state_into`); sum over 894 shared functions 6 204 282 → 6 193 198 B |
+| RISC-V | identical | identical | 0 → 0 | identical (the booted binary is byte-identical) |
+
+* Witness variants move by the same proportions: x86 `.text` −6.5% to −8.0%, AArch64 −2.1% to
+  −2.7%.
+* Frame sizes are per-function maxima from `-Z emit-stack-sizes`. Individual functions moved
+  both ways, by up to about 8 KiB, because inlining changed. No call-chain worst case is computed,
+  and the kernel has no runtime stack-watermark instrumentation. A smaller sum is therefore **not**
+  a stack-bound claim.
+* Removing compiler SIMD makes bulk copies use integer code; nothing here shows that is faster or
+  slower on hardware.
+
+**Remaining limits:**
+
+* RISC-V enforcement is by the image only (hard-float target, kept for ABI stability). Its
+  `sstatus` writes are not classified, because FS/VS share the register with SIE; with no FP
+  instruction present, FS has nothing to enable.
+* Smoke scripts that build a kernel directly with `cargo` rather than through the artifact
+  scripts are not gated at build time. The qualification runner checks every kernel it boots.
+* The RPi5 bring-up targets (`aarch64-rpi5-*`) keep `+neon`. Hardware work is outside this
+  package, and their asm now carries the same bracketing.
+* The checker trusts the system disassemblers (binutils 2.42, LLVM 18) to decode correctly. Its
+  self-test and negative controls exercise them, but do not prove them.
 
 ## 9. Evidence index
 
@@ -894,6 +1027,8 @@ never by adding an alternative dispatcher selected by profile.
 | `model::model_wake_while_exhausted_takes_no_position` | M | SC-PRI-12c/d/f, SC-CTX-8 |
 | `model::model_simultaneous_replenishments_rejoin_in_context_order` | M | SC-CTX-7 |
 | `model::model_queue_membership_has_no_duplicates_or_stale_positions` | M | SC-CTX-8 |
+| `scripts/check-kernel-nofp.py` on every artifact build (all three ports, default and witness variants) | S (final image) | SC-FP-1, SC-FP-2, SC-KT-5 |
+| `kernel_nofp_scope::*` (6 tests) | S (source guard) | SC-FP-1/3 configuration, gate, exception inventory |
 | `model::every_mutation_is_killed_by_its_targeted_check` | M (mutation) | the model predicates above, now including `ForgiveDebtAtReplenish`, `QueueOnExhaustion`, `WrappingDebt` and `IgnoreOverflowLatch` |
 
 **Mutation checks (§5 of the package brief).**
@@ -932,9 +1067,10 @@ never by adding an alternative dispatcher selected by profile.
 | SC-BND-3, SC-INV-2/3 | none | configuration validation (shared regions, ceilings) | P | PARTITION1 / RT-SCHED1 |
 | SC-INV-1, W1 | TTAS `SpinLockIrq` | fair lock or bounded-contention proof; per-rank section bounds | S + N | RT-SCHED1 |
 | SC-WCET-1/2, W3/W7 | synchronous logging, unbounded routes | per-route bounds, buffered diagnostics | S + N | RT-SCHED1 |
-| SC-FP-1…3, SC-KT-5 | kernel built with FP/SIMD (§1.10) | no FP/SIMD in ordinary kernel code and linked helpers; audited exception allowlist | S: final-image disassembly per port, allowlist-bounded | **KERNEL-NOFP1** (next) |
+| SC-FP-1…3, SC-KT-5 | **done** (KERNEL-NOFP1, §8.2) | — | final-image check on every artifact build | — |
+| SC-FP-5 | QEMU only | execution cost on hardware | N | hardware bring-up |
 | SC-FP-4 | none | static per-task FP policy with enforced non-use | P + L | FP-POLICY1 |
-| SC-LOCK-1…8 (§12) | one rank-1 lock over every CPU's scheduler state | CPU-local ownership, bounded local exclusion, cross-CPU wake protocol | P + L + S (progress argument) | **SCHED-LOCK1** (OPEN) |
+| SC-LOCK-1…8 (§12) | one rank-1 lock over every CPU's scheduler state | CPU-local ownership, bounded local exclusion, cross-CPU wake protocol | P + L + S (progress argument) | **SCHED-LOCK1** (OPEN, next) |
 
 **Not started and not part of this contract:** VFS work and hardware bring-up remain on the
 roadmap in `doc/KERNEL_UNLOCKING.md` §0.8. Hardware bring-up is the prerequisite for every **N**
@@ -1099,10 +1235,10 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-TIME-1, SC-TIME-2;
   * SC-GP-1 (differential, for the mechanisms exercised);
   * SC-KT-0;
+  * SC-KT-5, SC-FP-1, SC-FP-2, SC-FP-3 (KERNEL-NOFP1);
   * SC-LOCK-9.
 * **SPECIFIED, with an implementing package:**
-  * **KERNEL-NOFP1:** SC-FP-1…3, SC-KT-5.
-  * **SCHED-LOCK1:** SC-LOCK-1…8.
+  * **SCHED-LOCK1** (next): SC-LOCK-1…8.
   * **KTHREAD1:** SC-KT-1…4, SC-KT-7…12, SC-BND-2, SC-EXEC-3.
   * **RT-SCHED1:**
     * SC-CPU-2;
@@ -1129,7 +1265,7 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-INV-1;
   * SC-TIME-3, SC-TIME-4, SC-TIME-6;
   * SC-KT-6;
-  * SC-FP-5.
+  * SC-FP-5 (hardware execution cost; the rest is measured).
 
 ---
 

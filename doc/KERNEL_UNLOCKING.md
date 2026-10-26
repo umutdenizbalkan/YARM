@@ -655,8 +655,8 @@ the production `PriorityScheduler`.
 
 | Package | Status | Scope | Contract requirements |
 |---|---|---|---|
-| **KERNEL-NOFP1** | **next implementation package** | ordinary kernel code and its linked runtime helpers use no FP/SIMD registers. Audited exceptions are the explicit init and context save/restore routines. Proof is by disassembly of the final linked images, bounded by an allowlist; a blanket zero-FP check is wrong. Eager user preservation and exact continuation-owner authentication are unchanged. No compiler flag or calling convention is prescribed. No lazy FP. Cost measurement is outstanding; no WCET or certification claim | SC-FP-1…3, SC-KT-5 |
-| **SCHED-LOCK1** | **OPEN prerequisite**: before preemptible kernel threads are enabled and before any bounded RT latency claim | give CPU-local runnable/current/quantum state explicit local ownership, so unrelated CPUs leave the one shared rank-1 scheduler critical section. Requires bounded local exclusion with a progress argument ("lock-free" is not mandated), and an explicit cross-CPU wake protocol: capacity, full-queue behaviour, publication order, cancellation, no lost wakeups. Preserves incarnation authentication, membership, wake arbitration, dispatch tokens and lock order. Separates global clock, topology and admission. Inventories the remaining shared dependencies. Must explicitly reconcile `AI_AGENT_RULES.md` §14.4 D6, §7.1/§8 below, the `stage106_d6_audit…` source guard and the `KERNEL_LOCKING.md` rank table | SC-LOCK-1…8 |
+| **KERNEL-NOFP1** | **done** (see the record below) | ordinary kernel code and its linked runtime helpers use no FP/SIMD registers. Audited exceptions are the explicit init and context save/restore routines. Proof is by disassembly of the final linked images, bounded by an allowlist; a blanket zero-FP check is wrong. Eager user preservation and exact continuation-owner authentication are unchanged. No compiler flag or calling convention is prescribed. No lazy FP. Cost measurement is outstanding; no WCET or certification claim | SC-FP-1…3, SC-KT-5 |
+| **SCHED-LOCK1** | **OPEN prerequisite, next**: before preemptible kernel threads are enabled and before any bounded RT latency claim | give CPU-local runnable/current/quantum state explicit local ownership, so unrelated CPUs leave the one shared rank-1 scheduler critical section. Requires bounded local exclusion with a progress argument ("lock-free" is not mandated), and an explicit cross-CPU wake protocol: capacity, full-queue behaviour, publication order, cancellation, no lost wakeups. Preserves incarnation authentication, membership, wake arbitration, dispatch tokens and lock order. Separates global clock, topology and admission. Inventories the remaining shared dependencies. Must explicitly reconcile `AI_AGENT_RULES.md` §14.4 D6, §7.1/§8 below, the `stage106_d6_audit…` source guard and the `KERNEL_LOCKING.md` rank table | SC-LOCK-1…8 |
 | **KTHREAD1** | after KERNEL-NOFP1. Context preparation may proceed before SCHED-LOCK1; kernel preemption may not | independent kernel threads: owned stacks, entry ABI, kernel-mode preemption, kernel TLS policy, guard check, stack residency and reclamation, trap classifiers | SC-KT-1…4, SC-KT-6…12, SC-BND-2, SC-EXEC-3 |
 | **RT-SCHED1** | after SCHED-LOCK1 | 32-level fixed-priority preemptive selection, scheduling contexts and budgets, calibrated time and earliest-deadline programming, structural no-migration, a fair kernel lock or contention bound, buffered diagnostics | SC-PRI-10…13, SC-CTX-*, SC-TIME-3…6, SC-CPU-2, SC-SEP-*, SC-INV-*, SC-WCET-*, SC-EXEC-* |
 | **PARTITION1** | with or after RT-SCHED1 | cyclic schedule, epoch, windows and boundaries, the OPERATIONAL transition, system allowance and health monitoring, configuration validation | SC-PART-*, SC-POOL-2/4, SC-EXEC-5, SC-IPC-3, SC-BND-3 |
@@ -815,6 +815,37 @@ Contract §15 has the record.
   and the VMI sequence checks pass.
 * *Live evidence:* because the kernels are identical, the bound live evidence remains
   VM-INVALIDATION2-SEAL's qualification of `00bd04e8`.
+
+
+#### KERNEL-NOFP1 (from delivered `91030225`)
+
+Ordinary kernel code and its linked runtime helpers no longer use FP/SIMD registers. The full
+record is contract §8.2.
+
+* **Build:**
+  * The x86_64 and AArch64 kernel targets take the toolchain's own soft-float configuration
+    (that of `x86_64-unknown-none` and `aarch64-unknown-none-softfloat`). `core`, `alloc` and
+    `compiler_builtins` are rebuilt with it.
+  * The user targets are unchanged.
+  * RISC-V is unchanged: it never had an FP instruction, and its booted binaries are
+    byte-identical to base.
+* **Exceptions:**
+  * Every legitimate FP/SIMD or FP-control range is an exact, recorded range with a named
+    purpose. The ranges are trap-entry capture and return restore, first entry, saved-frame
+    resume, switch frames, per-CPU FP control, CR0/CR4 and CPACR/CPTR writes, and the CONTEXT1
+    witness probes.
+  * The eager user preservation, the kernel's control environment and owner authentication are
+    unchanged.
+* **Enforcement:** `scripts/check-kernel-nofp.py` decodes every executable byte of the image that
+  boots and fails on any classified instruction outside its exception's exact list. All three
+  artifact builds run it and fail closed.
+* **Cost** (static, default kernels):
+  * x86 `.text` −7.3%, AArch64 −2.2%;
+  * largest per-function frame unchanged on x86, −64 B on AArch64;
+  * no runtime stack watermark or hardware timing exists, so no speed or stack-bound claim is
+    made.
+
+SCHED-LOCK1 is OPEN and next; FP-POLICY1 stays separate; broad-lock retirement stays closed.
 
 ---
 
