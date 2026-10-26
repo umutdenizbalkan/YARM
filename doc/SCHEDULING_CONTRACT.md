@@ -1,7 +1,8 @@
 # YARM Scheduling Contract
 
-**Package:** SCHED-CONTRACT1. **Baseline:** commit `635374140c59586b11ce1d3456fb77dffe1b059f`
-(tree `127827ce276d1a7038f61690e1a96141c40f5d2d`). **Linked from:** `doc/KERNEL_UNLOCKING.md` §0.8.
+**Package:** SCHED-CONTRACT1, corrected by SCHED-CONTRACT1-CORRECTION (§13). **Baseline:** commit
+`635374140c59586b11ce1d3456fb77dffe1b059f` (tree `127827ce276d1a7038f61690e1a96141c40f5d2d`); the
+correction changes no production source. **Linked from:** `doc/KERNEL_UNLOCKING.md` §0.8.
 
 This document is the normative scheduling contract for YARM. It governs the independent kernel
 threads of KTHREAD1, the real-time scheduler of RT-SCHED1 and the partition windows of
@@ -55,8 +56,12 @@ They are never alternate dispatchers:
   `SharedKernel::with_scheduler_split_mut`. That state is every CPU's queues, the clock owner's
   `timer`, every other CPU's `ap_quanta` and the ambient `current_cpu`. So the queues are
   **per-CPU storage, but not independently owned or independently locked**. Every enqueue,
-  selection, block and tick on any CPU serialises on that one lock. `doc/KERNEL_LOCKING.md`'s rank
-  table and `AI_AGENT_RULES.md` §14.4 still forbid per-CPU scheduler locks.
+  selection, block and tick on any CPU serialises on that one lock. Per-CPU scheduler lock types
+  are restricted by `AI_AGENT_RULES.md` §14.4 (the D6 bullet), restated in
+  `doc/KERNEL_UNLOCKING.md` §7.1 and §8, and pinned by a source guard. `doc/KERNEL_LOCKING.md`'s
+  "Stage 4", by contrast, *plans* per-CPU lock domains. §12 (SCHED-LOCK1) records how a future
+  package must reconcile them. *(Corrected by SCHED-CONTRACT1-CORRECTION: this line previously
+  said the `KERNEL_LOCKING.md` rank table forbids per-CPU locks. It does not.)*
 * **Priorities.** There are three levels, `TaskPriority::{High, Normal, Low}`
   (`crates/yarm-kernel/src/scheduler.rs`). They are derived only by
   `task_enqueue::priority_for_class`: `SystemServer` is High, and `Driver` and `App` are Normal.
@@ -225,6 +230,7 @@ Every port assumes that kernel-mode execution, when interrupted or faulting, is 
   * RISC-V: 0 instructions reference FP registers.
 
   This is safe today only because the kernel is non-preemptive and user state is saved first.
+  The direction for removing it is decided in §8.1 (KERNEL-NOFP1).
 
 ### 1.11 Logging on scheduling-critical paths
 
@@ -330,9 +336,14 @@ The first real-time profile is the **smallest analysable configuration**:
 * **SC-PRI-11 — RT-P1 equal-priority order is FIFO by readiness.** **SPECIFIED → RT-SCHED1.**
   There is no time-slicing among equals; budgets bound execution instead. M
   `model_equal_priority_order_is_deterministic_fifo`.
-* **SC-PRI-12 — RT-P1 queue position rules.** **SPECIFIED → RT-SCHED1.** Each rule is checked by
-  M `model_preemption_yield_block_and_wake_queue_positions`, except (f), which
-  `model_exhausted_context_is_ineligible_despite_priority` checks:
+* **SC-PRI-12 — RT-P1 queue position rules.** **SPECIFIED → RT-SCHED1.**
+  * M `model_preemption_yield_block_and_wake_queue_positions` checks (a) to (e).
+  * (f) is checked by:
+    * `model_exhausted_context_is_ineligible_despite_priority`;
+    * `model_exhausted_thread_rejoins_the_tail_only_at_replenishment`;
+    * `model_debt_consumed_replenishment_grants_no_position`;
+    * `model_wake_while_exhausted_takes_no_position`;
+    * `model_queue_membership_has_no_duplicates_or_stale_positions`.
 
   | Event | Queue position |
   |---|---|
@@ -341,7 +352,10 @@ The first real-time profile is the **smallest analysable configuration**:
   | (c) block | removed |
   | (d) wake | **tail** of its level |
   | (e) displaced by a window boundary | keeps its position (head if it was running) for its next window |
-  | (f) budget exhaustion | leaves the eligible set; eligible again only at replenishment, at the **tail** |
+  | (f) budget exhaustion | leaves its queue **entirely**, holding no position while exhausted. A wake of an exhausted thread gives it none either. It takes the **tail** only at a replenishment that leaves it budget (`remaining > 0`); one wholly consumed by debt gives it nothing (SC-CTX-4, SC-CTX-8) |
+
+  *(Corrected by SCHED-CONTRACT1-CORRECTION: the delivered model appended the thread at
+  exhaustion, so it kept an earlier position while ineligible. §13 records the reproduction.)*
 * **SC-PRI-13 — In RT-P1, a wake is a scheduling point.** **SPECIFIED → RT-SCHED1.**
   * A wake of a strictly higher-priority eligible thread preempts the running thread on that CPU
     at its next preemption point.
@@ -405,15 +419,39 @@ The first real-time profile is the **smallest analysable configuration**:
   synchronous kernel work of its own traps (SC-EXEC-2).
 * **SC-CTX-3 — An exhausted context is ineligible whatever its priority.** **SPECIFIED →
   RT-SCHED1.** M `model_exhausted_context_is_ineligible_despite_priority`.
-* **SC-CTX-4 — Periodic replenishment.** **SPECIFIED → RT-SCHED1.** Replenishment happens at
-  fixed release instants `E + kT`: `remaining := B − debt`, saturating. There is no carry-over
-  beyond `B`. Sporadic servers are not part of RT-P1.
+* **SC-CTX-4 — Periodic replenishment with conserved repayment.** **SPECIFIED → RT-SCHED1.**
+  * Replenishment happens at fixed release instants `E + kT`. Each one pays the debt it can and
+    carries the rest:
+
+    ```text
+    paid      := min(B, debt)
+    remaining := B − paid
+    debt      := debt − paid
+    ```
+
+  * Debt is never forgiven. Budget 3 with debt 8 replenishes to (0, 5), (0, 2), then (1, 0).
+  * The previous `remaining` is discarded, not added to: unused budget does **not** accumulate.
+  * Sporadic servers are not part of RT-P1.
+  * M:
+    * `model_debt_beyond_one_replenishment_is_conserved`;
+    * `model_debt_repayment_cases_and_no_budget_accumulation` (zero, below-, equal-to- and
+      above-budget debt; repayment across periods with a fresh overrun between them; no
+      accumulation);
+    * `model_overrun_debt_is_repaid_at_replenishment`.
+
+  *(Corrected by SCHED-CONTRACT1-CORRECTION: the delivered rule `remaining := B − debt,
+  saturating`, then clearing all debt, silently forgave whatever one replenishment could not
+  repay. §13.)*
 * **SC-CTX-5 — Overrun.** **SPECIFIED → RT-SCHED1.**
   * Execution past exhaustion is an **overrun**. It arises from tick granularity and from a
     non-preemptible kernel section that outlived the budget.
   * It is recorded as debt, repaid from the next replenishment, and **reported** as a
     health-monitor event carrying the context, the amount and the instant. M
     `model_overrun_debt_is_repaid_at_replenishment`.
+  * Debt accumulation uses checked arithmetic. It **never wraps and is never forgiven**. At the
+    limit it saturates at `Tick::MAX` and is **reported** as a `DebtOverflow` health event for
+    that context. A saturated context stays ineligible until the recovery policy acts. M
+    `model_debt_overflow_saturates_and_is_reported`.
   * Recovery policy is configuration (PARTITION1's health monitor). It is selected per context
     and never inferred from priority.
 * **SC-CTX-6 — Enforcement granularity.** **UNRESOLVED.**
@@ -422,6 +460,32 @@ The first real-time profile is the **smallest analysable configuration**:
   * Owner: RT-SCHED1, after SC-TIME-3.
   * Until then a budget can be enforced only to tick granularity, and overrun bounds inherit §6
     W3.
+* **SC-CTX-7 — Same-instant event order.** **SPECIFIED → RT-SCHED1/PARTITION1.** Events falling
+  on one instant are applied in this order:
+  1. charge the running contexts for the elapsed tick;
+  2. advance time;
+  3. apply every replenishment whose release instant has arrived, in **ascending context id**.
+     Each exhausted Ready thread left with budget joins its tail in that order;
+  4. on each CPU, in ascending CPU id, re-evaluate the running thread, then select. A window
+     boundary displaces it to the head (SC-PRI-12e). Exhaustion removes it from the queues
+     (SC-PRI-12f).
+
+  Consequences:
+  * A running thread that exhausts and is replenished at the same instant never becomes
+    ineligible, and keeps running.
+  * A running thread whose window ends at its replenishment instant is replenished first, then
+    displaced to the head.
+  * A running thread that is both outside its window and exhausted after step 3 takes **no**
+    position: exhaustion overrides the head placement of (a) and (e) until a replenishment.
+  * M `model_simultaneous_replenishments_rejoin_in_context_order`.
+* **SC-CTX-8 — Queue membership.** **SPECIFIED → RT-SCHED1.** At every instant:
+  * every Ready thread with budget holds **exactly one** queue position;
+  * every exhausted Ready thread holds **none**;
+  * Running and Blocked threads hold none.
+
+  No path — wake, block, yield, preemption, boundary, charge or replenishment — may create a
+  duplicate or a stale position. M `model_queue_membership_has_no_duplicates_or_stale_positions`
+  (randomized, invariant checked after every operation).
 
 ### 3.5 Separation of scheduling attributes
 
@@ -726,8 +790,8 @@ never by adding an alternative dispatcher selected by profile.
 | SC-KT-1 | Owned kernel stack, from a bounded pool, with a guard page; distinct from user and idle stacks (idle is a diverging primitive at a per-CPU anchor, §1.7). Stacks are pre-mapped: supervisor page faults are kernel-fatal (§1.9). | `KernelExecutionContext {stack_base, stack_top, owns_stack}` exists (D6 scaffolding); `refresh_boot_tss_rsp0` | same field | same field | **SPECIFIED → KTHREAD1** |
 | SC-KT-2 | Kernel continuation saved and resumed, distinct from the user `UserRegisterContext` | `yarm_x86_switch_frame` (callee-saved, `rsp`, `rip`) | `yarm_aarch64_switch_frame` | `yarm_riscv64_switch_frame` | **SPECIFIED → KTHREAD1** (cooperative switch exists on all three; production-dormant) |
 | SC-KT-3 | First entry: an explicit entry ABI (stack alignment, argument registers, return-to-exit) | `yarm_kernel_thread_switch_trampoline` (D6 proof) | not established | not established | **SPECIFIED → KTHREAD1** (canonical 202A already requires the ABI contract) |
-| SC-KT-4 | Asynchronous preemption of kernel mode | none: masked kernel | none | none; S-mode traps other than idle halt | **SPECIFIED → KTHREAD1** |
-| SC-KT-5 | Kernel FP/SIMD state. The kernel uses FP/SIMD registers (§1.10), so an asynchronously preempted kernel thread must have that state preserved, **or** the kernel must be built soft-float and verified free of FP/SIMD by disassembly. | 22 755 XMM instructions; `initialize_frame_fpu_state` exists for switch frames | 2 429 q/v instructions | 0 | **UNRESOLVED**: missing decision and measurement of its cost; owner KTHREAD1 |
+| SC-KT-4 | Asynchronous preemption of kernel mode. Not to be enabled before SCHED-LOCK1 (SC-LOCK-8) and KERNEL-NOFP1 (SC-FP-1). | none: masked kernel | none | none; S-mode traps other than idle halt | **SPECIFIED → KTHREAD1**, gated by SCHED-LOCK1 and KERNEL-NOFP1 |
+| SC-KT-5 | Kernel FP/SIMD state. **Direction decided: KERNEL-NOFP1 (§8.1).** Ordinary kernel code and its linked runtime helpers use no FP/SIMD registers, so a kernel thread carries no FP/SIMD state; audited context routines are the exceptions. | 22 755 XMM instructions today; `initialize_frame_fpu_state` exists for switch frames | 2 429 q/v instructions today | 0 | **SPECIFIED → KERNEL-NOFP1**. Implementation and cost measurement **outstanding** |
 | SC-KT-6 | Flags and TLS: the kernel's per-CPU base and flags are restored on a kernel-to-kernel switch | not traced in this package | not traced | not traced | **UNRESOLVED**: missing inventory of kernel per-CPU and TLS registers; owner KTHREAD1 |
 | SC-KT-7 | Interrupt nesting and safe preemption points: preemption only at points holding none of SC-BND-2's items | no nesting | no nesting | no nesting | **SPECIFIED → KTHREAD1** |
 | SC-KT-8 | No blocking or switching while a prohibited guard is held. Today non-hosted lock-rank tracking is placeholder-only (`doc/KERNEL_LOCKING.md`). A per-CPU held-guard count must make a switch under a guard fail closed. | `SpinLockIrqGuard` is `!Send`; no run-time check | same | same | **SPECIFIED → KTHREAD1** |
@@ -737,6 +801,50 @@ never by adding an alternative dispatcher selected by profile.
 | SC-KT-12 | Every kernel thread has a budgeted scheduling context (SC-EXEC-3) and a home CPU (SC-CPU-2) | — | — | — | **SPECIFIED → KTHREAD1 / RT-SCHED1** |
 
 ---
+
+### 8.1 Kernel FP/SIMD direction: KERNEL-NOFP1, then FP-POLICY1
+
+* **SC-FP-1 — KERNEL-NOFP1: ordinary kernel code uses no FP/SIMD.** **SPECIFIED →
+  KERNEL-NOFP1** (the next implementation package).
+  * Ordinary kernel code **and its linked runtime helpers** (compiler-generated `memcpy`,
+    `memset` and similar builtins included) must not use FP/SIMD registers on any port.
+  * **Audited exceptions** are the explicit architectural routines that *must* touch that state:
+    * FP/SIMD initialization;
+    * the user FP/SIMD save and restore of the eager policy (SC-KT-0);
+    * any FP/SIMD context save and restore a later package adds.
+
+    Each exception is named by symbol in an allowlist and reviewed.
+* **SC-FP-2 — Qualification inspects the final linked images.** **SPECIFIED → KERNEL-NOFP1.**
+  * Qualification disassembles the final linked kernel image of every port.
+  * Every instruction that reads or writes an FP/SIMD register must lie inside an audited
+    exception symbol.
+  * A blanket "zero FP/SIMD instructions anywhere" check is **wrong**: it would reject the
+    required context routines. A source-level or flag-level check is **insufficient**: it would
+    miss compiler-generated helpers.
+  * Today's baseline for that inspection is §1.10 (22 755 / 2 429 / 0).
+* **SC-FP-3 — Scope limits of KERNEL-NOFP1.** **SPECIFIED → KERNEL-NOFP1.**
+  * The current eager userspace FP/SIMD preservation and the exact continuation-owner
+    authentication stay **unchanged**.
+  * This contract prescribes no particular compiler flag, target feature string or
+    calling-convention change. Choosing a supported mechanism, and proving it by SC-FP-2, is the
+    package's job.
+  * There is **no** exception-driven lazy state allocation and **no** lazy ownership switching.
+* **SC-FP-4 — FP-POLICY1: static per-task FP policy, recorded separately.** **SPECIFIED →
+  FP-POLICY1** (after KERNEL-NOFP1).
+  * A later package may give each task a *static* FP policy and skip preservation for tasks that
+    declare no FP use.
+  * A task flag alone **cannot** enforce non-use and **cannot** prevent state disclosure. Before
+    any preservation is skipped, FP-POLICY1 must define all of the following:
+    * instruction access: the architectural trap or disable control per port that makes non-use
+      enforced, not trusted;
+    * violation handling: what happens to a task that uses FP/SIMD against its policy;
+    * initialization: the register state a policy-enabled task starts from;
+    * isolation: that no other task's FP/SIMD state is ever observable;
+    * lifecycle: fork, exec, thread creation and policy change.
+* **SC-FP-5 — Outstanding.** **UNRESOLVED.**
+  * The implementation, the per-port mechanism, and the measured cost (code size and execution
+    time of the replacement helpers) are outstanding. Owner: KERNEL-NOFP1.
+  * Neither this decision nor its later implementation is a WCET or certification claim.
 
 ## 9. Evidence index
 
@@ -750,8 +858,16 @@ never by adding an alternative dispatcher selected by profile.
 | `production::sc_pool_1_run_queue_exhaustion_is_explicit_and_atomic` | P | SC-POOL-1 |
 | `production::sc_elig_1_acceptance_filter_skips_ineligible_highest_in_place` | P | SC-SEP-2 (mechanism) |
 | `sc_gp_1_general_purpose_model_agrees_with_production_priority_scheduler` | P (differential) | SC-GP-1 |
-| `model::model_*` (11 tests) | M | SC-PART-2/3/6, SC-CTX-3/5, SC-PRI-11/12, SC-IPC-1/2/3, SC-CPU-3, SC-EXEC-2/3/5 |
-| `model::every_mutation_is_killed_by_its_targeted_check` | M (mutation) | the model predicates above |
+| `model::model_*` (11 SCHED-CONTRACT1 tests) | M | SC-PART-2/3/6, SC-CTX-3/5, SC-PRI-11/12, SC-IPC-1/2/3, SC-CPU-3, SC-EXEC-2/3/5 |
+| `model::model_debt_beyond_one_replenishment_is_conserved` | M | SC-CTX-4 |
+| `model::model_debt_repayment_cases_and_no_budget_accumulation` | M | SC-CTX-4 |
+| `model::model_debt_overflow_saturates_and_is_reported` | M | SC-CTX-5 |
+| `model::model_exhausted_thread_rejoins_the_tail_only_at_replenishment` | M | SC-PRI-12f |
+| `model::model_debt_consumed_replenishment_grants_no_position` | M | SC-PRI-12f, SC-CTX-4, SC-CTX-8 |
+| `model::model_wake_while_exhausted_takes_no_position` | M | SC-PRI-12c/d/f, SC-CTX-8 |
+| `model::model_simultaneous_replenishments_rejoin_in_context_order` | M | SC-CTX-7 |
+| `model::model_queue_membership_has_no_duplicates_or_stale_positions` | M | SC-CTX-8 |
+| `model::every_mutation_is_killed_by_its_targeted_check` | M (mutation) | the model predicates above, now including `ForgiveDebtAtReplenish`, `QueueOnExhaustion` and `WrappingDebt` |
 
 **Mutation checks (§5 of the package brief).**
 
@@ -778,17 +894,20 @@ never by adding an alternative dispatcher selected by profile.
 | SC-CPU-2 no migration | `task_enqueue` planners | Pinned plan must equal an existing home or fail closed | P: pinned enqueue of a homed task refused | RT-SCHED1 |
 | SC-PRI-10/11/12/13 | `PriorityScheduler` (3 levels, tail-on-preempt, wake non-preempting) | 32 levels; head-on-priority-preemption; wake as scheduling point; preempting remote IPI | P on the production owners; L on three ports | RT-SCHED1 |
 | SC-PART-1…7 | none | schedule, epoch, window evaluation, boundary switch | P + L (boundary instants, idle advance) | PARTITION1 |
-| SC-CTX-1…5 | none (per-CPU quantum only) | scheduling contexts, budgets, replenishment, overrun debt and reports | P + L | RT-SCHED1 |
+| SC-CTX-1…5, 7, 8 | none (per-CPU quantum only) | scheduling contexts, budgets, conserved-debt replenishment, overrun debt and reports, same-instant order, exhausted-set membership | P + L | RT-SCHED1 |
 | SC-CTX-6, SC-TIME-3/4/6 | per-port relative re-arm | calibrated counter, absolute deadlines, cross-CPU time, tick unit | M (measurement) on named hardware + S | RT-SCHED1 |
 | SC-TIME-5 | periodic tick | earliest-deadline programming | P + L | RT-SCHED1 / PARTITION1 |
 | SC-SEP-1/2 | acceptance-filtered selection | window + budget in the existing predicate | P | RT-SCHED1 |
 | SC-POOL-2/3/4 | fixed arrays; `BootExclusive` phase | configured pools, queue sizing, OPERATIONAL transition | P | RT-SCHED1 / PARTITION1 |
 | SC-EXEC-1…6 | inline kernel work, uncounted | accounting points, system allowance, overrun events | P + N bounds | RT-SCHED1 / PARTITION1 |
 | SC-IPC-1/2/3 | `direct_eligibility`, ordinary selection | eligibility-checked handoff; donation stays off | P | RT-SCHED1 / PARTITION1 |
-| SC-BND-2, SC-KT-1…12 | D6 scaffolding (dormant), diverging idle | kernel stacks, entry ABI, kernel preemption, FP/TLS policy, guard check, stack residency, trap classifiers | P + L on three ports | KTHREAD1 |
+| SC-BND-2, SC-KT-1…12 | D6 scaffolding (dormant), diverging idle | kernel stacks, entry ABI, kernel preemption (after SCHED-LOCK1 and KERNEL-NOFP1), TLS policy, guard check, stack residency, trap classifiers | P + L on three ports | KTHREAD1 |
 | SC-BND-3, SC-INV-2/3 | none | configuration validation (shared regions, ceilings) | P | PARTITION1 / RT-SCHED1 |
 | SC-INV-1, W1 | TTAS `SpinLockIrq` | fair lock or bounded-contention proof; per-rank section bounds | S + N | RT-SCHED1 |
 | SC-WCET-1/2, W3/W7 | synchronous logging, unbounded routes | per-route bounds, buffered diagnostics | S + N | RT-SCHED1 |
+| SC-FP-1…3, SC-KT-5 | kernel built with FP/SIMD (§1.10) | no FP/SIMD in ordinary kernel code and linked helpers; audited exception allowlist | S: final-image disassembly per port, allowlist-bounded | **KERNEL-NOFP1** (next) |
+| SC-FP-4 | none | static per-task FP policy with enforced non-use | P + L | FP-POLICY1 |
+| SC-LOCK-1…8 (§12) | one rank-1 lock over every CPU's scheduler state | CPU-local ownership, bounded local exclusion, cross-CPU wake protocol | P + L + S (progress argument) | **SCHED-LOCK1** (OPEN) |
 
 **Not started and not part of this contract:** VFS work and hardware bring-up remain on the
 roadmap in `doc/KERNEL_UNLOCKING.md` §0.8. Hardware bring-up is the prerequisite for every **N**
@@ -812,3 +931,169 @@ bound above.
   assessment.
 * **Who could close this.** Only an assessor working from the normative editions could make that
   assessment, and they would record those editions. Owner: unassigned (project owner).
+
+---
+
+## 12. SCHED-LOCK1: the scheduler domain lock is an OPEN prerequisite
+
+**The problem, from source (§1.1, §1.2).**
+
+* The per-CPU run queues, current slots and quanta all live inside ONE rank-1 scheduler domain
+  lock (`SchedulerState` behind `with_scheduler_split_mut`).
+* So unrelated CPUs serialise enqueue, selection, blocking and timer bookkeeping on one critical
+  section, every one of them with interrupts masked.
+* That lock is a TTAS `SpinLockIrq` with no fairness (§6 W1).
+* This is a **different lock** from the retired broad `KernelState` lock, whose production
+  census is 0. Retiring the broad lock did not make the scheduler CPU-local.
+
+**SCHED-LOCK1 is OPEN.** Its requirements:
+
+* **SC-LOCK-1 — CPU-local scheduling state has explicit local ownership.** **SPECIFIED →
+  SCHED-LOCK1.** Each CPU's runnable queues, current slot and quantum belong to that CPU. Another
+  CPU's scheduling operation does not enter that CPU's critical section, except through SC-LOCK-3.
+* **SC-LOCK-2 — Local exclusion is bounded.** **SPECIFIED → SCHED-LOCK1.** The exclusion that
+  protects CPU-local state has a stated progress argument and a bound in the §6 kinds. A local
+  lock is acceptable only with that argument. An owner-consumed queue is acceptable only with
+  that argument. **"Lock-free" is not mandated and is not by itself an argument.**
+* **SC-LOCK-3 — There is an explicit cross-CPU wake protocol.** **SPECIFIED → SCHED-LOCK1.** A
+  remote wake publishes to the target CPU by a defined protocol, which must specify:
+  * the remote-queue capacity, and the behaviour when it is full — never silent loss;
+  * publication ordering against the reschedule IPI;
+  * cancellation: a wake for an incarnation that died or was already woken;
+  * lost-wakeup prevention, including the target entering idle concurrently with publication.
+* **SC-LOCK-4 — Existing guarantees are preserved.** **SPECIFIED → SCHED-LOCK1.** The
+  decomposition preserves:
+  * exact task-incarnation authentication (`{tid, asid}` and generations);
+  * queue membership (one place per runnable incarnation, SC-CTX-8 for RT-P1);
+  * wake arbitration (exactly one waker wins);
+  * `DispatchAuthority` and `DispatchMarkToken`;
+  * the ascending lock order.
+* **SC-LOCK-5 — Global coordination is separated from local dispatch.** **SPECIFIED →
+  SCHED-LOCK1.** Genuinely global state is owned separately from per-CPU dispatch and is never
+  taken on a CPU's ordinary dispatch path. That state includes the clock owner's tick
+  (SC-TIME-2), topology, admission (wake-only and balance-excluded sets), balanced placement and
+  the ambient `current_cpu`.
+* **SC-LOCK-6 — Remaining shared dependencies are inventoried.** **SPECIFIED → SCHED-LOCK1.**
+  Splitting this one lock does not make scheduling bounded. The package inventories every shared
+  dependency left on a dispatch path, and claims nothing about the whole scheduler's bound. The
+  known ones are:
+  * the rank-2 task table read by the acceptance filter (§6 W2);
+  * `PRINTK_DRAIN_LOCK` (W7);
+  * the IPC and timeout domains;
+  * TLB shootdown waits (W4).
+* **SC-LOCK-7 — The legacy restrictions are reconciled explicitly.** **SPECIFIED → SCHED-LOCK1.**
+  These restrict per-CPU scheduler lock types today:
+  * `doc/AI_AGENT_RULES.md` §14.4, the D6 bullet: "no per-CPU scheduler lock types until the
+    x86_64 SMP trampoline split lands and D2/D3 are smoke-stable";
+  * `doc/KERNEL_UNLOCKING.md` §7.1 and §8, which restate that gate;
+  * the source guard `src/kernel/syscall.rs` `stage106_d6_audit_no_per_cpu_scheduler_locking_started`,
+    which rejects per-CPU scheduler lock type names in `runtime.rs` and `scheduler.rs`.
+
+  The rank table in `doc/KERNEL_LOCKING.md` has a single rank-1 scheduler domain, while its
+  "Stage 4" plans per-CPU lock domains.
+
+  SCHED-LOCK1 must revise those rules, the guard and the rank table **explicitly**, in the same
+  change and with stated justification. It must not route around them. This contract does not
+  relax any of them.
+* **SC-LOCK-8 — Ordering in the roadmap.** **SPECIFIED.**
+  * SCHED-LOCK1 is scheduled **before** preemptible kernel threads are enabled, and **before** any
+    claim of bounded RT scheduling latency.
+  * Basic kernel-context preparation (KTHREAD1's stacks, entry ABI and cooperative switch) may
+    proceed separately. It must not enable preemption that SCHED-LOCK1's exclusion rules would
+    make unsafe.
+* **SC-LOCK-9 — No lock is split before SCHED-LOCK1.** **ENFORCED** by the legacy guard above.
+  SCHED-CONTRACT1 and its correction change no lock.
+
+---
+
+## 13. Correction record: SCHED-CONTRACT1-CORRECTION
+
+The delivered SCHED-CONTRACT1 model had two defects. Both were **reproduced by executed
+regressions against the unmodified model** before either was fixed. The model at `e41b3be9` was
+unchanged for that run, except for a read-only membership observer, plain helpers and an inert
+report field; 0 lines were removed. All eight new regressions failed, and all 20 earlier tests
+passed:
+
+| Defect | Regression | Failure on the unmodified model |
+|---|---|---|
+| A — debt forgiven | `model_debt_beyond_one_replenishment_is_conserved` | `(remaining, debt) = (0, 0)` at t=10, want `(0, 5)` |
+| A | `model_debt_repayment_cases_and_no_budget_accumulation` | debt 4: got `(0, 0)`, want `(0, 1)` |
+| A (overflow) | `model_debt_overflow_saturates_and_is_reported` | `attempt to add with overflow` (would wrap in a release build) |
+| B — exhausted thread kept its place | `model_exhausted_thread_rejoins_the_tail_only_at_replenishment` | after B blocks, A ran; C, ready before A's replenishment, must run first |
+| B | `model_simultaneous_replenishments_rejoin_in_context_order` | order `[2, 1, 0]`, want `[2, 0, 1]` |
+| B | `model_wake_while_exhausted_takes_no_position` | an exhausted Ready thread holds 1 queue position |
+| B | `model_debt_consumed_replenishment_grants_no_position` | an exhausted Ready thread holds 1 queue position |
+| B | `model_queue_membership_has_no_duplicates_or_stale_positions` | seed 1 step 14: an exhausted Ready thread holds a position |
+
+**The repairs.**
+
+* **A — conserved repayment.** SC-CTX-4 (`paid = min(B, debt)`) and SC-CTX-5 (checked
+  accumulation, saturating with a report).
+* **B — exhausted threads hold no queue position.** An exhausted Ready thread sits in an exhausted
+  set with no position. It joins the tail only at a replenishment that leaves it budget, in
+  SC-CTX-7 order. The window-boundary and higher-priority-preemption head placements are
+  unchanged (SC-PRI-12a/e).
+
+**Independent revert controls.** Each repair was reverted alone in the model source, and the full
+suite was run against the frozen tests:
+
+| Revert | Failing tests | Reason |
+|---|---|---|
+| A1 repayment (back to `B − debt`, clear) | the two debt-repayment regressions | debt forgiven: `(0, 0)` vs `(0, 5)`; debt 4 → `(0, 0)` vs `(0, 1)` |
+| A2 overflow (back to a plain add) | the overflow regression | `attempt to add with overflow` |
+| B queueing (back to push at exhaustion and wake) | the five queue regressions | A ran before C; order `[2, 1, 0]`; exhausted threads hold positions |
+
+In each revert run every other repair's regressions still passed. The in-test mutation check
+also failed, because its unmutated baseline no longer held. The in-test mutations
+`ForgiveDebtAtReplenish`, `WrappingDebt` and `QueueOnExhaustion` now keep each defect killed
+permanently.
+
+**These are model tests.** They make the specification executable and check its predicates. They
+do not implement or qualify production RT scheduling, which remains SPECIFIED → RT-SCHED1.
+
+---
+
+## 14. Requirement status summary
+
+* **ENFORCED by production:**
+  * SC-CPU-1;
+  * SC-CPU-3 (GP);
+  * SC-PRI-1, SC-PRI-2, SC-PRI-3, SC-PRI-4;
+  * SC-POOL-1;
+  * SC-SEP-2 (mechanism);
+  * SC-BND-1;
+  * SC-INV-4 (as a known GP property);
+  * SC-TIME-1, SC-TIME-2;
+  * SC-GP-1 (differential, for the mechanisms exercised);
+  * SC-KT-0;
+  * SC-LOCK-9.
+* **SPECIFIED, with an implementing package:**
+  * **KERNEL-NOFP1:** SC-FP-1…3, SC-KT-5.
+  * **SCHED-LOCK1:** SC-LOCK-1…8.
+  * **KTHREAD1:** SC-KT-1…4, SC-KT-7…12, SC-BND-2, SC-EXEC-3.
+  * **RT-SCHED1:**
+    * SC-CPU-2;
+    * SC-PRI-10…13;
+    * SC-CTX-1…5, SC-CTX-7, SC-CTX-8;
+    * SC-SEP-1;
+    * SC-IPC-1, SC-IPC-2;
+    * SC-INV-2, SC-INV-3;
+    * SC-EXEC-1, SC-EXEC-2, SC-EXEC-4;
+    * SC-TIME-5;
+    * SC-WCET-1, SC-WCET-2;
+    * SC-GP-2.
+  * **PARTITION1:**
+    * SC-PART-1…7;
+    * SC-POOL-2, SC-POOL-4;
+    * SC-EXEC-5;
+    * SC-IPC-3;
+    * SC-BND-3.
+  * **FP-POLICY1:** SC-FP-4.
+* **UNRESOLVED (missing fact and owner stated in place):**
+  * SC-CTX-6;
+  * SC-POOL-3;
+  * SC-EXEC-6;
+  * SC-INV-1;
+  * SC-TIME-3, SC-TIME-4, SC-TIME-6;
+  * SC-KT-6;
+  * SC-FP-5.

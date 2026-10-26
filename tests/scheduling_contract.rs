@@ -20,6 +20,12 @@
 //!   the production `PriorityScheduler` makes over random operation sequences. That is what
 //!   licenses the contract's claim that the general-purpose profile is described by the same
 //!   mechanisms as RT-P1 — for the general-purpose configuration, and for nothing more.
+//!
+//! SCHED-CONTRACT1-CORRECTION reproduced two model defects with regressions that failed against
+//! the unmodified model, then repaired them: debt beyond one replenishment was forgiven (now
+//! conserved, SC-CTX-4/5), and an exhausted thread kept a FIFO position while ineligible (now it
+//! holds none until a replenishment leaves it budget, SC-PRI-12f, SC-CTX-7/8). These remain model
+//! tests: they do not implement or qualify production RT scheduling.
 
 use yarm::kernel::ipc::ThreadId;
 use yarm::kernel::scheduler::{
@@ -246,7 +252,7 @@ mod production {
 
 /// Executable policy model of RT-P1. SPECIFICATION EVIDENCE ONLY — see the module docs above.
 mod model {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     pub type Tick = u64;
     /// RT-P1 fixed priority levels, 0 highest (SC-PRI-10).
@@ -269,6 +275,13 @@ mod model {
         WrappingWindowArithmetic,
         EssentialWorkUncharged,
         NoOverrunDebt,
+        /// The delivered SCHED-CONTRACT1 replenishment: `budget - debt`, then ALL debt cleared.
+        ForgiveDebtAtReplenish,
+        /// The delivered SCHED-CONTRACT1 queueing: an exhausted thread keeps (or takes) a queue
+        /// position at exhaustion and at wake, instead of rejoining the tail at replenishment.
+        QueueOnExhaustion,
+        /// Debt accumulation wraps silently instead of saturating with a report.
+        WrappingDebt,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,6 +453,8 @@ mod model {
         pub ctx: Vec<Context>,
         pub state: Vec<State>,
         queues: BTreeMap<(usize, usize, usize), VecDeque<usize>>,
+        /// Ready threads whose budget is exhausted. They hold NO queue position (SC-PRI-12f).
+        exhausted: BTreeSet<usize>,
         pub running: Vec<Option<usize>>,
         pub now: Tick,
         /// RT-P1: a wake is a scheduling point. General-purpose: it is not (SC-PRI-4).
@@ -451,6 +466,8 @@ mod model {
         allowance_frame: Vec<Option<Tick>>,
         pub overrun: Vec<Tick>,
         pub essential_total: Vec<Tick>,
+        /// SC-CTX-5: per-context record that debt accumulation saturated.
+        pub debt_overflow: Vec<bool>,
         mutation: Option<Mutation>,
     }
 
@@ -491,6 +508,7 @@ mod model {
                 ctx,
                 state: vec![State::Blocked; n],
                 queues: BTreeMap::new(),
+                exhausted: BTreeSet::new(),
                 running: vec![None; n_cpus],
                 preempt_on_wake: true,
                 resched_on_block: true,
@@ -499,6 +517,7 @@ mod model {
                 allowance_frame: vec![None; n_cpus],
                 overrun: vec![0; n_cpus],
                 essential_total: vec![0; n_cpus],
+                debt_overflow: vec![false; n],
                 mutation,
             }
         }
@@ -562,6 +581,19 @@ mod model {
             self.queues.entry(k).or_default().push_front(t);
         }
 
+        /// Make `t` Ready at the head or tail of its level — or, if its budget is exhausted, in
+        /// the exhausted set with no queue position at all (SC-PRI-12f).
+        fn make_ready(&mut self, t: usize, head: bool) {
+            self.state[t] = State::Ready;
+            if !self.budget_ok(t) && !self.mutated(Mutation::QueueOnExhaustion) {
+                self.exhausted.insert(t);
+            } else if head {
+                self.push_front(t);
+            } else {
+                self.push_back(t);
+            }
+        }
+
         fn take(&mut self, cpu: usize, t: usize) {
             let k = self.key(t);
             if let Some(q) = self.queues.get_mut(&k) {
@@ -577,21 +609,22 @@ mod model {
                 && !self.eligible(cur, cpu)
             {
                 self.running[cpu] = None;
-                self.state[cur] = State::Ready;
-                if self.budget_ok(cur) {
-                    // A window boundary: the thread keeps its place for its next window.
-                    self.push_front(cur);
-                } else {
-                    // Exhausted: it rejoins the tail, eligible again only at replenishment.
+                // A window boundary: the thread keeps its place (head) for its next window.
+                // Exhausted: it leaves the queue entirely and rejoins the tail only when a
+                // replenishment leaves it budget (SC-PRI-12e/f).
+                let head = self.budget_ok(cur);
+                if !head && self.mutated(Mutation::QueueOnExhaustion) {
+                    self.state[cur] = State::Ready;
                     self.push_back(cur);
+                } else {
+                    self.make_ready(cur, head);
                 }
             }
             let cand = self.select(cpu);
             match (self.running[cpu], cand) {
                 (Some(cur), Some(c)) if self.ctx[c].priority < self.ctx[cur].priority => {
                     // Preempted by strictly higher priority: head of its level (SC-PRI-12a).
-                    self.state[cur] = State::Ready;
-                    self.push_front(cur);
+                    self.make_ready(cur, true);
                     self.take(cpu, c);
                 }
                 (None, Some(c)) => self.take(cpu, c),
@@ -620,8 +653,7 @@ mod model {
             {
                 self.ctx[t].remaining = budget;
             }
-            self.state[t] = State::Ready;
-            self.push_back(t);
+            self.make_ready(t, false);
             if self.preempt_on_wake {
                 let cpu = self.ctx[t].cpu;
                 self.reschedule(cpu);
@@ -640,8 +672,7 @@ mod model {
         /// Explicit Yield (and the general-purpose quantum expiry): tail of its own level.
         pub fn yield_now(&mut self, cpu: usize) {
             if let Some(cur) = self.running[cpu].take() {
-                self.state[cur] = State::Ready;
-                self.push_back(cur);
+                self.make_ready(cur, false);
             }
             self.reschedule(cpu);
         }
@@ -653,7 +684,27 @@ mod model {
                 let c = &mut self.ctx[t];
                 let used = ticks.min(c.remaining);
                 c.remaining -= used;
-                c.debt += ticks - used;
+                // SC-CTX-5: never wraps, never forgiven. At the limit it saturates and is reported.
+                match c.debt.checked_add(ticks - used) {
+                    Some(d) => c.debt = d,
+                    None if self.mutation == Some(Mutation::WrappingDebt) => {
+                        c.debt = c.debt.wrapping_add(ticks - used);
+                    }
+                    None => {
+                        c.debt = Tick::MAX;
+                        self.debt_overflow[t] = true;
+                    }
+                }
+                // A queued Ready thread charged to exhaustion gives up its queue position.
+                if self.state[t] == State::Ready
+                    && !self.budget_ok(t)
+                    && !self.mutated(Mutation::QueueOnExhaustion)
+                {
+                    for q in self.queues.values_mut() {
+                        q.retain(|&x| x != t);
+                    }
+                    self.exhausted.insert(t);
+                }
             }
         }
 
@@ -700,8 +751,11 @@ mod model {
             self.reschedule(cpu);
         }
 
-        /// One tick: charge the running contexts, replenish at release instants, then let every
-        /// CPU observe the new instant — boundaries included, idle or not.
+        /// One tick, in the SC-CTX-7 order: (1) charge the running contexts for the elapsed tick;
+        /// (2) advance time; (3) replenish every context whose release instant has arrived, in
+        /// ascending context id, an exhausted Ready thread with budget left joining the TAIL in
+        /// that order; (4) reschedule every CPU in ascending CPU id — window boundaries and
+        /// exhaustion included, idle or not.
         pub fn tick(&mut self) {
             for cpu in 0..self.running.len() {
                 if let Some(t) = self.running[cpu] {
@@ -713,17 +767,32 @@ mod model {
                 if let Budget::Limited { budget, period } = self.ctx[t].budget
                     && self.now >= self.ctx[t].next_release
                 {
+                    let forgive = self.mutation == Some(Mutation::ForgiveDebtAtReplenish);
+                    let no_debt = self.mutation == Some(Mutation::NoOverrunDebt);
                     let c = &mut self.ctx[t];
-                    c.remaining = if self.mutation == Some(Mutation::NoOverrunDebt) {
-                        budget
+                    if no_debt {
+                        c.remaining = budget;
+                        c.debt = 0;
+                    } else if forgive {
+                        c.remaining = budget.saturating_sub(c.debt);
+                        c.debt = 0;
                     } else {
-                        budget.saturating_sub(c.debt)
-                    };
-                    c.debt = 0;
+                        // SC-CTX-4: conserved repayment. Unused budget never accumulates: the
+                        // previous `remaining` is discarded, not added to.
+                        let paid = budget.min(c.debt);
+                        c.remaining = budget - paid;
+                        c.debt -= paid;
+                    }
                     c.next_release = c
                         .next_release
                         .checked_add(period)
                         .expect("release overflow");
+                    // SC-PRI-12f: only a replenishment that leaves budget restores a position —
+                    // at the tail, in ascending context order (SC-CTX-7).
+                    if self.exhausted.contains(&t) && self.budget_ok(t) {
+                        self.exhausted.remove(&t);
+                        self.push_back(t);
+                    }
                 }
             }
             for cpu in 0..self.running.len() {
@@ -732,6 +801,42 @@ mod model {
                 }
                 self.reschedule(cpu);
             }
+        }
+    }
+
+    impl Model {
+        /// SC-PRI-12(f)/SC-CTX-8: every Ready thread holds exactly one place, and an exhausted
+        /// Ready thread holds NO eligible queue position; Running and Blocked threads hold none.
+        /// A read-only observer of the model's state.
+        pub fn membership_violations(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            for t in 0..self.ctx.len() {
+                let queued: usize = self
+                    .queues
+                    .values()
+                    .map(|q| q.iter().filter(|&&x| x == t).count())
+                    .sum();
+                let want = match self.state[t] {
+                    State::Running | State::Blocked => 0,
+                    State::Ready if !self.budget_ok(t) => 0,
+                    State::Ready => 1,
+                };
+                let parked = self.exhausted.contains(&t);
+                let want_parked = self.state[t] == State::Ready && !self.budget_ok(t);
+                if parked != want_parked {
+                    out.push(format!(
+                        "t={} ctx {t} ({:?}, remaining {}) exhausted-set membership {parked}, want {want_parked}",
+                        self.now, self.state[t], self.ctx[t].remaining
+                    ));
+                }
+                if queued != want {
+                    out.push(format!(
+                        "t={} ctx {t} ({:?}, remaining {}) holds {queued} queue positions, want {want}",
+                        self.now, self.state[t], self.ctx[t].remaining
+                    ));
+                }
+            }
+            out
         }
     }
 
@@ -1149,6 +1254,320 @@ mod model {
         Ok(())
     }
 
+    fn membership(m: &Model) -> Result<(), String> {
+        let v = m.membership_violations();
+        if v.is_empty() {
+            Ok(())
+        } else {
+            Err(v.join("; "))
+        }
+    }
+
+    /// Advance until `now == until` (dispatch and state only).
+    fn advance(m: &mut Model, until: Tick) {
+        while m.now < until {
+            m.tick();
+        }
+    }
+
+    /// Advance until `now == until`, checking queue membership after every tick.
+    fn run_until(m: &mut Model, until: Tick) -> Result<(), String> {
+        while m.now < until {
+            m.tick();
+            membership(m)?;
+        }
+        Ok(())
+    }
+
+    /// SC-CTX-4: debt is CONSERVED. Each replenishment pays `min(budget, debt)`; what it cannot
+    /// repay is carried, never forgiven. Budget 3 with debt 8 replenishes to (0, 5), (0, 2),
+    /// then (1, 0).
+    pub fn check_debt_conservation(mu: Option<Mutation>) -> Result<(), String> {
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let mut m = Model::new(s, &[(0, 0, 0, lim(3, 10))], 1, 0, mu);
+        // A non-preemptible section of 11 ticks against a budget of 3: debt 8.
+        m.charge(0, 11);
+        ensure!(
+            (m.ctx[0].remaining, m.ctx[0].debt) == (0, 8),
+            "setup: remaining {} debt {}",
+            m.ctx[0].remaining,
+            m.ctx[0].debt
+        );
+        m.wake(0, 0);
+        for (release, want) in [(10, (0, 5)), (20, (0, 2)), (30, (1, 0))] {
+            advance(&mut m, release);
+            let got = (m.ctx[0].remaining, m.ctx[0].debt);
+            ensure!(
+                got == want,
+                "after the replenishment at t={release}: (remaining, debt) = {got:?}, want {want:?}"
+            );
+            let should_run = want.0 > 0;
+            ensure!(
+                (m.running[0] == Some(0)) == should_run,
+                "t={release}: running {:?} with remaining {}",
+                m.running[0],
+                want.0
+            );
+        }
+        Ok(())
+    }
+
+    /// SC-CTX-4: zero, below-, equal-to- and above-budget debt; repayment across periods with a
+    /// fresh overrun in between; and unused budget never accumulates.
+    pub fn check_debt_cases(mu: Option<Mutation>) -> Result<(), String> {
+        // (debt before the release, (remaining, debt) after it), budget 3.
+        for (debt, want) in [
+            (0, (3, 0)),
+            (2, (1, 0)),
+            (3, (0, 0)),
+            (4, (0, 1)),
+            (9, (0, 6)),
+        ] {
+            let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+            let mut m = Model::new(s, &[(0, 0, 0, lim(3, 10))], 1, 0, mu);
+            m.charge(0, 3 + debt);
+            advance(&mut m, 10);
+            let got = (m.ctx[0].remaining, m.ctx[0].debt);
+            ensure!(got == want, "debt {debt}: got {got:?}, want {want:?}");
+        }
+        // Across periods, with a new overrun between two replenishments.
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let mut m = Model::new(s, &[(0, 0, 0, lim(3, 10))], 1, 0, mu);
+        m.charge(0, 3 + 8);
+        advance(&mut m, 10);
+        ensure!(
+            m.ctx[0].debt == 5,
+            "first repayment: debt {}",
+            m.ctx[0].debt
+        );
+        m.charge(0, 2); // remaining is 0: the whole charge is overrun
+        ensure!(m.ctx[0].debt == 7, "fresh overrun: debt {}", m.ctx[0].debt);
+        advance(&mut m, 20);
+        ensure!(
+            (m.ctx[0].remaining, m.ctx[0].debt) == (0, 4),
+            "second repayment: ({}, {})",
+            m.ctx[0].remaining,
+            m.ctx[0].debt
+        );
+        // Unused budget does not accumulate across replenishments.
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let mut m = Model::new(s, &[(0, 0, 0, lim(3, 10))], 1, 0, mu);
+        advance(&mut m, 30);
+        ensure!(
+            m.ctx[0].remaining == 3,
+            "an idle context accumulated budget: remaining {}",
+            m.ctx[0].remaining
+        );
+        Ok(())
+    }
+
+    /// SC-CTX-5: debt accumulation never wraps; at the limit it saturates and is REPORTED.
+    pub fn check_debt_overflow(mu: Option<Mutation>) -> Result<(), String> {
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let mut m = Model::new(s, &[(0, 0, 0, lim(3, 10))], 1, 0, mu);
+        m.charge(0, Tick::MAX);
+        m.charge(0, 10);
+        ensure!(
+            m.ctx[0].debt == Tick::MAX,
+            "debt wrapped or was forgiven: {}",
+            m.ctx[0].debt
+        );
+        ensure!(m.debt_overflow[0], "the saturation was not reported");
+        Ok(())
+    }
+
+    /// SC-PRI-12(f): an exhausted thread leaves the eligible queue and rejoins its TAIL only when
+    /// replenished. A runs and exhausts; B runs; C becomes ready while A is exhausted; A
+    /// replenishes; B blocks — C must run before A.
+    pub fn check_exhausted_rejoins_tail(mu: Option<Mutation>) -> Result<(), String> {
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let (a, b, c) = (0, 1, 2);
+        let ctxs = [
+            (0, 0, 3, lim(2, 10)),
+            (0, 0, 3, lim(100, 100)),
+            (0, 0, 3, lim(100, 100)),
+        ];
+        let mut m = Model::new(s, &ctxs, 1, 0, mu);
+        m.wake(a, 0);
+        m.wake(b, 0);
+        ensure!(m.running[0] == Some(a), "A runs first");
+        advance(&mut m, 2);
+        ensure!(m.running[0] == Some(b), "A exhausted at t=2, so B runs");
+        advance(&mut m, 3);
+        m.wake(c, 0);
+        advance(&mut m, 10);
+        ensure!(m.ctx[a].remaining == 2, "A replenished at t=10");
+        ensure!(m.running[0] == Some(b), "B keeps running: equal priority");
+        m.block(0);
+        ensure!(
+            m.running[0] == Some(c),
+            "after B blocks, {:?} ran; C became ready before A was replenished and must run first",
+            m.running[0]
+        );
+        m.block(0);
+        ensure!(m.running[0] == Some(a), "then A");
+        Ok(())
+    }
+
+    /// SC-CTX-4/SC-PRI-12(f): a replenishment entirely consumed by debt grants neither
+    /// eligibility nor a queue position, even with nothing else to run.
+    pub fn check_debt_consumed_replenishment(mu: Option<Mutation>) -> Result<(), String> {
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let mut m = Model::new(s, &[(0, 0, 3, lim(3, 10))], 1, 0, mu);
+        m.wake(0, 0);
+        m.charge_kernel(0, KernelWork::CallerSynchronous(0), 3 + 3);
+        membership(&m)?;
+        run_until(&mut m, 10)?;
+        ensure!(
+            m.ctx[0].remaining == 0 && m.running[0].is_none(),
+            "a replenishment consumed by debt let it run (remaining {}, running {:?})",
+            m.ctx[0].remaining,
+            m.running[0]
+        );
+        run_until(&mut m, 20)?;
+        ensure!(
+            m.running[0] == Some(0),
+            "the next replenishment restores it"
+        );
+        Ok(())
+    }
+
+    /// SC-PRI-12(c,d,f): a thread that exhausts and blocks in the same trap, and is woken while
+    /// still exhausted, takes no position until its replenishment — then the tail.
+    pub fn check_wake_while_exhausted(mu: Option<Mutation>) -> Result<(), String> {
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let (a, b, c) = (0, 1, 2);
+        let ctxs = [
+            (0, 0, 3, lim(2, 10)),
+            (0, 0, 3, lim(100, 100)),
+            (0, 0, 3, lim(100, 100)),
+        ];
+        let mut m = Model::new(s, &ctxs, 1, 0, mu);
+        m.wake(a, 0);
+        m.wake(b, 0);
+        // A's trap overruns its budget and then blocks, before any reschedule.
+        m.charge(a, 2);
+        m.block(0);
+        ensure!(m.running[0] == Some(b), "B runs once A blocks");
+        m.wake(a, 0); // still exhausted
+        membership(&m)?;
+        m.wake(c, 0);
+        membership(&m)?;
+        run_until(&mut m, 10)?;
+        m.block(0);
+        ensure!(
+            m.running[0] == Some(c),
+            "{:?} ran; A was woken exhausted and may queue only at replenishment",
+            m.running[0]
+        );
+        Ok(())
+    }
+
+    /// SC-CTX-7: replenishments falling at the same instant rejoin in ascending context order.
+    pub fn check_simultaneous_replenishments(mu: Option<Mutation>) -> Result<(), String> {
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let ctxs = [
+            (0, 0, 3, lim(2, 10)),
+            (0, 0, 3, lim(1, 10)),
+            (0, 0, 3, lim(100, 100)),
+        ];
+        let mut m = Model::new(s, &ctxs, 1, 0, mu);
+        // 1 exhausts first, then 0; both replenish at t=10 while 2 runs.
+        m.wake(1, 0);
+        m.wake(0, 0);
+        m.wake(2, 0);
+        advance(&mut m, 3);
+        ensure!(
+            m.running[0] == Some(2),
+            "1 then 0 exhausted, 2 runs (got {:?})",
+            m.running[0]
+        );
+        advance(&mut m, 10);
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            if let Some(t) = m.running[0] {
+                order.push(t);
+            }
+            m.block(0);
+        }
+        ensure!(order == vec![2, 0, 1], "order {order:?}, want [2, 0, 1]");
+        Ok(())
+    }
+
+    /// Duplicate membership never arises: random wake/block/yield/charge/tick sequences keep
+    /// every thread in exactly its specified place.
+    pub fn check_membership_soak(mu: Option<Mutation>) -> Result<(), String> {
+        for seed in 1..=16u64 {
+            let mut rng = seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1;
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let s = one_cpu(&[w(0, 0, 0, 7), w(0, 1, 7, 5)], 12, 2, mu);
+            let ctxs: Vec<_> = (0..6)
+                .map(|i| (0, i % 2, (i % 3) as usize, lim(1 + (i as Tick % 3), 6)))
+                .collect();
+            let mut m = Model::new(s, &ctxs, 1, 0, mu);
+            for step in 0..400 {
+                match next() % 5 {
+                    0 => m.wake((next() % 6) as usize, 0),
+                    1 => m.block(0),
+                    2 => m.yield_now(0),
+                    3 => {
+                        if let Some(t) = m.running[0] {
+                            m.charge_kernel(0, KernelWork::CallerSynchronous(t), next() % 4);
+                        }
+                    }
+                    _ => m.tick(),
+                }
+                membership(&m).map_err(|e| format!("seed {seed} step {step}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_debt_beyond_one_replenishment_is_conserved() {
+        check_debt_conservation(None).unwrap();
+    }
+
+    #[test]
+    fn model_debt_repayment_cases_and_no_budget_accumulation() {
+        check_debt_cases(None).unwrap();
+    }
+
+    #[test]
+    fn model_debt_overflow_saturates_and_is_reported() {
+        check_debt_overflow(None).unwrap();
+    }
+
+    #[test]
+    fn model_exhausted_thread_rejoins_the_tail_only_at_replenishment() {
+        check_exhausted_rejoins_tail(None).unwrap();
+    }
+
+    #[test]
+    fn model_debt_consumed_replenishment_grants_no_position() {
+        check_debt_consumed_replenishment(None).unwrap();
+    }
+
+    #[test]
+    fn model_wake_while_exhausted_takes_no_position() {
+        check_wake_while_exhausted(None).unwrap();
+    }
+
+    #[test]
+    fn model_simultaneous_replenishments_rejoin_in_context_order() {
+        check_simultaneous_replenishments(None).unwrap();
+    }
+
+    #[test]
+    fn model_queue_membership_has_no_duplicates_or_stale_positions() {
+        check_membership_soak(None).unwrap();
+    }
+
     const CHECKS: &[(&str, Check)] = &[
         ("window", check_window),
         ("budget", check_budget),
@@ -1161,6 +1580,20 @@ mod model {
         ("essential", check_essential),
         ("overrun_debt", check_overrun_debt),
         ("cross_partition_window", check_cross_partition_window),
+        ("debt_conservation", check_debt_conservation),
+        ("debt_cases", check_debt_cases),
+        ("debt_overflow", check_debt_overflow),
+        ("exhausted_rejoins_tail", check_exhausted_rejoins_tail),
+        (
+            "debt_consumed_replenishment",
+            check_debt_consumed_replenishment,
+        ),
+        ("wake_while_exhausted", check_wake_while_exhausted),
+        (
+            "simultaneous_replenishments",
+            check_simultaneous_replenishments,
+        ),
+        ("membership_soak", check_membership_soak),
     ];
 
     #[test]
@@ -1235,7 +1668,22 @@ mod model {
             (M::AllowOverlap, &["schedule_validation"]),
             (M::WrappingWindowArithmetic, &["schedule_validation"]),
             (M::EssentialWorkUncharged, &["essential"]),
-            (M::NoOverrunDebt, &["overrun_debt"]),
+            (M::NoOverrunDebt, &["overrun_debt", "debt_conservation"]),
+            (
+                M::ForgiveDebtAtReplenish,
+                &["debt_conservation", "debt_cases"],
+            ),
+            (M::WrappingDebt, &["debt_overflow"]),
+            (
+                M::QueueOnExhaustion,
+                &[
+                    "exhausted_rejoins_tail",
+                    "debt_consumed_replenishment",
+                    "wake_while_exhausted",
+                    "simultaneous_replenishments",
+                    "membership_soak",
+                ],
+            ),
         ];
         for (name, check) in CHECKS {
             assert_eq!(check(None), Ok(()), "unmutated check {name} must pass");

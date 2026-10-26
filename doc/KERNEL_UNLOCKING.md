@@ -615,13 +615,14 @@ conformance (contract §11).
 
 * static CPU assignment with no migration after the INITIALIZATION → OPERATIONAL transition;
 * 32 fixed priorities with FIFO among equals. A higher-priority preemption leaves the preempted
-  thread at the head of its level; Yield and wake go to the tail; budget exhaustion rejoins the
-  tail at replenishment;
+  thread at the head of its level; Yield and wake go to the tail. An exhausted thread holds no
+  queue position at all, and rejoins the tail only at a replenishment that leaves it budget;
 * one cyclic schedule of half-open windows over a major frame, from an epoch fixed at OPERATIONAL.
   Boundaries are instants of time, empty windows idle, and there is no slack donation;
 * **a partition is bound to one CPU**, so no window or budget is ever consumed in parallel;
 * one budgeted scheduling context per thread, `{cpu, partition, priority, B, T}`, with periodic
-  replenishment and overrun carried as debt and reported;
+  replenishment. Overrun is carried as debt and reported. Debt is repaid across as many
+  replenishments as it takes, never forgiven, and never wraps;
 * priority, criticality, partition eligibility, budget eligibility and CPU affinity are separate
   attributes. Priority never overrides a window or an exhausted budget;
 * handoff is not donation, and donation stays disabled;
@@ -650,13 +651,16 @@ the production `PriorityScheduler`.
 * Every port treats interrupted or faulting kernel-mode execution as idle or fatal.
 * Two source comments disagree with the code; both are recorded in contract §1.12.
 
-**Next packages, in order:**
+**Next packages, in order** (revised by SCHED-CONTRACT1-CORRECTION):
 
-| Package | Scope | Contract requirements |
-|---|---|---|
-| **KTHREAD1** | independent kernel threads: owned stacks, entry ABI, kernel-mode preemption, kernel FP/TLS policy, guard check, stack residency and reclamation, trap classifiers | SC-KT-1…12, SC-BND-2, SC-EXEC-3 |
-| **RT-SCHED1** | 32-level fixed-priority preemptive selection, scheduling contexts and budgets, calibrated time and earliest-deadline programming, structural no-migration, a fair kernel lock or contention bound, buffered diagnostics | SC-PRI-10…13, SC-CTX-*, SC-TIME-3…6, SC-CPU-2, SC-SEP-*, SC-INV-*, SC-WCET-*, SC-EXEC-* |
-| **PARTITION1** | cyclic schedule, epoch, windows and boundaries, the OPERATIONAL transition, system allowance and health monitoring, configuration validation | SC-PART-*, SC-POOL-2/4, SC-EXEC-5, SC-IPC-3, SC-BND-3 |
+| Package | Status | Scope | Contract requirements |
+|---|---|---|---|
+| **KERNEL-NOFP1** | **next implementation package** | ordinary kernel code and its linked runtime helpers use no FP/SIMD registers. Audited exceptions are the explicit init and context save/restore routines. Proof is by disassembly of the final linked images, bounded by an allowlist; a blanket zero-FP check is wrong. Eager user preservation and exact continuation-owner authentication are unchanged. No compiler flag or calling convention is prescribed. No lazy FP. Cost measurement is outstanding; no WCET or certification claim | SC-FP-1…3, SC-KT-5 |
+| **SCHED-LOCK1** | **OPEN prerequisite**: before preemptible kernel threads are enabled and before any bounded RT latency claim | give CPU-local runnable/current/quantum state explicit local ownership, so unrelated CPUs leave the one shared rank-1 scheduler critical section. Requires bounded local exclusion with a progress argument ("lock-free" is not mandated), and an explicit cross-CPU wake protocol: capacity, full-queue behaviour, publication order, cancellation, no lost wakeups. Preserves incarnation authentication, membership, wake arbitration, dispatch tokens and lock order. Separates global clock, topology and admission. Inventories the remaining shared dependencies. Must explicitly reconcile `AI_AGENT_RULES.md` §14.4 D6, §7.1/§8 below, the `stage106_d6_audit…` source guard and the `KERNEL_LOCKING.md` rank table | SC-LOCK-1…8 |
+| **KTHREAD1** | after KERNEL-NOFP1. Context preparation may proceed before SCHED-LOCK1; kernel preemption may not | independent kernel threads: owned stacks, entry ABI, kernel-mode preemption, kernel TLS policy, guard check, stack residency and reclamation, trap classifiers | SC-KT-1…4, SC-KT-6…12, SC-BND-2, SC-EXEC-3 |
+| **RT-SCHED1** | after SCHED-LOCK1 | 32-level fixed-priority preemptive selection, scheduling contexts and budgets, calibrated time and earliest-deadline programming, structural no-migration, a fair kernel lock or contention bound, buffered diagnostics | SC-PRI-10…13, SC-CTX-*, SC-TIME-3…6, SC-CPU-2, SC-SEP-*, SC-INV-*, SC-WCET-*, SC-EXEC-* |
+| **PARTITION1** | with or after RT-SCHED1 | cyclic schedule, epoch, windows and boundaries, the OPERATIONAL transition, system allowance and health monitoring, configuration validation | SC-PART-*, SC-POOL-2/4, SC-EXEC-5, SC-IPC-3, SC-BND-3 |
+| **FP-POLICY1** | later, after KERNEL-NOFP1 | optional static per-task FP policy and conditional-save optimization. A task flag alone cannot enforce non-use or prevent disclosure. Instruction access, violation handling, initialization, isolation and lifecycle must be defined before any preservation is skipped | SC-FP-4 |
 
 **Roadmap, not started:** VFS work (owner doc `doc/VFS.md`) and hardware bring-up (owner doc
 `doc/RPI5_BRINGUP.md` and the per-ISA architecture docs) remain on the roadmap and were not
@@ -704,6 +708,30 @@ kind **N** in contract §6.
   * four strict VMI2 witness boots.
 
   Production broad-lock retirement is intact.
+
+#### SCHED-CONTRACT1-CORRECTION (from delivered `e41b3be9`)
+
+A contract-and-tests package. It changed no production source, scheduling policy, lock or build
+configuration. It corrected two defects in the executable RT-P1 model. It recorded the kernel
+FP/SIMD direction (KERNEL-NOFP1, then FP-POLICY1), and added SCHED-LOCK1 as an OPEN
+prerequisite. It also corrected contract §1.1, which had wrongly attributed the per-CPU lock
+restriction to `KERNEL_LOCKING.md`'s rank table. Details are in contract §8.1, §12, §13 and §14.
+
+* **A — debt beyond one replenishment was forgiven.** `B − debt`, saturating, followed by
+  clearing the debt, dropped whatever one replenishment could not pay. Replenishment is now
+  `paid = min(B, debt)`, `remaining = B − paid`, `debt −= paid`. Accumulation is checked and
+  saturates with a reported `DebtOverflow`. Unused budget still does not accumulate.
+* **B — an exhausted thread kept an early FIFO position.** It was appended at exhaustion, so it
+  kept a place while ineligible. An exhausted thread now holds no position. It joins the tail
+  only at a replenishment that leaves it budget, in ascending context id at a shared instant
+  (new SC-CTX-7). The membership invariant is new SC-CTX-8.
+* **Reproduced before fixing:** eight new regressions failed on the unmodified model, and the 20
+  earlier tests passed. Examples: `(0,0)` instead of `(0,5)`; an `attempt to add with overflow`;
+  exhausted thread A running before C; replenishment order `[2,1,0]` instead of `[2,0,1]`;
+  exhausted threads holding queue positions.
+* **Independent revert controls:** reverting repayment, overflow handling or queue membership
+  alone fails exactly that repair's regressions.
+* **Model tests only:** none of this implements or qualifies production RT scheduling.
 
 ---
 
