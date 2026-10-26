@@ -1272,6 +1272,131 @@ ownership or ABI change: the production diff is a default-off witness feature (b
   still yielding, and the strict core smoke stops at that terminal idle before the query runs.
   The script refuses any other CPU count by name.
 
+**Qualification of BUILD-GATES1.**
+
+*Binding:*
+
+* Qualified candidate `c837c80b` (tree `592d7700`); base `9b6c889b`.
+* Toolchain `rustc 1.101.0-nightly (32dba69d6 2026-10-09)`; GNU objdump 2.42 (Ubuntu); Ubuntu LLVM
+  18.1.3 `llvm-objdump`; QEMU from the container.
+* The schedule was written before any run. Every result was kept.
+
+*Failed candidates (kept, not rerun into passes):*
+
+| Candidate | Failed at | Cause | Repair |
+|---|---|---|---|
+| `086af0ab` | Q3 byte comparison | The feature-off reuse witness was a cfg-gated block above the supervisor's query. It moved two panic-location line numbers (+17), so `sbin/supervisor`, and with it every default initramfs, differed from base. | The witness became a macro at the end of `yarm-user-rt`. A function or `use` alternative still changed code layout; the macro gives a byte-identical supervisor. |
+| `70c11216` | Q4, then Q5.1/Q5.2 | The verifier compared a record's requested features with the no-FP check's features. The checker expands those through the feature graph, so 19 of the 21 custom kernel configurations were refused before boot. The runner was stopped once the tree changed. | Compare the judged set with the Cargo-resolved set; check selected features against the arguments and the resolved set. Added an implied-feature control and relabels at three depths. |
+| `bcdc286f` | Q7.7 (reuse witness, `-smp 2`) | Premise not established. The second CPU entered terminal idle while the supervisor was still yielding, and the strict core smoke stopped QEMU before tid 2's query. That `-smp 2` cell was an invalid configuration of the predefined schedule. | The witness supports `-smp 1` only and refuses other counts by name. Its other 33 scheduled runs passed. |
+
+*Results on `bcdc286f`, reused for `c837c80b`:* the only difference between the two is the witness
+script, its pin test and this document. Every reused run executed scripts identical in both, on
+kernel and initramfs bytes identical in both and identical to base.
+
+* **Clean-environment dependency checks** (`env -i`):
+  * tools on `PATH` with no selection: the fixtures pass;
+  * `llvm-objdump` absent: `kernel_nofp_cli` fails with the named `NOFP-TOOLS` diagnostic (no
+    skip);
+  * the provisioning script given a missing LLVM: named refusal;
+  * an unsupported objdump version: named refusal;
+  * real tools: three `NOFP_TOOLS … result=ok` lines.
+* **Custom build paths (Q4).** The 21 distinct kernel configurations the 37 migrated paths build
+  were all staged through `artifact_build_kernel`:
+  * x86_64: `x86-ipc-reply-timeout-oracle`, `x86-ipccall-direct-smp-oracle`,
+    `x86-ipccall-direct-oracle`, `x86-shared-region-direct-oracle`, `x86-apsched-witness`,
+    `x86_64-lock3-witness`, `x86-overtaken-witness`, `x86-smp1-witness`, `x86-vmi2-witness`;
+  * AArch64: `aarch64-apsched-witness`, `aarch64-ipc-reply-timeout-oracle`,
+    `aarch64-ipccall-direct-oracle`, `aarch64-shared-region-direct-oracle`;
+  * RISC-V: `riscv64-ipc-reply-timeout-oracle`, `riscv-ipccall-direct-oracle`,
+    `riscv64-apsched-witness`, `riscv64-lock1-witness`, `riscv64-smp3-witness`,
+    `riscv64-sr-replace-witness`, `riscv64-vmi-witness`, `riscv-shared-region-direct-oracle`.
+
+  **21/21** pass the no-FP check on the published bytes, are accepted by the guard with
+  `kernel=<feature>`, and are ELF byte-identical to the same configuration built from base.
+* **Representative boots, one per bypass path (Q5), all pass:**
+  * overlay through a core smoke (`ipccall-reply-direct-x86_64`, both live cells);
+  * the server-dies runner (x86_64);
+  * a dedicated witness with its own build dir (VMI2);
+  * builder feature publication with a direct guard (CONTEXT1 x86_64);
+  * the multi-arch overlay (`ipc-residual1`, AArch64);
+  * a RISC-V witness build dir (SMP3);
+  * a boot-only launcher (x86 optional-FS, strict);
+  * builder publication consumed by a core smoke (x86 exit-current-task).
+* **Strict default cores (Q6), all pass:**
+  * x86_64 on the timer-contract build, as CI strict;
+  * AArch64, with the U9-RX4 reply win on record (0, 1);
+  * RISC-V.
+* **Strict AArch64 grading (Q7):** three default strict cores, each with the corpus self-test
+  (8 accepted, 27 rejected) and a reply win on record (0, 1).
+
+*Results on `c837c80b`:*
+
+* Checker self-test 101/0.
+* `kernel_nofp_cli`, `kernel_nofp_scope`, `artifact_binding_scope`, `aarch64_reply_grader`:
+  19/19.
+* `cargo fmt --check` clean.
+* Hosted 6197 passed, serial.
+* Integration: 36 suites, 353 passed, 0 failed, including the documentation guards and the
+  broad-lock census.
+* Fresh default builds pass the no-FP check on all three ports. Every published kernel ELF, raw
+  image and initramfs is **byte-identical to base**:
+  * x86 `33c00b48`;
+  * AArch64 ELF `a9fffbfd`, raw `1335fc44`;
+  * RISC-V ELF `d8abb10a`, raw `810f37b7`;
+  * initramfs `5b27d145` / `1fa8c2c7` / `f0c35c57`.
+  Production bytes are unchanged, so earlier live evidence on these images stands.
+* Reuse witness at `-smp 1`, three runs (one build, two skip-build runs on a copy of it): **3/3
+  pass**. The premise held each time: tid 2's query ran on record (0, 17), direct route, after
+  earlier generations armed by other callers. The production grader accepted each boot. The
+  pre-repair grader rejects all three logs.
+* Witness at `-smp 2`: refused by name before any build.
+
+*Inventory of base custom paths (43).* 37 now build through the checked path:
+
+* `serverdies-runner-common.sh`;
+* the AArch64, RISC-V and x86 apsched witnesses;
+* the three ipc-reply-timeout retirements and the timeout matrix;
+* residual1, residual2, send-final-fault, timer5 and xfer2;
+* the four ipccall-reply-direct smokes and the x86 smp-request smoke;
+* RISC-V late-reply-yield, lock1, smp3, sr-replace and vmi;
+* the three shared-region-direct smokes;
+* the six x86 ap-* smokes;
+* x86 lock3, overtaken, server-dies, smp1 and vmi2.
+
+The three exit-current-task runners boot the builder's publication. The three
+`build-*-none-bootstrap.sh` helpers are compile-only.
+
+*CI (observed on GitHub Actions):*
+
+* The new `kernel-nofp-gates` job passed on every head where I inspected it:
+  * `4322dd8e` (run 40380103116);
+  * `70c11216` (run 40390655441);
+  * `bcdc286f` (run 40393117966);
+  * the qualified `c837c80b` (run 40396476361, job 121830745084).
+
+  Its provisioning step selected `/usr/bin/objdump` (GNU 2.42) and
+  `/usr/lib/llvm-18/bin/llvm-objdump` (LLVM 18.1.3) on image ubuntu-24.04 20261012.
+* `core-profile` and `posix-compat-profile` provision the tools successfully, then fail in the
+  hosted lib suite run in parallel (46–52 failures; serial 6197/6197 locally). That failure
+  predates this package. It stops those jobs before they reach the integration suites, so on
+  GitHub the new tests run only in `kernel-nofp-gates`.
+* The other red jobs (`ci-workflow-enforcement`, `service-boundary-check`, `roadmap-readiness`,
+  `phase5`, `phase3-4`, `phase4-ui-smoke-marker`) were red before this package and were not
+  touched.
+* `core-qemu-smoke` runs on pull requests and `workflow_dispatch` only, so it has not run for
+  this branch. Its provisioning is verified locally and pinned by `kernel_nofp_scope`.
+
+*Remaining limitations:*
+
+* Provenance records are unsigned. A consistent forgery of record, report and hashes is not
+  detected.
+* The guard binds artifacts to the exact source tree, so every commit needs a rebuild before
+  booting.
+* The RPi5 NEON exception stays **OPEN**, and nothing here qualifies kernel preemption on Pi5.
+* The reuse witness is `-smp 1` only.
+
+SCHED-LOCK1 is next and is not started; KTHREAD1 and hardware work are not started.
+
 ---
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
