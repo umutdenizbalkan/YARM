@@ -6,10 +6,13 @@
 //! What these pin is configuration and inventory, which no hosted test can execute: the kernel
 //! targets stay soft-float while the user targets keep their FP/SIMD; every artifact build runs
 //! the final-image check and fails closed; every audited exception the sources record is a kind
-//! the checker's policy knows, and every policy kind is recorded somewhere; on AArch64 FP/SIMD is
-//! assembled only inside bracketed ranges. The final-image behaviour itself — every executable
-//! byte decoded, every FP/SIMD instruction inside an audited range — is
-//! `scripts/check-kernel-nofp.py`, run on the built images.
+//! the checker's policy knows, and every policy kind is recorded somewhere; every region the
+//! sources record is an entry of the checker's reviewed exclusion inventory owned by that source,
+//! and every inventory entry is recorded by its owner; on AArch64 FP/SIMD is assembled only
+//! inside bracketed ranges. The final-image behaviour itself — every executable byte either
+//! decoded or excluded by an anchored inventory entry, every FP/SIMD instruction inside an audited
+//! range — is `scripts/check-kernel-nofp.py`, run on the built images; its behaviour on synthetic
+//! images is `tests/kernel_nofp_cli.rs`.
 
 use std::collections::BTreeSet;
 
@@ -205,6 +208,14 @@ fn policy_kinds(arch: &str) -> BTreeSet<String> {
 }
 
 fn recorded_kinds(prefix: &str) -> BTreeSet<String> {
+    recorded_names(prefix)
+        .into_iter()
+        .map(|(_, k)| k.split(' ').next().unwrap_or(&k).to_string())
+        .collect()
+}
+
+/// (source, full record name) for every map record the sources under `prefix` emit.
+fn recorded_names(prefix: &str) -> BTreeSet<(String, String)> {
     let mut out = BTreeSet::new();
     for (name, src) in RECORDING_SOURCES
         .iter()
@@ -231,7 +242,7 @@ fn recorded_kinds(prefix: &str) -> BTreeSet<String> {
             };
             if let Some(k) = kind {
                 assert!(!k.is_empty(), "{name}: empty record kind");
-                out.insert(k.split(' ').next().unwrap_or(k).to_string());
+                out.insert((name.to_string(), k.to_string()));
             }
         }
     }
@@ -276,6 +287,55 @@ fn recorded_exception_kinds_match_the_checker_policy() {
     assert!(ARCH_MOD.contains("macro_rules! nofp_map_record"));
     assert!(ARCH_MOD.contains(".quad 0x3150464F4E4D5259"));
     assert!(CHECKER.contains("MAGIC = 0x3150464F4E4D5259"));
+}
+
+/// The sources and the checker's reviewed exclusion inventory (`--list-inventory`) agree: every
+/// CODE16/CODE32/DATA/USER_PROGRAM record a source emits is an inventory entry of that port owned
+/// by that very source, every inventory entry is emitted by its owner, and every anchor symbol an
+/// entry names is a label its owner defines.
+#[test]
+fn recorded_regions_match_the_reviewed_exclusion_inventory() {
+    let out = std::process::Command::new("python3")
+        .args(["-I", "scripts/check-kernel-nofp.py", "--list-inventory"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 is required to list the KERNEL-NOFP1 exclusion inventory");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut inventory = BTreeSet::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 7, "inventory line `{line}`");
+        let (arch, name, source, segs) = (f[0], f[1], f[3], f[6]);
+        let owner = source
+            .strip_prefix("src/arch/")
+            .unwrap_or_else(|| panic!("{name}: owner {source} outside src/arch"));
+        let (_, src) = RECORDING_SOURCES
+            .iter()
+            .find(|(n, _)| *n == owner)
+            .unwrap_or_else(|| panic!("{arch} `{name}`: owner {owner} is not a recording source"));
+        assert!(owner.starts_with(&format!("{arch}/")), "{name}: {owner}");
+        for anchor in segs.split(',').flat_map(|seg| seg.split("..")) {
+            if anchor.starts_with("section-") {
+                continue;
+            }
+            assert!(
+                src.lines().any(|l| l.trim() == format!("{anchor}:")),
+                "{arch} `{name}`: anchor `{anchor}` is not a label {owner} defines"
+            );
+        }
+        inventory.insert((owner.to_string(), name.to_string()));
+    }
+    let heads = ["CODE16 ", "CODE32 ", "DATA ", "USER_PROGRAM "];
+    let recorded: BTreeSet<(String, String)> = ["x86_64/", "aarch64/", "riscv64/"]
+        .iter()
+        .flat_map(|p| recorded_names(p))
+        .filter(|(_, k)| heads.iter().any(|h| k.starts_with(h)))
+        .collect();
+    assert_eq!(
+        recorded, inventory,
+        "region records emitted by the sources == the reviewed exclusion inventory"
+    );
 }
 
 /// AArch64 assembles FP/SIMD only inside bracketed ranges: every `.arch_extension fp` / `simd`

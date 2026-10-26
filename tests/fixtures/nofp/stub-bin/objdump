@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Umut Deniz Balkan
+"""KERNEL-NOFP1-ACCEPTANCE — a disassembler stand-in for the checker's malformed-output fixtures.
+
+Runs the real `objdump` (the next one on PATH after this directory) and rewrites its output the
+way `YARM_NOFP_STUB` names, so a fixture can present decoder output the checker must refuse to
+interpret. `passthrough` changes nothing (the control). Only the first ordinary integer
+instruction of the fixture's `kernel_main` (`mov %rax,%rbx`) is touched.
+"""
+import os
+import re
+import subprocess
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+real = None
+for d in os.environ.get("PATH", "").split(os.pathsep):
+    if d and os.path.abspath(d) != here and os.access(os.path.join(d, "objdump"), os.X_OK):
+        real = os.path.join(d, "objdump")
+        break
+if real is None:
+    sys.exit("stub objdump: no real objdump on PATH")
+mode = os.environ.get("YARM_NOFP_STUB", "passthrough")
+if mode == "fails" and "--version" not in sys.argv:
+    sys.stderr.write("objdump: simulated failure\n")
+    sys.exit(1)
+r = subprocess.run([real] + sys.argv[1:], capture_output=True, text=True)
+out = r.stdout
+target = re.compile(r"^(\s*[0-9a-f]+:\s+48 89 c3\s+)(mov\s+%rax,%rbx)$", re.M)
+if mode == "unknown-prefix":
+    out = target.sub(r"\1rex.Q \2", out, count=1)
+elif mode == "extra-tokens":
+    out = target.sub(r"\1\2 extra", out, count=1)
+elif mode == "bad-pseudo-prefix":
+    out = target.sub(r"\1{bad} \2", out, count=1)
+elif mode == "garbage-line":
+    out = target.sub(r"\1\2\n  ?? garbage ??", out, count=1)
+elif mode == "dropped-line":
+    out = target.sub("", out, count=1)
+elif mode != "passthrough" and mode != "fails":
+    sys.exit(f"stub objdump: unknown mode {mode}")
+sys.stdout.write(out)
+sys.stderr.write(r.stderr)
+sys.exit(r.returncode)
