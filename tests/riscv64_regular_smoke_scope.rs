@@ -73,7 +73,9 @@ fn build_script_fails_clearly_when_artifacts_missing() {
             && BUILD_COMMON.contains("artifact_boot_guard \"$arch\" \"$kernel\" \"$initramfs\""),
         "the shared build library must record the initramfs and verify the published pair"
     );
-    assert!(ARTIFACT_BINDING.contains("record-kernel") && ARTIFACT_BINDING.contains("record-initramfs"));
+    assert!(
+        ARTIFACT_BINDING.contains("record-kernel") && ARTIFACT_BINDING.contains("record-initramfs")
+    );
 }
 
 #[test]

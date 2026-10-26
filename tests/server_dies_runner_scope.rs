@@ -385,8 +385,12 @@ fn every_runner_records_its_live_stage_and_boots_the_staged_initramfs() {
     );
     // BUILD-GATES1: the live cell refuses, before QEMU, any pair that is not exactly the checked
     // oracle-on kernel over the feature-free initramfs.
-    let guard = COMMON.find("serverdies_boot_guard || ").expect("the live cell is guarded");
-    let boot = COMMON.find("serverdies_boot_once \"$log\"").expect("the live cell boots");
+    let guard = COMMON
+        .find("serverdies_boot_guard || ")
+        .expect("the live cell is guarded");
+    let boot = COMMON
+        .find("serverdies_boot_once \"$log\"")
+        .expect("the live cell boots");
     assert!(guard < boot);
     assert!(COMMON.contains("\"kernel=$FEATURE\" \"initramfs=none\""));
     // The seal the runner emits is the LIVE one, distinct from the readiness seal the stage

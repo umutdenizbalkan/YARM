@@ -176,9 +176,11 @@ fn selected_tools() -> Tools {
         .args(["-I", "scripts/check-kernel-nofp.py", "--check-tools"])
         .current_dir(repo())
         .output()
-        .expect("python3 is required to run the KERNEL-NOFP1 checker (the artifact builds need it too)");
-    let text = String::from_utf8_lossy(&out.stdout).to_string()
-        + &String::from_utf8_lossy(&out.stderr);
+        .expect(
+            "python3 is required to run the KERNEL-NOFP1 checker (the artifact builds need it too)",
+        );
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
         "the no-FP checker's disassemblers are not usable here:\n{text}"

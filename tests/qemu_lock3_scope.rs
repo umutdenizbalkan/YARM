@@ -556,7 +556,11 @@ fn the_smoke_and_grader_are_wired() {
     assert!(SMOKE.contains("FEATURES=x86_64-lock3-witness"));
     // BUILD-GATES1: built and published through the checked path, and refused before boot
     // unless the pair is exactly that witness kernel over the feature-free initramfs.
-    assert!(SMOKE.contains("artifact_build_kernel x86_64 \"--no-default-features --features $FEATURES\""));
+    assert!(
+        SMOKE.contains(
+            "artifact_build_kernel x86_64 \"--no-default-features --features $FEATURES\""
+        )
+    );
     assert!(SMOKE.contains(
         "artifact_boot_guard x86_64 \"$BUILD_DIR/kernel_boot.elf\" \"$BUILD_DIR/initramfs-core.cpio\" \"kernel=$FEATURES\" \"initramfs=none\""
     ));

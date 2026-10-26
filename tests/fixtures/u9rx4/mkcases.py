@@ -158,7 +158,7 @@ def _():
     return PRIOR + fresh_queued_reply(0, 3, 196610) + init_call(0, 4, 262146) + init_call(0, 5, 327682)
 
 
-@case("stale_generation_reply", "reject", "PM's cap ${CAP} resolved against another record")
+@case("stale_generation_reply", "reject", "resolved against another record")
 def _():
     # tid 2's record is (0, 3); the reply resolves and commits against the stale generation 1.
     lines = PRIOR + queued_request(0, 3, 196610) + queued_receive(0, 3, 196610) + PM
@@ -182,7 +182,7 @@ def _():
             + ["IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 len=40"] + init_call(0, 4, 262146))
 
 
-@case("substituted_reply_identity", "reject", "PM's cap ${CAP} resolved against another record")
+@case("substituted_reply_identity", "reject", "resolved against another record")
 def _():
     # PM's cap resolves against another slot's record (1, 3) rather than the request's own.
     lines = PRIOR + fresh_queued_reply(0, 3, 196610)
@@ -216,7 +216,7 @@ def _():
     return PRIOR + fresh_queued_reply(0, 3, 196610) + TIMEOUT
 
 
-@case("duplicate_resolution", "reject", "PM's cap ${CAP} resolved")
+@case("duplicate_resolution", "reject", "resolved more than once")
 def _():
     lines = PRIOR + fresh_queued_reply(0, 3, 196610)
     return lines + ["IPC_REPLY_OBJECT_OK tid=3 cap=196610 reply_index=0 generation=3 target_endpoint=5"]
@@ -251,7 +251,7 @@ def _():
             + prelock_refusal(0, 1))
 
 
-@case("fresh_substituted_reply_index", "reject", "PM's cap ${CAP} resolved against another record")
+@case("fresh_substituted_reply_index", "reject", "resolved against another record")
 def _():
     # Generation 1, but PM's cap resolves against slot 1 rather than the request's slot 0.
     return [l.replace("cap=65538 reply_index=0 generation=1", "cap=65538 reply_index=1 generation=1")
@@ -264,6 +264,84 @@ def _():
     return [l.replace("waiter_cap=65538 expected=Reply { index: 0, generation: 1 }",
                       "waiter_cap=65538 expected=Reply { index: 1, generation: 1 }")
             for l in fresh_queued_reply()]
+
+
+@case("extra_revoke_of_pm_cap_against_another_record", "reject", "revoked once, against")
+def _():
+    # The witnessed revoke is present, and PM's cap is ALSO revoked as another record's one-shot.
+    return fresh_queued_reply() + [
+        f"IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538 waiter_cap=65538 {expected(1, 1)} ok=true"]
+
+
+# ── the evaluator's original self-test cases (U9-RX4 / BL4b / DIRECT3-CAP-FINAL), kept ──────
+
+def fresh_timeout(*late):
+    return queued_request(0, 1, 65538) + TIMEOUT + queued_receive(0, 1, 65538) + PM + list(late)
+
+
+@case("selftest_winner_without_its_attributed_wake", "reject", "the caller must wake exactly once")
+def _():
+    return [l for l in fresh_queued_reply() if not l.startswith("IPC_RECV_V2_META_BLOCKED_WAITER_OK")]
+
+
+@case("selftest_reply_success_after_timeout", "reject", "exactly one claimant must win")
+def _():
+    return fresh_timeout("IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=0 generation=1 target_endpoint=5")
+
+
+@case("selftest_reply_completion_with_timeout_ownership", "reject", "the reply must NOT complete the caller")
+def _():
+    return fresh_timeout("IPC_REPLY_FAIL tid=3 reply_cap=65538 err=WrongObject",
+                         "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 len=40")
+
+
+@case("selftest_late_reply_successes_nonzero", "reject", "late_reply_successes must be 0")
+def _():
+    return [l.replace("late_reply_successes=0", "late_reply_successes=1")
+            for l in fresh_timeout("IPC_REPLY_FAIL tid=3 reply_cap=65538 err=WrongObject")]
+
+
+@case("selftest_timeout_win_without_refusal_of_the_late_reply", "reject", "must be refused")
+def _():
+    return fresh_timeout()
+
+
+@case("selftest_leaked_alias_record_link", "reject", "leak on the witnessed path")
+def _():
+    return fresh_queued_reply() + ["IPC_REPLY_FAST_REVOKE_FAIL tid=3"]
+
+
+@case("selftest_prelock_refusal_that_mutated_state", "reject", "was not inert")
+def _():
+    return fresh_timeout(prelock_refusal(0, 1)[0].replace("reply_copies=0", "reply_copies=1")
+                         .replace("mutations=0", "mutations=1"))
+
+
+@case("selftest_prelock_refusal_on_another_record", "reject", "must be refused")
+def _():
+    return fresh_timeout(prelock_refusal(7, 1)[0])
+
+
+@case("selftest_reply_win_with_a_renumbered_cap", "accept")
+def _():
+    return [l.replace("65538", "262146") for l in fresh_queued_reply()]
+
+
+@case("selftest_resolve_and_revoke_name_another_cap", "reject", "exactly one claimant must win")
+def _():
+    lines = fresh_queued_reply()
+    return [l.replace("cap=65538 reply_index", "cap=131074 reply_index")
+            .replace("replier_tid=3 cap=65538 waiter_cap=65538", "replier_tid=3 cap=131074 waiter_cap=131074")
+            for l in lines]
+
+
+@case("selftest_reply_cap_minted_after_the_receive", "reject", "before the receive")
+def _():
+    lines = fresh_queued_reply()
+    mint = next(l for l in lines if l.startswith("IPC_REPLY_CAP_ONESHOT_OK"))
+    lines.remove(mint)
+    at = next(i for i, l in enumerate(lines) if "PM_RECV_GOT_MSG" in l)
+    return lines[:at + 1] + [mint] + lines[at + 1:]
 
 
 def main():

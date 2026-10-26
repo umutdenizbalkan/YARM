@@ -178,8 +178,14 @@ guard over "$d/over"
         assert_eq!(verdict(&text, ok), "accept", "{ok}:\n{text}");
     }
     for (label, why) in [
-        ("wrong_kernel", "requires the kernel built with features=x86-vmi2-witness"),
-        ("wrong_initramfs", "requires the initramfs built with features=none"),
+        (
+            "wrong_kernel",
+            "requires the kernel built with features=x86-vmi2-witness",
+        ),
+        (
+            "wrong_initramfs",
+            "requires the initramfs built with features=none",
+        ),
         ("swapped", "is not the recorded artifact"),
         ("stale_initramfs", "is not the recorded artifact"),
         ("missing_kernel_record", "has no provenance record"),
@@ -212,7 +218,11 @@ guard over "$d/over"
 fn stub_qemu(dir: &Path) -> PathBuf {
     let bin = dir.join("stub-bin");
     std::fs::create_dir_all(&bin).unwrap();
-    for name in ["qemu-system-x86_64", "qemu-system-aarch64", "qemu-system-riscv64"] {
+    for name in [
+        "qemu-system-x86_64",
+        "qemu-system-aarch64",
+        "qemu-system-riscv64",
+    ] {
         let p = bin.join(name);
         std::fs::write(
             &p,
@@ -290,7 +300,8 @@ grep -h "ARTIFACT_BINDING " "$d/v2ok.log" | sed 's/^/  [v2ok] /'
     assert!(text.contains("[v2bad] [error] ARTIFACT-BINDING: this run requires the kernel built with features=x86-vmi2-witness"), "{text}");
     assert!(text.contains("PUBLISH_v2ok=0"), "{text}");
     assert!(
-        text.lines().any(|l| l.starts_with("V2OK rc=") && l.ends_with("qemu=yes")),
+        text.lines()
+            .any(|l| l.starts_with("V2OK rc=") && l.ends_with("qemu=yes")),
         "positive control: an accepted skip-build set must reach QEMU:\n{text}"
     );
     for label in ["cached", "wrong"] {
@@ -299,7 +310,10 @@ grep -h "ARTIFACT_BINDING " "$d/v2ok.log" | sed 's/^/  [v2ok] /'
             "{label} must be refused before QEMU:\n{text}"
         );
     }
-    assert!(text.contains("[cached] [error] ARTIFACT-BINDING:"), "{text}");
+    assert!(
+        text.contains("[cached] [error] ARTIFACT-BINDING:"),
+        "{text}"
+    );
     assert!(text.contains("has no provenance record"), "{text}");
     assert!(
         text.contains("requires the kernel built with features=x86-vmi2-witness"),
@@ -417,7 +431,10 @@ fn the_recorded_compile_environment_is_every_option_env_in_the_tree() {
     servers.sort();
     servers.dedup();
     let py = include_str!("../scripts/artifact-provenance.py");
-    assert!(kernel.is_empty(), "the kernel crate reads {kernel:?}: record it");
+    assert!(
+        kernel.is_empty(),
+        "the kernel crate reads {kernel:?}: record it"
+    );
     let list = py
         .split("\"initramfs\": (")
         .nth(1)

@@ -181,8 +181,13 @@ fn every_artifact_build_runs_the_final_image_check() {
         .1;
     let body = &body[..body.find("\n}\n").expect("end")];
     let check = body.find("scripts/check-kernel-nofp.sh").expect("check");
-    let publish = body.find("mv -f \"$stage_elf\" \"$out_elf\"").expect("publish");
-    assert!(check < publish, "the check runs before anything is published");
+    let publish = body
+        .find("mv -f \"$stage_elf\" \"$out_elf\"")
+        .expect("publish");
+    assert!(
+        check < publish,
+        "the check runs before anything is published"
+    );
     assert!(body.contains("return 1"));
     assert!(body.contains("_ab_invalidate \"$out_elf\" \"$out_boot\""));
 }
