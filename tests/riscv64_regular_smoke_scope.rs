@@ -39,7 +39,7 @@ fn build_script_fails_clearly_when_artifacts_missing() {
         "common_build_integrity_init",
         "common_verify_artifact_fresh \"$KERNEL_IMAGE\" \"kernel image\"",
         "common_verify_artifact_fresh \"$INITRAMFS_IMAGE_ABS\" \"initramfs image\"",
-        "common_write_manifest \"riscv64\"",
+        "common_record_artifacts \"riscv64\" \"$KERNEL_IMAGE\" \"$INITRAMFS_IMAGE_ABS\"",
     ] {
         assert!(
             BUILD_SCRIPT.contains(gate),
@@ -58,19 +58,22 @@ fn build_script_fails_clearly_when_artifacts_missing() {
             && BUILD_COMMON.contains("exit 1"),
         "a failed build/stage step must fail closed with a nonzero exit"
     );
-    // Artifact sizes are still recorded for diagnostic transparency. BL5c: each manifest record is
-    // written by `artifact_manifest_line` in the artifact-binding library, which the shared build
-    // library sources and calls for both artifacts.
+    // BUILD-GATES1: the kernel is published through the shared path (no-FP check on the final ELF
+    // and raw image, then a provenance record), and the initramfs is recorded and the pair
+    // verified by the binding library the shared build library sources.
+    assert!(
+        BUILD_SCRIPT.contains(
+            "artifact_publish_kernel \"riscv64\" \"$KERNEL_ELF\" \"${BOOTSTRAP_FEATURE_ARGS}\" \"$KERNEL_ELF_IMAGE\" \"$KERNEL_IMAGE\""
+        ),
+        "the RISC-V build must publish its kernel through the checked publish path"
+    );
     assert!(
         BUILD_COMMON.contains("source \"$(dirname \"${BASH_SOURCE[0]}\")/artifact-binding.sh\"")
-            && BUILD_COMMON.contains("artifact_manifest_line \"$kernel\" kernel \"$feat\"")
-            && BUILD_COMMON.contains("artifact_manifest_line \"$initramfs\" initramfs \"$feat\""),
-        "the shared build library must write each manifest record through the binding library"
+            && BUILD_COMMON.contains("artifact_record_initramfs \"$arch\" \"$initramfs\"")
+            && BUILD_COMMON.contains("artifact_boot_guard \"$arch\" \"$kernel\" \"$initramfs\""),
+        "the shared build library must record the initramfs and verify the published pair"
     );
-    assert!(
-        ARTIFACT_BINDING.contains("size=%s") && ARTIFACT_BINDING.contains("stat -c '%s'"),
-        "the manifest must report artifact sizes for diagnostic transparency"
-    );
+    assert!(ARTIFACT_BINDING.contains("record-kernel") && ARTIFACT_BINDING.contains("record-initramfs"));
 }
 
 #[test]

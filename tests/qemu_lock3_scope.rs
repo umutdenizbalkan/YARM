@@ -554,7 +554,12 @@ fn the_smp1_hooks_and_round_count_are_gated() {
 #[test]
 fn the_smoke_and_grader_are_wired() {
     assert!(SMOKE.contains("FEATURES=x86_64-lock3-witness"));
-    assert!(SMOKE.contains("--no-default-features --features \"$FEATURES\""));
+    // BUILD-GATES1: built and published through the checked path, and refused before boot
+    // unless the pair is exactly that witness kernel over the feature-free initramfs.
+    assert!(SMOKE.contains("artifact_build_kernel x86_64 \"--no-default-features --features $FEATURES\""));
+    assert!(SMOKE.contains(
+        "artifact_boot_guard x86_64 \"$BUILD_DIR/kernel_boot.elf\" \"$BUILD_DIR/initramfs-core.cpio\" \"kernel=$FEATURES\" \"initramfs=none\""
+    ));
     assert!(SMOKE.contains("SMP1_MUTUAL_ROUNDS=12 SMP1_EXTRA_WAKES_01=6 SMP1_EXTRA_WAKES_10=6"));
     assert!(SMOKE.contains("python3 scripts/grade-x86_64-lock3-witness.py"));
     assert!(

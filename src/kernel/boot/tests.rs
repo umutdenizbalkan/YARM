@@ -104034,7 +104034,9 @@ mod stage200d0c1_aarch64_exit_prep {
         assert!(
             RUNNER.contains("BOOTSTRAP_FEATURE_ARGS=\"--no-default-features --features $FEATURE\"")
         );
-        assert!(RUNNER.contains("--features \"$FEATURE\" \\"));
+        // BUILD-GATES1: the artifact build above publishes the feature-on kernel (no separate
+        // rebuild), and the boot refuses any kernel or initramfs not built with exactly it.
+        assert!(RUNNER.contains("ARTIFACT_REQUIRE=\"kernel=$FEATURE initramfs=$FEATURE\""));
         assert!(RUNNER.contains("feature not forwarded to userspace"));
     }
 
@@ -105297,7 +105299,9 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(
             RUNNER.contains("BOOTSTRAP_FEATURE_ARGS=\"--no-default-features --features $FEATURE\"")
         );
-        assert!(RUNNER.contains("--features \"$FEATURE\" \\"));
+        // BUILD-GATES1: the artifact build above publishes the feature-on kernel (no separate
+        // rebuild), and the boot refuses any kernel or initramfs not built with exactly it.
+        assert!(RUNNER.contains("ARTIFACT_REQUIRE=\"kernel=$FEATURE initramfs=$FEATURE\""));
         assert!(RUNNER.contains("feature not forwarded to userspace"));
     }
 

@@ -378,11 +378,17 @@ fn every_runner_records_its_live_stage_and_boots_the_staged_initramfs() {
     assert!(
         COMMON.contains("./scripts/build-qemu-${arch}-artifacts.sh")
             && COMMON.contains(
-                "--features \"$FEATURE\" -p yarm --bin kernel_boot >>\"$LOGDIR/stage.log\""
+                "artifact_build_kernel \"$arch\" \"--no-default-features --features $FEATURE\" \\"
             )
             && COMMON.contains("staged image is not oracle-on"),
-        "the staging helper rebuilds oracle-on after the artifact script and verifies the image"
+        "the staging helper rebuilds oracle-on (checked and recorded) after the artifact script and verifies the image"
     );
+    // BUILD-GATES1: the live cell refuses, before QEMU, any pair that is not exactly the checked
+    // oracle-on kernel over the feature-free initramfs.
+    let guard = COMMON.find("serverdies_boot_guard || ").expect("the live cell is guarded");
+    let boot = COMMON.find("serverdies_boot_once \"$log\"").expect("the live cell boots");
+    assert!(guard < boot);
+    assert!(COMMON.contains("\"kernel=$FEATURE\" \"initramfs=none\""));
     // The seal the runner emits is the LIVE one, distinct from the readiness seal the stage
     // itself emits — so a prepared-but-unrun runner can never be mistaken for a live proof.
     assert!(

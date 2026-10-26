@@ -23,7 +23,7 @@ const A64_USER_TARGET: &str = include_str!("../targets/aarch64-yarm-user-none.js
 const RV_USER_TARGET: &str = include_str!("../targets/riscv64-yarm-user-none.json");
 const CARGO_CONFIG: &str = include_str!("../.cargo/config.toml");
 const CHECKER: &str = include_str!("../scripts/check-kernel-nofp.py");
-const COMMON: &str = include_str!("../scripts/lib/build-qemu-artifacts-common.sh");
+const BINDING: &str = include_str!("../scripts/lib/artifact-binding.sh");
 const BUILD_X86: &str = include_str!("../scripts/build-qemu-x86_64-artifacts.sh");
 const BUILD_A64: &str = include_str!("../scripts/build-qemu-aarch64-artifacts.sh");
 const BUILD_RV: &str = include_str!("../scripts/build-qemu-riscv64-artifacts.sh");
@@ -150,37 +150,41 @@ fn user_targets_keep_their_fp_simd() {
     assert_eq!(json_string(RV_USER_TARGET, "llvm-abiname"), "lp64");
 }
 
-/// Every QEMU artifact build runs the final-image check on the kernel it publishes, after the
-/// marker contract, and a failure aborts the build.
+/// Every QEMU artifact build publishes its kernel through the shared publish path, after the
+/// marker contract and before the pair is recorded; that path runs the final-image check on the
+/// staged bytes and publishes nothing on a failure.
 #[test]
 fn every_artifact_build_runs_the_final_image_check() {
     for (build, call) in [
         (
             BUILD_X86,
-            "common_verify_kernel_nofp \"x86_64\" \"$KERNEL_IMAGE\"\n",
+            "artifact_publish_kernel \"x86_64\" \"$KERNEL_ELF\" \"${BOOTSTRAP_FEATURE_ARGS}\" \"$KERNEL_IMAGE\"\n",
         ),
         (
             BUILD_A64,
-            "common_verify_kernel_nofp \"aarch64\" \"$KERNEL_ELF\" \"$KERNEL_BIN_IMAGE\"\n",
+            "artifact_publish_kernel \"aarch64\" \"$KERNEL_ELF\" \"${BOOTSTRAP_FEATURE_ARGS}\" \"$KERNEL_IMAGE\" \"$KERNEL_BIN_IMAGE\"\n",
         ),
         (
             BUILD_RV,
-            "common_verify_kernel_nofp \"riscv64\" \"$KERNEL_ELF\" \"$KERNEL_IMAGE\"\n",
+            "artifact_publish_kernel \"riscv64\" \"$KERNEL_ELF\" \"${BOOTSTRAP_FEATURE_ARGS}\" \"$KERNEL_ELF_IMAGE\" \"$KERNEL_IMAGE\"\n",
         ),
     ] {
         assert!(build.contains("set -euo pipefail"));
-        let at = build.find(call).expect("the check is called");
+        let at = build.find(call).expect("the publish path is called");
         let markers = build.find("common_verify_kernel_markers").expect("markers");
-        let manifest = build.find("common_write_manifest").expect("manifest");
-        assert!(markers < at && at < manifest);
+        let record = build.find("common_record_artifacts").expect("record");
+        assert!(markers < at && at < record);
     }
-    let body = COMMON
-        .split_once("common_verify_kernel_nofp() {")
-        .expect("gate defined")
+    let body = BINDING
+        .split_once("artifact_publish_kernel() {")
+        .expect("publish defined")
         .1;
     let body = &body[..body.find("\n}\n").expect("end")];
-    assert!(body.contains("scripts/check-kernel-nofp.sh"));
+    let check = body.find("scripts/check-kernel-nofp.sh").expect("check");
+    let publish = body.find("mv -f \"$stage_elf\" \"$out_elf\"").expect("publish");
+    assert!(check < publish, "the check runs before anything is published");
     assert!(body.contains("return 1"));
+    assert!(body.contains("_ab_invalidate \"$out_elf\" \"$out_boot\""));
 }
 
 fn policy_kinds(arch: &str) -> BTreeSet<String> {

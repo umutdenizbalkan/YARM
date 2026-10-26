@@ -237,6 +237,17 @@ def verify(arch, kernel, initramfs, requires):
                     problems.append(f"the no-FP report {rpt or '?'} is missing or changed")
                 elif rec.get("nofp_line", "") not in open(rpt).read():
                     problems.append(f"the no-FP report {rpt} does not hold the recorded result")
+                else:
+                    # The check judged the image under the features its build was given; a
+                    # record whose features differ from the ones the check used is relabeled.
+                    m = re.search(r" features=(\S+) ", rec.get("nofp_line", ""))
+                    judged = m.group(1) if m else "?"
+                    if judged == "-":
+                        judged = "none"
+                    if judged != rec.get("features"):
+                        problems.append(f"kernel {path} is recorded with features="
+                                        f"{rec.get('features')}, but its no-FP check judged "
+                                        f"features={judged}")
     env_want = {"kernel": [], "initramfs": []}
     exact = set()
     for req in requires:
