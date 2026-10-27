@@ -28653,7 +28653,8 @@ without one:
 
 | Field(s) of `KernelState` | Authority |
 |---|---|
-| `scheduler_state` | its own `SpinLockIrq` (rank 1), which contains the data |
+| `scheduler_state` | SCHED-LOCK1: the `SchedDomain`'s own internal authorities — one `SpinLockIrq` per CPU (rank 1L) for that CPU's queues, current slot and quantum; the admission lock (rank 1G); and atomics for the clock, the admission bitmaps and the per-CPU mirrors (`doc/SCHEDULING_CONTRACT.md` §16). (Before SCHED-LOCK1: its own `SpinLockIrq` (rank 1), which contained all of it.) |
+| `hosted_ambient_cpu` | SCHED-LOCK1, hosted builds only: the test harness's CPU selector, an atomic written by `set_current_cpu` and read only by hosted code; absent from freestanding builds |
 | `tcbs`, `task_classes`, `tls_restore_pending`, `robust_futex`, `tid_allocation_cursor`, `spawn_reservation_generation` | `task_state_lock` (rank 2) |
 | `ipc` | `ipc_state_lock` (rank 3) |
 | `capability` | `capability_state_lock` (rank 4) |

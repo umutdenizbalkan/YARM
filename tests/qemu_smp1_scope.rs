@@ -116,11 +116,13 @@ fn the_ack_wait_answers_its_own_mailbox_in_the_stub_order() {
 #[test]
 fn fp_homes_are_authenticated_against_the_current_incarnation() {
     let helper = code(fn_body(RUNTIME, "fn with_current_fpu_home_split<R>("));
-    let rank1 = pos(&helper, "self.with_scheduler_split_mut(");
+    // SCHED-LOCK1: rank 1 is this CPU's own 1L; the other CPUs are read through their mirrors.
+    let rank1 = pos(&helper, "self.with_cpu_sched_split(cpu, |c| {");
     let rank2 = pos(&helper, "self.with_task_tcbs_split_mut(");
     assert!(rank1 < rank2);
     for check in [
-        "current_tid_on(cpu)",
+        "c.current_tid()",
+        "domain.current_elsewhere(cpu,",
         "CurrentElsewhere",
         "tcb.asid",
         "tcb.status",

@@ -1294,8 +1294,13 @@ enum Authority {
     Lock(&'static str),
     /// A lock: an atomic protocol in its own right.
     IsLock,
-    /// A lock that contains its data (`SpinLockIrq<SchedulerState>`).
-    SelfLocked,
+    /// SCHED-LOCK1: a domain that contains its own locks and atomics (`SchedDomain`: one lock per
+    /// CPU, an admission lock, an atomic clock and published bitmaps/mirrors). It is only ever
+    /// shared; there is no whole-domain lock to project alongside it.
+    InternallyLocked,
+    /// SCHED-LOCK1: hosted builds only — the test harness's CPU selector, an atomic outside the
+    /// scheduler that no production split path reads. Absent from freestanding builds.
+    HostedOnlyAtomic,
     /// Written during construction, read-only afterwards.
     ImmutableAfterConstruction,
     /// Touched only by whole-state code, which runs only in the boot exclusive phase (and in
@@ -1307,7 +1312,8 @@ const FIELD_AUTHORITY: &[(&str, Authority)] = &[
     ("kernel_aspace", Authority::ExclusivePhaseOnly),
     ("hal", Authority::ExclusivePhaseOnly),
     ("user_spaces", Authority::Lock("vm_state_lock")),
-    ("scheduler_state", Authority::SelfLocked),
+    ("scheduler_state", Authority::InternallyLocked),
+    ("hosted_ambient_cpu", Authority::HostedOnlyAtomic),
     ("ipc_state_lock", Authority::IsLock),
     ("driver_state_lock", Authority::IsLock),
     ("fault_state_lock", Authority::IsLock),
@@ -1456,7 +1462,12 @@ fn blr1_kernel_state_field_authority_is_total_and_projections_respect_it() {
                 Authority::ExclusivePhaseOnly => {
                     panic!("{name}: `{f}` is whole-state-only and must never be projected")
                 }
-                Authority::IsLock | Authority::SelfLocked => {}
+                Authority::IsLock | Authority::InternallyLocked => {}
+                Authority::HostedOnlyAtomic => assert!(
+                    !mutable && name.starts_with("hosted_"),
+                    "{name}: `{f}` is the hosted-only selector and may only be read, by its own \
+                     hosted projector"
+                ),
             }
         }
         audited += 1;

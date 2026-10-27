@@ -120,10 +120,20 @@ fn the_ap_is_admitted_only_after_its_interface_is_published() {
             < pos(&borrow, "yarm_aarch64_enter_user_mode_eret("),
         "the BSP ends its boot borrow before its first EL0 entry"
     );
+    // SCHED-LOCK1: production admission is ONE transition under 1G + the CPU's 1L, shared by
+    // both admission kinds: it leaves the wake-only set and (for `admit_dispatch`) joins
+    // balanced placement.
     let admit = code(fn_body(SCHED, "pub fn admit_dispatch("));
+    assert!(admit.contains("admit(&mut view, false)"));
+    let transition = code(fn_body(
+        SCHED,
+        "fn admit(view: &mut CpuView<'_>, pinned_only: bool)",
+    ));
     assert!(
-        admit.contains("self.wake_only &= !bit;")
-            && admit.contains("self.balance_excluded &= !bit;")
+        transition.contains("SchedTopo::set_bit(&view.topo.wake_only, view.idx, false);")
+            && transition.contains(
+                "SchedTopo::set_bit(&view.topo.balance_excluded, view.idx, pinned_only);"
+            )
     );
     assert!(code(TRAP).contains("pub(crate) fn enter_ap_idle(cpu: CpuId) -> ! {"));
     assert!(fn_body(TRAP, "pub(crate) fn enter_ap_idle(").contains("idle_no_eret_loop();"));

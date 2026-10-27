@@ -6,7 +6,7 @@
 //! Three kinds of evidence live here, and they are deliberately kept apart because they prove
 //! different things:
 //!
-//! * [`production`] drives the REAL `PriorityScheduler` / `SmpScheduler` — the owners every
+//! * [`production`] drives the REAL `PriorityScheduler` / `SchedDomain` — the owners every
 //!   production dispatch reaches. These tests are enforcement evidence, and only for requirements
 //!   the contract labels **ENFORCED**. Each names the requirement it pins.
 //! * [`model`] is a small, test-only executable policy model of the FUTURE first real-time profile
@@ -33,8 +33,8 @@
 
 use yarm::kernel::ipc::ThreadId;
 use yarm::kernel::scheduler::{
-    AcceptedSelection, CpuId, DispatchSelection, MAX_RUN_QUEUE, PriorityScheduler, SchedulerError,
-    SmpScheduler, TaskPriority,
+    AcceptedSelection, CpuId, DispatchSelection, MAX_RUN_QUEUE, PriorityScheduler, SchedDomain,
+    SchedulerError, TaskPriority,
 };
 
 /// Evidence for requirements the contract labels ENFORCED, against the production owners.
@@ -177,7 +177,9 @@ mod production {
     /// CPU idle.
     #[test]
     fn sc_cpu_1_enqueue_is_confined_to_the_named_cpu() {
-        let mut s = SmpScheduler::default();
+        // SCHED-LOCK1: the production scheduler domain, under its exclusive (unlocked) view.
+        let mut domain = SchedDomain::new(0b1, 1);
+        let mut s = domain.exclusive();
         s.set_present_cpu_bitmap(0b11);
         s.bring_up_cpu(CpuId(1)).expect("cpu1 online");
         s.enqueue_on_with_priority(CpuId(1), t(5), TaskPriority::Normal)

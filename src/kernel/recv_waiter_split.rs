@@ -532,7 +532,13 @@ mod tests {
         // therefore NOT call the SharedKernel-level seam methods directly,
         // and the M2_SEAM_HELPER_ONLY fence for those seams must stay intact.
         let ipc_src = include_str!("boot/ipc_state.rs");
-        for name in ["with_scheduler_split_mut(", "with_task_tcbs_split_mut("] {
+        // SCHED-LOCK1: the scheduler seams are now the per-CPU / admission / coherent forms.
+        for name in [
+            "with_cpu_sched_split(",
+            "with_cpu_admission_split(",
+            "with_all_cpus_sched_split(",
+            "with_task_tcbs_split_mut(",
+        ] {
             assert!(
                 !ipc_src.contains(name),
                 "{name} must not be called from the D2 path yet (deferred, see doc note)"
