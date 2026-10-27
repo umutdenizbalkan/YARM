@@ -64,6 +64,10 @@ They are never alternate dispatchers:
   "Stage 4", by contrast, *plans* per-CPU lock domains. §12 (SCHED-LOCK1) records how a future
   package must reconcile them. *(Corrected by SCHED-CONTRACT1-CORRECTION: this line previously
   said the `KERNEL_LOCKING.md` rank table forbids per-CPU locks. It does not.)*
+  **Superseded by SCHED-LOCK1 (§16–§17):** `SmpScheduler` and `SchedulerState` are gone. The
+  `SchedDomain` gives each CPU its own lock (rank 1L) over its queues, current slot and quantum;
+  admission has its own lock (rank 1G); the clock, admission bitmaps and per-CPU mirrors are
+  atomics; the ambient `current_cpu` is removed. The paragraph above is kept as the baseline.
 * **Priorities.** There are three levels, `TaskPriority::{High, Normal, Low}`
   (`crates/yarm-kernel/src/scheduler.rs`). They are derived only by
   `task_enqueue::priority_for_class`: `SystemServer` is High, and `Driver` and `App` are Normal.
@@ -816,7 +820,7 @@ never by adding an alternative dispatcher selected by profile.
 | SC-KT-1 | Owned kernel stack, from a bounded pool, with a guard page; distinct from user and idle stacks (idle is a diverging primitive at a per-CPU anchor, §1.7). Stacks are pre-mapped: supervisor page faults are kernel-fatal (§1.9). | `KernelExecutionContext {stack_base, stack_top, owns_stack}` exists (D6 scaffolding); `refresh_boot_tss_rsp0` | same field | same field | **SPECIFIED → KTHREAD1** |
 | SC-KT-2 | Kernel continuation saved and resumed, distinct from the user `UserRegisterContext` | `yarm_x86_switch_frame` (callee-saved, `rsp`, `rip`) | `yarm_aarch64_switch_frame` | `yarm_riscv64_switch_frame` | **SPECIFIED → KTHREAD1** (cooperative switch exists on all three; production-dormant) |
 | SC-KT-3 | First entry: an explicit entry ABI (stack alignment, argument registers, return-to-exit) | `yarm_kernel_thread_switch_trampoline` (D6 proof) | not established | not established | **SPECIFIED → KTHREAD1** (canonical 202A already requires the ABI contract) |
-| SC-KT-4 | Asynchronous preemption of kernel mode. Not to be enabled before SCHED-LOCK1 (SC-LOCK-8) and KERNEL-NOFP1 (SC-FP-1). | none: masked kernel | none | none; S-mode traps other than idle halt | **SPECIFIED → KTHREAD1**, gated by SCHED-LOCK1 and KERNEL-NOFP1 |
+| SC-KT-4 | Asynchronous preemption of kernel mode. Not to be enabled before SCHED-LOCK1 (SC-LOCK-8) and KERNEL-NOFP1 (SC-FP-1); both are done, and neither enables or qualifies it. | none: masked kernel | none | none; S-mode traps other than idle halt | **SPECIFIED → KTHREAD1**, gated by SCHED-LOCK1 and KERNEL-NOFP1 |
 | SC-KT-5 | Kernel FP/SIMD state. Ordinary kernel code and its linked runtime helpers use no FP/SIMD registers, so a kernel thread carries no FP/SIMD state; audited context routines are the exceptions (§8.2). | 0 in ordinary code (was 22 779 FP/SIMD-classified instructions) | 0 in ordinary code (was 2 547) | 0 | **ENFORCED by KERNEL-NOFP1** (final-image check on every artifact build) |
 | SC-KT-6 | Flags and TLS: the kernel's per-CPU base and flags are restored on a kernel-to-kernel switch | not traced in this package | not traced | not traced | **UNRESOLVED**: missing inventory of kernel per-CPU and TLS registers; owner KTHREAD1 |
 | SC-KT-7 | Interrupt nesting and safe preemption points: preemption only at points holding none of SC-BND-2's items | no nesting | no nesting | no nesting | **SPECIFIED → KTHREAD1** |
@@ -1157,7 +1161,8 @@ CPU executes.
 | SC-FP-1…3, SC-KT-5 | **done** (KERNEL-NOFP1, §8.2) | — | final-image check on every artifact build | — |
 | SC-FP-5 | QEMU only | execution cost on hardware | N | hardware bring-up |
 | SC-FP-4 | none | static per-task FP policy with enforced non-use | P + L | FP-POLICY1 |
-| SC-LOCK-1…8 (§12) | one rank-1 lock over every CPU's scheduler state | CPU-local ownership, bounded local exclusion, cross-CPU wake protocol | P + L + S (progress argument) | **SCHED-LOCK1** (OPEN, next) |
+| SC-LOCK-1…7 (§12) | **done** (SCHED-LOCK1, §16–§17): per-CPU 1L, admission 1G, atomic clock / bitmaps / mirrors | — | P + L + S (progress argument), §17 | — |
+| SC-INV-1, W1 for 1L / 1G | TTAS `SpinLockIrq`, now per CPU | fair lock or bounded-contention proof | S + N | RT-SCHED1 |
 
 **Not started and not part of this contract:** VFS work and hardware bring-up remain on the
 roadmap in `doc/KERNEL_UNLOCKING.md` §0.8. Hardware bring-up is the prerequisite for every **N**
@@ -1184,9 +1189,9 @@ bound above.
 
 ---
 
-## 12. SCHED-LOCK1: the scheduler domain lock is an OPEN prerequisite
+## 12. SCHED-LOCK1: the scheduler domain lock — DONE
 
-**The problem, from source (§1.1, §1.2).**
+**The problem, from source (§1.1, §1.2), as it stood before SCHED-LOCK1.**
 
 * The per-CPU run queues, current slots and quanta all live inside ONE rank-1 scheduler domain
   lock (`SchedulerState` behind `with_scheduler_split_mut`).
@@ -1196,34 +1201,36 @@ bound above.
 * This is a **different lock** from the retired broad `KernelState` lock, whose production
   census is 0. Retiring the broad lock did not make the scheduler CPU-local.
 
-**SCHED-LOCK1 is OPEN.** Its requirements:
+**SCHED-LOCK1 is DONE** (design record §16, implementation and evidence §17, qualification
+record `doc/KERNEL_UNLOCKING.md` §0.8). The requirements and their status:
 
-* **SC-LOCK-1 — CPU-local scheduling state has explicit local ownership.** **SPECIFIED →
-  SCHED-LOCK1.** Each CPU's runnable queues, current slot and quantum belong to that CPU. Another
+* **SC-LOCK-1 — CPU-local scheduling state has explicit local ownership.** **ENFORCED**
+  (SCHED-LOCK1: one rank-1L lock per CPU, §16.2, §17.1). Each CPU's runnable queues, current slot and quantum belong to that CPU. Another
   CPU's scheduling operation does not enter that CPU's critical section, except through SC-LOCK-3.
-* **SC-LOCK-2 — Local exclusion is bounded.** **SPECIFIED → SCHED-LOCK1.** The exclusion that
+* **SC-LOCK-2 — Local exclusion is bounded.** **ENFORCED as a progress argument (§17.3); the
+  acquisition wait stays kind W1 (A / N): no time bound is claimed.** The exclusion that
   protects CPU-local state has a stated progress argument and a bound in the §6 kinds. A local
   lock is acceptable only with that argument. An owner-consumed queue is acceptable only with
   that argument. **"Lock-free" is not mandated and is not by itself an argument.**
-* **SC-LOCK-3 — There is an explicit cross-CPU wake protocol.** **SPECIFIED → SCHED-LOCK1.** A
+* **SC-LOCK-3 — There is an explicit cross-CPU wake protocol.** **ENFORCED** (§16.4, §17.2). A
   remote wake publishes to the target CPU by a defined protocol, which must specify:
   * the remote-queue capacity, and the behaviour when it is full — never silent loss;
   * publication ordering against the reschedule IPI;
   * cancellation: a wake for an incarnation that died or was already woken;
   * lost-wakeup prevention, including the target entering idle concurrently with publication.
-* **SC-LOCK-4 — Existing guarantees are preserved.** **SPECIFIED → SCHED-LOCK1.** The
+* **SC-LOCK-4 — Existing guarantees are preserved.** **ENFORCED** (§16.6, §17.4). The
   decomposition preserves:
   * exact task-incarnation authentication (`{tid, asid}` and generations);
   * queue membership (one place per runnable incarnation, SC-CTX-8 for RT-P1);
   * wake arbitration (exactly one waker wins);
   * `DispatchAuthority` and `DispatchMarkToken`;
   * the ascending lock order.
-* **SC-LOCK-5 — Global coordination is separated from local dispatch.** **SPECIFIED →
-  SCHED-LOCK1.** Genuinely global state is owned separately from per-CPU dispatch and is never
+* **SC-LOCK-5 — Global coordination is separated from local dispatch.** **ENFORCED** (§16.2:
+  1G, the atomic clock and bitmaps; the ambient `current_cpu` removed). Genuinely global state is owned separately from per-CPU dispatch and is never
   taken on a CPU's ordinary dispatch path. That state includes the clock owner's tick
   (SC-TIME-2), topology, admission (wake-only and balance-excluded sets), balanced placement and
   the ambient `current_cpu`.
-* **SC-LOCK-6 — Remaining shared dependencies are inventoried.** **SPECIFIED → SCHED-LOCK1.**
+* **SC-LOCK-6 — Remaining shared dependencies are inventoried.** **ENFORCED** (§16.7, §17.3).
   Splitting this one lock does not make scheduling bounded. The package inventories every shared
   dependency left on a dispatch path, and claims nothing about the whole scheduler's bound. The
   known ones are:
@@ -1231,7 +1238,8 @@ bound above.
   * `PRINTK_DRAIN_LOCK` (W7);
   * the IPC and timeout domains;
   * TLB shootdown waits (W4).
-* **SC-LOCK-7 — The legacy restrictions are reconciled explicitly.** **SPECIFIED → SCHED-LOCK1.**
+* **SC-LOCK-7 — The legacy restrictions are reconciled explicitly.** **ENFORCED** (§17.5): the
+  D6 bullet, the guard and the rank table were revised in SCHED-LOCK1 itself, as recorded there.
   These restrict per-CPU scheduler lock types today:
   * `doc/AI_AGENT_RULES.md` §14.4, the D6 bullet: "no per-CPU scheduler lock types until the
     x86_64 SMP trampoline split lands and D2/D3 are smoke-stable";
@@ -1244,15 +1252,17 @@ bound above.
 
   SCHED-LOCK1 must revise those rules, the guard and the rank table **explicitly**, in the same
   change and with stated justification. It must not route around them. This contract does not
-  relax any of them.
-* **SC-LOCK-8 — Ordering in the roadmap.** **SPECIFIED.**
+  relax any of them. (Done by SCHED-LOCK1, which the brief explicitly authorized; §17.5.)
+* **SC-LOCK-8 — Ordering in the roadmap.** **SPECIFIED** (unchanged; SCHED-LOCK1 now precedes
+  KTHREAD1 and RT-SCHED1, neither of which is started).
   * SCHED-LOCK1 is scheduled **before** preemptible kernel threads are enabled, and **before** any
     claim of bounded RT scheduling latency.
   * Basic kernel-context preparation (KTHREAD1's stacks, entry ABI and cooperative switch) may
     proceed separately. It must not enable preemption that SCHED-LOCK1's exclusion rules would
     make unsafe.
-* **SC-LOCK-9 — No lock is split before SCHED-LOCK1.** **ENFORCED** by the legacy guard above.
-  SCHED-CONTRACT1 and its correction change no lock.
+* **SC-LOCK-9 — No lock is split before SCHED-LOCK1.** **DISCHARGED.** It held until SCHED-LOCK1
+  (SCHED-CONTRACT1 and its correction changed no lock). SCHED-LOCK1 is the split, and it replaced
+  the legacy guard with checks for the new ownership rules (§17.5).
 
 ---
 
@@ -1323,9 +1333,11 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-GP-1 (differential, for the mechanisms exercised);
   * SC-KT-0;
   * SC-KT-5, SC-FP-1, SC-FP-2, SC-FP-3 (KERNEL-NOFP1);
-  * SC-LOCK-9.
+  * SC-LOCK-1, SC-LOCK-3…7 (SCHED-LOCK1), and SC-LOCK-2 as a progress argument (its wait stays
+    W1: no time bound).
+* **DISCHARGED:** SC-LOCK-9 (it held until SCHED-LOCK1, which is the split).
 * **SPECIFIED, with an implementing package:**
-  * **SCHED-LOCK1** (next): SC-LOCK-1…8.
+  * SC-LOCK-8 (roadmap order: SCHED-LOCK1 before KTHREAD1 kernel preemption and RT-SCHED1).
   * **KTHREAD1:** SC-KT-1…4, SC-KT-7…12, SC-BND-2, SC-EXEC-3.
   * **RT-SCHED1:**
     * SC-CPU-2;
@@ -1574,3 +1586,173 @@ kernel preemption, RT priorities/budgets, migration or partition windows.
 * The coherent snapshot holds every 1L for one O(MAX_CPUS × 3 × 64) scan; it is used only on the
   rare paths in §16.1.
 * Nothing here is a latency or WCET claim.
+
+---
+
+## 17. SCHED-LOCK1: implementation and evidence
+
+§16 is the design record, written before any caller was converted. This section records what was
+built against it, the arguments it rests on, and the evidence. Qualification results (counts,
+runs, hashes) are in `doc/KERNEL_UNLOCKING.md` §0.8, bound to the commits that produced them.
+
+### 17.1 What was built
+
+* **`SchedDomain`** (`src/kernel/scheduler.rs`) replaces `SmpScheduler` and `SchedulerState`:
+  * `cpus: [CpuCell; MAX_CPUS]` (boxed in hosted builds). Each `CpuCell` is `#[repr(align(64))]`
+    and holds `lock: SpinLockIrq<CpuSched>` (rank **1L**: run queues, current slot, membership
+    mirror, quantum) and `mirror` (current tid + 1 and load, SeqCst atomics).
+  * `admission: SpinLockIrq<Admission>` (rank **1G**: topology, `next_balance_cpu`).
+  * `topo`: the published present / online / wake-only / balance-excluded bitmaps (atomics).
+  * `clock`: the scheduler tick, an `AtomicU64` advanced only by `tick_on(CLOCK_OWNER_CPU)`.
+* **Access paths**, each projecting only what its authority owns:
+  * `lock_cpu(cpu)` → `CpuSchedGuard` → `CpuView`: exactly one CPU's `CpuSched`. The guard's
+    drop publishes that CPU's mirror while 1L is still held.
+  * `lock_cpu_admission(cpu)` (1G then that CPU's 1L) → `admit_dispatch` /
+    `admit_pinned_dispatch`.
+  * `lock_all()` (1G, then every 1L ascending; released descending, then 1G) → `SchedAll`, the
+    design record's "AllCpus". `exclusive(&mut self)` gives the same view without locking, for
+    boot (exclusive `&mut KernelState`) and hosted tests.
+  * Lock-free: `clock_now`, `topo()`, `current_mirror`, `load_mirror`, `current_elsewhere`.
+* **`SharedKernel` seams** (`src/runtime.rs`): `with_cpu_sched_split(cpu, …)` (1L),
+  `with_cpu_admission_split` (1G + 1L), `with_all_cpus_sched_split` (the coherent view; exactly
+  five production callers: `placement_of` ×3, `tid_placed_anywhere_split`,
+  `post_lock_exit_validation_split`), and `commit_enqueue_split`, **the** per-CPU enqueue commit
+  (`task_enqueue::commit_enqueue_on_cpu_locked`, which refuses a plan naming another CPU).
+* **The ambient `current_cpu` is removed** from the scheduler. Production routes use the CPU they
+  were given. Hosted tests keep a selector outside the scheduler
+  (`KernelState::hosted_ambient_cpu`, `#[cfg(feature = "hosted-dev")]`); freestanding RISC-V
+  `KernelState::current_cpu()` reads the hart's own identity.
+* **One implementation**, the default on all three ports. There is no fallback, knob or alternate
+  legacy owner.
+
+### 17.2 The cross-CPU protocol as implemented
+
+| Question (brief §3) | Answer |
+|---|---|
+| Executing CPU | The CPU the route was given (its trap's `DispatchAuthority`, or the explicit `cpu` argument). |
+| Destination | The task's home: its pinned affinity, else the home fixed at first placement (`fix_home_cpu_split`; the balanced choice runs under 1G alone). |
+| Incarnation authority | Rank 2, before any 1L: the existing owners settle `{tid, asid}` and status and pick exactly one waker. A dead or replaced incarnation is refused there; the queue's membership mirror refuses a second entry (`AlreadyQueued`). |
+| Commit | Under the destination's 1L only: admission bits and capacity are checked, then the append and the mirror update; the mirror is published at release. |
+| Ordering | commit → mirror publish → 1L release → `notify_enqueued(d)` (wake IPI). No IPI is sent under any scheduler lock. |
+| Wake IPI vs idle | The destination's idle decision reads its queue under the same 1L[d]. Either the decision is ordered after the commit and sees the work, or before it, and the IPI sent after the commit wakes the idle wait (§16.4 step 2). |
+| Duplicate | `AlreadyQueued` under 1L[d]; the wake arbitration at rank 2 is unchanged. |
+| Stale | Refused at rank 2 before any 1L (the planner requires the live incarnation's class and status). |
+| Cancellation | `withdraw_queued_tid_on` under the destination's 1L; against a concurrent dispatch exactly one wins. |
+| Teardown and reuse | Exit clears the current slot on the CPU named by the token (`clear_current_exact`), under that CPU's 1L; reaping checks absence through the coherent view. |
+| Capacity | 64 per priority per CPU. `QueueFull` is returned **before** mutation, so a committed wake is never displaced and a refused one is never half-published. There is no mailbox: the run queue is the reservation. |
+| Full-queue settlement | Each caller keeps its existing settlement (the mapped error, rollback or withdraw). The producer still owns a refused wake. |
+| Bounded drain | The destination drains by its own selections; at most 192 entries per CPU (§6 W2). |
+| Mutual holding / waiting | No path holds two 1L guards except the coherent view, which takes them in ascending order. No path waits for an IPI, a remote completion or another CPU's lock while holding a 1L. `wake_tid_to_runnable_split` reads "already current here" under 1L[e], releases it, then takes 1L[d]. |
+| Scanning fallback, migration, new switch | None. |
+
+A source guard (`sched_lock1_d6_per_cpu_scheduler_ownership_rules` (6)) scans every production
+scheduler-lock closure in `runtime.rs` and refuses one that reaches a notification, an IPI, a
+shootdown, an address-space switch or cross-CPU work.
+
+### 17.3 Progress, fairness and retained dependencies
+
+* **Progress argument (SC-LOCK-2).** Every 1L critical section runs with interrupts masked and
+  contains no wait on another CPU: no IPI or shootdown wait, no other CPU's 1L (except the
+  coherent view's ascending acquisition, which waits only for sections that themselves wait for
+  nothing), and no 1G. Each section therefore finishes in a finite number of its own steps once
+  its holder runs. A CPU waiting for 1L[c] waits only for a finite succession of such sections,
+  issued by operations that name `c`.
+* **Fairness.** None. 1L and 1G are TTAS `SpinLockIrq` (§6 W1): a waiter can be overtaken
+  indefinitely, in principle. **No time bound and no WCET is claimed.**
+* **Who contends for 1L[c]:** routes executing on `c`; remote enqueues, withdrawals and
+  "anywhere" scans that name `c`; the coherent view. Previously every CPU's every scheduling
+  operation contended for the one rank-1 lock.
+* **Retained shared dependencies** (unchanged, §16.7): rank 2 (task table) inside the selection
+  filter and the planners; the IPC and timeout domains; `PRINTK_DRAIN_LOCK` (W7, inside
+  scheduler closures); shootdown waits (W4, never under a 1L); and the coherent view on the five
+  rare paths.
+
+### 17.4 Invariants and where each is checked
+
+| Invariant (brief §4) | Mechanism | Evidence |
+|---|---|---|
+| One placement per incarnation | membership mirror under 1L; rank-2 arbitration | `sl1_a_duplicate_wake_has_exactly_one_winner`, `sl1_the_coherent_placement_never_tears_against_local_moves`; witness trace replay (each task in at most one place) |
+| No task running on two CPUs | current-elsewhere check (own 1L + SeqCst mirrors) | `sl1_a_duplicate_current_is_seen_by_at_least_one_side`; witness census |
+| No lost or duplicate wake | commit before notify; `QueueFull` / `AlreadyQueued` before mutation | `sl1_opposite_direction_remote_wakes_neither_deadlock_nor_lose`, `sl1_a_wake_racing_idle_entry_is_never_stranded`, `sl1_capacity_exhaustion_…`; witness CLAIM ↔ ADD ↔ NOTIFY matching |
+| No stale token affects a replacement | rank-2 incarnation checks before any 1L | `sl1_a_stale_incarnation_wake_is_refused_before_any_queue_mutation`; existing exit/reuse tests |
+| No return through an unowned continuation; no parked result lost | unchanged owners (`DispatchAuthority`, `DispatchMarkToken`, parked-result settlement) on explicit CPUs | the converted hosted suite (CONTEXT1, overtaken, parked-result tests) |
+| VMI2 coverage | mirrors ∪ hardware residency (§16.5) | `sl1_shootdown_targets_follow_the_published_current`; VMI2 witness |
+| First-start, FP/TLS/flags, idle-root handoff, exit/reap ordering | unchanged, on explicit CPUs | converted hosted suite; apsched witness (reap, idle-root records) |
+| Explicit CPU authority, no ambient selector in production | `current_cpu` removed; guard (4), (7) | `sched_lock1_d6_per_cpu_scheduler_ownership_rules`; ambient-binding tests assert no binding |
+
+### 17.5 Legacy restrictions, revised explicitly (SC-LOCK-7)
+
+The brief explicitly authorized this.
+
+* `doc/AI_AGENT_RULES.md` §14.4: the D6 bullet's prohibition of per-CPU scheduler lock types is
+  replaced by the ownership rules (projection only, ascending acquisition, no waits under a
+  scheduler lock, the coherent view only on named rare paths, no ambient selector). The §14.5
+  seam rule names the new seams.
+* `doc/KERNEL_UNLOCKING.md` §7.1.2 and §8 keep their historical text and point here.
+* The source guard `stage106_d6_audit_no_per_cpu_scheduler_locking_started` is replaced by
+  `sched_lock1_d6_per_cpu_scheduler_ownership_rules` (`src/kernel/syscall.rs`), which checks:
+  (1) no whole-domain lock; (2) the per-CPU guard projects only its CPU; (3) ascending
+  acquisition and descending release; (4) the retired seam and selector are gone; (5) exactly
+  five production coherent-view callers; (6) no scheduler-lock closure reaches a notification,
+  IPI, shootdown, switch or cross-CPU work; (7) the hosted selector is read by exactly one
+  production function. The unrelated D6 fence (x86 core smoke default `-smp 1`) is unchanged.
+* `doc/KERNEL_LOCKING.md` §4: rank 1 (numbered 2 there) becomes 1G / 1L (2G / 2L).
+
+### 17.6 Evidence
+
+* **Deterministic and concurrent hosted tests** (`src/kernel/sched_lock1_tests/tests.rs`, 19 tests, on
+  the real `SchedDomain` and the real `SharedKernel` seams): projection; unauthorized access
+  refused before mutation; the clock owner and per-CPU quanta; independence while another CPU's
+  1L is held; mutual exclusion on one CPU; the coherent view; placement never tearing; the
+  duplicate-current Dekker argument; the mirror balanced choice against the coherent one; the
+  frozen-subject scan; duplicate wake; capacity before and after publication; withdrawal against
+  dispatch; a refused candidate keeping its position; production seams on CPU 1 while CPU 0 is
+  held; opposite-direction remote wakes; wake against idle entry; stale incarnation; shootdown
+  targets. The concurrent tests use real threads; the serial hosted suite is a regression gate,
+  not evidence of concurrency correctness.
+* **Live witness** (default-off `<port>-sched-lock1-witness`, run by
+  `scripts/qemu-sched-lock1-witness-smoke.sh`, graded by `scripts/grade-sched-lock1-witness.py`):
+  * **Synchronized** (labelled): in phase A of the AP-scheduling workload (two spinners per CPU,
+    rotated by timer preemption), CPU A holds its **actual** 1L inside its own production timer
+    tick, interrupts masked, while observer CPU B runs its ordinary production scheduling. For
+    every ordered pair of the schedule (`(a, a+1)` and `(a+1, a)` around the ring), a hold is
+    awarded only if: A's lock is held at begin and end with the same acquisition generation; A
+    holds exactly one 1L and no 1G; no section on A's CPU is recorded inside the hold; B makes
+    ≥ 2 owner commits on its own lock instance; and a task B installed is then observed running
+    on B. A RELATED record (B touching A's lock) aborts the attempt.
+  * **Fixture synchronization** (labelled, not production behaviour): a hold starts only when B
+    has a task current and another queued, and until the rounds are done the AP-scheduling
+    witness withholds its preemption counts from the workload so phase A continues.
+  * **Natural**: from SNAP (taken under the coherent view once phase-A spinners run on every
+    CPU) to CENSUS (taken under the coherent view at the workload's last step), every mutating
+    1L section is recorded with its CPU, executing CPU, acquisition generation, the current slot
+    before and after, and the queue entries added and removed. The grader replays the trace and
+    requires it to reproduce the CENSUS exactly, each task in at most one place, every remote
+    CLAIM matched by the ADD it names on that destination and incarnation, and every remote add
+    followed by its notification.
+  * Every record carries a CRC; the grader validates every record before awarding any coverage.
+    Its self-test corpus covers the accepted case and 15 rejections (dropped publication,
+    substituted destination, substituted incarnation, duplicate consumption ×2, missing
+    notification, global serialization, a holder section, a reacquired lock, two locks held,
+    census mismatch, no progress, an unclosed window, …).
+* **Negative controls** (scratch mutations, never committed; results in the qualification
+  record). Hosted: global serialization, dropped publication, dropped notification, substituted
+  destination, substituted incarnation, duplicate consumption, capacity stranding. Live (RISC-V,
+  `-smp 2`): global serialization, dropped publication, dropped notification, substituted
+  destination, duplicate consumption.
+
+### 17.7 Scope of the measured independence
+
+What is shown: an unrelated CPU's local enqueue, selection, current-slot update and timer
+preemption complete — and its task runs — while another CPU holds its own scheduler lock, on
+all three ports, in both directions of every scheduled pair, at the CPU counts in the
+qualification record.
+
+What is **not** claimed:
+
+* that the whole kernel is independently scheduled: rank 2 (task table), the IPC and timeout
+  domains, `PRINTK_DRAIN_LOCK` and shootdown waits are still shared, and the five coherent-view
+  paths still serialize every CPU;
+* any latency, contention or WCET bound (W1 unchanged), or anything about kernel preemption
+  (KTHREAD1 is not started) or RT scheduling (RT-SCHED1);
+* anything about hardware: all live evidence is QEMU TCG.

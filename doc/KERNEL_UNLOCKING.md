@@ -656,8 +656,8 @@ the production `PriorityScheduler`.
 | Package | Status | Scope | Contract requirements |
 |---|---|---|---|
 | **KERNEL-NOFP1** | **done** (see the record below) | ordinary kernel code and its linked runtime helpers use no FP/SIMD registers. Audited exceptions are the explicit init and context save/restore routines. Proof is by disassembly of the final linked images, bounded by an allowlist; a blanket zero-FP check is wrong. Eager user preservation and exact continuation-owner authentication are unchanged. No compiler flag or calling convention is prescribed. No lazy FP. Cost measurement is outstanding; no WCET or certification claim | SC-FP-1…3, SC-KT-5 |
-| **SCHED-LOCK1** | **OPEN prerequisite, next**: before preemptible kernel threads are enabled and before any bounded RT latency claim | give CPU-local runnable/current/quantum state explicit local ownership, so unrelated CPUs leave the one shared rank-1 scheduler critical section. Requires bounded local exclusion with a progress argument ("lock-free" is not mandated), and an explicit cross-CPU wake protocol: capacity, full-queue behaviour, publication order, cancellation, no lost wakeups. Preserves incarnation authentication, membership, wake arbitration, dispatch tokens and lock order. Separates global clock, topology and admission. Inventories the remaining shared dependencies. Must explicitly reconcile `AI_AGENT_RULES.md` §14.4 D6, §7.1/§8 below, the `stage106_d6_audit…` source guard and the `KERNEL_LOCKING.md` rank table | SC-LOCK-1…8 |
-| **KTHREAD1** | after KERNEL-NOFP1. Context preparation may proceed before SCHED-LOCK1; kernel preemption may not | independent kernel threads: owned stacks, entry ABI, kernel-mode preemption, kernel TLS policy, guard check, stack residency and reclamation, trap classifiers | SC-KT-1…4, SC-KT-6…12, SC-BND-2, SC-EXEC-3 |
+| **SCHED-LOCK1** | **done** (see the record below; contract §16–§17). It was the prerequisite before preemptible kernel threads and before any bounded RT latency claim; it makes neither claim | give CPU-local runnable/current/quantum state explicit local ownership, so unrelated CPUs leave the one shared rank-1 scheduler critical section. Requires bounded local exclusion with a progress argument ("lock-free" is not mandated), and an explicit cross-CPU wake protocol: capacity, full-queue behaviour, publication order, cancellation, no lost wakeups. Preserves incarnation authentication, membership, wake arbitration, dispatch tokens and lock order. Separates global clock, topology and admission. Inventories the remaining shared dependencies. Must explicitly reconcile `AI_AGENT_RULES.md` §14.4 D6, §7.1/§8 below, the `stage106_d6_audit…` source guard and the `KERNEL_LOCKING.md` rank table | SC-LOCK-1…8 |
+| **KTHREAD1** | **not started**; after KERNEL-NOFP1 and SCHED-LOCK1 (both done). Neither qualifies kernel preemption | independent kernel threads: owned stacks, entry ABI, kernel-mode preemption, kernel TLS policy, guard check, stack residency and reclamation, trap classifiers | SC-KT-1…4, SC-KT-6…12, SC-BND-2, SC-EXEC-3 |
 | **RT-SCHED1** | after SCHED-LOCK1 | 32-level fixed-priority preemptive selection, scheduling contexts and budgets, calibrated time and earliest-deadline programming, structural no-migration, a fair kernel lock or contention bound, buffered diagnostics | SC-PRI-10…13, SC-CTX-*, SC-TIME-3…6, SC-CPU-2, SC-SEP-*, SC-INV-*, SC-WCET-*, SC-EXEC-* |
 | **PARTITION1** | with or after RT-SCHED1 | cyclic schedule, epoch, windows and boundaries, the OPERATIONAL transition, system allowance and health monitoring, configuration validation | SC-PART-*, SC-POOL-2/4, SC-EXEC-5, SC-IPC-3, SC-BND-3 |
 | **FP-POLICY1** | later, after KERNEL-NOFP1 | optional static per-task FP policy and conditional-save optimization. A task flag alone cannot enforce non-use or prevent disclosure. Instruction access, violation handling, initialization, isolation and lifecycle must be defined before any preservation is skipped | SC-FP-4 |
@@ -1396,6 +1396,44 @@ The three exit-current-task runners boot the builder's publication. The three
 * The reuse witness is `-smp 1` only.
 
 SCHED-LOCK1 is next and is not started; KTHREAD1 and hardware work are not started.
+
+#### SCHED-LOCK1 (from delivered `adf5fa63`)
+
+The single shared scheduler lock is gone from unrelated CPUs' local scheduling. The design record
+(contract §16) was committed before any caller was converted; the implementation, arguments and
+evidence are in contract §17. In short:
+
+* **Owners.** One `SpinLockIrq<CpuSched>` per CPU (rank 1L: run queues, current slot, membership
+  mirror, quantum); an admission lock (rank 1G: topology, balanced-placement cursor); atomics for
+  the scheduler clock (single writer, CPU 0's tick), the admission bitmaps and per-CPU
+  current/load mirrors. `SmpScheduler`, `SchedulerState`, `with_scheduler_split_mut` and the
+  ambient `current_cpu` are gone; one implementation, default on all three ports, no fallback.
+* **Projection.** A per-CPU guard yields only that CPU's state. The whole-domain view exists only
+  with every 1L held (ascending; with 1G) or under exclusive boot access, and production takes it
+  on five rare paths (`placement_of` ×3, `tid_placed_anywhere_split`,
+  `post_lock_exit_validation_split`).
+* **Remote wake.** Rank 2 settles the incarnation and picks the one waker; the commit takes only
+  the destination's 1L and refuses (`QueueFull`, `AlreadyQueued`, admission) before mutation; the
+  mirror is published at release; the wake IPI is sent after release. The idle decision uses the
+  same 1L. No mailbox, no scanning fallback, no migration, no new switch mechanism.
+* **Readers that needed several CPUs** use mirrors (FPU current-elsewhere, VMI2 targets with the
+  unchanged residency term, balanced choice), a per-CPU frozen-subject scan (direct-IPC
+  membership), or the coherent view (the five rare paths).
+* **Legacy rules revised explicitly** (the brief authorized it): the `AI_AGENT_RULES.md` §14.4 D6
+  bullet, its source guard (now `sched_lock1_d6_per_cpu_scheduler_ownership_rules`, seven
+  checks), the `KERNEL_LOCKING.md` rank table, and the historical §7.1.2 / §8 text.
+* **Evidence.** 19 hosted tests on the real owners (deterministic and concurrent); a default-off
+  live witness on all three ports (`<port>-sched-lock1-witness`): synchronized holds of a CPU's
+  actual 1L while another CPU commits and progresses, in both directions of every scheduled pair,
+  and a natural membership trace replayed from SNAP to CENSUS; hosted and live negative controls.
+* **Not claimed.** Whole-kernel independence (rank 2, IPC/timeout domains, the printk lock and
+  shootdown waits stay shared), any latency or WCET bound (the 1L/1G wait is still W1: TTAS, no
+  fairness), kernel preemption, RT scheduling, hardware behaviour.
+
+The qualification record follows in a documentation-only commit, bound to the candidate that
+produced it.
+
+KTHREAD1 is not started.
 
 ---
 
@@ -8011,7 +8049,11 @@ audit; nothing else in the repo should restate it.
   trampoline split has landed (it has, §14.5 of `AI_AGENT_RULES.md`)
   **and** D2/D3 are smoke-stable on `-smp ≥ 2` (they are not — see
   §7.1.4 below). `entering_tid` / `exiting_tid` remain Class F
-  (authoritative read only).
+  (authoritative read only). *(Historical, 2026-06-16. Revised by
+  SCHED-LOCK1, whose brief explicitly authorized it: the prohibition is
+  replaced by the per-CPU ownership rules in `AI_AGENT_RULES.md` §14.4 D6
+  and the guard `sched_lock1_d6_per_cpu_scheduler_ownership_rules`; see
+  `doc/SCHEDULING_CONTRACT.md` §16–§17.)*
 
 ### 7.1.3 Architecture smoke matrix (required before any future unlocking commit)
 
