@@ -1736,10 +1736,17 @@ The brief explicitly authorized this.
     notification, global serialization, a holder section, a reacquired lock, two locks held,
     census mismatch, no progress, an unclosed window, …).
 * **Negative controls** (scratch mutations, never committed; results in the qualification
-  record). Hosted: global serialization, dropped publication, dropped notification, substituted
-  destination, substituted incarnation, duplicate consumption, capacity stranding. Live (RISC-V,
-  `-smp 2`): global serialization, dropped publication, dropped notification, substituted
-  destination, duplicate consumption.
+  record). Hosted: global serialization (one shared flag held inside every 1L section), dropped
+  publication, dropped notification, substituted destination, substituted incarnation, duplicate
+  consumption (the production selection installs the head but leaves it queued), capacity
+  stranding (a full queue reports success). Live (RISC-V, `-smp 2`, graded): global
+  serialization (while a CPU holds its lock in a witness hold, every other CPU's 1L section waits
+  for it, as for one shared lock), dropped notification (every remote one), and — fired **once,
+  inside the recording window**, so the failure is that obligation's own — a dropped remote
+  publication, a substituted destination and a duplicate consumption. The first two reach the
+  grader; a duplicate consumption wedges that CPU's selection (the task is current and still
+  queued) before the dump, so it fails at the workload, and the grader's own duplicate check is
+  exercised by its self-test fixtures and the hosted control.
 
 ### 17.7 Scope of the measured independence
 

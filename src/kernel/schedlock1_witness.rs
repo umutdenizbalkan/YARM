@@ -285,6 +285,10 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
             m += 1;
         }
     });
+    // Fast path: most sections change nothing — same current, same queue in the same order.
+    if before_cur == after_cur && n == m && before[..n] == after[..m] {
+        return;
+    }
     let in_set = |set: &[(u64, u8)], tid: u64| set.iter().any(|&(t, _)| t == tid);
     let added: [(u64, u8); 192] = core::array::from_fn(|i| {
         if i < m && !in_set(&before[..n], after[i].0) {
