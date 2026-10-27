@@ -12258,8 +12258,9 @@ smoke.
   (`try_split_vm_brk_shrink_into_frame`, Stage 114) gated on single-CPU-
   online; multi-CPU callers still require the lock-free
   `await_tlb_shootdown_ack` design and multi-CPU smoke before those seams
-  may be called on > 1 CPU. No per-CPU scheduler lock types until the
-  x86_64 SMP trampoline split has landed and D2/D3 are smoke-stable.
+  may be called on > 1 CPU. (Superseded by SCHED-LOCK1: per-CPU scheduler
+  locks now exist under the ownership rules of `doc/AI_AGENT_RULES.md` §14.4
+  D6 and `doc/SCHEDULING_CONTRACT.md` §16.)
   `entering_tid` / `exiting_tid` remain Class F (authoritative read only).
 - **Stage 108/115 seam rule.** `with_scheduler_split_mut` (rank 1),
   `with_task_tcbs_split_mut` (rank 2), and `with_ipc_split_mut` (rank 3,
@@ -15693,8 +15694,9 @@ is the mutual exclusion rank-local locks do not provide.
 > `dispatching > 1`, and NR 0 has a reachable production terminal-dispatch fallback under
 > `yarm.ap_user_dispatch=1`.
 >
-> This is squarely inside the D6 fence (`doc/AI_AGENT_RULES.md` §14.4: no per-CPU scheduler lock
-> types until the x86_64 SMP trampoline split lands and D2/D3 are smoke-stable; `entering_tid` /
+> This is squarely inside the D6 fence (`doc/AI_AGENT_RULES.md` §14.4 as it then stood: no per-CPU
+> scheduler lock types until the x86_64 SMP trampoline split lands and D2/D3 are smoke-stable —
+> since revised by SCHED-LOCK1, which removed `current_cpu` from the scheduler; `entering_tid` /
 > `exiting_tid` remain Class F). It is a scheduler-wide change requiring its own authorization,
 > its own SMP evidence and its own migration of all six queue-advancing families at once — not a
 > Yield change.

@@ -6977,18 +6977,60 @@ mod tests {
         );
     }
 
+    /// SCHED-LOCK1 — the D6 per-CPU scheduler OWNERSHIP rules (`doc/SCHEDULING_CONTRACT.md` §16).
+    ///
+    /// Until SCHED-LOCK1 this guard (`stage106_d6_audit_no_per_cpu_scheduler_locking_started`)
+    /// forbade per-CPU scheduler lock types outright. SCHED-LOCK1 introduced them, as the brief
+    /// authorised, so the prohibition is REPLACED by the rules that make them sound:
+    ///
+    /// 1. there is no whole-domain scheduler lock: the domain is a `SchedDomain`, not a lock;
+    /// 2. a per-CPU guard projects ONLY that CPU's state (`CpuView`), never a whole-domain view;
+    /// 3. the coherent whole-domain view takes 1G then every 1L in ascending order and releases
+    ///    them in descending order;
+    /// 4. the retired whole-domain seam and the ambient `current_cpu` selector are gone from the
+    ///    scheduler;
+    /// 5. production takes the coherent view only on the named rare paths.
+    ///
+    /// The unrelated D6 fence — the x86_64 core smoke defaulting to `-smp 1` — is unchanged.
     #[test]
-    fn stage106_d6_audit_no_per_cpu_scheduler_locking_started() {
-        // D6 is audit-only at Stage 106: no per-CPU scheduler locks may exist
-        // and the x86_64 core smoke must stay pinned to -smp 1.
+    fn sched_lock1_d6_per_cpu_scheduler_ownership_rules() {
         let runtime_src = include_str!("../runtime.rs");
         let sched_src = include_str!("scheduler.rs");
-        for forbidden in ["per_cpu_scheduler_lock", "PerCpuSchedulerLock"] {
-            assert!(
-                !runtime_src.contains(forbidden) && !sched_src.contains(forbidden),
-                "{forbidden} must not exist at Stage 106 (D6 is audit-only)"
-            );
-        }
+        let mod_src = include_str!("boot/mod.rs");
+        // (1) no whole-domain lock.
+        assert!(mod_src.contains("    scheduler_state: crate::kernel::scheduler::SchedDomain,\n"));
+        assert!(!mod_src.contains("scheduler_state: SpinLockIrq<"));
+        assert!(!sched_src.contains("pub struct SmpScheduler"));
+        assert!(sched_src.contains("    lock: SpinLockIrq<CpuSched>,\n"));
+        // (2) the per-CPU guard projects only its CPU.
+        let guard = &sched_src[sched_src.find("impl CpuSchedGuard<'_> {").expect("guard")..];
+        let guard = &guard[..guard.find("\n}\n").expect("end")];
+        assert!(guard.contains("pub fn view(&mut self) -> CpuView<'_> {"));
+        assert!(!guard.contains("SchedAll"));
+        // (3) ascending acquisition, descending release.
+        let lock_all = &sched_src[sched_src.find("pub fn lock_all(&self)").expect("lock_all")..];
+        let lock_all = &lock_all[..lock_all.find("\n    }\n").expect("end")];
+        let g = lock_all.find("self.admission.lock()").expect("1G");
+        let l = lock_all
+            .find("for (idx, slot) in guards.iter_mut().enumerate()")
+            .expect("ascending 1L");
+        assert!(g < l, "1G before every 1L");
+        let drop_all = &sched_src[sched_src
+            .find("impl Drop for SchedAllGuard<'_>")
+            .expect("drop")..];
+        assert!(drop_all.contains("for idx in (0..MAX_CPUS).rev()"));
+        // (4) the retired seam and selector.
+        assert!(!runtime_src.contains("fn with_scheduler_split_mut"));
+        assert!(!sched_src.contains("current_cpu:"));
+        // (5) the coherent view in production: exactly the rare paths §16.1 names.
+        let prod = &runtime_src[..runtime_src
+            .find("\n#[cfg(test)]\nmod ")
+            .unwrap_or(runtime_src.len())];
+        let callers = prod.matches(".with_all_cpus_sched_split(").count();
+        assert_eq!(
+            callers, 5,
+            "placement_of ×3, tid_placed_anywhere, post_lock_exit_validation — and nothing else"
+        );
         // Stage 183 (SMP-LIVE): the smoke DEFAULTS to -smp 1 but now honors an explicit
         // QEMU_SMP so the smp2/smp4 SMP-LIVE profiles can drive -smp >1. Still -smp 1 by
         // default; the SMP override selects only QEMU topology, not a production knob.

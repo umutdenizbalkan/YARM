@@ -520,12 +520,7 @@ impl KernelState {
     /// production path under real SMP. Clearing an AP's wake-only bit (a future
     /// AP-dispatcher increment) raises this and re-gates the seams automatically.
     pub fn dispatching_cpu_count(&self) -> usize {
-        self.with_scheduler_state(|sched| {
-            let s = sched;
-            let online = s.online_cpu_bitmap();
-            let dispatching = online & !s.wake_only_bitmap();
-            dispatching.count_ones() as usize
-        })
+        self.with_scheduler_state(|sched| sched.dispatching_bitmap().count_ones() as usize)
     }
 
     pub fn present_cpu_count(&self) -> usize {

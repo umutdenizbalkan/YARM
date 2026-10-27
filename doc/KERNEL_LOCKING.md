@@ -1876,7 +1876,20 @@ The following order should be treated as mandatory for any nested lock
 acquisition to prevent future lock-order inversions:
 
 1. **Global runtime lock**: `SharedKernel.state` (if present in that path)
-2. `scheduler_state_lock`
+2. scheduler domain (SCHED-LOCK1 — there is no single scheduler lock any more):
+   * **2G** — the scheduler admission lock (`SchedDomain.admission`: topology, balanced
+     rotation). Never taken on an ordinary dispatch, enqueue, block, preempt or tick path, and
+     never taken while any 2L is held;
+   * **2L** — the per-CPU scheduler locks (`CpuCell.lock`, one per CPU: run queues, current slot,
+     quantum). An ordinary scheduler operation holds exactly one. Only the coherent whole-domain
+     view holds several: 2G first, then every 2L in **ascending CPU index**, released in
+     descending order;
+   * the scheduler tick, the published admission bitmaps and the per-CPU current/load mirrors
+     are atomics and take no lock.
+
+   Task-domain (rank 2/3 below) acquisitions nested inside a 2L are unchanged from their nesting
+   inside the old single scheduler lock. (The scheduling contract numbers these ranks 1G/1L,
+   counting from the scheduler; the order is the same.)
 3. `task_state_lock`
 4. `ipc_state_lock`
 5. `capability_state_lock`

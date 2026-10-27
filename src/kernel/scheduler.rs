@@ -769,6 +769,15 @@ impl CpuSched {
     fn load(&self) -> usize {
         self.rq.runnable_count() + usize::from(self.rq.current.is_some())
     }
+
+    /// Where `tid` is on THIS CPU: (current here, queued here). `current` is checked separately
+    /// from the queues because the current slot is the authority on what is executing.
+    fn placement_here(&self, tid: ThreadId) -> (bool, bool) {
+        (
+            self.rq.current.is_some_and(|task| task.tid == tid),
+            self.rq.queues.iter().any(|q| q.count_tid(tid) > 0),
+        )
+    }
 }
 
 /// SCHED-LOCK1 — the published, lock-free summary of one CPU's state: its current task (tid + 1,
@@ -829,6 +838,15 @@ impl SchedTopo {
     pub(crate) fn balance_excluded(&self) -> u64 {
         self.balance_excluded.load(Ordering::Acquire)
     }
+    /// The DISPATCHING CPUs: online and not wake-only — THE masked expression every dispatching
+    /// count uses. `online` is loaded first: a CPU is marked wake-only before it is onlined, so an
+    /// online bit observed here carries (Acquire/Release) its wake-only bit with it, and the mask
+    /// can never count a CPU that is still wake-only.
+    pub(crate) fn dispatching(&self) -> u64 {
+        let online = self.online();
+        online & !self.wake_only()
+    }
+
     fn cpu_online(&self, idx: usize) -> bool {
         idx < MAX_CPUS && self.online() & (1u64 << idx) != 0
     }
@@ -1150,22 +1168,27 @@ impl CpuView<'_> {
     ) -> Result<(), SchedulerError> {
         self.validate_online()?;
         let cpu = self.cpu();
-        // Stage 183.5: a wake-only online CPU runs no dispatcher — a task placed on its queue
-        // would strand forever. Deny placement explicitly.
+        // Stage 183.5: a wake-only online CPU runs no dispatcher — a task placed on
+        // its queue would strand forever. Deny placement explicitly (nothing pins
+        // work to APs today; 183.6 lifts this per CPU when the AP dispatcher lands).
         if self.wake_only() {
             crate::yarm_log!(
                 "SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu={} tid={} reason=no_ap_dispatcher_yet",
                 cpu.0,
                 tid.0
             );
-            // Stage 195D (BSP DISPATCH AFFINITY): emitted ONLY on a real rejection.
+            // Stage 195D (BSP DISPATCH AFFINITY): an actual prevented placement of a runnable
+            // user task onto a wake-only AP queue. Emitted ONLY on a real rejection (never
+            // fabricated); the caller reroutes to the BSP dispatcher.
             #[cfg(target_arch = "aarch64")]
             crate::yarm_log!(
                 "AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid={} cpu={}",
                 tid.0,
                 cpu.0
             );
-            // Stage 199D: `WakeOnly`, not `CpuOffline`. The CPU is up; it refuses work.
+            // Stage 199D: `WakeOnly`, not `CpuOffline`. The CPU is up; it refuses work. A
+            // direct-IPC wake must be able to tell those apart — collapsing them is what let
+            // `sr_enqueue_committed_receiver_split` report a placement that never happened.
             return Err(SchedulerError::WakeOnly);
         }
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
@@ -1366,14 +1389,6 @@ impl CpuView<'_> {
     pub fn set_quantum(&mut self, quantum_ticks: u64) {
         self.sched.quantum.set_quantum(quantum_ticks);
     }
-
-    /// Where `tid` is on THIS CPU: (current here, queued here).
-    fn placement_here(&self, tid: ThreadId) -> (bool, bool) {
-        (
-            self.sched.rq.current.is_some_and(|task| task.tid == tid),
-            self.sched.rq.queues.iter().any(|q| q.count_tid(tid) > 0),
-        )
-    }
 }
 
 /// SCHED-LOCK1 — held 1G and every 1L (see [`SchedDomain::lock_all`]).
@@ -1484,6 +1499,11 @@ impl SchedAll<'_> {
 
     pub fn wake_only_bitmap(&self) -> u64 {
         self.topo.wake_only()
+    }
+
+    /// The dispatching CPUs (online, not wake-only) — [`SchedTopo::dispatching`].
+    pub fn dispatching_bitmap(&self) -> u64 {
+        self.topo.dispatching()
     }
 
     /// Stage 183.5: install the scheduler-owned IDLE current (tid 0) for a wake-only online AP.
@@ -1707,17 +1727,11 @@ impl SchedAll<'_> {
     }
 
     /// U9-RECV-BLOCK2 §1 — WHERE `tid` is, as ONE coherent observation of every CPU.
-    pub(crate) fn placement_of(&mut self, tid: ThreadId) -> TaskPlacement {
+    pub(crate) fn placement_of(&self, tid: ThreadId) -> TaskPlacement {
         let mut queued_on = None;
         let mut current_on = None;
         for idx in 0..MAX_CPUS {
-            let view = CpuView {
-                idx,
-                sched: &mut *self.cpus[idx],
-                topo: self.topo,
-                clock: self.clock,
-            };
-            let (current, queued) = view.placement_here(tid);
+            let (current, queued) = self.cpus[idx].placement_here(tid);
             if current {
                 current_on = Some(CpuId(idx as u8));
             }

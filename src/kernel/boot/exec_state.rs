@@ -4460,14 +4460,10 @@ impl crate::runtime::SharedKernel {
         // The SAME predicate `KernelState::dispatching_cpu_count` computes. SCHED-LOCK1: from the
         // published admission bitmaps (no lock), and the authoritative dispatch CPU is the one
         // the bitmap names — the ONE online, non-wake-only CPU — never the retired ambient field.
-        let topo = self.sched_domain().topo();
-        let dispatching_set = topo.online() & !topo.wake_only();
+        let dispatching_set = self.sched_domain().topo().dispatching();
         let dispatching = dispatching_set.count_ones() as usize;
-        let dispatch_cpu = if dispatching == 1 {
-            Some(CpuId(dispatching_set.trailing_zeros() as u8))
-        } else {
-            None
-        };
+        // The one dispatcher, from the SAME read (an empty set names CPU 64, which no CPU equals).
+        let dispatch_cpu = CpuId(dispatching_set.trailing_zeros() as u8);
         // U9-QA §1: pre-check the authentication the commit's selection step will perform. The
         // commit cannot refuse, so this must fail HERE — before the caller blocks anything.
         //
@@ -4479,7 +4475,7 @@ impl crate::runtime::SharedKernel {
             if dispatching > 1 {
                 return Err(QueueAdvanceRefusal::MultiCpu);
             }
-            if dispatch_cpu != Some(cpu) {
+            if dispatch_cpu != cpu {
                 return Err(QueueAdvanceRefusal::CpuNotAuthoritative);
             }
         } else {

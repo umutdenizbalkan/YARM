@@ -1045,15 +1045,37 @@ acceptance table. Declaring without smoke is a hard violation of §13.
     invalidation is a failure settlement for its caller, never a success, and a
     page-table root may be freed only when no CPU has it loaded
     (`doc/KERNEL_UNLOCKING.md` §VMI1).
-- D6: no per-CPU scheduler lock types until the x86_64 SMP trampoline split
-  lands and D2/D3 are smoke-stable. `entering_tid`/`exiting_tid` remain
-  Class F (authoritative read only).
+- D6 (SCHED-LOCK1 revision; the former "no per-CPU scheduler lock types"
+  prohibition is retired, as SCHED-LOCK1's brief authorised). The scheduler
+  domain is `SchedDomain` (`doc/SCHEDULING_CONTRACT.md` §16):
+  - each CPU's run queues, current slot and quantum belong to that CPU's own
+    lock (rank 1L); admission/topology and the balanced rotation to rank 1G;
+    the scheduler tick, the admission bitmaps and the per-CPU mirrors are
+    atomics. There is no whole-domain scheduler lock and none may be added;
+  - a 1L guard projects ONLY its CPU (`CpuView`). Never build a whole-domain
+    or overlapping `&mut` view under a per-CPU lock. The coherent view
+    (`SchedAll`) exists only with 1G and every 1L held (ascending acquire,
+    descending release) or under exclusive `&mut KernelState`;
+  - an ordinary dispatch, enqueue, block, preempt or tick takes exactly one
+    1L. Production uses the coherent view only on the rare paths §16.1 names;
+    hot "anywhere/elsewhere" checks read mirrors or the frozen-subject scan;
+  - no scheduler lock is held across an architectural switch, an IPI, or a
+    remote-completion wait; the wake IPI follows the enqueue guard's release;
+  - the ambient `current_cpu` selector is gone from the scheduler. Every
+    production decision names its CPU explicitly; the hosted-only test
+    selector (`hosted_ambient_cpu`) is never read by a split path;
+  - enforced by `sched_lock1_d6_per_cpu_scheduler_ownership_rules`
+    (`src/kernel/syscall.rs`).
+  `entering_tid`/`exiting_tid` remain Class F (authoritative read only).
 
 ### 14.5 Stage 108 seam and knob rules
 
-- The Stage 108 split-mut seams (`with_scheduler_split_mut`,
-  `with_task_tcbs_split_mut`, `with_vm_user_spaces_split_mut`,
-  `with_memory_split_mut`) are M2_SEAM_HELPER_ONLY. Live-wiring any of them
+- The Stage 108 split-mut seams (`with_task_tcbs_split_mut`,
+  `with_vm_user_spaces_split_mut`, `with_memory_split_mut`) are
+  M2_SEAM_HELPER_ONLY. (SCHED-LOCK1 retired `with_scheduler_split_mut`; the
+  scheduler's seams are `with_cpu_sched_split`, `with_cpu_admission_split`,
+  `with_all_cpus_sched_split` and the lock-free `sched_domain()` reads, under
+  the D6 rules above.) Live-wiring any of them
   requires its own PR + MUST_SMOKE run + deletion of the helper-only fence
   in the same PR.
 - `yarm.loglevel=` may be used in verbose smoke runs; never change the

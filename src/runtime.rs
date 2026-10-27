@@ -2013,12 +2013,15 @@ impl SharedKernel {
         // be is named by the bitmap itself — the ONE online, non-wake-only CPU — not by the
         // retired ambient `current_cpu`, which any CPU's bind (an idling wake-only AP's included)
         // could leave naming another CPU.
-        let topo = self.sched_domain().topo();
-        let dispatching_set = topo.online() & !topo.wake_only();
-        if dispatching_set.count_ones() > 1 {
+        let dispatching_set = self.sched_domain().topo().dispatching();
+        let dispatching = dispatching_set.count_ones() as usize;
+        // The one dispatcher, from the SAME read: the CPU whose bit is the whole set (an empty set
+        // names CPU 64, which no admitted CPU equals).
+        let dispatch_cpu = CpuId(dispatching_set.trailing_zeros() as u8);
+        if dispatching > 1 {
             return Err(R::MultiDispatcher);
         }
-        if (cpu.0 as usize) >= 64 || dispatching_set != 1u64 << cpu.0 {
+        if dispatch_cpu != cpu {
             return Err(R::NotDispatchCpu);
         }
         Ok(())
@@ -2517,8 +2520,7 @@ impl SharedKernel {
                 asid,
             })
         })
-        .ok()
-        .flatten()
+        .unwrap_or(None)
     }
 
     /// QEMU-SMP3-SEAL §2 — phase 2 of [`Self::revalidate_idle_owner_after_drains`]: claim the
@@ -15612,7 +15614,7 @@ impl SharedKernel {
         for (cpu, slot) in current.iter_mut().enumerate() {
             *slot = domain.current_mirror(cpu).map(|t| t.0);
         }
-        // rank 1 released. rank 2: resolve each candidate's ASID.
+        // No scheduler lock is held. rank 2: resolve each candidate's ASID.
         let candidates = online & !wake_only;
         let mut bitmap = 0u64;
         for (cpu, tid) in current.iter().enumerate() {
@@ -21417,18 +21419,20 @@ mod tests {
         );
         // One rank-1 acquisition covers the validate and the read.
         assert_eq!(
-            body.matches("with_scheduler_split_mut").count(),
+            body.matches("self.with_cpu_sched_split(cpu,").count(),
             1,
-            "exactly one rank-1 scheduler acquisition"
+            "exactly one scheduler acquisition: `cpu`'s own 1L (SCHED-LOCK1)"
         );
         let validate = body
-            .find("validate_online_cpu(cpu)")
+            .find("c.validate_online()")
             .expect("same online predicate set_current_cpu uses");
         let read = body
-            .find("current_tid_on(cpu)")
+            .find("c.current_tid()")
             .expect("reads the EXPLICIT cpu's current tid");
         assert!(validate < read, "validation must precede the read");
         // No ambient write, and no ambient selector consulted for the lookup.
+        // (`c.current_tid()` is the explicit CPU's own slot under its 1L, not the ambient read.)
+        let body = body.replace("c.current_tid()", "");
         for banned in [
             "sched.current_cpu = cpu",
             "set_current_cpu",
@@ -21486,7 +21490,9 @@ mod tests {
             "current_tid_split_read must stay non-binding — binding here would erase the \
              distinction the Stage 4T+6R revert established"
         );
-        assert!(body.contains("current_tid_on(cpu)"));
+        assert!(
+            body.contains("self.with_cpu_sched_split(cpu, |c| c.current_tid().map(|tid| tid.0))")
+        );
     }
 
     #[test]

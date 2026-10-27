@@ -5335,9 +5335,13 @@ in `doc/KERNEL_UNLOCKING.md` passed on all three runs.
    reclamation in `unmap_page_phase1` are asserted by
    `stage106_d3_two_phase_order_is_structural_and_gated`. Reordering those
    calls is a UAF-class regression.
-5. **D6 is fenced.** `stage106_d6_audit_no_per_cpu_scheduler_locking_started`
-   asserts no per-CPU scheduler lock types exist and the x86_64 core smoke
-   stays pinned `QEMU_SMP=1`.
+5. **D6 ownership rules.** `sched_lock1_d6_per_cpu_scheduler_ownership_rules`
+   (which replaced `stage106_d6_audit_no_per_cpu_scheduler_locking_started`
+   in SCHED-LOCK1) asserts the per-CPU scheduler ownership rules — no
+   whole-domain lock, per-CPU guards project only their CPU, ascending
+   acquisition / descending release of the coherent view, no ambient selector,
+   and the coherent view only on the named rare paths — and that the x86_64
+   core smoke still defaults to `QEMU_SMP=1`.
 6. **The milestone doc may not lie.**
    `stage106_milestone_doc_exists_and_is_not_falsely_declared` requires an
    explicit status line; flipping to DECLARED belongs to the smoke-running

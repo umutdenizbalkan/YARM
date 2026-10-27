@@ -11843,8 +11843,8 @@ fn stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker() {
     let sched_src = include_str!("scheduler_state.rs");
     let exec_src = include_str!("exec_state.rs");
     assert!(
-        !sched_src.contains("with_scheduler_split_mut("),
-        "with_scheduler_split_mut must not be called from scheduler_state.rs yet"
+        !sched_src.contains("_sched_split("),
+        "_sched_split( must not be called from scheduler_state.rs yet"
     );
     // U9-QA re-derivation. The file-wide ban was a PROXY for the real claim: the BROAD dispatch
     // entry point must not be relocated onto the seam. U9-QA added an off-lock queue-advance
@@ -11861,8 +11861,8 @@ fn stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker() {
         .next()
         .expect("bounded by the next item");
     assert!(
-        !broad_dispatch.contains("with_scheduler_split_mut("),
-        "the BROAD dispatch entry point must not be relocated onto with_scheduler_split_mut"
+        !broad_dispatch.contains("_sched_split("),
+        "the BROAD dispatch entry point must not be relocated onto _sched_split("
     );
     // U9-RECV-BLOCK1 §4. The admission is now a FAMILY: the ambient-contract entry point
     // `queue_advance_admit_split`, the trap-authority entry point
@@ -11897,10 +11897,9 @@ fn stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker() {
         .next()
         .expect("its body");
     assert_eq!(
-        exec_src.matches("with_scheduler_split_mut(").count(),
-        admit.matches("with_scheduler_split_mut(").count()
-            + commit.matches("with_scheduler_split_mut(").count(),
-        "every with_scheduler_split_mut in exec_state.rs must be inside the U9-QA transaction"
+        exec_src.matches("_sched_split(").count(),
+        admit.matches("_sched_split(").count() + commit.matches("_sched_split(").count(),
+        "every _sched_split( in exec_state.rs must be inside the U9-QA transaction"
     );
     assert!(
         sched_src.contains("relocating the dispatch entry point"),
@@ -11945,10 +11944,15 @@ fn stage113_per_cpu_runqueue_sharding_remains_deferred() {
         .map(|rel| start + rel)
         .expect("on_preempt_current_cpu must follow local_dispatch_step_split");
     let body = &sched_src[start..end];
+    // SCHED-LOCK1: this is the KernelState (boot / hosted-test) path, and `scheduler_state()` is
+    // now the COHERENT all-CPU guard (1G, every 1L ascending). Per-CPU ownership lives in the
+    // scheduler domain itself (`SchedDomain`), not in an ad-hoc sharded type here.
     assert!(
         body.contains("self.scheduler_state()"),
-        "dispatch must still take the single shared scheduler-state lock (no per-CPU sharding yet)"
+        "the KernelState dispatch path takes the coherent all-CPU scheduler view"
     );
+    let domain_src = include_str!("../scheduler.rs");
+    assert!(domain_src.contains("pub struct SchedDomain {"));
     for forbidden in [
         "PerCpuSchedulerLock",
         "per_cpu_runqueue_lock",
@@ -11956,7 +11960,7 @@ fn stage113_per_cpu_runqueue_sharding_remains_deferred() {
     ] {
         assert!(
             !sched_src.contains(forbidden),
-            "{forbidden} must not be introduced (per-CPU runqueue sharding is deferred)"
+            "{forbidden}: per-CPU ownership is SchedDomain's (SCHED-LOCK1), not a second type"
         );
     }
 }
@@ -33889,8 +33893,7 @@ mod stage114_d3_vm_brk_shrink_live {
             "the D2 Outcome-B blocker reason must remain present, unchanged"
         );
         assert!(
-            !ipc_src.contains("with_scheduler_split_mut(")
-                && !ipc_src.contains("with_task_tcbs_split_mut("),
+            !ipc_src.contains("_sched_split(") && !ipc_src.contains("with_task_tcbs_split_mut("),
             "D2 must still not call the Stage 108 scheduler/task seams directly (Outcome B retained): \
              relocating the blocking-recv entry point ahead of with_cpu would require a new ipc(3) \
              split-mut seam to publish the receiver waiter pre-lock, which does not exist, and \
@@ -33929,7 +33932,7 @@ mod stage114_d3_vm_brk_shrink_live {
         // sites fanning into it and is still NOT relocated; U9-QA instead added a separate
         // transaction for the frame-decodable trap boundaries this very text names as the
         // acceptable shape.
-        assert!(!sched_src.contains("with_scheduler_split_mut("));
+        assert!(!sched_src.contains("_sched_split("));
         let broad_dispatch = exec_src
             .split("pub(crate) fn dispatch_next_task")
             .nth(1)
@@ -33938,7 +33941,7 @@ mod stage114_d3_vm_brk_shrink_live {
             .next()
             .expect("bounded by the next item");
         assert!(
-            !broad_dispatch.contains("with_scheduler_split_mut("),
+            !broad_dispatch.contains("_sched_split("),
             "D6 Outcome-B retained: the BROAD dispatch entry point has ~50+ call sites fanning \
              into it (yield, block, exit, fault, many syscalls), not one frame-decodable trap \
              boundary like VmBrk/IpcRecv, so it is still not relocated ahead of with_cpu"
@@ -33997,6 +34000,8 @@ mod stage114_d3_vm_brk_shrink_live {
 
     #[test]
     fn stage114_d6_full_per_cpu_runqueue_sharding_remains_deferred() {
+        // SCHED-LOCK1: per-CPU run-queue ownership landed, in ONE place — the scheduler domain's
+        // per-CPU cells. The KernelState wrappers must not grow a second sharded owner.
         let sched_src = include_str!("scheduler_state.rs");
         for forbidden in [
             "PerCpuSchedulerLock",
@@ -34005,9 +34010,10 @@ mod stage114_d3_vm_brk_shrink_live {
         ] {
             assert!(
                 !sched_src.contains(forbidden),
-                "{forbidden} must not be introduced (per-CPU runqueue sharding is deferred)"
+                "{forbidden}: per-CPU ownership is SchedDomain's (SCHED-LOCK1), not a second type"
             );
         }
+        assert!(include_str!("../scheduler.rs").contains("pub struct CpuCell {"));
     }
 
     #[test]
@@ -34172,7 +34178,7 @@ mod stage115_d2_d6_seam_analysis {
         // No D2 blocking path calls it outside with_cpu.
         let runtime_src = include_str!("../../../src/runtime.rs");
         assert!(
-            runtime_src.contains("with_scheduler_split_mut"),
+            runtime_src.contains("_sched_split("),
             "scheduler seam must still exist in runtime.rs"
         );
         assert!(
@@ -34307,8 +34313,8 @@ mod stage115_d2_d6_seam_analysis {
         // since that is the actual live-wire marker for D6 Phase A.
         let split_src = include_str!("../syscall_split.rs");
         assert!(
-            !split_src.contains("with_scheduler_split_mut"),
-            "syscall_split must not call with_scheduler_split_mut (D6 live-wire deferred)"
+            !split_src.contains("_sched_split("),
+            "syscall_split must not call _sched_split( (D6 live-wire deferred)"
         );
         // Also verify local_dispatch_step_split is not called from syscall_split
         assert!(
@@ -36717,9 +36723,10 @@ mod scheduler_correctness {
     // 2. block_current_cpu calls reset_quantum on successful block.
     #[test]
     fn block_current_cpu_calls_reset_quantum_in_scheduler_state() {
+        // SCHED-LOCK1: the blocking CPU's OWN quantum.
         assert!(
-            SCHEDULER_STATE_SRC.contains("reset_quantum()"),
-            "scheduler_state.rs::block_current_cpu must call timer.reset_quantum()"
+            SCHEDULER_STATE_SRC.contains("sched.reset_quantum_on(cpu);"),
+            "scheduler_state.rs::block_current_cpu must reset the blocking CPU's quantum"
         );
     }
 
@@ -37592,8 +37599,8 @@ mod stage130_d6_proof_cleanup {
             "scheduler_timer.rs reset_quantum API must remain intact"
         );
         assert!(
-            SCHEDULER_STATE_SRC.contains("reset_quantum()"),
-            "scheduler_state.rs block_current_cpu must still call reset_quantum"
+            SCHEDULER_STATE_SRC.contains("sched.reset_quantum_on(cpu);"),
+            "scheduler_state.rs block_current_cpu must still reset the (blocking CPU's) quantum"
         );
     }
 
@@ -47758,7 +47765,7 @@ mod stage186a_capability_split_mut_infra {
     #[test]
     fn stage186a_no_split_mut_seam_exposes_broad_kernel_state() {
         for (seam, marker) in [
-            ("with_scheduler_split_mut", "fn with_scheduler_split_mut"),
+            ("_sched_split(", "fn with_cpu_sched_split"),
             ("with_task_tcbs_split_mut", "fn with_task_tcbs_split_mut"),
             ("with_ipc_split_mut", "fn with_ipc_split_mut"),
             (
@@ -47899,7 +47906,7 @@ mod stage186e_vm_user_copy_seam {
             "with_ipc_state",
             "with_capability_state_split_mut",
             "with_capability_state",
-            "with_scheduler_split_mut",
+            "_sched_split(",
             "with_scheduler_state",
             "with_tcbs",
             "with_task_tcbs_split_mut",
@@ -54252,7 +54259,7 @@ mod stage166_d6_switch_a {
         );
         // The with_scheduler_split_mut / global-lock fences are not removed here.
         assert!(
-            !EXEC_STATE_SRC.contains("// D6-SWITCH-A: delete with_scheduler_split_mut fence"),
+            !EXEC_STATE_SRC.contains("// D6-SWITCH-A: delete _sched_split( fence"),
             "Stage 166 must not broadly remove the seam fences"
         );
     }
@@ -54299,7 +54306,7 @@ mod stage166_d6_switch_a {
         // The split-mut seam helper-only fence marker must still be present
         // (i.e. we did not live-wire or delete it as part of D6-SWITCH-A).
         assert!(
-            !EXEC_STATE_SRC.contains("D6_SWITCH_A: live-wire with_scheduler_split_mut")
+            !EXEC_STATE_SRC.contains("D6_SWITCH_A: live-wire _sched_split(")
                 && !EXEC_STATE_SRC.contains("D6_SWITCH_A: live-wire with_task_tcbs_split_mut"),
             "D6-SWITCH-A must not live-wire the D1/D2/D3/D5 seams"
         );
@@ -54430,7 +54437,7 @@ mod stage167_d6_genuine {
             .expect("seam method must exist");
         let body = &RUNTIME_SRC[method_idx..method_idx + 900];
         assert!(
-            body.contains("self.with_scheduler_split_mut("),
+            body.contains("_sched_split("),
             "the d6_genuine wrapper must call the rank-1 scheduler seam"
         );
         assert!(
@@ -54464,18 +54471,17 @@ mod stage167_d6_genuine {
             .expect("seam method must exist");
         let body = &RUNTIME_SRC[method_idx..method_idx + 900];
         assert!(
-            body.contains("current_tid_on(") && body.contains("runnable_count_on("),
+            body.contains("c.current_tid()") && body.contains("c.runnable_count()"),
             "the observe wrapper must read the committed decision (current_tid/runnable_count)"
         );
         assert!(
-            !body.contains("dispatch_next_on("),
+            !body.contains("dispatch_next"),
             "the observe wrapper must NOT mutate the run queue via dispatch_next_on"
         );
         // The in-lock authoritative dispatch still takes the scheduler lock via
         // self.scheduler_state() and must NOT call the seam (would alias).
         assert!(
-            SCHED_SRC.contains("self.scheduler_state()")
-                && !SCHED_SRC.contains("with_scheduler_split_mut("),
+            SCHED_SRC.contains("self.scheduler_state()") && !SCHED_SRC.contains("_sched_split("),
             "in-lock local_dispatch_step_split must remain the authoritative non-seam path"
         );
         assert!(
@@ -54671,8 +54677,8 @@ mod stage168_d6_genuine_b_and_d2_recv {
     #[test]
     fn stage168_mut_dispatch_out_of_lock_call_site() {
         assert!(
-            RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)")
-                && RUNTIME_SRC.contains("self.with_scheduler_split_mut("),
+            RUNTIME_SRC.contains("let selection = c.dispatch_next_selection();")
+                && RUNTIME_SRC.contains("_sched_split("),
             "the mutating dispatch seam must call dispatch_next_on under the scheduler seam"
         );
         assert!(
@@ -55058,7 +55064,7 @@ mod stage168b_d2_recv_genuine_completion {
         // derivation that explains why it is there.
         let owner_body = &RUNTIME_SRC[owner..owner + 5200];
         assert!(
-            owner_body.contains("dispatch_next_accepted_selection_on(cpu, |tid| {"),
+            owner_body.contains("c.dispatch_next_accepted_selection(|tid| {"),
             "the owner must call the authoritative queue-advancing scheduler primitive"
         );
         // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates before mutating. U9-DISPATCH-CPU1
@@ -55462,7 +55468,7 @@ mod stage169_d2_send_genuine {
         // derivation that explains why it is there.
         let owner_body = &RUNTIME_SRC[owner..owner + 5200];
         assert!(
-            owner_body.contains("dispatch_next_accepted_selection_on(cpu, |tid| {"),
+            owner_body.contains("c.dispatch_next_accepted_selection(|tid| {"),
             "the owner must call the authoritative queue-advancing scheduler primitive"
         );
         // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates before mutating. U9-DISPATCH-CPU1
@@ -60536,7 +60542,8 @@ mod stage183_smp_live {
         // dispatching_cpu_count is a pure derivation of online + wake-only bitmaps.
         assert!(
             include_str!("scheduler_state.rs").contains("fn dispatching_cpu_count(&self) -> usize")
-                && include_str!("scheduler_state.rs").contains("!s.wake_only_bitmap()"),
+                && include_str!("scheduler_state.rs").contains("sched.dispatching_bitmap()")
+                && include_str!("../scheduler.rs").contains("online & !self.wake_only()"),
             "dispatching_cpu_count must derive from online AND NOT wake-only"
         );
         // No Stage-182-removed seam selector knob was reintroduced.
@@ -61242,7 +61249,7 @@ mod stage183_ap_idle_admit {
         // Wake-only placement gating: balanced enqueue skips wake-only CPUs, explicit
         // enqueues are denied, and the AP is marked wake-only BEFORE bring_up_cpu.
         assert!(
-            SCHED_SRC.contains("wake_only: u64")
+            SCHED_SRC.contains("    wake_only: AtomicU64,")
                 && SCHED_SRC.contains("fn set_cpu_wake_only")
                 && SCHED_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY")
                 && SCHED_SRC.contains("fn install_ap_idle_current"),
@@ -61768,12 +61775,12 @@ mod stage189b_ap_dispatch_scaffold {
     fn admission_guards_deny_wake_only_placement() {
         assert!(
             SCHED_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY")
-                && SCHED_SRC.contains("fn least_loaded_online_cpu("),
+                && SCHED_SRC.contains("fn least_loaded("),
             "wake-only enqueue denial + least-loaded skip must exist"
         );
         // least_loaded_online_cpu skips wake-only CPUs.
         assert!(
-            SCHED_SRC.contains("if self.wake_only & (1u64 << idx) != 0 {")
+            SCHED_SRC.contains("if excluded & (1u64 << idx) != 0 || online & (1u64 << idx) == 0 {")
                 && SCHED_SRC.contains("continue;"),
             "least-loaded selection must skip wake-only CPUs"
         );
@@ -62390,7 +62397,7 @@ mod stage190a_ap_sched_loop {
         // scheduler primitive — the membership algorithm is never reproduced outside it.
         assert!(
             RUNTIME_SRC.contains("pub(crate) fn block_current_on_cpu_split(")
-                && RUNTIME_SRC.contains(".block_current_on(cpu)"),
+                && RUNTIME_SRC.contains("Ok(c.block_current().map(|tid| tid.0))"),
             "the AP probe must be removed via the scheduler's block_current_on (consistent run queue)"
         );
     }
@@ -62853,7 +62860,7 @@ mod stage191b_futex_wake_retire {
         assert!(
             RUNTIME_SRC.contains("pub fn futex_wake_split_mut(")
                 && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
-                && RUNTIME_SRC.contains("self.with_all_cpus_sched_split(|sched| {")
+                && RUNTIME_SRC.contains("self.commit_enqueue_split(&plan)")
                 // U9-SPAWN1 SP-1: the route no longer reaches the SmpScheduler primitives
                 // itself. It plans under rank 2 and commits through the ONE shared owner, which
                 // is what reaches `enqueue_on_with_priority` / `enqueue_balanced` — the same
@@ -62863,8 +62870,10 @@ mod stage191b_futex_wake_retire {
                 && RUNTIME_SRC.contains(
                     "crate::kernel::task_enqueue::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)"
                 )
-                && RUNTIME_SRC.contains("crate::kernel::task_enqueue::commit_enqueue_locked(")
-                && OWNER_SRC.contains("enqueue_on_with_priority(cpu, ThreadId(plan.tid), plan.priority)")
+                // SCHED-LOCK1: THE split commit is `commit_enqueue_split`, which reaches the per-CPU
+                // commit owner under the target CPU's own 1L.
+                && RUNTIME_SRC.contains("crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(c, &pinned)")
+                && OWNER_SRC.contains(".enqueue_with_priority(ThreadId(plan.tid), plan.priority)")
                 && OWNER_SRC.contains("enqueue_balanced(ThreadId(plan.tid), plan.priority)"),
             "the split wake must use the task + scheduler split-mut seams and the same enqueue"
         );
@@ -63409,9 +63418,9 @@ mod stage191d_futex_wait_block_publish {
         assert!(
             RUNTIME_SRC.contains("pub(crate) fn futex_wait_park_exact_split(")
                 && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
-                && RUNTIME_SRC.contains("self.with_all_cpus_sched_split(|sched| {")
+                && RUNTIME_SRC.contains(".with_cpu_sched_split(cpu, |c| {")
                 // AP-SCHED1: the quantum reset is this CPU's own.
-                && RUNTIME_SRC.contains("sched.reset_quantum_on(cpu);"),
+                && RUNTIME_SRC.contains("c.reset_quantum();"),
             "the park transaction must use the task + scheduler split-mut seams"
         );
         let park = RUNTIME_SRC
@@ -63420,11 +63429,11 @@ mod stage191d_futex_wait_block_publish {
             .and_then(|b| b.split("\n    ///").next())
             .expect("the park transaction");
         assert!(
-            park.contains(".block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid))"),
+            park.contains("c.block_current_exact(crate::kernel::ipc::ThreadId(tid))"),
             "the clear must be a COMPARE-and-clear, so it can never clear another task"
         );
         assert!(
-            !park.contains("block_current_on(cpu)"),
+            !park.contains("c.block_current()"),
             "the unconditional clear may not come back"
         );
         assert!(
@@ -64776,7 +64785,7 @@ mod stage192a_queue_advancing_dispatch {
     fn dispatch_step_uses_authoritative_dispatch_next_on() {
         assert!(
             RUNTIME_SRC.contains("pub(crate) fn futex_wait_dispatch_step_mut(")
-                && RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)")
+                && RUNTIME_SRC.contains("let selection = c.dispatch_next_selection();")
                 && RUNTIME_SRC.contains("pub(crate) fn futex_wait_reverify_blocked("),
             "the futex dispatch-step must use the authoritative dispatch_next_on + reverify"
         );
@@ -65175,7 +65184,7 @@ mod stage192b_yield_queue_advancing_dispatch {
         assert!(
             SCHED_SRC.contains("pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId>")
                 && RUNTIME_SRC.contains("pub(crate) fn yield_dispatch_step_mut(")
-                && RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)"),
+                && RUNTIME_SRC.contains("let selection = c.dispatch_next_selection();"),
             "the re-enqueue-only split + authoritative dispatch-step must exist"
         );
         // U9-REAP1 §4: ReapFaultedTask is split-eligible, and is non-switching, so it neither
@@ -76082,7 +76091,7 @@ mod stage195d_aarch64_bsp_dispatch_affinity {
     #[test]
     fn balanced_placement_skips_wake_only_core() {
         assert!(
-            SCHED_SRC.contains("if self.wake_only & (1u64 << idx) != 0 {")
+            SCHED_SRC.contains("if self.wake_only() {")
                 && SCHED_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
             "the scheduler must deny wake-only placement (arch-neutral)"
         );
@@ -76954,7 +76963,8 @@ mod stage184_cross_arch_live {
     fn stage184_cross_arch_topology_predicate() {
         assert!(
             SCHED_STATE_SRC.contains("fn dispatching_cpu_count(&self) -> usize")
-                && SCHED_STATE_SRC.contains("!s.wake_only_bitmap()"),
+                && SCHED_STATE_SRC.contains("sched.dispatching_bitmap()")
+                && include_str!("../scheduler.rs").contains("online & !self.wake_only()"),
             "dispatching_cpu_count (online - wake_only) must exist"
         );
         assert!(
@@ -95249,7 +95259,7 @@ mod stage200c_reply_timeout_transaction {
                 "{name} must have no broad fallback"
             );
             assert!(
-                !body.contains("with_scheduler_split_mut"),
+                !body.contains("_sched_split("),
                 "{name} must not acquire the scheduler lock"
             );
         }
@@ -96644,7 +96654,7 @@ mod stage200c2b_guards {
             .nth(1)
             .expect("enqueue seam");
         let enq = enq.split("\n    pub").next().unwrap();
-        assert!(enq.contains("with_scheduler_split_mut"));
+        assert!(enq.contains("_sched_split("));
         assert!(!enq.contains(".with(|"));
     }
 
@@ -104421,14 +104431,12 @@ mod stage200d0c1_aarch64_exit_prep {
             .next()
             .expect("its body");
         // rank 1 acquired first, rank 2 NESTED inside it — ascending, one acquisition of each.
-        let sched = seam
-            .find("self.with_scheduler_split_mut(")
-            .expect("rank 1 first");
+        let sched = seam.find("_sched_split(").expect("rank 1 first");
         let task = seam
             .find("self.with_task_return_split_mut(")
             .expect("rank 2 nested");
         assert!(sched < task, "rank 1 is entered before rank 2");
-        assert_eq!(seam.matches("with_scheduler_split_mut(").count(), 1);
+        assert_eq!(seam.matches("_sched_split(").count(), 1);
         assert_eq!(
             seam.matches("with_task_return_split_mut(").count(),
             1,
@@ -104449,11 +104457,13 @@ mod stage200d0c1_aarch64_exit_prep {
             );
         }
         // The `with_cpu` admission contract: same predicate, same error, same binding.
-        assert!(seam.contains("validate_online_cpu(cpu)"));
+        assert!(seam.contains("c.validate_online()"));
         assert!(seam.contains("map_err(crate::kernel::boot::map_scheduler_error)"));
-        assert!(seam.contains("sched.current_cpu = cpu;"));
+        // SCHED-LOCK1: the retired ambient bind is gone; the CPU is named explicitly.
+        assert!(!seam.contains("current_cpu = cpu"));
+        assert!(seam.contains("self.with_cpu_sched_split(cpu, |c| {"));
         // The replacement is resolved on the EXACT trapping CPU and refused when stale.
-        assert!(seam.contains("current_tid_on(cpu)"));
+        assert!(seam.contains("c.current_tid()"));
         assert!(seam.contains("!= Some(next_tid)"));
         assert_eq!(
             seam.matches("KernelError::TaskMissing").count(),
@@ -105736,7 +105746,7 @@ mod stage200d0d1_riscv_exit_prep {
     fn u3_rank1_precedes_rank2_and_both_stay_held() {
         let txn = transaction_body();
         let rank1 = txn
-            .find("with_scheduler_split_mut")
+            .find("_sched_split(")
             .expect("rank-1 scheduler acquisition");
         let rank2 = txn
             .find("with_task_tcbs_split_mut")
@@ -109130,21 +109140,21 @@ mod stage200d2b1d5a_owner_revalidation {
         // `Running` before returning to userspace. `dispatch_next_on` threw that away, which is
         // exactly the shape U9-DISPATCH-CPU1 D4 had to undo at the AP's first entry.
         assert!(
-            body.contains("sched.dispatch_next_selection_on(cpu)"),
+            body.contains("let selection = c.dispatch_next_selection();"),
             "the seam must advance through the existing scheduler dispatch primitive"
         );
         assert_eq!(
-            body.matches("dispatch_next_selection_on(").count(),
+            body.matches("dispatch_next_selection(").count(),
             1,
             "exactly one queue advance per revalidation"
         );
         assert!(
-            !body.contains("dispatch_next_on("),
+            !body.contains("dispatch_next()"),
             "and not through the bare-TID form, which cannot carry provenance to the mark"
         );
         // No second queue, no hand-rolled selection. (`block_current_on_cpu`/`enqueue_on_cpu`
         // ARE used, but only to UNDO this advance — see the Stage 200D-2B1D5B guards.)
-        for forbidden in ["runnable_count_on", "dispatch_next_current_cpu"] {
+        for forbidden in ["runnable_count", "dispatch_next_current_cpu"] {
             assert!(
                 !body.contains(forbidden),
                 "the seam must not reach for `{forbidden}`"
@@ -109157,15 +109167,16 @@ mod stage200d2b1d5a_owner_revalidation {
     fn g02_seam_is_cpu_local() {
         let body = seam();
         assert!(
-            body.contains("dispatch_next_selection_on(cpu)"),
+            body.contains("self.with_cpu_sched_split(cpu, |c| {")
+                && body.contains("let selection = c.dispatch_next_selection();"),
             "the seam must pop from this CPU's own run queue"
         );
         // The Stage 200D-2B1D5B rollback is CPU-local too: it must undo the advance on the very
         // CPU that made it, never park the task somewhere else. U3 (203C) reaches the same two
         // scheduler primitives `block_current_on_cpu` / `enqueue_on_cpu` wrapped, under rank 1.
         assert!(
-            body.contains("block_current_on(cpu)")
-                && body.contains("enqueue_on_with_priority(cpu, ThreadId(tid), priority)"),
+            body.contains("c.block_current()")
+                && body.contains("c.enqueue_with_priority(ThreadId(tid), priority)"),
             "the rollback must clear and requeue on the caller's own CPU"
         );
         assert!(
@@ -109174,8 +109185,8 @@ mod stage200d2b1d5a_owner_revalidation {
         );
         // `current_cpu` appears exactly once, and only to BIND the caller's own CPU — the bind
         // `with_cpu` performed through `set_current_cpu`. It is never read as a different CPU.
-        assert_eq!(body.matches("current_cpu").count(), 1);
-        assert!(body.contains("sched.current_cpu = cpu;"));
+        // SCHED-LOCK1: the ambient binding these seams used to perform is retired.
+        assert_eq!(body.matches("current_cpu").count(), 0);
         // `dispatch_next_on_cpu` itself is per-CPU by construction.
         let prim = include_str!("scheduler_state.rs")
             .split("pub fn dispatch_next_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {")
@@ -109822,14 +109833,12 @@ mod stage200d2b1d5b_restore_contract {
         // Whitespace-insensitive: `cargo fmt` may wrap either expression across lines.
         let dense: alloc::string::String = body.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            dense.contains(
-                "letcleared=kernel_mut(&mutsched.scheduler).block_current_on(cpu).map(|t|t.0)==Some(tid);"
-            ),
+            dense.contains("letcleared=c.block_current().map(|t|t.0)==Some(tid);"),
             "the rollback must take the committed task back off `current`"
         );
         assert!(
             dense.contains("letrequeued=if!restorable{true}else{")
-                && dense.contains("enqueue_on_with_priority(cpu,ThreadId(tid),priority)"),
+                && dense.contains("c.enqueue_with_priority(ThreadId(tid),priority)"),
             "a live task is returned to its run queue; a reaped one is not resurrected"
         );
         assert!(
@@ -114039,7 +114048,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .and_then(|s| s.split("\n    }").next())
             .expect("the rollback seam");
         assert!(
-            rollback.contains("preempt_reenqueue_only_on(cpu)"),
+            rollback.contains("c.preempt_reenqueue_only()"),
             "rollback must use the existing exact inverse of the dequeue"
         );
     }
@@ -114744,12 +114753,12 @@ mod stage199d_remote_wake_authority {
         // The AlreadyQueued reconciliation happens in the SAME rank-1 closure, and ONLY for the
         // direct-IPC seam.
         assert!(
-            RUNTIME.contains("reconcile.then(|| sm.withdraw_queued_tid_on(cpu, ThreadId(tid)))"),
+            RUNTIME.contains("reconcile.then(|| sm.withdraw_queued_tid(ThreadId(tid)))"),
             "membership is reconciled under the acquisition that detected it"
         );
         assert!(
             RUNTIME.contains("pub(crate) fn current_cpu_split_read(&self) -> CpuId {")
-                && RUNTIME.contains("self.with_all_cpus_sched_split(|sched| sched.current_cpu)"),
+                && RUNTIME.contains("    pub(crate) fn current_cpu_split_read(&self) -> CpuId {\n        self.executing_cpu_split()\n    }"),
             "the enqueueing CPU comes from the same rank-1 authority"
         );
     }
@@ -116397,9 +116406,9 @@ mod stage199d_riscv_production_readiness_audit {
             "`current_tid_authoritative` is no longer a broad-lock acquisition"
         );
         assert!(
-            authoritative.contains("with_scheduler_split_mut")
-                && authoritative.contains("validate_online_cpu(cpu)")
-                && authoritative.contains("current_tid_on(cpu)"),
+            authoritative.contains("_sched_split(")
+                && authoritative.contains("c.validate_online()")
+                && authoritative.contains("c.current_tid()"),
             "it must be ONE rank-1 transaction that validates and reads the EXPLICIT cpu"
         );
         assert!(
@@ -116407,7 +116416,8 @@ mod stage199d_riscv_production_readiness_audit {
                 && !authoritative.contains("set_current_cpu")
                 && !authoritative.contains("bind_current_cpu_split")
                 && !authoritative.contains("current_cpu_split_read")
-                && !authoritative.contains("current_tid()"),
+                // (`c.current_tid()` is the explicit CPU's slot under its own 1L.)
+                && !authoritative.replace("c.current_tid()", "").contains("current_tid()"),
             "it must NOT bind or otherwise consult the process-global ambient current_cpu"
         );
         let bridge = function_body(RISCV_BRIDGE, "extern \"C\" fn yarm_riscv64_trap_bridge");
@@ -118697,7 +118707,7 @@ mod stage199d_riscv_link2_wake_only_online {
         );
         // And the scheduler genuinely excludes wake-only CPUs from placement.
         assert!(
-            SCHED.contains("if self.wake_only & (1u64 << idx) != 0 {")
+            SCHED.contains("if excluded & (1u64 << idx) != 0 || online & (1u64 << idx) == 0 {")
                 && SCHED.contains("continue;"),
             "least_loaded_online_cpu must skip wake-only CPUs"
         );
@@ -119589,11 +119599,11 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
     #[test]
     fn the_denial_is_documented_production_policy_with_a_named_owner() {
         let at = SCHED
-            .find("pub fn enqueue_on_with_priority")
+            .find("    ) -> Result<(), SchedulerError> {\n        self.validate_online()?;\n        let cpu = self.cpu();")
             .expect("the placement seam");
         let body = &SCHED[at..at + 1600];
         assert!(
-            body.contains("if self.wake_only & (1u64 << idx) != 0 {"),
+            body.contains("if self.wake_only() {"),
             "the wake-only branch guards placement"
         );
         assert!(
@@ -119624,11 +119634,11 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
         // Bound the slice at the method's closing brace (column 4), not at a byte count.
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("the method end")];
         assert!(
-            !body.contains("let _ = sm.enqueue_on_with_priority"),
+            !body.contains("let _ = sm.enqueue_with_priority"),
             "the enqueue result must never be dropped again"
         );
         assert!(
-            body.contains("match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {"),
+            body.contains("match sm.enqueue_with_priority(ThreadId(tid), priority) {"),
             "the result is matched"
         );
         assert!(
@@ -119708,7 +119718,7 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
         assert_eq!(
             runtime_code
                 .iter()
-                .filter(|l| l.contains("withdraw_queued_tid_on"))
+                .filter(|l| l.contains(".withdraw_queued_tid("))
                 .count(),
             1,
             "exactly one runtime caller: the same-acquisition reconciliation"
@@ -119718,7 +119728,7 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             .expect("the shared enqueue body");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
         assert!(
-            body.contains("withdraw_queued_tid_on"),
+            body.contains(".withdraw_queued_tid("),
             "…and it is inside the enqueue body, not anywhere else"
         );
     }
@@ -120219,13 +120229,13 @@ mod stage199d_receiver_enqueue_outcome {
             .expect("the shared enqueue body");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
         let open = body
-            .find("self.with_all_cpus_sched_split(|sched| {")
+            .find(".with_cpu_sched_split(cpu, |sm| {")
             .expect("acquisition");
         let detect = body
             .find("Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued)")
             .expect("the collision arm");
         let reconcile = body
-            .find("reconcile.then(|| sm.withdraw_queued_tid_on(cpu, ThreadId(tid)))")
+            .find("reconcile.then(|| sm.withdraw_queued_tid(ThreadId(tid)))")
             .expect("the reconciliation");
         assert!(
             open < detect && detect < reconcile,
@@ -120233,7 +120243,7 @@ mod stage199d_receiver_enqueue_outcome {
         );
         // Exactly one acquisition in the whole seam: a second one would BE the window.
         assert_eq!(
-            body.matches("with_scheduler_split_mut").count(),
+            body.matches("_sched_split(").count(),
             1,
             "a second acquisition is exactly the unlock/relock window this forbids"
         );
@@ -125790,8 +125800,8 @@ mod stage199d_wa3a_transition_barriers {
                 .or_else(|| scoped.find("if dispatch_cpu != cpu {"))
                 .unwrap_or_else(|| panic!("{seam} must authenticate before it mutates"));
             let mutate = scoped
-                .find("dispatch_next_accepted_selection_on(")
-                .or_else(|| scoped.find("dispatch_next_selection_on("))
+                .find("dispatch_next_accepted_selection(")
+                .or_else(|| scoped.find("dispatch_next_selection("))
                 .unwrap_or_else(|| panic!("{seam} must dispatch"));
             assert!(
                 guard < mutate,
@@ -125810,8 +125820,8 @@ mod stage199d_wa3a_transition_barriers {
             let scoped = scope_of(seam);
             if scoped.contains("self.queue_advance_select_step_split(") {
                 assert!(
-                    !scoped.contains("dispatch_next_selection_on(")
-                        && !scoped.contains("dispatch_next_accepted_selection_on("),
+                    !scoped.contains("dispatch_next_selection(")
+                        && !scoped.contains("dispatch_next_accepted_selection("),
                     "{seam} delegates selection, so it must not also dequeue itself"
                 );
                 continue;
@@ -127444,15 +127454,16 @@ mod u3_ap_saved_context_snapshot {
     #[test]
     fn u3_transaction_authenticates_once_and_resolves_cr3_after_releasing_it() {
         let helper = body_of("fn with_current_fpu_home_split<R>(");
-        assert_eq!(helper.matches("self.with_scheduler_split_mut(").count(), 1);
+        assert_eq!(helper.matches("_sched_split(").count(), 1);
         assert_eq!(helper.matches("self.with_task_tcbs_split_mut(").count(), 1);
         assert!(
-            helper.find("self.with_scheduler_split_mut(").unwrap()
+            helper.find("_sched_split(").unwrap()
                 < helper.find("self.with_task_tcbs_split_mut(").unwrap(),
             "ascending rank order: the scheduler, then the task domain nested inside it"
         );
         for check in [
-            "current_tid_on(cpu)",
+            "c.current_tid()",
+            "domain.current_elsewhere(cpu,",
             "CurrentElsewhere",
             "tcb.asid",
             "tcb.status",
@@ -127992,7 +128003,7 @@ mod u3_ap_enqueue_dispatch_transaction {
             "the transaction must hold no broad acquisition"
         );
         assert_eq!(
-            body.matches("with_scheduler_split_mut").count(),
+            body.matches("_sched_split(").count(),
             1,
             "exactly one rank-1 scheduler acquisition"
         );
@@ -128004,16 +128015,17 @@ mod u3_ap_enqueue_dispatch_transaction {
         // U3 (203C): re-derived. The transaction no longer writes the process-global ambient
         // `scheduler.current_cpu` — see `u3_ed_transaction_is_explicit_cpu_and_non_binding`.
         // The chronology it guarantees is otherwise unchanged, minus the retired bind step.
-        let rank1 = body.find("with_scheduler_split_mut").expect("rank 1");
-        let validate = body.find("validate_online_cpu").expect("CPU validation");
+        let rank1 = body.find("_sched_split(").expect("rank 1");
+        let validate = body.find("c.validate_online()").expect("CPU validation");
         let rank2 = body
             .find("with_task_enqueue_policy_split_mut")
             .expect("rank 2");
         let enqueue = body
-            .find("enqueue_on_with_priority")
+            .find("c\n                        .enqueue_with_priority(")
+            .or_else(|| body.find("c.enqueue_with_priority("))
             .expect("the existing enqueue primitive");
         let dispatch = body
-            .find("dispatch_next_on(cpu)")
+            .find("c.dispatch_next()")
             .expect("the existing dispatch primitive");
         assert!(
             rank1 < validate && validate < rank2 && rank2 < enqueue && enqueue < dispatch,
@@ -128127,7 +128139,7 @@ mod u3_ap_enqueue_dispatch_transaction {
             .expect("the transaction call");
         let tail = &body[after..];
         assert!(
-            !tail.contains("with_scheduler_split_mut")
+            !tail.contains("_sched_split(")
                 && !tail.contains("with_task_enqueue_policy_split_mut")
                 && !tail.contains(".with_cpu(")
                 && !tail.contains("shared.with("),
@@ -128249,8 +128261,8 @@ mod u3_ap_block_current_transaction {
         assert_eq!(removed, Some(300), "the removed TID is returned verbatim");
         assert_eq!(
             current_cpu(&k),
-            CpuId(AP),
-            "the transaction binds current_cpu before removing"
+            CpuId(0),
+            "SCHED-LOCK1: the transaction no longer binds the retired ambient selector"
         );
         assert_eq!(current_on(&k, CpuId(AP)), None, "nothing is left running");
     }
@@ -128263,8 +128275,8 @@ mod u3_ap_block_current_transaction {
         assert_eq!(removed, None, "no current task -> None");
         assert_eq!(
             current_cpu(&k),
-            CpuId(AP),
-            "current_cpu is bound even when that CPU has no current task"
+            CpuId(0),
+            "SCHED-LOCK1: the retired ambient selector is never bound by the split transaction"
         );
     }
 
@@ -128450,7 +128462,13 @@ mod u3_ap_block_current_transaction {
                 split.unwrap_or(None),
                 "{name}: the caller's `.unwrap_or(None)` sees the same value"
             );
-            assert_eq!(current_cpu(&a), current_cpu(&b), "{name}: same binding");
+            // SCHED-LOCK1: the broad body still binds the (hosted) ambient selector; the split
+            // transaction never does — it names its CPU explicitly.
+            assert_eq!(
+                current_cpu(&b),
+                CpuId(0),
+                "{name}: the split transaction never binds"
+            );
             assert_eq!(
                 current_on(&a, CpuId(AP)),
                 current_on(&b, CpuId(AP)),
@@ -128497,7 +128515,7 @@ mod u3_ap_block_current_transaction {
             "no broad acquisition"
         );
         assert_eq!(
-            body.matches("with_scheduler_split_mut").count(),
+            body.matches("_sched_split(").count(),
             1,
             "exactly one rank-1 scheduler acquisition"
         );
@@ -128512,14 +128530,16 @@ mod u3_ap_block_current_transaction {
                 "`{rank2}`: rank 2 must never be taken — this is a scheduler-only mutation"
             );
         }
-        let validate = body.find("validate_online_cpu").expect("CPU validation");
-        let bind = body.find("sched.current_cpu = cpu").expect("the bind");
+        // SCHED-LOCK1: validate -> the existing block primitive, on `cpu`'s own 1L; the
+        // retired ambient bind is gone.
+        let validate = body.find("c.validate_online()").expect("CPU validation");
+        assert!(!body.contains("current_cpu = cpu"), "no ambient bind");
         let block = body
-            .find("block_current_on(cpu)")
+            .find("c.block_current()")
             .expect("the existing primitive");
         assert!(
-            validate < bind && bind < block,
-            "chronology must be: validate -> bind -> existing block primitive"
+            validate < block,
+            "chronology must be: validate -> existing block primitive"
         );
         // Nothing beyond the scheduler mutation.
         for forbidden in [
@@ -128574,7 +128594,7 @@ mod u3_ap_block_current_transaction {
             "the transaction completes before any telemetry"
         );
         assert!(
-            !body[seam..].contains("with_scheduler_split_mut"),
+            !body[seam..].contains("_sched_split("),
             "no guard is held across the marker"
         );
     }
@@ -128744,7 +128764,8 @@ mod u3_d6_first_resume_bind_transaction {
         let k = kernel();
         k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
         assert_eq!(k.bind_current_cpu_split(CpuId(AP)), Ok(()));
-        assert_eq!(current_cpu(&k), CpuId(AP));
+        // SCHED-LOCK1: validation only; the retired ambient selector is not bound.
+        assert_eq!(current_cpu(&k), CpuId(0));
     }
 
     #[test]
@@ -128761,7 +128782,8 @@ mod u3_d6_first_resume_bind_transaction {
             Ok(()),
             "a valid CPU with no current task must SUCCEED — not be conflated with refusal"
         );
-        assert_eq!(current_cpu(&k), CpuId(AP));
+        // SCHED-LOCK1: validation only; the retired ambient selector is not bound.
+        assert_eq!(current_cpu(&k), CpuId(0));
     }
 
     #[test]
@@ -128842,10 +128864,12 @@ mod u3_d6_first_resume_bind_transaction {
             let split = b.bind_current_cpu_split(cpu);
 
             assert_eq!(legacy, split, "cpu {}: same result", cpu.0);
+            // SCHED-LOCK1: the broad `with_cpu` still binds the hosted ambient selector; the
+            // split transaction is now validation only and never binds.
             assert_eq!(
-                current_cpu(&a),
                 current_cpu(&b),
-                "cpu {}: same binding",
+                CpuId(0),
+                "cpu {}: the split transaction never binds",
                 cpu.0
             );
             assert_eq!(
@@ -128885,7 +128909,7 @@ mod u3_d6_first_resume_bind_transaction {
             "no broad acquisition"
         );
         assert_eq!(
-            body.matches("with_scheduler_split_mut").count(),
+            body.matches("_sched_split(").count(),
             1,
             "exactly one rank-1 scheduler acquisition"
         );
@@ -128904,9 +128928,9 @@ mod u3_d6_first_resume_bind_transaction {
                 "`{other_domain}`: no domain beyond rank 1 may be touched"
             );
         }
-        let validate = body.find("validate_online_cpu").expect("validation");
-        let bind = body.find("sched.current_cpu = cpu").expect("the bind");
-        assert!(validate < bind, "validate before bind");
+        // SCHED-LOCK1: the bind is retired; the transaction is exactly its validation.
+        assert!(body.contains("c.validate_online()"), "validation");
+        assert!(!body.contains("current_cpu = cpu"), "no ambient bind");
         for forbidden in [
             "current_tid",
             "block_current",
@@ -128991,7 +129015,7 @@ mod u3_d6_first_resume_bind_transaction {
         );
         // Nothing is held across the hardware CR3 read.
         assert!(
-            !body[guard..].contains("with_scheduler_split_mut"),
+            !body[guard..].contains("_sched_split("),
             "the rank-1 guard is released before marker emission and the hardware CR3 read"
         );
         // FirstResumeContext is unchanged in shape at this site.
@@ -129314,8 +129338,8 @@ mod u3_blocked_waiter_completion_transaction {
         );
         assert_eq!(
             k.with(|s| s.current_cpu()),
-            CpuId(1),
-            "current_cpu is bound"
+            CpuId(0),
+            "SCHED-LOCK1: the retired ambient selector is not bound by the split transaction"
         );
     }
 
@@ -129601,7 +129625,7 @@ mod u3_blocked_waiter_completion_transaction {
             );
         }
         // Ascending, one acquisition each, in the legacy order.
-        let sched = outer.find("with_scheduler_split_mut").expect("rank 1");
+        let sched = outer.find("_sched_split(").expect("rank 1");
         let task = outer
             .find("with_task_tcbs_split_mut")
             .expect("rank 2 register clear");
@@ -129611,13 +129635,13 @@ mod u3_blocked_waiter_completion_transaction {
             sched < task && task < ipc && ipc < wake_call,
             "rank 1 -> rank 2 -> rank 3 -> wake, matching the legacy order"
         );
-        assert_eq!(outer.matches("with_scheduler_split_mut").count(), 1);
+        assert_eq!(outer.matches("_sched_split(").count(), 1);
         assert_eq!(outer.matches("with_ipc_split_mut").count(), 1);
         // The wake half: rank 2 then rank 1, never the reverse.
         let w_task = wake
             .find("with_task_enqueue_policy_split_mut")
             .expect("rank 2");
-        let w_sched = wake.find("with_scheduler_split_mut").expect("rank 1");
+        let w_sched = wake.find("_sched_split(").expect("rank 1");
         assert!(
             w_task < w_sched,
             "rank 2 fully released before the rank-1 enqueue"
@@ -129637,6 +129661,8 @@ mod u3_blocked_waiter_completion_transaction {
             "identity stays `task_asid(wake_tid).unwrap_or(Asid(0))`, not the snapshot ASID"
         );
         // No re-entrant KernelState accessors inside the held domains.
+        // SCHED-LOCK1: `c.current_tid()` reads the executing CPU's own slot under its own 1L.
+        let wake = wake.replace("c.current_tid()", "");
         for reentrant in [
             "clear_blocked_recv_return_regs(",
             "ipc_clear_plain_receiver_waiter_only(",
@@ -129660,7 +129686,7 @@ mod u3_blocked_waiter_completion_transaction {
             assert!(wake.contains(marker), "marker `{marker}` must be preserved");
         }
         assert!(
-            wake.contains("enqueue_on_with_priority"),
+            wake.contains("c.enqueue_with_priority(tid, state.priority)"),
             "the existing queue primitive is used"
         );
     }
@@ -130287,15 +130313,16 @@ mod u3_owner_revalidation_transaction {
     fn the_phases_are_rank_ordered_and_each_takes_exactly_one_acquisition() {
         let select = body_of(RUNTIME, "fn owner_revalidation_select_split");
         assert_eq!(
-            select.matches("with_scheduler_split_mut").count(),
+            select.matches("_sched_split(").count(),
             1,
             "rank 1, one acquisition"
         );
         // Validation precedes the bind, which precedes the advance.
-        let v = select.find("validate_online_cpu").expect("validate");
-        let bind = select.find("current_cpu = cpu").expect("bind");
-        let adv = select.find("dispatch_next_selection_on(").expect("advance");
-        assert!(v < bind && bind < adv, "validate -> bind -> advance");
+        // SCHED-LOCK1: validate -> advance under `cpu`'s own 1L; the ambient bind is retired.
+        let v = select.find("c.validate_online()").expect("validate");
+        assert!(!select.contains("current_cpu = cpu"), "no ambient bind");
+        let adv = select.find("c.dispatch_next_selection()").expect("advance");
+        assert!(v < adv, "validate -> advance");
         // QEMU-SMP3-SEAL §2: the ONE task-domain touch in the selection is a read-only lookup of
         // the selected TID's ASID, nested INSIDE rank 1 (ascending) after the advance — the pin
         // that lets every later phase name the exact incarnation that was dequeued.
@@ -130319,7 +130346,7 @@ mod u3_owner_revalidation_transaction {
             "rank 2, ONE acquisition covering the verdict and the payload"
         );
         assert!(
-            !snap.contains("with_scheduler_split_mut"),
+            !snap.contains("_sched_split("),
             "rank 1 is released before rank 2 is taken"
         );
         assert!(
@@ -130336,8 +130363,7 @@ mod u3_owner_revalidation_transaction {
             "rank 2, one acquisition"
         );
         assert!(
-            !claim.contains("with_scheduler_split_mut")
-                && !claim.contains("with_task_tcbs_split_mut"),
+            !claim.contains("_sched_split(") && !claim.contains("with_task_tcbs_split_mut"),
             "no second acquisition of either domain"
         );
         let at = |needle: &str| {
@@ -130474,7 +130500,7 @@ mod u3_owner_revalidation_transaction {
         // The still-live requeue arm is present, guarded by restorability (fact 8), and the
         // reaped short-circuit is present (fact 9).
         assert!(rb.contains("if !restorable"));
-        assert!(rb.contains("enqueue_on_with_priority"));
+        assert!(rb.contains("c.enqueue_with_priority(ThreadId(tid), priority)"));
     }
 
     #[test]
@@ -130552,7 +130578,7 @@ mod u3_recv_copy_fault_completion {
         Option<FaultInfo>, // last_fault
         bool,              // last_fault_frame present
         TrapFrame,         // the caller's frame
-        CpuId,             // bound current_cpu
+        (),                // SCHED-LOCK1: the retired ambient selector — not compared
         Option<TaskStatus>,
         Option<u64>, // current on cpu 0
         usize,       // cpu 0 queue depth
@@ -130565,7 +130591,8 @@ mod u3_recv_copy_fault_completion {
                 s.last_fault(),
                 s.last_fault_frame().is_some(),
                 f.clone(),
-                s.current_cpu(),
+                // SCHED-LOCK1: the retired ambient selector is not compared.
+                (),
                 s.with_tcbs(|tcbs| {
                     tcbs.iter()
                         .flatten()
@@ -130644,7 +130671,8 @@ mod u3_recv_copy_fault_completion {
             k.record_recv_boundary_user_fault_split_for_test(CpuId(1), &mut f, FAULT_ADDR)
                 .is_ok()
         );
-        assert_eq!(k.with(|s| s.current_cpu()), CpuId(1));
+        // SCHED-LOCK1: the retired ambient selector is never bound by a split transaction.
+        assert_eq!(k.with(|s| s.current_cpu()), CpuId(0));
     }
 
     #[test]
@@ -130660,7 +130688,8 @@ mod u3_recv_copy_fault_completion {
             k.record_recv_boundary_user_fault_split_for_test(CpuId(1), &mut f, FAULT_ADDR)
                 .is_ok()
         );
-        assert_eq!(k.with(|s| s.current_cpu()), CpuId(1));
+        // SCHED-LOCK1: the retired ambient selector is never bound by a split transaction.
+        assert_eq!(k.with(|s| s.current_cpu()), CpuId(0));
         assert_eq!(f.error, SyscallError::PageFault.code());
     }
 
@@ -130954,7 +130983,7 @@ mod u3_recv_copy_fault_completion {
         // The rank-1 guard is released by `bind_current_cpu_split` returning: the transaction
         // never nests the fault seam inside a scheduler closure.
         assert!(
-            !t.contains("with_scheduler_split_mut"),
+            !t.contains("_sched_split("),
             "the binding is delegated, never re-implemented or held open"
         );
         // Exactly the legacy record, and no frame snapshot. The direction is the shared body's
@@ -131045,7 +131074,8 @@ mod u3_recv_copy_fault_completion {
             "exactly one CPU-binding transaction exists"
         );
         let bind = body_of("pub(crate) fn bind_current_cpu_split");
-        assert!(bind.contains("validate_online_cpu(cpu)") && bind.contains("current_cpu = cpu"));
+        // SCHED-LOCK1: validation only — the ambient bind is retired.
+        assert!(bind.contains("c.validate_online()") && !bind.contains("current_cpu = cpu"));
         assert!(
             !bind.contains("target_arch") && !bind.contains("x86"),
             "its body names no architecture"
@@ -131217,7 +131247,7 @@ mod u3_riscv_terminal_idle_snapshot {
 
     /// Everything the snapshot may legitimately change — which is only the CPU binding.
     type Observed = (
-        CpuId,       // bound current_cpu
+        (),          // SCHED-LOCK1: the retired ambient selector — not compared
         Option<u64>, // current on cpu 0
         Option<u64>, // current on cpu 1
         usize,       // cpu 0 queue depth
@@ -131236,8 +131266,9 @@ mod u3_riscv_terminal_idle_snapshot {
                         .map(|t| t.status)
                 })
             };
+            // SCHED-LOCK1: the retired ambient selector is not compared.
             (
-                s.current_cpu(),
+                (),
                 s.current_tid_on_cpu(CpuId(0)),
                 s.current_tid_on_cpu(CpuId(1)),
                 s.runnable_count_on_cpu(CpuId(0)),
@@ -131254,7 +131285,11 @@ mod u3_riscv_terminal_idle_snapshot {
     fn an_online_idle_cpu_succeeds_and_binds_current_cpu() {
         let k = fixture();
         assert_eq!(k.terminal_idle_on_cpu_split(CpuId(1)), Ok(true));
-        assert_eq!(k.with(|s| s.current_cpu()), CpuId(1), "the CPU is bound");
+        assert_eq!(
+            k.with(|s| s.current_cpu()),
+            CpuId(0),
+            "SCHED-LOCK1: the retired ambient selector is not bound"
+        );
     }
 
     fn refusal_changes_nothing(cpu: CpuId, label: &str) {
@@ -131396,7 +131431,7 @@ mod u3_riscv_terminal_idle_snapshot {
             "no broad acquisition and no fallback"
         );
         assert_eq!(
-            t.matches("with_scheduler_split_mut").count(),
+            t.matches("_sched_split(").count(),
             1,
             "rank 1 exactly once — one coherent snapshot, not two locked reads"
         );
@@ -131411,12 +131446,12 @@ mod u3_riscv_terminal_idle_snapshot {
             assert!(!t.contains(other), "no `{other}` domain may be entered");
         }
         // Validate, then bind, then the two reads — and nothing else is mutated.
-        let v = t.find("validate_online_cpu").expect("validate");
-        let bind = t.find("current_cpu = cpu").expect("bind");
-        let cur = t.find("current_tid_on(cpu)").expect("current read");
-        let run = t.find("runnable_count_on(cpu)").expect("runnable read");
-        assert!(v < bind && bind < cur && cur < run);
-        assert_eq!(t.matches("current_cpu = cpu").count(), 1);
+        // SCHED-LOCK1: validate -> current -> runnable under `cpu`'s own 1L; no ambient bind.
+        let v = t.find("c.validate_online()").expect("validate");
+        let cur = t.find("c.current_tid()").expect("current read");
+        let run = t.find("c.runnable_count()").expect("runnable read");
+        assert!(v < cur && cur < run);
+        assert_eq!(t.matches("current_cpu = cpu").count(), 0);
         for forbidden in [
             "dispatch_next_on",
             "block_current_on",
@@ -131575,7 +131610,7 @@ mod u3_ordinary_cap_sender_wake {
 
     /// Everything a sender wake may legitimately change.
     type Observed = (
-        CpuId,              // bound current_cpu
+        (),                 // SCHED-LOCK1: the retired ambient selector — not compared
         Option<TaskStatus>, // SENDER status
         Option<u64>,        // SENDER ipc_timeout_deadline
         bool,               // SENDER ipc_timeout_fired
@@ -131597,8 +131632,10 @@ mod u3_ordinary_cap_sender_wake {
                 })
             };
             let sender = f(SENDER);
+            // SCHED-LOCK1: the ambient selector is retired from the scheduler; the split path
+            // never binds it, so it is no longer part of the compared state.
             (
-                s.current_cpu(),
+                (),
                 sender.map(|x| x.0),
                 sender.and_then(|x| x.1),
                 sender.map(|x| x.2).unwrap_or(false),
@@ -134202,7 +134239,7 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 "pub(crate) fn commit_blocking_send_split(",
                 "\n    /// U6 §2 — the split (rank-2 only) form of",
             );
-            let sched = body.find("with_scheduler_split_mut").expect("rank 1");
+            let sched = body.find("_sched_split(").expect("rank 1");
             let task = body.find("with_task_tcbs_split_mut").expect("rank 2");
             let ipc = body.find("with_ipc_split_mut").expect("rank 3");
             assert!(
@@ -134237,7 +134274,8 @@ mod u4_cross_arch_queue_advancing_dispatch {
             }
             // `current` is cleared inside the SAME rank-1 section that validated it.
             assert!(
-                body.contains("block_current_on(snap.cpu)"),
+                body.contains("self.with_cpu_sched_split(snap.cpu, |c| {")
+                    && body.contains("let cleared = c.block_current();"),
                 "the clear reuses the established rank-1 transition"
             );
             // The generation is CHECKED, never wrapping.
@@ -135768,7 +135806,7 @@ mod u7_production_timeout_promotion {
             "tcb.ipc_timeout_deadline =",
             "tcb.pending_syscall_completion =",
             "with_ipc_split_mut",
-            "with_scheduler_split_mut",
+            "_sched_split(",
         ] {
             assert!(
                 !body.contains(forbidden),
@@ -141529,13 +141567,19 @@ mod u3_saved_resume_cpu_authority {
                 .next()
                 .expect("its body"),
         );
-        assert!(body.contains("validate_online_cpu(cpu)") && body.contains("current_tid_on(cpu)"));
+        assert!(
+            body.contains("self.with_cpu_sched_split(cpu, |c| {")
+                && body.contains("c.validate_online()")
+                && body.contains("c.current_tid()")
+        );
         for banned in [
             "sched.current_cpu = cpu",
             "set_current_cpu",
             "bind_current_cpu_split",
             "current_cpu_split_read",
-            "current_tid()",
+            // (`c.current_tid()` is the explicit CPU's own slot under its 1L, not the ambient read.)
+            "self.current_tid()",
+            "s.current_tid()",
             "read_mpidr_el1",
             ".with_cpu(",
             "self.with(|",
@@ -141855,7 +141899,7 @@ mod u3_bsp_saved_resume_retirement {
             .next()
             .expect("bounded");
         assert_eq!(
-            body.matches("with_scheduler_split_mut").count(),
+            body.matches("_sched_split(").count(),
             1,
             "exactly one rank-1 acquisition"
         );
@@ -141874,7 +141918,9 @@ mod u3_bsp_saved_resume_retirement {
             );
         }
         assert!(
-            body.contains("on_preempt_prefer_on(cpu,"),
+            body.contains("self.with_cpu_sched_split(cpu, |c| {")
+                && body
+                    .contains("c.on_preempt_prefer(crate::kernel::ipc::ThreadId(preferred_tid))"),
             "it runs the SAME scheduler primitive the retired wrapper ran"
         );
     }
@@ -142174,13 +142220,14 @@ mod u3_ed2_next_task_retirement {
             "the transaction must neither read nor write the process-global ambient current_cpu"
         );
         assert!(
-            code.contains("validate_online_cpu(cpu)"),
+            code.contains("self.with_cpu_sched_split(cpu, |c| {")
+                && code.contains("c.validate_online()"),
             "explicit-CPU validation is retained"
         );
         for explicit in [
-            "validate_online_cpu(cpu)",
-            "enqueue_on_with_priority(cpu, ThreadId(tid), priority)",
-            "dispatch_next_on(cpu)",
+            "self.with_cpu_sched_split(cpu, |c| {",
+            ".enqueue_with_priority(ThreadId(tid), priority)",
+            "c.dispatch_next()",
         ] {
             assert!(
                 code.contains(explicit),
@@ -142188,7 +142235,7 @@ mod u3_ed2_next_task_retirement {
             );
         }
         assert_eq!(
-            code.matches("with_scheduler_split_mut").count(),
+            code.matches("_sched_split(").count(),
             1,
             "rank 1 acquired exactly once"
         );
@@ -142242,7 +142289,7 @@ mod u3_ed2_next_task_retirement {
             .expect("the transaction");
         let tail = &code[txn..];
         for banned in [
-            "with_scheduler_split_mut",
+            "_sched_split(",
             "with_task_enqueue_policy_split_mut",
             "with_task_tcbs_split_mut",
             ".with_cpu(",
@@ -142529,6 +142576,9 @@ mod u6_frame_exact_envelope_preservation {
             commit.contains("msg: snap.msg,"),
             "the waiter must take the snapshot's exact message"
         );
+        // SCHED-LOCK1: `c.current_tid()` is the preflight's read of the explicit CPU's slot under
+        // its own 1L (formerly `current_tid_on(snap.cpu)`), not an envelope rebuild.
+        let commit = commit.replace("c.current_tid()", "");
         for rebuilt in ["Message::with_header(", "Message::new(", "current_tid()"] {
             assert!(
                 !commit.contains(rebuilt),
@@ -145029,7 +145079,7 @@ mod u9f_split_capability_revocation {
                 &[
                     "with_ipc_split_mut(",
                     "with_task_tcbs_split_mut(",
-                    "with_scheduler_split_mut(",
+                    "_sched_split(",
                     "process_id_split_read(",
                 ][..],
                 "rank-4 capability",
@@ -145048,7 +145098,7 @@ mod u9f_split_capability_revocation {
                 &[
                     "with_capability_state_split_mut(",
                     "with_ipc_split_mut(",
-                    "with_scheduler_split_mut(",
+                    "_sched_split(",
                 ][..],
                 "rank-2 task",
             ),
@@ -145672,8 +145722,8 @@ mod u9_production_post_switch_restore {
         assert_eq!(k.post_switch_restore_admit_split(ap), Ok(Some(90106)));
         assert_eq!(
             k.with(|s| s.current_cpu()),
-            ap,
-            "the admission binds, exactly as `set_current_cpu` did inside `with_cpu`"
+            CpuId(0),
+            "SCHED-LOCK1: the admission no longer binds the retired ambient selector"
         );
         assert_eq!(
             k.with_cpu(ap, |s| s.current_tid()).expect("admitted"),
@@ -145782,16 +145832,14 @@ mod u9_production_post_switch_restore {
     #[test]
     fn u9_admission_reproduces_both_halves_of_with_cpu() {
         let body = fn_body(RUNTIME, "pub(crate) fn post_switch_restore_admit_split(");
-        let validate = body.find("validate_online_cpu(cpu)").expect("admission");
-        let bind = body.find("sched.current_cpu = cpu;").expect("bind");
-        let read = body.find("current_tid_on(cpu)").expect("the TID read");
-        assert!(validate < bind, "a refused CPU must not be bound");
+        // SCHED-LOCK1: validation then the TID read, under `cpu`'s own 1L; the ambient bind
+        // `with_cpu` also performed is retired (no split path reads it back).
+        let validate = body.find("c.validate_online()").expect("admission");
+        assert!(!body.contains("current_cpu = cpu"), "no ambient bind");
+        let read = body.find("c.current_tid()").expect("the TID read");
+        assert!(validate < read, "a refused CPU is never read");
         assert!(
-            bind < read,
-            "the TID is read after the bind, as `with_cpu` did"
-        );
-        assert!(
-            body.contains("with_scheduler_split_mut"),
+            body.contains("_sched_split("),
             "and all three happen under rank 1"
         );
         for banned in [".with_cpu(", ".with(|", "state.lock()"] {
@@ -146256,7 +146304,7 @@ mod u9d3_d6_cleanup_split {
             "with_memory_split_mut",
             "with_vm_user_spaces_split_mut",
             "with_task_tcbs_split_mut",
-            "with_scheduler_split_mut",
+            "_sched_split(",
             ".with_cpu(",
             "self.with(|",
         ] {
@@ -147376,12 +147424,16 @@ mod u9d3_split_unmap_drives_real_d3 {
     #[test]
     fn u9d3_target_predicate_is_rank_ordered_and_released() {
         let b = fn_body(RUNTIME, "pub(crate) fn live_cpu_bitmap_for_asid_split(");
+        // SCHED-LOCK1 (§16.5): the placement half reads the published admission bitmaps and the
+        // per-CPU current mirrors — NO scheduler lock at all, so certainly none held into rank 2.
         assert_eq!(
-            b.matches("with_scheduler_split_mut").count(),
-            1,
-            "ONE rank-1 acquisition"
+            b.matches("_sched_split(").count(),
+            0,
+            "no scheduler-lock acquisition"
         );
-        let sched_end = b.find("});").expect("the rank-1 closure closes");
+        let sched_end = b
+            .find("domain.current_mirror(cpu)")
+            .expect("the per-CPU current mirrors");
         let asid_at = b
             .find("task_asid_for_tid_split_read")
             .expect("the rank-2 resolution");
@@ -148938,7 +148990,7 @@ mod u9qa_one_queue_advance_owner {
     fn the_shared_step_takes_rank_one_once_and_is_site_attributed() {
         let step = body_of(RUNTIME, "pub(crate) fn queue_advance_select_step_split(");
         assert_eq!(
-            step.matches("with_scheduler_split_mut").count(),
+            step.matches("_sched_split(").count(),
             1,
             "the shared selection step must take rank 1 exactly once"
         );
@@ -148962,7 +149014,7 @@ mod u9qa_one_queue_advance_owner {
         );
         let stale = step.find("reason=stale_window").expect("checked above");
         let rank1 = step
-            .find("self.with_scheduler_split_mut")
+            .find("self.with_cpu_sched_split(cpu, |c| {")
             .expect("the step takes rank 1");
         assert!(
             stale < rank1,
@@ -148970,7 +149022,7 @@ mod u9qa_one_queue_advance_owner {
              not even take rank 1"
         );
         assert!(
-            step.contains("dispatch_next_accepted_selection_on(cpu, |tid| {"),
+            step.contains("c.dispatch_next_accepted_selection(|tid| {"),
             "the shared step must call the ACCEPTANCE-FILTERED authoritative selection primitive, \
              addressed by the authority's own CPU"
         );
@@ -149004,8 +149056,7 @@ mod u9qa_one_queue_advance_owner {
              IT the authority its own trap minted — not a bare CpuId assembled in the adapter"
         );
         assert!(
-            !futex.contains("dispatch_next_selection_on(")
-                && !futex.contains("with_scheduler_split_mut"),
+            !futex.contains("dispatch_next_selection_on(") && !futex.contains("_sched_split("),
             "the FutexWait seam must contain NO independent dequeue or scheduler acquisition"
         );
         // U9-QA §3: the TIMER's queue advance. A timer that expires a quantum reaches
@@ -149020,8 +149071,7 @@ mod u9qa_one_queue_advance_owner {
             "the Yield/timer preemption drain must delegate selection to the shared step"
         );
         assert!(
-            !yld.contains("dispatch_next_selection_on(")
-                && !yld.contains("with_scheduler_split_mut"),
+            !yld.contains("dispatch_next_selection_on(") && !yld.contains("_sched_split("),
             "the Yield/timer seam must contain NO independent dequeue or scheduler acquisition"
         );
         let commit = body_of(EXEC, "pub(crate) fn queue_advance_commit_split(");
@@ -149038,12 +149088,12 @@ mod u9qa_one_queue_advance_owner {
         // Its only other rank-1 use is the EXACT inverse of a dequeue on the fail-closed path —
         // an undo, not a selection.
         assert_eq!(
-            commit.matches("with_scheduler_split_mut").count(),
+            commit.matches("_sched_split(").count(),
             1,
             "the commit's only other rank-1 acquisition is the dequeue undo"
         );
         assert!(
-            commit.contains("preempt_reenqueue_only_on(cpu)"),
+            commit.contains("c.preempt_reenqueue_only()"),
             "and that acquisition must be the existing exact inverse of the dequeue"
         );
     }
@@ -149212,7 +149262,7 @@ mod u9qa_one_queue_advance_owner {
             .find("reason=plan_unavailable")
             .expect("the fail-closed path");
         let undo = commit
-            .find("preempt_reenqueue_only_on(cpu)")
+            .find("c.preempt_reenqueue_only()")
             .expect("the exact dequeue inverse");
         assert!(
             undo < refusal,
@@ -149509,7 +149559,7 @@ mod u9tm_timer_entry {
             "one tick policy"
         );
         assert!(
-            SCHED_STATE.contains("sched.timer.tick_and_check()"),
+            SCHED_STATE.contains("sched.tick_on(crate::kernel::boot::CLOCK_OWNER_CPU)"),
             "the broad arm reaches the one policy"
         );
         let owner = RUNTIME
@@ -149520,22 +149570,34 @@ mod u9tm_timer_entry {
         // AP-SCHED1: through `SchedulerState::tick_on`, which applies the same policy to the
         // clock owner's timer or to this CPU's own quantum and restates none of it.
         assert!(
-            owner.contains("sched.tick_on(cpu)"),
+            owner.contains(".with_cpu_sched_split(cpu, |c| c.tick())"),
             "the rank-1 owner reaches the SAME policy — it does not restate it"
         );
-        const DEFS: &str = include_str!("defs.rs");
-        let tick_on = DEFS
-            .split("pub(crate) fn tick_on(&mut self, cpu: CpuId)")
+        // SCHED-LOCK1: every CPU's quantum (the clock owner's included) runs the one policy; the
+        // clock is a separate single-writer atomic advanced only on the clock owner.
+        const SCHED: &str = include_str!("../scheduler.rs");
+        let tick = SCHED
+            .split("pub fn tick(&mut self) -> (Tick, bool) {")
             .nth(1)
             .and_then(|b| b.split("\n    }").next())
-            .expect("tick_on");
+            .expect("CpuView::tick");
         assert_eq!(
-            tick_on.matches(".tick_and_check()").count(),
-            2,
-            "the clock owner's timer or this CPU's quantum — the one policy either way"
+            tick.matches(".tick_and_check()").count(),
+            1,
+            "this CPU's quantum — the one policy"
+        );
+        assert!(tick.contains("if self.idx == CLOCK_OWNER_CPU.0 as usize {"));
+        let all = SCHED
+            .split("pub fn tick_on(&mut self, cpu: CpuId) -> (Tick, bool) {")
+            .nth(1)
+            .and_then(|b| b.split("\n    }").next())
+            .expect("SchedAll::tick_on");
+        assert!(
+            all.contains("Ok(mut v) => v.tick(),"),
+            "the coherent view delegates"
         );
         assert_eq!(
-            owner.matches("with_scheduler_split_mut").count(),
+            owner.matches("_sched_split(").count(),
             1,
             "one rank-1 acquisition"
         );
@@ -153910,9 +153972,12 @@ mod u9pagefault3_authenticated_return {
         }
         // And no production seam hands one of them a CPU it did not enter on: the split seams
         // take `cpu` as a parameter and pass it straight through.
+        // SCHED-LOCK1: a split seam reaches a current slot only through the 1L view of the CPU it
+        // names (`with_cpu_sched_split(cpu, ..)`), so the view cannot address another CPU.
+        assert!(RUNTIME_SRC.contains("self.with_cpu_sched_split(cpu, |c| {"));
         for seam in [
-            ".block_current_on(cpu)",
-            ".block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(expected_tid))",
+            "Ok(c.block_current().map(|tid| tid.0))",
+            "c.block_current_exact(crate::kernel::ipc::ThreadId(expected_tid))",
         ] {
             assert!(
                 RUNTIME_SRC.contains(seam),
@@ -156086,7 +156151,7 @@ mod stage199gc4_ipc_mutation_owners {
         for forbidden in [
             "with_task_split_mut",
             "with_memory_split_mut",
-            "with_scheduler_split_mut",
+            "_sched_split(",
             "with_capability_split_mut",
             "self.with(",
         ] {
@@ -157290,11 +157355,7 @@ mod stage199gc4_waiting_receiver_and_blocking_send {
         assert!(
             split.contains("KernelState::ipc_try_send_to_plain_receiver_endpoint_only_locked(")
         );
-        for forbidden in [
-            "with_task_tcbs_split_mut",
-            "with_scheduler_split_mut",
-            "self.with(",
-        ] {
+        for forbidden in ["with_task_tcbs_split_mut", "_sched_split(", "self.with("] {
             assert!(
                 !split.contains(forbidden),
                 "the split entry takes rank 3 and nothing else (saw `{forbidden}`)"
@@ -160350,11 +160411,30 @@ mod u9spawn1_one_enqueue_owner {
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .expect("the commit owner");
+        // SCHED-LOCK1: THE commit is the per-CPU one; the whole-domain form (boot / tests)
+        // delegates a pinned plan to it and a balanced plan to the coherent balanced placement.
         assert!(
-            body.contains("enqueue_on_with_priority(cpu, ThreadId(plan.tid), plan.priority)")
+            body.contains("commit_enqueue_on_cpu_locked(&mut view, plan)")
                 && body.contains("enqueue_balanced(ThreadId(plan.tid), plan.priority)"),
-            "the commit delegates to the SmpScheduler primitives unchanged"
+            "the whole-domain commit delegates to THE per-CPU commit unchanged"
         );
+        let per_cpu = OWNER
+            .split("pub(crate) fn commit_enqueue_on_cpu_locked(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the per-CPU commit");
+        assert!(
+            per_cpu.contains(".enqueue_with_priority(ThreadId(plan.tid), plan.priority)"),
+            "the per-CPU commit delegates to the scheduler primitive unchanged"
+        );
+        for forbidden in [
+            "TaskClass",
+            "cpu_affinity",
+            "is_spawn_reservation",
+            "AlreadyQueued",
+        ] {
+            assert!(!per_cpu.contains(forbidden), "{forbidden}");
+        }
         // It decides nothing itself: no class, no affinity, no reservation, no duplicate check.
         for forbidden in [
             "TaskClass",
@@ -160419,8 +160499,8 @@ mod u9spawn1_one_enqueue_owner {
             .find("with_task_enqueue_policy_split_mut")
             .expect("the rank-2 section");
         let rank1 = body
-            .find("with_scheduler_split_mut")
-            .expect("the rank-1 section");
+            .find("self.commit_enqueue_split(&plan)")
+            .expect("the rank-1 (1L) section");
         assert!(rank2 < rank1, "rank 2 is planned before rank 1 commits");
         // The two are siblings, not nested: the rank-2 closure ends before the rank-1 call.
         let rank2_closes = body[rank2..rank1].contains("})?;");
@@ -160449,10 +160529,10 @@ mod u9spawn1_one_enqueue_owner {
             .and_then(|s| s.split("\n    /// ").next())
             .expect("the AP transaction");
         assert!(
-            body.contains("with_scheduler_split_mut"),
+            body.contains("_sched_split("),
             "it holds rank 1 across the whole transaction"
         );
-        let outer = body.find("with_scheduler_split_mut").expect("rank 1");
+        let outer = body.find("_sched_split(").expect("rank 1");
         let inner = body
             .find("with_task_enqueue_policy_split_mut")
             .expect("nested rank 2");
@@ -160466,7 +160546,7 @@ mod u9spawn1_one_enqueue_owner {
         );
         // The owner imposes no lock discipline of its own — that is what lets both work.
         assert!(
-            !OWNER.contains("with_scheduler_split_mut") && !OWNER.contains("scheduler_state()"),
+            !OWNER.contains("_sched_split(") && !OWNER.contains("scheduler_state()"),
             "the owner must take no locks itself"
         );
     }
@@ -169369,7 +169449,7 @@ mod u9exit1_self_exit_transaction {
             .nth(1)
             .expect("the mint");
         assert!(
-            ctor.contains("sched.block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid))?"),
+            ctor.contains("view.block_current_exact(crate::kernel::ipc::ThreadId(tid))?"),
             "the mint must be a COMPARE-and-clear, so a mismatched slot yields no token"
         );
         assert_eq!(
@@ -169601,7 +169681,7 @@ mod u9exit1_self_exit_transaction {
             .nth(1)
             .expect("the all-CPU predicate");
         assert!(
-            anywhere.contains("self.schedulers\n            .iter()\n            .any(|sched| sched.contains_or_current(tid))"),
+            anywhere.contains("self.cpus.iter().any(|s| s.rq.contains_or_current(tid))"),
             "it must scan every CPU's current slot AND run queues"
         );
         // The scheduler write itself refuses unless the slot is still empty and the task unqueued.
@@ -171325,7 +171405,7 @@ mod u9residual1_terminal_admission {
             "bound before drainer: each refusal must cost less than the next"
         );
         assert!(
-            !local.contains("with_scheduler_split_mut"),
+            !local.contains("_sched_split("),
             "and the route-local half must take NO scheduler lock — it is what an authority-bound \
              route pays, and it must stay free"
         );
@@ -171342,22 +171422,25 @@ mod u9residual1_terminal_admission {
             .find("if topology == TerminalRouteTopology::AuthorityBound {")
             .expect("the topology short-circuit");
         let sched = body
-            .find("self.with_scheduler_split_mut(")
+            .find("self.sched_domain().topo().dispatching()")
             .expect("the topology read");
         assert!(
             local_call < short_circuit && short_circuit < sched,
             "route-local first, then the topology decision, then the scheduler: an authority-bound \
              route must never pay rank 1 for a condition its drain does not ask"
         );
+        // SCHED-LOCK1: no scheduler lock at all — ONE read of the published dispatching mask,
+        // from which both the count and the dispatch CPU derive, so they cannot tear.
+        assert_eq!(body.matches("_sched_split(").count(), 0);
         assert_eq!(
-            body.matches("self.with_scheduler_split_mut(").count(),
+            body.matches(".dispatching()").count(),
             1,
-            "the count and the bound CPU must come from ONE rank-1 acquisition, or they could be \
-             torn against each other"
+            "the count and the dispatch CPU must come from ONE read, or they could be torn \
+             against each other"
         );
         // The dispatching count masks wake-only CPUs out, and the verdict is the exact conjunction.
         assert!(
-            body.contains("(online & !s.wake_only_bitmap()).count_ones() as usize"),
+            body.contains("let dispatching = dispatching_set.count_ones() as usize;"),
             "wake-only CPUs must be excluded from the dispatching count by construction"
         );
         assert!(
@@ -171498,8 +171581,15 @@ mod u9residual1_terminal_admission {
             .split("pub fn dispatching_cpu_count(&self) -> usize {")
             .nth(1)
             .expect("the broad count");
+        // SCHED-LOCK1: ONE masked expression, `SchedTopo::dispatching` (online & !wake_only),
+        // which the broad count reaches through the coherent view and both split owners through
+        // the published bitmaps.
+        const SCHED_DOMAIN: &str = include_str!("../scheduler.rs");
+        assert!(SCHED_DOMAIN.contains(
+            "    pub(crate) fn dispatching(&self) -> u64 {\n        let online = self.online();\n        online & !self.wake_only()\n    }"
+        ));
         assert!(
-            broad.contains("let dispatching = online & !s.wake_only_bitmap();"),
+            broad.contains("sched.dispatching_bitmap().count_ones() as usize"),
             "the broad count must mask wake-only CPUs out"
         );
         // The two split admissions, which read the count and the bound CPU together.
@@ -171516,12 +171606,13 @@ mod u9residual1_terminal_admission {
                 .nth(1)
                 .unwrap_or_else(|| panic!("{name} must exist"));
             assert!(
-                body.contains("(online & !s.wake_only_bitmap()).count_ones() as usize"),
+                body.contains("let dispatching_set = self.sched_domain().topo().dispatching();"),
                 "{name} must use the same masked count as the broad owner"
             );
             assert!(
-                body.contains("sched.current_cpu,"),
-                "{name} must read the bound dispatch CPU in the SAME acquisition as the count"
+                body.contains("let dispatch_cpu = CpuId(dispatching_set.trailing_zeros() as u8);"),
+                "{name} must derive the dispatch CPU from the SAME read as the count, never from \
+                 the retired ambient binding"
             );
         }
         // And both split admissions refuse the same two topology shapes, in the same order, each
@@ -172984,7 +173075,8 @@ mod u9yield2_family_edge {
         }
         // (b) The admission is the only clearer, and each port reaches it only behind the knob.
         let runtime = code(RUNTIME);
-        assert_eq!(runtime.matches("admit_pinned_dispatch(cpu)").count(), 1);
+        // SCHED-LOCK1: each admission is ONE call on the 1G + 1L[cpu] admission guard.
+        assert_eq!(runtime.matches("a.admit_pinned_dispatch()").count(), 1);
         // AP-SCHED3 §B: AArch64 has no pinned admission any more, and the knob has no authority
         // over admission — every secondary takes the production one, in `ap_main`, last.
         let a64 = code(A64_SMP);
@@ -173016,7 +173108,7 @@ mod u9yield2_family_edge {
                 .contains("let released = release_set(trap_ready_cpus, capable, diagnostic);"),
             "riscv64: the release names its CPUs"
         );
-        assert_eq!(runtime.matches("admit_dispatch(cpu)").count(), 1);
+        assert_eq!(runtime.matches("a.admit_dispatch()").count(), 1);
         assert_eq!(rv.matches("admit_ap_dispatch_split(cpu)").count(), 1);
         let prod = rv
             .split("fn riscv_secondary_production_admission(")
@@ -174290,7 +174382,8 @@ mod u9dispatchcpu2_recovery {
             .map(|(_, r)| r.split_once("\n    }").map(|(b, _)| b).unwrap_or(r))
             .expect("the split reader");
         assert!(
-            reader.contains("runnable_count_on(cpu)") && !reader.contains("sched.current_cpu"),
+            reader.contains("self.with_cpu_sched_split(cpu, |c| c.runnable_count())")
+                && !reader.contains("current_cpu"),
             "it must address the CPU it was given, never the ambient binding"
         );
     }
@@ -174858,7 +174951,9 @@ mod u9dispatchcpu3_recovery_chain {
     fn the_quantum_and_the_hardware_deadline_are_separate_constants() {
         const BOOTSTRAP: &str = include_str!("bootstrap_state.rs");
         assert!(
-            BOOTSTRAP.contains("timer: Timer::new(crate::kernel::boot::sched_quantum_ticks())"),
+            BOOTSTRAP.contains(
+                "crate::kernel::scheduler::SchedDomain::new(\n            present_cpu_bitmap,\n            crate::kernel::boot::sched_quantum_ticks(),\n        );"
+            ),
             "the quantum is initialised through the single quantum owner"
         );
         assert!(
@@ -176290,7 +176385,7 @@ mod u9timer1_preempting_timer {
                 .and_then(|s| s.split("\n    }").next())
                 .unwrap_or_else(|| panic!("the seam `{seam}`"));
             assert!(
-                body.contains("with_scheduler_split_mut")
+                body.contains("_sched_split(")
                     && !body.contains(".with(|")
                     && !body.contains("with_cpu("),
                 "`{seam}` must be a rank-1 scheduler-domain seam"
@@ -177073,9 +177168,7 @@ mod u9pf1_not_running {
         let ident_end = code
             .find("return A::Forfeited(R::IncarnationNotResumable);")
             .expect("the identity refusal");
-        let sched_at = code
-            .find("self.with_scheduler_split_mut(")
-            .expect("the rank-1 acquisition");
+        let sched_at = code.find("_sched_split(").expect("the rank-1 acquisition");
         assert!(
             ident_end < sched_at,
             "the rank-2 answer must be complete before the rank-1 acquisition is taken"
@@ -201336,10 +201429,9 @@ mod ap_sched1 {
             ("runtime.rs", runtime),
             ("capability_lifecycle_state.rs", cap),
         ] {
-            for pat in [
-                "crate::kernel::task_enqueue::commit_enqueue_locked(",
-                ".enqueue_on_with_priority(",
-            ] {
+            // SCHED-LOCK1: the split commits are `commit_enqueue_split` (THE per-CPU commit) and
+            // the per-CPU view's `enqueue_with_priority`.
+            for pat in [".commit_enqueue_split(&plan)", ".enqueue_with_priority("] {
                 for (i, _) in src.match_indices(pat) {
                     let head = &src[..i];
                     let fn_start = head.rfind("fn ").unwrap();
