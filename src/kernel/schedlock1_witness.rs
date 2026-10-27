@@ -44,7 +44,7 @@ compile_error!(
     "sched-lock1-witness runs on the AP-scheduling witness workload: enable it through x86-/aarch64-/riscv64-sched-lock1-witness"
 );
 
-pub const RECS_MAX: usize = 24_576;
+pub const RECS_MAX: usize = 65_536;
 /// CPUs the schedule covers (the AP-scheduling witness's mailbox maximum).
 pub const MAX_W_CPUS: usize = 8;
 /// Attempts per round before it is recorded as failed and the schedule moves on.
