@@ -1474,10 +1474,216 @@ of candidate `155fd8d8`:
 
 Those failures stay in the record next to the reruns.
 
-The qualification record follows in a documentation-only commit, bound to the candidate that
-produced it.
+**Qualification of SCHED-LOCK1.**
 
-KTHREAD1 is not started.
+*Binding:*
+
+* Qualified candidate `00edb00f` (tree `3056bf18`); base `adf5fa63`.
+* Toolchain `rustc 1.101.0-nightly (32dba69d6 2026-10-09)`; QEMU 8.2.2 (Debian
+  1:8.2.2+ds-0ubuntu1.18), 4 host CPUs.
+* The schedule above was written before any qualification run and revised only where marked.
+  Every result was kept, including the failed attempts below.
+* Every image was built and booted through BUILD-GATES1 (`artifact_build_kernel`,
+  `artifact_boot_guard`); no run reused artifacts it did not publish.
+
+*Failed candidates and attempts (kept, not rerun into passes):*
+
+| Candidate | Attempt | Failed at | Cause | Repair |
+|---|---|---|---|---|
+| `4199b7f4` | 1 | Q5 | The host disk filled (105 MB free) with earlier scratch worktrees and targets. No result was judged. | Removed old scratch worktrees; the runner cleans each build tree after use and logs free space per step. |
+| `4199b7f4` | 2 | Q1 | Three hosted source guards failed (3 of 6218): the receiver enqueue's witness claim sat between its commit and its notification, outside the guard's window; the withdrawal-seam guard counted the SCHED-LOCK1 test file as a production caller; the tick-policy guard pinned the closure's exact text. | `155fd8d8`: the claim moved inside the notification block; the test file is listed among the seam's owners; the tick guard pins one `c.tick()` under the CPU's own 1L. |
+| `155fd8d8` | 1 | Q11 RISC-V SMP3, and Q10 x86 at 4 CPUs | **SMP3** (production defect): kernel verdict `shoot_targets_inconsistent` at fence attempt 18. The shootdown target set read each CPU's current from its published mirror, which shows the state before an install in progress, so it named CPU 0 by residency with no current behind it. **x86 Q10 at 4 CPUs** (idle and loaded): both ran out of the runner's 900 s default (912 s, 921 s). The runner was stopped at Q11. | `42d6fc4f`: target and teardown sets read each candidate's current under that CPU's own 1L (contract §16.5). `00edb00f`: the smoke's budget is 2400 s from 4 CPUs (see the schedule revision). |
+
+Also in the stopped `155fd8d8` attempt, three invocation errors of my schedule (not candidate
+defects; the schedule revision above corrects them):
+
+* Q9 RISC-V at 8 harts timed out at 610 s under the 600 s default; its record requires 1500 s.
+* Q11 shared-region direct on all three ports: `no_boot_log`. The artifact guard refused the
+  boot because the default initramfs lacks `shared-region-offset-witness`. Each needs
+  `OFFSET_SELECTION=1`.
+
+Every other `155fd8d8` result passed:
+
+* Q1–Q8;
+* Q9 8/9;
+* Q10 13/15;
+* the other Q11 runs.
+
+*Development findings between `155fd8d8` and `00edb00f`:*
+
+* **CI parallel-suite hang.** On `155fd8d8`, GitHub's `core-profile` (`cargo test -q`, parallel)
+  stopped at 6207/6218 and was cancelled after 57 minutes; at base it fails in about 2 minutes
+  (6143 passed, 54 failed, 68.7 s).
+  * Reproduced locally. `ipc_reply_cap_direct_mint_path_survives_1536_cycles` loops forever.
+  * Earlier in the test, one of its yields was deferred to a post-trap drain that a direct
+    `yield_current()` never runs. That happens because another test's trap entry had set the
+    process-global drainer flag (`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]`) at that moment. Task 1
+    stays blocked in its receive while CPU 0's queue is empty.
+  * Base has the same race. A scratch test that pulses the flag during the test body hangs at
+    base too (60 s, exit 42).
+  * The candidate exposed it because the test ran 4.5 times longer (2.1 s against 0.45 s):
+    `KernelState::current_tid` took the whole-domain view for a one-CPU fact. It now takes that
+    CPU's 1L (0.7 s).
+  * After the change, 18 local parallel runs:
+    * 17 completed, with 46–67 parallel-only failures each (base: 8/8, 57–66);
+    * one was killed by the container's memory limit at 13.5 GB RSS; a watcher found no
+      runaway in ten further runs;
+    * normal peak RSS is about 1 GB at both base and candidate.
+  * GitHub on `00edb00f`: `core-profile` 6168 passed, 48 failed, 64.8 s.
+* **Parallel-only failure sets differ from base.** Union over 18 candidate runs against 8 base
+  runs: 219 names against 155. Tests that fail only on the candidate include
+  `two_cpus_hold_independent_active_address_spaces` (8/18) and
+  `repeated_finalization_cannot_enqueue_twice` (10/18). Both depend on process-global test
+  state (the global active-ASID table, `reset_globals()`) and pass serially. This stays part of
+  the known parallel-suite failure.
+* **x86 at 4 CPUs.** A diagnostic run on `42d6fc4f` (scratch instrumentation of lock spins and
+  `cpu_relax` waits, sampled during holds) passed in 1041 s with 8/8 rounds over 11 attempts.
+  The stalls it recorded were CPU 0's frozen-subject membership scan waiting out a hold on CPU 3
+  or CPU 1. That is the expected cross-CPU wait.
+* **SMP3 after the repair.** Three development runs on `42d6fc4f` under concurrent host load:
+  two passed. The third failed `tlb_too_few_credited_rounds_per_direction`, the pre-existing
+  timer-interference signature (base passed 24/30 under load with this verdict among its
+  failures). `shoot_targets_inconsistent` did not recur.
+
+*Results on `00edb00f` (run 18:24–21:42Z, every scheduled run listed):*
+
+* **Hosted and static.**
+  * Q1 hosted serial: 6216 passed, 2 ignored.
+  * Q2: the 19 SCHED-LOCK1 tests, ×3 with harness threading and ×20 serially, all pass.
+  * Q3: 36 integration suites, 353 passed, including the D6/ownership guards, the
+    broad-lock census and the documentation guards.
+  * Q4: `cargo fmt --check` clean.
+* **Builds (Q5) and no-FP (Q6).** Fresh default builds of all three ports pass the no-FP check
+  on the published bytes:
+  * candidate kernels: x86 `f828aa8f`, AArch64 `655f4436`, RISC-V `7b9cc2bb`;
+  * base kernels, rebuilt the same way: `33c00b48`, `a9fffbfd`, `d8abb10a` (identical to the
+    BUILD-GATES1 record).
+
+  Kernel warnings are identical to base on every port (222, 399, 237; no warning added or
+  removed). The hosted library has 305 warnings against base's 306: the unused `tick_on` is gone.
+  No-FP suites 10/10; checker self-test 101/0.
+* **Q7 VMI.** x86 VMI2 (8 contract rounds, 4 required gaps) and RISC-V VMI
+  (`remote_target=cpu1 fence=ok`): pass.
+* **Q8 strict default cores at `-smp 1`.** x86_64 (timer-contract build), AArch64 and RISC-V:
+  pass.
+* **Q9 default AP-scheduling witness** at 2, 4 and 8 CPUs on each port: **9/9** (RISC-V at 8
+  harts in 798 s).
+* **Q10 SCHED-LOCK1 witness: 15/15**, each with every scheduled direction awarded and the natural
+  trace replayed exactly from SNAP to CENSUS. No run had a late observer record.
+
+  | Port | CPUs, host | Rounds / attempts | Sections | Remote adds | Claims matched | Time |
+  |---|---|---|---|---|---|---|
+  | x86_64 | 2 idle | 2/2 over 2 | 141 | 21 | 36 | 60 s |
+  | x86_64 | 2 loaded | 2/2 over 2 | 127 | 19 | 32 | 39 s |
+  | x86_64 | 4 idle | 8/8 over 10 | 3595 | 76 | 86 | 692 s |
+  | x86_64 | 4 loaded | 8/8 over 9 | 1626 | 57 | 85 | 305 s |
+  | x86_64 | 8 idle | 16/16 over 20 | 13113 | 178 | 192 | 898 s |
+  | AArch64 | 2 idle | 2/2 over 2 | 282 | 18 | 81 | 55 s |
+  | AArch64 | 2 loaded | 2/2 over 3 | 295 | 15 | 86 | 45 s |
+  | AArch64 | 4 idle | 8/8 over 8 | 493 | 59 | 124 | 37 s |
+  | AArch64 | 4 loaded | 8/8 over 9 | 552 | 53 | 126 | 78 s |
+  | AArch64 | 8 idle | 16/16 over 18 | 2298 | 130 | 219 | 78 s |
+  | RISC-V | 2 idle | 2/2 over 2 | 219 | 16 | 36 | 45 s |
+  | RISC-V | 2 loaded | 2/2 over 2 | 287 | 25 | 56 | 32 s |
+  | RISC-V | 4 idle | 8/8 over 8 | 1126 | 66 | 101 | 84 s |
+  | RISC-V | 4 loaded | 8/8 over 8 | 486 | 50 | 83 | 54 s |
+  | RISC-V | 8 idle | 16/16 over 16 | 5717 | 154 | 205 | 602 s |
+
+  "Loaded" means `nproc` host busy loops for the run's duration. Each synchronized round is
+  labelled apart from the natural trace, as contract §17.6 describes.
+* **Q11 regressions: 26/26.**
+  * x86_64: SMP1, LOCK3, overtaken return, UART IRQ, exit-current-task, reply-timeout
+    retirement, shared-region direct (offset selection, `misplaced=0`), SMP ipccall reply.
+  * AArch64: SMP2, LOCK2, overtaken return, PL011 IRQ, exit-current-task, reply-timeout
+    retirement, shared-region direct (offset selection), ipccall reply.
+  * RISC-V: SMP3 (the failure of `155fd8d8` did not recur), LOCK1, UART IRQ, shared-region
+    replace, exit-current-task, reply-timeout retirement, shared-region direct (offset
+    selection), ipccall reply.
+  * CONTEXT1 on x86_64 and AArch64.
+
+  COW and reap run in every AP-scheduling witness's phase D (Q9, Q10).
+* **Q12 negative controls: every control fails.** Hosted baseline: 19/19 pass. Hosted controls
+  (tests that fail):
+  * global serialization: the two independence tests;
+  * dropped publication: 5, including stale incarnation, wake against idle entry, and
+    opposite-direction wakes;
+  * dropped notification: wake against idle entry;
+  * substituted destination: the same 5 as dropped publication;
+  * substituted incarnation: stale incarnation;
+  * duplicate consumption: 8;
+  * capacity stranding: the capacity test and opposite-direction wakes.
+
+  Live controls on RISC-V, 2 CPUs:
+  * global serialization (hold-scoped): "rounds [0, 1] were never awarded";
+  * dropped publication: "CLAIM seq 41 has no ADD";
+  * dropped notification: "remote ADD seq 125 was never notified";
+  * substituted destination: "CLAIM seq 136 has no ADD";
+  * duplicate consumption: the workload stalled after `APS P_PING` and the boot timed out
+    (600 s) before the dump. Contract §17.6 records why this control fails at the workload. Its
+    obligation is checked by the hosted control and by the grader's self-test.
+
+  The mutations are `ctl.py` at hash `76c14a9b`.
+* **Q13 memory reservation.** Kernel sections, candidate minus base:
+
+  | Port | `.text` | `.rodata` | `.data` | `.bss` |
+  |---|---|---|---|---|
+  | x86_64 | +8704 | +384 | +32 | +8248 |
+  | AArch64 | +11168 | +400 | 0 | +12736 |
+  | RISC-V | +6864 | +632 | 0 | +9704 |
+
+  The hosted scheduler storage grows from `SmpScheduler` 250 424 B (64 × 3912 B
+  `PriorityScheduler`) to `SchedDomain` 262 328 B: 64 × 4096 B `CpuCell` (a 3936 B `CpuSched`,
+  its lock and mirror, padded) plus a 40 B `Admission`. That is +11 904 B, mostly cache-line
+  padding of the per-CPU cells.
+* **Q14 lock-acquisition census** (production call sites; test modules excluded).
+  * Removed: `with_scheduler_split_mut` 55 → 0. Raw scheduler projections 5 → 1 (the
+    `sched_domain` projector).
+  * Retained, boot and hosted `KernelState` wrappers: `with_scheduler_state_mut` 7 → 6,
+    `with_scheduler_state` 15 → 11, `.scheduler_state()` 15 → 15.
+  * New, one CPU's lock:
+    * `with_cpu_sched_split` 42;
+    * `.lock_cpu(` 3;
+    * `commit_enqueue_split` 4;
+    * `present_anywhere_scan` 1 (one 1L at a time).
+  * New, 1G with one 1L: `with_cpu_admission_split` 2, `lock_cpu_admission` 1.
+  * New, 1G alone: `balanced_choice_and_note` 2.
+  * New, the coherent view: `with_all_cpus_sched_split` 5, `.lock_all()` 7.
+  * New, lock-free: `current_mirror` 1, `load_mirror` 2, `current_elsewhere` 1.
+
+  The independence measured is the scope of contract §17.7. The whole kernel is not
+  independently scheduled: rank 2, the IPC and timeout domains, the printk drain lock, shootdown
+  waits, the per-CPU shootdown target reads and the five coherent-view paths remain shared or
+  cross-CPU.
+
+*CI (observed on GitHub Actions):*
+
+* `compatibility-gates` on `00edb00f` (run 40559043495) has the same job outcomes as base
+  `adf5fa63` (run 40397290058):
+  * `kernel-nofp-gates` passes;
+  * `core-profile` fails the parallel hosted suite as at base: 6168 passed, 48 failed, 64.8 s
+    (base 6143/54, 68.7 s; job 122382787122);
+  * `posix-compat-profile` fails the same way;
+  * `ci-workflow-enforcement`, `service-boundary-check`, `roadmap-readiness-check`,
+    `phase5-boundary-gates`, `phase3-4-strict-runtime-gate` and `phase4-ui-smoke-marker` are red
+    as at base and untouched.
+* On `155fd8d8` (run 40517997945) `core-profile` and `posix-compat-profile` were cancelled after
+  57 and 75 minutes. That is the hang described above, not a test failure. It is kept as a
+  finding of that candidate.
+* `core-qemu-smoke` runs on pull requests and `workflow_dispatch` only; it did not run here.
+
+*Known findings kept separate (not repaired by this package):*
+
+* The process-global `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` lets any hosted test's trap entry defer
+  another test's direct `yield_current()`. Base hangs under it too. Only exposure time changed.
+* The parallel hosted suite's failure set varies run to run and differs from base's. Its tests
+  share process-global state; serial runs pass.
+* RISC-V SMP3 `tlb_too_few_credited_rounds_per_direction` under host load (pre-existing timer
+  interference).
+* The shared-region direct smokes are refused by their own artifact binding without
+  `OFFSET_SELECTION=1`, at base too.
+
+KTHREAD1 is not started. Nothing here qualifies kernel preemption, RT latency or hardware
+behaviour.
 
 ---
 

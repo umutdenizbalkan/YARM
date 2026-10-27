@@ -1790,8 +1790,9 @@ qualification record.
 What is **not** claimed:
 
 * that the whole kernel is independently scheduled: rank 2 (task table), the IPC and timeout
-  domains, `PRINTK_DRAIN_LOCK` and shootdown waits are still shared, and the five coherent-view
-  paths still serialize every CPU;
+  domains, `PRINTK_DRAIN_LOCK` and shootdown waits are still shared; the shootdown target and
+  teardown sets read each candidate CPU's current under that CPU's own 1L and so wait for its
+  section (§16.5); and the five coherent-view paths still serialize every CPU;
 * any latency, contention or WCET bound (W1 unchanged), or anything about kernel preemption
   (KTHREAD1 is not started) or RT scheduling (RT-SCHED1);
 * anything about hardware: all live evidence is QEMU TCG.
