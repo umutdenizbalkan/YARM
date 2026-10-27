@@ -715,6 +715,8 @@ pub fn observe_user_marker(
     }
     record(K_USER, c, tid, step_code(step), [a2, a3, asid, 0, 0]);
     if step == "P_END" && !ENDED.swap(true, Ordering::AcqRel) {
+        #[cfg(feature = "sched-lock1-witness")]
+        crate::kernel::schedlock1_witness::close_at_end(shared);
         dump();
     }
     true

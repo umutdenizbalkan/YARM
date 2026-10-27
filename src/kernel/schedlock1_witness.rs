@@ -52,7 +52,8 @@ const ATTEMPTS: u64 = 3;
 /// Bound on one hold, in spin iterations.
 const HOLD_SPINS: u64 = 400_000_000;
 /// Bound on the open window, in global ticks: past it the window closes with the rounds it has
-/// (the grader then refuses coverage for the missing ones).
+/// (the grader then refuses coverage for the missing ones). Normally the window closes at the
+/// workload's last step ([`close_at_end`]), long before this.
 const WINDOW_MAX_TICKS: u64 = 4_000;
 
 // ── record kinds ─────────────────────────────────────────────────────────────────────────────
@@ -568,7 +569,8 @@ fn snapshot(
 }
 
 /// After a production timer tick on `cpu`, with no scheduler lock held: open the window (CPU 0,
-/// once every present CPU dispatches) or close it (once the schedule is done). Both happen under
+/// once phase-A spinners run on every present CPU) or, past the tick bound, close it (normally
+/// [`close_at_end`] closes it). Opening and closing both happen under
 /// the coherent view, so no 1L section straddles the opening or the closing: the SNAP is exactly
 /// the state before the first recorded section and the CENSUS exactly the state after the last.
 pub(crate) fn after_tick(shared: &SharedKernel, cpu: CpuId) {
@@ -601,52 +603,75 @@ pub(crate) fn after_tick(shared: &SharedKernel, cpu: CpuId) {
             drop(view);
             drop(guard);
         }
-        1 if (ROUND.load(Ordering::Acquire) >= total_rounds()
-            || shared.sched_domain().clock_now().0
-                > OPENED_AT.load(Ordering::Acquire) + WINDOW_MAX_TICKS)
+        1 if shared.sched_domain().clock_now().0
+            > OPENED_AT.load(Ordering::Acquire) + WINDOW_MAX_TICKS
             && HOLD_ACTIVE.load(Ordering::Acquire) == 0 =>
         {
-            let domain = shared.sched_domain();
-            let mut guard = domain.lock_all();
-            if PHASE
-                .compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return;
-            }
-            let view = guard.view();
-            snapshot(
-                &view,
-                shared,
-                (K_CENSUS_BEGIN, K_CENSUS_CUR, K_CENSUS_Q),
-                ROUNDS_OK.load(Ordering::Acquire),
-            );
-            record(
-                K_CENSUS_END,
-                0,
-                [
-                    ROUNDS_OK.load(Ordering::Acquire),
-                    total_rounds(),
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            );
-            PHASE.store(2, Ordering::Release);
-            drop(view);
-            drop(guard);
+            close(shared);
         }
         _ => {}
     }
 }
 
-/// FIXTURE SYNCHRONIZATION (labelled): while the window is not closed, the AP-scheduling
-/// witness withholds its preemption counts from the workload, so phase A's spinners — the
-/// observers' local scheduling — keep running through every round. The window's own tick bound
-/// closes it, so this never holds the workload indefinitely.
+/// The workload's last step (P_END, from its log syscall: no scheduler or domain lock is held
+/// there), before either dump: the window closes under the coherent view, so the natural trace
+/// spans every workload phase after A — idle-IPI wakes, cross-CPU IPC, fork and reap.
+pub(crate) fn close_at_end(shared: &SharedKernel) {
+    if PHASE.load(Ordering::Acquire) != 1 {
+        return;
+    }
+    // A hold in progress ends by its own bound; the coherent view would wait for it anyway.
+    let mut spins = 0u64;
+    while HOLD_ACTIVE.load(Ordering::Acquire) != 0 && spins < 2 * HOLD_SPINS {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    close(shared);
+}
+
+fn close(shared: &SharedKernel) {
+    let domain = shared.sched_domain();
+    let mut guard = domain.lock_all();
+    if PHASE
+        .compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let view = guard.view();
+    snapshot(
+        &view,
+        shared,
+        (K_CENSUS_BEGIN, K_CENSUS_CUR, K_CENSUS_Q),
+        ROUNDS_OK.load(Ordering::Acquire),
+    );
+    record(
+        K_CENSUS_END,
+        0,
+        [
+            ROUNDS_OK.load(Ordering::Acquire),
+            total_rounds(),
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    PHASE.store(2, Ordering::Release);
+    drop(view);
+    drop(guard);
+}
+
+/// FIXTURE SYNCHRONIZATION (labelled): until every hold round has run, the AP-scheduling witness
+/// withholds its preemption counts from the workload, so phase A's spinners — the observers'
+/// local scheduling — keep running through the rounds. The window's tick bound closes it, so this
+/// never holds the workload indefinitely.
 pub(crate) fn holds_phase_a() -> bool {
-    PHASE.load(Ordering::Acquire) != 2
+    match PHASE.load(Ordering::Acquire) {
+        0 => true,
+        1 => ROUND.load(Ordering::Acquire) < total_rounds(),
+        _ => false,
+    }
 }
 
 /// The sealed dump, after the AP-scheduling witness's own.
