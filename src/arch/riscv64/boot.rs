@@ -1120,6 +1120,13 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             cpu,
             crate::arch::riscv64::ipi::ArrivalOrigin::User,
         );
+        // AP-scheduling witness: a reschedule IPI taken from user mode (outside the idle
+        // boundary), so a wake that lost the race to the idle CPU's own timer is told apart from
+        // one whose IPI never came.
+        #[cfg(feature = "riscv64-apsched-witness")]
+        if arrival.sources != 0 {
+            crate::kernel::apsched_witness::note_sgi_elsewhere(cpu, 1);
+        }
         #[cfg(feature = "riscv64-smp3-witness")]
         crate::arch::riscv64::smp3_witness::note_arrival(
             cpu,

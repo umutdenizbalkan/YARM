@@ -528,6 +528,8 @@ pub fn note_idle_reached(cpu: usize) {
     if !enabled() || cpu == 0 || cpu >= MBX_CPUS {
         return;
     }
+    #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+    x86_late_ipi::check(cpu);
     let n = IDLES[cpu].fetch_add(1, Ordering::AcqRel) + 1;
     record(K_IDLE, cpu as u64, 0, 0, [n, 0, 0, 0, 0]);
     publish(M_IDLE + 8 * cpu as u64, 1);
@@ -601,9 +603,11 @@ pub fn note_idle_ipi(cpu: CpuId, sources: u64) {
     record(K_IDLE_IPI, u64::from(cpu.0), 0, 0, [sources, 0, 0, 0, 0]);
 }
 
-/// AArch64: a reschedule SGI `cpu` took outside its idle boundary (`lane` 1 = from EL0, 3 = in
-/// kernel code). Lets the grader tell a wake whose SGI was delivered but lost the race to the idle
-/// CPU's own backstop timer from a wake whose SGI never came.
+/// A reschedule IPI `cpu` took outside its idle boundary (`lane` 1 = from user mode, 3 = in kernel
+/// code; on x86_64, 4 = observed by count at the next idle arrival). Lets the grader tell a wake
+/// whose IPI was delivered but lost the race to the idle CPU's own timer from a wake whose IPI
+/// never came. AArch64 records it at the SGI's arrival, RISC-V at a user-origin software
+/// interrupt carrying a sender, x86_64 from its per-CPU arrival count (below).
 pub fn note_sgi_elsewhere(cpu: CpuId, lane: u64) {
     if !enabled() || cpu.0 == 0 {
         return;
@@ -631,6 +635,45 @@ pub fn note_idle_dispatch(shared: &SharedKernel, cpu: CpuId, tid: u64, by_ipi: b
         0,
         [u64::from(by_ipi), 0, 0, 0, 0],
     );
+    #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+    if !by_ipi {
+        x86_late_ipi::arm(cpu);
+    }
+}
+
+/// x86_64: the reschedule IPI's stub is settled in assembly outside the idle boundary, so its late
+/// arrival is observed by count: armed when a CPU leaves idle by its timer, checked at that CPU's
+/// next idle arrival. Recorded only when the vector-0xF1 arrival count grew and the TLB
+/// acknowledgement generation did not (the same vector also carries shootdowns), so a shootdown
+/// cannot stand in for the reschedule IPI.
+#[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+mod x86_late_ipi {
+    use super::{CpuId, MBX_CPUS};
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static ARMED: [AtomicU64; MBX_CPUS] = [const { AtomicU64::new(0) }; MBX_CPUS];
+
+    pub(super) fn arm(cpu: CpuId) {
+        let Some(slot) = ARMED.get(cpu.0 as usize) else {
+            return;
+        };
+        let r = crate::arch::x86_64::percpu::read_record(cpu);
+        let packed =
+            (1u64 << 63) | (u64::from(r.tlb_ack_gen) << 32) | u64::from(r.remote_wake_count);
+        slot.store(packed, Ordering::Release);
+    }
+
+    pub(super) fn check(cpu: usize) {
+        let Some(slot) = ARMED.get(cpu) else { return };
+        let armed = slot.swap(0, Ordering::AcqRel);
+        if armed == 0 {
+            return;
+        }
+        let r = crate::arch::x86_64::percpu::read_record(CpuId(cpu as u8));
+        let (ack0, wake0) = ((armed >> 32) as u32 & 0x7FFF_FFFF, armed as u32);
+        if r.remote_wake_count != wake0 && (r.tlb_ack_gen & 0x7FFF_FFFF) == ack0 {
+            super::note_sgi_elsewhere(CpuId(cpu as u8), 4);
+        }
+    }
 }
 
 /// The DebugLog observation point. Returns `true` when the message was this witness's.

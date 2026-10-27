@@ -1740,6 +1740,13 @@ The brief explicitly authorized this.
     serialization, a holder section, a reacquired lock, two locks held, census mismatch, no
     progress, progress only after its hold, progress for a round never held, overflow, an
     unclosed window, a torn record).
+* **AP-scheduling witness parity (witness builds only).** Its grader accepts one benign race —
+  the idle CPU's own timer dispatches a woken sleeper before the wake IPI arrives — only with a
+  record that the IPI did arrive later. AArch64 recorded that; x86_64 and RISC-V did not, so an
+  x86 run at 8 CPUs failed on that race. RISC-V now records a reschedule IPI taken from user mode
+  with a sender; x86_64 records one from its vector-0xF1 arrival count between the timer dispatch
+  and the CPU's next idle arrival, only when the TLB acknowledgement generation did not move (the
+  vector also carries shootdowns). A wake whose IPI never came still fails.
 * **Negative controls** (scratch mutations, never committed; results in the qualification
   record). Hosted: global serialization (one shared flag held inside every 1L section), dropped
   publication, dropped notification, substituted destination, substituted incarnation, duplicate
