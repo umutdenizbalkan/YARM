@@ -119375,10 +119375,13 @@ mod stage199d_runqueue_withdrawal_foundation {
         // Stage 199D: `runtime.rs` joined the owners when the enqueue seam gained its
         // same-acquisition `AlreadyQueued` reconciliation — the seam's ONLY consumer. It is
         // still wired into no oracle, no RISC-V path and no production wake decision.
+        // SCHED-LOCK1: its hosted tests exercise the withdrawal against a concurrent dispatch
+        // (test code only; no oracle or production path).
         const OWNERS: &[&str] = &[
             "src/kernel/scheduler.rs",
             "src/kernel/boot/scheduler_state.rs",
             "src/kernel/boot/tests.rs",
+            "src/kernel/sched_lock1_tests/tests.rs",
             "src/runtime.rs",
         ];
         let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
@@ -149569,8 +149572,12 @@ mod u9tm_timer_entry {
             .expect("the rank-1 tick owner");
         // AP-SCHED1: through `SchedulerState::tick_on`, which applies the same policy to the
         // clock owner's timer or to this CPU's own quantum and restates none of it.
+        // SCHED-LOCK1: inside this CPU's own 1L, exactly one call to the policy (the default-off
+        // witness's hold hook sits beside it in the same section, under its feature).
         assert!(
-            owner.contains(".with_cpu_sched_split(cpu, |c| c.tick())"),
+            owner.contains(".with_cpu_sched_split(cpu, |c| {")
+                && owner.matches("c.tick()").count() == 1
+                && !owner.contains("tick_and_check"),
             "the rank-1 owner reaches the SAME policy — it does not restate it"
         );
         // SCHED-LOCK1: every CPU's quantum (the clock owner's included) runs the one policy; the

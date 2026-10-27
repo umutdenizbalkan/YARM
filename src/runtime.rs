@@ -16417,11 +16417,9 @@ impl SharedKernel {
                 error,
                 reconciled: None,
             });
-        #[cfg(feature = "sched-lock1-witness")]
         if matches!(outcome, ReceiverEnqueue::Enqueued { .. }) {
+            #[cfg(feature = "sched-lock1-witness")]
             crate::kernel::schedlock1_witness::claim(self, cpu, tid);
-        }
-        if matches!(outcome, ReceiverEnqueue::Enqueued { .. }) {
             crate::arch::hal::notify_enqueued(cpu);
         }
         outcome
