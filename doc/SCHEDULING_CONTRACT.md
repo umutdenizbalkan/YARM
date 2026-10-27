@@ -1464,7 +1464,7 @@ mutated another CPU's queue in the same acquisition.
 | `placement_of` (`entering_frame_authority_split_read`, `recv_unwind_placement_outcome_split`, `yield_forfeited_placement_split_read`) | refused-switch and unwind settlements | rare | **coherent all-CPU snapshot** (§16.3) |
 | `task_present_anywhere` / `tid_present_anywhere` for exit restore, reap, post-lock exit validation, `task_present_in_any_runqueue` | exit / reap / validation | rare | **coherent all-CPU snapshot** |
 | `task_present_anywhere` for the direct-IPC receiver-membership check | every direct call / reply | hot | **per-CPU scan** (each CPU under its own 1L, one at a time); frozen-subject argument §16.4 |
-| `live_cpu_bitmap_for_asid_split`, `address_space_loaded_cpus_split` | VMI2 shootdown targets, teardown | warm | **current mirrors** ∪ the hardware residency table (unchanged), §16.5 |
+| `live_cpu_bitmap_for_asid_split`, `address_space_loaded_cpus_split` | VMI2 shootdown targets, teardown | warm | each candidate's current under **its own 1L, one at a time** ∪ the hardware residency table (unchanged), §16.5 |
 | `reap_shootdown_cpu_bitmap_split`, `split_terminal_route_admission`, `dispatching_cpu_count`, online/present counts | admission predicates | warm | **published admission bitmaps** (atomic, §16.2) |
 | `balanced_choice` | home fixing at first placement | rare | 1G + **load mirrors** (§16.4) |
 
@@ -1477,7 +1477,7 @@ mutated another CPU's queue in the same acquisition.
 | scheduler tick (time) | `SchedDomain.clock` (`AtomicU64`) | everyone, lock-free | **only** `tick_on(CLOCK_OWNER_CPU)`, under 1L[0] | single writer; `fetch_add` Release, loads Acquire |
 | topology, `next_balance_cpu` | `Admission` | admission paths | boot bring-up; `set_present_cpu_bitmap` | **1G** |
 | published present / online / wake-only / balance-excluded bitmaps | `SchedDomain.topo` (atomics) | every validation, lock-free | admission transitions only | written under 1G **and** the affected CPU's 1L[c]; Release stores, Acquire loads. Hence a holder of 1L[c] sees `c`'s admission bits stable |
-| current mirror[c] (tid + 1, 0 = none) and load mirror[c] (queued + current) | `SchedDomain.mirror[c]` | FPU "elsewhere", VMI2 target sets, balanced choice | written **only** by the holder of 1L[c], when its guard is released (after every mutation it made) | SeqCst stores and loads |
+| current mirror[c] (tid + 1, 0 = none) and load mirror[c] (queued + current) | `SchedDomain.mirror[c]` | FPU "elsewhere", balanced choice | written **only** by the holder of 1L[c], when its guard is released (after every mutation it made) | SeqCst stores and loads |
 | ambient `current_cpu` | **removed** from the scheduler domain | — | — | Production decisions use the explicit CPU each route was given. Hosted tests keep a hosted-only selector outside the scheduler (`#[cfg(feature = "hosted-dev")]`), and freestanding RISC-V `KernelState::current_cpu()` uses the hart's own identity |
 
 ### 16.3 Lock ranks and the projection rule
@@ -1561,12 +1561,27 @@ CPU for the scan is still reported.
 ### 16.5 VMI2 coverage
 
 The shootdown target set stays `(placement ∪ hardware residency) ∩ (online ∖ wake-only)`. The
-placement half now reads current mirrors instead of a locked scan; the residency half
+placement half now reads each candidate CPU's current under that CPU's own 1L, one CPU at a time
+(never two held together, released before the rank-2 ASID resolution), instead of one locked
+scan; the residency half
 (`address_space_loaded_bitmap`, set before ring 3 at every activation and cleared only at the
 idle-root handoff) is unchanged and is what covers the dispatch gap (empty `current`, root still
 loaded). Splitting the read therefore cannot recreate the empty-current / root-still-loaded
 omission: that omission was closed by the residency term, not by the placement scan's
 coherence.
+
+The placement read is per-CPU locked, not a mirror read, because of what a mirror shows during a
+section in progress. A mirror is published when 1L[c] is released, so while CPU `c` is installing
+a task its mirror still shows the state before the install, possibly no current task, while the
+residency term may already name `c`. The set stays safe, but it then names `c` with no placement
+behind it, a combination the base's per-CPU fact never produced. The RISC-V SMP3 witness's
+`shoot_targets_inconsistent` check rejects exactly that combination. It caught it during the
+first SCHED-LOCK1 qualification (candidate `155fd8d8`, fence attempt 18, recorded in
+KERNEL_UNLOCKING). Reading under 1L[c] waits for the section in progress, so the result is again
+the per-CPU fact the base read. Teardown's `address_space_loaded_cpus_split` uses the same read.
+These are cross-CPU operations by nature, so they wait for the CPU they read. The concurrent test
+`sl1_production_seams_on_cpu1_complete_while_cpu0_is_held` pins that they complete only after
+CPU 0's section ends, while CPU 1's local operations do not wait.
 
 ### 16.6 What is not changed
 
@@ -1676,7 +1691,7 @@ shootdown, an address-space switch or cross-CPU work.
 | No lost or duplicate wake | commit before notify; `QueueFull` / `AlreadyQueued` before mutation | `sl1_opposite_direction_remote_wakes_neither_deadlock_nor_lose`, `sl1_a_wake_racing_idle_entry_is_never_stranded`, `sl1_capacity_exhaustion_…`; witness CLAIM ↔ ADD ↔ NOTIFY matching |
 | No stale token affects a replacement | rank-2 incarnation checks before any 1L | `sl1_a_stale_incarnation_wake_is_refused_before_any_queue_mutation`; existing exit/reuse tests |
 | No return through an unowned continuation; no parked result lost | unchanged owners (`DispatchAuthority`, `DispatchMarkToken`, parked-result settlement) on explicit CPUs | the converted hosted suite (CONTEXT1, overtaken, parked-result tests) |
-| VMI2 coverage | mirrors ∪ hardware residency (§16.5) | `sl1_shootdown_targets_follow_the_published_current`; VMI2 witness |
+| VMI2 coverage | per-CPU locked current reads ∪ hardware residency (§16.5) | `sl1_shootdown_targets_follow_each_cpus_settled_current`; VMI2 witness |
 | First-start, FP/TLS/flags, idle-root handoff, exit/reap ordering | unchanged, on explicit CPUs | converted hosted suite; apsched witness (reap, idle-root records) |
 | Explicit CPU authority, no ambient selector in production | `current_cpu` removed; guard (4), (7) | `sched_lock1_d6_per_cpu_scheduler_ownership_rules`; ambient-binding tests assert no binding |
 

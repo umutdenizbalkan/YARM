@@ -147427,16 +147427,37 @@ mod u9d3_split_unmap_drives_real_d3 {
     #[test]
     fn u9d3_target_predicate_is_rank_ordered_and_released() {
         let b = fn_body(RUNTIME, "pub(crate) fn live_cpu_bitmap_for_asid_split(");
-        // SCHED-LOCK1 (§16.5): the placement half reads the published admission bitmaps and the
-        // per-CPU current mirrors — NO scheduler lock at all, so certainly none held into rank 2.
+        // SCHED-LOCK1 (§16.5): the placement half reads the published admission bitmaps, then
+        // each candidate CPU's current under THAT CPU's own 1L, one at a time, copied out by
+        // value — no scheduler lock in the body itself, so none held into rank 2.
         assert_eq!(
             b.matches("_sched_split(").count(),
             0,
-            "no scheduler-lock acquisition"
+            "no scheduler-lock acquisition in the body"
         );
+        let per_cpu = fn_body(RUNTIME, "fn current_tid_per_cpu_settled_split(");
+        assert_eq!(
+            per_cpu
+                .matches(".with_cpu_sched_split(CpuId(cpu as u8), |c| c.current_tid()")
+                .count(),
+            1,
+            "each CPU's current is read under that CPU's own 1L, one CPU per section"
+        );
+        for banned in [
+            "lock_all",
+            "lock_cpu(",
+            "with_all_cpus_sched_split",
+            "task_asid_for_tid_split_read",
+            "current_mirror",
+        ] {
+            assert!(
+                !per_cpu.contains(banned),
+                "the per-CPU current read must not contain `{banned}`"
+            );
+        }
         let sched_end = b
-            .find("domain.current_mirror(cpu)")
-            .expect("the per-CPU current mirrors");
+            .find("current_tid_per_cpu_settled_split(candidates)")
+            .expect("the per-CPU locked current reads");
         let asid_at = b
             .find("task_asid_for_tid_split_read")
             .expect("the rank-2 resolution");

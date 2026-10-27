@@ -1416,9 +1416,10 @@ evidence are in contract §17. In short:
   the destination's 1L and refuses (`QueueFull`, `AlreadyQueued`, admission) before mutation; the
   mirror is published at release; the wake IPI is sent after release. The idle decision uses the
   same 1L. No mailbox, no scanning fallback, no migration, no new switch mechanism.
-* **Readers that needed several CPUs** use mirrors (FPU current-elsewhere, VMI2 targets with the
-  unchanged residency term, balanced choice), a per-CPU frozen-subject scan (direct-IPC
-  membership), or the coherent view (the five rare paths).
+* **Readers that needed several CPUs** use mirrors (FPU current-elsewhere, balanced choice), a
+  per-CPU locked read one CPU at a time (VMI2 shootdown targets and teardown, with the unchanged
+  residency term; contract §16.5), a per-CPU frozen-subject scan (direct-IPC membership), or the
+  coherent view (the five rare paths).
 * **Legacy rules revised explicitly** (the brief authorized it): the `AI_AGENT_RULES.md` §14.4 D6
   bullet, its source guard (now `sched_lock1_d6_per_cpu_scheduler_ownership_rules`, seven
   checks), the `KERNEL_LOCKING.md` rank table, and the historical §7.1.2 / §8 text.

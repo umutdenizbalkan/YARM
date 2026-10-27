@@ -15620,18 +15620,37 @@ impl SharedKernel {
     ///
     /// This is deliberately NOT `online_wake_only_ap_bitmap`: that is the complement set (idle APs)
     /// and would target CPUs that cannot possibly hold the mapping while missing the one that does.
-    pub(crate) fn live_cpu_bitmap_for_asid_split(&self, asid: crate::kernel::vm::Asid) -> u64 {
-        // SCHED-LOCK1 (§16.5): the published admission bitmaps and every CPU's published current
-        // mirror — no scheduler lock. The placement half was never what covered the dispatch gap
-        // (the residency OR below is), so reading it per CPU cannot reopen that omission.
-        let domain = self.sched_domain();
-        let (online, wake_only) = (domain.topo().online(), domain.topo().wake_only());
+    /// SCHED-LOCK1 (§16.5) — each CPU in `mask`'s current task, read under THAT CPU's own 1L, one
+    /// CPU at a time (never two held together). A read under the CPU's lock waits for a section in
+    /// progress there — an install, a preemption — and so returns the same per-CPU fact the base's
+    /// single scheduler lock returned. A mirror read would return the state before that section:
+    /// still safe for a shootdown (the residency term covers a loaded root), but it would name a
+    /// CPU by residency alone while its install is completing, which the base never did.
+    fn current_tid_per_cpu_settled_split(
+        &self,
+        mask: u64,
+    ) -> [Option<u64>; crate::arch::platform_constants::MAX_CPUS] {
         let mut current = [None; crate::arch::platform_constants::MAX_CPUS];
         for (cpu, slot) in current.iter_mut().enumerate() {
-            *slot = domain.current_mirror(cpu).map(|t| t.0);
+            if mask & (1u64 << cpu) != 0 {
+                *slot = self
+                    .with_cpu_sched_split(CpuId(cpu as u8), |c| c.current_tid().map(|t| t.0))
+                    .ok()
+                    .flatten();
+            }
         }
-        // No scheduler lock is held. rank 2: resolve each candidate's ASID.
+        current
+    }
+
+    pub(crate) fn live_cpu_bitmap_for_asid_split(&self, asid: crate::kernel::vm::Asid) -> u64 {
+        // SCHED-LOCK1 (§16.5): the published admission bitmaps, then each candidate CPU's current
+        // task under that CPU's own 1L, one at a time. The residency OR below is what covers the
+        // dispatch gap; the per-CPU read keeps the placement half the base's per-CPU fact.
+        let domain = self.sched_domain();
+        let (online, wake_only) = (domain.topo().online(), domain.topo().wake_only());
         let candidates = online & !wake_only;
+        let current = self.current_tid_per_cpu_settled_split(candidates);
+        // No scheduler lock is held. rank 2: resolve each candidate's ASID.
         let mut bitmap = 0u64;
         for (cpu, tid) in current.iter().enumerate() {
             let bit = 1u64 << cpu;
@@ -16451,14 +16470,12 @@ impl SharedKernel {
     /// recorded activation is it (the lock-free per-CPU activation table). A teardown may free the
     /// space's root and frames only when this is empty.
     pub(crate) fn address_space_loaded_cpus_split(&self, asid: crate::kernel::vm::Asid) -> u64 {
-        // SCHED-LOCK1 (§16.5): published bitmaps and current mirrors, no lock; the residency
-        // table below is unchanged and is what covers a loaded root with an empty `current`.
-        let domain = self.sched_domain();
-        let online = domain.topo().online();
-        let mut current = [None; crate::arch::platform_constants::MAX_CPUS];
-        for (cpu, slot) in current.iter_mut().enumerate() {
-            *slot = domain.current_mirror(cpu).map(|t| t.0);
-        }
+        // SCHED-LOCK1 (§16.5): the published online bitmap, then each online CPU's current task
+        // under its own 1L, one at a time (the same read as the shootdown target set); the
+        // residency table below is unchanged and is what covers a loaded root with an empty
+        // `current`.
+        let online = self.sched_domain().topo().online();
+        let current = self.current_tid_per_cpu_settled_split(online);
         let mut running = 0u64;
         for (cpu, tid) in current.iter().enumerate() {
             if online & (1u64 << cpu) == 0 {

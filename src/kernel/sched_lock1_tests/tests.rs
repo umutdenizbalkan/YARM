@@ -653,8 +653,10 @@ fn register(k: &SharedKernel, tids: impl IntoIterator<Item = u64>) {
 /// **Independence through the production seams.** CPU 0's actual 1L is held while CPU 1 runs the
 /// production owners: the pinned enqueue (plan under rank 2, THE per-CPU commit, notification),
 /// the queue-advancing dispatch, the timer tick, the terminal-idle decision, the authoritative
-/// current read, and the lock-free reads (clock, admission bitmaps, shootdown targets). All
-/// complete while CPU 0 is held; an operation that names CPU 0 does NOT complete until release.
+/// current read, and the lock-free reads (clock, admission bitmaps, reap shootdown bitmap). All
+/// complete while CPU 0 is held; an operation that names CPU 0 does NOT complete until release —
+/// CPU 0's authoritative current, and an address space's shootdown target set, which reads each
+/// candidate CPU's current under that CPU's own 1L (§16.5) and so waits for CPU 0's section.
 #[test]
 fn sl1_production_seams_on_cpu1_complete_while_cpu0_is_held() {
     let k = kernel2();
@@ -662,6 +664,7 @@ fn sl1_production_seams_on_cpu1_complete_while_cpu0_is_held() {
     let held = AtomicBool::new(false);
     let cpu1_done = AtomicBool::new(false);
     let cpu0_op_done = AtomicBool::new(false);
+    let targets_done = AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| {
             let g = k.sched_domain().lock_cpu(CpuId(0)).expect("cpu0");
@@ -673,6 +676,10 @@ fn sl1_production_seams_on_cpu1_complete_while_cpu0_is_held() {
             assert!(
                 !cpu0_op_done.load(Ordering::Acquire),
                 "an operation on CPU 0 completed while CPU 0's lock was held"
+            );
+            assert!(
+                !targets_done.load(Ordering::Acquire),
+                "a shootdown target set read CPU 0's current while CPU 0's section was in progress"
             );
             drop(g);
         });
@@ -690,7 +697,6 @@ fn sl1_production_seams_on_cpu1_complete_while_cpu0_is_held() {
                 assert_eq!(k.terminal_idle_on_cpu_split(CpuId(1)), Ok(true));
                 let _ = k.scheduler_tick_now_split_read();
                 let _ = k.reap_shootdown_cpu_bitmap_split();
-                let _ = k.live_cpu_bitmap_for_asid_split(crate::kernel::vm::Asid(7));
                 let _ = k.online_cpu_count_split_read();
             }
             cpu1_done.store(true, Ordering::Release);
@@ -700,10 +706,19 @@ fn sl1_production_seams_on_cpu1_complete_while_cpu0_is_held() {
             let _ = k.current_tid_authoritative(CpuId(0));
             cpu0_op_done.store(true, Ordering::Release);
         });
+        s.spawn(|| {
+            wait_until("CPU 0 held", || held.load(Ordering::Acquire));
+            let _ = k.live_cpu_bitmap_for_asid_split(crate::kernel::vm::Asid(7));
+            targets_done.store(true, Ordering::Release);
+        });
     });
     assert!(
         cpu0_op_done.load(Ordering::Acquire),
         "released, the CPU-0 operation completes"
+    );
+    assert!(
+        targets_done.load(Ordering::Acquire),
+        "released, the shootdown target set completes"
     );
 }
 
@@ -846,12 +861,13 @@ fn sl1_a_stale_incarnation_wake_is_refused_before_any_queue_mutation() {
     assert_eq!(k.runnable_count_on_cpu_split_read(CpuId(1)), before + 1);
 }
 
-/// VMI2 coverage through the mirrors: a task installed as CPU 1's current is named by the
-/// shootdown target computation as soon as the install's guard is released, and no longer named
+/// VMI2 coverage through the per-CPU locked current reads (§16.5): a task installed as CPU 1's
+/// current is named by the shootdown target computation once the install's section ends, and no
+/// longer named
 /// by the placement half once it is blocked (the residency half — not exercised in a hosted build
 /// — is what covers a loaded root with an empty slot).
 #[test]
-fn sl1_shootdown_targets_follow_the_published_current() {
+fn sl1_shootdown_targets_follow_each_cpus_settled_current() {
     let k = kernel2();
     register(&k, [90_001]);
     let asid = crate::kernel::vm::Asid(0x5157);
