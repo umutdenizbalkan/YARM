@@ -58,6 +58,8 @@ pub mod printk;
 pub mod process;
 pub mod recv_core;
 pub mod recv_waiter_split;
+#[cfg(test)]
+mod sched_lock1_tests;
 pub mod scheduler;
 pub mod scheduler_timer;
 pub mod smp;
