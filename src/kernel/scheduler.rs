@@ -2,9 +2,15 @@
 // Copyright 2026 Umut Deniz Balkan
 
 const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
-use crate::arch::{platform_constants, topology};
+use crate::arch::platform_constants;
+#[cfg(test)]
+use crate::arch::topology;
 use crate::kernel::ipc::ThreadId;
+use crate::kernel::lock::{SpinLockIrq, SpinLockIrqGuard};
+use crate::kernel::scheduler_timer::Timer;
+use crate::kernel::time::{Tick, TickInstant};
 use crate::kernel::topology::CpuTopology;
+use core::sync::atomic::{AtomicU64, Ordering};
 pub use yarm_kernel::scheduler::{CpuId, SchedulerError, TaskPriority};
 
 pub const MAX_RUN_QUEUE: usize = 64;
@@ -739,39 +745,698 @@ impl PriorityScheduler {
     }
 }
 
+/// SCHED-LOCK1 — the clock owner: the one CPU whose timer interrupts advance the scheduler tick.
+pub(crate) const CLOCK_OWNER_CPU: CpuId = CpuId(platform_constants::BOOTSTRAP_CPU_ID);
+
+/// SCHED-LOCK1 — ONE CPU's scheduling state: its run queues, its current slot (both in `rq`) and
+/// its quantum. Owned by that CPU's own lock (rank 1L, `doc/SCHEDULING_CONTRACT.md` §16.2) and
+/// reachable only through a [`CpuView`] built from that lock's guard or from a [`SchedAll`] that
+/// holds every 1L.
 #[derive(Debug)]
-pub struct SmpScheduler {
-    schedulers: [PriorityScheduler; MAX_CPUS],
-    topology: CpuTopology,
-    next_balance_cpu: usize,
-    // Stage 183.5: CPUs that are ONLINE for accounting/wake (they idle, receive
-    // IPIs, and have a scheduler-owned idle current) but do NOT yet run a
-    // dispatcher, so task PLACEMENT on them is denied — `enqueue_balanced` skips
-    // them and explicit enqueues are rejected. This is the intermediate
-    // "wake-only online" admission state between idle-live and full dispatch;
-    // 183.6+ clears the bit per CPU when its dispatch loop is wired. NOT a
-    // fallback knob: no boot option touches it.
-    wake_only: u64,
-    // QEMU-SMP2: CPUs admitted by `admit_pinned_dispatch`. They dispatch, and they accept the
-    // explicit (home-CPU) placements the enqueue planner makes, but `enqueue_balanced` never
-    // chooses them: nothing on such a CPU sends a remote wake except the owners that do, and it
-    // arms no timer, so an unpinned task placed there could strand.
-    balance_excluded: u64,
+pub struct CpuSched {
+    rq: PriorityScheduler,
+    quantum: Timer,
 }
 
-impl Default for SmpScheduler {
-    fn default() -> Self {
+impl CpuSched {
+    fn new(quantum_ticks: u64) -> Self {
         Self {
-            schedulers: core::array::from_fn(|_| PriorityScheduler::default()),
-            topology: CpuTopology::from_present_bitmap(topology::default_present_cpu_bitmap()),
-            next_balance_cpu: 0,
-            wake_only: 0,
-            balance_excluded: 0,
+            rq: PriorityScheduler::default(),
+            quantum: Timer::new(quantum_ticks),
+        }
+    }
+
+    fn load(&self) -> usize {
+        self.rq.runnable_count() + usize::from(self.rq.current.is_some())
+    }
+}
+
+/// SCHED-LOCK1 — the published, lock-free summary of one CPU's state: its current task (tid + 1,
+/// 0 = none) and its load (queued + current). Written ONLY by the holder of that CPU's 1L, when
+/// the guard is released; read by anyone (SeqCst). See §16.4 for what a reader may conclude.
+#[derive(Debug, Default)]
+struct CpuMirror {
+    current: AtomicU64,
+    load: AtomicU64,
+}
+
+/// One CPU's cell: its lock-owned state and its mirror. Cache-line aligned so one CPU's lock and
+/// mirror traffic does not share a line with its neighbour's.
+#[derive(Debug)]
+#[repr(align(64))]
+pub struct CpuCell {
+    lock: SpinLockIrq<CpuSched>,
+    mirror: CpuMirror,
+}
+
+impl CpuCell {
+    fn new(quantum_ticks: u64) -> Self {
+        Self {
+            lock: SpinLockIrq::new(CpuSched::new(quantum_ticks)),
+            mirror: CpuMirror::default(),
         }
     }
 }
 
-impl SmpScheduler {
+/// Publish `sched` into `mirror`. Called only by a holder of that CPU's 1L (or of the exclusive
+/// domain), after its last mutation and before the release.
+fn publish(mirror: &CpuMirror, sched: &CpuSched) {
+    let current = sched.rq.current.map_or(0, |t| t.tid.0.wrapping_add(1));
+    mirror.current.store(current, Ordering::SeqCst);
+    mirror.load.store(sched.load() as u64, Ordering::SeqCst);
+}
+
+/// SCHED-LOCK1 — the published admission bitmaps. Written only under 1G **and** the affected
+/// CPU's 1L (so a holder of 1L[c] sees `c`'s bits stable); read lock-free with Acquire.
+#[derive(Debug, Default)]
+pub(crate) struct SchedTopo {
+    present: AtomicU64,
+    online: AtomicU64,
+    wake_only: AtomicU64,
+    balance_excluded: AtomicU64,
+}
+
+impl SchedTopo {
+    pub(crate) fn present(&self) -> u64 {
+        self.present.load(Ordering::Acquire)
+    }
+    pub(crate) fn online(&self) -> u64 {
+        self.online.load(Ordering::Acquire)
+    }
+    pub(crate) fn wake_only(&self) -> u64 {
+        self.wake_only.load(Ordering::Acquire)
+    }
+    pub(crate) fn balance_excluded(&self) -> u64 {
+        self.balance_excluded.load(Ordering::Acquire)
+    }
+    fn cpu_online(&self, idx: usize) -> bool {
+        idx < MAX_CPUS && self.online() & (1u64 << idx) != 0
+    }
+    fn set_bit(word: &AtomicU64, idx: usize, on: bool) {
+        if on {
+            word.fetch_or(1u64 << idx, Ordering::AcqRel);
+        } else {
+            word.fetch_and(!(1u64 << idx), Ordering::AcqRel);
+        }
+    }
+    fn publish_topology(&self, topology: &CpuTopology) {
+        self.present
+            .store(topology.present_cpu_bitmap(), Ordering::Release);
+        self.online
+            .store(topology.online_cpu_bitmap(), Ordering::Release);
+    }
+
+    /// The least-loaded online CPU that is neither wake-only nor balance-excluded, scanning from
+    /// `start` and keeping the first minimum — `SmpScheduler::least_loaded_online_cpu`'s policy,
+    /// over whichever load source the caller holds the authority to read.
+    fn least_loaded(
+        &self,
+        start: usize,
+        load: impl Fn(usize) -> usize,
+    ) -> Result<CpuId, SchedulerError> {
+        let excluded = self.wake_only() | self.balance_excluded();
+        let online = self.online();
+        let mut best: Option<(usize, CpuId)> = None;
+        for offset in 0..MAX_CPUS {
+            let idx = (start + offset) % MAX_CPUS;
+            // Stage 183.5: wake-only CPUs accept no placement; QEMU-SMP2: nor a pinned-only one.
+            if excluded & (1u64 << idx) != 0 || online & (1u64 << idx) == 0 {
+                continue;
+            }
+            let l = load(idx);
+            if best.map_or(true, |(best_load, _)| l < best_load) {
+                best = Some((l, CpuId(idx as u8)));
+            }
+        }
+        best.map(|(_, cpu)| cpu).ok_or(SchedulerError::CpuOffline)
+    }
+}
+
+/// SCHED-LOCK1 — genuinely global placement state: topology and the balanced-placement rotation.
+/// Behind rank 1G; never taken on an ordinary dispatch path.
+#[derive(Debug)]
+pub(crate) struct Admission {
+    topology: CpuTopology,
+    next_balance_cpu: usize,
+}
+
+/// SCHED-LOCK1 — the scheduler domain. There is NO lock around the whole: each CPU's state has
+/// its own lock (rank 1L), admission has its own (rank 1G), and the clock, the admission bitmaps
+/// and the per-CPU mirrors are atomics. `doc/SCHEDULING_CONTRACT.md` §16.
+#[derive(Debug)]
+pub struct SchedDomain {
+    cpus: SchedCells,
+    admission: SpinLockIrq<Admission>,
+    topo: SchedTopo,
+    /// The scheduler tick. Single writer: [`CpuView::tick`] on [`CLOCK_OWNER_CPU`], under its 1L.
+    clock: AtomicU64,
+}
+
+#[cfg(feature = "hosted-dev")]
+type SchedCells = alloc::boxed::Box<[CpuCell; MAX_CPUS]>;
+#[cfg(not(feature = "hosted-dev"))]
+type SchedCells = [CpuCell; MAX_CPUS];
+
+impl SchedDomain {
+    /// A domain with `present` CPUs present, only the boot CPU online, every quantum
+    /// `quantum_ticks`, and the clock at 0.
+    pub fn new(present: u64, quantum_ticks: u64) -> Self {
+        let cells: [CpuCell; MAX_CPUS] = core::array::from_fn(|_| CpuCell::new(quantum_ticks));
+        #[cfg(feature = "hosted-dev")]
+        let cells = alloc::boxed::Box::new(cells);
+        let topology = CpuTopology::from_present_bitmap(present);
+        let topo = SchedTopo::default();
+        topo.publish_topology(&topology);
+        Self {
+            cpus: cells,
+            admission: SpinLockIrq::new(Admission {
+                topology,
+                next_balance_cpu: 0,
+            }),
+            topo,
+            clock: AtomicU64::new(0),
+        }
+    }
+
+    /// The published admission bitmaps (lock-free).
+    pub(crate) fn topo(&self) -> &SchedTopo {
+        &self.topo
+    }
+
+    /// The scheduler tick (lock-free; Acquire).
+    pub fn clock_now(&self) -> Tick {
+        TickInstant(self.clock.load(Ordering::Acquire))
+    }
+
+    /// CPU `idx`'s published current task (see [`CpuMirror`]). `None` for an out-of-range CPU.
+    pub(crate) fn current_mirror(&self, idx: usize) -> Option<ThreadId> {
+        let raw = self.cpus.get(idx)?.mirror.current.load(Ordering::SeqCst);
+        (raw != 0).then(|| ThreadId(raw - 1))
+    }
+
+    /// SCHED-LOCK1 §16.4 — does any ONLINE CPU other than `cpu` publish `tid` as its current?
+    /// Lock-free (SeqCst mirror loads). The caller holds `cpu`'s own 1L.
+    pub(crate) fn current_elsewhere(&self, cpu: CpuId, tid: ThreadId) -> bool {
+        let online = self.topo.online();
+        (0..MAX_CPUS).any(|idx| {
+            idx != cpu.0 as usize
+                && online & (1u64 << idx) != 0
+                && self.current_mirror(idx) == Some(tid)
+        })
+    }
+
+    /// CPU `idx`'s published load (queued + current).
+    pub(crate) fn load_mirror(&self, idx: usize) -> usize {
+        self.cpus
+            .get(idx)
+            .map_or(0, |c| c.mirror.load.load(Ordering::SeqCst) as usize)
+    }
+
+    /// Rank 1L — lock exactly CPU `cpu`'s state. `InvalidCpu` (nothing locked) when out of range.
+    pub fn lock_cpu(&self, cpu: CpuId) -> Result<CpuSchedGuard<'_>, SchedulerError> {
+        let idx = cpu.0 as usize;
+        let cell = self.cpus.get(idx).ok_or(SchedulerError::InvalidCpu)?;
+        Ok(CpuSchedGuard {
+            guard: cell.lock.lock(),
+            cell,
+            topo: &self.topo,
+            clock: &self.clock,
+            idx,
+        })
+    }
+
+    /// Rank 1G then rank 1L — an admission transition of CPU `cpu`.
+    pub(crate) fn lock_cpu_admission(
+        &self,
+        cpu: CpuId,
+    ) -> Result<CpuAdmissionGuard<'_>, SchedulerError> {
+        let idx = cpu.0 as usize;
+        if idx >= MAX_CPUS {
+            return Err(SchedulerError::InvalidCpu);
+        }
+        let admission = self.admission.lock();
+        let cpu = self.lock_cpu(cpu)?;
+        Ok(CpuAdmissionGuard { cpu, admission })
+    }
+
+    /// Rank 1G alone — the balanced choice over the load mirrors, rotating the next starting
+    /// point exactly as the base did. Any CPU returned is admitted for balanced placement; the
+    /// enqueue onto it re-checks admission under that CPU's own 1L.
+    pub(crate) fn balanced_choice_and_note(&self) -> Result<CpuId, SchedulerError> {
+        let mut admission = self.admission.lock();
+        let cpu = self
+            .topo
+            .least_loaded(admission.next_balance_cpu, |idx| self.load_mirror(idx))?;
+        admission.next_balance_cpu = (cpu.0 as usize + 1) % MAX_CPUS;
+        Ok(cpu)
+    }
+
+    /// SCHED-LOCK1 §16.4 — the per-CPU scan for a FROZEN subject: each CPU examined under its own
+    /// 1L, one at a time, never two held. Equal to the coherent answer whenever `tid`'s placement
+    /// cannot change during the scan; the caller states why it cannot.
+    pub(crate) fn present_anywhere_scan(&self, tid: ThreadId) -> bool {
+        (0..MAX_CPUS).any(|idx| {
+            let cell = &self.cpus[idx];
+            let guard = cell.lock.lock();
+            guard.rq.contains_or_current(tid)
+        })
+    }
+
+    /// Rank 1G, then every 1L in ascending order — the ONE coherent whole-domain view. Rare paths
+    /// only (§16.1). Released in descending order, 1G last.
+    pub fn lock_all(&self) -> SchedAllGuard<'_> {
+        let admission = self.admission.lock();
+        let mut guards: [Option<SpinLockIrqGuard<'_, CpuSched>>; MAX_CPUS] =
+            [const { None }; MAX_CPUS];
+        for (idx, slot) in guards.iter_mut().enumerate() {
+            *slot = Some(self.cpus[idx].lock.lock());
+        }
+        SchedAllGuard {
+            domain: self,
+            guards,
+            admission: Some(admission),
+        }
+    }
+
+    /// Exclusive access (no other reference to the domain exists): the whole view without
+    /// locking. Construction and hosted unit tests only. Mirrors are republished when the view is
+    /// dropped.
+    pub fn exclusive(&mut self) -> SchedAll<'_> {
+        let mut cpus: [Option<&mut CpuSched>; MAX_CPUS] = [const { None }; MAX_CPUS];
+        let mut mirrors: [Option<&CpuMirror>; MAX_CPUS] = [None; MAX_CPUS];
+        for (idx, cell) in self.cpus.iter_mut().enumerate() {
+            let CpuCell { lock, mirror } = cell;
+            cpus[idx] = Some(lock.get_mut());
+            mirrors[idx] = Some(&*mirror);
+        }
+        SchedAll {
+            cpus: cpus.map(|c| c.expect("every cell")),
+            mirrors: mirrors.map(|m| m.expect("every cell")),
+            admission: self.admission.get_mut(),
+            topo: &self.topo,
+            clock: &self.clock,
+        }
+    }
+}
+
+/// SCHED-LOCK1 — a held 1L on one CPU. Projects ONLY that CPU's [`CpuSched`]; republishes the
+/// CPU's mirror when released (before the lock itself is released).
+pub struct CpuSchedGuard<'a> {
+    guard: SpinLockIrqGuard<'a, CpuSched>,
+    cell: &'a CpuCell,
+    topo: &'a SchedTopo,
+    clock: &'a AtomicU64,
+    idx: usize,
+}
+
+impl CpuSchedGuard<'_> {
+    pub fn view(&mut self) -> CpuView<'_> {
+        CpuView {
+            idx: self.idx,
+            sched: &mut self.guard,
+            topo: self.topo,
+            clock: self.clock,
+        }
+    }
+}
+
+impl Drop for CpuSchedGuard<'_> {
+    fn drop(&mut self) {
+        publish(&self.cell.mirror, &self.guard);
+        // `guard` is dropped after this body: the mirror is published while 1L is still held.
+    }
+}
+
+/// SCHED-LOCK1 — 1G and one CPU's 1L, for that CPU's admission transition.
+pub(crate) struct CpuAdmissionGuard<'a> {
+    // Field order is drop order: the 1L guard is released before 1G.
+    cpu: CpuSchedGuard<'a>,
+    admission: SpinLockIrqGuard<'a, Admission>,
+}
+
+impl CpuAdmissionGuard<'_> {
+    pub(crate) fn admit_pinned_dispatch(&mut self) -> Result<(), SchedulerError> {
+        let _ = &mut self.admission;
+        let mut view = self.cpu.view();
+        admit(&mut view, true)
+    }
+
+    pub(crate) fn admit_dispatch(&mut self) -> Result<(), SchedulerError> {
+        let _ = &mut self.admission;
+        let mut view = self.cpu.view();
+        admit(&mut view, false)
+    }
+}
+
+/// The wake-only → dispatching transition (`admit_pinned_dispatch` / `admit_dispatch`): ONE
+/// mutation under 1G + the CPU's 1L, refused (changing nothing) unless the CPU is online,
+/// wake-only, running nothing but the idle placeholder and holding no queued work.
+fn admit(view: &mut CpuView<'_>, pinned_only: bool) -> Result<(), SchedulerError> {
+    if !view.online() {
+        return Err(SchedulerError::CpuOffline);
+    }
+    let bit = 1u64 << view.idx;
+    if view.topo.wake_only() & bit == 0 {
+        return Err(SchedulerError::CpuOffline);
+    }
+    match view.sched.rq.current_tid() {
+        None | Some(ThreadId(0)) => {}
+        Some(_) => return Err(SchedulerError::AlreadyQueued),
+    }
+    if view.sched.rq.runnable_count() != 0 {
+        return Err(SchedulerError::AlreadyQueued);
+    }
+    view.sched.rq.current = None;
+    SchedTopo::set_bit(&view.topo.balance_excluded, view.idx, pinned_only);
+    SchedTopo::set_bit(&view.topo.wake_only, view.idx, false);
+    Ok(())
+}
+
+/// SCHED-LOCK1 — one CPU's state under an authority that owns it (a [`CpuSchedGuard`] or a
+/// [`SchedAll`]). Every method is the per-CPU half of the base `SmpScheduler::*_on`, with the
+/// same refusal for a CPU that is not online.
+pub struct CpuView<'a> {
+    idx: usize,
+    sched: &'a mut CpuSched,
+    topo: &'a SchedTopo,
+    clock: &'a AtomicU64,
+}
+
+impl CpuView<'_> {
+    pub fn cpu(&self) -> CpuId {
+        CpuId(self.idx as u8)
+    }
+
+    fn online(&self) -> bool {
+        self.topo.cpu_online(self.idx)
+    }
+
+    pub fn validate_online(&self) -> Result<(), SchedulerError> {
+        if self.online() {
+            Ok(())
+        } else {
+            Err(SchedulerError::CpuOffline)
+        }
+    }
+
+    pub fn wake_only(&self) -> bool {
+        self.topo.wake_only() & (1u64 << self.idx) != 0
+    }
+
+    pub fn enqueue_with_priority(
+        &mut self,
+        tid: ThreadId,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        self.validate_online()?;
+        let cpu = self.cpu();
+        // Stage 183.5: a wake-only online CPU runs no dispatcher — a task placed on its queue
+        // would strand forever. Deny placement explicitly.
+        if self.wake_only() {
+            crate::yarm_log!(
+                "SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu={} tid={} reason=no_ap_dispatcher_yet",
+                cpu.0,
+                tid.0
+            );
+            // Stage 195D (BSP DISPATCH AFFINITY): emitted ONLY on a real rejection.
+            #[cfg(target_arch = "aarch64")]
+            crate::yarm_log!(
+                "AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid={} cpu={}",
+                tid.0,
+                cpu.0
+            );
+            // Stage 199D: `WakeOnly`, not `CpuOffline`. The CPU is up; it refuses work.
+            return Err(SchedulerError::WakeOnly);
+        }
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!(
+                "ENQUEUE_QUEUE_INDEX tid={} requested_cpu={} queue_index={}",
+                tid.0,
+                cpu.0,
+                self.idx
+            );
+        }
+        self.sched.rq.enqueue_with_priority(tid, priority).map(|_| {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                crate::yarm_log!("ENQUEUE_COMMIT tid={} queue_cpu={}", tid.0, cpu.0);
+            }
+        })
+    }
+
+    pub fn enqueue(&mut self, tid: ThreadId) -> Result<(), SchedulerError> {
+        self.enqueue_with_priority(tid, TaskPriority::Normal)
+    }
+
+    /// Provenance-preserving form of [`Self::dispatch_next`].
+    pub fn dispatch_next_selection(&mut self) -> DispatchSelection {
+        if !self.online() {
+            return DispatchSelection::Idle;
+        }
+        self.sched.rq.dispatch_next_selection()
+    }
+
+    /// U9-DISPATCH-CPU1 §1 — an offline CPU yields `Empty`.
+    pub fn dispatch_next_accepted_selection(
+        &mut self,
+        accept: impl FnMut(ThreadId) -> bool,
+    ) -> AcceptedSelection {
+        if !self.online() {
+            return AcceptedSelection::Empty;
+        }
+        self.sched.rq.dispatch_next_accepted_selection(accept)
+    }
+
+    pub fn on_preempt_selection(&mut self) -> DispatchSelection {
+        if !self.online() {
+            return DispatchSelection::Idle;
+        }
+        self.sched.rq.on_preempt_selection()
+    }
+
+    pub fn on_preempt_prefer_selection(&mut self, preferred: ThreadId) -> DispatchSelection {
+        if !self.online() {
+            return DispatchSelection::Idle;
+        }
+        self.sched.rq.on_preempt_prefer_selection(preferred)
+    }
+
+    pub fn dispatch_next(&mut self) -> Option<ThreadId> {
+        if !self.online() {
+            return None;
+        }
+        let cpu = self.idx;
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!(
+                "SCHED cpu={} idle_tid={} runq_len={}",
+                cpu,
+                self.sched.rq.current_tid().unwrap_or(ThreadId(0)).0,
+                self.sched.rq.runnable_count()
+            );
+        }
+        let final_tid = self.sched.rq.dispatch_next();
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!("SCHED cpu={} final_tid={:?}", cpu, final_tid);
+        }
+        final_tid
+    }
+
+    pub fn on_preempt(&mut self) -> Option<ThreadId> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.on_preempt()
+    }
+
+    /// Stage 192B: re-enqueue the current task and clear the slot WITHOUT dispatching.
+    pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.preempt_reenqueue_only()
+    }
+
+    pub fn on_preempt_prefer(&mut self, preferred: ThreadId) -> Option<ThreadId> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.on_preempt_prefer(preferred)
+    }
+
+    pub fn block_current(&mut self) -> Option<ThreadId> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.block_current()
+    }
+
+    /// U9-EXIT3 §2 — compare-and-clear. See [`PriorityScheduler::block_current_exact`].
+    pub fn block_current_exact(&mut self, tid: ThreadId) -> Option<TaskPriority> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.block_current_exact(tid)
+    }
+
+    /// U9-EXIT3 §2 — restore. Refuses only on this CPU; "on no OTHER CPU" is the caller's proof.
+    pub fn restore_exact_current(&mut self, tid: ThreadId, priority: TaskPriority) -> bool {
+        if !self.online() {
+            return false;
+        }
+        self.sched.rq.restore_exact_current(tid, priority)
+    }
+
+    /// Stage 199D: withdraw one queued incarnation of `tid` from THIS CPU's queue only.
+    pub(crate) fn withdraw_queued_tid(&mut self, tid: ThreadId) -> WithdrawOutcome {
+        if !self.online() {
+            return WithdrawOutcome::InvalidCpu;
+        }
+        self.sched.rq.withdraw_queued_tid(tid)
+    }
+
+    pub fn current_tid(&self) -> Option<ThreadId> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.current_tid()
+    }
+
+    pub fn current_priority(&self) -> Option<TaskPriority> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.current_priority()
+    }
+
+    pub fn runnable_count(&self) -> usize {
+        if !self.online() {
+            return 0;
+        }
+        self.sched.rq.runnable_count()
+    }
+
+    /// Non-mutating peek of the next-runnable candidate (highest-priority queue head).
+    pub fn peek_next_runnable(&self) -> Option<ThreadId> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.peek_highest()
+    }
+
+    /// Is `tid` this CPU's current task or in one of its queues (online or not)?
+    pub fn contains_or_current(&self, tid: ThreadId) -> bool {
+        self.sched.rq.contains_or_current(tid)
+    }
+
+    /// Visit every queued entry in dispatch order (High → Normal → Low, FIFO within each).
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub fn for_each_queued(&self, mut f: impl FnMut(TaskPriority, ThreadId)) {
+        if !self.online() {
+            return;
+        }
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            let q = &self.sched.rq.queues[PriorityScheduler::priority_index(priority)];
+            for offset in 0..q.len {
+                f(priority, q.tids[RingQueue::index(q.head + offset)]);
+            }
+        }
+    }
+
+    /// One timer interrupt on this CPU: the clock owner advances the scheduler tick; every CPU
+    /// consumes only its own quantum. Returns `(scheduler tick, this CPU's quantum expired)`.
+    pub fn tick(&mut self) -> (Tick, bool) {
+        let (_, expired) = self.sched.quantum.tick_and_check();
+        let now = if self.idx == CLOCK_OWNER_CPU.0 as usize {
+            self.clock.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+        } else {
+            self.clock.load(Ordering::Acquire)
+        };
+        (TickInstant(now), expired)
+    }
+
+    /// Would this CPU's NEXT timer interrupt expire its quantum?
+    pub fn would_preempt_next(&self) -> bool {
+        self.sched.quantum.would_preempt_next()
+    }
+
+    /// A voluntary switch: the next task here starts with a full quantum.
+    pub fn reset_quantum(&mut self) {
+        self.sched.quantum.reset_quantum();
+    }
+
+    pub fn set_quantum(&mut self, quantum_ticks: u64) {
+        self.sched.quantum.set_quantum(quantum_ticks);
+    }
+
+    /// Where `tid` is on THIS CPU: (current here, queued here).
+    fn placement_here(&self, tid: ThreadId) -> (bool, bool) {
+        (
+            self.sched.rq.current.is_some_and(|task| task.tid == tid),
+            self.sched.rq.queues.iter().any(|q| q.count_tid(tid) > 0),
+        )
+    }
+}
+
+/// SCHED-LOCK1 — held 1G and every 1L (see [`SchedDomain::lock_all`]).
+pub struct SchedAllGuard<'a> {
+    domain: &'a SchedDomain,
+    guards: [Option<SpinLockIrqGuard<'a, CpuSched>>; MAX_CPUS],
+    admission: Option<SpinLockIrqGuard<'a, Admission>>,
+}
+
+impl SchedAllGuard<'_> {
+    pub fn view(&mut self) -> SchedAll<'_> {
+        let domain = self.domain;
+        let cpus = self.guards.each_mut().map(|g| {
+            &mut **g
+                .as_mut()
+                .expect("every 1L is held for the guard's lifetime")
+        });
+        SchedAll {
+            cpus,
+            mirrors: core::array::from_fn(|idx| &domain.cpus[idx].mirror),
+            admission: self
+                .admission
+                .as_mut()
+                .expect("1G is held for the guard's lifetime"),
+            topo: &domain.topo,
+            clock: &domain.clock,
+        }
+    }
+}
+
+impl Drop for SchedAllGuard<'_> {
+    fn drop(&mut self) {
+        // Release the 1Ls in DESCENDING order — each guard restores the interrupt state its own
+        // acquisition saved, so the first-acquired guard is released last — then 1G. (Mirrors
+        // were republished by the view, while every 1L was held.)
+        for idx in (0..MAX_CPUS).rev() {
+            drop(self.guards[idx].take());
+        }
+        drop(self.admission.take());
+    }
+}
+
+/// SCHED-LOCK1 — the coherent whole-domain view: every CPU's state, admission, the bitmaps and
+/// the clock. Exists only while every 1L and 1G are held ([`SchedAllGuard`]) or under exclusive
+/// ownership of the domain ([`SchedDomain::exclusive`]). The `_on` methods are the base
+/// `SmpScheduler` API, each delegating to that CPU's [`CpuView`].
+pub struct SchedAll<'a> {
+    cpus: [&'a mut CpuSched; MAX_CPUS],
+    mirrors: [&'a CpuMirror; MAX_CPUS],
+    admission: &'a mut Admission,
+    topo: &'a SchedTopo,
+    clock: &'a AtomicU64,
+}
+
+impl Drop for SchedAll<'_> {
+    fn drop(&mut self) {
+        for idx in 0..MAX_CPUS {
+            publish(self.mirrors[idx], self.cpus[idx]);
+        }
+    }
+}
+
+impl SchedAll<'_> {
     fn check_cpu(cpu: CpuId) -> Result<usize, SchedulerError> {
         let idx = cpu.0 as usize;
         if idx >= MAX_CPUS {
@@ -780,190 +1445,114 @@ impl SmpScheduler {
         Ok(idx)
     }
 
-    fn check_online_cpu(&self, cpu: CpuId) -> Result<usize, SchedulerError> {
+    /// CPU `cpu`'s view under this authority.
+    pub fn cpu(&mut self, cpu: CpuId) -> Result<CpuView<'_>, SchedulerError> {
         let idx = Self::check_cpu(cpu)?;
-        if !self.topology.cpu_online(idx as u8) {
-            return Err(SchedulerError::CpuOffline);
-        }
-        Ok(idx)
+        Ok(CpuView {
+            idx,
+            sched: &mut *self.cpus[idx],
+            topo: self.topo,
+            clock: self.clock,
+        })
+    }
+
+    fn cpu_ref(&self, cpu: CpuId) -> Option<(usize, &CpuSched)> {
+        let idx = cpu.0 as usize;
+        (idx < MAX_CPUS && self.topo.cpu_online(idx)).then(|| (idx, &*self.cpus[idx]))
     }
 
     pub fn validate_online_cpu(&self, cpu: CpuId) -> Result<(), SchedulerError> {
-        self.check_online_cpu(cpu).map(|_| ())
+        let idx = Self::check_cpu(cpu)?;
+        if !self.topo.cpu_online(idx) {
+            return Err(SchedulerError::CpuOffline);
+        }
+        Ok(())
     }
 
-    /// Stage 183.5: mark/unmark `cpu` wake-only (online for accounting/wake, no task
-    /// placement — see the field doc). Idempotent.
+    /// Stage 183.5: mark/unmark `cpu` wake-only. Idempotent.
     pub fn set_cpu_wake_only(&mut self, cpu: CpuId, wake_only: bool) -> Result<(), SchedulerError> {
         let idx = Self::check_cpu(cpu)?;
-        if wake_only {
-            self.wake_only |= 1u64 << idx;
-        } else {
-            self.wake_only &= !(1u64 << idx);
-        }
+        SchedTopo::set_bit(&self.topo.wake_only, idx, wake_only);
         Ok(())
     }
 
     pub fn cpu_wake_only(&self, cpu: CpuId) -> bool {
         Self::check_cpu(cpu)
-            .map(|idx| self.wake_only & (1u64 << idx) != 0)
+            .map(|idx| self.topo.wake_only() & (1u64 << idx) != 0)
             .unwrap_or(false)
     }
 
     pub fn wake_only_bitmap(&self) -> u64 {
-        self.wake_only
+        self.topo.wake_only()
     }
 
-    /// Stage 183.5: install the scheduler-owned IDLE current for a wake-only online
-    /// AP. Uses the scheduler's existing idle convention — current = tid 0, the
-    /// placeholder `dispatch_next` already knows to switch away from when real work
-    /// arrives (so the representation is forward-correct for the 183.6 AP
-    /// dispatcher). Only valid on an online, wake-only CPU with no current task.
+    /// Stage 183.5: install the scheduler-owned IDLE current (tid 0) for a wake-only online AP.
     pub fn install_ap_idle_current(&mut self, cpu: CpuId) -> Result<ThreadId, SchedulerError> {
-        let idx = self.check_online_cpu(cpu)?;
-        if self.wake_only & (1u64 << idx) == 0 {
+        self.validate_online_cpu(cpu)?;
+        let idx = cpu.0 as usize;
+        if self.topo.wake_only() & (1u64 << idx) == 0 {
             return Err(SchedulerError::CpuOffline);
         }
-        if self.schedulers[idx].current_tid().is_some() {
+        if self.cpus[idx].rq.current_tid().is_some() {
             return Err(SchedulerError::AlreadyQueued);
         }
         let idle = ScheduledTask {
             tid: ThreadId(0),
             priority: TaskPriority::Low,
         };
-        self.schedulers[idx].current = Some(idle);
+        self.cpus[idx].rq.current = Some(idle);
         Ok(idle.tid)
     }
 
-    /// QEMU-SMP2 — admit a wake-only AP to dispatch the tasks explicitly placed on it.
-    ///
-    /// ONE mutation of the scheduler, so no observer sees a partial admission: the CPU leaves
-    /// the wake-only set (explicit enqueues are accepted and `dispatching` counts it), its
-    /// scheduler-owned idle placeholder (tid 0, installed by `install_ap_idle_current`) is
-    /// cleared so its idle boundary reads `current == None` exactly as the BSP's does, and it
-    /// joins `balance_excluded`, so balanced placement still never chooses it.
-    ///
-    /// Refused — changing nothing — unless the CPU is online, wake-only, running nothing but the
-    /// placeholder and holding no queued work: admission is a transition out of the wake-only
-    /// state, never a way to adopt a CPU in some other one.
+    /// QEMU-SMP2 — admit a wake-only AP to dispatch only explicitly placed tasks.
     pub fn admit_pinned_dispatch(&mut self, cpu: CpuId) -> Result<(), SchedulerError> {
-        let idx = self.check_online_cpu(cpu)?;
-        let bit = 1u64 << idx;
-        if self.wake_only & bit == 0 {
-            return Err(SchedulerError::CpuOffline);
-        }
-        match self.schedulers[idx].current_tid() {
-            None | Some(ThreadId(0)) => {}
-            Some(_) => return Err(SchedulerError::AlreadyQueued),
-        }
-        if self.schedulers[idx].runnable_count() != 0 {
-            return Err(SchedulerError::AlreadyQueued);
-        }
-        self.schedulers[idx].current = None;
-        self.wake_only &= !bit;
-        self.balance_excluded |= bit;
-        Ok(())
+        let mut view = self.cpu(cpu)?;
+        admit(&mut view, true)
     }
 
-    /// AP-SCHED1 — admit a wake-only CPU to PRODUCTION dispatch: the same single transition as
-    /// [`Self::admit_pinned_dispatch`] (out of wake-only, idle placeholder cleared, refused unless
-    /// the CPU is online, wake-only, running nothing and holding no work) except that the CPU
-    /// joins balanced placement. It is called only once the CPU can take work AND interrupts: its
-    /// own timer is armed (an unpinned task placed there is preempted and never strands) and it is
-    /// a published reschedule-IPI target (every remote enqueue reaches it).
+    /// AP-SCHED1 — admit a wake-only CPU to production (balanced) dispatch.
     pub fn admit_dispatch(&mut self, cpu: CpuId) -> Result<(), SchedulerError> {
-        let idx = self.check_online_cpu(cpu)?;
-        let bit = 1u64 << idx;
-        if self.wake_only & bit == 0 {
-            return Err(SchedulerError::CpuOffline);
-        }
-        match self.schedulers[idx].current_tid() {
-            None | Some(ThreadId(0)) => {}
-            Some(_) => return Err(SchedulerError::AlreadyQueued),
-        }
-        if self.schedulers[idx].runnable_count() != 0 {
-            return Err(SchedulerError::AlreadyQueued);
-        }
-        self.schedulers[idx].current = None;
-        self.wake_only &= !bit;
-        self.balance_excluded &= !bit;
-        Ok(())
+        let mut view = self.cpu(cpu)?;
+        admit(&mut view, false)
     }
 
-    /// AP-SCHED1 — the CPU balanced placement WOULD choose now, without enqueueing anything: the
-    /// least-loaded online CPU that is neither wake-only nor balance-excluded. Read-only; the
-    /// caller fixes the choice as the task's home before the task is ever queued.
+    /// AP-SCHED1 — the CPU balanced placement would choose now, from the coherent loads.
     pub fn balanced_choice(&self) -> Result<CpuId, SchedulerError> {
-        self.least_loaded_online_cpu(self.next_balance_cpu)
+        self.topo
+            .least_loaded(self.admission.next_balance_cpu, |idx| self.cpus[idx].load())
     }
 
-    /// AP-SCHED1 — note that a balanced choice was used, so successive placements rotate their
-    /// starting point exactly as [`Self::enqueue_balanced`] does.
     pub fn note_balanced_choice(&mut self, cpu: CpuId) {
-        self.next_balance_cpu = (cpu.0 as usize + 1) % MAX_CPUS;
+        self.admission.next_balance_cpu = (cpu.0 as usize + 1) % MAX_CPUS;
     }
 
-    /// QEMU-SMP2: CPUs that dispatch only explicitly placed tasks.
     pub fn balance_excluded_bitmap(&self) -> u64 {
-        self.balance_excluded
-    }
-
-    fn least_loaded_online_cpu(&self, start: usize) -> Result<CpuId, SchedulerError> {
-        let mut best: Option<(usize, CpuId)> = None;
-        for offset in 0..MAX_CPUS {
-            let idx = (start + offset) % MAX_CPUS;
-            // Stage 183.5: wake-only CPUs are online but accept no task placement
-            // (no dispatcher runs on them yet) — never balance onto them.
-            // QEMU-SMP2: nor onto a CPU admitted for pinned dispatch only.
-            if (self.wake_only | self.balance_excluded) & (1u64 << idx) != 0 {
-                continue;
-            }
-            if self.topology.cpu_online(idx as u8) {
-                let load = self.schedulers[idx].runnable_count()
-                    + usize::from(self.schedulers[idx].current_tid().is_some());
-                let cpu = CpuId(idx as u8);
-                if best.map_or(true, |(best_load, _)| load < best_load) {
-                    best = Some((load, cpu));
-                }
-            }
-        }
-        best.map(|(_, cpu)| cpu).ok_or(SchedulerError::CpuOffline)
+        self.topo.balance_excluded()
     }
 
     /// Simulates the full secondary-CPU bring-up handshake in a single call.
-    ///
-    /// This is suitable for tests and single-threaded simulation. On real SMP
-    /// hardware, the bootstrap CPU should call `start_secondary_cpu()`, the
-    /// secondary CPU's entry point should call `acknowledge_secondary_cpu()` on
-    /// itself, and only then should the bootstrap CPU call
-    /// `mark_cpu_online()`.
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), SchedulerError> {
         Self::check_cpu(cpu)?;
-        self.topology
-            .start_secondary_cpu(cpu.0)
-            .map_err(|_| SchedulerError::CpuOffline)?;
-        self.topology
-            .acknowledge_secondary_cpu(cpu.0)
-            .map_err(|_| SchedulerError::CpuOffline)?;
-        self.topology
-            .mark_cpu_online(cpu.0)
-            .map_err(|_| SchedulerError::CpuOffline)
+        let topology = &mut self.admission.topology;
+        let result = if topology.start_secondary_cpu(cpu.0).is_err()
+            || topology.acknowledge_secondary_cpu(cpu.0).is_err()
+            || topology.mark_cpu_online(cpu.0).is_err()
+        {
+            Err(SchedulerError::CpuOffline)
+        } else {
+            Ok(())
+        };
+        self.topo.publish_topology(&self.admission.topology);
+        result
     }
 
-    /// U9-DISPATCH-CPU1 D1 — visit every queued entry on `cpu` in dispatch order
-    /// (High → Normal → Low, FIFO within each).
-    ///
-    /// Read-only, and test/hosted-only: the D1 contracts assert that a rejected candidate keeps
-    /// its exact priority AND its exact FIFO position, which a count cannot express and which is
-    /// precisely what the rollback form got wrong.
     #[cfg(any(test, feature = "hosted-dev"))]
     pub fn for_each_queued_on(&self, cpu: CpuId, mut f: impl FnMut(TaskPriority, ThreadId)) {
-        let Ok(idx) = self.check_online_cpu(cpu) else {
+        let Some((_, sched)) = self.cpu_ref(cpu) else {
             return;
         };
-        let sched = &self.schedulers[idx];
         for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            let q = &sched.queues[PriorityScheduler::priority_index(priority)];
+            let q = &sched.rq.queues[PriorityScheduler::priority_index(priority)];
             for offset in 0..q.len {
                 f(priority, q.tids[RingQueue::index(q.head + offset)]);
             }
@@ -972,35 +1561,31 @@ impl SmpScheduler {
 
     pub fn cpu_is_online(&self, cpu: CpuId) -> bool {
         Self::check_cpu(cpu)
-            .ok()
-            .map(|idx| self.topology.cpu_online(idx as u8))
+            .map(|idx| self.topo.cpu_online(idx))
             .unwrap_or(false)
     }
 
     pub fn online_cpu_bitmap(&self) -> u64 {
-        self.topology.online_cpu_bitmap()
+        self.topo.online()
     }
 
     pub fn online_cpu_count(&self) -> usize {
-        self.topology.online_cpu_count()
+        self.topo.online().count_ones() as usize
     }
 
     pub fn present_cpu_count(&self) -> usize {
-        self.topology.present_cpu_count()
+        self.topo.present().count_ones() as usize
     }
 
     pub fn present_cpu_bitmap(&self) -> u64 {
-        self.topology.present_cpu_bitmap()
+        self.topo.present()
     }
 
-    /// WARNING: Resets all secondary CPU online state.
-    ///
-    /// Any tasks already queued on secondary CPUs remain in their per-CPU run
-    /// queues, but those CPUs will appear offline until `bring_up_cpu()` is run
-    /// again for each secondary.
+    /// WARNING: resets all secondary CPU online state (queued work stays where it is).
     pub fn set_present_cpu_bitmap(&mut self, present: u64) {
-        self.topology = CpuTopology::from_present_bitmap(present);
-        self.next_balance_cpu = 0;
+        self.admission.topology = CpuTopology::from_present_bitmap(present);
+        self.admission.next_balance_cpu = 0;
+        self.topo.publish_topology(&self.admission.topology);
     }
 
     pub fn enqueue_on_with_priority(
@@ -1009,45 +1594,8 @@ impl SmpScheduler {
         tid: ThreadId,
         priority: TaskPriority,
     ) -> Result<(), SchedulerError> {
-        let idx = self.check_online_cpu(cpu)?;
-        // Stage 183.5: a wake-only online CPU runs no dispatcher — a task placed on
-        // its queue would strand forever. Deny placement explicitly (nothing pins
-        // work to APs today; 183.6 lifts this per CPU when the AP dispatcher lands).
-        if self.wake_only & (1u64 << idx) != 0 {
-            crate::yarm_log!(
-                "SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu={} tid={} reason=no_ap_dispatcher_yet",
-                cpu.0,
-                tid.0
-            );
-            // Stage 195D (BSP DISPATCH AFFINITY): an actual prevented placement of a runnable
-            // user task onto a wake-only AP queue. Emitted ONLY on a real rejection (never
-            // fabricated); the caller reroutes to the BSP dispatcher.
-            #[cfg(target_arch = "aarch64")]
-            crate::yarm_log!(
-                "AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid={} cpu={}",
-                tid.0,
-                cpu.0
-            );
-            // Stage 199D: `WakeOnly`, not `CpuOffline`. The CPU is up; it refuses work. A
-            // direct-IPC wake must be able to tell those apart — collapsing them is what let
-            // `sr_enqueue_committed_receiver_split` report a placement that never happened.
-            return Err(SchedulerError::WakeOnly);
-        }
-        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!(
-                "ENQUEUE_QUEUE_INDEX tid={} requested_cpu={} queue_index={}",
-                tid.0,
-                cpu.0,
-                idx
-            );
-        }
-        self.schedulers[idx]
-            .enqueue_with_priority(tid, priority)
-            .map(|_| {
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!("ENQUEUE_COMMIT tid={} queue_cpu={}", tid.0, cpu.0);
-                }
-            })
+        self.validate_online_cpu(cpu)?;
+        self.cpu(cpu)?.enqueue_with_priority(tid, priority)
     }
 
     pub fn enqueue_balanced(
@@ -1055,10 +1603,9 @@ impl SmpScheduler {
         tid: ThreadId,
         priority: TaskPriority,
     ) -> Result<CpuId, SchedulerError> {
-        let start = self.next_balance_cpu;
-        let cpu = self.least_loaded_online_cpu(start)?;
+        let cpu = self.balanced_choice()?;
         self.enqueue_on_with_priority(cpu, tid, priority)?;
-        self.next_balance_cpu = (cpu.0 as usize + 1) % MAX_CPUS;
+        self.note_balanced_choice(cpu);
         Ok(cpu)
     }
 
@@ -1066,189 +1613,116 @@ impl SmpScheduler {
         self.enqueue_on_with_priority(cpu, tid, TaskPriority::Normal)
     }
 
-    /// Provenance-preserving form of [`Self::dispatch_next_on`].
     pub fn dispatch_next_selection_on(&mut self, cpu: CpuId) -> DispatchSelection {
-        let Ok(idx) = self.check_online_cpu(cpu) else {
-            return DispatchSelection::Idle;
-        };
-        self.schedulers[idx].dispatch_next_selection()
+        self.cpu(cpu)
+            .map_or(DispatchSelection::Idle, |mut v| v.dispatch_next_selection())
     }
 
-    /// U9-DISPATCH-CPU1 §1 — [`PriorityScheduler::dispatch_next_accepted_selection`] on one CPU.
-    ///
-    /// An offline CPU yields `Empty`: it has no runqueue, so there is nothing to examine and
-    /// nothing to claim was exhausted.
     pub fn dispatch_next_accepted_selection_on(
         &mut self,
         cpu: CpuId,
         accept: impl FnMut(ThreadId) -> bool,
     ) -> AcceptedSelection {
-        let Ok(idx) = self.check_online_cpu(cpu) else {
-            return AcceptedSelection::Empty;
-        };
-        self.schedulers[idx].dispatch_next_accepted_selection(accept)
+        self.cpu(cpu).map_or(AcceptedSelection::Empty, |mut v| {
+            v.dispatch_next_accepted_selection(accept)
+        })
     }
 
-    /// Provenance-preserving form of [`Self::on_preempt_on`].
     pub fn on_preempt_selection_on(&mut self, cpu: CpuId) -> DispatchSelection {
-        let Ok(idx) = self.check_online_cpu(cpu) else {
-            return DispatchSelection::Idle;
-        };
-        self.schedulers[idx].on_preempt_selection()
+        self.cpu(cpu)
+            .map_or(DispatchSelection::Idle, |mut v| v.on_preempt_selection())
     }
 
-    /// Provenance-preserving form of [`Self::on_preempt_prefer_on`].
     pub fn on_preempt_prefer_selection_on(
         &mut self,
         cpu: CpuId,
         preferred: ThreadId,
     ) -> DispatchSelection {
-        let Ok(idx) = self.check_online_cpu(cpu) else {
-            return DispatchSelection::Idle;
-        };
-        self.schedulers[idx].on_preempt_prefer_selection(preferred)
+        self.cpu(cpu).map_or(DispatchSelection::Idle, |mut v| {
+            v.on_preempt_prefer_selection(preferred)
+        })
     }
 
     pub fn dispatch_next_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
-        let idx = self.check_online_cpu(cpu).ok()?;
-        let idle_tid = self.schedulers[idx].current_tid().unwrap_or(ThreadId(0));
-        let runq_len = self.schedulers[idx].runnable_count();
-        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!(
-                "SCHED cpu={} idle_tid={} runq_len={}",
-                cpu.0,
-                idle_tid.0,
-                runq_len
-            );
-        }
-        let final_tid = self.schedulers[idx].dispatch_next();
-        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!("SCHED cpu={} final_tid={:?}", cpu.0, final_tid);
-        }
-        final_tid
+        self.cpu(cpu).ok()?.dispatch_next()
     }
 
     pub fn on_preempt_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
-        let idx = self.check_online_cpu(cpu).ok()?;
-        self.schedulers[idx].on_preempt()
+        self.cpu(cpu).ok()?.on_preempt()
     }
 
-    /// Stage 192B: the re-enqueue half of `on_preempt_on` — re-enqueue the current task on
-    /// `cpu` and clear the current slot WITHOUT dispatching. See
-    /// `PriorityScheduler::preempt_reenqueue_only`.
     pub fn preempt_reenqueue_only_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
-        let idx = self.check_online_cpu(cpu).ok()?;
-        self.schedulers[idx].preempt_reenqueue_only()
+        self.cpu(cpu).ok()?.preempt_reenqueue_only()
     }
 
-    /// Preempt current task on `cpu`, preferring `preferred` as the next task.
-    /// See `PriorityScheduler::on_preempt_prefer` for semantics.
     pub fn on_preempt_prefer_on(&mut self, cpu: CpuId, preferred: ThreadId) -> Option<ThreadId> {
-        let idx = self.check_online_cpu(cpu).ok()?;
-        self.schedulers[idx].on_preempt_prefer(preferred)
+        self.cpu(cpu).ok()?.on_preempt_prefer(preferred)
     }
 
     pub fn block_current_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
-        let idx = self.check_online_cpu(cpu).ok()?;
-        self.schedulers[idx].block_current()
+        self.cpu(cpu).ok()?.block_current()
     }
 
-    /// U9-EXIT3 §2 — compare-and-clear on one CPU. See [`PriorityScheduler::block_current_exact`].
     pub fn block_current_exact_on(&mut self, cpu: CpuId, tid: ThreadId) -> Option<TaskPriority> {
-        let idx = self.check_online_cpu(cpu).ok()?;
-        self.schedulers[idx].block_current_exact(tid)
+        self.cpu(cpu).ok()?.block_current_exact(tid)
     }
 
-    /// U9-EXIT3 §2 — restore on one CPU. See [`PriorityScheduler::restore_exact_current`].
-    ///
-    /// The `tid_present_anywhere` check is the caller's, not this seam's: this one refuses only on
-    /// its own CPU, and a restore must additionally prove the task is on no OTHER CPU.
     pub fn restore_exact_current_on(
         &mut self,
         cpu: CpuId,
         tid: ThreadId,
         priority: TaskPriority,
     ) -> bool {
-        let Ok(idx) = self.check_online_cpu(cpu) else {
-            return false;
-        };
-        self.schedulers[idx].restore_exact_current(tid, priority)
+        self.cpu(cpu)
+            .is_ok_and(|mut v| v.restore_exact_current(tid, priority))
     }
 
-    /// U9-EXIT3 §2 — is `tid` current on, or queued on, ANY CPU?
-    ///
-    /// Read-only, and deliberately every CPU rather than one: "absent from every runqueue and
-    /// current slot" is the precondition a restore needs, and a per-CPU answer cannot state it.
+    /// U9-EXIT3 §2 — is `tid` current on, or queued on, ANY CPU? (coherent)
     pub fn tid_present_anywhere(&self, tid: ThreadId) -> bool {
-        self.schedulers
-            .iter()
-            .any(|sched| sched.contains_or_current(tid))
+        self.cpus.iter().any(|s| s.rq.contains_or_current(tid))
     }
 
-    /// Stage 199D: withdraw one queued incarnation of `tid` from `cpu`'s runqueue.
-    ///
-    /// (1) Exact CPU confinement — only `schedulers[idx]` is inspected or mutated, so a TID
-    /// queued on another CPU is untouched. (2) Non-dispatching — see
-    /// [`PriorityScheduler::withdraw_queued_tid`]. (7) No policy change: online, present,
-    /// wake-only, affinity, priority, timeslice, balancing and timer state are all untouched.
-    /// (8) No task-state mutation: this seam does not see or change any TCB.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn withdraw_queued_tid_on(&mut self, cpu: CpuId, tid: ThreadId) -> WithdrawOutcome {
-        let Ok(idx) = self.check_online_cpu(cpu) else {
-            return WithdrawOutcome::InvalidCpu;
-        };
-        self.schedulers[idx].withdraw_queued_tid(tid)
+        self.cpu(cpu).map_or(WithdrawOutcome::InvalidCpu, |mut v| {
+            v.withdraw_queued_tid(tid)
+        })
     }
 
     pub fn current_tid_on(&self, cpu: CpuId) -> Option<ThreadId> {
-        let idx = self.check_online_cpu(cpu).ok()?;
-        self.schedulers[idx].current_tid()
+        self.cpu_ref(cpu)?.1.rq.current_tid()
     }
 
     pub fn current_priority_on(&self, cpu: CpuId) -> Option<TaskPriority> {
-        let idx = self.check_online_cpu(cpu).ok()?;
-        self.schedulers[idx].current_priority()
+        self.cpu_ref(cpu)?.1.rq.current_priority()
     }
 
     pub fn runnable_count_on(&self, cpu: CpuId) -> usize {
-        let Ok(idx) = self.check_online_cpu(cpu) else {
-            return 0;
-        };
-        self.schedulers[idx].runnable_count()
+        self.cpu_ref(cpu).map_or(0, |(_, s)| s.rq.runnable_count())
     }
 
-    /// Stage 199A2D2C2B1: true iff `tid` appears in ANY CPU's run queue or as ANY
-    /// CPU's dispatched `current` task. Used to prove a blocked recv-v2 server is
-    /// absent from every runqueue (not merely the home CPU's) before its
-    /// authoritative blocked-server acknowledgement is published. Read-only.
+    /// Stage 199A2D2C2B1: true iff `tid` is queued or current on ANY CPU. (coherent)
     pub fn task_present_anywhere(&self, tid: ThreadId) -> bool {
-        self.schedulers
-            .iter()
-            .any(|sched| sched.contains_or_current(tid))
+        self.tid_present_anywhere(tid)
     }
 
-    /// U9-RECV-BLOCK2 §1 — WHERE `tid` actually is, as ONE read-only rank-1 observation.
-    ///
-    /// [`Self::task_present_anywhere`] answers `contains_or_current`, and the membership mirror it
-    /// consults deliberately tracks the run queues **plus** the dispatched `current` task
-    /// (`rebuild_membership_table` inserts `current`; `block_current` removes it). So a `true`
-    /// from that predicate means one of three unrelated things — the task is queued and waiting,
-    /// it is EXECUTING on some CPU right now, or both — and a caller that reads it as "queued, so
-    /// this CPU may idle" is wrong in the second case: a task another CPU is running has a live
-    /// saved context that must not be written, and is not waiting for a dispatch at all.
-    ///
-    /// This distinguishes them, in one acquisition so the answers cannot tear against each other.
-    /// `current` is checked before the queues on each CPU because the two are not symmetric: the
-    /// current slot is the authority on what is executing.
-    pub(crate) fn placement_of(&self, tid: ThreadId) -> TaskPlacement {
+    /// U9-RECV-BLOCK2 §1 — WHERE `tid` is, as ONE coherent observation of every CPU.
+    pub(crate) fn placement_of(&mut self, tid: ThreadId) -> TaskPlacement {
         let mut queued_on = None;
         let mut current_on = None;
-        for (idx, sched) in self.schedulers.iter().enumerate() {
-            let cpu = CpuId(idx as u8);
-            if sched.current.is_some_and(|task| task.tid == tid) {
-                current_on = Some(cpu);
+        for idx in 0..MAX_CPUS {
+            let view = CpuView {
+                idx,
+                sched: &mut *self.cpus[idx],
+                topo: self.topo,
+                clock: self.clock,
+            };
+            let (current, queued) = view.placement_here(tid);
+            if current {
+                current_on = Some(CpuId(idx as u8));
             }
-            if sched.queues.iter().any(|q| q.count_tid(tid) > 0) {
-                queued_on = Some(cpu);
+            if queued {
+                queued_on = Some(CpuId(idx as u8));
             }
         }
         match (current_on, queued_on) {
@@ -1259,12 +1733,61 @@ impl SmpScheduler {
         }
     }
 
-    /// Non-mutating peek of the next-runnable dispatch candidate on `cpu`: the TID
-    /// that `dispatch_next_on` would select when the current slot is idle/cleared
-    /// (highest-priority queue head), WITHOUT dequeuing or setting current. Read-only.
     pub fn peek_next_runnable_on(&self, cpu: CpuId) -> Option<ThreadId> {
-        let idx = self.check_online_cpu(cpu).ok()?;
-        self.schedulers[idx].peek_highest()
+        self.cpu_ref(cpu)?.1.rq.peek_highest()
+    }
+
+    // ── time and quanta ──────────────────────────────────────────────────────────────────
+
+    /// One timer interrupt on `cpu` (see [`CpuView::tick`]). An out-of-range CPU ticks nothing
+    /// and reads the clock.
+    pub fn tick_on(&mut self, cpu: CpuId) -> (Tick, bool) {
+        match self.cpu(cpu) {
+            Ok(mut v) => v.tick(),
+            Err(_) => (TickInstant(self.clock.load(Ordering::Acquire)), false),
+        }
+    }
+
+    pub fn would_preempt_next_on(&self, cpu: CpuId) -> bool {
+        let idx = cpu.0 as usize;
+        idx < MAX_CPUS && self.cpus[idx].quantum.would_preempt_next()
+    }
+
+    pub fn reset_quantum_on(&mut self, cpu: CpuId) {
+        if let Ok(mut v) = self.cpu(cpu) {
+            v.reset_quantum();
+        }
+    }
+
+    /// Install `quantum_ticks` on every CPU's quantum. The clock is untouched.
+    pub fn set_quantum_all(&mut self, quantum_ticks: u64) {
+        for s in self.cpus.iter_mut() {
+            s.quantum.set_quantum(quantum_ticks);
+        }
+    }
+
+    /// The scheduler tick.
+    pub fn current_ticks(&self) -> Tick {
+        TickInstant(self.clock.load(Ordering::Acquire))
+    }
+
+    /// Hosted tests: replace the clock owner's timer (clock value and quantum) wholesale.
+    #[cfg(test)]
+    pub fn set_clock_owner_timer_for_test(&mut self, timer: Timer) {
+        self.clock.store(timer.current_ticks().0, Ordering::Release);
+        self.cpus[CLOCK_OWNER_CPU.0 as usize].quantum = timer;
+    }
+
+    /// The clock owner's quantum, for tests that inspect it.
+    #[cfg(test)]
+    pub fn quantum_for_test(&self, cpu: CpuId) -> Timer {
+        self.cpus[cpu.0 as usize].quantum
+    }
+
+    /// `posix-compat` / tests: advance the clock by one tick outside an interrupt (the base
+    /// `timer.tick_and_check()` on the clock owner's timer, quantum included).
+    pub fn advance_clock_owner_tick(&mut self) -> Tick {
+        self.tick_on(CLOCK_OWNER_CPU).0
     }
 }
 
@@ -1274,17 +1797,24 @@ mod tests {
 
     // ── Stage 199D: non-dispatching runqueue withdrawal ─────────────────────────────────
 
-    fn online_two_cpu_scheduler() -> SmpScheduler {
-        let mut sched = SmpScheduler::default();
+    fn new_domain() -> SchedDomain {
+        SchedDomain::new(topology::default_present_cpu_bitmap(), 1)
+    }
+
+    fn online_two_cpu_scheduler() -> SchedDomain {
+        let mut dom = new_domain();
+        let mut sched = dom.exclusive();
         sched.set_present_cpu_bitmap(0b11);
         sched.bring_up_cpu(CpuId(1)).expect("cpu1 online");
-        sched
+        drop(sched);
+        dom
     }
 
     #[test]
     fn withdraw_removes_from_each_priority_queue() {
         for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            let mut sched = SmpScheduler::default();
+            let mut sched_dom = new_domain();
+            let mut sched = sched_dom.exclusive();
             sched
                 .enqueue_on_with_priority(CpuId(0), ThreadId(7), priority)
                 .expect("enqueue");
@@ -1304,7 +1834,8 @@ mod tests {
     #[test]
     fn withdraw_handles_head_middle_and_tail_positions() {
         for target in [ThreadId(1), ThreadId(2), ThreadId(3)] {
-            let mut sched = SmpScheduler::default();
+            let mut sched_dom = new_domain();
+            let mut sched = sched_dom.exclusive();
             for tid in [ThreadId(1), ThreadId(2), ThreadId(3)] {
                 sched
                     .enqueue_on_with_priority(CpuId(0), tid, TaskPriority::Normal)
@@ -1370,7 +1901,8 @@ mod tests {
 
     #[test]
     fn withdraw_from_an_empty_queue_reports_not_queued() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         assert_eq!(
             sched.withdraw_queued_tid_on(CpuId(0), ThreadId(9)),
             WithdrawOutcome::NotQueued
@@ -1379,7 +1911,8 @@ mod tests {
 
     #[test]
     fn withdraw_leaves_a_tid_queued_on_another_cpu_untouched() {
-        let mut sched = online_two_cpu_scheduler();
+        let mut sched_dom = online_two_cpu_scheduler();
+        let mut sched = sched_dom.exclusive();
         sched
             .enqueue_on_with_priority(CpuId(1), ThreadId(42), TaskPriority::Normal)
             .expect("enqueue on cpu1");
@@ -1398,7 +1931,8 @@ mod tests {
 
     #[test]
     fn withdraw_refuses_the_current_task_without_mutation() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         sched
             .enqueue_on_with_priority(CpuId(0), ThreadId(5), TaskPriority::Normal)
             .expect("enqueue");
@@ -1426,7 +1960,8 @@ mod tests {
 
     #[test]
     fn withdraw_preserves_the_scheduler_owned_idle_current() {
-        let mut sched = online_two_cpu_scheduler();
+        let mut sched_dom = online_two_cpu_scheduler();
+        let mut sched = sched_dom.exclusive();
         sched.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
         sched
             .install_ap_idle_current(CpuId(1))
@@ -1446,16 +1981,17 @@ mod tests {
 
     #[test]
     fn withdraw_fails_closed_on_a_duplicate_occurrence_with_zero_mutation() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         // The public enqueue refuses duplicates, so force the pathological state directly to
         // prove the seam fails closed if it ever arose.
-        sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::High)]
+        sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::High)]
             .push(ThreadId(3))
             .expect("push");
-        sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
+        sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
             .push(ThreadId(3))
             .expect("push");
-        sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
+        sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
             .push(ThreadId(8))
             .expect("push");
         let before = sched.runnable_count_on(CpuId(0));
@@ -1465,18 +2001,19 @@ mod tests {
         );
         assert_eq!(sched.runnable_count_on(CpuId(0)), before, "zero mutation");
         assert!(
-            sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::High)]
+            sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::High)]
                 .contains(ThreadId(3))
         );
         assert!(
-            sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
+            sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
                 .contains(ThreadId(3))
         );
     }
 
     #[test]
     fn withdraw_reports_invalid_cpu_for_an_offline_target() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         assert_eq!(
             sched.withdraw_queued_tid_on(CpuId(7), ThreadId(1)),
             WithdrawOutcome::InvalidCpu
@@ -1485,7 +2022,8 @@ mod tests {
 
     #[test]
     fn withdraw_changes_no_topology_or_current_state() {
-        let mut sched = online_two_cpu_scheduler();
+        let mut sched_dom = online_two_cpu_scheduler();
+        let mut sched = sched_dom.exclusive();
         // Queue on CPU 1 while it is still a dispatching CPU, then mark it wake-only: the
         // withdrawal must not disturb that state either.
         sched
@@ -1591,7 +2129,8 @@ mod tests {
 
     #[test]
     fn balanced_enqueue_round_robins_equal_load_cpus() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         sched.bring_up_cpu(CpuId(1)).expect("cpu1");
 
         let cpu_a = sched
@@ -1611,7 +2150,8 @@ mod tests {
     // non-dispatching AP. This is the invariant the AArch64 AP bring-up now establishes.
     #[test]
     fn stage195d_balanced_enqueue_avoids_wake_only_ap() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         sched.bring_up_cpu(CpuId(1)).expect("cpu1");
         sched
             .set_cpu_wake_only(CpuId(1), true)
@@ -1635,7 +2175,8 @@ mod tests {
     // BSP). This is what emits `AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED` on a real rejection.
     #[test]
     fn stage195d_explicit_enqueue_onto_wake_only_ap_denied() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         sched.bring_up_cpu(CpuId(1)).expect("cpu1");
         sched
             .set_cpu_wake_only(CpuId(1), true)
@@ -1658,7 +2199,8 @@ mod tests {
     // two CPUs are online — the single_dispatcher topology the AArch64 SMP=2 boot now attains.
     #[test]
     fn stage195d_all_aps_wake_only_is_single_dispatcher() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         sched.bring_up_cpu(CpuId(1)).expect("cpu1");
         sched
             .set_cpu_wake_only(CpuId(1), true)
@@ -1679,7 +2221,8 @@ mod tests {
     /// balanced placement; and it is refused, changing nothing, on the same states.
     #[test]
     fn production_admission_joins_balanced_placement() {
-        let mut sched = wake_only_ap();
+        let mut sched_dom = wake_only_ap();
+        let mut sched = sched_dom.exclusive();
         sched.admit_dispatch(CpuId(1)).expect("admitted");
         assert!(!sched.cpu_wake_only(CpuId(1)));
         assert_eq!(sched.balance_excluded_bitmap(), 0);
@@ -1692,9 +2235,10 @@ mod tests {
             sched.admit_dispatch(CpuId(1)),
             Err(SchedulerError::CpuOffline)
         );
-        let mut busy = wake_only_ap();
+        let mut busy_dom = wake_only_ap();
+        let mut busy = busy_dom.exclusive();
         busy.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
-        busy.schedulers[1].current = Some(ScheduledTask {
+        busy.cpus[1].rq.current = Some(ScheduledTask {
             tid: ThreadId(9),
             priority: TaskPriority::Normal,
         });
@@ -1705,20 +2249,23 @@ mod tests {
         assert!(busy.cpu_wake_only(CpuId(1)), "refusal changed nothing");
     }
 
-    fn wake_only_ap() -> SmpScheduler {
-        let mut sched = SmpScheduler::default();
+    fn wake_only_ap() -> SchedDomain {
+        let mut dom = new_domain();
+        let mut sched = dom.exclusive();
         sched.set_present_cpu_bitmap(0b11);
         sched.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
         sched.bring_up_cpu(CpuId(1)).expect("cpu1 online");
         sched
             .install_ap_idle_current(CpuId(1))
             .expect("idle current");
-        sched
+        drop(sched);
+        dom
     }
 
     #[test]
     fn smp2_admission_is_one_transition_out_of_wake_only() {
-        let mut sched = wake_only_ap();
+        let mut sched_dom = wake_only_ap();
+        let mut sched = sched_dom.exclusive();
         assert_eq!(
             sched.enqueue_on(CpuId(1), ThreadId(7)),
             Err(SchedulerError::WakeOnly),
@@ -1745,7 +2292,8 @@ mod tests {
 
     #[test]
     fn smp2_balanced_placement_never_chooses_a_pinned_only_cpu() {
-        let mut sched = wake_only_ap();
+        let mut sched_dom = wake_only_ap();
+        let mut sched = sched_dom.exclusive();
         sched.admit_pinned_dispatch(CpuId(1)).expect("admitted");
         // Load the BSP so a least-loaded rule WOULD pick CPU 1 if it were eligible.
         for t in 100..110 {
@@ -1763,13 +2311,15 @@ mod tests {
     #[test]
     fn smp2_admission_refuses_every_other_state_and_changes_nothing() {
         // Not wake-only (the BSP).
-        let mut sched = wake_only_ap();
+        let mut sched_dom = wake_only_ap();
+        let mut sched = sched_dom.exclusive();
         assert_eq!(
             sched.admit_pinned_dispatch(CpuId(0)),
             Err(SchedulerError::CpuOffline)
         );
         // Offline.
-        let mut offline = SmpScheduler::default();
+        let mut offline_dom = new_domain();
+        let mut offline = offline_dom.exclusive();
         assert!(offline.admit_pinned_dispatch(CpuId(1)).is_err());
         // Already admitted: no longer wake-only.
         sched.admit_pinned_dispatch(CpuId(1)).expect("first");
@@ -1778,11 +2328,12 @@ mod tests {
             Err(SchedulerError::CpuOffline)
         );
         // A real task current on the AP.
-        let mut busy = SmpScheduler::default();
+        let mut busy_dom = new_domain();
+        let mut busy = busy_dom.exclusive();
         busy.set_present_cpu_bitmap(0b11);
         busy.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
         busy.bring_up_cpu(CpuId(1)).expect("online");
-        busy.schedulers[1].current = Some(ScheduledTask {
+        busy.cpus[1].rq.current = Some(ScheduledTask {
             tid: ThreadId(42),
             priority: TaskPriority::Normal,
         });
@@ -1797,7 +2348,8 @@ mod tests {
 
     #[test]
     fn smp_scheduler_tracks_per_cpu_queues() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         assert_eq!(sched.online_cpu_count(), 1);
         assert!(sched.bring_up_cpu(CpuId(1)).is_ok());
         assert_eq!(sched.online_cpu_count(), 2);
@@ -1935,7 +2487,8 @@ mod tests {
     // never made current; the CPU falls back to its own FIFO instead.
     #[test]
     fn on_preempt_prefer_on_rejects_absent_replacement_tid() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         sched
             .enqueue_on_with_priority(CpuId(0), ThreadId(1), TaskPriority::Normal)
             .expect("enqueue 1");
@@ -1950,7 +2503,8 @@ mod tests {
     // A task assigned to a DIFFERENT CPU is never selected as current on this CPU (no cross-CPU steal).
     #[test]
     fn on_preempt_prefer_on_does_not_select_wrong_cpu_task() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         sched.bring_up_cpu(CpuId(1)).expect("cpu1");
         sched
             .enqueue_on_with_priority(CpuId(1), ThreadId(20), TaskPriority::Normal)
@@ -1971,7 +2525,8 @@ mod tests {
     // not in a queue, a re-enqueue is rejected, and the next dispatch does not hand it out again.
     #[test]
     fn on_preempt_prefer_on_does_not_dispatch_duplicate_twice() {
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = new_domain();
+        let mut sched = sched_dom.exclusive();
         sched
             .enqueue_on_with_priority(CpuId(0), ThreadId(5), TaskPriority::Normal)
             .expect("enqueue 5");

@@ -590,12 +590,15 @@ impl Bootstrap {
             })?;
 
         crate::arch::boot_entry::bootstrap_step("scheduler_new");
-        let mut scheduler = SmpScheduler::default();
         let present_cpu_bitmap =
             crate::arch::boot_entry::take_staged_present_cpu_bitmap_for_bootstrap()
                 .unwrap_or_else(topology::default_present_cpu_bitmap);
-        scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
+        let mut scheduler = crate::kernel::scheduler::SchedDomain::new(
+            present_cpu_bitmap,
+            crate::kernel::boot::sched_quantum_ticks(),
+        );
         scheduler
+            .exclusive()
             .enqueue_on(
                 CpuId(platform_constants::BOOTSTRAP_CPU_ID),
                 crate::kernel::ipc::ThreadId(0),
@@ -609,15 +612,11 @@ impl Bootstrap {
                 .write(crate::arch::hal::SelectedIsaHal::default());
             core::ptr::addr_of_mut!((*state_ptr).user_spaces)
                 .write(store_kernel_value(AddressSpaceManager::default()));
-            core::ptr::addr_of_mut!((*state_ptr).scheduler_state).write(SpinLockIrq::new(
-                SchedulerState {
-                    scheduler: store_kernel_value(scheduler),
-                    timer: Timer::new(crate::kernel::boot::sched_quantum_ticks()),
-                    ap_quanta: [Timer::new(crate::kernel::boot::sched_quantum_ticks());
-                        crate::kernel::scheduler::MAX_CPUS],
-                    current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
-                },
-            ));
+            core::ptr::addr_of_mut!((*state_ptr).scheduler_state).write(scheduler);
+            #[cfg(feature = "hosted-dev")]
+            core::ptr::addr_of_mut!((*state_ptr).hosted_ambient_cpu).write(
+                core::sync::atomic::AtomicU8::new(platform_constants::BOOTSTRAP_CPU_ID),
+            );
             core::ptr::addr_of_mut!((*state_ptr).ipc_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).driver_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).fault_state_lock).write(SpinLockIrq::new(()));

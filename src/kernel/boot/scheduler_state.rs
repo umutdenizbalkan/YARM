@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{KernelError, KernelState, kernel_mut, kernel_ref, map_scheduler_error};
+use super::{KernelError, KernelState, map_scheduler_error};
 use crate::arch::hal::Hal;
 use crate::kernel::ipc::Message;
 use crate::kernel::ipc::ThreadId;
@@ -23,9 +23,7 @@ const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 impl KernelState {
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
         self.with_scheduler_state_mut(|sched| {
-            kernel_mut(&mut sched.scheduler)
-                .bring_up_cpu(cpu)
-                .map_err(map_scheduler_error)
+            sched.bring_up_cpu(cpu).map_err(map_scheduler_error)
         })?;
         // AP-SCHED4 §A2: no hardware-identity binding here. This used to bind APIC ID `cpu.0` to
         // logical `cpu` on x86_64 — the assumption that the two numberings coincide. The binding is
@@ -39,7 +37,7 @@ impl KernelState {
     /// so there is no placement window.
     pub fn mark_cpu_wake_only(&mut self, cpu: CpuId, wake_only: bool) -> Result<(), KernelError> {
         self.with_scheduler_state_mut(|sched| {
-            kernel_mut(&mut sched.scheduler)
+            sched
                 .set_cpu_wake_only(cpu, wake_only)
                 .map_err(map_scheduler_error)
         })
@@ -49,7 +47,7 @@ impl KernelState {
     /// scheduler's existing idle placeholder convention) for a wake-only online AP.
     pub fn install_ap_idle_current(&mut self, cpu: CpuId) -> Result<u64, KernelError> {
         self.with_scheduler_state_mut(|sched| {
-            kernel_mut(&mut sched.scheduler)
+            sched
                 .install_ap_idle_current(cpu)
                 .map(|tid| tid.0)
                 .map_err(map_scheduler_error)
@@ -68,24 +66,28 @@ impl KernelState {
         tid: u64,
     ) -> crate::kernel::scheduler::WithdrawOutcome {
         self.with_scheduler_state_mut(|sched| {
-            kernel_mut(&mut sched.scheduler)
-                .withdraw_queued_tid_on(cpu, crate::kernel::ipc::ThreadId(tid))
+            sched.withdraw_queued_tid_on(cpu, crate::kernel::ipc::ThreadId(tid))
         })
     }
 
     /// Stage 183.5: the wake-only (online, no-placement) CPU bitmap.
     pub fn wake_only_cpu_bitmap(&self) -> u64 {
-        self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).wake_only_bitmap())
+        self.with_scheduler_state(|sched| sched.wake_only_bitmap())
     }
 
+    /// Validate `cpu` and, in a hosted build only, bind the hosted test selector to it.
+    ///
+    /// SCHED-LOCK1: the ambient `current_cpu` no longer lives in the scheduler domain. Freestanding
+    /// builds derive the executing CPU from hardware on every port (see [`Self::current_cpu`]), so
+    /// this only validates there; a hosted test, which has no hardware identity unless it
+    /// simulates one, binds `hosted_ambient_cpu` — a `KernelState` field no production split path
+    /// reads.
     pub fn set_current_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
-        self.with_scheduler_state_mut(|sched| {
-            kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
-                .map_err(map_scheduler_error)?;
-            sched.current_cpu = cpu;
-            Ok(())
-        })?;
+        self.with_scheduler_state(|sched| sched.validate_online_cpu(cpu))
+            .map_err(map_scheduler_error)?;
+        #[cfg(feature = "hosted-dev")]
+        self.hosted_ambient_cpu
+            .store(cpu.0, core::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -100,44 +102,37 @@ impl KernelState {
         {
             return crate::arch::x86_64::descriptor_tables::current_cpu_id();
         }
+        // SCHED-LOCK1: the hart's own identity (trap or boot stack), never an ambient field.
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+        {
+            return crate::arch::riscv64::boot::riscv_executing_cpu();
+        }
         #[cfg(feature = "hosted-dev")]
         {
             if let Some(cpu) = crate::arch::x86_cpu_identity::hosted::executing_cpu_id() {
                 return cpu;
             }
-        }
-        #[cfg(any(
-            feature = "hosted-dev",
-            not(any(target_arch = "aarch64", target_arch = "x86_64"))
-        ))]
-        {
-            self.with_scheduler_state(|sched| sched.current_cpu)
+            CpuId(
+                self.hosted_ambient_cpu
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            )
         }
     }
 
     pub fn current_tid(&self) -> Option<u64> {
         let cpu = self.current_cpu();
-        self.with_scheduler_state(|sched| {
-            kernel_ref(&sched.scheduler)
-                .current_tid_on(cpu)
-                .map(|tid| tid.0)
-        })
+        self.with_scheduler_state(|sched| sched.current_tid_on(cpu).map(|tid| tid.0))
     }
 
     pub fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
-        self.with_scheduler_state(|sched| {
-            kernel_ref(&sched.scheduler)
-                .current_tid_on(cpu)
-                .map(|tid| tid.0)
-        })
+        self.with_scheduler_state(|sched| sched.current_tid_on(cpu).map(|tid| tid.0))
     }
 
     pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {
         let cpu = self.current_cpu();
-        let mut sched = self.scheduler_state();
-        let next = kernel_mut(&mut sched.scheduler)
-            .dispatch_next_on(cpu)
-            .map(|tid| tid.0);
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        let next = sched.dispatch_next_on(cpu).map(|tid| tid.0);
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("DISPATCH_NEXT cpu={} result_tid={:?}", cpu.0, next);
         }
@@ -159,15 +154,15 @@ impl KernelState {
         &mut self,
         cpu: CpuId,
     ) -> crate::kernel::scheduler::DispatchSelection {
-        let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu)
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        sched.dispatch_next_selection_on(cpu)
     }
 
     pub fn dispatch_next_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {
-        let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler)
-            .dispatch_next_on(cpu)
-            .map(|tid| tid.0)
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        sched.dispatch_next_on(cpu).map(|tid| tid.0)
     }
 
     /// Stage 190A: take the current task off a SPECIFIC `cpu` (return it to the
@@ -176,10 +171,9 @@ impl KernelState {
     /// routing the AP to its interruptible idle loop (return-to-idle). Returns the tid
     /// that was blocked, if any.
     pub fn block_current_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {
-        let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler)
-            .block_current_on(cpu)
-            .map(|tid| tid.0)
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        sched.block_current_on(cpu).map(|tid| tid.0)
     }
 
     /// Stage 107 / D6 first live step — typed local-CPU dispatch step.
@@ -276,8 +270,9 @@ impl KernelState {
         let cpu = self.current_cpu();
         crate::yarm_log!("D6_DISPATCH_SPLIT_BEGIN cpu={}", cpu.0);
         let selection = {
-            let mut sched = self.scheduler_state();
-            kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu)
+            let mut sched_guard = self.scheduler_state();
+            let mut sched = sched_guard.view();
+            sched.dispatch_next_selection_on(cpu)
         };
         let next = selection.tid().map(|tid| tid.0);
         crate::yarm_log!("D6_DISPATCH_SCHED_PHASE_DONE cpu={} tid={:?}", cpu.0, next);
@@ -298,8 +293,9 @@ impl KernelState {
         &mut self,
     ) -> crate::kernel::scheduler::DispatchSelection {
         let cpu = self.current_cpu();
-        let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler).on_preempt_selection_on(cpu)
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        sched.on_preempt_selection_on(cpu)
     }
 
     /// Stage 192B: re-enqueue the current task on the current CPU and clear the current
@@ -308,10 +304,9 @@ impl KernelState {
     /// unchanged) when there was no current task or the re-enqueue failed.
     pub(crate) fn preempt_reenqueue_current_cpu(&mut self) -> Option<u64> {
         let cpu = self.current_cpu();
-        let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler)
-            .preempt_reenqueue_only_on(cpu)
-            .map(|tid| tid.0)
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        sched.preempt_reenqueue_only_on(cpu).map(|tid| tid.0)
     }
 
     /// Preempt the current task on the current CPU, preferring `preferred` as the
@@ -330,8 +325,9 @@ impl KernelState {
         preferred: u64,
     ) -> crate::kernel::scheduler::DispatchSelection {
         let cpu = self.current_cpu();
-        let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler).on_preempt_prefer_selection_on(cpu, ThreadId(preferred))
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        sched.on_preempt_prefer_selection_on(cpu, ThreadId(preferred))
     }
 
     /// Stage 199D-WA3A-R2-SEAL — count a context switch iff the RESUMED task differs from the
@@ -441,12 +437,12 @@ impl KernelState {
 
     pub fn block_current_cpu(&mut self) -> Option<u64> {
         let cpu = self.current_cpu();
-        let mut sched = self.scheduler_state();
-        let blocked = kernel_mut(&mut sched.scheduler)
-            .block_current_on(cpu)
-            .map(|tid| tid.0);
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        let blocked = sched.block_current_on(cpu).map(|tid| tid.0);
         if blocked.is_some() {
-            sched.timer.reset_quantum();
+            // SCHED-LOCK1: the blocking CPU's OWN quantum (the base reset the clock owner's).
+            sched.reset_quantum_on(cpu);
         }
         blocked
     }
@@ -472,7 +468,7 @@ impl KernelState {
     /// currently running task).  Zero when `cpu` is offline or out of range.
     #[allow(dead_code)]
     pub(crate) fn runnable_count_on_cpu(&self, cpu: CpuId) -> usize {
-        self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
+        self.with_scheduler_state(|sched| sched.runnable_count_on(cpu))
     }
 
     /// Stage 199A2D2C2B1: true iff `tid` is present in any CPU's run queue or as any
@@ -480,9 +476,7 @@ impl KernelState {
     /// (absent from all runqueues) before its blocked-server acknowledgement is
     /// published — the authoritative no-premature-re-selection proof.
     pub(crate) fn task_present_in_any_runqueue(&self, tid: u64) -> bool {
-        self.with_scheduler_state(|sched| {
-            kernel_ref(&sched.scheduler).task_present_anywhere(ThreadId(tid))
-        })
+        self.with_scheduler_state(|sched| sched.task_present_anywhere(ThreadId(tid)))
     }
 
     /// Inspect TCB status and return the wake plan without mutating any state.
@@ -513,7 +507,7 @@ impl KernelState {
     }
 
     pub fn online_cpu_count(&self) -> usize {
-        self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).online_cpu_count())
+        self.with_scheduler_state(|sched| sched.online_cpu_count())
     }
 
     /// Stage 183.6: number of online CPUs that actually DISPATCH user tasks —
@@ -527,7 +521,7 @@ impl KernelState {
     /// AP-dispatcher increment) raises this and re-gates the seams automatically.
     pub fn dispatching_cpu_count(&self) -> usize {
         self.with_scheduler_state(|sched| {
-            let s = kernel_ref(&sched.scheduler);
+            let s = sched;
             let online = s.online_cpu_bitmap();
             let dispatching = online & !s.wake_only_bitmap();
             dispatching.count_ones() as usize
@@ -535,18 +529,21 @@ impl KernelState {
     }
 
     pub fn present_cpu_count(&self) -> usize {
-        let sched = self.scheduler_state();
-        kernel_ref(&sched.scheduler).present_cpu_count()
+        let mut sched_guard = self.scheduler_state();
+        let sched = sched_guard.view();
+        sched.present_cpu_count()
     }
 
     pub fn present_cpu_bitmap(&self) -> u64 {
-        let sched = self.scheduler_state();
-        kernel_ref(&sched.scheduler).present_cpu_bitmap()
+        let mut sched_guard = self.scheduler_state();
+        let sched = sched_guard.view();
+        sched.present_cpu_bitmap()
     }
 
     pub fn online_cpu_bitmap(&self) -> u64 {
-        let sched = self.scheduler_state();
-        kernel_ref(&sched.scheduler).online_cpu_bitmap()
+        let mut sched_guard = self.scheduler_state();
+        let sched = sched_guard.view();
+        sched.online_cpu_bitmap()
     }
 
     pub fn program_timer_deadline_current_cpu(&mut self, ticks_from_now: u64) {
@@ -555,8 +552,9 @@ impl KernelState {
     }
 
     pub(crate) fn tick_scheduler_timer(&mut self) -> (Tick, bool) {
-        let mut sched = self.scheduler_state();
-        sched.timer.tick_and_check()
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        sched.tick_on(crate::kernel::boot::CLOCK_OWNER_CPU)
     }
 
     /// U9-SPAWN1 SP-1: the class→priority rule itself moved to
@@ -637,11 +635,9 @@ impl KernelState {
         })?;
         // AP-SCHED1: the same home rule as the split twin — the first placement is the home.
         self.fix_plan_home(&mut plan, current_cpu);
-        let mut sched = self.scheduler_state();
-        let cpu = crate::kernel::task_enqueue::commit_enqueue_locked(
-            kernel_mut(&mut sched.scheduler),
-            &plan,
-        )?;
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        let cpu = crate::kernel::task_enqueue::commit_enqueue_locked(&mut sched, &plan)?;
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
         }
@@ -664,11 +660,9 @@ impl KernelState {
         use crate::kernel::task_enqueue::EnqueueTarget;
         let chosen = match plan.target {
             EnqueueTarget::Pinned(cpu) => cpu,
-            EnqueueTarget::Balanced => self.with_scheduler_state(|sched| {
-                kernel_ref(&sched.scheduler)
-                    .balanced_choice()
-                    .unwrap_or(fallback)
-            }),
+            EnqueueTarget::Balanced => {
+                self.with_scheduler_state(|sched| sched.balanced_choice().unwrap_or(fallback))
+            }
         };
         let tid = plan.tid;
         let home = self
@@ -726,16 +720,14 @@ impl KernelState {
                 }
             }
         }
-        let mut sched = self.scheduler_state();
-        crate::kernel::task_enqueue::commit_enqueue_locked(
-            kernel_mut(&mut sched.scheduler),
-            &plan,
-        )?;
+        let mut sched_guard = self.scheduler_state();
+        let mut sched = sched_guard.view();
+        crate::kernel::task_enqueue::commit_enqueue_locked(&mut sched, &plan)?;
         if tid == BOOTSTRAP_FIRST_USER_TID && cfg!(not(feature = "hosted-dev")) {
-            let queue0 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(0));
-            let queue1 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(1));
-            let queue2 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(2));
-            let queue3 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(3));
+            let queue0 = sched.runnable_count_on(CpuId(0));
+            let queue1 = sched.runnable_count_on(CpuId(1));
+            let queue2 = sched.runnable_count_on(CpuId(2));
+            let queue3 = sched.runnable_count_on(CpuId(3));
             crate::yarm_log!(
                 "BOOTSTRAP_ENQUEUE_VERIFY tid=1 queue0_len={} queue1_len={} queue2_len={} queue3_len={}",
                 queue0,

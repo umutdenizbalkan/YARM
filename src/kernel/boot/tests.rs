@@ -17139,9 +17139,7 @@ fn exit_task_leaves_exited_status_not_runnable_in_queue() {
     );
 
     // The run queue on CPU 0 must not contain TID 20.
-    let runnable = state.with_scheduler_state(|sched| {
-        super::kernel_ref(&sched.scheduler).runnable_count_on(super::CpuId(0))
-    });
+    let runnable = state.with_scheduler_state(|sched| sched.runnable_count_on(super::CpuId(0)));
     // task20 was enqueued then exited; the scheduler may have removed it or not,
     // but if it's still in the queue it would be stale.  Verify by confirming
     // that no scheduler operation is required for task20 to stay in Exited state
@@ -62855,7 +62853,7 @@ mod stage191b_futex_wake_retire {
         assert!(
             RUNTIME_SRC.contains("pub fn futex_wake_split_mut(")
                 && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
-                && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
+                && RUNTIME_SRC.contains("self.with_all_cpus_sched_split(|sched| {")
                 // U9-SPAWN1 SP-1: the route no longer reaches the SmpScheduler primitives
                 // itself. It plans under rank 2 and commits through the ONE shared owner, which
                 // is what reaches `enqueue_on_with_priority` / `enqueue_balanced` — the same
@@ -63411,7 +63409,7 @@ mod stage191d_futex_wait_block_publish {
         assert!(
             RUNTIME_SRC.contains("pub(crate) fn futex_wait_park_exact_split(")
                 && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
-                && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
+                && RUNTIME_SRC.contains("self.with_all_cpus_sched_split(|sched| {")
                 // AP-SCHED1: the quantum reset is this CPU's own.
                 && RUNTIME_SRC.contains("sched.reset_quantum_on(cpu);"),
             "the park transaction must use the task + scheduler split-mut seams"
@@ -64588,7 +64586,7 @@ mod stage191e_dispatch_next_candidate_seam {
     fn candidate_seam_is_read_only_and_helper_only() {
         assert!(
             RUNTIME_SRC.contains("pub fn dispatch_next_candidate_split_read(")
-                && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
+                && RUNTIME_SRC.contains("self.with_all_cpus_sched_split(|sched| {")
                 && RUNTIME_SRC.contains(".peek_next_runnable_on(cpu)"),
             "the candidate seam must peek via the scheduler split seam"
         );
@@ -109132,7 +109130,7 @@ mod stage200d2b1d5a_owner_revalidation {
         // `Running` before returning to userspace. `dispatch_next_on` threw that away, which is
         // exactly the shape U9-DISPATCH-CPU1 D4 had to undo at the AP's first entry.
         assert!(
-            body.contains("kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu)"),
+            body.contains("sched.dispatch_next_selection_on(cpu)"),
             "the seam must advance through the existing scheduler dispatch primitive"
         );
         assert_eq!(
@@ -114751,7 +114749,7 @@ mod stage199d_remote_wake_authority {
         );
         assert!(
             RUNTIME.contains("pub(crate) fn current_cpu_split_read(&self) -> CpuId {")
-                && RUNTIME.contains("self.with_scheduler_split_mut(|sched| sched.current_cpu)"),
+                && RUNTIME.contains("self.with_all_cpus_sched_split(|sched| sched.current_cpu)"),
             "the enqueueing CPU comes from the same rank-1 authority"
         );
     }
@@ -119470,8 +119468,11 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
     #[test]
     fn an_online_wake_only_cpu_refuses_the_placement_the_proof_requires() {
         use crate::kernel::ipc::ThreadId;
-        use crate::kernel::scheduler::SmpScheduler;
-        let mut sched = SmpScheduler::default();
+        let mut sched_dom = crate::kernel::scheduler::SchedDomain::new(
+            crate::arch::topology::default_present_cpu_bitmap(),
+            1,
+        );
+        let mut sched = sched_dom.exclusive();
         sched.set_present_cpu_bitmap(0b11);
         sched.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
         sched.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
@@ -119555,10 +119556,13 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
     #[test]
     fn queued_on_the_target_and_target_wake_only_are_mutually_exclusive() {
         use crate::kernel::ipc::ThreadId;
-        use crate::kernel::scheduler::SmpScheduler;
         let mut rows = alloc::vec::Vec::new();
         for wake_only in [false, true] {
-            let mut sched = SmpScheduler::default();
+            let mut sched_dom = crate::kernel::scheduler::SchedDomain::new(
+                crate::arch::topology::default_present_cpu_bitmap(),
+                1,
+            );
+            let mut sched = sched_dom.exclusive();
             sched.set_present_cpu_bitmap(0b11);
             sched.bring_up_cpu(CpuId(1)).expect("online");
             sched
@@ -120215,7 +120219,7 @@ mod stage199d_receiver_enqueue_outcome {
             .expect("the shared enqueue body");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
         let open = body
-            .find("self.with_scheduler_split_mut(|sched| {")
+            .find("self.with_all_cpus_sched_split(|sched| {")
             .expect("acquisition");
         let detect = body
             .find("Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued)")
@@ -167214,7 +167218,7 @@ mod u9exit1_self_exit_transaction {
         /// U9-EXIT3 §4: a REAL `SmpScheduler`, not a fake current array. The post-clear
         /// settlements are scheduler decisions — compare-and-clear, "placed on any CPU?", exact
         /// restore — and a stand-in would prove nothing about them.
-        sched: crate::kernel::scheduler::SmpScheduler,
+        sched: crate::kernel::scheduler::SchedDomain,
         /// Set while some route holds this CPU's ONE queue-advance deferral.
         queue_advance: [Option<u64>; 4],
         /// The exact incarnation the deferral names, once published.
@@ -167249,7 +167253,11 @@ mod u9exit1_self_exit_transaction {
 
     impl Harness {
         fn new(tasks: &[ThreadControlBlock], current: Option<u64>) -> Self {
-            let mut sched = crate::kernel::scheduler::SmpScheduler::default();
+            let mut sched_dom = crate::kernel::scheduler::SchedDomain::new(
+                crate::arch::topology::default_present_cpu_bitmap(),
+                1,
+            );
+            let mut sched = sched_dom.exclusive();
             if !sched.cpu_is_online(CPU) {
                 sched.bring_up_cpu(CPU).expect("cpu 0 online");
             }
@@ -167263,9 +167271,10 @@ mod u9exit1_self_exit_transaction {
                     "the harness must start with the victim actually current"
                 );
             }
+            drop(sched);
             Self {
                 tcbs: tasks.iter().cloned().map(Some).collect(),
-                sched,
+                sched: sched_dom,
                 queue_advance: [None; 4],
                 exit_deferral: [None; 4],
                 death_slots: 1,
@@ -167301,6 +167310,8 @@ mod u9exit1_self_exit_transaction {
         /// This CPU's current, read from the REAL scheduler.
         fn current_of(&self, cpu: u8) -> Option<u64> {
             self.sched
+                .lock_all()
+                .view()
                 .current_tid_on(crate::kernel::scheduler::CpuId(cpu))
                 .map(|t| t.0)
         }
@@ -167331,6 +167342,8 @@ mod u9exit1_self_exit_transaction {
             let current: alloc::vec::Vec<_> = (0..4u8)
                 .map(|c| {
                     self.sched
+                        .lock_all()
+                        .view()
                         .current_tid_on(crate::kernel::scheduler::CpuId(c))
                         .map(|t| t.0)
                 })
@@ -167339,7 +167352,12 @@ mod u9exit1_self_exit_transaction {
                 .tcbs
                 .iter()
                 .flatten()
-                .map(|t| (t.tid.0, self.sched.tid_present_anywhere(t.tid)))
+                .map(|t| {
+                    (
+                        t.tid.0,
+                        self.sched.lock_all().view().tid_present_anywhere(t.tid),
+                    )
+                })
                 .collect();
             alloc::format!(
                 "{tasks:?}|{current:?}|{placed:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
@@ -167374,7 +167392,10 @@ mod u9exit1_self_exit_transaction {
         }
         fn tid_placed_anywhere(&mut self, tid: u64) -> bool {
             self.note("tid_placed_anywhere");
-            self.sched.tid_present_anywhere(ThreadId(tid))
+            self.sched
+                .lock_all()
+                .view()
+                .tid_present_anywhere(ThreadId(tid))
         }
         fn restore_current_exact(
             &mut self,
@@ -167384,6 +167405,8 @@ mod u9exit1_self_exit_transaction {
         ) -> bool {
             self.note("restore_current_exact");
             self.sched
+                .lock_all()
+                .view()
                 .restore_exact_current_on(cpu, ThreadId(tid), priority)
         }
         fn publish_advance_for(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
@@ -167406,7 +167429,11 @@ mod u9exit1_self_exit_transaction {
         }
 
         fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
-            self.sched.current_tid_on(cpu).map(|t| t.0)
+            self.sched
+                .lock_all()
+                .view()
+                .current_tid_on(cpu)
+                .map(|t| t.0)
         }
 
         fn clear_current_exact(
@@ -167419,15 +167446,22 @@ mod u9exit1_self_exit_transaction {
             if self.inject == Inject::SchedulerHandsBackAnother {
                 // The scheduler moved on between the read and the clear: the slot now names
                 // somebody else, so the compare-and-clear must mutate NOTHING.
-                self.sched.block_current_exact_on(cpu, ThreadId(tid));
                 self.sched
+                    .lock_all()
+                    .view()
+                    .block_current_exact_on(cpu, ThreadId(tid));
+                self.sched
+                    .lock_all()
+                    .view()
                     .enqueue_on(cpu, ThreadId(OTHER_TID))
                     .expect("the replacement enqueues");
-                assert_eq!(self.sched.dispatch_next_on(cpu), Some(ThreadId(OTHER_TID)));
+                assert_eq!(
+                    self.sched.lock_all().view().dispatch_next_on(cpu),
+                    Some(ThreadId(OTHER_TID))
+                );
             }
             crate::kernel::boot::cleared_current::clear_current_exact(
-                &mut self.sched,
-                cpu,
+                &mut self.sched.lock_all().view().cpu(cpu).expect("cpu"),
                 tid,
                 asid,
             )
@@ -167966,7 +168000,7 @@ mod u9exit1_self_exit_transaction {
         // The dead task is current NOWHERE and queued NOWHERE, and the advance the drain needs is
         // held and published for it — the reservation is deliberately NOT released here.
         assert_eq!(h.current_of(0), None);
-        assert!(!h.sched.tid_present_anywhere(ThreadId(1)));
+        assert!(!h.sched.lock_all().view().tid_present_anywhere(ThreadId(1)));
         assert_eq!(h.queue_advance[0], Some(1));
         assert_eq!(h.exit_deferral[0], Some((1, Some(Asid(201)))));
         assert_eq!(h.count("release_queue_advance"), 0);
@@ -168017,9 +168051,14 @@ mod u9exit1_self_exit_transaction {
         let mut h = three_task_world();
         run_exit_transaction(&mut h, CPU, CODE).expect("the first exit commits");
         h.sched
+            .lock_all()
+            .view()
             .enqueue_on(CPU, ThreadId(1))
             .expect("re-present the corpse");
-        assert_eq!(h.sched.dispatch_next_on(CPU), Some(ThreadId(1)));
+        assert_eq!(
+            h.sched.lock_all().view().dispatch_next_on(CPU),
+            Some(ThreadId(1))
+        );
         h.queue_advance[0] = None;
         h.exit_deferral[0] = None;
         let before = h.snapshot();
@@ -168687,7 +168726,10 @@ mod u9exit1_self_exit_transaction {
     fn assert_advanced_and_unreachable(h: &Harness, tid: u64, asid: Option<Asid>) {
         assert_eq!(h.current_of(0), None, "the victim must not be current");
         assert!(
-            !h.sched.tid_present_anywhere(ThreadId(tid)),
+            !h.sched
+                .lock_all()
+                .view()
+                .tid_present_anywhere(ThreadId(tid)),
             "the victim must be queued on no CPU"
         );
         assert_eq!(
@@ -168843,13 +168885,14 @@ mod u9exit1_self_exit_transaction {
         // The slot is genuinely cleared, and then a restart re-queues the victim.
         let mut h = three_task_world();
         let token = crate::kernel::boot::cleared_current::clear_current_exact(
-            &mut h.sched,
-            CPU,
+            &mut h.sched.lock_all().view().cpu(CPU).expect("cpu"),
             1,
             Some(Asid(201)),
         )
         .expect("the exact clear succeeds");
         h.sched
+            .lock_all()
+            .view()
             .enqueue_on(CPU, ThreadId(1))
             .expect("a restart re-queues the victim");
         let before = h.snapshot();
@@ -168944,12 +168987,16 @@ mod u9exit1_self_exit_transaction {
                 Self::RestartRequeued => {
                     set(h, TaskStatus::Runnable);
                     h.sched
+                        .lock_all()
+                        .view()
                         .enqueue_on(CPU, ThreadId(1))
                         .expect("the restart re-enqueues");
                 }
                 Self::RestartNotYetQueued => set(h, TaskStatus::Runnable),
                 Self::EnqueuedWhileStillRunning => {
                     h.sched
+                        .lock_all()
+                        .view()
                         .enqueue_on(CPU, ThreadId(1))
                         .expect("the placement lands first");
                 }
@@ -169034,8 +169081,7 @@ mod u9exit1_self_exit_transaction {
         for (competitor, want_restore, want_advance) in rows {
             let mut h = three_task_world();
             let token = crate::kernel::boot::cleared_current::clear_current_exact(
-                &mut h.sched,
-                CPU,
+                &mut h.sched.lock_all().view().cpu(CPU).expect("cpu"),
                 1,
                 Some(Asid(201)),
             )
@@ -169116,7 +169162,7 @@ mod u9exit1_self_exit_transaction {
                             "the replacement must be untouched by the old incarnation's exit"
                         );
                         assert!(
-                            !h.sched.tid_present_anywhere(ThreadId(1)),
+                            !h.sched.lock_all().view().tid_present_anywhere(ThreadId(1)),
                             "and it must not be placed by this settlement either"
                         );
                     }
@@ -169148,7 +169194,7 @@ mod u9exit1_self_exit_transaction {
             // making the victim terminal, which is the ONLY thing that changes the answer. That is
             // the property stated the other way round: the admission tracks the victim's state, not
             // the caller's intent, and no amount of retrying moves it.
-            let placement = h.sched.tid_present_anywhere(ThreadId(1));
+            let placement = h.sched.lock_all().view().tid_present_anywhere(ThreadId(1));
             h.tcbs
                 .iter_mut()
                 .flatten()
@@ -169165,7 +169211,7 @@ mod u9exit1_self_exit_transaction {
                 ClearedCurrentSettlement::AdvanceCommitted
             );
             assert_eq!(
-                h.sched.tid_present_anywhere(ThreadId(1)),
+                h.sched.lock_all().view().tid_present_anywhere(ThreadId(1)),
                 placement,
                 "{competitor:?}: a settlement never disturbs the victim's legitimate placement"
             );
@@ -169262,13 +169308,22 @@ mod u9exit1_self_exit_transaction {
     fn the_compare_and_clear_never_removes_a_task_it_did_not_name() {
         let mut h = three_task_world();
         // The scheduler moved on to tid 2.
-        h.sched.block_current_exact_on(CPU, ThreadId(1));
-        h.sched.enqueue_on(CPU, ThreadId(2)).expect("enqueue");
-        assert_eq!(h.sched.dispatch_next_on(CPU), Some(ThreadId(2)));
+        h.sched
+            .lock_all()
+            .view()
+            .block_current_exact_on(CPU, ThreadId(1));
+        h.sched
+            .lock_all()
+            .view()
+            .enqueue_on(CPU, ThreadId(2))
+            .expect("enqueue");
+        assert_eq!(
+            h.sched.lock_all().view().dispatch_next_on(CPU),
+            Some(ThreadId(2))
+        );
         let before = h.snapshot();
         let token = crate::kernel::boot::cleared_current::clear_current_exact(
-            &mut h.sched,
-            CPU,
+            &mut h.sched.lock_all().view().cpu(CPU).expect("cpu"),
             1,
             Some(Asid(201)),
         );
@@ -169288,8 +169343,7 @@ mod u9exit1_self_exit_transaction {
     fn a_dropped_token_diverges() {
         let mut h = three_task_world();
         let token = crate::kernel::boot::cleared_current::clear_current_exact(
-            &mut h.sched,
-            CPU,
+            &mut h.sched.lock_all().view().cpu(CPU).expect("cpu"),
             1,
             Some(Asid(201)),
         )
@@ -171064,9 +171118,7 @@ mod u9residual1_terminal_admission {
         kernel.with(|state| {
             (
                 state.online_cpu_bitmap(),
-                state.with_scheduler_state(|sched| {
-                    crate::kernel::boot::kernel_ref(&sched.scheduler).wake_only_bitmap()
-                }),
+                state.with_scheduler_state(|sched| sched.wake_only_bitmap()),
                 state.current_cpu().0,
             )
         })
@@ -171574,7 +171626,7 @@ mod u9residual1_yield_family {
     /// decisions, and a stand-in would prove nothing about them.
     struct Harness {
         tcbs: alloc::vec::Vec<Option<ThreadControlBlock>>,
-        sched: crate::kernel::scheduler::SmpScheduler,
+        sched: crate::kernel::scheduler::SchedDomain,
         deferral: [Option<u64>; 4],
         /// Forced answers, so each gate can be exercised in isolation.
         force_collision: bool,
@@ -171595,7 +171647,11 @@ mod u9residual1_yield_family {
 
     impl Harness {
         fn new(tasks: &[ThreadControlBlock], current: Option<u64>) -> Self {
-            let mut sched = crate::kernel::scheduler::SmpScheduler::default();
+            let mut sched_dom = crate::kernel::scheduler::SchedDomain::new(
+                crate::arch::topology::default_present_cpu_bitmap(),
+                1,
+            );
+            let mut sched = sched_dom.exclusive();
             if !sched.cpu_is_online(CPU) {
                 sched.bring_up_cpu(CPU).expect("cpu 0 online");
             }
@@ -171603,9 +171659,10 @@ mod u9residual1_yield_family {
                 sched.enqueue_on(CPU, ThreadId(tid)).expect("enqueue");
                 assert_eq!(sched.dispatch_next_on(CPU), Some(ThreadId(tid)));
             }
+            drop(sched);
             Self {
                 tcbs: tasks.iter().cloned().map(Some).collect(),
-                sched,
+                sched: sched_dom,
                 deferral: [None; 4],
                 force_collision: false,
                 force_admission: None,
@@ -171622,7 +171679,11 @@ mod u9residual1_yield_family {
                 .map(|t| t.status)
         }
         fn current_of(&self, cpu: u8) -> Option<u64> {
-            self.sched.current_tid_on(CpuId(cpu)).map(|t| t.0)
+            self.sched
+                .lock_all()
+                .view()
+                .current_tid_on(CpuId(cpu))
+                .map(|t| t.0)
         }
         /// Everything a decline must not have changed.
         fn snapshot(&self) -> alloc::string::String {
@@ -171637,7 +171698,12 @@ mod u9residual1_yield_family {
                 .tcbs
                 .iter()
                 .flatten()
-                .map(|t| (t.tid.0, self.sched.tid_present_anywhere(t.tid)))
+                .map(|t| {
+                    (
+                        t.tid.0,
+                        self.sched.lock_all().view().tid_present_anywhere(t.tid),
+                    )
+                })
                 .collect();
             alloc::format!(
                 "{tasks:?}|{current:?}|{placed:?}|{:?}|{}",
@@ -171658,7 +171724,11 @@ mod u9residual1_yield_family {
 
     impl YieldOwners for Harness {
         fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
-            self.sched.current_tid_on(cpu).map(|t| t.0)
+            self.sched
+                .lock_all()
+                .view()
+                .current_tid_on(cpu)
+                .map(|t| t.0)
         }
         fn is_bootstrap_cpu(&self, cpu: CpuId) -> bool {
             cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
@@ -171713,7 +171783,11 @@ mod u9residual1_yield_family {
                 // The primitive's contract on failure: `current` is left exactly as it was.
                 return None;
             }
-            self.sched.preempt_reenqueue_only_on(cpu).map(|t| t.0)
+            self.sched
+                .lock_all()
+                .view()
+                .preempt_reenqueue_only_on(cpu)
+                .map(|t| t.0)
         }
     }
 
@@ -171909,7 +171983,12 @@ mod u9residual1_yield_family {
         assert_eq!(outcome.outgoing, CALLER);
         assert_eq!(h.status_of(CALLER), Some(TaskStatus::Runnable));
         assert_eq!(h.current_of(0), None, "the drain owns the CPU now");
-        assert!(h.sched.tid_present_anywhere(ThreadId(CALLER)));
+        assert!(
+            h.sched
+                .lock_all()
+                .view()
+                .tid_present_anywhere(ThreadId(CALLER))
+        );
         assert_eq!(h.deferral[0], Some(CALLER), "the deferral names the caller");
         assert_eq!(h.count("reserve"), 1);
         assert_eq!(h.count("release"), 0, "a committed yield releases nothing");
@@ -171928,7 +172007,7 @@ mod u9residual1_yield_family {
         run_yield_transaction(&mut h, CPU).expect("a lone yield still commits");
         assert_eq!(h.current_of(0), None);
         assert_eq!(
-            h.sched.dispatch_next_on(CPU),
+            h.sched.lock_all().view().dispatch_next_on(CPU),
             Some(ThreadId(CALLER)),
             "the drain finds the re-enqueued caller — never nothing"
         );
@@ -173310,23 +173389,26 @@ pub(crate) fn give_task_an_incarnation(state: &mut crate::kernel::boot::KernelSt
 mod u9dispatchcpu1_contracts {
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::scheduler::{
-        AcceptedSelection, CpuId, DispatchSelection, SchedulerError, SmpScheduler, TaskPriority,
+        AcceptedSelection, CpuId, DispatchSelection, SchedAll, SchedDomain, SchedulerError,
+        TaskPriority,
     };
     use crate::runtime::DispatchAuthority;
 
     const CPU: CpuId = CpuId(0);
 
-    fn sched() -> SmpScheduler {
-        let mut s = SmpScheduler::default();
+    fn sched() -> SchedDomain {
+        let mut dom = SchedDomain::new(crate::arch::topology::default_present_cpu_bitmap(), 1);
+        let mut s = dom.exclusive();
         if !s.cpu_is_online(CPU) {
             s.bring_up_cpu(CPU).expect("cpu 0 online");
         }
-        s
+        drop(s);
+        dom
     }
 
     /// Everything a selection must not have disturbed: which TIDs are queued, in what order, at
     /// what priority, plus the current slot.
-    fn placement(s: &SmpScheduler, cpu: CpuId) -> (alloc::vec::Vec<u64>, Option<u64>) {
+    fn placement(s: &SchedAll<'_>, cpu: CpuId) -> (alloc::vec::Vec<u64>, Option<u64>) {
         let mut queued = alloc::vec::Vec::new();
         s.for_each_queued_on(cpu, |_, tid| queued.push(tid.0));
         (queued, s.current_tid_on(cpu).map(|t| t.0))
@@ -173341,7 +173423,8 @@ mod u9dispatchcpu1_contracts {
     /// silently weakened rather than removed.
     #[test]
     fn an_accepted_selection_retains_the_selected_tasks_membership() {
-        let mut s = sched();
+        let mut s_dom = sched();
+        let mut s = s_dom.exclusive();
         s.enqueue_on(CPU, ThreadId(41)).expect("enqueue");
         let sel = s.dispatch_next_accepted_selection_on(CPU, |_| true);
         assert_eq!(
@@ -173361,7 +173444,8 @@ mod u9dispatchcpu1_contracts {
     /// succeeds and a second still collides.
     #[test]
     fn a_removed_task_can_be_enqueued_again_exactly_once() {
-        let mut s = sched();
+        let mut s_dom = sched();
+        let mut s = s_dom.exclusive();
         s.enqueue_on(CPU, ThreadId(42)).expect("enqueue");
         let _ = s.dispatch_next_accepted_selection_on(CPU, |_| true);
         assert_eq!(s.block_current_on(CPU), Some(ThreadId(42)), "removed");
@@ -173379,7 +173463,8 @@ mod u9dispatchcpu1_contracts {
     /// cannot be double-placed.
     #[test]
     fn idle_replacement_releases_only_the_outgoing_idle_membership() {
-        let mut s = sched();
+        let mut s_dom = sched();
+        let mut s = s_dom.exclusive();
         s.enqueue_on(CPU, ThreadId(0)).expect("idle queued");
         assert_eq!(
             s.dispatch_next_accepted_selection_on(CPU, |_| true),
@@ -173414,7 +173499,8 @@ mod u9dispatchcpu1_contracts {
     /// N attempts is spent rotating within `High`.
     #[test]
     fn a_rejected_high_task_does_not_hide_a_runnable_normal_one() {
-        let mut s = sched();
+        let mut s_dom = sched();
+        let mut s = s_dom.exclusive();
         s.enqueue_on_with_priority(CPU, ThreadId(1), TaskPriority::High)
             .expect("high 1");
         s.enqueue_on_with_priority(CPU, ThreadId(2), TaskPriority::High)
@@ -173443,7 +173529,8 @@ mod u9dispatchcpu1_contracts {
     /// rejected: the second is selected and the first stays at the head of `High`.
     #[test]
     fn a_rejected_head_keeps_its_fifo_position() {
-        let mut s = sched();
+        let mut s_dom = sched();
+        let mut s = s_dom.exclusive();
         s.enqueue_on_with_priority(CPU, ThreadId(7), TaskPriority::High)
             .expect("high 7");
         s.enqueue_on_with_priority(CPU, ThreadId(8), TaskPriority::High)
@@ -173465,7 +173552,8 @@ mod u9dispatchcpu1_contracts {
     /// leaves every one of them exactly where it was.
     #[test]
     fn none_acceptable_examines_every_entry_and_moves_none() {
-        let mut s = sched();
+        let mut s_dom = sched();
+        let mut s = s_dom.exclusive();
         for (tid, prio) in [
             (11u64, TaskPriority::High),
             (12, TaskPriority::Normal),
@@ -173492,7 +173580,8 @@ mod u9dispatchcpu1_contracts {
     /// — one is a justified idle and the other is stranded work — so they must not collapse.
     #[test]
     fn an_empty_runqueue_is_distinguishable_from_an_unacceptable_one() {
-        let mut s = sched();
+        let mut s_dom = sched();
+        let mut s = s_dom.exclusive();
         assert_eq!(
             s.dispatch_next_accepted_selection_on(CPU, |_| true),
             AcceptedSelection::Empty
@@ -173509,7 +173598,8 @@ mod u9dispatchcpu1_contracts {
     /// entry that disappears in between is skipped rather than reported as selected.
     #[test]
     fn an_entry_that_vanishes_during_the_scan_is_not_reported_as_selected() {
-        let mut s = sched();
+        let mut s_dom = sched();
+        let mut s = s_dom.exclusive();
         s.enqueue_on(CPU, ThreadId(31)).expect("enqueue");
         s.enqueue_on(CPU, ThreadId(32)).expect("enqueue");
         // Accept 31 but withdraw it first, exactly as a concurrent removal would.
@@ -192825,9 +192915,7 @@ mod u9terminal_settlement_yield {
         k.with(|s| s.task_status(tid))
     }
     fn placement(k: &SharedKernel, tid: u64) -> P {
-        k.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_ref(&sched.scheduler).placement_of(ThreadId(tid))
-        })
+        k.with_all_cpus_sched_split(|sched| sched.placement_of(ThreadId(tid)))
     }
     fn yield_calls(k: &SharedKernel) -> u64 {
         k.with(|s| s.ipc_path_telemetry().scheduler_yield_calls)
@@ -193422,9 +193510,7 @@ mod u9closure_switch_owned_elsewhere {
         });
     }
     fn placement(k: &SharedKernel, tid: u64) -> P {
-        k.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_ref(&sched.scheduler).placement_of(ThreadId(tid))
-        })
+        k.with_all_cpus_sched_split(|sched| sched.placement_of(ThreadId(tid)))
     }
 
     /// **The branch does not switch.** A Yield cell left pending by some earlier trap is the
@@ -200519,7 +200605,7 @@ mod vm_invalidation1 {
             }
             assert!(
                 !code.contains(
-                    "let ambient = self.with_scheduler_split_mut(|sched| sched.current_cpu)"
+                    "let ambient = self.with_all_cpus_sched_split(|sched| sched.current_cpu)"
                 ),
                 "{name}: no ambient requester is read"
             );
@@ -201077,7 +201163,7 @@ mod ap_sched1 {
     #[test]
     fn an_ap_tick_consumes_its_own_quantum_and_never_advances_the_clock() {
         let k = with_wake_only_ap();
-        k.with_scheduler_split_mut(|sched| sched.set_quantum_all(3));
+        k.with_all_cpus_sched_split(|sched| sched.set_quantum_all(3));
         let t0 = k.scheduler_tick_now_split_read();
         let ap = |k: &SharedKernel| match k.scheduler_tick_split_mut(CPU1) {
             crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => (tick, true),
@@ -201110,7 +201196,7 @@ mod ap_sched1 {
             "fifteen interrupts across two CPUs, five ticks of time"
         );
         // The quanta are independent: a voluntary switch on one resets only that CPU's.
-        k.with_scheduler_split_mut(|sched| {
+        k.with_all_cpus_sched_split(|sched| {
             sched.reset_quantum_on(CPU1);
             assert!(!sched.would_preempt_next_on(CPU1));
         });
@@ -201148,8 +201234,8 @@ mod ap_sched1 {
             CPU1,
             "an admitted AP joins balanced placement"
         );
-        k.with_scheduler_split_mut(|sched| {
-            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+        k.with_all_cpus_sched_split(|sched| {
+            let s = sched;
             assert_eq!(s.wake_only_bitmap() & 0b10, 0);
             assert_eq!(s.balance_excluded_bitmap() & 0b10, 0);
         });
@@ -201590,8 +201676,8 @@ mod ap_sched2 {
     }
 
     fn masks(k: &SharedKernel) -> (u64, u64, u64) {
-        k.with_scheduler_split_mut(|sched| {
-            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+        k.with_all_cpus_sched_split(|sched| {
+            let s = sched;
             (
                 s.online_cpu_bitmap(),
                 s.wake_only_bitmap(),
@@ -201800,14 +201886,16 @@ mod ap_sched2 {
                         // 1. consume the pending notification (clear SSIP, drain the mailbox);
                         let seen = crate::arch::hal::enqueues_notified(cpu);
                         // 2. look at this CPU's own queue;
-                        let next = k.with_scheduler_split_mut(|sched| {
-                            let s = crate::kernel::boot::kernel_mut(&mut sched.scheduler);
-                            let next = s.dispatch_next_on(cpu);
-                            if next.is_some() {
-                                s.block_current_on(cpu);
-                            }
-                            next
-                        });
+                        // SCHED-LOCK1: this CPU's own 1L only — the real per-CPU owner.
+                        let next = k
+                            .with_cpu_sched_split(cpu, |c| {
+                                let next = c.dispatch_next();
+                                if next.is_some() {
+                                    c.block_current();
+                                }
+                                next
+                            })
+                            .expect("valid cpu");
                         if next.is_some() {
                             ran[i].fetch_add(1, O::AcqRel);
                             continue;
@@ -202414,9 +202502,8 @@ mod ap_sched3 {
                 let k = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
                 // The boot CPU publishes the planned logical map (eight present) first, as
                 // `stage_aarch64_cpu_plan` does through the DTB staging.
-                k.with_scheduler_split_mut(|sched| {
-                    crate::kernel::boot::kernel_mut(&mut sched.scheduler)
-                        .set_present_cpu_bitmap(0xff);
+                k.with_all_cpus_sched_split(|sched| {
+                    sched.set_present_cpu_bitmap(0xff);
                 });
                 k.with(|s| {
                     for cpu in aps {
@@ -202431,8 +202518,8 @@ mod ap_sched3 {
                         scope.spawn(move || k.admit_ap_dispatch_split(cpu).expect("admit"));
                     }
                 });
-                k.with_scheduler_split_mut(|sched| {
-                    let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+                k.with_all_cpus_sched_split(|sched| {
+                    let s = sched;
                     assert_eq!(s.online_cpu_bitmap(), 0xff);
                     assert_eq!(s.wake_only_bitmap(), 0);
                     assert_eq!(s.balance_excluded_bitmap(), 0);
@@ -202484,14 +202571,16 @@ mod ap_sched3 {
                         scope.spawn(move || {
                             while ran[i].load(O::Acquire) < ROUNDS as usize {
                                 let seen = crate::arch::hal::enqueues_notified(cpu);
-                                let next = k.with_scheduler_split_mut(|sched| {
-                                    let s = crate::kernel::boot::kernel_mut(&mut sched.scheduler);
-                                    let next = s.dispatch_next_on(cpu);
-                                    if next.is_some() {
-                                        s.block_current_on(cpu);
-                                    }
-                                    next
-                                });
+                                // SCHED-LOCK1: this CPU's own 1L only.
+                                let next = k
+                                    .with_cpu_sched_split(cpu, |c| {
+                                        let next = c.dispatch_next();
+                                        if next.is_some() {
+                                            c.block_current();
+                                        }
+                                        next
+                                    })
+                                    .expect("valid cpu");
                                 if next.is_some() {
                                     ran[i].fetch_add(1, O::AcqRel);
                                     continue;
@@ -203216,7 +203305,7 @@ mod ap_sched4_a {
         let fx = fixture(true);
         fx.k.with(|s| s.set_current_cpu(CPU1))
             .expect("ambient → CPU 1");
-        assert_eq!(fx.k.with_scheduler_split_mut(|s| s.current_cpu), CPU1);
+        assert_eq!(fx.k.hosted_ambient_cpu_split_read(), CPU1);
         let _cpu0 = execute_as(&MAP, 0x20);
         assert_eq!(fx.k.executing_cpu_split(), CPU0);
         assert_eq!(fx.k.current_cpu_split_read(), CPU0);

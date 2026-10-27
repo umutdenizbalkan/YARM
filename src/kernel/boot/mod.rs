@@ -126,7 +126,8 @@ use super::capabilities::{
 #[cfg(test)]
 use super::ipc::EndpointMode;
 use super::ipc::{Endpoint, IpcError, Message};
-use super::scheduler::{CpuId, SchedulerError, SmpScheduler};
+use super::scheduler::{CpuId, SchedulerError};
+#[cfg(test)]
 use super::scheduler_timer::Timer;
 use super::smp::SmpMailbox;
 #[cfg(test)]
@@ -10123,7 +10124,13 @@ pub struct KernelState {
     pub kernel_aspace: AddressSpace,
     hal: crate::arch::hal::SelectedIsaHal,
     pub user_spaces: KernelStorage<AddressSpaceManager>,
-    scheduler_state: SpinLockIrq<SchedulerState>,
+    /// SCHED-LOCK1 — the scheduler DOMAIN: per-CPU state behind per-CPU locks (rank 1L),
+    /// admission behind rank 1G, the clock and the published bitmaps/mirrors atomic.
+    scheduler_state: crate::kernel::scheduler::SchedDomain,
+    /// SCHED-LOCK1 — the hosted test harness's CPU selector (`set_current_cpu`). Not part of the
+    /// scheduler and absent from freestanding builds, which take the executing CPU from hardware.
+    #[cfg(feature = "hosted-dev")]
+    hosted_ambient_cpu: core::sync::atomic::AtomicU8,
     ipc_state_lock: SpinLockIrq<()>,
     driver_state_lock: SpinLockIrq<()>,
     fault_state_lock: SpinLockIrq<()>,

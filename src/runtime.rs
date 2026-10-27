@@ -3,8 +3,8 @@
 
 use crate::kernel::boot::{
     ControlPlaneCnodePlan, FaultSubsystem, KernelCapacityProfile, KernelError, KernelState,
-    KernelStorage, RuntimeCapacityConfig, SchedulerState, TelemetrySubsystem, TrapHandleError,
-    kernel_mut, kernel_ref,
+    KernelStorage, RuntimeCapacityConfig, TelemetrySubsystem, TrapHandleError, kernel_mut,
+    kernel_ref,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights};
 use crate::kernel::ipc::Message;
@@ -1634,14 +1634,8 @@ impl SharedKernel {
     pub fn scheduler_tick_now_split_read(&self) -> u64 {
         // Stage 2B split: read scheduler tick directly under scheduler lock.
         crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read");
-        // SAFETY: `self.state_ptr()` is the live address of the
-        // `KernelState` owned by this `SharedKernel`; recomputed fresh on
-        // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
-        let scheduler_state =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
-        let scheduler_state = unsafe { &*scheduler_state };
-        let sched = scheduler_state.lock();
-        sched.timer.current_ticks().0
+        // SCHED-LOCK1: the tick is an atomic with one writer (the clock owner); no lock.
+        self.sched_domain().clock_now().0
     }
 
     /// Authoritative current-TID read for the *live* trap path (x86_64 -smp 1).
@@ -1702,17 +1696,13 @@ impl SharedKernel {
     ///
     /// No task lock, no dispatch, no enqueue, no status mutation, no broad fallback.
     pub fn current_tid_authoritative(&self, cpu: CpuId) -> Option<u64> {
-        self.with_scheduler_split_mut(|sched| {
-            if kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
-                .is_err()
-            {
-                return None;
-            }
-            kernel_ref(&sched.scheduler)
-                .current_tid_on(cpu)
-                .map(|tid| tid.0)
+        // SCHED-LOCK1: `cpu`'s own 1L only.
+        self.with_cpu_sched_split(cpu, |c| {
+            c.validate_online().ok()?;
+            c.current_tid().map(|tid| tid.0)
         })
+        .ok()
+        .flatten()
     }
 
     /// U9-PAGEFAULT1 §0 — **may this trap return through the frame it entered on?**
@@ -1770,8 +1760,9 @@ impl SharedKernel {
         }
         // Rank 1: where the scheduler actually has it. Ranks are taken 2 then 1 with NO nesting —
         // the rank-2 acquisition above has been released before this one is taken.
-        let placement = self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler).placement_of(crate::kernel::ipc::ThreadId(tid))
+        // SCHED-LOCK1: `placement_of` is a COHERENT all-CPU answer (§16.1) — every 1L, ascending.
+        let placement = self.with_all_cpus_sched_split(|sched| {
+            sched.placement_of(crate::kernel::ipc::ThreadId(tid))
         });
         match placement {
             TaskPlacement::Current(on) if on == cpu => A::OwnsEnteringFrame,
@@ -1790,16 +1781,10 @@ impl SharedKernel {
         // Phase L5A split: read the scheduler's per-CPU current TID directly
         // under the scheduler lock.  This intentionally avoids the global
         // SharedKernel lock and does not mutate current_cpu or task state.
-        // SAFETY: `self.state_ptr()` is the live address of the
-        // `KernelState` owned by this `SharedKernel`; recomputed fresh on
-        // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
-        let scheduler_state =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
-        let scheduler_state = unsafe { &*scheduler_state };
-        let sched = scheduler_state.lock();
-        kernel_ref(&sched.scheduler)
-            .current_tid_on(cpu)
-            .map(|tid| tid.0)
+        // SCHED-LOCK1: `cpu`'s own 1L only.
+        self.with_cpu_sched_split(cpu, |c| c.current_tid().map(|tid| tid.0))
+            .ok()
+            .flatten()
     }
 
     /// # Validation status: UNIT_ONLY — staged read helper, not on the trap path.
@@ -1807,14 +1792,8 @@ impl SharedKernel {
         // Phase L7A split: read scheduler topology through scheduler_state only.
         // This is a read-only staged helper; it does not acquire the global
         // SharedKernel lock, mutate runqueues, or update current_cpu.
-        // SAFETY: `self.state_ptr()` is the live address of the
-        // `KernelState` owned by this `SharedKernel`; recomputed fresh on
-        // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
-        let scheduler_state =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
-        let scheduler_state = unsafe { &*scheduler_state };
-        let sched = scheduler_state.lock();
-        kernel_ref(&sched.scheduler).online_cpu_count()
+        // SCHED-LOCK1: the published admission bitmap; no lock.
+        self.sched_domain().topo().online().count_ones() as usize
     }
 
     /// # Validation status: UNIT_ONLY — staged read helper, not on the trap path.
@@ -1822,14 +1801,8 @@ impl SharedKernel {
         // Phase L7A split: read scheduler topology through scheduler_state only.
         // This is a read-only staged helper; it does not acquire the global
         // SharedKernel lock, mutate runqueues, or update current_cpu.
-        // SAFETY: `self.state_ptr()` is the live address of the
-        // `KernelState` owned by this `SharedKernel`; recomputed fresh on
-        // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
-        let scheduler_state =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
-        let scheduler_state = unsafe { &*scheduler_state };
-        let sched = scheduler_state.lock();
-        kernel_ref(&sched.scheduler).present_cpu_count()
+        // SCHED-LOCK1: the published admission bitmap; no lock.
+        self.sched_domain().topo().present().count_ones() as usize
     }
 
     /// # Validation status: UNIT_ONLY — immutable boot-config read, not on the trap path.
@@ -2036,18 +2009,16 @@ impl SharedKernel {
             // invalidate, so there is nothing left to refuse.
             return Ok(());
         }
-        let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
-            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
-            let online = s.online_cpu_bitmap();
-            (
-                (online & !s.wake_only_bitmap()).count_ones() as usize,
-                sched.current_cpu,
-            )
-        });
-        if dispatching > 1 {
+        // SCHED-LOCK1: the published admission bitmaps, no lock. The dispatcher this route must
+        // be is named by the bitmap itself — the ONE online, non-wake-only CPU — not by the
+        // retired ambient `current_cpu`, which any CPU's bind (an idling wake-only AP's included)
+        // could leave naming another CPU.
+        let topo = self.sched_domain().topo();
+        let dispatching_set = topo.online() & !topo.wake_only();
+        if dispatching_set.count_ones() > 1 {
             return Err(R::MultiDispatcher);
         }
-        if dispatch_cpu != cpu {
+        if (cpu.0 as usize) >= 64 || dispatching_set != 1u64 << cpu.0 {
             return Err(R::NotDispatchCpu);
         }
         Ok(())
@@ -2269,20 +2240,58 @@ impl SharedKernel {
     ///   `stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker`
     ///   (the in-lock path still does NOT call the seam — calling it from
     ///   inside the `with_cpu` borrow would alias the same backing lock).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn with_scheduler_split_mut<R>(
+    ///
+    /// SCHED-LOCK1 retired the whole-domain seam: the scheduler domain has no whole-domain lock.
+    /// Its seams are, by authority (`doc/SCHEDULING_CONTRACT.md` §16):
+    ///
+    /// * [`Self::with_cpu_sched_split`] — rank 1L, exactly ONE CPU's state;
+    /// * [`Self::with_cpu_admission_split`] — rank 1G then that CPU's 1L, for an admission
+    ///   transition;
+    /// * [`Self::with_all_cpus_sched_split`] — rank 1G then every 1L ascending, the coherent
+    ///   whole-domain view, for the rare paths §16.1 names;
+    /// * [`Self::sched_domain`] — the lock-free parts: the clock, the published admission bitmaps,
+    ///   the per-CPU mirrors, the balanced choice (1G alone) and the frozen-subject scan.
+    pub(crate) fn sched_domain(&self) -> &crate::kernel::scheduler::SchedDomain {
+        // SAFETY: `self.state_ptr()` is the stable KernelState storage owned by this
+        // SharedKernel. `scheduler_split_mut_ptr_from_raw` derives a raw field pointer without
+        // creating a whole-KernelState reference. The domain is only ever SHARED (`&`): every
+        // mutable part is behind its own lock or is atomic, so no `&mut` to it exists at run time.
+        unsafe { &*KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) }
+    }
+
+    /// SCHED-LOCK1 — rank 1L: run `f` on exactly `cpu`'s scheduler state, holding only that CPU's
+    /// lock. `f` sees `cpu`'s [`crate::kernel::scheduler::CpuView`] and nothing else; the CPU's
+    /// mirror is republished before the lock is released. `InvalidCpu` (nothing run) for an
+    /// out-of-range CPU.
+    pub(crate) fn with_cpu_sched_split<R>(
         &self,
-        f: impl FnOnce(&mut SchedulerState) -> R,
+        cpu: CpuId,
+        f: impl FnOnce(&mut crate::kernel::scheduler::CpuView<'_>) -> R,
+    ) -> Result<R, crate::kernel::scheduler::SchedulerError> {
+        let mut guard = self.sched_domain().lock_cpu(cpu)?;
+        let mut view = guard.view();
+        Ok(f(&mut view))
+    }
+
+    /// SCHED-LOCK1 — rank 1G then `cpu`'s 1L: an admission transition of `cpu`.
+    pub(crate) fn with_cpu_admission_split<R>(
+        &self,
+        cpu: CpuId,
+        f: impl FnOnce(&mut crate::kernel::scheduler::CpuAdmissionGuard<'_>) -> R,
+    ) -> Result<R, crate::kernel::scheduler::SchedulerError> {
+        let mut guard = self.sched_domain().lock_cpu_admission(cpu)?;
+        Ok(f(&mut guard))
+    }
+
+    /// SCHED-LOCK1 — rank 1G then every 1L in ascending order: the ONE coherent whole-domain
+    /// view. Rare paths only (§16.1); never an ordinary dispatch, enqueue, block or tick.
+    pub(crate) fn with_all_cpus_sched_split<R>(
+        &self,
+        f: impl FnOnce(&mut crate::kernel::scheduler::SchedAll<'_>) -> R,
     ) -> R {
-        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned
-        // by this SharedKernel. `scheduler_split_mut_ptr_from_raw` derives a
-        // raw field pointer without creating a whole-KernelState reference;
-        // the scheduler lock contains and serializes its own data.
-        let scheduler_lock =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
-        let scheduler_lock = unsafe { &*scheduler_lock };
-        let mut guard = scheduler_lock.lock();
-        f(&mut guard)
+        let mut guard = self.sched_domain().lock_all();
+        let mut view = guard.view();
+        f(&mut view)
     }
 
     /// Stage 167 (D6-GENUINE-A): the first LIVE production caller of the rank-1
@@ -2297,14 +2306,11 @@ impl SharedKernel {
     /// TID. Default-off behind `yarm.d6_genuine=1` (gated by the caller).
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn d6_genuine_local_dispatch_observe(&self, cpu: CpuId) -> Option<u64> {
-        self.with_scheduler_split_mut(|sched| {
-            // Mirror `local_dispatch_step_split`'s CPU selection: it reads the
-            // scheduler's own `current_cpu` under the scheduler lock.
-            let observe_cpu = sched.current_cpu;
-            let current = kernel_ref(&sched.scheduler)
-                .current_tid_on(observe_cpu)
-                .map(|tid| tid.0);
-            let runnable = kernel_ref(&sched.scheduler).runnable_count_on(observe_cpu);
+        // SCHED-LOCK1: the observation names `cpu` explicitly (the retired ambient selector no
+        // longer exists) and holds only that CPU's 1L.
+        self.with_cpu_sched_split(cpu, |c| {
+            let current = c.current_tid().map(|tid| tid.0);
+            let runnable = c.runnable_count();
             crate::yarm_log!(
                 "D6_LOCAL_DISPATCH_STEP_SPLIT cpu={} tid={:?} runnable={}",
                 cpu.0,
@@ -2313,6 +2319,8 @@ impl SharedKernel {
             );
             current
         })
+        .ok()
+        .flatten()
     }
 
     /// Stage 200D-2B1D5A — re-validate an `idle` restore-owner decision AFTER the post-lock
@@ -2484,14 +2492,14 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
     ) -> Option<OwnerRevalidationSelection> {
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler).validate_online_cpu(cpu).ok()?;
-            sched.current_cpu = cpu;
+        // SCHED-LOCK1: `cpu`'s own 1L; the retired ambient bind is gone (nothing read it back).
+        self.with_cpu_sched_split(cpu, |c| {
+            c.validate_online().ok()?;
             // U9-DISPATCH-CPU3 §3: the provenance-preserving form. `dispatch_next_on` returns a
             // bare TID; this returns WHICH kind of selection was made, which is what lets the
             // caller mark the task `Running` through the one existing seam instead of entering
             // userspace with the scheduler and the task table disagreeing about its status.
-            let selection = kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu);
+            let selection = c.dispatch_next_selection();
             let tid = selection.tid()?.0;
             // QEMU-SMP3-SEAL §2 — pin the incarnation while the dequeue is still this guard's.
             // A READ-ONLY rank-2 lookup nested inside rank 1 (ascending, the shape
@@ -2509,6 +2517,8 @@ impl SharedKernel {
                 asid,
             })
         })
+        .ok()
+        .flatten()
     }
 
     /// QEMU-SMP3-SEAL §2 — phase 2 of [`Self::revalidate_idle_owner_after_drains`]: claim the
@@ -2664,11 +2674,9 @@ impl SharedKernel {
 
         const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
         let OwnerRevalidationSelection { cpu, tid, .. } = selection;
-        self.with_scheduler_split_mut(|sched| {
-            let cleared = kernel_mut(&mut sched.scheduler)
-                .block_current_on(cpu)
-                .map(|t| t.0)
-                == Some(tid);
+        // SCHED-LOCK1: `cpu`'s own 1L, rank 2 nested inside as before.
+        self.with_cpu_sched_split(cpu, |c| {
+            let cleared = c.block_current().map(|t| t.0) == Some(tid);
             // A reaped task is never resurrected: `!restorable` short-circuits before any
             // queue mutation, exactly as `!restorable || enqueue_on_cpu(..)` did.
             let requeued = if !restorable {
@@ -2700,9 +2708,7 @@ impl SharedKernel {
                             );
                             assert_eq!(cpu.0, crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
                         }
-                        kernel_mut(&mut sched.scheduler)
-                            .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
-                            .is_ok()
+                        c.enqueue_with_priority(ThreadId(tid), priority).is_ok()
                     }
                 }
             };
@@ -2710,6 +2716,10 @@ impl SharedKernel {
                 tid,
                 rolled_back: cleared && requeued,
             }
+        })
+        .unwrap_or(OwnerRevalidation::RestoreFailed {
+            tid,
+            rolled_back: false,
         })
     }
 
@@ -2726,8 +2736,11 @@ impl SharedKernel {
     /// Default-off behind `yarm.d6_genuine=1` (gated by the caller).
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn d6_genuine_local_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
-        self.with_scheduler_split_mut(|sched| {
-            let dispatch_cpu = sched.current_cpu;
+        // SCHED-LOCK1: the authority is the EXECUTING CPU's hardware identity
+        // (`executing_cpu_split`), read before `cpu`'s 1L is taken; the retired ambient selector
+        // it used to be compared with no longer exists.
+        let dispatch_cpu = self.executing_cpu_split();
+        let outcome = self.with_cpu_sched_split(cpu, |c| {
             // Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's CPU against the
             // authoritative dispatch CPU BEFORE any mutation. On mismatch nothing is dequeued.
             if dispatch_cpu != cpu {
@@ -2750,8 +2763,7 @@ impl SharedKernel {
                 };
             }
             // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
-            let selection =
-                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
+            let selection = c.dispatch_next_selection();
             let incoming = selection.tid().map(|t| t.0);
             // Stage 199D-WA3A-R2-SEAL: the marker field is read off the TYPED selection, not
             // reconstructed from `Option::is_some` — same emitted text, no second source of
@@ -2770,6 +2782,12 @@ impl SharedKernel {
                 cpu: dispatch_cpu,
                 selection,
             }
+        });
+        outcome.unwrap_or(CpuDispatch::Refused {
+            requested: cpu,
+            reason: DispatchAuthorityRefusal::AmbientMismatch {
+                authoritative: dispatch_cpu,
+            },
         })
     }
 
@@ -2780,17 +2798,16 @@ impl SharedKernel {
     /// Returns `true` when `dispatch_next_on` would NOT dequeue (safe to run
     /// the mutating step out of lock).
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn d6_genuine_dispatch_queue_neutral(&self, _cpu: CpuId) -> bool {
-        self.with_scheduler_split_mut(|sched| {
-            let scpu = sched.current_cpu;
-            let current = kernel_ref(&sched.scheduler)
-                .current_tid_on(scpu)
-                .map(|tid| tid.0);
-            let runnable = kernel_ref(&sched.scheduler).runnable_count_on(scpu);
+    pub(crate) fn d6_genuine_dispatch_queue_neutral(&self, cpu: CpuId) -> bool {
+        // SCHED-LOCK1: the CPU the caller names, under its own 1L (no ambient selector).
+        self.with_cpu_sched_split(cpu, |c| {
+            let current = c.current_tid().map(|tid| tid.0);
+            let runnable = c.runnable_count();
             // dispatch_next_on dequeues iff (current is None or idle tid 0) AND
             // there is something runnable. Everything else is queue-neutral.
             !(runnable > 0 && matches!(current, None | Some(0)))
         })
+        .unwrap_or(true)
     }
 
     /// Stage 168 (D6-GENUINE-B): the deferred Phase-B TCB status write, applied
@@ -2987,9 +3004,9 @@ impl SharedKernel {
                     );
                     return DispatchMarkOutcome::RefusedTorn;
                 }
-                let restored = self.with_scheduler_split_mut(|sched| {
-                    kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu) == Some(tid)
-                });
+                let restored = self
+                    .with_cpu_sched_split(cpu, |c| c.preempt_reenqueue_only() == Some(tid))
+                    .unwrap_or(false);
                 crate::yarm_log!(
                     "DISPATCH_MARK_REFUSED cpu={} tid={} provenance=dequeued scheduler_rollback={}",
                     cpu.0,
@@ -3263,18 +3280,13 @@ impl SharedKernel {
         tid: u64,
         asid: Option<crate::kernel::vm::Asid>,
     ) -> Option<crate::kernel::boot::cleared_current::ClearedCurrentToken> {
-        self.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
-                .ok()?;
-            sched.current_cpu = cpu;
-            crate::kernel::boot::cleared_current::clear_current_exact(
-                crate::kernel::boot::kernel_mut(&mut sched.scheduler),
-                cpu,
-                tid,
-                asid,
-            )
+        // SCHED-LOCK1: `cpu`'s own 1L; the token names the CPU whose lock the clear held.
+        self.with_cpu_sched_split(cpu, |c| {
+            c.validate_online().ok()?;
+            crate::kernel::boot::cleared_current::clear_current_exact(c, tid, asid)
         })
+        .ok()
+        .flatten()
     }
 
     /// U9-EXIT3 §2 — rank 2: is this EXACT incarnation present and `Running`?
@@ -3293,10 +3305,12 @@ impl SharedKernel {
     }
 
     /// U9-EXIT3 §2 — rank 1: is `tid` current on, or queued on, ANY CPU?
+    ///
+    /// SCHED-LOCK1: the restore precondition is a COHERENT all-CPU answer (§16.1), so it takes
+    /// every 1L in ascending order. Exit is rare; no ordinary dispatch path reaches this.
     pub(crate) fn tid_placed_anywhere_split(&self, tid: u64) -> bool {
-        self.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_ref(&sched.scheduler)
-                .tid_present_anywhere(crate::kernel::ipc::ThreadId(tid))
+        self.with_all_cpus_sched_split(|sched| {
+            sched.tid_present_anywhere(crate::kernel::ipc::ThreadId(tid))
         })
     }
 
@@ -3307,13 +3321,11 @@ impl SharedKernel {
         tid: u64,
         priority: crate::kernel::scheduler::TaskPriority,
     ) -> bool {
-        self.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_mut(&mut sched.scheduler).restore_exact_current_on(
-                cpu,
-                crate::kernel::ipc::ThreadId(tid),
-                priority,
-            )
+        // SCHED-LOCK1: `cpu`'s own 1L.
+        self.with_cpu_sched_split(cpu, |c| {
+            c.restore_exact_current(crate::kernel::ipc::ThreadId(tid), priority)
         })
+        .unwrap_or(false)
     }
 
     /// `Terminal` and `Removed` both mean "the advance is owed"; `Contradicted` is the only
@@ -3385,7 +3397,9 @@ impl SharedKernel {
     /// Nothing else ticks this CPU's timer, and interrupts are masked for the whole trap, so the
     /// answer cannot go stale between this read and the tick that follows it.
     pub(crate) fn timer_would_preempt_split_read(&self, cpu: CpuId) -> bool {
-        self.with_scheduler_split_mut(|sched| sched.would_preempt_next_on(cpu))
+        // SCHED-LOCK1: this CPU's own quantum, under its own 1L.
+        self.with_cpu_sched_split(cpu, |c| c.would_preempt_next())
+            .unwrap_or(false)
     }
 
     /// U9-TIMER1 §3 — install a quantum on the LIVE scheduler timer. Rank 1, one acquisition.
@@ -3399,13 +3413,21 @@ impl SharedKernel {
     /// This touches only the interrupt-count quantum. The hardware interval is programmed from
     /// `BOOTSTRAP_TIMER_DEADLINE_TICKS` directly and is not reachable from here, so every timer
     /// interrupt still arrives on its production schedule.
+    ///
+    /// SCHED-LOCK1: each CPU's quantum is that CPU's own state, so the configuration takes each
+    /// CPU's 1L in turn (ascending, one at a time) rather than one lock over all of them.
     pub(crate) fn set_scheduler_quantum_split_mut(&self, quantum_ticks: u64) {
-        self.with_scheduler_split_mut(|sched| sched.set_quantum_all(quantum_ticks));
+        for idx in 0..crate::kernel::scheduler::MAX_CPUS {
+            let _ = self.with_cpu_sched_split(CpuId(idx as u8), |c| c.set_quantum(quantum_ticks));
+        }
     }
 
     pub(crate) fn scheduler_tick_split_mut(&self, cpu: CpuId) -> SchedulerTickOutcome {
         // AP-SCHED1: this CPU's own quantum; the scheduler tick advances only on the clock owner.
-        let (tick, should_preempt) = self.with_scheduler_split_mut(|sched| sched.tick_on(cpu));
+        // SCHED-LOCK1: this CPU's own 1L; the clock is the domain's atomic.
+        let (tick, should_preempt) = self
+            .with_cpu_sched_split(cpu, |c| c.tick())
+            .unwrap_or((self.sched_domain().clock_now(), false));
         if should_preempt {
             SchedulerTickOutcome::Preempt { cpu, tick: tick.0 }
         } else {
@@ -3444,17 +3466,20 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
     ) -> Option<SchedulerTickOutcome> {
-        self.with_scheduler_split_mut(|sched| {
-            if sched.would_preempt_next_on(cpu) {
+        // SCHED-LOCK1: lookahead and tick under ONE acquisition of this CPU's own 1L.
+        self.with_cpu_sched_split(cpu, |c| {
+            if c.would_preempt_next() {
                 return None;
             }
-            let (tick, should_preempt) = sched.tick_on(cpu);
+            let (tick, should_preempt) = c.tick();
             debug_assert!(
                 !should_preempt,
                 "the lookahead and the tick are one acquisition; they cannot disagree"
             );
             Some(SchedulerTickOutcome::NoSwitch { cpu, tick: tick.0 })
         })
+        .ok()
+        .flatten()
     }
 
     /// U9-QA §1 (ONE QUEUE-ADVANCE OWNER): the single authoritative off-lock queue-advancing
@@ -3517,14 +3542,13 @@ impl SharedKernel {
                 reason: DispatchAuthorityRefusal::StaleWindow,
             };
         }
-        self.with_scheduler_split_mut(|sched| {
+        // SCHED-LOCK1: `cpu`'s own 1L, with the rank-2 acceptance filter nested inside it exactly
+        // as it was nested inside the old rank 1.
+        let outcome = self.with_cpu_sched_split(cpu, |c| {
             // The CPU must be an ONLINE scheduler CPU — the same predicate
             // `current_tid_authoritative` applies, and the reason `CpuOutOfRange` is no longer a
             // reachable selection refusal (an out-of-range CPU cannot mint a live authority).
-            if kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
-                .is_err()
-            {
+            if c.validate_online().is_err() {
                 crate::yarm_log!(
                     "DISPATCH_STEP_REFUSED site={} requested={} reason=cpu_offline",
                     site,
@@ -3571,29 +3595,28 @@ impl SharedKernel {
             // and send drains, the FutexWait and yield retirement drains, and the U9-QA commit —
             // so `ExactTokenResume` is the convention to screen for, and it is the same value
             // those applies pass.
-            let selection =
-                kernel_mut(&mut sched.scheduler).dispatch_next_accepted_selection_on(cpu, |tid| {
-                    self.with_task_tcbs_split_mut(|tcbs| {
-                        if !crate::kernel::task_transition::dispatch_transition_would_be_accepted(
-                            tcbs,
-                            tid.0,
-                            crate::kernel::task_transition::TaskTransition::DispatchIncoming,
-                        ) {
-                            return false;
-                        }
-                        let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == tid.0) else {
-                            return false;
-                        };
-                        if MarkedIncarnation::resolve(tid.0, tcb.asid).is_none() {
-                            return false;
-                        }
-                        crate::kernel::boot::classify_incoming_resume_convention(
-                            tcb,
-                            crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
-                        )
-                        .is_some()
-                    })
-                });
+            let selection = c.dispatch_next_accepted_selection(|tid| {
+                self.with_task_tcbs_split_mut(|tcbs| {
+                    if !crate::kernel::task_transition::dispatch_transition_would_be_accepted(
+                        tcbs,
+                        tid.0,
+                        crate::kernel::task_transition::TaskTransition::DispatchIncoming,
+                    ) {
+                        return false;
+                    }
+                    let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == tid.0) else {
+                        return false;
+                    };
+                    if MarkedIncarnation::resolve(tid.0, tcb.asid).is_none() {
+                        return false;
+                    }
+                    crate::kernel::boot::classify_incoming_resume_convention(
+                        tcb,
+                        crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+                    )
+                    .is_some()
+                })
+            });
             match selection {
                 crate::kernel::scheduler::AcceptedSelection::Selected(selection) => {
                     CpuDispatch::Selected { cpu, selection }
@@ -3612,6 +3635,10 @@ impl SharedKernel {
                     CpuDispatch::NoneAcceptable { examined }
                 }
             }
+        });
+        outcome.unwrap_or(CpuDispatch::Refused {
+            requested: cpu,
+            reason: DispatchAuthorityRefusal::CpuOffline,
         })
     }
 
@@ -3795,9 +3822,8 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
     ) -> Result<(), crate::kernel::scheduler::SchedulerError> {
-        self.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_mut(&mut sched.scheduler).admit_pinned_dispatch(cpu)
-        })
+        // SCHED-LOCK1: an admission transition — 1G, then `cpu`'s 1L.
+        self.with_cpu_admission_split(cpu, |a| a.admit_pinned_dispatch())?
     }
 
     /// AP-SCHED1 — admit the wake-only AP `cpu` to PRODUCTION dispatch, in ONE rank-1 scheduler
@@ -3812,18 +3838,14 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
     ) -> Result<(), crate::kernel::scheduler::SchedulerError> {
-        self.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_mut(&mut sched.scheduler).admit_dispatch(cpu)
-        })
+        // SCHED-LOCK1: an admission transition — 1G, then `cpu`'s 1L.
+        self.with_cpu_admission_split(cpu, |a| a.admit_dispatch())?
     }
 
     pub(crate) fn yield_reverify_ready(&self, cpu: CpuId) -> bool {
-        self.with_scheduler_split_mut(|sched| {
-            // `cpu` is the trap CPU == the authoritative dispatch CPU under the
-            // single-dispatcher gate; check its `current` slot is still cleared.
-            let _ = sched.current_cpu;
-            kernel_ref(&sched.scheduler).current_tid_on(cpu).is_none()
-        })
+        // `cpu` is the trap CPU; check its `current` slot is still cleared, under its own 1L.
+        self.with_cpu_sched_split(cpu, |c| c.current_tid().is_none())
+            .unwrap_or(true)
     }
 
     /// QEMU-SMP3-ACCEPTANCE §1 — THE settlement for a blocking-class drain (D2 send, D2 receive,
@@ -4115,30 +4137,48 @@ impl SharedKernel {
             crate::kernel::task_enqueue::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)
         })?;
         self.resolve_plan_home_split(&mut plan, cpu);
-        let target = self.with_scheduler_split_mut(|sched| {
-            crate::kernel::task_enqueue::commit_enqueue_locked(
-                kernel_mut(&mut sched.scheduler),
-                &plan,
-            )
-        })?;
+        let target = self.commit_enqueue_split(&plan)?;
         crate::arch::hal::notify_enqueued(target);
         Ok(target)
     }
 
-    /// AP-SCHED1 — rank 1: the CPU balanced placement chooses now, rotating the next choice's
-    /// starting point exactly as `SmpScheduler::enqueue_balanced` does; `fallback` when none is
-    /// eligible (the commit then refuses exactly as it did before).
-    pub(crate) fn balanced_choice_split(&self, fallback: CpuId) -> CpuId {
-        self.with_scheduler_split_mut(|sched| {
-            let s = kernel_mut(&mut sched.scheduler);
-            match s.balanced_choice() {
-                Ok(cpu) => {
-                    s.note_balanced_choice(cpu);
-                    cpu
-                }
-                Err(_) => fallback,
-            }
+    /// SCHED-LOCK1 — THE split enqueue commit: the plan's ONE CPU, under that CPU's own 1L only
+    /// (`doc/SCHEDULING_CONTRACT.md` §16.4 step 1). The run queue is the reservation: a full queue,
+    /// a wake-only or offline CPU, or a duplicate refuses BEFORE any mutation, so no committed
+    /// wake can be lost to capacity. A balanced plan (none reaches here after
+    /// `resolve_plan_home_split`) is resolved by the balanced choice (1G) first, never under a 1L.
+    /// The caller sends the wake IPI after this returns, with no scheduler lock held.
+    pub(crate) fn commit_enqueue_split(
+        &self,
+        plan: &crate::kernel::task_enqueue::EnqueuePlan,
+    ) -> Result<CpuId, KernelError> {
+        use crate::kernel::boot::map_scheduler_error;
+        use crate::kernel::task_enqueue::EnqueueTarget;
+        let cpu = match plan.target {
+            EnqueueTarget::Pinned(cpu) => cpu,
+            EnqueueTarget::Balanced => self
+                .sched_domain()
+                .balanced_choice_and_note()
+                .map_err(map_scheduler_error)?,
+        };
+        let pinned = crate::kernel::task_enqueue::EnqueuePlan {
+            target: EnqueueTarget::Pinned(cpu),
+            ..*plan
+        };
+        self.with_cpu_sched_split(cpu, |c| {
+            crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(c, &pinned)
         })
+        .map_err(map_scheduler_error)?
+    }
+
+    /// AP-SCHED1 — the CPU balanced placement chooses now, rotating the next choice's starting
+    /// point exactly as the base `enqueue_balanced` did; `fallback` when none is eligible (the
+    /// commit then refuses exactly as it did before). SCHED-LOCK1: 1G alone, over the per-CPU
+    /// load mirrors (§16.4); no CPU's 1L is taken.
+    pub(crate) fn balanced_choice_split(&self, fallback: CpuId) -> CpuId {
+        self.sched_domain()
+            .balanced_choice_and_note()
+            .unwrap_or(fallback)
     }
 
     /// AP-SCHED1 — rank 2: `tid`'s home CPU, fixing `chosen` as it when it has none
@@ -4173,6 +4213,15 @@ impl SharedKernel {
     ///
     /// A woken task practically always has a home already (it was enqueued once before it could
     /// block); this decides only the first placement of one that somehow has none.
+    /// SCHED-LOCK1 — hosted only: the test harness's CPU selector (`KernelState::set_current_cpu`),
+    /// which lives outside the scheduler domain and is absent from freestanding builds.
+    #[cfg(feature = "hosted-dev")]
+    pub(crate) fn hosted_ambient_cpu_split_read(&self) -> CpuId {
+        // SAFETY: a raw field projection of the live `KernelState`; the field is an atomic.
+        let cell = unsafe { &*KernelState::hosted_ambient_cpu_ptr_from_raw(self.state_ptr()) };
+        CpuId(cell.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
     pub(crate) fn executing_cpu_split(&self) -> CpuId {
         #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
         {
@@ -4191,7 +4240,7 @@ impl SharedKernel {
         #[cfg(feature = "hosted-dev")]
         {
             crate::arch::x86_cpu_identity::hosted::executing_cpu_id()
-                .unwrap_or_else(|| self.with_scheduler_split_mut(|sched| sched.current_cpu))
+                .unwrap_or_else(|| self.hosted_ambient_cpu_split_read())
         }
     }
 
@@ -4232,12 +4281,7 @@ impl SharedKernel {
             crate::kernel::task_enqueue::plan_pinned_enqueue_locked(tcbs, classes, tid, cpu)
         })?;
         self.resolve_plan_home_split(&mut plan, cpu);
-        let target = self.with_scheduler_split_mut(|sched| {
-            crate::kernel::task_enqueue::commit_enqueue_locked(
-                kernel_mut(&mut sched.scheduler),
-                &plan,
-            )
-        })?;
+        let target = self.commit_enqueue_split(&plan)?;
         crate::arch::hal::notify_enqueued(target);
         Ok(target)
     }
@@ -4981,10 +5025,11 @@ impl SharedKernel {
             return false;
         }
         // Rank 1: undo the dequeue and the current-set with the EXISTING exact inverse.
-        let sched_ok = self.with_scheduler_split_mut(|sched| {
-            let restored = kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu);
-            restored == Some(crate::kernel::ipc::ThreadId(incoming))
-        });
+        let sched_ok = self
+            .with_cpu_sched_split(cpu, |c| {
+                c.preempt_reenqueue_only() == Some(crate::kernel::ipc::ThreadId(incoming))
+            })
+            .unwrap_or(false);
         if !sched_ok {
             // Task rollback succeeded but the scheduler did not: do NOT leave status=Runnable
             // with current=T. Put the task back to Running for its exact incarnation.
@@ -5343,15 +5388,15 @@ impl SharedKernel {
         tid: u64,
         asid: crate::kernel::vm::Asid,
     ) -> Result<PostLockExitValidation, KernelError> {
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler)
+        // SCHED-LOCK1: `in_runqueue` is an "anywhere" fact read together with `cpu`'s current
+        // slot and (nested) the task facts — a COHERENT observation, so this rare exit-settlement
+        // path takes the coherent all-CPU view (1G, every 1L ascending), then rank 2.
+        self.with_all_cpus_sched_split(|sched| {
+            sched
                 .validate_online_cpu(cpu)
                 .map_err(crate::kernel::boot::map_scheduler_error)?;
-            let current = kernel_ref(&sched.scheduler)
-                .current_tid_on(cpu)
-                .map(|t| t.0);
-            let in_runqueue = kernel_ref(&sched.scheduler)
-                .task_present_anywhere(crate::kernel::ipc::ThreadId(tid));
+            let current = sched.current_tid_on(cpu).map(|t| t.0);
+            let in_runqueue = sched.task_present_anywhere(crate::kernel::ipc::ThreadId(tid));
             // Rank 2 nested here, with the rank-1 guard above still held: the scheduler facts
             // and the task facts are one coherent observation, not two that can tear.
             let (identity_ok, terminal) = self.with_task_tcbs_split_mut(|tcbs| {
@@ -5439,17 +5484,11 @@ impl SharedKernel {
         if next_tid == 0 || next_tid == exiting_tid {
             return Err(KernelError::TaskMissing);
         }
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
+        // SCHED-LOCK1: `cpu`'s own 1L, rank 2 nested; the retired ambient bind is gone.
+        self.with_cpu_sched_split(cpu, |c| {
+            c.validate_online()
                 .map_err(crate::kernel::boot::map_scheduler_error)?;
-            // The admission side effect `with_cpu` performed, which the retired body relied on.
-            sched.current_cpu = cpu;
-            if kernel_ref(&sched.scheduler)
-                .current_tid_on(cpu)
-                .map(|t| t.0)
-                != Some(next_tid)
-            {
+            if c.current_tid().map(|t| t.0) != Some(next_tid) {
                 return Err(KernelError::TaskMissing);
             }
             // Rank 2 nested here, with the rank-1 guard above still held.
@@ -5483,6 +5522,7 @@ impl SharedKernel {
                 }
             }))
         })
+        .map_err(crate::kernel::boot::map_scheduler_error)?
     }
 
     /// U9 (canonical 203C) — the rank-1 half of the PRODUCTION post-switch restore.
@@ -5508,16 +5548,13 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
     ) -> Result<Option<u64>, KernelError> {
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
+        // SCHED-LOCK1: `cpu`'s own 1L; the retired ambient bind is gone.
+        self.with_cpu_sched_split(cpu, |c| {
+            c.validate_online()
                 .map_err(crate::kernel::boot::map_scheduler_error)?;
-            // The admission side effect `with_cpu` performed, which the retired body relied on.
-            sched.current_cpu = cpu;
-            Ok(kernel_ref(&sched.scheduler)
-                .current_tid_on(cpu)
-                .map(|tid| tid.0))
+            Ok(c.current_tid().map(|tid| tid.0))
         })
+        .map_err(crate::kernel::boot::map_scheduler_error)?
     }
 
     /// U9 (canonical 203C) — the rank-2 half of the AArch64 post-switch restore, ONE acquisition.
@@ -5627,14 +5664,11 @@ impl SharedKernel {
         use crate::kernel::boot::{ReceiverWaiterIdentity, map_scheduler_error};
         use crate::kernel::vm::Asid;
 
-        // (1) rank 1 — the CPU authentication and binding `with_cpu` performed on entry.
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
-                .map_err(map_scheduler_error)?;
-            sched.current_cpu = cpu;
-            Ok::<(), KernelError>(())
-        })?;
+        // (1) rank 1L — the CPU authentication `with_cpu` performed on entry (SCHED-LOCK1: the
+        // ambient binding it also performed is retired; nothing reads it).
+        self.with_cpu_sched_split(cpu, |c| c.validate_online())
+            .map_err(map_scheduler_error)?
+            .map_err(map_scheduler_error)?;
 
         // (2) rank 2 — return-register clear, then the wake TID's current ASID. An absent waiter
         // TCB mutates nothing and is not an error, exactly as the locked helper behaves.
@@ -5917,7 +5951,8 @@ impl SharedKernel {
         // the question is whether the snapshot was produced on THIS CPU. Read before rank 1 (on a
         // one-dispatcher port it is that binding, through its own acquisition).
         let executing = self.executing_cpu_split();
-        self.with_scheduler_split_mut(|sched| {
+        // SCHED-LOCK1: `snap.cpu`'s own 1L, ranks 2 and 3 nested inside as before.
+        let outcome = self.with_cpu_sched_split(snap.cpu, |c| {
             // ── rank 1 preflight ────────────────────────────────────────────────────────────
             if executing != snap.cpu {
                 return BlockingSendCommitOutcome::RefusedCpuMismatch {
@@ -5925,9 +5960,7 @@ impl SharedKernel {
                     authoritative: executing,
                 };
             }
-            let current = kernel_ref(&sched.scheduler)
-                .current_tid_on(snap.cpu)
-                .map(|t| t.0);
+            let current = c.current_tid().map(|t| t.0);
             if current != Some(snap.sender_tid) {
                 return BlockingSendCommitOutcome::RefusedNotCurrent {
                     expected: snap.sender_tid,
@@ -6049,8 +6082,8 @@ impl SharedKernel {
                 // `block_current_cpu` performs — this adds no second `current` writer — and it
                 // runs inside the rank-1 section that validated `current` above, so the
                 // blocked-but-still-current window never exists.
-                let cleared = kernel_mut(&mut sched.scheduler).block_current_on(snap.cpu);
-                sched.reset_quantum_on(snap.cpu);
+                let cleared = c.block_current();
+                c.reset_quantum();
                 debug_assert_eq!(
                     cleared.map(|t| t.0),
                     Some(snap.sender_tid),
@@ -6061,6 +6094,12 @@ impl SharedKernel {
                     send_generation: next_generation,
                 }
             })
+        });
+        // An out-of-range CPU has no lock to take; it is refused exactly as the preflight above
+        // refuses any CPU that is not the executing one.
+        outcome.unwrap_or(BlockingSendCommitOutcome::RefusedCpuMismatch {
+            requested: snap.cpu,
+            authoritative: executing,
         })
     }
 
@@ -6243,15 +6282,18 @@ impl SharedKernel {
         // `current_tid()` read: the in-lock body resolved it through `current_cpu()`, which is
         // this CPU (bound in step 1, and MPIDR-derived to the same value on freestanding
         // AArch64, where `cpu` is the trapping CPU).
-        let committed = self.with_scheduler_split_mut(|sched| {
-            let already_current = kernel_ref(&sched.scheduler)
-                .current_tid_on(cpu)
-                .is_some_and(|c| c.0 == tid.0)
-                && matches!(state.old_status, TaskStatus::Running);
-            if already_current {
-                crate::yarm_log!("SCHED_WAKE_ALREADY_RUNNABLE tid={}", tid.0);
-                return Ok(None);
-            }
+        // SCHED-LOCK1 (§16.4 step 6): the "already current HERE" fact is read under the
+        // EXECUTING CPU's own 1L and released before the destination's 1L is taken — the two are
+        // never held together. It cannot go stale in between: only routes executing on `cpu`
+        // change `cpu`'s current slot to or from a running task.
+        let already_current = self
+            .with_cpu_sched_split(cpu, |c| c.current_tid().is_some_and(|t| t.0 == tid.0))
+            .unwrap_or(false)
+            && matches!(state.old_status, TaskStatus::Running);
+        let committed: Option<CpuId> = if already_current {
+            crate::yarm_log!("SCHED_WAKE_ALREADY_RUNNABLE tid={}", tid.0);
+            None
+        } else {
             // `enqueue_woken_task`: the task's home (AP-SCHED1, resolved above).
             let (target, reason) = (
                 home,
@@ -6274,17 +6316,27 @@ impl SharedKernel {
             {
                 crate::yarm_log!(
                     "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
-                    sched.current_cpu.0,
+                    cpu.0,
                     tid.0,
                     target.0
                 );
                 assert_eq!(target.0, crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
             }
-            kernel_mut(&mut sched.scheduler)
-                .enqueue_on_with_priority(target, tid, state.priority)
+            // The commit: the destination's 1L only. Capacity / admission / duplicate refusals
+            // happen before any mutation (the queue is the reservation).
+            let queue_len = self
+                .with_cpu_sched_split(target, |c| {
+                    c.enqueue_with_priority(tid, state.priority)
+                        .map(|()| c.runnable_count())
+                })
+                .map_err(map_scheduler_error)?
                 .map_err(map_scheduler_error)?;
             if tid.0 == BOOTSTRAP_FIRST_USER_TID && cfg!(not(feature = "hosted-dev")) {
-                let q = |c: u8| kernel_ref(&sched.scheduler).runnable_count_on(CpuId(c));
+                // Diagnostic only: each CPU's queue length under its own 1L, one at a time.
+                let q = |c: u8| {
+                    self.with_cpu_sched_split(CpuId(c), |v| v.runnable_count())
+                        .unwrap_or(0)
+                };
                 crate::yarm_log!(
                     "BOOTSTRAP_ENQUEUE_VERIFY tid=1 queue0_len={} queue1_len={} queue2_len={} queue3_len={}",
                     q(0),
@@ -6293,7 +6345,6 @@ impl SharedKernel {
                     q(3)
                 );
             }
-            let queue_len = kernel_ref(&sched.scheduler).runnable_count_on(target);
             crate::yarm_log!(
                 "SCHED_WAKE_ENQUEUE tid={} cpu={} queue_len={} reason={}",
                 tid.0,
@@ -6301,8 +6352,8 @@ impl SharedKernel {
                 queue_len,
                 reason
             );
-            Ok(Some(target))
-        })?;
+            Some(target)
+        };
         if let Some(target) = committed {
             crate::arch::hal::notify_enqueued(target);
         }
@@ -6346,14 +6397,13 @@ impl SharedKernel {
     /// portable stored binding. The recv copy-fault completion transaction reaches it on every
     /// architecture, so the gate is gone rather than a second CPU-binding implementation existing.
     #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// SCHED-LOCK1: the ambient selector this bound is retired, so the transaction is now exactly
+    /// its validation, under `cpu`'s own 1L. The name is kept for its callers and guards.
     pub(crate) fn bind_current_cpu_split(&self, cpu: CpuId) -> Result<(), KernelError> {
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
-                .map_err(crate::kernel::boot::map_scheduler_error)?;
-            sched.current_cpu = cpu;
-            Ok(())
-        })
+        self.with_cpu_sched_split(cpu, |c| c.validate_online())
+            .map_err(crate::kernel::boot::map_scheduler_error)?
+            .map_err(crate::kernel::boot::map_scheduler_error)
     }
 
     /// U3 (canonical 203C) — the authoritative return-to-scheduler transaction for an x86_64 AP,
@@ -6392,15 +6442,13 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
     ) -> Result<Option<u64>, KernelError> {
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
+        // SCHED-LOCK1: `cpu`'s own 1L; the retired ambient bind is gone.
+        self.with_cpu_sched_split(cpu, |c| {
+            c.validate_online()
                 .map_err(crate::kernel::boot::map_scheduler_error)?;
-            sched.current_cpu = cpu;
-            Ok(kernel_mut(&mut sched.scheduler)
-                .block_current_on(cpu)
-                .map(|tid| tid.0))
+            Ok(c.block_current().map(|tid| tid.0))
         })
+        .map_err(crate::kernel::boot::map_scheduler_error)?
     }
 
     /// U3 (canonical 203C) — the x86_64 BSP saved-resume PREEMPT-AND-PREFER selection, taken as
@@ -6452,11 +6500,13 @@ impl SharedKernel {
         cpu: CpuId,
         preferred_tid: u64,
     ) -> Option<u64> {
-        self.with_scheduler_split_mut(|sched| {
-            kernel_mut(&mut sched.scheduler)
-                .on_preempt_prefer_on(cpu, crate::kernel::ipc::ThreadId(preferred_tid))
+        // SCHED-LOCK1: `cpu`'s own 1L.
+        self.with_cpu_sched_split(cpu, |c| {
+            c.on_preempt_prefer(crate::kernel::ipc::ThreadId(preferred_tid))
                 .map(|tid| tid.0)
         })
+        .ok()
+        .flatten()
     }
 
     /// U3 (canonical 203C) — the RISC-V post-lock TERMINAL-IDLE predicate, taken as ONE
@@ -6495,17 +6545,16 @@ impl SharedKernel {
     /// ownership token, no provenance mutation, and no fallback. The provenance take stays where
     /// it was, ahead of this call.
     pub(crate) fn terminal_idle_on_cpu_split(&self, cpu: CpuId) -> Result<bool, KernelError> {
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
+        // SCHED-LOCK1: `cpu`'s own 1L — the SAME lock every enqueue onto `cpu` commits under, which
+        // is what orders this idle decision against a remote wake (§16.4 step 2).
+        self.with_cpu_sched_split(cpu, |c| {
+            c.validate_online()
                 .map_err(crate::kernel::boot::map_scheduler_error)?;
-            sched.current_cpu = cpu;
-            let current = kernel_ref(&sched.scheduler)
-                .current_tid_on(cpu)
-                .map(|t| t.0);
-            let runnable = kernel_ref(&sched.scheduler).runnable_count_on(cpu);
+            let current = c.current_tid().map(|t| t.0);
+            let runnable = c.runnable_count();
             Ok(matches!(current, None | Some(0)) && runnable == 0)
         })
+        .map_err(crate::kernel::boot::map_scheduler_error)?
     }
 
     /// U3 (canonical 203C) — the authoritative enqueue→dispatch transaction for an x86_64 AP
@@ -6574,12 +6623,11 @@ impl SharedKernel {
         const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
         const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 
-        self.with_scheduler_split_mut(|sched| {
+        // SCHED-LOCK1: `cpu`'s own 1L for the whole enqueue→dispatch, rank 2 nested inside.
+        self.with_cpu_sched_split(cpu, |c| {
             // (2) Same admission predicate `set_current_cpu` uses. A refusal returns the same
             // error class with nothing below having run.
-            kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
-                .map_err(map_scheduler_error)?;
+            c.validate_online().map_err(map_scheduler_error)?;
             // (3) No ambient binding. `scheduler.current_cpu` is deliberately NOT written here —
             // see the contract above. Every step below names the CPU explicitly.
 
@@ -6627,14 +6675,24 @@ impl SharedKernel {
                             crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize
                         );
                     }
-                    let placed = kernel_mut(&mut sched.scheduler)
-                        .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
+                    let placed = c
+                        .enqueue_with_priority(ThreadId(tid), priority)
                         .map_err(map_scheduler_error);
                     if placed.is_ok()
                         && tid == BOOTSTRAP_FIRST_USER_TID
                         && cfg!(not(feature = "hosted-dev"))
                     {
-                        let q = |c: u8| kernel_ref(&sched.scheduler).runnable_count_on(CpuId(c));
+                        // Diagnostic only. SCHED-LOCK1: this CPU's queue under its held 1L; every
+                        // other CPU's PUBLISHED load (§16.4 mirrors) — never another CPU's lock.
+                        let own = c.runnable_count();
+                        let domain = self.sched_domain();
+                        let q = |n: u8| {
+                            if n == cpu.0 {
+                                own
+                            } else {
+                                domain.load_mirror(n as usize)
+                            }
+                        };
                         crate::yarm_log!(
                             "BOOTSTRAP_ENQUEUE_VERIFY tid=1 queue0_len={} queue1_len={} queue2_len={} queue3_len={}",
                             q(0),
@@ -6650,12 +6708,11 @@ impl SharedKernel {
             // The one place the two historical policies differ, and the only place they may.
             let selected = match (policy, &enqueued) {
                 (EnqueueRefusalPolicy::Decline, Err(_)) => None,
-                _ => kernel_mut(&mut sched.scheduler)
-                    .dispatch_next_on(cpu)
-                    .map(|t| t.0),
+                _ => c.dispatch_next().map(|t| t.0),
             };
             Ok(CpuEnqueueDispatch { enqueued, selected })
         })
+        .map_err(map_scheduler_error)?
     }
 
     /// QEMU-SMP1 §2 — the ONE authentication both FP/SIMD-home accessors below share.
@@ -6679,18 +6736,22 @@ impl SharedKernel {
         f: impl FnOnce(&mut crate::kernel::task::ThreadControlBlock) -> R,
     ) -> Result<(FpuHomeOwner, R), FpuHomeRefusal> {
         use crate::kernel::task::TaskStatus;
-        self.with_scheduler_split_mut(|sched| {
-            let scheduler = kernel_ref(&sched.scheduler);
-            if scheduler.validate_online_cpu(cpu).is_err() {
+        // SCHED-LOCK1: `cpu`'s own 1L (its `current` cannot change under it) and the OTHER CPUs'
+        // published current mirrors — never their locks. This runs on every user trap entry and
+        // return, so it must not serialise against unrelated CPUs. The duplicate-current refusal
+        // survives the split (§16.4): each CPU publishes its own install (SeqCst) before it can
+        // reach a user return and loads the others' (SeqCst) here, so of two CPUs running one
+        // incarnation at least one observes the other and refuses.
+        let domain = self.sched_domain();
+        self.with_cpu_sched_split(cpu, |c| {
+            if c.validate_online().is_err() {
                 return Err(FpuHomeRefusal::InvalidCpu);
             }
-            let tid = match scheduler.current_tid_on(cpu) {
+            let tid = match c.current_tid() {
                 Some(t) if t.0 != 0 => t.0,
                 _ => return Err(FpuHomeRefusal::NoCurrent),
             };
-            let elsewhere = (0..crate::kernel::scheduler::MAX_CPUS)
-                .filter(|&i| i != cpu.0 as usize)
-                .any(|i| scheduler.current_tid_on(CpuId(i as u8)).map(|t| t.0) == Some(tid));
+            let elsewhere = domain.current_elsewhere(cpu, crate::kernel::ipc::ThreadId(tid));
             if elsewhere {
                 return Err(FpuHomeRefusal::CurrentElsewhere { tid });
             }
@@ -6728,6 +6789,7 @@ impl SharedKernel {
                 Ok((FpuHomeOwner { tid, asid }, f(tcb)))
             })
         })
+        .unwrap_or(Err(FpuHomeRefusal::InvalidCpu))
     }
 
     /// QEMU-SMP1 §2 — COMMIT a trap's captured user FP/SIMD state into the home of the exact
@@ -6976,14 +7038,14 @@ impl SharedKernel {
         let entering_asid = self
             .task_asid_opt_split_read(expected_tid)
             .unwrap_or(crate::kernel::vm::Asid(0));
-        let priority = self.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_ref(&sched.scheduler)
-                .validate_online_cpu(cpu)
-                .ok()?;
-            sched.current_cpu = cpu;
-            crate::kernel::boot::kernel_mut(&mut sched.scheduler)
-                .block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(expected_tid))
-        });
+        // SCHED-LOCK1: `cpu`'s own 1L; the retired ambient bind is gone.
+        let priority = self
+            .with_cpu_sched_split(cpu, |c| {
+                c.validate_online().ok()?;
+                c.block_current_exact(crate::kernel::ipc::ThreadId(expected_tid))
+            })
+            .ok()
+            .flatten();
         let Some(priority) = priority else {
             crate::yarm_log!(
                 "D2_RECV_SPLIT_REFUSED cpu={} phase=a reason=victim_changed expected={} removed=none",
@@ -7457,10 +7519,11 @@ impl SharedKernel {
             // nothing unless the slot still names exactly this task, so a scheduler that has
             // already moved on is untouched.
             let retracted = self
-                .with_scheduler_split_mut(|sched| {
-                    kernel_mut(&mut sched.scheduler)
-                        .block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid))
+                .with_cpu_sched_split(cpu, |c| {
+                    c.block_current_exact(crate::kernel::ipc::ThreadId(tid))
                 })
+                .ok()
+                .flatten()
                 .is_some();
             let refusal = commit.unwrap_err();
             crate::yarm_log!(
@@ -7548,8 +7611,9 @@ impl SharedKernel {
             );
             return U::IncarnationMoved;
         }
-        let placement = self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler).placement_of(crate::kernel::ipc::ThreadId(tid))
+        // SCHED-LOCK1: a COHERENT all-CPU placement (§16.1) — rare unwind settlement.
+        let placement = self.with_all_cpus_sched_split(|sched| {
+            sched.placement_of(crate::kernel::ipc::ThreadId(tid))
         });
         let outcome = match placement {
             TaskPlacement::Queued(cpu) => U::QueuedRunnable(cpu),
@@ -13574,12 +13638,7 @@ impl SharedKernel {
             };
             // AP-SCHED1: the woken task's home, then the remote half of the commit.
             self.resolve_plan_home_split(&mut plan, cpu);
-            let committed = self.with_scheduler_split_mut(|sched| {
-                crate::kernel::task_enqueue::commit_enqueue_locked(
-                    kernel_mut(&mut sched.scheduler),
-                    &plan,
-                )
-            });
+            let committed = self.commit_enqueue_split(&plan);
             if let Ok(target) = committed {
                 crate::arch::hal::notify_enqueued(target);
             }
@@ -15544,17 +15603,15 @@ impl SharedKernel {
     /// This is deliberately NOT `online_wake_only_ap_bitmap`: that is the complement set (idle APs)
     /// and would target CPUs that cannot possibly hold the mapping while missing the one that does.
     pub(crate) fn live_cpu_bitmap_for_asid_split(&self, asid: crate::kernel::vm::Asid) -> u64 {
-        // rank 1: topology + per-CPU current TID, one acquisition.
-        let (online, wake_only, current) = self.with_scheduler_split_mut(|sched| {
-            let s = kernel_ref(&sched.scheduler);
-            let online = s.online_cpu_bitmap();
-            let wake_only = s.wake_only_bitmap();
-            let mut current = [None; crate::arch::platform_constants::MAX_CPUS];
-            for (cpu, slot) in current.iter_mut().enumerate() {
-                *slot = s.current_tid_on(CpuId(cpu as u8)).map(|t| t.0);
-            }
-            (online, wake_only, current)
-        });
+        // SCHED-LOCK1 (§16.5): the published admission bitmaps and every CPU's published current
+        // mirror — no scheduler lock. The placement half was never what covered the dispatch gap
+        // (the residency OR below is), so reading it per CPU cannot reopen that omission.
+        let domain = self.sched_domain();
+        let (online, wake_only) = (domain.topo().online(), domain.topo().wake_only());
+        let mut current = [None; crate::arch::platform_constants::MAX_CPUS];
+        for (cpu, slot) in current.iter_mut().enumerate() {
+            *slot = domain.current_mirror(cpu).map(|t| t.0);
+        }
         // rank 1 released. rank 2: resolve each candidate's ASID.
         let candidates = online & !wake_only;
         let mut bitmap = 0u64;
@@ -15863,11 +15920,10 @@ impl SharedKernel {
             Some(cpu) => cpu,
             None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),
         };
-        let enqueued = self.with_scheduler_split_mut(|sched| {
-            let sm = kernel_mut(&mut sched.scheduler);
-            sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority)
-                .is_ok()
-        });
+        // SCHED-LOCK1: the destination's 1L only; the IPI after its release.
+        let enqueued = self
+            .with_cpu_sched_split(cpu, |c| c.enqueue_with_priority(ThreadId(tid), priority))
+            .is_ok_and(|r| r.is_ok());
         if enqueued {
             crate::arch::hal::notify_enqueued(cpu);
         }
@@ -16224,7 +16280,8 @@ impl SharedKernel {
     /// backlog under this CPU's name, which is exactly the ambient-authority confusion
     /// U9-DISPATCH-CPU1 §1 removed from the selection owner.
     pub(crate) fn runnable_count_on_cpu_split_read(&self, cpu: CpuId) -> usize {
-        self.with_scheduler_split_mut(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
+        self.with_cpu_sched_split(cpu, |c| c.runnable_count())
+            .unwrap_or(0)
     }
 
     /// Reports what the rank-1 enqueue **actually did**.
@@ -16309,30 +16366,35 @@ impl SharedKernel {
             Some(cpu) => cpu,
             None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),
         };
-        let outcome = self.with_scheduler_split_mut(|sched| {
-            let sm = kernel_mut(&mut sched.scheduler);
-            match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {
-                Ok(()) => ReceiverEnqueue::Enqueued { cpu },
-                // Pre-existing membership. When the caller owns a rollback that can complete it,
-                // reconcile HERE, still holding the rank-1 lock the collision was detected under —
-                // there is no unlock/relock window in which a dispatcher could take the entry
-                // between the two. Otherwise report the collision and touch NOTHING.
-                Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued) => {
-                    let reconciled =
-                        reconcile.then(|| sm.withdraw_queued_tid_on(cpu, ThreadId(tid)));
-                    ReceiverEnqueue::Rejected {
-                        cpu,
-                        error: crate::kernel::scheduler::SchedulerError::AlreadyQueued,
-                        reconciled,
+        // SCHED-LOCK1: the destination's 1L for the enqueue AND the reconciling withdrawal.
+        let outcome = self
+            .with_cpu_sched_split(cpu, |sm| {
+                match sm.enqueue_with_priority(ThreadId(tid), priority) {
+                    Ok(()) => ReceiverEnqueue::Enqueued { cpu },
+                    // Pre-existing membership. When the caller owns a rollback that can complete it,
+                    // reconcile HERE, still holding the rank-1 lock the collision was detected under —
+                    // there is no unlock/relock window in which a dispatcher could take the entry
+                    // between the two. Otherwise report the collision and touch NOTHING.
+                    Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued) => {
+                        let reconciled = reconcile.then(|| sm.withdraw_queued_tid(ThreadId(tid)));
+                        ReceiverEnqueue::Rejected {
+                            cpu,
+                            error: crate::kernel::scheduler::SchedulerError::AlreadyQueued,
+                            reconciled,
+                        }
                     }
+                    Err(error) => ReceiverEnqueue::Rejected {
+                        cpu,
+                        error,
+                        reconciled: None,
+                    },
                 }
-                Err(error) => ReceiverEnqueue::Rejected {
-                    cpu,
-                    error,
-                    reconciled: None,
-                },
-            }
-        });
+            })
+            .unwrap_or_else(|error| ReceiverEnqueue::Rejected {
+                cpu,
+                error,
+                reconciled: None,
+            });
         if matches!(outcome, ReceiverEnqueue::Enqueued { .. }) {
             crate::arch::hal::notify_enqueued(cpu);
         }
@@ -16355,10 +16417,9 @@ impl SharedKernel {
     /// for this ASID — and including one would leave the retired-ASID slot pending forever, which
     /// after 32 destroys turns every later teardown into `VmError::Full`.
     pub(crate) fn reap_shootdown_cpu_bitmap_split(&self) -> u64 {
-        self.with_scheduler_split_mut(|sched| {
-            let scheduler = kernel_ref(&sched.scheduler);
-            scheduler.online_cpu_bitmap() & !scheduler.wake_only_bitmap()
-        })
+        // SCHED-LOCK1: the published admission bitmaps; no lock.
+        let topo = self.sched_domain().topo();
+        topo.online() & !topo.wake_only()
     }
 
     /// VM-INVALIDATION1 — the CPUs on which `asid` may still be LOADED: a CPU whose current task
@@ -16366,14 +16427,14 @@ impl SharedKernel {
     /// recorded activation is it (the lock-free per-CPU activation table). A teardown may free the
     /// space's root and frames only when this is empty.
     pub(crate) fn address_space_loaded_cpus_split(&self, asid: crate::kernel::vm::Asid) -> u64 {
-        let (online, current) = self.with_scheduler_split_mut(|sched| {
-            let s = kernel_ref(&sched.scheduler);
-            let mut current = [None; crate::arch::platform_constants::MAX_CPUS];
-            for (cpu, slot) in current.iter_mut().enumerate() {
-                *slot = s.current_tid_on(CpuId(cpu as u8)).map(|t| t.0);
-            }
-            (s.online_cpu_bitmap(), current)
-        });
+        // SCHED-LOCK1 (§16.5): published bitmaps and current mirrors, no lock; the residency
+        // table below is unchanged and is what covers a loaded root with an empty `current`.
+        let domain = self.sched_domain();
+        let online = domain.topo().online();
+        let mut current = [None; crate::arch::platform_constants::MAX_CPUS];
+        for (cpu, slot) in current.iter_mut().enumerate() {
+            *slot = domain.current_mirror(cpu).map(|t| t.0);
+        }
         let mut running = 0u64;
         for (cpu, tid) in current.iter().enumerate() {
             if online & (1u64 << cpu) == 0 {
@@ -16604,8 +16665,9 @@ impl SharedKernel {
             // owner holds it; nothing may be claimed or published.
             _ => return U::IncarnationMoved,
         };
-        let placement = self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler).placement_of(crate::kernel::ipc::ThreadId(entering.tid))
+        // SCHED-LOCK1: a COHERENT all-CPU placement (§16.1) — rare settlement path.
+        let placement = self.with_all_cpus_sched_split(|sched| {
+            sched.placement_of(crate::kernel::ipc::ThreadId(entering.tid))
         });
         match placement {
             // This CPU still holds it, alone or doubly placed, and the frame has been disowned.
@@ -16631,19 +16693,26 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
     ) -> Option<(u64, crate::kernel::scheduler::TaskPriority)> {
-        self.with_scheduler_split_mut(|sched| {
-            let s = kernel_ref(&sched.scheduler);
-            let tid = s.current_tid_on(cpu)?;
-            let priority = s.current_priority_on(cpu)?;
+        // SCHED-LOCK1: one acquisition of `cpu`'s own 1L, so the pair cannot tear.
+        self.with_cpu_sched_split(cpu, |c| {
+            let tid = c.current_tid()?;
+            let priority = c.current_priority()?;
             Some((tid.0, priority))
         })
+        .ok()
+        .flatten()
     }
 
+    /// SCHED-LOCK1 (§16.4) — the FROZEN-SUBJECT per-CPU scan, not a coherent snapshot: each CPU
+    /// is examined under its own 1L, one at a time, never two held. This runs on every direct
+    /// IPC call and reply, so it must not serialise unrelated CPUs. It answers exactly what the
+    /// coherent read answered for every state the callers' invariant admits: the subject is a
+    /// receiver `Blocked` with a committed endpoint waiter, which nothing can wake while both
+    /// hold, and there is no migration — so its placement cannot change during the scan, and a
+    /// violating membership that stays on one CPU across the scan is still reported.
     pub(crate) fn receiver_has_scheduler_membership_split_read(&self, tid: u64) -> bool {
         use crate::kernel::ipc::ThreadId;
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler).task_present_anywhere(ThreadId(tid))
-        })
+        self.sched_domain().present_anywhere_scan(ThreadId(tid))
     }
 
     /// U9-RECV-BLOCK1 §2 — rank 2: the two TASK-domain facts the SMP blocked-server marker
@@ -17638,11 +17707,10 @@ impl SharedKernel {
             Some(cpu) => cpu,
             None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),
         };
-        let enqueued = self.with_scheduler_split_mut(|sched| {
-            kernel_mut(&mut sched.scheduler)
-                .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
-                .is_ok()
-        });
+        // SCHED-LOCK1: the destination's 1L only; the IPI after its release.
+        let enqueued = self
+            .with_cpu_sched_split(cpu, |c| c.enqueue_with_priority(ThreadId(tid), priority))
+            .is_ok_and(|r| r.is_ok());
         if enqueued {
             crate::arch::hal::notify_enqueued(cpu);
         }
@@ -18124,14 +18192,17 @@ impl SharedKernel {
         // (2) rank 1 — COMPARE-AND-CLEAR. `block_current_exact_on` mutates nothing unless the slot
         // names exactly this task, so a mismatch costs no other task its placement. The quantum
         // reset is `block_current_cpu`'s and is preserved on the successful clear.
-        let removed = self.with_scheduler_split_mut(|sched| {
-            let priority = kernel_mut(&mut sched.scheduler)
-                .block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid));
-            if priority.is_some() {
-                sched.reset_quantum_on(cpu);
-            }
-            priority
-        });
+        // SCHED-LOCK1: `cpu`'s own 1L — its current slot and its own quantum together.
+        let removed = self
+            .with_cpu_sched_split(cpu, |c| {
+                let priority = c.block_current_exact(crate::kernel::ipc::ThreadId(tid));
+                if priority.is_some() {
+                    c.reset_quantum();
+                }
+                priority
+            })
+            .ok()
+            .flatten();
         let Some(priority) = removed else {
             // Undo the registration exactly: this transaction published a block it could not
             // complete, and leaving the TCB `Blocked` would strand a task the scheduler still
@@ -18201,11 +18272,9 @@ impl SharedKernel {
     /// hard part, so this seam is HELPER-ONLY (not wired into `try_split_dispatch`).
     /// Returns `None` when no task is runnable on `cpu` (the caller would idle).
     pub fn dispatch_next_candidate_split_read(&self, cpu: CpuId) -> Option<u64> {
-        self.with_scheduler_split_mut(|sched| {
-            kernel_ref(&sched.scheduler)
-                .peek_next_runnable_on(cpu)
-                .map(|tid| tid.0)
-        })
+        self.with_cpu_sched_split(cpu, |c| c.peek_next_runnable().map(|tid| tid.0))
+            .ok()
+            .flatten()
     }
 
     pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot {
@@ -19535,9 +19604,8 @@ mod tests {
         // installed would make the fixture ask the unwind to displace a task the scheduler chose
         // — which it correctly refuses, and which the route can never present it with.
         assert_eq!(
-            kernel.with_scheduler_split_mut(|sched| {
-                crate::kernel::boot::kernel_mut(&mut sched.scheduler)
-                    .block_current_exact_on(cpu, ThreadId(1))
+            kernel.with_all_cpus_sched_split(|sched| {
+                sched.block_current_exact_on(cpu, ThreadId(1))
             }),
             Some(crate::kernel::scheduler::TaskPriority::Normal),
             "the fixture's stand-in sender is descheduled, exactly"
@@ -19793,11 +19861,8 @@ mod tests {
         // directly — `task_present_anywhere` is `contains_or_current`, which is true either way
         // and so cannot tell a recovered task from a duplicated one.
         assert!(
-            kernel.with_scheduler_split_mut(|sched| {
-                kernel_ref(&sched.scheduler)
-                    .peek_next_runnable_on(cpu)
-                    .is_none()
-            }),
+            kernel
+                .with_all_cpus_sched_split(|sched| { sched.peek_next_runnable_on(cpu).is_none() }),
             "the prefer primitive must have taken it OUT of the run queue, not duplicated it"
         );
     }
@@ -20263,8 +20328,8 @@ mod tests {
         });
 
         let place = |tid: u64| {
-            kernel.with_scheduler_split_mut(|sched| {
-                kernel_ref(&sched.scheduler).placement_of(crate::kernel::ipc::ThreadId(tid))
+            kernel.with_all_cpus_sched_split(|sched| {
+                sched.placement_of(crate::kernel::ipc::ThreadId(tid))
             })
         };
         assert!(
@@ -20523,11 +20588,8 @@ mod tests {
         );
         // EXACTLY ONE placement: current, and no longer a queue entry as well.
         assert!(
-            kernel.with_scheduler_split_mut(|sched| {
-                kernel_ref(&sched.scheduler)
-                    .peek_next_runnable_on(cpu)
-                    .is_none()
-            }),
+            kernel
+                .with_all_cpus_sched_split(|sched| { sched.peek_next_runnable_on(cpu).is_none() }),
             "the prefer primitive must have taken it OUT of the run queue, not duplicated it"
         );
     }
@@ -21890,13 +21952,11 @@ mod tests {
         });
         let global_count = kernel.with(|state| {
             state.with_scheduler_state(|sched| {
-                crate::kernel::boot::kernel_ref(&sched.scheduler)
-                    .runnable_count_on(crate::kernel::scheduler::CpuId(0))
+                sched.runnable_count_on(crate::kernel::scheduler::CpuId(0))
             })
         });
-        let seam_count = kernel.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_ref(&sched.scheduler)
-                .runnable_count_on(crate::kernel::scheduler::CpuId(0))
+        let seam_count = kernel.with_all_cpus_sched_split(|sched| {
+            sched.runnable_count_on(crate::kernel::scheduler::CpuId(0))
         });
         assert_eq!(seam_count, global_count);
         assert!(seam_count >= 1, "enqueued task visible through the seam");
@@ -22113,8 +22173,8 @@ impl SharedKernel {
         let cpu = affinity.unwrap_or_else(|| self.current_cpu_split_read());
         let _ = self.sr_enqueue_committed_receiver_split(tid, Some(cpu));
         if mode == 2 {
-            self.with_scheduler_split_mut(|sched| {
-                let _ = kernel_mut(&mut sched.scheduler).dispatch_next_on(cpu);
+            self.with_all_cpus_sched_split(|sched| {
+                let _ = sched.dispatch_next_on(cpu);
             });
         }
     }

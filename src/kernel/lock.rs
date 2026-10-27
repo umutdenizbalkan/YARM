@@ -129,6 +129,11 @@ impl<T> SpinLockIrq<T> {
         }
     }
 
+    /// Exclusive access needs no lock: `&mut self` proves no guard exists.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
     /// QEMU-LOCK1: construct the ONE witnessed subdomain lock, tagged with a stable non-zero id.
     /// The acquisition algorithm is identical to [`Self::new`]'s lock; the id only selects which
     /// instance the (default-off) witness records.

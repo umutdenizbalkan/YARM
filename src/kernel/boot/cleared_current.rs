@@ -371,13 +371,16 @@ impl AdvanceAuthority<'_> {
 ///
 /// `None` therefore means "the scheduler had already moved on, and nothing changed", which is a
 /// PRE-mutation refusal rather than a post-clear state needing settlement.
+///
+/// SCHED-LOCK1: `view` is `cpu`'s own state under its 1L; the token names the CPU that view was
+/// built for, so no token can name a CPU whose lock the clear did not hold.
 pub(crate) fn clear_current_exact(
-    sched: &mut crate::kernel::scheduler::SmpScheduler,
-    cpu: CpuId,
+    view: &mut crate::kernel::scheduler::CpuView<'_>,
     tid: u64,
     asid: Option<Asid>,
 ) -> Option<ClearedCurrentToken> {
-    let priority = sched.block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid))?;
+    let cpu = view.cpu();
+    let priority = view.block_current_exact(crate::kernel::ipc::ThreadId(tid))?;
     Some(ClearedCurrentToken {
         cpu,
         tid,

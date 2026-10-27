@@ -2049,8 +2049,7 @@ impl KernelState {
             crate::yarm_log!("SCHED_WAKE_ALREADY_RUNNABLE tid={}", tid.0);
         } else {
             let (cpu, reason) = self.enqueue_woken_task(tid.0)?;
-            let queue_len = self
-                .with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu));
+            let queue_len = self.with_scheduler_state(|sched| sched.runnable_count_on(cpu));
             crate::yarm_log!(
                 "SCHED_WAKE_ENQUEUE tid={} cpu={} queue_len={} reason={}",
                 tid.0,

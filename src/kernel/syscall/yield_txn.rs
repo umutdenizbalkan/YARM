@@ -511,11 +511,11 @@ impl YieldOwners for SharedYieldOwners<'_> {
     }
 
     fn reenqueue_and_clear_current(&mut self, cpu: CpuId) -> Option<u64> {
-        self.shared.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_mut(&mut sched.scheduler)
-                .preempt_reenqueue_only_on(cpu)
-                .map(|t| t.0)
-        })
+        // SCHED-LOCK1: `cpu`'s own 1L.
+        self.shared
+            .with_cpu_sched_split(cpu, |c| c.preempt_reenqueue_only().map(|t| t.0))
+            .ok()
+            .flatten()
     }
 }
 

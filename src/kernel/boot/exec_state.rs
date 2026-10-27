@@ -4457,16 +4457,17 @@ impl crate::runtime::SharedKernel {
         {
             return Err(QueueAdvanceRefusal::NoTrapDrainer);
         }
-        // The SAME predicate `KernelState::dispatching_cpu_count` computes, read under rank 1 —
-        // together with the authoritative dispatch CPU, in ONE acquisition.
-        let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
-            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
-            let online = s.online_cpu_bitmap();
-            (
-                (online & !s.wake_only_bitmap()).count_ones() as usize,
-                sched.current_cpu,
-            )
-        });
+        // The SAME predicate `KernelState::dispatching_cpu_count` computes. SCHED-LOCK1: from the
+        // published admission bitmaps (no lock), and the authoritative dispatch CPU is the one
+        // the bitmap names — the ONE online, non-wake-only CPU — never the retired ambient field.
+        let topo = self.sched_domain().topo();
+        let dispatching_set = topo.online() & !topo.wake_only();
+        let dispatching = dispatching_set.count_ones() as usize;
+        let dispatch_cpu = if dispatching == 1 {
+            Some(CpuId(dispatching_set.trailing_zeros() as u8))
+        } else {
+            None
+        };
         // U9-QA §1: pre-check the authentication the commit's selection step will perform. The
         // commit cannot refuse, so this must fail HERE — before the caller blocks anything.
         //
@@ -4478,7 +4479,7 @@ impl crate::runtime::SharedKernel {
             if dispatching > 1 {
                 return Err(QueueAdvanceRefusal::MultiCpu);
             }
-            if dispatch_cpu != cpu {
+            if dispatch_cpu != Some(cpu) {
                 return Err(QueueAdvanceRefusal::CpuNotAuthoritative);
             }
         } else {
@@ -4492,11 +4493,11 @@ impl crate::runtime::SharedKernel {
             return Err(QueueAdvanceRefusal::StashOccupied);
         }
         // (2) rank 1: the NON-mutating candidate peek. The run queue is not touched.
-        let Some(candidate) = self.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_ref(&sched.scheduler)
-                .peek_next_runnable_on(cpu)
-                .map(|t| t.0)
-        }) else {
+        let Some(candidate) = self
+            .with_cpu_sched_split(cpu, |c| c.peek_next_runnable().map(|t| t.0))
+            .ok()
+            .flatten()
+        else {
             return Ok(None);
         };
         // (3) rank 2: the candidate must be resumable BY THE CONVENTION THE CALLER WILL USE.
@@ -4703,10 +4704,11 @@ impl crate::runtime::SharedKernel {
             // current slot are restored to what they were before step (1). The outgoing task
             // remains correctly blocked and will be woken by its own waker. Nothing is stashed, no
             // address space was activated, and no plan was published.
-            let restored = self.with_scheduler_split_mut(|sched| {
-                crate::kernel::boot::kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu)
-                    == Some(crate::kernel::ipc::ThreadId(incoming))
-            });
+            let restored = self
+                .with_cpu_sched_split(cpu, |c| {
+                    c.preempt_reenqueue_only() == Some(crate::kernel::ipc::ThreadId(incoming))
+                })
+                .unwrap_or(false);
             crate::yarm_log!(
                 "D6_GLOBAL_LOCK_DROP_DEFERRED reason=plan_unavailable outgoing={} incoming={} dequeue_undone={}",
                 outgoing_tid,

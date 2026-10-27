@@ -1318,12 +1318,7 @@ impl crate::runtime::SharedKernel {
         // AP-SCHED1: the task's home, fixed before the commit.
         self.resolve_plan_home_split(&mut plan, current_cpu);
         // Phase 3 (rank 1): the shared committer, then the remote half of the commit.
-        let committed = self.with_scheduler_split_mut(|sched| {
-            crate::kernel::task_enqueue::commit_enqueue_locked(
-                kernel_mut(&mut sched.scheduler),
-                &plan,
-            )
-        });
+        let committed = self.commit_enqueue_split(&plan);
         if let Ok(target) = committed {
             crate::arch::hal::notify_enqueued(target);
         }

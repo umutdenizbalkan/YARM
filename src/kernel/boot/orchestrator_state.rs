@@ -1549,18 +1549,22 @@ impl KernelState {
     /// This intentionally forwards to existing behavior while giving callers a
     /// stable helper name for future lock-discipline migration.
     #[allow(dead_code)]
-    pub(crate) fn with_scheduler<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {
+    pub(crate) fn with_scheduler<R>(
+        &self,
+        f: impl FnOnce(&crate::kernel::scheduler::SchedAll<'_>) -> R,
+    ) -> R {
         // Lock-order domain: scheduler
         Self::debug_lock_order_note("scheduler");
         self.with_scheduler_state(f)
     }
 
-    pub(crate) fn scheduler_state(
-        &self,
-    ) -> crate::kernel::lock::SpinLockIrqGuard<'_, SchedulerState> {
+    /// SCHED-LOCK1 — the coherent whole-domain guard (1G, then every 1L ascending). Reachable
+    /// only through `KernelState` (boot, with exclusive access, and hosted tests); production
+    /// split paths take one CPU's 1L through `SharedKernel`.
+    pub(crate) fn scheduler_state(&self) -> crate::kernel::scheduler::SchedAllGuard<'_> {
         // Lock-order domain: scheduler
         Self::debug_lock_order_note("scheduler");
-        self.scheduler_state.lock()
+        self.scheduler_state.lock_all()
     }
 
     /// Stage 114 fix: raw-pointer sibling of the (removed) pre-move
@@ -1656,14 +1660,24 @@ impl KernelState {
     // Stage 101 §6.2 audit — a separate debug "is the lock held?" check would
     // be redundant with the guard the wrapper itself holds).
 
-    /// Stage 108: scheduler (rank 1) seam projector. Unlike the
-    /// `lock + storage` pairs, `scheduler_state` is a `SpinLockIrq` that
-    /// CONTAINS its data, so a single lock pointer is sufficient.
+    /// Stage 108: scheduler (rank 1) seam projector. SCHED-LOCK1: the field is the scheduler
+    /// DOMAIN, which has no whole-domain lock — each CPU's state is behind its own lock (1L),
+    /// admission behind 1G, and the rest is atomic — so a shared pointer is all a seam needs.
     pub(crate) unsafe fn scheduler_split_mut_ptr_from_raw(
         state: *mut KernelState,
-    ) -> *const crate::kernel::lock::SpinLockIrq<SchedulerState> {
+    ) -> *const crate::kernel::scheduler::SchedDomain {
         // SAFETY: see module pattern note above.
         unsafe { core::ptr::addr_of!((*state).scheduler_state) }
+    }
+
+    /// SCHED-LOCK1 — hosted only: the test harness's CPU selector (an atomic, outside the
+    /// scheduler domain).
+    #[cfg(feature = "hosted-dev")]
+    pub(crate) unsafe fn hosted_ambient_cpu_ptr_from_raw(
+        state: *mut KernelState,
+    ) -> *const core::sync::atomic::AtomicU8 {
+        // SAFETY: see module pattern note above.
+        unsafe { core::ptr::addr_of!((*state).hosted_ambient_cpu) }
     }
 
     /// Stage 108: task/TCB (rank 2) seam projector.
@@ -1911,33 +1925,36 @@ impl KernelState {
         }
     }
 
-    pub(crate) fn with_scheduler_state<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {
-        // Lock-order domain: scheduler
+    pub(crate) fn with_scheduler_state<R>(
+        &self,
+        f: impl FnOnce(&crate::kernel::scheduler::SchedAll<'_>) -> R,
+    ) -> R {
+        // Lock-order domain: scheduler (1G, then every 1L ascending)
         Self::debug_lock_order_note("scheduler");
-        let sched = self.scheduler_state.lock();
-        f(&sched)
+        let mut guard = self.scheduler_state.lock_all();
+        let view = guard.view();
+        f(&view)
     }
 
     pub(crate) fn with_scheduler_state_mut<R>(
         &mut self,
-        f: impl FnOnce(&mut SchedulerState) -> R,
+        f: impl FnOnce(&mut crate::kernel::scheduler::SchedAll<'_>) -> R,
     ) -> R {
-        // Lock-order domain: scheduler
+        // Lock-order domain: scheduler (1G, then every 1L ascending)
         Self::debug_lock_order_note("scheduler");
-        let mut sched = self.scheduler_state.lock();
-        f(&mut sched)
+        let mut guard = self.scheduler_state.lock_all();
+        let mut view = guard.view();
+        f(&mut view)
     }
 
     #[cfg(test)]
     pub(crate) fn set_timer_for_test(&mut self, timer: Timer) {
-        self.with_scheduler_state_mut(|sched| {
-            sched.timer = timer;
-        });
+        self.with_scheduler_state_mut(|sched| sched.set_clock_owner_timer_for_test(timer));
     }
 
     #[cfg(test)]
     pub(crate) fn runnable_count_on_for_test(&self, cpu: CpuId) -> usize {
-        self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
+        self.with_scheduler_state(|sched| sched.runnable_count_on(cpu))
     }
 
     /// U9-DISPATCH-CPU2 §2: the exact queued order on `cpu`, priority-major then FIFO — the shape
@@ -1949,24 +1966,23 @@ impl KernelState {
         cpu: CpuId,
         mut f: impl FnMut(crate::kernel::scheduler::TaskPriority, crate::kernel::ipc::ThreadId),
     ) {
-        self.with_scheduler_state(|sched| {
-            kernel_ref(&sched.scheduler).for_each_queued_on(cpu, &mut f)
-        });
+        self.with_scheduler_state(|sched| sched.for_each_queued_on(cpu, &mut f));
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn timer_ticks_for_test(&self) -> u64 {
-        self.with_scheduler_state(|sched| sched.timer.current_ticks().0)
+        self.scheduler_state.clock_now().0
     }
 
+    /// SCHED-LOCK1: the scheduler tick is an atomic with one writer; reading it takes no lock.
     pub(crate) fn scheduler_tick_now(&self) -> u64 {
-        self.with_scheduler_state(|sched| sched.timer.current_ticks().0)
+        self.scheduler_state.clock_now().0
     }
 
     #[cfg(feature = "posix-compat")]
     pub(crate) fn scheduler_tick_advance(&mut self) -> u64 {
-        self.with_scheduler_state_mut(|sched| sched.timer.tick_and_check().0.0)
+        self.with_scheduler_state_mut(|sched| sched.advance_clock_owner_tick().0)
     }
 
     pub(crate) fn with_ipc_state<R>(&self, f: impl FnOnce(&IpcSubsystem) -> R) -> R {
@@ -2145,23 +2161,24 @@ impl KernelState {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_scheduler_then_ipc<R>(
         &self,
-        f: impl FnOnce(&SchedulerState, &IpcSubsystem) -> R,
+        f: impl FnOnce(&crate::kernel::scheduler::SchedAll<'_>, &IpcSubsystem) -> R,
     ) -> R {
         // Multi-lock helper order (must match doc/KERNEL_LOCKING.md):
-        // scheduler -> ipc
+        // scheduler (1G, every 1L) -> ipc
         Self::debug_lock_order_note("scheduler");
-        let sched = self.scheduler_state.lock();
+        let mut sched = self.scheduler_state.lock_all();
+        let view = sched.view();
         Self::debug_lock_order_note("ipc");
         let _ipc_guard = self.ipc_state_lock.lock();
-        f(&sched, kernel_ref(&self.ipc))
+        f(&view, kernel_ref(&self.ipc))
     }
 
     #[cfg(test)]
     pub(crate) fn lock_order_snapshot_for_test(&self) -> (u8, usize, u64) {
         self.with_scheduler_then_ipc(|sched, ipc| {
             (
-                sched.current_cpu.0,
-                kernel_ref(&sched.scheduler).online_cpu_count(),
+                self.current_cpu().0,
+                sched.online_cpu_count(),
                 ipc.telemetry.scheduler_dispatch_calls,
             )
         })

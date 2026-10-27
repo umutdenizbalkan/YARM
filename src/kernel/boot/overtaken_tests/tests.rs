@@ -132,7 +132,7 @@ fn queued(k: &SharedKernel, cpu: CpuId) -> alloc::vec::Vec<u64> {
     k.with(|s| {
         s.with_scheduler_state(|sched| {
             let mut v = alloc::vec::Vec::new();
-            super::kernel_ref(&sched.scheduler).for_each_queued_on(cpu, |_, t| v.push(t.0));
+            sched.for_each_queued_on(cpu, |_, t| v.push(t.0));
             v
         })
     })

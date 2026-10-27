@@ -28,13 +28,13 @@
 //!   block-and-requeue must be atomic against the dispatcher.
 //!
 //! Both call the same functions and therefore cannot drift. What this module must never become
-//! is a *second* scheduler policy: the rank-1 half delegates to `SmpScheduler` primitives
+//! is a *second* scheduler policy: the rank-1 half delegates to the per-CPU scheduler primitives
 //! unchanged, so queue selection, priority ordering and duplicate refusal remain the
 //! scheduler's own.
 
 use crate::kernel::boot::{KernelError, map_scheduler_error};
 use crate::kernel::ipc::ThreadId;
-use crate::kernel::scheduler::{CpuId, SmpScheduler, TaskPriority};
+use crate::kernel::scheduler::{CpuId, CpuView, SchedAll, TaskPriority};
 use crate::kernel::task::{TaskClass, ThreadControlBlock};
 
 /// Which queue the commit half will place the task on.
@@ -190,20 +190,45 @@ pub(crate) fn fix_home_locked(
     }
 }
 
-/// rank 1 — **THE** commit. The only place a task-lifecycle transition touches a run queue.
+/// rank 1L — **THE** commit, on the one CPU whose lock the caller holds. The only place a
+/// task-lifecycle transition touches a run queue.
 ///
-/// Delegates to the `SmpScheduler` primitives unchanged, so wake-only rejection, CPU-online
-/// validation, balanced placement and the duplicate-enqueue refusal all remain the scheduler's
-/// own rules rather than being restated here. Returns the CPU the task actually landed on.
+/// Delegates to the per-CPU scheduler primitive unchanged, so wake-only rejection, CPU-online
+/// validation and the duplicate-enqueue refusal all remain the scheduler's own rules rather than
+/// being restated here. SCHED-LOCK1: the plan must name exactly this CPU (`Pinned(view.cpu())`);
+/// a balanced plan is resolved to a CPU before any 1L is taken (`resolve_plan_home_split`), so a
+/// plan for another CPU is refused (`CpuOffline`, the error a commit onto a CPU that cannot take
+/// it already returns) with nothing mutated.
+pub(crate) fn commit_enqueue_on_cpu_locked(
+    view: &mut CpuView<'_>,
+    plan: &EnqueuePlan,
+) -> Result<CpuId, KernelError> {
+    let cpu = view.cpu();
+    match plan.target {
+        EnqueueTarget::Pinned(target) if target == cpu => view
+            .enqueue_with_priority(ThreadId(plan.tid), plan.priority)
+            .map(|()| cpu)
+            .map_err(map_scheduler_error),
+        _ => Err(map_scheduler_error(
+            crate::kernel::scheduler::SchedulerError::CpuOffline,
+        )),
+    }
+}
+
+/// The whole-domain commit (boot and hosted tests, under every 1L and 1G): a pinned plan is THE
+/// per-CPU commit above on its CPU; a balanced plan takes the coherent balanced choice.
 pub(crate) fn commit_enqueue_locked(
-    scheduler: &mut SmpScheduler,
+    scheduler: &mut SchedAll<'_>,
     plan: &EnqueuePlan,
 ) -> Result<CpuId, KernelError> {
     match plan.target {
-        EnqueueTarget::Pinned(cpu) => scheduler
-            .enqueue_on_with_priority(cpu, ThreadId(plan.tid), plan.priority)
-            .map(|()| cpu)
-            .map_err(map_scheduler_error),
+        EnqueueTarget::Pinned(cpu) => {
+            scheduler
+                .validate_online_cpu(cpu)
+                .map_err(map_scheduler_error)?;
+            let mut view = scheduler.cpu(cpu).map_err(map_scheduler_error)?;
+            commit_enqueue_on_cpu_locked(&mut view, plan)
+        }
         EnqueueTarget::Balanced => scheduler
             .enqueue_balanced(ThreadId(plan.tid), plan.priority)
             .map_err(map_scheduler_error),
