@@ -7022,6 +7022,65 @@ mod tests {
         // (4) the retired seam and selector.
         assert!(!runtime_src.contains("fn with_scheduler_split_mut"));
         assert!(!sched_src.contains("current_cpu:"));
+        // (6) no scheduler lock is held across a notification, an IPI, a remote-completion wait or
+        // an address-space switch: every per-CPU / coherent / admission closure body is scanned.
+        let prod_src = &runtime_src[..runtime_src
+            .find("\n#[cfg(test)]\nmod ")
+            .unwrap_or(runtime_src.len())];
+        let mut scanned = 0usize;
+        for opener in [
+            ".with_cpu_sched_split(",
+            ".with_all_cpus_sched_split(",
+            ".with_cpu_admission_split(",
+        ] {
+            for (at, _) in prod_src.match_indices(opener) {
+                let body = &prod_src[at + opener.len()..];
+                let mut depth = 1i32;
+                let mut end = 0;
+                for (i, ch) in body.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let closure = &body[..end];
+                for banned in [
+                    "notify_enqueued",
+                    "send_reschedule",
+                    "send_ipi",
+                    "shootdown",
+                    "switch_address_space",
+                    "leave_user_root",
+                    "cross_cpu_work",
+                ] {
+                    assert!(
+                        !closure.contains(banned),
+                        "a scheduler-lock closure reaches `{banned}`: {}",
+                        &closure[..closure.len().min(200)]
+                    );
+                }
+                scanned += 1;
+            }
+        }
+        assert!(
+            scanned >= 30,
+            "the closure scan must cover the scheduler seams ({scanned})"
+        );
+        // (7) the hosted test selector is read by exactly one production function, under the
+        // hosted feature: the executing-CPU fallback when no simulated hardware identity is set.
+        assert_eq!(
+            prod_src
+                .matches("self.hosted_ambient_cpu_split_read()")
+                .count(),
+            1
+        );
         // (5) the coherent view in production: exactly the rare paths §16.1 names.
         let prod = &runtime_src[..runtime_src
             .find("\n#[cfg(test)]\nmod ")
