@@ -1442,7 +1442,8 @@ run; every result is kept, and a failed run is never replaced by an unlabeled re
   artifact-binding suites.
 * Q7 VMI: the x86 VMI2 witness and the RISC-V VMI witness. Q8 strict default cores at `-smp 1`
   (x86 on the timer-contract build, as CI strict; AArch64; RISC-V).
-* Q9 the default AP-scheduling witness on each port at 2, 4 and 8 CPUs.
+* Q9 the default AP-scheduling witness on each port at 2, 4 and 8 CPUs (RISC-V at 8 harts with
+  its documented `TIMEOUT_SECS=1500`).
 * Q10 the SCHED-LOCK1 witness on each port at 2 and 4 CPUs on an idle host and on a loaded host
   (`nproc` busy loops for the run), and at 8 CPUs on an idle host.
 * Q11 regressions: x86 SMP1, LOCK3, overtaken return, UART IRQ, exit-current-task, reply-timeout
@@ -1450,13 +1451,28 @@ run; every result is kept, and a failed run is never replaced by an unlabeled re
   PL011 IRQ, exit-current-task, reply-timeout retirement, shared-region direct, ipccall reply;
   RISC-V SMP3, LOCK1, UART IRQ, shared-region replace, exit-current-task, reply-timeout
   retirement, shared-region direct, ipccall reply; CONTEXT1 on x86 and AArch64. COW and reap are
-  exercised by the AP-scheduling witness's phase D.
+  exercised by the AP-scheduling witness's phase D. The shared-region direct smokes run with
+  `OFFSET_SELECTION=1`, as their record requires.
 * Q12 negative controls (contract §17.6), hosted and live, against the frozen candidate.
 * Q13 kernel section sizes against base, and the hosted size of the old and new scheduler domain.
   Q14 the production lock-site census at base and at the candidate.
 
 Every image is built and booted through BUILD-GATES1 (`artifact_build_kernel`,
 `artifact_boot_guard`); no run uses a skip-build path over artifacts it did not publish itself.
+
+*Revision after the first attempts.* Two invocations above were corrected after qualification
+of candidate `155fd8d8`:
+* RISC-V Q9 at 8 harts timed out under the script's 600 s default. The script's own record
+  requires 1500 s.
+* All three shared-region direct smokes were refused by their own artifact binding. Each needs
+  `OFFSET_SELECTION=1`; the default build does not carry the offset-witness initramfs those
+  smokes require. That default is unchanged from base and is recorded as a separate finding.
+* x86 Q10 at 4 CPUs (idle and loaded) ran out of the x86 runner's 900 s default. A
+  development run with a hold-time diagnostic passed in 1041 s. Its stalls were CPU 0's
+  frozen-subject scan waiting out a hold on another CPU, which is the expected cross-CPU wait.
+  The SCHED-LOCK1 smoke now defaults to 2400 s from 4 CPUs, as it already did at 8.
+
+Those failures stay in the record next to the reruns.
 
 The qualification record follows in a documentation-only commit, bound to the candidate that
 produced it.

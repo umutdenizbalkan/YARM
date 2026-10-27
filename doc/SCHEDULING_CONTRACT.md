@@ -1627,6 +1627,11 @@ runs, hashes) are in `doc/KERNEL_UNLOCKING.md` §0.8, bound to the commits that 
   * `lock_all()` (1G, then every 1L ascending; released descending, then 1G) → `SchedAll`, the
     design record's "AllCpus". `exclusive(&mut self)` gives the same view without locking, for
     boot (exclusive `&mut KernelState`) and hosted tests.
+  * The boot and hosted `KernelState` readers of one CPU's current task, `current_tid` and
+    `current_tid_on_cpu`, take that CPU's 1L alone, not `lock_all`. Building the whole view for
+    a one-CPU fact made a 1536-cycle hosted test 4.5 times slower than at base (2.1 s against
+    0.45 s; 0.7 s after this change). That longer exposure let it hit a pre-existing race on a
+    process-global flag in the parallel hosted suite (KERNEL_UNLOCKING, SCHED-LOCK1 findings).
   * Lock-free: `clock_now`, `topo()`, `current_mirror`, `load_mirror`, `current_elsewhere`.
 * **`SharedKernel` seams** (`src/runtime.rs`): `with_cpu_sched_split(cpu, …)` (1L),
   `with_cpu_admission_split` (1G + 1L), `with_all_cpus_sched_split` (the coherent view; exactly

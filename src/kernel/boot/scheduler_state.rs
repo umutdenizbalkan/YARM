@@ -120,12 +120,15 @@ impl KernelState {
     }
 
     pub fn current_tid(&self) -> Option<u64> {
-        let cpu = self.current_cpu();
-        self.with_scheduler_state(|sched| sched.current_tid_on(cpu).map(|tid| tid.0))
+        self.current_tid_on_cpu(self.current_cpu())
     }
 
+    /// SCHED-LOCK1: one CPU's current task is that CPU's own fact, read under its own 1L (rank
+    /// 1L), never the whole-domain view (1G plus every 1L). `None` for an out-of-range or offline
+    /// CPU, exactly as the coherent read answered.
     pub fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
-        self.with_scheduler_state(|sched| sched.current_tid_on(cpu).map(|tid| tid.0))
+        let mut guard = self.scheduler_state.lock_cpu(cpu).ok()?;
+        guard.view().current_tid().map(|tid| tid.0)
     }
 
     pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {

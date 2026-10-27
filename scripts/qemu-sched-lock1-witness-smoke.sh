@@ -17,15 +17,16 @@
 #
 #   ARCH=x86_64|aarch64|riscv64   SMP=N (2..8)   LOGDIR=...   SKIP_BUILD=1
 #   HOST_LOAD=idle|loaded         a LABEL of the host condition the caller arranged; recorded only
-#   TIMEOUT_SECS=...              boot budget passed to the port's runner; default 2400 at 8 CPUs
-#                                 (QEMU TCG with 8 vCPUs and masked-interrupt holds is slow), else
-#                                 the runner's own default
+#   TIMEOUT_SECS=...              boot budget passed to the port's runner; default 2400 from 4
+#                                 CPUs (QEMU TCG with several vCPUs and masked-interrupt holds is
+#                                 slow: an x86 4-CPU run needed 1041 s, over its runner's 900 s),
+#                                 else the runner's own default
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ARCH=${ARCH:?ARCH=x86_64|aarch64|riscv64}
 SMP=${SMP:-2}
 HOST_LOAD=${HOST_LOAD:-idle}
-if [[ -z "${TIMEOUT_SECS:-}" ]] && (( SMP >= 8 )); then export TIMEOUT_SECS=2400; fi
+if [[ -z "${TIMEOUT_SECS:-}" ]] && (( SMP >= 4 )); then export TIMEOUT_SECS=2400; fi
 LOGDIR=${LOGDIR:-/tmp/qemu-sched-lock1-witness-$ARCH-smp$SMP}
 case "$ARCH" in
   x86_64) FEATURE=x86-sched-lock1-witness ;;
