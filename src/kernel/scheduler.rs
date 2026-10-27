@@ -770,6 +770,23 @@ impl CpuSched {
         self.rq.runnable_count() + usize::from(self.rq.current.is_some())
     }
 
+    /// SCHED-LOCK1 witness only: the current slot, read-only.
+    #[cfg(feature = "sched-lock1-witness")]
+    pub(crate) fn witness_current(&self) -> Option<ThreadId> {
+        self.rq.current_tid()
+    }
+
+    /// SCHED-LOCK1 witness only: every queued entry, read-only, in dispatch order.
+    #[cfg(feature = "sched-lock1-witness")]
+    pub(crate) fn witness_for_each_queued(&self, mut f: impl FnMut(TaskPriority, ThreadId)) {
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            let q = &self.rq.queues[PriorityScheduler::priority_index(priority)];
+            for offset in 0..q.len {
+                f(priority, q.tids[RingQueue::index(q.head + offset)]);
+            }
+        }
+    }
+
     /// Where `tid` is on THIS CPU: (current here, queued here). `current` is checked separately
     /// from the queues because the current slot is the authority on what is executing.
     fn placement_here(&self, tid: ThreadId) -> (bool, bool) {
@@ -974,8 +991,13 @@ impl SchedDomain {
     pub fn lock_cpu(&self, cpu: CpuId) -> Result<CpuSchedGuard<'_>, SchedulerError> {
         let idx = cpu.0 as usize;
         let cell = self.cpus.get(idx).ok_or(SchedulerError::InvalidCpu)?;
+        #[cfg(feature = "sched-lock1-witness")]
+        crate::kernel::schedlock1_witness::before_acquire(idx);
+        let guard = cell.lock.lock();
+        #[cfg(feature = "sched-lock1-witness")]
+        crate::kernel::schedlock1_witness::after_acquire(idx, &guard);
         Ok(CpuSchedGuard {
-            guard: cell.lock.lock(),
+            guard,
             cell,
             topo: &self.topo,
             clock: &self.clock,
@@ -993,6 +1015,8 @@ impl SchedDomain {
             return Err(SchedulerError::InvalidCpu);
         }
         let admission = self.admission.lock();
+        #[cfg(feature = "sched-lock1-witness")]
+        crate::kernel::schedlock1_witness::admission_acquired();
         let cpu = self.lock_cpu(cpu)?;
         Ok(CpuAdmissionGuard { cpu, admission })
     }
@@ -1029,6 +1053,8 @@ impl SchedDomain {
         for (idx, slot) in guards.iter_mut().enumerate() {
             *slot = Some(self.cpus[idx].lock.lock());
         }
+        #[cfg(feature = "sched-lock1-witness")]
+        crate::kernel::schedlock1_witness::all_acquired();
         SchedAllGuard {
             domain: self,
             guards,
@@ -1074,12 +1100,20 @@ impl CpuSchedGuard<'_> {
             sched: &mut self.guard,
             topo: self.topo,
             clock: self.clock,
+            #[cfg(feature = "sched-lock1-witness")]
+            cell: Some(self.cell),
         }
     }
 }
 
 impl Drop for CpuSchedGuard<'_> {
     fn drop(&mut self) {
+        #[cfg(feature = "sched-lock1-witness")]
+        crate::kernel::schedlock1_witness::before_release(
+            self.idx,
+            self.cell as *const CpuCell as usize,
+            &self.guard,
+        );
         publish(&self.cell.mirror, &self.guard);
         // `guard` is dropped after this body: the mirror is published while 1L is still held.
     }
@@ -1090,6 +1124,13 @@ pub(crate) struct CpuAdmissionGuard<'a> {
     // Field order is drop order: the 1L guard is released before 1G.
     cpu: CpuSchedGuard<'a>,
     admission: SpinLockIrqGuard<'a, Admission>,
+}
+
+#[cfg(feature = "sched-lock1-witness")]
+impl Drop for CpuAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        crate::kernel::schedlock1_witness::admission_released();
+    }
 }
 
 impl CpuAdmissionGuard<'_> {
@@ -1138,6 +1179,9 @@ pub struct CpuView<'a> {
     sched: &'a mut CpuSched,
     topo: &'a SchedTopo,
     clock: &'a AtomicU64,
+    /// SCHED-LOCK1 witness only: the cell whose 1L this view holds (`None` under `SchedAll`).
+    #[cfg(feature = "sched-lock1-witness")]
+    cell: Option<&'a CpuCell>,
 }
 
 impl CpuView<'_> {
@@ -1389,6 +1433,20 @@ impl CpuView<'_> {
     pub fn set_quantum(&mut self, quantum_ticks: u64) {
         self.sched.quantum.set_quantum(quantum_ticks);
     }
+
+    /// SCHED-LOCK1 witness only: the tick hook, inside this CPU's held 1L (see
+    /// `kernel::schedlock1_witness::on_tick`).
+    #[cfg(feature = "sched-lock1-witness")]
+    pub(crate) fn witness_tick(&self) {
+        if let Some(cell) = self.cell {
+            crate::kernel::schedlock1_witness::on_tick(
+                self.cpu(),
+                cell as *const CpuCell as usize,
+                || cell.lock.is_locked(),
+                self.sched,
+            );
+        }
+    }
 }
 
 /// SCHED-LOCK1 — held 1G and every 1L (see [`SchedDomain::lock_all`]).
@@ -1424,6 +1482,8 @@ impl Drop for SchedAllGuard<'_> {
         // Release the 1Ls in DESCENDING order — each guard restores the interrupt state its own
         // acquisition saved, so the first-acquired guard is released last — then 1G. (Mirrors
         // were republished by the view, while every 1L was held.)
+        #[cfg(feature = "sched-lock1-witness")]
+        crate::kernel::schedlock1_witness::all_released();
         for idx in (0..MAX_CPUS).rev() {
             drop(self.guards[idx].take());
         }
@@ -1468,7 +1528,15 @@ impl SchedAll<'_> {
             sched: &mut *self.cpus[idx],
             topo: self.topo,
             clock: self.clock,
+            #[cfg(feature = "sched-lock1-witness")]
+            cell: None,
         })
+    }
+
+    /// SCHED-LOCK1 witness only: CPU `cpu`'s state under this (coherent) view, read-only.
+    #[cfg(feature = "sched-lock1-witness")]
+    pub(crate) fn witness_cell(&self, cpu: CpuId) -> &CpuSched {
+        &*self.cpus[cpu.0 as usize]
     }
 
     fn cpu_ref(&self, cpu: CpuId) -> Option<(usize, &CpuSched)> {

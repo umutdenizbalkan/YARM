@@ -37,6 +37,18 @@ pub mod ipc;
 pub mod ipccall_direct;
 pub mod ipccall_direct_txn;
 pub mod lock;
+/// SCHED-LOCK1 — the QEMU independence and wake witness (default-off; layered on the AP-scheduling
+/// witness, whose workload it runs on). No default or production profile carries it.
+#[cfg(all(
+    feature = "sched-lock1-witness",
+    not(feature = "hosted-dev"),
+    any(
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "x86_64"
+    )
+))]
+pub mod schedlock1_witness;
 // QEMU-LOCK1: the real subdomain-lock contention / interrupt-progress witness. Default off.
 #[cfg(feature = "riscv64-lock1-witness")]
 pub mod lock1_witness;

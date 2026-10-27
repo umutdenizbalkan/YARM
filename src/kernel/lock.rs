@@ -129,6 +129,13 @@ impl<T> SpinLockIrq<T> {
         }
     }
 
+    /// SCHED-LOCK1 witness only: is the lock held right now (by anyone)? An observation, never a
+    /// decision.
+    #[cfg(feature = "sched-lock1-witness")]
+    pub fn is_locked(&self) -> bool {
+        self.held.0.load(Ordering::Acquire)
+    }
+
     /// Exclusive access needs no lock: `&mut self` proves no guard exists.
     pub fn get_mut(&mut self) -> &mut T {
         self.value.get_mut()

@@ -791,7 +791,7 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// Print one line twice, each copy carrying the CRC of its content.
-fn emit_twice(args: core::fmt::Arguments<'_>) {
+pub(crate) fn emit_twice(args: core::fmt::Arguments<'_>) {
     let mut line = Line {
         buf: [0; 256],
         len: 0,
@@ -871,6 +871,10 @@ fn dump() {
             used(7)
         ));
     }
+    // SCHED-LOCK1 witness (default-off): its sealed dump precedes this one's end marker, so a
+    // runner that stops at APSW_DUMP_END has it whole.
+    #[cfg(feature = "sched-lock1-witness")]
+    crate::kernel::schedlock1_witness::dump();
     let irq = |c: usize| IRQS[c].load(Ordering::Acquire);
     let pre = |c: usize| PRE[c].load(Ordering::Acquire);
     emit_twice(format_args!(

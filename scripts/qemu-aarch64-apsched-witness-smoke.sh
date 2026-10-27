@@ -32,7 +32,13 @@ mkdir -p "$LOGDIR"
 BUILD_DIR="$LOGDIR/build"
 BOOT_LOG="$LOGDIR/boot.log"
 QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64}
-FEATURE=aarch64-apsched-witness
+# SCHED-LOCK1: `APSW_FEATURE=aarch64-sched-lock1-witness` runs the same workload with the
+# independence/wake witness co-enabled (`scripts/qemu-sched-lock1-witness-smoke.sh`); nothing else.
+FEATURE=${APSW_FEATURE:-aarch64-apsched-witness}
+case "$FEATURE" in
+  aarch64-apsched-witness|aarch64-sched-lock1-witness) ;;
+  *) echo "APSW_WITNESS_SEAL arch=aarch64 result=fail reason=unsupported_feature feature=$FEATURE"; exit 2 ;;
+esac
 
 seal() { echo "APSW_WITNESS_SEAL arch=aarch64 $*"; }
 

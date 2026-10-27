@@ -3428,8 +3428,16 @@ impl SharedKernel {
         // AP-SCHED1: this CPU's own quantum; the scheduler tick advances only on the clock owner.
         // SCHED-LOCK1: this CPU's own 1L; the clock is the domain's atomic.
         let (tick, should_preempt) = self
-            .with_cpu_sched_split(cpu, |c| c.tick())
+            .with_cpu_sched_split(cpu, |c| {
+                let ticked = c.tick();
+                // SCHED-LOCK1 witness (default-off): the independence hold, inside this very 1L.
+                #[cfg(feature = "sched-lock1-witness")]
+                c.witness_tick();
+                ticked
+            })
             .unwrap_or((self.sched_domain().clock_now(), false));
+        #[cfg(feature = "sched-lock1-witness")]
+        crate::kernel::schedlock1_witness::after_tick(self, cpu);
         if should_preempt {
             SchedulerTickOutcome::Preempt { cpu, tick: tick.0 }
         } else {
@@ -4167,10 +4175,16 @@ impl SharedKernel {
             target: EnqueueTarget::Pinned(cpu),
             ..*plan
         };
-        self.with_cpu_sched_split(cpu, |c| {
-            crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(c, &pinned)
-        })
-        .map_err(map_scheduler_error)?
+        let committed = self
+            .with_cpu_sched_split(cpu, |c| {
+                crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(c, &pinned)
+            })
+            .map_err(map_scheduler_error)?;
+        #[cfg(feature = "sched-lock1-witness")]
+        if committed.is_ok() {
+            crate::kernel::schedlock1_witness::claim(self, cpu, plan.tid);
+        }
+        committed
     }
 
     /// AP-SCHED1 — the CPU balanced placement chooses now, rotating the next choice's starting
@@ -6354,6 +6368,8 @@ impl SharedKernel {
                 queue_len,
                 reason
             );
+            #[cfg(feature = "sched-lock1-witness")]
+            crate::kernel::schedlock1_witness::claim(self, target, tid.0);
             Some(target)
         };
         if let Some(target) = committed {
@@ -15926,6 +15942,10 @@ impl SharedKernel {
         let enqueued = self
             .with_cpu_sched_split(cpu, |c| c.enqueue_with_priority(ThreadId(tid), priority))
             .is_ok_and(|r| r.is_ok());
+        #[cfg(feature = "sched-lock1-witness")]
+        if enqueued {
+            crate::kernel::schedlock1_witness::claim(self, cpu, tid);
+        }
         if enqueued {
             crate::arch::hal::notify_enqueued(cpu);
         }
@@ -16397,6 +16417,10 @@ impl SharedKernel {
                 error,
                 reconciled: None,
             });
+        #[cfg(feature = "sched-lock1-witness")]
+        if matches!(outcome, ReceiverEnqueue::Enqueued { .. }) {
+            crate::kernel::schedlock1_witness::claim(self, cpu, tid);
+        }
         if matches!(outcome, ReceiverEnqueue::Enqueued { .. }) {
             crate::arch::hal::notify_enqueued(cpu);
         }
@@ -17713,6 +17737,10 @@ impl SharedKernel {
         let enqueued = self
             .with_cpu_sched_split(cpu, |c| c.enqueue_with_priority(ThreadId(tid), priority))
             .is_ok_and(|r| r.is_ok());
+        #[cfg(feature = "sched-lock1-witness")]
+        if enqueued {
+            crate::kernel::schedlock1_witness::claim(self, cpu, tid);
+        }
         if enqueued {
             crate::arch::hal::notify_enqueued(cpu);
         }

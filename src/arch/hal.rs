@@ -208,6 +208,17 @@ pub(crate) fn leave_user_root(cpu: CpuId) -> bool {
 ///   (the NR 6 / NR 7 direct drains, under the diagnostic knob) are unchanged.
 /// * hosted: counted per target, so the suite can prove every enqueue owner reaches this.
 pub(crate) fn notify_enqueued(target: CpuId) {
+    // SCHED-LOCK1 witness (default-off): the notification, as the production owner makes it.
+    #[cfg(all(
+        feature = "sched-lock1-witness",
+        not(feature = "hosted-dev"),
+        any(
+            target_arch = "riscv64",
+            target_arch = "aarch64",
+            target_arch = "x86_64"
+        )
+    ))]
+    crate::kernel::schedlock1_witness::notify(target);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     {
         let me = crate::arch::riscv64::boot::riscv_executing_cpu();

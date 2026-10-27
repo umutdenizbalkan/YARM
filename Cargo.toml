@@ -117,6 +117,15 @@ aarch64-apsched-witness = ["apsched-witness"]
 x86-apsched-witness = ["apsched-witness"]
 # The port-neutral half of the witnesses (`kernel::apsched_witness`): never enabled on its own.
 apsched-witness = []
+# SCHED-LOCK1: the independence and wake witness, on each port's AP-scheduling workload (which it
+# co-enables). CPU A holds its own per-CPU scheduler lock inside its timer tick while CPU B's owner
+# commits and task progress are recorded; a membership trace from a coherent snapshot to a coherent
+# census is replayed by `scripts/grade-sched-lock1-witness.py`. Default-off.
+x86-sched-lock1-witness = ["x86-apsched-witness", "sched-lock1-witness"]
+aarch64-sched-lock1-witness = ["aarch64-apsched-witness", "sched-lock1-witness"]
+riscv64-sched-lock1-witness = ["riscv64-apsched-witness", "sched-lock1-witness"]
+# The port-neutral half (`kernel::schedlock1_witness`): never enabled on its own.
+sched-lock1-witness = []
 # QEMU-LOCK1: real subdomain-lock contention on the production VM address-space lock
 # (`vm_state_lock`, rank 5), driven by the SMP3 two-hart VM/IPI workload (which it co-enables). It
 # instruments the chosen lock's atomic acquire/release, a default-off bounded hold hook that makes a

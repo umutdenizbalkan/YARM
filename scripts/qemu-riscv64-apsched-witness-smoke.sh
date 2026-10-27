@@ -38,7 +38,13 @@ mkdir -p "$LOGDIR"
 BUILD_DIR="$LOGDIR/build"
 BOOT_LOG="$LOGDIR/boot.log"
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
-FEATURE=riscv64-apsched-witness
+# SCHED-LOCK1: `APSW_FEATURE=riscv64-sched-lock1-witness` runs the same workload with the
+# independence/wake witness co-enabled (`scripts/qemu-sched-lock1-witness-smoke.sh`); nothing else.
+FEATURE=${APSW_FEATURE:-riscv64-apsched-witness}
+case "$FEATURE" in
+  riscv64-apsched-witness|riscv64-sched-lock1-witness) ;;
+  *) echo "APSW_WITNESS_SEAL arch=riscv64 result=fail reason=unsupported_feature feature=$FEATURE"; exit 2 ;;
+esac
 PIN=scripts/firmware/riscv64-opensbi.pin
 pin() { sed -n "s/^$1=//p" "$PIN"; }
 FIRMWARE=$(pin path)
