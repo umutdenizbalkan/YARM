@@ -486,7 +486,19 @@ pub fn note_preempt(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
     if task_preemptions(outgoing) <= PRE_RECS_PER_TASK {
         record(K_PREEMPT, c as u64, outgoing, 0, [n, 0, 0, 0, 0]);
     }
+    // SCHED-LOCK1 witness (default-off): labelled fixture synchronization — phase A continues
+    // until the independence rounds are done (`schedlock1_witness::holds_phase_a`).
+    #[cfg(feature = "sched-lock1-witness")]
+    if crate::kernel::schedlock1_witness::holds_phase_a() {
+        return;
+    }
     publish(M_PRE + 8 * c as u64, n);
+}
+
+/// The CPUs on which a phase-A spinner has reported running.
+#[cfg(feature = "sched-lock1-witness")]
+pub(crate) fn spinner_cpus() -> u64 {
+    W_CPUS.load(Ordering::Acquire)
 }
 
 /// The tasks preempted so far, and how many times each (index-paired).

@@ -51,8 +51,9 @@ pub const MAX_W_CPUS: usize = 8;
 const ATTEMPTS: u64 = 3;
 /// Bound on one hold, in spin iterations.
 const HOLD_SPINS: u64 = 400_000_000;
-/// CPU 0 ticks after full admission before the window opens (the workload spreads first).
-const START_TICKS: u64 = 40;
+/// Bound on the open window, in global ticks: past it the window closes with the rounds it has
+/// (the grader then refuses coverage for the missing ones).
+const WINDOW_MAX_TICKS: u64 = 4_000;
 
 // ── record kinds ─────────────────────────────────────────────────────────────────────────────
 pub const K_SNAP_BEGIN: u8 = 1;
@@ -129,6 +130,10 @@ static B_RELATED: AtomicU64 = AtomicU64::new(0);
 /// Tasks B's commits installed during the current hold (tid + 1), with the installing generation.
 static B_INSTALLED: [[AtomicU64; 2]; 8] = [const { [const { AtomicU64::new(0) }; 2] }; 8];
 static B_INSTALLED_N: AtomicUsize = AtomicUsize::new(0);
+/// Per CPU, from its own last tick: it had a task current AND another queued — local scheduling
+/// work a hold's observer can make progress on. A hold starts only when its observer has some.
+static BUSY: [AtomicBool; MAX_W_CPUS] = [const { AtomicBool::new(false) }; MAX_W_CPUS];
+static OPENED_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Per-CPU 1L acquisition generation (by the CELL acquired), and per EXECUTING CPU the number of
 /// 1L and 1G guards it holds.
@@ -418,6 +423,14 @@ fn total_rounds() -> u64 {
 /// observer progress, and — on the round's holder — THE HOLD.
 pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool, sched: &CpuSched) {
     let c = cpu.0 as usize;
+    if let Some(busy) = BUSY.get(c) {
+        let mut queued = 0usize;
+        sched.witness_for_each_queued(|_, _| queued += 1);
+        busy.store(
+            sched.witness_current().is_some_and(|t| t.0 != 0) && queued > 0,
+            Ordering::Release,
+        );
+    }
     let active = HOLD_ACTIVE.load(Ordering::Acquire);
     if active != 0 && c == OBSERVER.load(Ordering::Acquire) as usize {
         if let Some(cur) = sched.witness_current() {
@@ -451,7 +464,8 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
         return;
     }
     let (a, b) = pair(round, NCPU.load(Ordering::Acquire));
-    if c != a {
+    if c != a || !BUSY[b].load(Ordering::Acquire) {
+        // Not this CPU's turn, or its observer has no local scheduling to do now: no attempt.
         return;
     }
     // ── THE HOLD: this CPU's 1L is held by this very tick, interrupts masked ──
@@ -568,15 +582,13 @@ pub(crate) fn after_tick(shared: &SharedKernel, cpu: CpuId) {
             if present.count_ones() < 2 || topo.dispatching() != present {
                 return;
             }
-            static ADMITTED_AT: AtomicU64 = AtomicU64::new(u64::MAX);
-            let now = shared.sched_domain().clock_now().0;
-            if ADMITTED_AT.load(Ordering::Acquire) == u64::MAX {
-                ADMITTED_AT.store(now, Ordering::Release);
+            // The window opens once the workload's phase-A spinners run on every present CPU
+            // (two per CPU, rotated by timer preemption: local scheduling on each CPU).
+            let started = crate::kernel::apsched_witness::spinner_cpus();
+            if started & present != present {
                 return;
             }
-            if now < ADMITTED_AT.load(Ordering::Acquire) + START_TICKS {
-                return;
-            }
+            OPENED_AT.store(shared.sched_domain().clock_now().0, Ordering::Release);
             NCPU.store(
                 u64::from(present.count_ones()).min(MAX_W_CPUS as u64),
                 Ordering::Release,
@@ -589,7 +601,9 @@ pub(crate) fn after_tick(shared: &SharedKernel, cpu: CpuId) {
             drop(view);
             drop(guard);
         }
-        1 if ROUND.load(Ordering::Acquire) >= total_rounds()
+        1 if (ROUND.load(Ordering::Acquire) >= total_rounds()
+            || shared.sched_domain().clock_now().0
+                > OPENED_AT.load(Ordering::Acquire) + WINDOW_MAX_TICKS)
             && HOLD_ACTIVE.load(Ordering::Acquire) == 0 =>
         {
             let domain = shared.sched_domain();
@@ -625,6 +639,14 @@ pub(crate) fn after_tick(shared: &SharedKernel, cpu: CpuId) {
         }
         _ => {}
     }
+}
+
+/// FIXTURE SYNCHRONIZATION (labelled): while the window is not closed, the AP-scheduling
+/// witness withholds its preemption counts from the workload, so phase A's spinners — the
+/// observers' local scheduling — keep running through every round. The window's own tick bound
+/// closes it, so this never holds the workload indefinitely.
+pub(crate) fn holds_phase_a() -> bool {
+    PHASE.load(Ordering::Acquire) != 2
 }
 
 /// The sealed dump, after the AP-scheduling witness's own.
