@@ -1430,6 +1430,33 @@ evidence are in contract §17. In short:
   shootdown waits stay shared), any latency or WCET bound (the 1L/1G wait is still W1: TTAS, no
   fairness), kernel preemption, RT scheduling, hardware behaviour.
 
+**Predeclared qualification schedule** (committed with the candidate, before any qualification
+run; every result is kept, and a failed run is never replaced by an unlabeled rerun):
+
+* Q1 hosted lib, serial (`--test-threads=1`). Q2 the 19 SCHED-LOCK1 tests with harness threading
+  ×3, and all 19 ×20 serially. Q3 every integration suite (`cargo test --test '*'`). Q4
+  `cargo fmt --check`.
+* Q5 fresh default builds of all three ports and the hosted lib, candidate and base `adf5fa63`,
+  warnings compared. Q6 the no-FP check on each published kernel, its self-test, and the no-FP and
+  artifact-binding suites.
+* Q7 VMI: the x86 VMI2 witness and the RISC-V VMI witness. Q8 strict default cores at `-smp 1`
+  (x86 on the timer-contract build, as CI strict; AArch64; RISC-V).
+* Q9 the default AP-scheduling witness on each port at 2, 4 and 8 CPUs.
+* Q10 the SCHED-LOCK1 witness on each port at 2 and 4 CPUs on an idle host and on a loaded host
+  (`nproc` busy loops for the run), and at 8 CPUs on an idle host.
+* Q11 regressions: x86 SMP1, LOCK3, overtaken return, UART IRQ, exit-current-task, reply-timeout
+  retirement, shared-region direct, SMP ipccall reply; AArch64 SMP2, LOCK2, overtaken return,
+  PL011 IRQ, exit-current-task, reply-timeout retirement, shared-region direct, ipccall reply;
+  RISC-V SMP3, LOCK1, UART IRQ, shared-region replace, exit-current-task, reply-timeout
+  retirement, shared-region direct, ipccall reply; CONTEXT1 on x86 and AArch64. COW and reap are
+  exercised by the AP-scheduling witness's phase D.
+* Q12 negative controls (contract §17.6), hosted and live, against the frozen candidate.
+* Q13 kernel section sizes against base, and the hosted size of the old and new scheduler domain.
+  Q14 the production lock-site census at base and at the candidate.
+
+Every image is built and booted through BUILD-GATES1 (`artifact_build_kernel`,
+`artifact_boot_guard`); no run uses a skip-build path over artifacts it did not publish itself.
+
 The qualification record follows in a documentation-only commit, bound to the candidate that
 produced it.
 

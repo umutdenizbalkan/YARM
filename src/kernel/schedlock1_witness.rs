@@ -444,7 +444,8 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
                 .iter()
                 .find(|s| s[0].load(Ordering::Acquire) == cur.0 + 1)
             {
-                B_PROGRESS.fetch_add(1, Ordering::AcqRel);
+                // The record is reserved BEFORE the count, so a progress event the holder counts
+                // always precedes its HOLD_END in sequence order.
                 record(
                     K_PROGRESS,
                     c,
@@ -457,6 +458,7 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
                         0,
                     ],
                 );
+                B_PROGRESS.fetch_add(1, Ordering::AcqRel);
             }
         }
         return;

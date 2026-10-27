@@ -1731,10 +1731,15 @@ The brief explicitly authorized this.
     CLAIM matched by the ADD it names on that destination and incarnation, and every remote add
     followed by its notification.
   * Every record carries a CRC; the grader validates every record before awarding any coverage.
-    Its self-test corpus covers the accepted case and 15 rejections (dropped publication,
-    substituted destination, substituted incarnation, duplicate consumption ×2, missing
-    notification, global serialization, a holder section, a reacquired lock, two locks held,
-    census mismatch, no progress, an unclosed window, …).
+    An observer record reserved after its hold's HOLD_END (the hold ended by its bound while the
+    observer was recording) is counted as late and contributes to no award; one naming a round
+    that never began is invalid. The witness reserves a progress record before counting it, so a
+    counted event always precedes HOLD_END. The self-test corpus has 19 cases: 2 accepted (the
+    valid trace; a late progress record) and 17 rejected (dropped publication, substituted
+    destination, substituted incarnation, duplicate consumption ×2, missing notification, global
+    serialization, a holder section, a reacquired lock, two locks held, census mismatch, no
+    progress, progress only after its hold, progress for a round never held, overflow, an
+    unclosed window, a torn record).
 * **Negative controls** (scratch mutations, never committed; results in the qualification
   record). Hosted: global serialization (one shared flag held inside every 1L section), dropped
   publication, dropped notification, substituted destination, substituted incarnation, duplicate

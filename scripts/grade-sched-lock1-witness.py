@@ -227,16 +227,23 @@ def grade(text, expect_cpus=None):
             if later:
                 raise Fail("natural: remote ADD seq %d (cpu %d → cpu %d) was never notified" % (seq, e, t))
     # ── SYNCHRONIZED: holds ──────────────────────────────────────────────────────────────────
-    attempts, open_hold = [], None
+    attempts, open_hold, late = [], None, 0
     for r in body:
         if r["kind"] == "HOLD_BEGIN":
             if open_hold is not None:
                 raise Fail("validity: nested hold at seq %d" % r["seq"])
             open_hold = {"begin": r, "progress": [], "related": []}
         elif r["kind"] in ("PROGRESS", "RELATED"):
-            if open_hold is None or r["f"][0] != open_hold["begin"]["f"][0]:
+            if open_hold is not None and r["f"][0] == open_hold["begin"]["f"][0]:
+                open_hold["progress" if r["kind"] == "PROGRESS" else "related"].append(r)
+            elif attempts and r["f"][0] == attempts[-1]["begin"]["f"][0] and (
+                    open_hold is None or open_hold["begin"]["f"][0] != r["f"][0]):
+                # Observed during the hold that has just ended (the observer read the hold as
+                # active, then the holder ended it by its bound before this record's slot was
+                # reserved). It is after HOLD_END, so it can contribute to no award: not counted.
+                late += 1
+            else:
                 raise Fail("validity: %s seq %d outside its hold" % (r["kind"], r["seq"]))
-            open_hold["progress" if r["kind"] == "PROGRESS" else "related"].append(r)
         elif r["kind"] == "HOLD_END":
             if open_hold is None or r["f"][0] != open_hold["begin"]["f"][0] or r["cpu"] != open_hold["begin"]["cpu"]:
                 raise Fail("validity: unpaired HOLD_END seq %d" % r["seq"])
@@ -282,9 +289,9 @@ def grade(text, expect_cpus=None):
                    % (missing, [pair(r, n) for r in missing]))
     dirs = sorted({(a, b) for a, b, _, _ in awarded.values()})
     return ("SL1W_GRADE result=pass ncpu=%d | SYNCHRONIZED holds: %d/%d rounds awarded over %d attempts, "
-            "directions %s | NATURAL trace: %d sections (%d remote adds, %d notifications, %d claims "
+            "directions %s, %d late observer records not counted | NATURAL trace: %d sections (%d remote adds, %d notifications, %d claims "
             "matched, %d restores) replayed SNAP→CENSUS exactly"
-            % (n, len(awarded), rounds, len(attempts), dirs, len(secs), remote_adds, notifies,
+            % (n, len(awarded), rounds, len(attempts), dirs, late, len(secs), remote_adds, notifies,
                len(claimed), restores))
 
 
@@ -412,6 +419,21 @@ def self_test():
     def no_progress(ev):
         del ev[find(ev, "PROGRESS")]
     cases.append(("no task progress", build(mutate(g, no_progress)), "never awarded"))
+
+    def late_progress(ev):  # a second progress record lands after round 0's HOLD_END: not counted
+        i = find(ev, "HOLD_END")
+        ev.insert(i + 1, ("PROGRESS", 1, 1, [0, 300, 11, 9]))
+    cases.append(("late progress after its hold (accepted)", build(mutate(g, late_progress)), None))
+
+    def stray_progress(ev):  # progress naming a round that never began
+        ev.insert(find(ev, "HOLD_END") + 1, ("PROGRESS", 1, 1, [5, 300, 11, 9]))
+    cases.append(("progress for a round never held", build(mutate(g, stray_progress)),
+                  "outside its hold"))
+
+    def only_late_progress(ev):  # round 0's only progress lands after its HOLD_END
+        p = ev.pop(find(ev, "PROGRESS"))
+        ev.insert(find(ev, "HOLD_END") + 1, p)
+    cases.append(("only progress is late", build(mutate(g, only_late_progress)), "never awarded"))
 
     cases.append(("overflow", build(g, overflow=1), "overflowed"))
     cases.append(("window not closed", build(g, phase=1), "never closed"))
