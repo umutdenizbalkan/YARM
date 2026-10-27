@@ -1406,3 +1406,171 @@ base on all three ports. The record is in `doc/KERNEL_UNLOCKING.md` §0.8.
 **Unchanged.** Debt conservation, FIFO and exhausted-set membership, same-instant ordering, and
 the production general-purpose differential are untouched, and every earlier test passes. These
 remain **model tests**: SC-CTX-5 stays SPECIFIED → RT-SCHED1, with recovery owned by PARTITION1.
+
+---
+
+## 16. SCHED-LOCK1: ownership decomposition of the scheduler domain (design record)
+
+This section was recorded from the delivered base `adf5fa63` **before any caller was converted**.
+It names, for every field of the old rank-1 domain, its new owner, readers, mutation authority
+and synchronization, and it fixes the cross-CPU protocol. §12 states the requirements
+(SC-LOCK-1…9); the implementation and its evidence are recorded in §17.
+
+### 16.1 Inventory of the old domain (base `adf5fa63`)
+
+One `SpinLockIrq<SchedulerState>` (rank 1, `KernelState::scheduler_state`) held:
+
+| Field (old) | Class | Production writers | Production readers |
+|---|---|---|---|
+| `SmpScheduler.schedulers[c]` — three FIFO rings (64 each), `current`, the 256-slot membership mirror | **CPU-local** | dispatch / preempt / block / exact clear / restore on `c`; enqueue and withdraw targeting `c` | every route on `c`; remote enqueue; the "anywhere" scans |
+| `SchedulerState.ap_quanta[c]`, and the quantum half of `SchedulerState.timer` (c = 0) | **CPU-local** | `tick_on(c)`, `reset_quantum_on(c)`, `set_quantum_all` | `would_preempt_next_on(c)` |
+| the tick half of `SchedulerState.timer` | **global time** | `tick_on(CLOCK_OWNER_CPU)` only (AP-SCHED1) | deadline arming and comparison on every CPU |
+| `SmpScheduler.topology` (present / started / acknowledged / online) | **topology / admission** | boot bring-up; `set_present_cpu_bitmap` | `validate_online_cpu` on almost every route; bitmaps |
+| `wake_only`, `balance_excluded` | **admission** | AP bring-up, `admit_pinned_dispatch`, `admit_dispatch` | enqueue refusal; balanced choice; shootdown sets |
+| `next_balance_cpu` | **placement config** | balanced choice | balanced choice |
+| `SchedulerState.current_cpu` | **ambient selector** | nine split writers (all also given an explicit `cpu`) | `split_terminal_route_admission`, the x86 `yarm.d6_genuine=1` knob paths, `yield_reverify_ready` (discarded), the hosted `executing_cpu_split` fallback, one log line, `KernelState::current_cpu()` on RISC-V and hosted |
+
+Accessors: `SharedKernel::with_scheduler_split_mut` (65 production sites), the raw
+`scheduler_split_mut_ptr_from_raw` reads (7), and the `KernelState` wrappers
+(`with_scheduler_state{,_mut}`, `scheduler_state()`), which are reachable at run time only in boot
+(exclusive `&mut KernelState`) and in hosted tests.
+
+**Coherent transactions** (one acquisition today), all naming one CPU explicitly: enqueue commit
+(`commit_enqueue_locked`), dequeue/withdraw, current install (`dispatch_next*`), block
+(`block_current*`), yield and timer preempt (`preempt_reenqueue_only_on`, `on_preempt*`), exit
+(`clear_current_exact`), rollback (`restore_exact_current_on`, `block_current_on` +
+`enqueue_on_with_priority` on the same CPU), admission (`admit_*` — topology bits + that CPU's
+slots), and remote wake (`enqueue_on_with_priority(target)` with an executing-CPU read).
+`wake_tid_to_runnable_split` is the one transaction that read the executing CPU's slot and
+mutated another CPU's queue in the same acquisition.
+
+**Consumers of multi-CPU snapshots**, and how each is replaced:
+
+| Consumer | Callers | Hotness | Replacement |
+|---|---|---|---|
+| FPU-home "current elsewhere" (`with_current_fpu_home_split`) | every user trap entry and return on x86/AArch64; RISC-V overtaken settle | hottest | own 1L + **current mirrors** of the other CPUs (Dekker argument, §16.4) |
+| `placement_of` (`entering_frame_authority_split_read`, `recv_unwind_placement_outcome_split`, `yield_forfeited_placement_split_read`) | refused-switch and unwind settlements | rare | **coherent all-CPU snapshot** (§16.3) |
+| `task_present_anywhere` / `tid_present_anywhere` for exit restore, reap, post-lock exit validation, `task_present_in_any_runqueue` | exit / reap / validation | rare | **coherent all-CPU snapshot** |
+| `task_present_anywhere` for the direct-IPC receiver-membership check | every direct call / reply | hot | **per-CPU scan** (each CPU under its own 1L, one at a time); frozen-subject argument §16.4 |
+| `live_cpu_bitmap_for_asid_split`, `address_space_loaded_cpus_split` | VMI2 shootdown targets, teardown | warm | **current mirrors** ∪ the hardware residency table (unchanged), §16.5 |
+| `reap_shootdown_cpu_bitmap_split`, `split_terminal_route_admission`, `dispatching_cpu_count`, online/present counts | admission predicates | warm | **published admission bitmaps** (atomic, §16.2) |
+| `balanced_choice` | home fixing at first placement | rare | 1G + **load mirrors** (§16.4) |
+
+### 16.2 New owners
+
+| State | Owner | Readers | Mutation authority | Synchronization |
+|---|---|---|---|---|
+| CPU `c`'s run queues, current slot, membership mirror | `CpuSched[c].rq` | routes on `c`; remote enqueuers; scans and snapshots | **current slot**: operations naming `c` (dispatch, preempt, block, exact clear/restore, rollback). **queues**: the same, plus remote enqueue and withdraw naming `c` | **1L[c]**, one `SpinLockIrq` per CPU |
+| CPU `c`'s quantum | `CpuSched[c].quantum` | `would_preempt_next_on(c)` | `tick_on(c)`, `reset_quantum_on(c)`; quantum configuration | 1L[c] |
+| scheduler tick (time) | `SchedDomain.clock` (`AtomicU64`) | everyone, lock-free | **only** `tick_on(CLOCK_OWNER_CPU)`, under 1L[0] | single writer; `fetch_add` Release, loads Acquire |
+| topology, `next_balance_cpu` | `Admission` | admission paths | boot bring-up; `set_present_cpu_bitmap` | **1G** |
+| published present / online / wake-only / balance-excluded bitmaps | `SchedDomain.topo` (atomics) | every validation, lock-free | admission transitions only | written under 1G **and** the affected CPU's 1L[c]; Release stores, Acquire loads. Hence a holder of 1L[c] sees `c`'s admission bits stable |
+| current mirror[c] (tid + 1, 0 = none) and load mirror[c] (queued + current) | `SchedDomain.mirror[c]` | FPU "elsewhere", VMI2 target sets, balanced choice | written **only** by the holder of 1L[c], when its guard is released (after every mutation it made) | SeqCst stores and loads |
+| ambient `current_cpu` | **removed** from the scheduler domain | — | — | Production decisions use the explicit CPU each route was given. Hosted tests keep a hosted-only selector outside the scheduler (`#[cfg(feature = "hosted-dev")]`), and freestanding RISC-V `KernelState::current_cpu()` uses the hart's own identity |
+
+### 16.3 Lock ranks and the projection rule
+
+* **Rank 1G** — the scheduler admission lock (`SpinLockIrq<Admission>`). Never taken on an
+  ordinary dispatch, enqueue, block, preempt or tick path.
+* **Rank 1L** — the per-CPU scheduler locks. Several are held only by the coherent snapshot,
+  which takes them in **ascending CPU index** and releases them in **descending** order (each
+  guard restores the interrupt state saved by its own acquisition, so the first-acquired guard,
+  which saved the caller's state, is released last).
+* Order: 1G → 1L (ascending) → 2 (task) → 3 … unchanged. Nothing takes 1G while holding a 1L.
+  Rank 2 nested inside a 1L (the acceptance filter, the FPU home) is unchanged from rank 2
+  nested inside the old rank 1.
+* **Projection.** A 1L guard dereferences to that CPU's `CpuSched` and to nothing else: no
+  `&mut SmpScheduler`, `&mut SchedulerState` or other whole-domain reference is manufactured
+  under a per-CPU lock. The only whole-domain view (`AllCpus`) exists while **every** 1L (and,
+  for admission, 1G) is held, or under exclusive `&mut KernelState` at boot, where it borrows the
+  cells through `get_mut` without locking.
+* **`UnsafeCell` / `Send` / `Sync`.** Each `CpuSched` sits in its own `SpinLockIrq` (the
+  existing `UnsafeCell` lock with `Sync for T: Send`). The atomics are `Sync` by construction.
+  Guards are `!Send` (existing `PhantomData<*const ()>`), so a guard and the interrupt state it
+  saved never leave the CPU that acquired it. A view's lifetime is bounded by the guard it
+  borrows from; nothing returns a reference into a `CpuSched` past its guard.
+* No guard is held across an architectural switch, a remote-completion wait (TLB shootdown,
+  `send_to`), or an IPI: the wake IPI is sent after the enqueue guard is dropped, exactly as
+  before.
+
+### 16.4 Cross-CPU protocol
+
+**Remote wake (no new mailbox).** The executing CPU `e` wakes task `t` (incarnation `{tid,
+asid}`, already settled Runnable under rank 2 by the existing owners) to its home `d`:
+
+1. *Reservation is the run queue itself.* Take 1L[d]; check `d`'s admission bits (online, not
+   wake-only) and the queue capacity (`RingQueue` 64 per priority; `QueueFull` is returned
+   **before** any mutation, as today); append and update the membership mirror; publish the
+   mirrors; release.
+2. *Publication → IPI.* `notify_enqueued(d)` is sent after the release. The destination's idle
+   decision (`terminal_idle_on_cpu_split` and the per-port idle loops) reads `d`'s queue under
+   the **same** 1L[d]. Either the idle check is ordered after the commit (it sees the work), or
+   before it (the IPI is sent after the commit and the existing check-then-wait sequence on each
+   port wakes on the pending interrupt). This is the base argument with the global lock replaced
+   by the destination's lock — the only lock both sides take.
+3. *Outstanding work* is the queued entry; its consumer is `d`'s own dispatch. Work is bounded by
+   the queue capacity, and a drain is the existing per-selection scan (§6 W2).
+4. *Full queue / refusal.* No wake is committed before the queue accepts it, so a full queue
+   never makes a committed wake disappear. Each caller keeps its existing settlement of the
+   refusal (QueueFull / WakeOnly / CpuOffline mapped to its existing error, rollback or
+   withdraw).
+5. *Duplicate, stale, cancellation.* Wake arbitration is unchanged and happens before step 1
+   (the rank-2/IPC owners pick exactly one winner and settle the incarnation). The membership
+   mirror refuses a second queue entry for a TID (`AlreadyQueued`), as today. A wake for an
+   exited incarnation is refused by the same rank-2 checks that refused it before; teardown and
+   reuse go through `withdraw_queued_tid_on` / exit clear on the CPU named by the token.
+6. The executing-CPU read in `wake_tid_to_runnable_split` ("already current here") is taken
+   under 1L[e] **before** 1L[d], and the two guards are never held together. The fact is stable:
+   only routes executing on `e` change `e`'s current slot to or from a running task.
+
+No path holds two 1L guards except the ascending coherent snapshot, and no path waits for an
+interrupt or a remote completion while holding any 1L — so two CPUs never need each other's
+scheduler locks.
+
+**Mirrors.** `current mirror[c]` and `load mirror[c]` are rewritten by every 1L[c] guard at
+release, so they equal the state after the last completed critical section on `c`.
+
+* *FPU "current elsewhere".* Each CPU stores its own current mirror (SeqCst, at the release of
+  the install) before it can reach a user return, and its check loads every other CPU's mirror
+  (SeqCst) while holding its own 1L. If one incarnation were installed on two CPUs, the two
+  store→load pairs are SeqCst, so at least one of the two checks observes the other: the
+  duplicate is still refused, by at least one side, exactly as the coherent scan refused it.
+* *Balanced choice.* Under 1G, the least-loaded admitted CPU by load mirrors. The decision is a
+  placement heuristic: any CPU it returns is admitted, and the enqueue onto it re-checks
+  admission under that CPU's 1L. Under serial execution it is identical to the base choice.
+
+**Per-CPU scan (frozen subject).** The direct-IPC check asks whether a receiver that is
+`Blocked` with a committed waiter has any queue or current membership. Such a receiver's
+placement cannot change (nothing can wake it while both hold; there is no migration). A scan
+that reads each CPU under its own 1L, one at a time, therefore returns exactly what the coherent
+snapshot returned for every state the invariant allows; a violating membership that stays on one
+CPU for the scan is still reported.
+
+### 16.5 VMI2 coverage
+
+The shootdown target set stays `(placement ∪ hardware residency) ∩ (online ∖ wake-only)`. The
+placement half now reads current mirrors instead of a locked scan; the residency half
+(`address_space_loaded_bitmap`, set before ring 3 at every activation and cleared only at the
+idle-root handoff) is unchanged and is what covers the dispatch gap (empty `current`, root still
+loaded). Splitting the read therefore cannot recreate the empty-current / root-still-loaded
+omission: that omission was closed by the residency term, not by the placement scan's
+coherence.
+
+### 16.6 What is not changed
+
+Scheduling policy (priorities, FIFO, selection filter, quanta), CPU admission order, fixed
+placement and homes, task identities, `DispatchAuthority` / `DispatchMarkToken`, context
+preservation, first-start consumption, FP/TLS/flags ownership, idle-root handoff, exit/reap
+ordering, CPU 0's timekeeping role and each CPU's own preemption accounting. No kernel threads,
+kernel preemption, RT priorities/budgets, migration or partition windows.
+
+### 16.7 Retained shared dependencies and timing kinds
+
+* W1 holds for every 1L and for 1G: TTAS, no fairness, no bound. 1L contention now comes only
+  from operations naming that CPU (its own routes, remote enqueues/withdrawals to it, the
+  per-CPU scan, the coherent snapshot) instead of from every CPU's operations.
+* W2 (rank-2 acquisitions inside the selection filter), W4 (shootdown waits, never under a 1L),
+  W7 (logging inside scheduler closures) and W8 (membership probes ≤ 256) are unchanged.
+* The coherent snapshot holds every 1L for one O(MAX_CPUS × 3 × 64) scan; it is used only on the
+  rare paths in §16.1.
+* Nothing here is a latency or WCET claim.
