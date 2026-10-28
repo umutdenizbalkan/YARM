@@ -1913,9 +1913,10 @@ are unchanged):**
   staging for its TID, or no such section, is recorded unbound. Nothing is looked up by bare TID
   after the commit.
 * `RUN` records an installed task's first kernel entry on its CPU: the shared trap entry on
-  x86_64 and AArch64, the RISC-V trap entry, or the tick. It gives the CPU's active address space
-  (the activation table) and the installing section. `PROGRESS` carries the same link for the
-  observer during a hold.
+  x86_64 and AArch64, or the RISC-V trap entry. It gives the CPU's active address space (the
+  activation table) and the installing section. `PROGRESS` carries the same link for the
+  observer during a hold. (SCHED-LOCK1-SEAL, §17.9, binds both to the installation timeline and
+  removed the tick-hook `RUN`.)
 * `HOLD_BEGIN` and `HOLD_END` record the holder's interrupt-mask state.
 * **One outcome per hold.** While a hold is in progress, its state carries its token (round and
   attempt) and, once decided, its outcome. A compare-and-swap from open decides the outcome
@@ -1955,9 +1956,102 @@ them.
 
 **Limits.** A claim's incarnation is confirmed only if its task runs again inside the window, so
 the grader reports the confirmed count. Over the 15 qualification boots, 1480 of 1485 claims
-were confirmed; the other five tasks did not run again inside the window.
+were confirmed; the other five tasks did not run again inside the window. (§17.9 replaces this
+binding with the installation that consumed the claim's wake, and reports the unconfirmed claims
+by reason.)
 The confirmation relies on the activation table showing the running task's address space at a
 kernel entry: kernel code runs with interrupts masked except in the idle halt loop, where no task
 is current. A claim for a task without an address space is bound to its commit but carries no
 ASID to confirm.
 
+### 17.9 SCHED-LOCK1-SEAL: execution bound to the installation timeline
+
+The delivered grader (`035d0f56`) accepted two more kinds of trace that do not show what it
+credited. Each was reproduced through its CLI on checksum-valid alterations of its own passing
+fixture, every record written twice identically (KERNEL_UNLOCKING, SCHED-LOCK1-SEAL). They are
+verifier defects reproduced with synthetic evidence, not demonstrated scheduler failures:
+
+1. **Execution after removal from current.** A genuine section cleared the observer's current
+   right after an installation, before that installation's `RUN` and `PROGRESS`; current stayed
+   empty through both, and the task was restored after the hold. The grader credited both
+   rounds: it checked that the named installation had existed, not that it was still the
+   installation in force when the execution was recorded.
+2. **No-ASID bypass.** A claim's incarnation changed to "no address space" while its task's later
+   `RUN` still named its user address space. The grader exempted such claims from comparison;
+   the confirmed count fell from one to zero and the trace passed.
+
+**What `RUN` and `PROGRESS` establish now.**
+
+* **The installation is a scheduler fact with one state.** An installation is a section that
+  makes a task other than 0 current on its CPU. Per CPU, the witness keeps one word for the
+  installation in force: its installing record number and its state. Two transitions leave
+  OPEN, each atomic and each taken once:
+  * the first observed execution: compare-and-swap OPEN → OBSERVED, at a kernel entry on that CPU;
+  * the end: the section that makes the task no longer current (cleared, replaced, blocked or
+    requeued) ors in ENDED under that CPU's 1L, and records `UNINSTALL`, carrying the
+    installation and whether it had been observed.
+
+  So no execution is observed after the end, and the end says whether one was observed before
+  it. A later reinstallation of the same task is a new installation with its own record number;
+  nothing of the old one carries over.
+* **`RUN` is the first kernel entry by the installation in force.** It is taken at the trap
+  entry, from the CPU's published current and the installation word, without a lock. It
+  records:
+  * the task;
+  * the activation table's address space;
+  * the entry's origin: user or kernel mode, from the x86_64 trap context (`CS`), AArch64
+    `SPSR_EL1.M` or RISC-V `sstatus.SPP`;
+  * the acquisition generation of the CPU's 1L, read before the compare-and-swap;
+  * the installation.
+
+  The grader requires each of these:
+  * a real installation of that task on that CPU, observed once, at a generation not before the
+    installation's;
+  * at its record, either that installation is still in force in the replay, or the
+    installation has ended and its end reports it observed (the lock-free entry's record can be
+    published after the end it raced). An end reporting "never observed" refuses any `RUN` of
+    it, wherever it lies;
+  * a generation no later than the ending section's;
+  * every end reporting "observed" has its `RUN`.
+
+  The tick-hook `RUN` (no origin) is removed. In the `3403a1e9` qualification every `RUN` was
+  already the trap entry's.
+* **`PROGRESS` is the installation in force, under the observer's own lock.** It is taken in the
+  observer's tick, holding its 1L, from the installation word, never by matching the task
+  against the hold's earlier installations. The producer previously took the first matching
+  entry of its per-hold history, which names a superseded installation after a reinstallation;
+  that is repaired. Sections on a CPU and its `PROGRESS` records are all reserved under that
+  CPU's 1L, so the grader checks `PROGRESS` strictly at its record: the installation it names
+  must be the one in force there, with that task current. No lag is admitted.
+
+**Claims and the task's class.** A claim is bound to the installation that consumed its wake: the
+first section on the target after the commit that removes the task from the queue, when that
+section installs it. Four states are kept apart:
+* **confirmed:** that installation's first kernel entry came from user mode, and the claim's
+  incarnation equals the address space the CPU had active. The task executed in that space,
+  activated before user entry.
+* **refused:** the same user-mode entry with a different address space, or with a claim of "no
+  address space". A task that executed in user mode has one; the claim cannot opt out by
+  changing its own class.
+* **unconfirmed, with its reason:**
+  * still queued at the census;
+  * withdrawn without installation;
+  * installed but never entered;
+  * entered only from kernel mode, where the active root is not evidence of the task's own space.
+* **unbound** (no staged incarnation): refused as before.
+
+No claim of "no address space" occurred in any qualification boot (every claim and every `RUN` of
+`3403a1e9`'s matrix named a user address space). The class exists in the source (`tcb.asid` is an
+`Option`), so the grader keeps it. Such a claim is confirmed by nothing (no user ASID is invented
+for it) and refused by any user-mode entry of its installation.
+
+**Grader obligations** add `installation` (every end recorded, by the section that ends it, and
+by no other) to those of §17.8. `run`, `progress` and `claim-incarnation` carry the checks above.
+The corpus (`tests/fixtures/sched_lock1/mkcases.py`) models the producer's end records itself,
+independently of the grader. Each of the four new repairs, undone alone, re-admits its
+regression.
+
+**Limits.** The timeline is the record order of each CPU's 1L, which orders its sections and its
+`PROGRESS`. Only the lock-free `RUN` may lag, and only behind an end that reports it observed.
+Claims whose tasks do not run again in the window stay unconfirmed and are reported by reason;
+they are not failures. A kernel-mode first entry neither confirms nor refutes a class.

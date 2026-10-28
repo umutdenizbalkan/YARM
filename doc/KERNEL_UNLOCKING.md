@@ -656,7 +656,7 @@ the production `PriorityScheduler`.
 | Package | Status | Scope | Contract requirements |
 |---|---|---|---|
 | **KERNEL-NOFP1** | **done** (see the record below) | ordinary kernel code and its linked runtime helpers use no FP/SIMD registers. Audited exceptions are the explicit init and context save/restore routines. Proof is by disassembly of the final linked images, bounded by an allowlist; a blanket zero-FP check is wrong. Eager user preservation and exact continuation-owner authentication are unchanged. No compiler flag or calling convention is prescribed. No lazy FP. Cost measurement is outstanding; no WCET or certification claim | SC-FP-1…3, SC-KT-5 |
-| **SCHED-LOCK1** | **done** (see the record below; contract §16–§17); its witness evidence contract finished and its progress claim corrected by SCHED-LOCK1-ACCEPTANCE (SC-LOCK-2 partial, §17.3, §17.8). It was the prerequisite before preemptible kernel threads and before any bounded RT latency claim; it makes neither claim | give CPU-local runnable/current/quantum state explicit local ownership, so unrelated CPUs leave the one shared rank-1 scheduler critical section. Requires bounded local exclusion with a progress argument ("lock-free" is not mandated), and an explicit cross-CPU wake protocol: capacity, full-queue behaviour, publication order, cancellation, no lost wakeups. Preserves incarnation authentication, membership, wake arbitration, dispatch tokens and lock order. Separates global clock, topology and admission. Inventories the remaining shared dependencies. Must explicitly reconcile `AI_AGENT_RULES.md` §14.4 D6, §7.1/§8 below, the `stage106_d6_audit…` source guard and the `KERNEL_LOCKING.md` rank table | SC-LOCK-1…8 |
+| **SCHED-LOCK1** | **done** (see the record below; contract §16–§17); its witness evidence contract finished and its progress claim corrected by SCHED-LOCK1-ACCEPTANCE (SC-LOCK-2 partial, §17.3, §17.8), and its execution evidence bound to the installation timeline by SCHED-LOCK1-SEAL (§17.9). It was the prerequisite before preemptible kernel threads and before any bounded RT latency claim; it makes neither claim | give CPU-local runnable/current/quantum state explicit local ownership, so unrelated CPUs leave the one shared rank-1 scheduler critical section. Requires bounded local exclusion with a progress argument ("lock-free" is not mandated), and an explicit cross-CPU wake protocol: capacity, full-queue behaviour, publication order, cancellation, no lost wakeups. Preserves incarnation authentication, membership, wake arbitration, dispatch tokens and lock order. Separates global clock, topology and admission. Inventories the remaining shared dependencies. Must explicitly reconcile `AI_AGENT_RULES.md` §14.4 D6, §7.1/§8 below, the `stage106_d6_audit…` source guard and the `KERNEL_LOCKING.md` rank table | SC-LOCK-1…8 |
 | **KTHREAD1** | **not started**; after KERNEL-NOFP1 and SCHED-LOCK1 (both done). Neither qualifies kernel preemption | independent kernel threads: owned stacks, entry ABI, kernel-mode preemption, kernel TLS policy, guard check, stack residency and reclamation, trap classifiers | SC-KT-1…4, SC-KT-6…12, SC-BND-2, SC-EXEC-3 |
 | **RT-SCHED1** | after SCHED-LOCK1 | 32-level fixed-priority preemptive selection, scheduling contexts and budgets, calibrated time and earliest-deadline programming, structural no-migration, a fair kernel lock or contention bound, buffered diagnostics | SC-PRI-10…13, SC-CTX-*, SC-TIME-3…6, SC-CPU-2, SC-SEP-*, SC-INV-*, SC-WCET-*, SC-EXEC-* |
 | **PARTITION1** | with or after RT-SCHED1 | cyclic schedule, epoch, windows and boundaries, the OPERATIONAL transition, system allowance and health monitoring, configuration validation | SC-PART-*, SC-POOL-2/4, SC-EXEC-5, SC-IPC-3, SC-BND-3 |
@@ -2068,6 +2068,133 @@ by Q13's byte identity, not by a live run of their own.
 
 No latency, starvation-freedom, WCET or kernel-preemption claim is made. KTHREAD1 is not
 started.
+
+---
+
+#### SCHED-LOCK1-SEAL (from delivered `035d0f56`)
+
+The two remaining reproduced false passes of the scheduler-lock witness are closed. Production
+scheduling policy, lock ownership, task placement, context restoration and invalidation
+behaviour are unchanged. Only default-off witness code (`sched-lock1-witness` builds), the
+grader, its corpus and tests, and the documents change. In the two production files that host
+the witness's trap-entry hook, the change is one argument on a line already gated by the witness
+feature, with no line added or removed. Contract §17.9 holds the evidence contract.
+
+**1. Both false passes, reproduced first.** The delivered grader (`035d0f56`,
+`scripts/grade-sched-lock1-witness.py`, sha256 `fd25193f…`) was run unmodified through its CLI.
+The inputs were built from the delivered corpus builder's healthy trace (`mkcases.py` at
+`035d0f56`, sha256 `0464538a…`) by a scratch script (`mkrepro.py`, `140a4cfe…`). They are
+checksum-valid, with every record written twice identically:
+
+| Input (sha256) | Edit | Delivered grader |
+|---|---|---|
+| baseline (`ba3aa2d5…`) | none | exit 0, 2/2 rounds, 1 incarnation confirmed |
+| A (`e79fca13…`) | after the observer's installation of 300 (cpu 1, gen 9): a genuine section (gen 10) clears current and requeues 300, before 300's `RUN` and `PROGRESS` (tick gen 11), which keep naming that installation while current is empty; after the hold, 300 is restored (gen 12); cpu 1's later wake generations shift by 2; the census is unchanged | exit 0, 2/2 rounds credited |
+| B (`1de41326…`) | the claim for 200: incarnation `inc(9)` → "no address space"; 200's later `RUN` still names `inc(9)` | exit 0, confirmed incarnations 1 → 0 |
+
+These are verifier defects reproduced with synthetic evidence, not demonstrated scheduler
+failures. The inputs, commands, outputs and exit statuses are kept with the qualification
+artifacts.
+
+**2–3. Repairs.** The producer audit found two producer defects as well:
+* `PROGRESS` matched the task against the hold's per-hold installation history and took the
+  FIRST match, which names a superseded installation after a reinstallation inside the hold;
+* the per-CPU installation slot was never closed when its task stopped being current, so nothing
+  recorded whether an execution preceded the end.
+
+The witness now keeps one state word per installation:
+* the first kernel entry observes it by compare-and-swap from OPEN;
+* the section that ends it (current cleared, replaced, blocked or requeued) ors in ENDED and
+  records `UNINSTALL` with the state it found;
+* `RUN` carries the entry's origin (user or kernel mode) and the acquisition generation read
+  before the compare-and-swap; the tick-hook `RUN`, which had no origin, is removed;
+* `PROGRESS` names the installation in force, under the observer's 1L.
+
+The grader tracks installations through the replay (`installation`). It checks every `RUN`
+against the installation in force at its record, or after its end only when the end reports it
+observed and no later than the end's generation (a lock-free entry may publish late). It checks
+every `PROGRESS` strictly against the installation in force (it is taken under the same lock as
+the sections). It binds each claim to the installation that consumed its wake, confirms only on
+a user-mode entry, and refuses a "no address space" claim against one. Unconfirmed claims are
+reported by reason.
+
+**4. Tests and controls.**
+* The corpus builder models the producer's end records itself, independently of the grader.
+  There are 76 cases.
+* New negatives:
+  * both reproductions in the new format;
+  * `RUN` while current is empty; `RUN` while another task is current;
+  * `PROGRESS` naming a superseded installation; `PROGRESS` while current is empty, with its
+    `RUN` excused as a delayed publication;
+  * execution linked to the first installation after a reinstallation;
+  * a delayed `RUN` past its end's generation;
+  * an end reporting an observation with no `RUN`; an end not recorded; an end for an
+    installation not in force;
+  * `RUN` naming another task or CPU than its installation;
+  * a `RUN` contradicting its claim;
+  * a contradictory `RUN` hidden by an end that reports it never observed;
+  * a contradictory `RUN` hidden by a "no address space" claim.
+* New positives:
+  * a genuine reinstallation with execution linked to the new installation;
+  * a legitimate delayed `RUN` publication;
+  * claims whose tasks never run again;
+  * "no address space" claims whose tasks never run, or are entered only from kernel mode.
+* Four new repair tags (`installation`, `run-timeline`, `progress-timeline`, `no-asid`) are each
+  undone alone. Each re-admits its named regression, and only cases of its own obligation
+  change. The `progress` control now names "progress reports another incarnation than its run",
+  because the queue-only-commit case it named is also refused by `progress-timeline`.
+* Source pins keep the compare-and-swap observation, the generation read before it, the single
+  (trap-entry) observer, the `ENDED` or with its `UNINSTALL`, and `PROGRESS` from the
+  installation word.
+* Two live controls are added. `no_end` records no end once inside the window, and `installation`
+  must refuse it. `noasid` makes every wake owner stage "no address space" (the live form of B),
+  and `claim-incarnation` must refuse it.
+
+**Predeclared qualification schedule** (committed with the candidate, before any qualification
+run; every result is kept; a failed sample is never replaced by an unlabeled rerun):
+
+* Q1 hosted lib, serial. Q2 focused:
+  * the SCHED-LOCK1 hosted tests ×3 (harness threading);
+  * the grader CLI suite ×3;
+  * the grader self-test;
+  * the reproductions re-run against the frozen grader on the original inputs (old-format: refused
+    by `installation`, as they predate the end records);
+  * both alterations of a new-format boot log from the frozen candidate (`mkreal.py`, `cf39507b…`,
+    on the Q9 RISC-V `-smp 2` idle boot), A required to fail `run` and B `claim-incarnation`, the
+    unaltered log to pass.
+* Q3 every integration suite. Q4 `cargo fmt --check`. Q5 the production lock-site census against
+  `035d0f56`.
+* Q6 fresh default builds of all three ports, candidate and `035d0f56`, comparing every published
+  kernel and initramfs hash and the warnings. They are expected byte-identical. Q7 the no-FP check
+  on every image of Q6 and Q8, its self-test, and the no-FP and artifact-binding suites.
+* Q8 image identity of the default AP-scheduling witness kernels (three ports), x86 VMI2, RISC-V
+  VMI, RISC-V SMP3, x86 SMP1 and AArch64 SMP2, candidate against `035d0f56`. They are expected
+  identical. Any difference is explained and booted fresh.
+* Q9 the SCHED-LOCK1 witness, the established 15-boot matrix (each port at 2 and 4 CPUs idle and
+  loaded, and at 8 CPUs idle; 2400 s from 4 CPUs). Every emitted `RUN` and `PROGRESS` is validated,
+  including those of uncredited attempts.
+* Q10 live negative controls on the frozen candidate (RISC-V, `-smp 2`): hold-scoped global
+  serialization, dropped notification, dropped publication, substituted destination, duplicate
+  consumption, `no_end` and `noasid`. A watchdog timeout is reported as a timeout.
+* Q11 kernel section sizes of the Q6 default kernels against `035d0f56`.
+* Q12 affected regressions booted fresh on the candidate:
+  * the strict default cores (three ports);
+  * the AP-scheduling witness at 2 CPUs on each port; x86 VMI2, RISC-V VMI, RISC-V SMP3 (one
+    scheduled run), x86 SMP1 and AArch64 SMP2;
+  * the established SCHED-LOCK1 regression list (LOCK1/2/3, overtaken, UART/PL011 IRQ,
+    exit-current-task, reply-timeout retirement, shared-region direct with offset selection,
+    `ipccall` reply direct, shared-region replace, CONTEXT1 on x86_64 and AArch64).
+
+Every image is built and booted through BUILD-GATES1 (`artifact_build_kernel`,
+`artifact_boot_guard`) with truthful features, source identity and hashes.
+
+The SMP3 verifier's missing residency input and its IPI-recording stamping race stay named and
+open (§16.5; SCHED-LOCK1-ACCEPTANCE); they are not repaired here, and no production behaviour
+changes to satisfy them. The parallel hosted-test race and the unrelated red CI jobs stay named
+and open; global test concurrency is not changed here.
+
+The qualification record follows in a documentation-only commit, bound to the candidate that
+produced it.
 
 ---
 
