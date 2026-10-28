@@ -1853,6 +1853,8 @@ above in full, and every result is kept. Two scheduled samples failed:
   (merged, seq 129), CPU 1's swap consumed it, and its arrival record (seq 128) was stamped first.
   The extra firmware request then arrived empty (seq 132, `empty=1`). Neither `ipi.rs` nor
   `smp3_record.rs` changed since `b7f33257`. It stays open and named, and is not repaired here.
+  *(SMP3-EVIDENCE1: reproduced on `0e21b2a6` and repaired in both verifiers. The interleaving was
+  legal; the verifier paired records by their order.)*
 
 The re-frozen candidate is qualified by the whole schedule above, run again (Q1–Q11), plus:
 * **Q12**: fresh boots of every differing image class Q6/Q8 found:
@@ -2019,8 +2021,8 @@ watchdog timeout occurred:
 | Freeze | Run | Verdict | Cause | Outcome |
 |---|---|---|---|---|
 | `64c9fdcf` | Q9 x86_64 2 CPUs loaded | `attempt: … reports success with commits=7 progress=1 related=1` | candidate: two closers of one hold | repaired (one outcome per hold), re-frozen |
-| `64c9fdcf` | Q8 RISC-V SMP3 | `ipi_merge_inconsistent` at 129 | SMP3 checker stamping race (merged publication stamped after the consuming arrival) | open, named |
-| `3403a1e9` | Q8 RISC-V SMP3 | `shoot_targets_inconsistent` at 8 | SMP3 verifier lacks the residency half of the target set | open, named; §16.5 corrected |
+| `64c9fdcf` | Q8 RISC-V SMP3 | `ipi_merge_inconsistent` at 129 | SMP3 checker stamping race (merged publication stamped after the consuming arrival) | open, named; repaired in the verifiers by SMP3-EVIDENCE1 |
+| `3403a1e9` | Q8 RISC-V SMP3 | `shoot_targets_inconsistent` at 8 | SMP3 verifier lacks the residency half of the target set | open, named; §16.5 corrected; repaired in the verifiers by SMP3-EVIDENCE1 |
 
 On `64c9fdcf` every other scheduled run passed, including the other 14 matrix boots and all five
 live controls.
@@ -2345,6 +2347,233 @@ own.
 
 No fairness, latency, starvation-freedom, WCET or kernel-preemption bound is established.
 SMP3-EVIDENCE1 and KTHREAD1 are not started.
+
+#### SMP3-EVIDENCE1 (from delivered `0e21b2a6`)
+
+The two remaining SMP3 evidence defects are repaired in the witness and in both verifiers.
+Production scheduling, mailbox semantics, invalidation policy, completion requirements and
+quarantine are unchanged. Contract §17.10 holds the evidence contract.
+
+The changes, kept apart:
+* **Production, two files, no line added or removed:**
+  * `runtime.rs` `live_cpu_bitmap_for_asid_split` names its residency contribution `loaded`, and
+    returns `bitmap | loaded` — the same value as before. Inside its existing witness-gated call
+    it hands the witness the four values it computed with. A comment is re-wrapped to keep the
+    line count.
+  * `kernel/boot/mod.rs` compiles the pure verifier `smp3_record` in hosted builds too, for the
+    differential test. This is one `cfg` line. Freestanding kernels never enable `hosted-dev`.
+* **Instrumentation** (default-off, `riscv64-smp3-witness`):
+  * `ShootInputs` (the decision's inputs) and `IpiConsumed` (one record per consumed source,
+    with its ordinal);
+  * the publication group in `IpiPublished`;
+  * `WitnessSync` markers and two labelled synchronizations;
+  * dispatch-gap rounds in the witness program;
+  * an `SMP3_EVID_SYNC` dump line.
+* **Checkers:**
+  * `smp3_record.rs`, the kernel verifier;
+  * `scripts/grade-riscv64-smp3-witness.py`: a records-only CLI and the same obligations, order
+    and codes;
+  * `tests/smp3_evidence_differential.rs` and its corpus `tests/fixtures/smp3_evidence/`.
+
+**1. Both defects, reproduced on the unmodified base first.** The production owners, the witness
+producers, the Rust verifier and the Python grader were read first.
+
+*A — shootdown residency.* A deterministic test was appended, in a scratch worktree only (never
+committed), to `0e21b2a6`'s `smp3_record.rs` (`repro_s3e.rs`, sha256 `baf4687c…`), and run with
+`cargo test --lib s3e_repro`. The cases are C (CPU 0) replacing S's W with S's CPU in the target
+set, the fence requested and completed before settlement:
+
+| Case | Delivered `replacement()` |
+|---|---|
+| A0: S current on its CPU | `Ok(resident=true)` |
+| A1: S's CPU has no current task; its root is still loaded | `Err("shoot_targets_inconsistent")` |
+| A2: another task of S's address space (tid 9399) current there | `Err("shoot_targets_inconsistent")` |
+
+The verifier derived "resident" from `current == S`. Production names the CPU by its residency
+contribution.
+
+*B — mailbox order.* The protocol has these linearization points:
+* `send_reschedule`: `fetch_or` (the publication), `fence rw,rw`, then the record;
+* `take_arrival`: `clear_ssip`, then `swap` (the consumption), then the record at its call site.
+
+The other CPU can act between either operation and its record. The legal interleaving is: C's
+`fetch_or` finds its bit set (merged); S swaps it out and records its arrival; then C records the
+publication.
+
+| Case | Delivered `check_ipi_population` |
+|---|---|
+| B1: merged publication recorded after the arrival that consumed its bit | `Err(MergeInconsistent { publication: 3 })` |
+| B2: fresh publication recorded after the arrival that consumed it | `Err(Unexplained { arrival: 0 })` |
+| B3: second fresh publication before the first's arrival record | `Ok((2, 2, 0, 0))` (the AP-SCHED3 allowance) |
+
+No kernel failure was manufactured.
+
+*Historical regrade* (kept separate from the fresh qualification): the delivered grader (sha256
+`4f22f7d2…`), run through its CLI with the pinned firmware file and each run's identity:
+
+| Retained log (sha256) | Delivered grader |
+|---|---|
+| `64c9fdcf` Q8 (`ee0a3ba3…`) | exit 1, `seq 129: merged publication 0->1 with none pending`; kernel `ipi_merge_inconsistent at=129` |
+| `3403a1e9` Q8 (`f0cbcdd7…`) | exit 1, `fence attempt 8 (target C): shoot_targets_inconsistent` |
+| `155fd8d8` Q11 (`f385b77d…`) | exit 1, `fence attempt 18 (target C): shoot_targets_inconsistent` |
+
+**2. The decision's inputs, from the owner.** `complete_unmap_shootdown_from_split` records:
+* `ShootInputs` (asid, va, online | wake-only, placement, loaded), from values
+  `live_cpu_bitmap_for_asid_split` handed over inside its own computation, with nothing re-read;
+* then `ShootTargets` (asid, va, the target set, the current tasks it read);
+* then the fence request (CPU set, hart mask, generation) and its completion, as before.
+
+Both verifiers check the target set against `(placement | loaded) & !requester`, and the
+placement contribution against the current tasks read. They require every named CPU's fence, on
+exactly its hart, completed before acknowledgement and settlement.
+
+Fenced (owed) is kept apart from resident (coverage):
+* an empty current or another task of the address space is fenced and graded `not_current`;
+* a CPU that left the address space and flushed is excluded by its recorded inputs, and needs
+  activation evidence, as before;
+* an invalid operation fails before coverage is considered.
+
+**3. Attribution from the mailbox protocol.** The publisher numbers its groups from its own
+`fetch_or` result. The consumer numbers its consumptions from its own swap, recording one
+`IpiConsumed` right after each arrival. The k-th consumption takes group k exactly, in any record
+order. Contract §17.10 lists the interleavings accepted and the refusals kept:
+* lost publication;
+* unexplained consumption;
+* duplicate attribution;
+* wrong source or target;
+* stale group;
+* firmware failure;
+* arrivals beyond requests.
+
+The AP-SCHED3 allowance is gone; the protocol covers its case. A wake that merged into another
+publication's group earns no coverage (`p1_merged`, P2 `merged_publication`); the fixed
+thresholds are unchanged. No witness lock serializes the mailbox and no masking changes: each
+side reads only its own operation's result.
+
+**4. One contract, two verifiers.** The Python grader's `verify_records` mirrors the kernel
+verifier obligation for obligation, in the same order with the same failure codes. Its
+`--records` mode prints the verdict, the counts and every graded attempt.
+
+`tests/smp3_evidence_differential.rs` runs the production Rust `verify_attempts` and that CLI on
+every case. They must print identical lines, and each verdict must be the case's own. The cases
+are 44 edits of `base.rec`, the sealed record of a passing development boot of this build
+(1,094 records). `mkcases.py` finds the records each edit targets by what they are, checks that
+every reordering keeps each CPU's own program order, and states each expected verdict. The cases
+cover:
+* placement-only, residency-only and overlapping contributions;
+* the dispatch gap in both directions;
+* another task of the address space;
+* a justified exclusion after leaving and flushing;
+* missing or substituted targets, CPU sets and hart maps;
+* the fence naming the requester's hart or another hart;
+* a relabelled boot whose hart ids differ from its CPU ids;
+* failed, missing, duplicated, other-generation and other-CPU completions;
+* settlement before completion;
+* a decision recorded by another CPU, and missing or unrecorded inputs;
+* both delayed-record orders, and a fresh publication between a swap and its arrival record;
+* missing, misplaced, duplicated and wrong-source consumptions;
+* an unexplained arrival, a lost publication, stale and wrong-group publications;
+* a wrong hart, a refused firmware request, and arrivals beyond requests.
+
+The base record itself carries coalesced groups, synchronized delayed records, and synchronized
+and natural gap decisions. The test also pins the step tables and the producer facts:
+* the inputs are the owner's own values;
+* groups and consumptions are numbered by their own operations;
+* the synchronizations touch neither the mailbox nor the fence.
+
+**Undo controls.** Each repair is reverted alone, in a worktree of the candidate: the decision
+check and the group attribution, in Rust and in Python separately. The scheduled run must show
+each regression failing. In development:
+* the Rust decision undo fails 4 unit tests, and the base record itself (with its gap decisions)
+  is refused, so the two verifiers disagree on every case;
+* the Rust attribution undo fails its tests too.
+
+**5. Live evidence, with labelled synchronization** (default-off, bounded, run with no domain lock
+held; never production behaviour):
+* **Dispatch gap.** In P3 rounds 23 and 24 (one per direction) the target yields in a loop once the
+  requester's readiness is recorded, instead of spinning. Its CPU keeps passing through the yield
+  drain with no current task and its root still loaded. The requester's shootdown waits, bounded
+  (`note_shoot_begin`, before the decision), until it sees that state. The decision is then taken
+  from whatever is there. These rounds are uncredited by design (the target enters the kernel);
+  their fence and completion are graded like any other.
+* **Delayed merged record.** A merged publication's record (not its `fetch_or`) waits, bounded,
+  until the target consumed its group. That is at most 8 per boot, and the firmware request
+  follows unchanged.
+
+Each records a `WitnessSync` marker, so synchronized and natural cases are reported apart.
+
+Development boots before the freeze:
+* dev 1, without the synchronizations: passed; no delayed record and no gap decision occurred
+  naturally.
+* dev 2, with them: passed; 7 synchronized delayed merged records; gap decisions in rounds 23
+  and 24 (synchronized) and round 12 (natural), each fenced, completed and graded `not_current`.
+
+**Controls.**
+* Live, each one exact substitution in a worktree of the candidate:
+  * suppressed IPI (`no_ipi`);
+  * SSIP never cleared (`no_ssip_clear`);
+  * consumption missing (`no_consume`);
+  * remote fence omitted and reported complete (`no_rfence`);
+  * failed completion (`fail_completion`);
+  * completion substituted by a fence of the requester's own hart (`substitute_completion`);
+  * context corruption (`corrupt_ctx`);
+  * new: the target set narrowed to placement, dropping residency while its inputs are still
+    recorded (`narrowed_mask`).
+* Verifier only (`vmut.py`): one sealed record of a candidate boot altered, both copies
+  re-checksummed — duplicate attribution, wrong source, phantom source, merged into another group,
+  stale group, a gap decision's target dropped, a gap CPU claimed as placement, a failed fence on
+  a gap decision, the fence naming the requester's hart, settlement swapped before completion, an
+  IPI dispatch relabelled as the timer's, and a step moved to another round. Each must be refused
+  for its own obligation.
+
+**6. Qualification schedule, fixed before the freeze.** The run is of the frozen commit carrying
+this text, from a fresh worktree. Every scheduled result is reported: no reruns, no retries
+until passes accumulate.
+* A candidate-caused failure means repair and re-freeze, and the whole schedule runs again.
+* Any other failure is named and kept.
+
+The steps:
+* **Q1** hosted lib, serial.
+* **Q2:**
+  * `smp3_record` unit tests ×3 and the differential test ×3;
+  * corpus regeneration identical to the committed `cases.txt`;
+  * the records CLI on `base.rec`;
+  * the four undo controls;
+  * the historical regrade: the retained logs through the frozen grader, labelled. They predate
+    the new records, so each is expected to fail `ipi_consumption_unbound`.
+* **Q3** integration. **Q4** `cargo fmt --check`. **Q5** the lock-site census against `0e21b2a6`.
+* **Q6** fresh three-port default builds through BUILD-GATES1, against `0e21b2a6`: image
+  identity, warnings and hosted warnings. **Q7** no-FP on every image. **Q11** section sizes.
+* **Q8** witness kernels against `0e21b2a6`: the AP-scheduling witnesses, x86 VMI2, RISC-V VMI,
+  SMP3, LOCK1 and shared-region replace, x86 SMP1 and AArch64 SMP2.
+* **Q9** 20 scheduled strict two-hart SMP3 boots with the pinned OpenSBI, alternating idle and
+  loaded host (`nproc` busy loops), 10 each, with the default 300 s budget. Each boot is reported
+  with its verdict, counts and attempts, and with its synchronized and natural cases apart.
+* **Q10:**
+  * the eight live controls, each with a 300 s budget (the IPI and SSIP controls are expected to
+    time out or fail);
+  * the twelve verifier controls on Q9's first idle boot.
+* **Q12** affected regressions, booted fresh:
+  * the strict default cores (three ports);
+  * the AP-scheduling witness at 2 CPUs (three ports);
+  * the SCHED-LOCK1 witness at 2 CPUs (three ports);
+  * RISC-V LOCK1, VMI, shared-region replace and UART IRQ;
+  * x86 VMI2 and UART IRQ; AArch64 PL011 IRQ;
+  * shared-region direct on three ports (offset selection).
+
+**What stays unconfirmed or QEMU-limited:**
+* QEMU gives no architectural barrier or timing evidence. The image-ordering check
+  (`check-riscv64-smp3-sequence.sh`) stays the evidence for the fence, publication and clear
+  order.
+* Which firmware request raised a given SSIP is not knowable. Coalescing makes it ambiguous by
+  design; attribution is by consumption.
+* Remote-fence completion is the pinned OpenSBI's answer. Staleness is observed only as QEMU
+  models TLBs.
+* The dispatch-gap decision is exercised under labelled synchronization. Its natural rate is
+  whatever the scheduled boots show.
+
+Open and unchanged: the parallel hosted-test race, the red CI jobs and lock fairness (§17.3).
+KTHREAD1 is next and is not started.
 
 ---
 
@@ -25744,6 +25973,8 @@ effect on RISC-V. "Hart online" with zero arrivals is not interrupt qualificatio
 * **Arrival** (`ipi::take_arrival`, one owner per trap): clear `sip.SSIP`, THEN swap the mailbox,
   so a publication racing the swap leaves SSIP pending for the next arrival rather than being
   lost. Empty arrivals and merged publications are counted, never taken as loss or duplication.
+  *(SMP3-EVIDENCE1: publications are attributed to consumptions by publication group and
+  consumption ordinal, not by record order — contract §17.10.)*
   U-origin: taken at the bridge entry and carried as `software_interrupt`; the interrupted task
   keeps running (`RISCV_IPI_SETTLED … settlement=return_to_interrupted`). Idle-origin: the S-mode
   landing owes the SAME idle queue advance the timer's owes, discharged by the same drain under an
@@ -26166,7 +26397,10 @@ fence or from a failed assertion:
   computation saw it off-CPU AND an `Activation` of its ASID on its hart lies after the displacement and
   before its observation; without that evidence it fails (`off_cpu_target_not_reactivated`). A
   computation whose mask disagrees with its own snapshot fails (`shoot_targets_inconsistent`), as does
-  one naming the requester.
+  one naming the requester. *(Superseded by SMP3-EVIDENCE1, contract §17.10: that check omitted the
+  loaded-root residency half of the decision. The decision is now checked against the policy over
+  the inputs its owner recorded; a CPU named by residency alone is fenced and owed its completion,
+  and a valid attempt whose target was not current is uncredited, `not_current`.)*
 * **P4 (mutual)**: unchanged overlap obligation (both operations entered before either completed); an
   off-CPU target of either operation needs the same activation evidence.
 * **Settlement, every displaced page**: shootdown targets recorded between displacement and settlement,

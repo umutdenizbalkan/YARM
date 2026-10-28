@@ -1621,6 +1621,12 @@ each CPU's own state, which is correct whatever the verifier models. The verifie
 residency input is an open witness defect, named here and not repaired by SCHED-LOCK1-ACCEPTANCE.
 As before, no withheld fence and no premature reclamation was observed, and none is claimed.
 
+*Repaired in the verifiers (SMP3-EVIDENCE1, §17.10).* The witness now records the decision's own
+inputs, and both verifiers check the target set against the policy over them: a CPU named by
+residency alone is fenced and owed its completion, and a valid gap attempt is uncredited
+(`not_current`), not refused. This repairs the verifier only. It does not show that the per-CPU
+read repair removed the verdict, and that claim stays withdrawn.
+
 ### 16.6 What is not changed
 
 Scheduling policy (priorities, FIFO, selection filter, quanta), CPU admission order, fixed
@@ -2055,3 +2061,148 @@ regression.
 `PROGRESS`. Only the lock-free `RUN` may lag, and only behind an end that reports it observed.
 Claims whose tasks do not run again in the window stay unconfirmed and are reported by reason;
 they are not failures. A kernel-mode first entry neither confirms nor refutes a class.
+
+### 17.10 SMP3-EVIDENCE1: the SMP3 evidence contract
+
+The RISC-V SMP3 witness (QEMU-SMP3, KERNEL_UNLOCKING) had two evidence defects left open by
+SCHED-LOCK1-ACCEPTANCE and SCHED-LOCK1-SEAL. Both were reproduced on delivered `0e21b2a6` before
+any change (KERNEL_UNLOCKING, SMP3-EVIDENCE1 §1). Both are verifier defects. Neither is a
+demonstrated kernel failure, and no production behaviour changes to satisfy the verifiers:
+
+1. **Shootdown verification omitted loaded-root residency.** The verifier derived "resident" from
+   `current == target`. It required the decision's bit for the target CPU to equal that, and owed
+   a fence only then. Production names a CPU by placement OR loaded-root residency (§16.5), so a
+   CPU named by residency alone was refused as inconsistent. That covers the dispatch gap (empty
+   `current`, root still loaded) and another task of the same address space. This is the
+   `shoot_targets_inconsistent` verdict of `155fd8d8` and `3403a1e9`. The claim that the
+   SCHED-LOCK1 per-CPU read repair eliminated that verdict stays withdrawn (§16.5).
+2. **IPI verification took record order for mailbox order.** A publication is recorded after its
+   `fetch_or`, an arrival after its `swap`. The other CPU can act in between, so either side's
+   record can land first. The verifier paired them by record order, with one allowance for a
+   second fresh publication. So it refused legal traces: a merged publication recorded after
+   the arrival that consumed its bit (`ipi_merge_inconsistent`, `64c9fdcf` seq 129), and a fresh
+   publication recorded after its arrival.
+
+**The shootdown decision, as its owner consumed it.** `live_cpu_bitmap_for_asid_split` hands the
+witness the four values it computes with, from inside the computation:
+* `online` and `wake_only`: the candidates are `online & !wake_only`;
+* `placement`: CPUs whose current task, read under that CPU's 1L, is bound to the address space;
+* `loaded`: `address_space_loaded_bitmap(asid) & candidates`.
+
+It also hands over the per-CPU current tasks it read. It still returns `placement | loaded`; the
+policy, its filters and the requester exclusion are unchanged, and nothing is re-read for the
+witness. `complete_unmap_shootdown_from_split` records these as `ShootInputs` immediately before
+its target set (`ShootTargets`), on the requester's CPU, then the fence request and its
+completion as before.
+
+Both verifiers check, for every decision on the witness page (its P3 and P4 operations, and every
+settled page):
+* the inputs and the target set are recorded by the operation's requester, for the operation's
+  address space and page. A decision recorded by another CPU is not the operation's decision;
+* `placement` and `loaded` lie within the candidates;
+* the target set is exactly `(placement | loaded) & !requester`. A missing or extra CPU fails
+  (`shoot_targets_not_the_policy`), and so does naming the requester;
+* `placement` agrees with the current tasks the same computation read. An empty slot contributes
+  no placement; a witness task contributes exactly when its address space is the operation's
+  (`shoot_placement_inconsistent`). Residency is never inferred from the mask or from `current`;
+* whenever the set is non-empty, one fence request on the requester names exactly those CPUs and
+  exactly their harts (CPU ids and hart ids are distinct; the map is the roles' recorded harts).
+  The requester's hart must not be in it. The request must complete successfully, once, under
+  its own generation, inside the operation. Then come the acknowledgement and the one
+  settlement. The checks are, in order:
+  * a missing fence request fails (`fence_not_requested_for_the_targets`);
+  * a substituted CPU set or hart map fails (`fence_targets_not_the_decision`,
+    `fence_harts_not_the_targets`, `requester_fenced_itself`);
+  * a failed, missing, duplicated or other-generation completion fails (`fence_failed`,
+    `fence_completion_missing`, `fence_duplicate_completion`, `fence_stale_completion`);
+  * settlement before completion fails.
+
+An empty `current` does not discharge a loaded-root obligation, and neither does another task of
+the address space: the CPU is named, so it is fenced. A CPU that left the address space and
+flushed (the idle-root handoff clears its `loaded` bit) is represented by its recorded inputs.
+It is excluded only with positive activation evidence before the target's observation, as
+before.
+
+**Coverage is separate and comes after.** An operation that fails any obligation fails its
+attempt; coverage is never considered for it. For a valid P3 attempt:
+* *fenced* (the target's CPU in the set) decides what the operation owed;
+* *resident* (the decision's own snapshot had the target current) decides only coverage.
+
+The uncredited reasons, in order:
+* `not_ready`;
+* `off_cpu`: not fenced, with activation evidence;
+* `not_current`: fenced and completed, but the target was not current there. This covers the
+  dispatch gap and another task of the address space;
+* `interfered`.
+
+P4 operations report `resident`, `off_cpu` or `not_current` and stay obligations.
+
+**The mailbox protocol.** For one (source, target) pair, bit `source` of the target's mailbox is
+set only by the source's `fetch_or` (`send_reschedule`, or `kick_self` for its own bit). It is
+cleared only by the target's `swap` (`take_arrival`, after clearing SSIP). These are the
+linearization points. Their modification order alternates:
+* a **fresh** publication (bit 0 → 1) opens a group;
+* any **merged** publications (bit already 1) join it;
+* the next swap that sees the bit **consumes** the group (1 → 0).
+
+So the k-th fresh publication of a pair opens group k, and the k-th consumption takes exactly
+group k. Each side numbers its own events from its own operation:
+* the publisher puts the group in its record (`IpiPublished.f[4]`), from its `fetch_or`'s result;
+* the consumer records each consumed source bit right after its arrival (`IpiConsumed`: source,
+  ordinal), from its swap's result.
+
+No lock, no witness serialization and no masking change is involved. The legal interleavings are
+all accepted:
+* fresh, then its consumption;
+* coalescing: fresh, merged…, one consumption;
+* a new fresh publication after a consumption (a new group);
+* either side's record landing first: a fresh or merged publication recorded after the arrival
+  that consumed its group, or a fresh publication recorded between the swap that consumed the
+  previous group and that swap's arrival record;
+* empty arrivals: a request whose bit an earlier swap had already taken;
+* both directions independently, and the self-kick pair.
+
+**Accounting** keeps apart:
+* publications (fresh and merged);
+* firmware requests and their results;
+* hardware arrivals (empty ones included);
+* consumed source bits.
+
+Both verifiers refuse, with the same codes and in the same order (one scan in record order, then
+the population totals, then the hart check):
+* a fresh publication that does not open its sender's next group, or a merged one outside its
+  current group (`ipi_group_inconsistent`: stale or substituted identities);
+* a firmware failure;
+* an arrival whose consumption records do not follow it one for one, in order, or that skip an
+  ordinal (`ipi_consumption_unbound`: missing consumption, wrong source);
+* a group consumed twice (`ipi_duplicate_attribution`);
+* a consumption of a group never opened (`ipi_unexplained_arrival`);
+* a group never consumed (`ipi_undelivered`: a lost publication);
+* more arrivals on a CPU than successful requests to it;
+* a publication naming another hart than its target's.
+
+**What a wake earns.** A wake is attributed to the arrival that consumed its group, found by group
+and ordinal, never by record order. A consumption recorded before the waker's own preceding step
+cannot be the wake's (`ipi_attribution_inconsistent`). If the wake opened its group (fresh), the
+attribution is unique. If it merged into a group another publication opened, the arrival is not
+uniquely its own; that is no failure, but it earns no coverage:
+* P1 counts it apart (`p1_merged`), never as an IPI-driven dispatch;
+* P2 grades it `merged_publication`.
+
+The fixed thresholds are unchanged. A population violation is never forgiven for coverage.
+
+**The two verifiers are one contract.** `smp3_record.rs` (which the kernel runs at its dump) and
+`scripts/grade-riscv64-smp3-witness.py` (independent, from the raw sealed records) check the same
+obligations in the same order, with the same codes. `tests/smp3_evidence_differential.rs` runs
+the production Rust functions and the grader's records-only CLI on every case of a shared corpus
+(`tests/fixtures/smp3_evidence`, built from a real boot record by named edits that keep each
+CPU's program order). They must agree on acceptance, the first violated obligation and where,
+every count and every graded attempt, and each case's verdict is stated independently in the
+corpus builder.
+
+**What stays unconfirmed.** QEMU shows no architectural barrier or timing. The record establishes
+the order of each CPU's own operations and the mailbox causality above. It cannot show:
+* which firmware request raised a given SSIP; with coalescing, that is unknowable from either
+  side;
+* that a completed SBI remote fence retired a translation on real hardware. Completion is the
+  pinned OpenSBI's answer, and staleness is observed only as QEMU models TLBs.

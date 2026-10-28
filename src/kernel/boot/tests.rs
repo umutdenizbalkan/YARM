@@ -201014,6 +201014,12 @@ mod vm_invalidation1 {
             split.contains("crate::arch::hal::address_space_loaded_bitmap(asid) & candidates"),
             "the split owner must OR the residency set, masked to candidates"
         );
+        // SMP3-EVIDENCE1: the residency set is computed apart (so the witness can record it) and
+        // the owner still returns the union.
+        assert!(
+            split.contains("        bitmap | loaded\n    }"),
+            "the split owner must return placement | loaded"
+        );
         let broad = include_str!("memory_state.rs");
         let b = &broad[broad
             .find("fn live_cpu_bitmap_for_asid(&self, asid: Asid) -> CpuBitmap {")
