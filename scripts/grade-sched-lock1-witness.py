@@ -20,16 +20,28 @@ order they are checked:
   duplicated or phantom wake, every remote addition notified).
 * `claim-commit` — every `CLAIM` names the exact section (record number, CPU, executing CPU,
   generation) that added its task, and each such addition is claimed at most once.
-* `claim-incarnation` — every `CLAIM` carries the incarnation its owner staged under rank 2, and
-  that incarnation agrees with the address space the CPU had active when the task next ran.
-* `run` — every `RUN` (the first kernel entry by an installed task: its tick, call or fault)
-  names the installation it observed, once, after it, on the same CPU.
+* `installation` — every installation (a section that makes a task other than 0 current) is
+  tracked through the replay until the section that ends it (its task no longer current); that
+  section records the end (`UNINSTALL`: the installation, and whether its first execution had
+  been observed), and no other section does.
+* `claim-incarnation` — every `CLAIM` carries the incarnation its owner staged under rank 2. The
+  claim is bound to the installation that consumed its wake (the first section on the target
+  after the commit that removes the task from the queue, if it installs it). When that
+  installation's first kernel entry came from user mode, the claim's incarnation must equal the
+  address space the CPU had active — a claim of "no address space" included. Otherwise the claim
+  is unconfirmed, with its reason.
+* `run` — every `RUN` (the first kernel entry by an installed task: a call, fault or interrupt)
+  names a real installation of its task on its CPU, once, and agrees with the installation's
+  timeline: published while that installation was in force, or after its end only when the end
+  reports it observed first; its acquisition generation lies between the installation's and the
+  end's.
 * `attempt` — EVERY hold attempt is valid before any coverage is counted: the schedule's pair and
   attempt order, the holder's cell, its lock held and interrupts masked at begin and end, exactly
   its own 1L and no admission lock, no reacquisition, holder sections ordered around it, and a
   reported outcome consistent with its own counters and the fixed bounds.
-* `progress` — every `PROGRESS` names an installation by the observer's own production owner, in
-  its hold, of the task it reports, with the running address space.
+* `progress` — every `PROGRESS` names the installation IN FORCE on the observer at its record
+  (taken under the observer's 1L, so it cannot lag), made by the observer's own production owner
+  in its hold, of the task it reports, with the running address space.
 * `coverage` — every scheduled round has a credited attempt. A valid attempt is credited when it
   reported success, its window holds at least two distinct genuine commits by the observer on its
   own cell, one of them installed (selected or restored) a task, and that task's execution was
@@ -44,7 +56,7 @@ import zlib
 
 KINDS = {"SNAP_BEGIN", "SNAP_CUR", "SNAP_Q", "SEC", "ADD", "REM", "CLAIM", "NOTIFY",
          "HOLD_BEGIN", "PROGRESS", "HOLD_END", "RELATED", "CENSUS_BEGIN", "CENSUS_CUR",
-         "CENSUS_Q", "CENSUS_END", "ALL_MUTATED", "CELL", "RUN"}
+         "CENSUS_Q", "CENSUS_END", "ALL_MUTATED", "CELL", "RUN", "UNINSTALL"}
 REC = re.compile(r"(SL1W_R seq=(\d+) kind=(\w+) cpu=(\d+) exec=(\d+) f0=(\d+) f1=(\d+) f2=(\d+) "
                  r"f3=(\d+) f4=(\d+) f5=(\d+)) crc=([0-9a-f]{8})")
 END = re.compile(r"(SL1W_END count=(\d+) overflow=(\d) phase=(\d) ncpu=(\d+) rounds=(\d+) "
@@ -55,6 +67,7 @@ HOLD_SPINS = 400_000_000
 ATTEMPTS = 3
 COMMITS_REQUIRED = 2
 INC_UNBOUND, INC_NO_ASID = 0, 1
+ORIGIN_KERNEL, ORIGIN_USER = 1, 2
 
 
 class Fail(Exception):
@@ -185,7 +198,7 @@ def grade(text, expect_cpus=None):
     sec_by_seq = {}
     while k < len(body):
         r = body[k]
-        if r["kind"] in ("ADD", "REM"):
+        if r["kind"] in ("ADD", "REM", "UNINSTALL"):
             fail("validity", "seq %d %s outside a section" % (r["seq"], r["kind"]))
         if r["kind"] != "SEC":
             k += 1
@@ -210,13 +223,21 @@ def grade(text, expect_cpus=None):
             fail("no-op-section", "section seq %d on cpu %d changes nothing (current %s kept, 0 added, "
                  "0 removed): the producer never records one, and it is no scheduling commit"
                  % (r["seq"], r["cpu"], dec(bcur)))
+        # The end of the installation this section ends, if it records one: right after its members.
+        endrec, nu = None, 0
+        u = k + 1 + na + nr
+        if u < len(body) and body[u]["kind"] == "UNINSTALL":
+            x = body[u]
+            if (x["cpu"], x["exec"], x["f"][0]) != (r["cpu"], r["exec"], gen) or x["f"][3] not in (0, 1):
+                fail("validity", "UNINSTALL seq %d does not belong to section seq %d" % (x["seq"], r["seq"]))
+            endrec, nu = {"seq": x["seq"], "tid": x["f"][1], "iseq": x["f"][2], "observed": x["f"][3]}, 1
         s = {"seq": r["seq"], "cpu": r["cpu"], "exec": r["exec"], "gen": gen,
              "before": dec(bcur), "after": dec(acur),
              "add": {p["f"][1]: p["f"][2] for p in part if p["kind"] == "ADD"},
-             "rem": {p["f"][1] for p in part if p["kind"] == "REM"}}
+             "rem": {p["f"][1] for p in part if p["kind"] == "REM"}, "end": endrec}
         secs.append(s)
         sec_by_seq[r["seq"]] = s
-        k += 1 + na + nr
+        k += 1 + na + nr + nu
     # ── NATURAL: replay ──────────────────────────────────────────────────────────────────────
     cur = {c: snap_cur[c][0] for c in range(n)}
     q = {c: dict(snap_q[c]) for c in range(n)}
@@ -228,6 +249,9 @@ def grade(text, expect_cpus=None):
         if tid != 0 and len(placements(tid)) > 1:
             fail("natural", "SNAP places tid %d twice" % tid)
     restores = 0
+    # Installations: a section making a task other than 0 current. Each is in force on its CPU
+    # until the section that ends it (its task no longer current), which records the end.
+    installs, in_force, timeline = {}, {c: None for c in range(n)}, {c: [] for c in range(n)}
     for s in secs:
         c = s["cpu"]
         if cur[c] != s["before"]:
@@ -251,6 +275,22 @@ def grade(text, expect_cpus=None):
                     fail("natural", "seq %d installs tid %d, which is placed elsewhere" % (s["seq"], a))
                 restores += 1
         cur[c] = s["after"]
+        I = in_force[c]
+        ends = I is not None and s["before"] == I["tid"] and s["after"] != s["before"]
+        e = s["end"]
+        if ends and (e is None or e["tid"] != I["tid"] or e["iseq"] != I["seq"]):  # repair:installation
+            fail("installation", "section seq %d on cpu %d ends installation seq %d (tid %d) without "
+                 "recording that end" % (s["seq"], c, I["seq"], I["tid"]))
+        if not ends and e is not None:  # repair:installation
+            fail("installation", "section seq %d records the end of installation seq %d, which was not in "
+                 "force on cpu %d" % (s["seq"], e["iseq"], c))
+        if ends:
+            I["end"], I["end_gen"], I["observed"] = s["seq"], s["gen"], e["observed"] if e else 0
+            in_force[c] = None
+        if s["after"] not in (None, 0) and s["after"] != s["before"]:
+            in_force[c] = installs[s["seq"]] = {"seq": s["seq"], "cpu": c, "tid": s["after"], "gen": s["gen"],
+                                               "exec": s["exec"], "end": None, "end_gen": None, "observed": None}
+        timeline[c].append((s["seq"], in_force[c]["seq"] if in_force[c] else None, cur[c]))
         for tid in {s["before"], s["after"], *s["add"], *s["rem"]}:
             if tid not in (None, 0) and len(placements(tid)) > 1:
                 fail("natural", "after seq %d tid %d holds %d placements %s"
@@ -284,22 +324,54 @@ def grade(text, expect_cpus=None):
                 what, seq, cpu, gen, tid)
         return None
 
-    # ── RUN: observed executions of installed tasks ──────────────────────────────────────────
+    def state_at(c, seq):
+        """CPU c's (installation in force, current) just before record `seq`, from the replay:
+        every section on c is recorded under c's 1L, as are PROGRESS records."""
+        st = (None, snap_cur[c][0])
+        for sseq, iseq, cu in timeline[c]:
+            if sseq > seq:
+                break
+            st = (iseq, cu)
+        return st
+
+    # ── RUN: observed executions of installed tasks, against the installation timeline ────────
     runs, run_of_install = [], {}
     for r in body:
         if r["kind"] != "RUN":
             continue
-        tid, inc, igen, tgen, iseq = r["f"][:5]
+        tid, inc, igen, tgen, iseq, origin = r["f"]
         bad = installation(iseq, r["cpu"], igen, tid, "RUN seq %d" % r["seq"])
-        if bad:  # repair:run
-            fail("run", bad)
-        later = iseq < r["seq"] and tgen >= igen and r["exec"] == r["cpu"] and inc != INC_UNBOUND and r["f"][5] in (0, 1)
+        if bad or iseq not in installs:  # repair:run
+            fail("run", bad or "RUN seq %d names installation seq %d, which is not one" % (r["seq"], iseq))
+        later = iseq < r["seq"] and tgen >= igen and r["exec"] == r["cpu"] and inc != INC_UNBOUND and origin in (ORIGIN_KERNEL, ORIGIN_USER)
         if not later:  # repair:run
-            fail("run", "RUN seq %d is not a later tick on cpu %d of installation seq %d" % (r["seq"], r["cpu"], iseq))
+            fail("run", "RUN seq %d is not a later kernel entry on cpu %d of installation seq %d" % (r["seq"], r["cpu"], iseq))
         if iseq in run_of_install:  # repair:run
             fail("run", "installation seq %d observed running twice (RUN seq %d)" % (iseq, r["seq"]))
+        I = installs[iseq]
+        in_force_then, cur_then = state_at(r["cpu"], r["seq"])
+        # Published after the installation ended: only an observation that won over the end (the
+        # end reports it observed), from a kernel entry no later than the end's acquisition.
+        after_end = I["end"] is not None and I["end"] < r["seq"]
+        if after_end and not I["observed"]:  # repair:run-timeline
+            fail("run", "RUN seq %d of installation seq %d (tid %d) was emitted after that installation "
+                 "ended (seq %d) unobserved: cpu %d's current was then %s"
+                 % (r["seq"], iseq, tid, I["end"], r["cpu"], cur_then))
+        if not after_end and in_force_then != iseq:  # repair:run-timeline
+            fail("run", "RUN seq %d names installation seq %d (tid %d), but cpu %d then had installation %s "
+                 "in force (current %s)" % (r["seq"], iseq, tid, r["cpu"], in_force_then, cur_then))
+        if not after_end and I["end"] is not None and not I["observed"]:  # repair:run-timeline
+            fail("run", "RUN seq %d observed installation seq %d, whose end (seq %d) reports it never observed"
+                 % (r["seq"], iseq, I["end"]))
+        if I["end_gen"] is not None and tgen > I["end_gen"]:  # repair:run-timeline
+            fail("run", "RUN seq %d observed installation seq %d at acquisition generation %d, after its "
+                 "ending section's %d" % (r["seq"], iseq, tgen, I["end_gen"]))
         run_of_install[iseq] = r
         runs.append(r)
+    for iseq, I in sorted(installs.items()):
+        if I["observed"] and iseq not in run_of_install:  # repair:run-timeline
+            fail("run", "installation seq %d's end (seq %d) reports it observed, but no RUN of it was recorded"
+                 % (iseq, I["end"]))
     # ── claims: bound to the commit and to the incarnation ───────────────────────────────────
     claimed, claims, verified = set(), [], 0
     for r in body:
@@ -321,17 +393,39 @@ def grade(text, expect_cpus=None):
         claimed.add((cseq, tid))
         claims.append((r, s))
     claims = [(r, s) for r, s in claims if s is not None]
-    for idx, (r, s) in enumerate(claims):
+    unconfirmed = {"still queued": 0, "withdrawn": 0, "installed, never entered": 0,
+                   "entered only from kernel mode": 0}
+    no_asid_claims = 0
+    for r, s in claims:
         t, tid, inc = r["cpu"], r["f"][0], r["f"][1]
-        nxt = [c for c, _ in claims[idx + 1:] if c["cpu"] == t and c["f"][0] == tid]
-        horizon = nxt[0]["f"][4] if nxt else float("inf")
-        seen = [x for x in runs if x["cpu"] == t and x["f"][0] == tid and s["seq"] < x["f"][4] < horizon]
-        if seen and inc != INC_NO_ASID:
-            if seen[0]["f"][1] != inc:  # repair:claim-incarnation
-                fail("claim-incarnation", "CLAIM seq %d placed tid %d with incarnation code %d; when it next ran "
-                     "(RUN seq %d) cpu %d had code %d active (stale or substituted incarnation)"
-                     % (r["seq"], tid, inc, seen[0]["seq"], t, seen[0]["f"][1]))
-            verified += 1
+        no_asid_claims += inc == INC_NO_ASID
+        # The installation that consumed this wake: the first later section on the target that
+        # removes the task from its queue — if it installs the task.
+        consumer = next((x for x in secs if x["cpu"] == t and x["seq"] > s["seq"] and tid in x["rem"]), None)
+        if consumer is None:
+            unconfirmed["still queued"] += 1
+            continue
+        if consumer["after"] != tid or consumer["seq"] not in installs:
+            unconfirmed["withdrawn"] += 1
+            continue
+        run = run_of_install.get(consumer["seq"])
+        if run is None:
+            unconfirmed["installed, never entered"] += 1
+            continue
+        if run["f"][5] != ORIGIN_USER:
+            # A kernel-mode entry does not show the task's own address space active.
+            unconfirmed["entered only from kernel mode"] += 1
+            continue
+        # A user-mode entry: the task executed in the address space the CPU had active.
+        if inc == INC_NO_ASID:  # repair:no-asid
+            fail("claim-incarnation", "CLAIM seq %d placed tid %d as a task with no address space; its wake was "
+                 "consumed by installation seq %d, whose first kernel entry (RUN seq %d) came from user mode with "
+                 "ASID code %d active" % (r["seq"], tid, consumer["seq"], run["seq"], run["f"][1]))
+        if inc != INC_NO_ASID and run["f"][1] != inc:  # repair:claim-incarnation
+            fail("claim-incarnation", "CLAIM seq %d placed tid %d with incarnation code %d; when it next ran "
+                 "(RUN seq %d) cpu %d had code %d active (stale or substituted incarnation)"
+                 % (r["seq"], tid, inc, run["seq"], t, run["f"][1]))
+        verified += 1
     # ── SYNCHRONIZED: attempts — validity first, then coverage ───────────────────────────────
     attempts, open_hold, late = [], None, 0
     by_try = {}
@@ -387,8 +481,12 @@ def grade(text, expect_cpus=None):
         if not own:  # repair:progress
             fail("progress", "round %d: PROGRESS seq %d's installation seq %d is not the observer's own "
                  "commit inside the hold, before a later tick" % (rnd, p["seq"], iseq))
+        in_force_then, cur_then = state_at(obs, p["seq"])
+        if in_force_then != iseq or cur_then != tid:  # repair:progress-timeline
+            fail("progress", "round %d: PROGRESS seq %d names installation seq %d (tid %d), but cpu %d then had "
+                 "installation %s in force (current %s)" % (rnd, p["seq"], iseq, tid, obs, in_force_then, cur_then))
         run = run_of_install.get(iseq)
-        if run is not None and run["f"][1] != inc:  # repair:progress
+        if run is not None and run["f"][5] == ORIGIN_USER and run["f"][1] != inc:  # repair:progress
             fail("progress", "round %d: PROGRESS seq %d reports incarnation code %d; RUN seq %d of the same "
                  "installation saw %d" % (rnd, p["seq"], inc, run["seq"], run["f"][1]))
         return s
@@ -468,8 +566,8 @@ def grade(text, expect_cpus=None):
             expect_try += 1
         # ── coverage: credit a valid attempt ─────────────────────────────────────────────────
         commits = [s for s in secs if b["seq"] < s["seq"] < e["seq"] and s["cpu"] == obs and s["exec"] == obs]
-        installs = {s["seq"] for s in commits if s["install"] is not None}
-        ran = [s for s in good_prog if s["seq"] in installs]
+        own_installs = {s["seq"] for s in commits if s["install"] is not None}
+        ran = [s for s in good_prog if s["seq"] in own_installs]
         enough = len({s["gen"] for s in commits}) >= COMMITS_REQUIRED  # repair:commit-count
         if ok and not at["related"] and enough and ran:
             credited.setdefault(rnd, (a, obs, len(commits), len(ran)))
@@ -480,12 +578,22 @@ def grade(text, expect_cpus=None):
         fail("coverage", "rounds %s were never credited (schedule %s)" % (missing, [pair(r, n) for r in missing]))
     dirs = sorted({(a, b) for a, b, _, _ in credited.values()})
     uncredited = len(attempts) - len(credited)
+    n_obs = sum(1 for i in installs.values() if i["seq"] in run_of_install)
+    n_end_unobs = sum(1 for i in installs.values() if i["end"] is not None and not i["observed"])
+    n_open = sum(1 for i in installs.values() if i["end"] is None)
+    n_user = sum(1 for r in runs if r["f"][5] == ORIGIN_USER)
+    n_prog = sum(len(at["progress"]) + sum(1 for x in at["late"] if x["kind"] == "PROGRESS") for at in attempts)
     return ("SL1W_GRADE result=pass ncpu=%d | SYNCHRONIZED holds: %d/%d rounds credited over %d valid attempts "
-            "(%d uncredited), directions %s, %d late observer records not counted | NATURAL trace: %d sections "
-            "(%d remote adds, %d notifications, %d claims bound to their commits, %d incarnations confirmed by "
-            "a later run, %d runs, %d restores) replayed SNAP→CENSUS exactly; cells %s"
-            % (n, len(credited), rounds, len(attempts), uncredited, dirs, late, len(secs), remote_adds,
-               notifies, len(claims), verified, len(runs), restores,
+            "(%d uncredited), directions %s, %d late observer records not counted | EXECUTION: %d installations "
+            "(%d observed by a RUN, %d ended unobserved, %d in force at the census), %d runs (%d from user mode, "
+            "%d from kernel mode), %d progress records, each checked against the installation in force | "
+            "CLAIMS: %d claims bound to their commits, %d incarnations confirmed by a later run, %d unconfirmed "
+            "(%s), %d claiming no address space | NATURAL trace: %d sections (%d remote adds, %d notifications, "
+            "%d restores) replayed SNAP→CENSUS exactly; cells %s"
+            % (n, len(credited), rounds, len(attempts), uncredited, dirs, late, len(installs), n_obs, n_end_unobs,
+               n_open, len(runs), n_user, len(runs) - n_user, n_prog, len(claims), verified,
+               sum(unconfirmed.values()), ", ".join("%s %d" % kv for kv in unconfirmed.items()), no_asid_claims,
+               len(secs), remote_adds, notifies, restores,
                " ".join("%d:%#x" % (c, cell[c]) for c in range(n))))
 
 
@@ -524,7 +632,7 @@ def good():
     ev += [("HOLD_BEGIN", 0, 0, [0, 1, C0, 6, 1, 1]),
            ("SEC", 1, 1, [8, 101, 0, 1, 0, C1]), ("ADD", 1, 1, [8, 100, 1]),
            ("SEC", 1, 1, [9, 0, 301, 0, 1, C1], "i300"), ("REM", 1, 1, [9, 300]),
-           ("RUN", 1, 1, [300, A2(3), 9, 10, ("@", "i300")]),
+           ("RUN", 1, 1, [300, A2(3), 9, 10, ("@", "i300"), ORIGIN_USER]),
            ("PROGRESS", 1, 1, [0, 300, 10, 9, A2(3), ("@", "i300")]),
            ("HOLD_END", 0, 0, [0, 2, 1, 0, 50, 1 | 2 | (6 << 8)])]
     ev += [("SEC", 1, 0, [11, 301, 301, 1, 0, C1], "c200"), ("ADD", 1, 0, [11, 200, 1]),
@@ -533,12 +641,12 @@ def good():
            ("HOLD_BEGIN", 1, 1, [1, 0, C1, 12, 1, 1]),
            ("SEC", 0, 0, [8, 0, 501, 0, 1, C0], "i500"), ("REM", 0, 0, [8, 500]),
            ("SEC", 0, 0, [9, 501, 501, 1, 0, C0]), ("ADD", 0, 0, [9, 600, 1]),
-           ("RUN", 0, 0, [500, A2(5), 8, 10, ("@", "i500")]),
+           ("RUN", 0, 0, [500, A2(5), 8, 10, ("@", "i500"), ORIGIN_USER]),
            ("PROGRESS", 0, 0, [1, 500, 10, 8, A2(5), ("@", "i500")]),
            ("HOLD_END", 1, 1, [1, 2, 1, 0, 70, 1 | 2 | (12 << 8)])]
     ev += [("SEC", 1, 1, [13, 301, 201, 1, 1, C1], "i200"), ("ADD", 1, 1, [13, 300, 1]),
-           ("REM", 1, 1, [13, 200]),
-           ("RUN", 1, 1, [200, A2(9), 13, 14, ("@", "i200")])]
+           ("REM", 1, 1, [13, 200]), ("UNINSTALL", 1, 1, [13, 300, ("@", "i300"), 1]),
+           ("RUN", 1, 1, [200, A2(9), 13, 14, ("@", "i200"), ORIGIN_USER])]
     ev += [("CENSUS_BEGIN", 0, 0, [2, 3, 3, 20, 2, 2]),
            ("CELL", 0, 0, [C0, C0 + LOCK_OFF, 1]), ("CELL", 1, 1, [C1, C1 + LOCK_OFF, 1]),
            ("CENSUS_CUR", 0, 0, [501, 10]), ("CENSUS_Q", 0, 0, [600, 1]),
@@ -561,6 +669,9 @@ def self_test():
              ("section names a third lock instance", build(sub("SEC", 0, 5, 0x7E570000)), "lock-instance:"),
              ("claim incarnation substituted", build(sub("CLAIM", 0, 1, A2(77))), "claim-incarnation:"),
              ("claim names another commit", build(sub("CLAIM", 0, 3, 9)), "claim-commit:"),
+             ("claim of no address space, user-mode entry", build(sub("CLAIM", 0, 1, INC_NO_ASID)),
+              "claim-incarnation:"),
+             ("an installation's end reports it unobserved", build(sub("UNINSTALL", 0, 3, 0)), "run:"),
              ("holder without its lock", build(sub("HOLD_BEGIN", 0, 5, 0)), "attempt:"),
              ("overflow", build(g, overflow=1), "validity:"),
              ("window not closed", build(g, phase=1), "validity:")]

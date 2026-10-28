@@ -45,12 +45,20 @@
 //!   its own rank-2 phase ([`stage_incarnation`]), and the generation and record number of the
 //!   exact 1L section, on this executing CPU, that added the task. A claim with no staged
 //!   incarnation, or no such section, is recorded as unbound and fails the grade.
-//! * `RUN` — the first kernel entry (a syscall, a fault or the timer tick) by a task after its
-//!   installation on a CPU records the task, the CPU's ACTIVE address space at that entry (the
-//!   activation table, independent of every wake owner) and the installing section. Kernel code
-//!   runs with interrupts masked except in the idle halt loop, where no task is current, so an
-//!   entry with a task current interrupted that task or is its own call. `PROGRESS` carries the
-//!   same evidence for the observer during a hold.
+//! * `RUN` — the first kernel entry (a call, a fault or an interrupt) by an installed task on its
+//!   CPU records the task, the CPU's ACTIVE address space at that entry (the activation table,
+//!   independent of every wake owner), whether the entry came from user mode, and the installing
+//!   section. `PROGRESS` names the installation IN FORCE on the observer at its tick.
+//!
+//! **Installation timeline (SCHED-LOCK1-SEAL).** Each installation (a section making a task other
+//! than 0 current) has one state word per CPU (`LAST_INSTALL`): its installing record number and
+//! its state. The first observed execution takes it from OPEN to OBSERVED by compare-and-swap at a
+//! kernel entry; the section that ends it (its task no longer current) ors in ENDED and records
+//! `UNINSTALL` with the state it found. So no execution can be observed after the end, and the end
+//! says whether one was observed first — the `RUN` record of such an observation may be published
+//! after the end's record (a lock-free kernel entry), and the end's report is what admits it.
+//! `PROGRESS` is taken under the observer's own 1L, from the installation in force, never from an
+//! earlier installation of the same task in the hold's history.
 //! * `HOLD_BEGIN` and `HOLD_END` record the holder's interrupt-mask state.
 //!
 //! The record ring is bounded; an overflow is reported and refuses coverage. All output is the
@@ -99,7 +107,8 @@ pub const K_CENSUS_END: u8 = 16;
 pub const K_ALL_MUTATED: u8 = 17;
 pub const K_CELL: u8 = 18;
 pub const K_RUN: u8 = 19;
-const KINDS: [&str; 20] = [
+pub const K_UNINSTALL: u8 = 20;
+const KINDS: [&str; 21] = [
     "-",
     "SNAP_BEGIN",
     "SNAP_CUR",
@@ -120,7 +129,20 @@ const KINDS: [&str; 20] = [
     "ALL_MUTATED",
     "CELL",
     "RUN",
+    "UNINSTALL",
 ];
+
+/// `RUN` origins (f5): the first kernel entry came from kernel mode, or from user mode.
+const ORIGIN_KERNEL: u64 = 1;
+const ORIGIN_USER: u64 = 2;
+
+/// An installation's state, in the low two bits of its `LAST_INSTALL` word (the installing
+/// section's record number above them). Exactly one transition out of OPEN is taken on each
+/// path: the first observed execution (`OPEN → OBSERVED`, compare-and-swap) and the section that
+/// ends the installation (`| ENDED`, one atomic or) — so the end knows whether an execution was
+/// observed first, and no execution can be observed after it.
+const INST_OBSERVED: u64 = 1;
+const INST_ENDED: u64 = 2;
 
 /// Incarnation encodings carried by `CLAIM`, `RUN` and `PROGRESS`: 0 = unbound (no authority),
 /// 1 = a task with no address space, `asid + 2` otherwise.
@@ -217,8 +239,10 @@ static STAGED: [[AtomicU64; 2]; MAX_CPUS] = [const { [const { AtomicU64::new(0) 
 /// `(target + 1, generation, record number)`. Read by that CPU's own claim right after the commit.
 static LAST_ADD: [[AtomicU64; 3]; MAX_CPUS] =
     [const { [const { AtomicU64::new(0) }; 3] }; MAX_CPUS];
-/// Per CPU (written and read only under that CPU's own 1L): the last installation recorded on it —
-/// `(tid + 1, generation, record number, observed running)`.
+/// Per CPU: the last installation recorded on it — `[tid + 1, installing generation, unused,
+/// word]`, `word = installing record number << 2 | state` ([`INST_OBSERVED`], [`INST_ENDED`]).
+/// Written only by sections on that CPU, under its 1L; a first kernel entry on that CPU observes
+/// it without a lock, through the word's compare-and-swap.
 static LAST_INSTALL: [[AtomicU64; 4]; MAX_W_CPUS] =
     [const { [const { AtomicU64::new(0) }; 4] }; MAX_W_CPUS];
 
@@ -320,35 +344,51 @@ fn take_snap(idx: usize, sched: &CpuSched) {
     s.valid.store(true, Ordering::Relaxed);
 }
 
-/// Record `RUN` for CPU `c`'s last installation if `cur` is that task and it has not been observed.
-/// `src` is 1 for a trap entry, 0 for the tick hook.
-fn observe_run(c: usize, cur: u64, src: u64) -> Option<u64> {
-    let slot = LAST_INSTALL.get(c)?;
-    if !recording()
-        || slot[0].load(Ordering::Acquire) != cur + 1
-        || slot[3].swap(1, Ordering::AcqRel) != 0
-    {
-        return None;
+/// Record `RUN` for CPU `c`'s installation in force if `cur` is its task and it has not been
+/// observed: the first kernel entry on `c` by that installation (`origin`: [`ORIGIN_KERNEL`] or
+/// [`ORIGIN_USER`]). The observation takes effect only if its compare-and-swap wins over the
+/// section that ends the installation; the record may then be published after that section's,
+/// and the section reports the installation observed. The acquisition generation is read BEFORE
+/// the compare-and-swap, so it is no later than the ending section's acquisition.
+fn observe_run(c: usize, cur: u64, origin: u64) {
+    let Some(slot) = LAST_INSTALL.get(c) else {
+        return;
+    };
+    if !recording() {
+        return;
     }
+    let word = slot[3].load(Ordering::Acquire);
+    if word == 0 || word & (INST_OBSERVED | INST_ENDED) != 0 {
+        return;
+    }
+    if slot[0].load(Ordering::Acquire) != cur + 1 {
+        return;
+    }
+    let igen = slot[1].load(Ordering::Acquire);
+    let tgen = ACQ_GEN[c].load(Ordering::Acquire);
     let inc = inc_code(crate::arch::hal::active_address_space(CpuId(c as u8)));
-    record(
-        K_RUN,
-        c,
-        [
-            cur,
-            inc,
-            slot[1].load(Ordering::Relaxed),
-            ACQ_GEN[c].load(Ordering::Acquire),
-            slot[2].load(Ordering::Relaxed),
-            src,
-        ],
-    );
-    Some(inc)
+    if slot[3]
+        .compare_exchange(
+            word,
+            word | INST_OBSERVED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    record(K_RUN, c, [cur, inc, igen, tgen, word >> 2, origin]);
 }
 
 /// A kernel entry on `cpu` (the shared trap entry, before anything else): if a just-installed
-/// task is current there (its published current), this is its first observed execution.
-pub(crate) fn trap_entered(shared: &SharedKernel, cpu: CpuId) {
+/// task is current there (its published current), this is its first observed execution, from
+/// user or kernel mode as the entry's own origin says ([`entered_from_user`]).
+pub(crate) fn trap_entered(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    context: &crate::arch::trap_entry::ArchTrapContext,
+) {
     let c = cpu.0 as usize;
     if c >= MAX_W_CPUS || !recording() {
         return;
@@ -356,8 +396,35 @@ pub(crate) fn trap_entered(shared: &SharedKernel, cpu: CpuId) {
     if let Some(cur) = shared.sched_domain().current_mirror(c)
         && cur.0 != 0
     {
-        let _ = observe_run(c, cur.0, 1);
+        let origin = if entered_from_user(context) {
+            ORIGIN_USER
+        } else {
+            ORIGIN_KERNEL
+        };
+        observe_run(c, cur.0, origin);
     }
+}
+
+/// Whether the trap being entered came from user mode: x86_64 from the hardware frame's `CS`
+/// (the trap context's own field); AArch64 from `SPSR_EL1.M` (EL0t); RISC-V from `sstatus.SPP`.
+/// Read at the top of the entry, before anything can take another exception.
+#[cfg(target_arch = "x86_64")]
+fn entered_from_user(context: &crate::arch::trap_entry::ArchTrapContext) -> bool {
+    context.entered_from_user
+}
+#[cfg(target_arch = "aarch64")]
+fn entered_from_user(_context: &crate::arch::trap_entry::ArchTrapContext) -> bool {
+    let spsr: u64;
+    // SAFETY: reads a system register; no memory access, no side effect.
+    unsafe { core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr, options(nomem, nostack)) };
+    spsr & 0xF == 0
+}
+#[cfg(target_arch = "riscv64")]
+fn entered_from_user(_context: &crate::arch::trap_entry::ArchTrapContext) -> bool {
+    let sstatus: u64;
+    // SAFETY: reads a CSR; no memory access, no side effect.
+    unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) sstatus, options(nomem, nostack)) };
+    sstatus & (1 << 8) == 0
 }
 
 // ── hooks called by the scheduler domain ─────────────────────────────────────────────────────
@@ -445,8 +512,22 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
         return;
     }
     let acq_gen = ACQ_GEN[idx].load(Ordering::Acquire);
+    // The installation this section ends: the CPU's installation in force, when its task was
+    // current and no longer is. One atomic or ends it; the previous state says whether its first
+    // execution was observed before the end (that observation's record may be published later).
+    let mut ended: Option<(u64, u64, u64)> = None;
+    if before_cur != after_cur
+        && let Some(slot) = LAST_INSTALL.get(idx)
+    {
+        let word = slot[3].load(Ordering::Acquire);
+        if word != 0 && word & INST_ENDED == 0 && slot[0].load(Ordering::Acquire) == before_cur {
+            let prev = slot[3].fetch_or(INST_ENDED, Ordering::AcqRel);
+            ended = Some((before_cur - 1, prev >> 2, prev & INST_OBSERVED));
+        }
+    }
+    let n_end = usize::from(ended.is_some());
     let mut sec_seq = 0u64;
-    if let Some(base) = reserve(1 + n_add + n_rem) {
+    if let Some(base) = reserve(1 + n_add + n_rem + n_end) {
         sec_seq = base as u64 + 1;
         write(
             base,
@@ -477,6 +558,15 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
             write(k, K_REM, idx, exec, [acq_gen, tid, 0, 0, 0, 0]);
             k += 1;
         }
+        if let Some((tid, iseq, observed)) = ended {
+            write(
+                k,
+                K_UNINSTALL,
+                idx,
+                exec,
+                [acq_gen, tid, iseq, observed, 0, 0],
+            );
+        }
     }
     if n_add > 0
         && let Some(slot) = LAST_ADD.get(exec)
@@ -485,15 +575,15 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
         slot[1].store(acq_gen, Ordering::Relaxed);
         slot[2].store(sec_seq, Ordering::Release);
     }
+    // A new installation: its task and generation first, then its word (OPEN) — an entry that
+    // reads the word sees them. Any installation in force before was ended above.
     if after_cur > 1
         && after_cur != before_cur
         && let Some(slot) = LAST_INSTALL.get(idx)
     {
-        slot[0].store(0, Ordering::Release);
-        slot[1].store(acq_gen, Ordering::Relaxed);
-        slot[3].store(0, Ordering::Relaxed);
-        slot[2].store(sec_seq, Ordering::Relaxed);
         slot[0].store(after_cur, Ordering::Release);
+        slot[1].store(acq_gen, Ordering::Release);
+        slot[3].store(sec_seq << 2, Ordering::Release);
     }
     // An OWNER COMMIT by the observer on its own CPU, during an open hold.
     if let Some(token) = open_hold()
@@ -637,24 +727,25 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
             Ordering::Release,
         );
     }
-    // RUN: the first tick on this CPU after an installation finds the installed task current —
-    // kernel entries run masked, so this tick interrupted that task. The address space the CPU
-    // has ACTIVE now is that task's incarnation, from the activation table (no wake owner's word).
+    // The address space the CPU has ACTIVE at this tick (the activation table, no wake owner's
+    // word). `RUN` is recorded at kernel entry ([`trap_entered`]), which precedes this hook.
     let running_inc = inc_code(crate::arch::hal::active_address_space(cpu));
-    if let Some(cur) = sched.witness_current()
-        && cur.0 != 0
-    {
-        let _ = observe_run(c, cur.0, 0);
-    }
     let active = HOLD_ACTIVE.load(Ordering::Acquire);
     if active != 0 && c == OBSERVER.load(Ordering::Acquire) as usize {
+        // The installation in force on this CPU (this tick holds its 1L, so no section on it is
+        // in progress): the task current now, by the installation that made it current — never
+        // an earlier installation of the same task from this hold's history.
         if let Some(token) = open_hold()
             && let Some(cur) = sched.witness_current()
+            && let Some(inst) = LAST_INSTALL.get(c)
+            && inst[0].load(Ordering::Acquire) == cur.0 + 1
+            && inst[3].load(Ordering::Acquire) & INST_ENDED == 0
         {
+            let iseq = inst[3].load(Ordering::Acquire) >> 2;
             let n = B_INSTALLED_N.load(Ordering::Acquire).min(B_INSTALLED.len());
             if let Some(slot) = B_INSTALLED[..n]
                 .iter()
-                .find(|s| s[0].load(Ordering::Acquire) == cur.0 + 1)
+                .find(|s| s[2].load(Ordering::Acquire) == iseq && iseq != 0)
             {
                 // The record is reserved BEFORE the count, so a progress event the holder counts
                 // always precedes its HOLD_END in sequence order.

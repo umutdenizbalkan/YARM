@@ -14,6 +14,11 @@ from the producer's timeline (`kernel::schedlock1_witness`):
   (and `PROGRESS`, during a hold) at the observer's next tick, a later acquisition;
 * the holder's own sections come before its tick or after the hold;
 * a claim follows the commit it names on the same executing CPU; its notification follows;
+* an installation (a section making a task other than 0 current) stays in force on its CPU until
+  the section that ends it (its task no longer current); that section carries `UNINSTALL` (the
+  installation, and whether a `RUN` of it was observed first) — `seal` adds it from this model
+  unless a case writes its own;
+* `RUN` is the first kernel entry, from user mode unless a case says otherwise;
 * every record appears twice, identically (the producer's `emit_twice`).
 
 Usage: mkcases.py --out DIR
@@ -24,6 +29,7 @@ import zlib
 
 C0, C1, OFF = 0x80001000, 0x80002000, 0x40
 SPINS = 400_000_000
+NO_ASID, ORIGIN_KERNEL, ORIGIN_USER = 1, 1, 2
 
 
 def inc(asid):
@@ -36,9 +42,52 @@ def rec(seq, kind, cpu, ex, f):
     return "%s crc=%08x" % (body, zlib.crc32(body.encode()) & 0xFFFFFFFF)
 
 
+def seal(events):
+    """The producer's installation bookkeeping, modelled here independently of the grader: per
+    CPU the installation in force; a section that ends it gets `UNINSTALL` right after its members
+    (observed = a `RUN` of it came first), unless the case already put one there. A `RUN` written
+    with five fields is a user-mode entry."""
+    out, in_force, auto = [], {}, 0
+    events = list(events)
+    i = 0
+    while i < len(events):
+        e = events[i]
+        if e[0] == "RUN" and len(e[3]) == 5:
+            e = (e[0], e[1], e[2], list(e[3]) + [ORIGIN_USER]) + tuple(e[4:])
+        if e[0] != "SEC":
+            out.append(e)
+            i += 1
+            continue
+        c, ex, f = e[1], e[2], e[3]
+        gen, bcur, acur, na, nr = f[:5]
+        members = events[i + 1:i + 1 + na + nr]
+        j = i + 1 + na + nr
+        explicit = j < len(events) and events[j][0] in ("UNINSTALL", "NO_UNINSTALL")
+        cur_inst = in_force.get(c)
+        if acur > 1 and acur != bcur and (len(e) < 5 or not e[4]):
+            auto += 1
+            e = e[:4] + ("_i%d" % auto,)
+        out.append(e)
+        out += members
+        if explicit:
+            if events[j][0] == "UNINSTALL":
+                out.append(events[j])
+            j += 1
+            in_force[c] = None
+        elif cur_inst is not None and bcur == cur_inst[1] + 1 and acur != bcur:
+            observed = int(any(x[0] == "RUN" and x[3][4] == ("@", cur_inst[0]) for x in out))
+            out.append(("UNINSTALL", c, ex, [gen, cur_inst[1], ("@", cur_inst[0]), observed]))
+            in_force[c] = None
+        if acur > 1 and acur != bcur:
+            in_force[c] = (e[4], acur - 1)
+        i = j
+    return out
+
+
 def render(events, ok, ncpu=2, phase=2, overflow=0, transform=None, census_ok=None):
     """`ok` is the producer's success count, carried by both CENSUS_END and SL1W_END (they are
     written from one counter); `census_ok` overrides CENSUS_END's alone."""
+    events = seal(events)
     events = [e if e[0] not in ("CENSUS_END", "CENSUS_BEGIN") else
               (e[0], e[1], e[2], [ok if census_ok is None else census_ok, 2] if e[0] == "CENSUS_END"
                else e[3][:4] + [ok if census_ok is None else census_ok] + e[3][5:]) + tuple(e[4:])
@@ -327,6 +376,177 @@ def cases():
         i = idx(ev, "RUN")
         ev.insert(i + 1, ("RUN", 1, 1, [300, inc(3), 9, 11, ("@", "i300")]))
     neg("one installation observed running twice", H, run_twice, "run:")
+
+    # ── SCHED-LOCK1-SEAL: execution against the installation timeline ─────────────────────────
+    def clear_before_exec(ev, keep_progress=False):
+        """the delivered reproduction A: a genuine section clears cpu 1's current (300 requeued)
+        right after its installation, BEFORE 300's RUN (and PROGRESS); current stays empty
+        through them; 300 is restored after the hold. cpu 1's later generations shift by 2."""
+        i = idx(ev, "RUN")
+        ev[i:i] = [("SEC", 1, 1, [10, 301, 0, 1, 0, C1]), ("ADD", 1, 1, [10, 300, 1])]
+        setf(ev, idx(ev, "RUN"), 3, 11)
+        if not keep_progress:
+            setf(ev, idx(ev, "PROGRESS"), 2, 11)
+        e = idx(ev, "HOLD_END")
+        setf(ev, e, 1, 3)
+        ev[e + 1:e + 1] = [("SEC", 1, 1, [12, 0, 301, 0, 1, C1]), ("REM", 1, 1, [12, 300])]
+        for k, x in enumerate(ev):
+            if x[0] in ("SEC", "ADD") and x[1] == 1 and x[2] == 0 and x[3][0] == 11:
+                setf(ev, k, 0, 13)
+            elif x[0] in ("CLAIM",):
+                setf(ev, k, 3, 13)
+            elif x[0] == "NOTIFY" and x[3][0] == 11:
+                setf(ev, k, 0, 13)
+    neg("A execution after removal from current (RUN and PROGRESS while current is empty)", H,
+        clear_before_exec, "run:")
+    def a_run_excused(ev):  # A, with the end reporting 300 observed: the RUN alone would be a
+        # legitimate delayed publication, but PROGRESS is taken under the observer's own lock
+        clear_before_exec(ev)
+        ev.insert(idx(ev, "ADD", 0, f1=300, f0=10) + 1, ("UNINSTALL", 1, 1, [10, 300, ("@", "i300"), 1]))
+        setf(ev, idx(ev, "RUN"), 3, 10)
+    neg("PROGRESS while current is empty (its RUN excused as a delayed publication)", H, a_run_excused,
+        "progress:")
+    neg("B no-ASID substituted for an address-space-bearing task", H,
+        lambda ev: setf(ev, idx(ev, "CLAIM"), 1, NO_ASID), "claim-incarnation:")
+
+    def run_while_empty(ev):  # PROGRESS while 300 is current; then current cleared; RUN after
+        p = idx(ev, "PROGRESS")
+        r = ev.pop(idx(ev, "RUN"))
+        p -= 1
+        ev[p + 1:p + 1] = [("SEC", 1, 1, [11, 301, 0, 1, 0, C1]), ("ADD", 1, 1, [11, 300, 1]),
+                           ("RUN", 1, 1, [300, inc(3), 9, 11, ("@", "i300")])]
+        e = idx(ev, "HOLD_END")
+        setf(ev, e, 1, 3)
+        ev[e + 1:e + 1] = [("SEC", 1, 1, [12, 0, 301, 0, 1, C1]), ("REM", 1, 1, [12, 300])]
+        for k, x in enumerate(ev):
+            if x[0] in ("SEC", "ADD") and x[1] == 1 and x[2] == 0 and x[3][0] == 11:
+                setf(ev, k, 0, 13)
+            elif x[0] == "CLAIM":
+                setf(ev, k, 3, 13)
+            elif x[0] == "NOTIFY" and x[3][0] == 11:
+                setf(ev, k, 0, 13)
+    neg("RUN while current is empty", H, run_while_empty, "run:")
+
+    def run_while_other(ev):  # 300 replaced by 100 (queued) before 300's RUN is published
+        p = idx(ev, "PROGRESS")
+        ev.pop(idx(ev, "RUN"))
+        p -= 1
+        ev[p + 1:p + 1] = [("SEC", 1, 1, [11, 301, 101, 1, 1, C1], "i100"), ("ADD", 1, 1, [11, 300, 1]),
+                           ("REM", 1, 1, [11, 100]),
+                           ("RUN", 1, 1, [300, inc(3), 9, 11, ("@", "i300")])]
+        e = idx(ev, "HOLD_END")
+        setf(ev, e, 1, 3)
+        ev[e + 1:e + 1] = [("SEC", 1, 1, [12, 101, 301, 1, 1, C1]), ("ADD", 1, 1, [12, 100, 1]),
+                           ("REM", 1, 1, [12, 300])]
+        for k, x in enumerate(ev):
+            if x[0] in ("SEC", "ADD") and x[1] == 1 and x[2] == 0 and x[3][0] == 11:
+                setf(ev, k, 0, 13)
+            elif x[0] == "CLAIM":
+                setf(ev, k, 3, 13)
+            elif x[0] == "NOTIFY" and x[3][0] == 11:
+                setf(ev, k, 0, 13)
+    neg("RUN while a different task is current", H, run_while_other, "run:")
+
+    def reinstall(ev, progress_to="i300b", run_new=True):
+        """inside the hold, after 300's RUN: 300 requeued (gen 10), then selected again (gen 11,
+        installation i300b); PROGRESS (tick gen 12) names `progress_to`."""
+        r = idx(ev, "RUN")
+        ev[r + 1:r + 1] = [("SEC", 1, 1, [10, 301, 0, 1, 0, C1]), ("ADD", 1, 1, [10, 300, 1]),
+                           ("SEC", 1, 1, [11, 0, 301, 0, 1, C1], "i300b"), ("REM", 1, 1, [11, 300])]
+        if run_new:
+            ev.insert(r + 5, ("RUN", 1, 1, [300, inc(3), 11, 12, ("@", "i300b")]))
+        p = idx(ev, "PROGRESS")
+        ev[p] = ("PROGRESS", 1, 1, [0, 300, 12, 11 if progress_to == "i300b" else 9, inc(3), ("@", progress_to)])
+        setf(ev, idx(ev, "HOLD_END"), 1, 4)
+        for k, x in enumerate(ev):
+            if x[0] in ("SEC", "ADD") and x[1] == 1 and x[2] == 0 and x[3][0] == 11:
+                setf(ev, k, 0, 13)
+            elif x[0] == "CLAIM":
+                setf(ev, k, 3, 13)
+            elif x[0] == "NOTIFY" and x[3][0] == 11:
+                setf(ev, k, 0, 13)
+    ev = copy(H); reinstall(ev)
+    out.append(("genuine reinstallation, execution linked to the new installation (accepted)",
+                render(ev, 2), "pass", "-"))
+    neg("PROGRESS referring to a superseded installation", H,
+        lambda ev: reinstall(ev, progress_to="i300"), "progress:")
+
+    def run_old_after_reinstall(ev):  # removal and reinstallation; the first installation's RUN
+        # (never observed before its end) is published after the reinstallation
+        reinstall(ev, run_new=False)
+        r = ev.pop(idx(ev, "RUN"))
+        ev.insert(lab(ev, "i300b") + 2, ("RUN", 1, 1, [300, inc(3), 9, 11, ("@", "i300")]))
+    neg("removal and reinstallation: execution linked to the first installation", H,
+        run_old_after_reinstall, "run:")
+
+    def delayed_run(ev):  # the observation won over the end (end reports it observed); its record
+        # was published after the ending section's — the trap-entry path, no later than the end
+        reinstall(ev, run_new=False)
+        r = ev.pop(idx(ev, "RUN"))
+        u = lab(ev, "i300b") - 2
+        ev.insert(u + 2, ("UNINSTALL", 1, 1, [10, 300, ("@", "i300"), 1]))
+        ev.insert(lab(ev, "i300b") + 2, ("RUN", 1, 1, [300, inc(3), 9, 10, ("@", "i300")]))
+    ev = copy(H); delayed_run(ev)
+    out.append(("legitimate delayed RUN publication (accepted)", render(ev, 2), "pass", "-"))
+
+    def delayed_run_late_gen(ev):
+        delayed_run(ev)
+        setf(ev, idx(ev, "RUN"), 3, 11)
+    neg("delayed RUN observed after its installation's end", H, delayed_run_late_gen, "run:")
+
+    def observed_without_run(ev):
+        reinstall(ev, run_new=False)
+        ev.pop(idx(ev, "RUN"))
+        u = lab(ev, "i300b") - 2
+        ev.insert(u + 2, ("UNINSTALL", 1, 1, [10, 300, ("@", "i300"), 1]))
+    neg("an end reports its installation observed, no RUN recorded", H, observed_without_run, "run:")
+
+    def no_end(ev):  # the section ending i300 (300 requeued) records no end
+        reinstall(ev)
+        u = lab(ev, "i300b") - 2
+        ev.insert(u + 2, ("NO_UNINSTALL", 1, 1, []))
+    neg("an installation's end not recorded", H, no_end, "installation:")
+
+    def foreign_end(ev):  # an UNINSTALL for an installation not in force (q100 installs nothing)
+        i = lab(ev, "q100")
+        ev.insert(i + 2, ("UNINSTALL", 1, 1, [8, 100, ("@", "q100"), 0]))
+    neg("an end recorded for an installation not in force", H, foreign_end, "installation:")
+    neg("RUN names another task than its installation", H,
+        lambda ev: (setf(ev, idx(ev, "RUN"), 0, 100)), "run:")
+    neg("RUN on another CPU than its installation", H,
+        lambda ev: ev.__setitem__(idx(ev, "RUN"), ("RUN", 0, 0, list(ev[idx(ev, "RUN")][3]))), "run:")
+    neg("RUN's address space contradicts its claim", H,
+        lambda ev: setf(ev, idx(ev, "RUN", 0, f0=200), 1, inc(4)), "claim-incarnation:")
+
+    def hide_by_unobserved(ev):  # the claimed task's RUN contradicts the claim; the log then ends
+        # that installation reporting it never observed, as if the claim were simply unconfirmed
+        setf(ev, idx(ev, "CLAIM"), 1, inc(1009))
+        ev += []
+        c = idx(ev, "CENSUS_BEGIN")
+        ev[c:c] = [("SEC", 1, 1, [23, 201, 0, 1, 0, C1]), ("ADD", 1, 1, [23, 200, 1]),
+                   ("UNINSTALL", 1, 1, [23, 200, ("@", "i200"), 0])]
+        ev[idx(ev, "CENSUS_CUR", 1)] = ("CENSUS_CUR", 1, 1, [0, 23])
+        ev.insert(idx(ev, "CENSUS_END"), ("CENSUS_Q", 1, 1, [200, 1]))
+    neg("contradictory RUN hidden by marking its installation never observed", H, hide_by_unobserved, "run:")
+    neg("contradictory RUN hidden by marking the claim no-address-space", H,
+        lambda ev: (setf(ev, idx(ev, "CLAIM"), 1, NO_ASID)), "claim-incarnation:")
+
+    def still_queued(ev):  # the claimed task never runs in the window: 200 stays queued
+        j = lab(ev, "i200")
+        del ev[j:j + 4]
+        ev[idx(ev, "CENSUS_CUR", 1)] = ("CENSUS_CUR", 1, 1, [301, 22])
+        q = idx(ev, "CENSUS_Q", 2)
+        ev[q] = ("CENSUS_Q", 1, 1, [200, 1])
+    ev = copy(H); still_queued(ev)
+    out.append(("claimed task never runs again in the window (unconfirmed, accepted)", render(ev, 2), "pass", "-"))
+    ev = copy(H); still_queued(ev); setf(ev, idx(ev, "CLAIM"), 1, NO_ASID)
+    out.append(("no-address-space claim whose task never runs in the window (unconfirmed, accepted)",
+                render(ev, 2), "pass", "-"))
+    ev = copy(H); setf(ev, idx(ev, "CLAIM"), 1, NO_ASID)
+    r = idx(ev, "RUN", 0, f0=200)
+    ev[r] = ("RUN", 1, 1, list(ev[r][3]) + [ORIGIN_KERNEL])
+    out.append(("no-address-space claim whose task is entered only from kernel mode (unconfirmed, accepted)",
+                render(ev, 2), "pass", "-"))
 
     # ── commits ──────────────────────────────────────────────────────────────────────────────
     def one_commit(ev):  # the requeue happens before the hold; the window keeps only the install

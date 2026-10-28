@@ -107,7 +107,7 @@ fn verdict_ok(c: &Case, code: i32, reason: &str) -> bool {
 fn every_corpus_case_gets_its_verdict_and_obligation() {
     let s = Scratch::new("corpus");
     let cases = corpus(&s.0);
-    assert!(cases.len() >= 40, "corpus too small: {}", cases.len());
+    assert!(cases.len() >= 70, "corpus too small: {}", cases.len());
     let grader = Path::new(repo()).join(GRADER);
     let mut bad = Vec::new();
     for c in &cases {
@@ -128,6 +128,11 @@ fn every_corpus_case_gets_its_verdict_and_obligation() {
         "valid uncredited attempt (bound) then credited retry",
         "valid uncredited attempt (interference) then credited retry",
         "late observer progress (accepted)",
+        "genuine reinstallation, execution linked to the new installation (accepted)",
+        "legitimate delayed RUN publication (accepted)",
+        "claimed task never runs again in the window (unconfirmed, accepted)",
+        "no-address-space claim whose task never runs in the window (unconfirmed, accepted)",
+        "no-address-space claim whose task is entered only from kernel mode (unconfirmed, accepted)",
     ] {
         assert!(
             cases.iter().any(|c| c.name == name && c.expect_pass),
@@ -213,7 +218,8 @@ fn undoing_each_repair_lets_its_own_defect_through() {
         (
             "progress",
             "progress:",
-            Some("progress linked to the wrong installation (a queue-only commit)"),
+            // (the queue-only-commit case is now also refused by `progress-timeline`)
+            Some("progress reports another incarnation than its run"),
         ),
         (
             "attempt-ownership",
@@ -234,6 +240,29 @@ fn undoing_each_repair_lets_its_own_defect_through() {
             "commit-count",
             "coverage:",
             Some("missing genuine commits (one in the window)"),
+        ),
+        // SCHED-LOCK1-SEAL
+        (
+            "installation",
+            "installation:",
+            Some("an installation's end not recorded"),
+        ),
+        (
+            "run-timeline",
+            "run:",
+            Some(
+                "A execution after removal from current (RUN and PROGRESS while current is empty)",
+            ),
+        ),
+        (
+            "progress-timeline",
+            "progress:",
+            Some("PROGRESS referring to a superseded installation"),
+        ),
+        (
+            "no-asid",
+            "claim-incarnation:",
+            Some("B no-ASID substituted for an address-space-bearing task"),
         ),
     ];
     let mut report = Vec::new();
@@ -305,6 +334,31 @@ fn producer_facts_the_grader_relies_on() {
     assert_eq!(WITNESS.matches("close_hold(token, OUT_RELATED)").count(), 1);
     assert_eq!(WITNESS.matches("close_hold(token, OUT_BOUND)").count(), 1);
     assert_eq!(WITNESS.matches("HOLD_ACTIVE.store(0").count(), 1);
+    // SCHED-LOCK1-SEAL: an installation has one atomic state word. Its first observed execution
+    // is a compare-and-swap from OPEN at a kernel entry (no tick-hook RUN, so every RUN carries
+    // its entry's origin), the section that ends it ors in ENDED and records UNINSTALL with the
+    // state it found, and PROGRESS names the installation in force (never a historical match).
+    let observe = WITNESS
+        .split("fn observe_run(")
+        .nth(1)
+        .and_then(|b| b.split("\n}\n").next())
+        .expect("observe_run body");
+    assert!(observe.contains(".compare_exchange(") && observe.contains("INST_OBSERVED"));
+    assert!(observe.find("ACQ_GEN[c]").unwrap() < observe.find(".compare_exchange(").unwrap());
+    assert!(WITNESS.contains("slot[3].fetch_or(INST_ENDED, Ordering::AcqRel)"));
+    assert!(WITNESS.contains("K_UNINSTALL,"));
+    assert_eq!(
+        WITNESS.matches("observe_run(").count(),
+        2,
+        "one definition, one (trap-entry) caller"
+    );
+    let tick = WITNESS
+        .split("pub(crate) fn on_tick(")
+        .nth(1)
+        .and_then(|b| b.split("\n}\n").next())
+        .expect("on_tick body");
+    assert!(tick.contains("LAST_INSTALL.get(c)") && !tick.contains("== cur.0 + 1)\n"));
+    assert!(!tick.contains("s[0].load(Ordering::Acquire) == cur.0 + 1"));
     // The cell map comes from the domain's own cell array, under the coherent view.
     assert!(SCHEDULER.contains("pub(crate) fn witness_cell_addrs(&self, idx: usize)"));
     assert!(WITNESS.contains("domain.witness_cell_addrs(cpu)"));
