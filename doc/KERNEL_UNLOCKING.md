@@ -2193,8 +2193,158 @@ open (§16.5; SCHED-LOCK1-ACCEPTANCE); they are not repaired here, and no produc
 changes to satisfy them. The parallel hosted-test race and the unrelated red CI jobs stay named
 and open; global test concurrency is not changed here.
 
-The qualification record follows in a documentation-only commit, bound to the candidate that
-produced it.
+**Qualification record** (this documentation-only commit; every scheduled result is kept).
+
+*The candidate.* `bd01491d6eca2a6a0c240113baa7bc2741b57ddf` (tree `8bc85b29…`), against base
+`035d0f56`. It was frozen at 2026-10-28T11:39:40Z, with the scratch runners' hashes recorded
+before the run: `qualify.sh` `f6f62975…`, controls `ctl.py` `f77aca1b…`, `mkreal.py` `cf39507b…`.
+Run 11:40–14:37Z. Toolchain: rustc 1.101.0-nightly (32dba69d6 2026-10-09). QEMU 8.2.2. No
+scheduled run failed, so there was no re-freeze.
+
+*Hosted, grader and source evidence:*
+
+| Gate | Result |
+|---|---|
+| Q1 hosted lib, serial | 6216 passed, 0 failed |
+| Q2 SCHED-LOCK1 hosted tests ×3 | 19/19 each |
+| Q2 grader CLI suite ×3 | 4/4 each: 76 corpus cases, 15 independent repair controls, producer pins |
+| Q2 grader self-test | 9 cases, 0 wrong |
+| Q2 original reproduction inputs on the frozen grader | baseline, A and B each exit 1, `installation` (they predate the end records), as predeclared |
+| Q2b alterations of the frozen candidate's Q9 RISC-V `-smp 2` idle boot (`6f66a80e…`) | A (installation seq 13, tid 10011, cleared before its `RUN` and `PROGRESS`, restored after): exit 1, `run: RUN seq 18 … emitted after that installation ended (seq 15) unobserved: cpu 1's current was then None`. B (claim seq 33, tid 2, ASID code 4 → "no address space"): exit 1, `claim-incarnation: … first kernel entry (RUN seq 46) came from user mode with ASID code 4 active`. The unaltered log: exit 0 |
+| Q3 integration | every suite passed |
+| Q4 `cargo fmt --check` | clean |
+| Q5 lock-site census, candidate vs `035d0f56` | identical |
+
+The repair controls changed these numbers of cases:
+
+| Control | Cases changed |
+|---|---|
+| lock-instance | 4 |
+| cell-map | 2 |
+| no-op-section | 1 |
+| claim-commit | 6 |
+| claim-incarnation | 4 |
+| run | 3 |
+| progress | 1 |
+| attempt-ownership | 5 |
+| attempt-order | 1 |
+| attempt-outcome | 6 |
+| commit-count | 1 |
+| installation | 2 |
+| run-timeline | 7 |
+| progress-timeline | 2 |
+| no-asid | 2 |
+
+*Images* (Q6–Q8, Q11), through BUILD-GATES1:
+* **The default kernels are byte-identical to `035d0f56`'s:** x86_64 `cb0a42ab…`, AArch64
+  `9bb5df05…`, RISC-V `d7b8663b…`. Every initramfs and rootfs binary is identical. The x86_64
+  and AArch64 output directories differ only in their own build logs (`x86_64-build.log`,
+  `aarch64-build.log`), which record the build.
+* Warnings are identical (222 / 399 / 237; hosted 306), and section sizes are identical.
+* **All eight Q8 witness kernels are byte-identical to `035d0f56`'s:** the three AP-scheduling
+  witnesses, x86 VMI2, RISC-V VMI, RISC-V SMP3, x86 SMP1 and AArch64 SMP2.
+* No-FP passes on every Q6 and Q8 image (self-test 101 cases, 0 mismatches).
+* The changed SCHED-LOCK1 witness kernels, booted fresh: x86_64 `8676f239…`, AArch64 `e965db1d…`,
+  RISC-V `4c29128a…`.
+
+*Live, on the frozen candidate.*
+
+**Q9 — SCHED-LOCK1 witness matrix, 15/15 pass** (no ring overflow). Every emitted `RUN` and
+`PROGRESS` was validated against the installation timeline, including those of uncredited
+attempts:
+
+| Port | CPUs | Host | Rounds | Valid attempts (uncredited) | Installations / observed by a RUN | RUNs (kernel-mode) | PROGRESS | Claims bound / confirmed / unconfirmed | Records |
+|---|---|---|---|---|---|---|---|---|---|
+| x86_64 | 2 | idle | 2/2 | 3 (1) | 50 / 50 | 50 (0) | 2 | 36 / 36 / 0 | 427 |
+| x86_64 | 2 | loaded | 2/2 | 3 (1) | 53 / 53 | 53 (0) | 2 | 35 / 35 / 0 | 442 |
+| x86_64 | 4 | idle | 8/8 | 11 (3) | 2488 / 2488 | 2488 (0) | 8 | 86 / 86 / 0 | 15229 |
+| x86_64 | 4 | loaded | 8/8 | 11 (3) | 1675 / 1675 | 1675 (0) | 8 | 93 / 93 / 0 | 10380 |
+| x86_64 | 8 | idle | 16/16 | 20 (4) | 6828 / 6828 | 6828 (0) | 16 | 183 / 183 / 0 | 41602 |
+| AArch64 | 2 | idle | 2/2 | 2 (0) | 102 / 102 | 102 (0) | 2 | 80 / 80 / 0 | 867 |
+| AArch64 | 2 | loaded | 2/2 | 2 (0) | 96 / 96 | 96 (0) | 2 | 78 / 78 / 0 | 827 |
+| AArch64 | 4 | idle | 8/8 | 8 (0) | 176 / 176 | 176 (0) | 8 | 119 / 119 / 0 | 1456 |
+| AArch64 | 4 | loaded | 8/8 | 8 (0) | 190 / 190 | 190 (0) | 8 | 123 / 123 / 0 | 1552 |
+| AArch64 | 8 | idle | 16/16 | 16 (0) | 484 / 484 | 484 (0) | 17 | 219 / 219 / 0 | 3647 |
+| RISC-V | 2 | idle | 2/2 | 2 (0) | 72 / 72 | 72 (0) | 2 | 31 / 30 / 1 | 540 |
+| RISC-V | 2 | loaded | 2/2 | 2 (0) | 131 / 131 | 131 (0) | 2 | 51 / 51 / 0 | 954 |
+| RISC-V | 4 | idle | 8/8 | 9 (1) | 171 / 171 | 171 (0) | 9 | 71 / 71 / 0 | 1279 |
+| RISC-V | 4 | loaded | 8/8 | 8 (0) | 188 / 188 | 188 (0) | 17 | 88 / 88 / 0 | 1444 |
+| RISC-V | 8 | idle | 16/16 | 17 (1) | 1110 / 1110 | 1110 (0) | 28 | 206 / 205 / 1 | 7380 |
+
+Totals:
+* 108 rounds credited over 122 valid attempts (14 valid, uncredited).
+* 13,814 installations, every one observed by exactly one `RUN` from user mode. No installation
+  ended unobserved, no `RUN` was published after its end, and no kernel-mode entry occurred. One
+  installation per boot was in force at the census.
+* 131 `PROGRESS` records.
+* 1,499 claims bound; 1,497 confirmed by a user-mode entry of the installation that consumed their
+  wake. 2 are unconfirmed, both still queued at the census; none was withdrawn, installed without
+  entry, or entered only from kernel mode. No claim of "no address space" occurred.
+* The largest record count was 41,602 of 65,536 (x86_64 at 8 CPUs).
+
+**Q10 — live negative controls** (RISC-V `-smp 2`, idle):
+
+| Control | Result |
+|---|---|
+| hold-scoped global serialization | exit 1 after 749 s: `coverage: rounds [0, 1] were never credited` |
+| dropped publication | `claim-commit: CLAIM seq 140 … names commit seq 0 gen 0` |
+| dropped notification | `natural: remote ADD seq 13 (cpu 1 → cpu 0) was never notified` |
+| substituted destination | `claim-commit: CLAIM seq 240 … names commit seq 0 gen 0` |
+| duplicate consumption | **watchdog timeout**: the boot timed out after 600 s, before the record dump (`validity: no CRC-valid SL1W_END`). This is a timeout, not a detection; in the `3403a1e9` qualification the same control failed `natural` in 56 s |
+| `no_end` (one end not recorded) | `installation: section seq 32 on cpu 0 ends installation seq 27 (tid 2) without recording that end` |
+| `noasid` (every wake owner stages "no address space") | `claim-incarnation: CLAIM seq 19 placed tid 2 as a task with no address space; … (RUN seq 26) came from user mode with ASID code 4 active` |
+
+**Q12 — affected regressions, booted fresh, 34/34 exit 0:**
+* the strict default cores (three ports);
+* the AP-scheduling witness at 2 CPUs on each port; x86 VMI2 (`contract_rounds=8`); RISC-V VMI;
+  RISC-V SMP3 (the one scheduled run passed);
+* x86 SMP1, LOCK3, overtaken, UART IRQ, exit-current-task, reply-timeout retirement,
+  shared-region direct (offset selection), and `ipccall` SMP (its designed
+  `result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired`, as at base);
+* AArch64 SMP2, LOCK2, overtaken, PL011 IRQ, exit, retirement, shared-region and `ipccall`;
+* RISC-V LOCK1, UART IRQ, shared-region replace, exit, retirement, shared-region and `ipccall`;
+* CONTEXT1 on x86_64 and AArch64.
+
+*Development evidence (not qualification).* Five boots of the sealed witness before the freeze
+passed: RISC-V 2-CPU idle and 4-CPU loaded, x86_64 2-CPU idle and loaded, and AArch64 4-CPU idle.
+In each, every installation was observed by one user-mode `RUN`.
+
+*CI (observed on GitHub Actions).* `compatibility-gates` on `bd01491d` (run 40681679121) has the
+same job outcomes as base:
+* `kernel-nofp-gates` passes;
+* `core-profile` fails the parallel hosted suite (6160 passed, 56 failed; serial passes all 6216);
+* `posix-compat-profile` fails the same way;
+* `ci-workflow-enforcement`, `service-boundary-check`, `roadmap-readiness-check`,
+  `phase5-boundary-gates`, `phase3-4-strict-runtime-gate` and `phase4-ui-smoke-marker` are red as
+  before and untouched.
+
+*What the evidence is, kept apart:*
+* **Hosted:** the serial suite, the SCHED-LOCK1 hosted tests and integration.
+* **Source:** fmt, the census and the producer pins.
+* **Image:** byte identity of every default and affected witness kernel with `035d0f56`,
+  warnings, sections and no-FP.
+* **Grader:** the 76-case CLI corpus, 15 repair controls, and the reproductions original and
+  real-log.
+* **Live:** the 15-boot matrix, seven controls (one a watchdog timeout) and 34 regressions.
+
+The production scheduler policy, lock ownership, placement, context restoration and invalidation
+behaviour are those of `035d0f56`. That is shown by the source diff (two one-argument edits on
+witness-gated lines, and the witness module) and by image identity, not by a live run of their
+own.
+
+*Open, named:*
+* the SMP3 verifier's missing residency input and its IPI-recording stamping race (§16.5;
+  SCHED-LOCK1-ACCEPTANCE), next in SMP3-EVIDENCE1;
+* the duplicate-consumption live control's watchdog timeout in this run;
+* the parallel hosted-test race and the red CI jobs above;
+* SC-LOCK-2 partial: no fairness or progress bound for the TTAS 1L wait (§17.3);
+* the shared dependencies of §17.3;
+* claims whose tasks do not run again in the window stay unconfirmed (reported by reason);
+* a kernel-mode first entry neither confirms nor refutes a task's class;
+* the record ring's headroom at 8 CPUs on x86_64 (41,602 of 65,536).
+
+No fairness, latency, starvation-freedom, WCET or kernel-preemption bound is established.
+SMP3-EVIDENCE1 and KTHREAD1 are not started.
 
 ---
 
