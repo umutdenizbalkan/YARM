@@ -1495,7 +1495,7 @@ Those failures stay in the record next to the reruns.
 |---|---|---|---|---|
 | `4199b7f4` | 1 | Q5 | The host disk filled (105 MB free) with earlier scratch worktrees and targets. No result was judged. | Removed old scratch worktrees; the runner cleans each build tree after use and logs free space per step. |
 | `4199b7f4` | 2 | Q1 | Three hosted source guards failed (3 of 6218): the receiver enqueue's witness claim sat between its commit and its notification, outside the guard's window; the withdrawal-seam guard counted the SCHED-LOCK1 test file as a production caller; the tick-policy guard pinned the closure's exact text. | `155fd8d8`: the claim moved inside the notification block; the test file is listed among the seam's owners; the tick guard pins one `c.tick()` under the CPU's own 1L. |
-| `155fd8d8` | 1 | Q11 RISC-V SMP3, and Q10 x86 at 4 CPUs | **SMP3** (production defect): kernel verdict `shoot_targets_inconsistent` at fence attempt 18. The shootdown target set read each CPU's current from its published mirror, which shows the state before an install in progress, so it named CPU 0 by residency with no current behind it. **x86 Q10 at 4 CPUs** (idle and loaded): both ran out of the runner's 900 s default (912 s, 921 s). The runner was stopped at Q11. | `42d6fc4f`: target and teardown sets read each candidate's current under that CPU's own 1L (contract §16.5). `00edb00f`: the smoke's budget is 2400 s from 4 CPUs (see the schedule revision). |
+| `155fd8d8` | 1 | Q11 RISC-V SMP3, and Q10 x86 at 4 CPUs | **SMP3** (recorded as a production defect; corrected by SCHED-LOCK1-ACCEPTANCE: the verdict recurred after the repair and is explained by the verifier's missing residency input, contract §16.5): kernel verdict `shoot_targets_inconsistent` at fence attempt 18. The shootdown target set read each CPU's current from its published mirror, which shows the state before an install in progress, so it named CPU 0 by residency with no current behind it. **x86 Q10 at 4 CPUs** (idle and loaded): both ran out of the runner's 900 s default (912 s, 921 s). The runner was stopped at Q11. | `42d6fc4f`: target and teardown sets read each candidate's current under that CPU's own 1L (contract §16.5). `00edb00f`: the smoke's budget is 2400 s from 4 CPUs (see the schedule revision). |
 
 Also in the stopped `155fd8d8` attempt, three invocation errors of my schedule (not candidate
 defects; the schedule revision above corrects them):
@@ -1546,7 +1546,9 @@ Every other `155fd8d8` result passed:
 * **SMP3 after the repair.** Three development runs on `42d6fc4f` under concurrent host load:
   two passed. The third failed `tlb_too_few_credited_rounds_per_direction`, the pre-existing
   timer-interference signature (base passed 24/30 under load with this verdict among its
-  failures). `shoot_targets_inconsistent` did not recur.
+  failures). `shoot_targets_inconsistent` did not recur. *(It recurred on `3403a1e9` with the
+  per-CPU read in place; the verifier lacks the residency half of the target set, so the
+  mirror-lag attribution is not established. See SCHED-LOCK1-ACCEPTANCE and contract §16.5.)*
 
 *Results on `00edb00f` (run 18:24–21:42Z, every scheduled run listed):*
 
@@ -1872,8 +1874,200 @@ The re-frozen candidate is qualified by the whole schedule above, run again (Q1�
   eight Q8 witness kernels are built and required to equal the candidate's byte for byte. That
   proves the image differences are line positions in panic locations only.
 
-The qualification record follows in a documentation-only commit, bound to the candidate that
-produced it.
+**Qualification record** (this documentation-only commit; every scheduled result is kept).
+
+*The candidate.* `3403a1e95e704aae754df5fd5648680d2b21c246` (tree `75ed8eb3…`), against base
+`b7f33257` (tree `13e5874b…`). It descends from the first freeze `64c9fdcf` through `e160e261`.
+That commit was a first form of the hold repair; it was never frozen, and development boots
+refuted it (see the repair above). The candidate was frozen at 2026-10-28T07:40:39Z. The
+scratch runners' hashes were recorded before the run: `qualify.sh` `a228e509…`, `q12.sh`
+`c111707d…`, `lineshift.py` `5629163a…`, controls `ctl.py` `76c14a9b…`. Toolchain: rustc
+1.101.0-nightly (32dba69d6 2026-10-09). QEMU 8.2.2.
+
+*The four reproductions* (§1). Delivered grader sha256 `194853ac…`. The ten runs (fixture and
+real-log originals plus their alterations A–D) all exited 0 with `result=pass` on the delivered
+grader, as listed above. The inputs are kept unchanged with their hashes, edit descriptions,
+commands and transcripts.
+* On the frozen grader (Q2), the old-format originals are refused by `cell-map`, as predeclared:
+  they predate the map.
+* The same four alterations of a new-format boot log from the frozen candidate (Q9 RISC-V `-smp 2`
+  idle, 222 sections), Q2b:
+
+| Alteration | Frozen grader |
+|---|---|
+| A: 222 `SEC` instances → `0x7e570000` | exit 1, `lock-instance: section seq 11 on cpu 0 names lock instance 0x7e570000; cpu 0's cell is 0x81832740` |
+| B: claim #13 (tid 2) ASID 4 → 1004 | exit 1, `claim-incarnation: … when it next ran (RUN seq 28) cpu 0 had code 4 active` |
+| C: invalid attempt (held=0, two 1L, ok=0) before the healthy one | exit 1, `attempt: round 0 attempt seq 9: the holder's lock was not held at begin and end` |
+| D: round 0's attempts replaced by one over net-no-op sections | exit 1, `no-op-section: section seq 10 on cpu 1 changes nothing` |
+| the unaltered log | exit 0, 2/2 rounds over 3 valid attempts (1 uncredited) |
+
+*Hosted and source evidence* (Q1–Q5, run on `3403a1e9`):
+
+| Gate | Result |
+|---|---|
+| Q1 hosted lib, serial | 6216 passed, 0 failed |
+| Q2 SCHED-LOCK1 hosted tests ×3 (harness threading) | 19/19 each |
+| Q2 grader CLI suite ×3 | 4/4 each: 55 corpus cases, 11 independent repair controls, producer pins |
+| Q2 grader self-test | 7 cases, 0 wrong |
+| Q3 integration | every suite passed |
+| Q4 `cargo fmt --check` | clean |
+| Q5 lock-site census, candidate vs `b7f33257` | identical except `current_mirror(` 1 → 2. The new site is the witness-only `trap_entered` (cfg `sched-lock1-witness`), which the census counts because it scans the witness module |
+
+The undo-one-repair controls each changed only cases expecting their own obligation, and each
+re-admitted its named original:
+
+| Control | Cases changed |
+|---|---|
+| lock-instance | 4 |
+| cell-map | 2 |
+| no-op-section | 1 |
+| claim-commit | 6 |
+| claim-incarnation | 3 |
+| run | 2 |
+| progress | 4 |
+| attempt-ownership | 5 |
+| attempt-order | 1 |
+| attempt-outcome | 6 |
+| commit-count | 1 |
+
+*Images* (Q6–Q8, Q11, Q13), built through BUILD-GATES1:
+* **Default kernels differ from `b7f33257`.**
+  * x86_64 `cb0a42ab…` (base `f828aa8f…`);
+  * AArch64 `9bb5df05…` (base `655f4436…`);
+  * RISC-V `d7b8663b…` (base `7b9cc2bb…`).
+
+  Every initramfs and rootfs binary is identical. Freestanding warnings are identical in named
+  classes and counts (222 / 399 / 237; hosted 306), with no new or gone warning. Section sizes
+  (`.text`, `.rodata`, `.data`, `.bss`) are identical on all three ports.
+* **All eight Q8 witness kernels differ from base:** the three AP-scheduling witnesses, x86 VMI2,
+  RISC-V VMI, RISC-V SMP3, x86 SMP1 and AArch64 SMP2. Every Q6 and Q8 image, candidate and base,
+  passes the no-FP check (self-test 101 cases, 0 mismatches).
+* **Why they differ.** Outside the witness module (a `compile_error!` unless
+  `sched-lock1-witness` is enabled), the candidate removes no source line, and every line it adds is
+  a comment or a `sched-lock1-witness`-gated item. Those 46 added lines, in five files, move later
+  lines, so the compiled panic locations carry different line numbers. Q13 proves this is the
+  only difference:
+  * `b7f33257`'s source was laid out on the candidate's line numbers (each added line an empty
+    comment; each file verified to reduce to the base exactly);
+  * its three default kernels and all eight Q8 witness kernels are **byte-identical** to the
+    candidate's.
+
+  No production image therefore differs from `b7f33257` in anything but line positions. The
+  default and other-witness images are identical to the first freeze's (`64c9fdcf`).
+* **SCHED-LOCK1 witness kernels** (changed, booted fresh): x86_64 `7436ab52…`, AArch64
+  `4bfd7cf8…`, RISC-V `69a040de…`.
+
+*Live, on the frozen candidate:*
+
+**Q9 — SCHED-LOCK1 witness matrix, 15/15 pass** (2400 s budget from 4 CPUs; no ring overflow):
+
+| Port | CPUs | Host | Rounds | Valid attempts (uncredited) | Claims bound / confirmed | Records |
+|---|---|---|---|---|---|---|
+| x86_64 | 2 | idle | 2/2 | 3 (1) | 36 / 36 | 379 |
+| x86_64 | 2 | loaded | 2/2 | 2 (0) | 37 / 37 | 414 |
+| x86_64 | 4 | idle | 8/8 | 8 (0) | 85 / 85 | 1076 |
+| x86_64 | 4 | loaded | 8/8 | 11 (3) | 90 / 90 | 8803 |
+| x86_64 | 8 | idle | 16/16 | 17 (1) | 189 / 189 | 10922 |
+| AArch64 | 2 | idle | 2/2 | 2 (0) | 82 / 81 | 746 |
+| AArch64 | 2 | loaded | 2/2 | 3 (1) | 84 / 83 | 775 |
+| AArch64 | 4 | idle | 8/8 | 8 (0) | 122 / 122 | 1302 |
+| AArch64 | 4 | loaded | 8/8 | 9 (1) | 120 / 120 | 1350 |
+| AArch64 | 8 | idle | 16/16 | 16 (0) | 217 / 217 | 3172 |
+| RISC-V | 2 | idle | 2/2 | 3 (1) | 41 / 41 | 591 |
+| RISC-V | 2 | loaded | 2/2 | 2 (0) | 37 / 37 | 508 |
+| RISC-V | 4 | idle | 8/8 | 11 (3) | 74 / 73 | 1183 |
+| RISC-V | 4 | loaded | 8/8 | 9 (1) | 92 / 91 | 1307 |
+| RISC-V | 8 | idle | 16/16 | 16 (0) | 179 / 178 | 5922 |
+
+Totals: 108 rounds credited over 120 valid attempts (12 valid, uncredited). 1485 claims were
+bound to their commits; 1480 were confirmed by a later run.
+
+**Q10 — live negative controls** (RISC-V `-smp 2`, idle). Each fails for its own obligation; no
+watchdog timeout occurred:
+
+| Control | Result |
+|---|---|
+| hold-scoped global serialization | exit 1 after 823 s: `coverage: rounds [0, 1] were never credited` |
+| dropped publication | `claim-commit: CLAIM seq 121 … names commit seq 0 gen 0, which did not add tid 10008` |
+| dropped notification | `natural: remote ADD seq 12 (cpu 1 → cpu 0) was never notified` |
+| substituted destination | `claim-commit: CLAIM seq 170 … names commit seq 0 gen 0` |
+| duplicate consumption | `natural: seq 18 installs tid 10010, which is placed elsewhere` |
+
+**Q8 and Q12 — affected regressions, every differing image class booted fresh:**
+* **AP-scheduling witness at 2 CPUs:** x86_64, AArch64 and RISC-V ok. x86 VMI2 ok
+  (`contract_rounds=8`).
+* **RISC-V SMP3 (scheduled Q8 run): FAILED.** Kernel verdict `shoot_targets_inconsistent` at
+  fence attempt 8, so 23 of 24 fence attempts were graded. Not candidate-caused: the image is
+  byte-identical to base on the candidate's line layout (Q13). The cause is the SMP3 verifier's
+  missing residency input; contract §16.5 now says so and withdraws the claim that the
+  SCHED-LOCK1 repair removed this verdict.
+* **Three labelled additional SMP3 samples** (beside the failure, not replacing it): all ok.
+* **Strict default cores:** x86_64, AArch64 and RISC-V ok.
+* **RISC-V VMI, x86 SMP1, AArch64 SMP2:** ok.
+* **Regression list**, all exit 0:
+  * x86: LOCK3, overtaken, UART IRQ, exit-current-task, reply-timeout retirement, shared-region
+    direct (offset selection), `ipccall` SMP. The `ipccall` SMP run reports its designed
+    `result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired`, as at base.
+  * AArch64: LOCK2, overtaken, PL011 IRQ, exit, retirement, shared-region, `ipccall`.
+  * RISC-V: LOCK1, UART IRQ, shared-region replace, exit, retirement, shared-region, `ipccall`.
+  * CONTEXT1 on x86_64 and AArch64.
+
+  32 of 32 Q12 runs passed.
+
+*Every scheduled failure, across both freezes:*
+
+| Freeze | Run | Verdict | Cause | Outcome |
+|---|---|---|---|---|
+| `64c9fdcf` | Q9 x86_64 2 CPUs loaded | `attempt: … reports success with commits=7 progress=1 related=1` | candidate: two closers of one hold | repaired (one outcome per hold), re-frozen |
+| `64c9fdcf` | Q8 RISC-V SMP3 | `ipi_merge_inconsistent` at 129 | SMP3 checker stamping race (merged publication stamped after the consuming arrival) | open, named |
+| `3403a1e9` | Q8 RISC-V SMP3 | `shoot_targets_inconsistent` at 8 | SMP3 verifier lacks the residency half of the target set | open, named; §16.5 corrected |
+
+On `64c9fdcf` every other scheduled run passed, including the other 14 matrix boots and all five
+live controls.
+
+*Development evidence (not qualification).*
+* Before the freeze: RISC-V `-smp 2` 34/35 incarnations confirmed; x86_64 `-smp 2` 35/35;
+  AArch64 `-smp 4` 122/122; RISC-V `-smp 4` 82/82; x86_64 `-smp 8` 16/16 rounds, 182/182.
+* `e160e261`: x86_64 2-CPU loaded failed coverage twice in three runs (the refuted repair).
+* Final form:
+  * x86_64 2-CPU loaded passed twice. A third run was refused by the artifact-binding gate,
+    because the tree was committed while that run was building its initramfs (correctly refused;
+    its kernel was identical to the two that passed).
+  * x86_64 2-CPU idle, RISC-V 2-CPU idle and AArch64 4-CPU loaded passed.
+
+*CI (observed on GitHub Actions).* `compatibility-gates` on `3403a1e9` (run 40650728698) has the
+same job outcomes as `b7f33257` (run 40589660104):
+* `kernel-nofp-gates` passes.
+* `core-profile` fails the parallel hosted suite as at base: 6162 passed, 54 failed. The delivered
+  SCHED-LOCK1 candidate showed 6168/48 there; serial runs pass all 6216.
+* `posix-compat-profile` fails the same way.
+* `ci-workflow-enforcement`, `service-boundary-check`, `roadmap-readiness-check`,
+  `phase5-boundary-gates`, `phase3-4-strict-runtime-gate` and `phase4-ui-smoke-marker` are red as
+  at base and untouched. Global test concurrency is not changed.
+* `core-qemu-smoke` runs on pull requests and `workflow_dispatch` only; it did not run here.
+
+*What the evidence is, kept apart:*
+* **Hosted:** the serial suite, the SCHED-LOCK1 hosted tests and integration.
+* **Source:** fmt, the census and the producer pins.
+* **Image:** byte identity under the line shift, warnings, sections and no-FP.
+* **Grader:** the CLI corpus, the repair controls, and the reproductions old and new.
+* **Live:** the 15-boot matrix, the five controls and the regressions above.
+
+The production scheduler policy and lock ownership are those of `b7f33257`, shown by the source
+diff (outside the witness-only module no line removed or changed; every addition comment-only or
+witness-gated) and
+by Q13's byte identity, not by a live run of their own.
+
+*Open, named:*
+* the parallel hosted-test race (`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`) and the red CI jobs above;
+* the SMP3 checker's merged-publication stamping race;
+* the SMP3 verifier's missing residency input (§16.5);
+* SC-LOCK-2 partial: no fairness or progress bound for the TTAS 1L wait (§17.3);
+* the five coherent-view paths and the other shared dependencies of §17.3;
+* claims for tasks that do not run again in the window stay unconfirmed (reported, not credited).
+
+No latency, starvation-freedom, WCET or kernel-preemption claim is made. KTHREAD1 is not
+started.
 
 ---
 

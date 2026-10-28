@@ -1601,6 +1601,26 @@ cross-CPU operations and wait for the CPU they read. The concurrent test
 CPU 0's section ends, while CPU 1's local operations do not wait. After the repair the SMP3
 witness passed in its scheduled run on `00edb00f`.
 
+*What recurred, and what it changes (SCHED-LOCK1-ACCEPTANCE qualification).* With the per-CPU
+locked read in place, the same verdict recurred: RISC-V SMP3, scheduled run on `3403a1e9`, fence
+attempt 8, kernel `SMP3_VERDICT result=fail reason=shoot_targets_inconsistent at=8`.
+* That SMP3 image is byte-identical to `b7f33257`'s laid out on the candidate's line numbers
+  (KERNEL_UNLOCKING, Q13).
+* The requester was CPU 1, task C was confirmed current on CPU 0 just before the operation (record
+  589), and the mask was `0x1` while the recorded current for CPU 0 was empty (record 593). CPU 0's
+  fence was requested and completed (records 594–595).
+
+The target set is the placement half OR the residency half. The SMP3 witness records only the
+placement half, and its verifier requires the mask bit to equal "recorded current is C". So a
+CPU named by residency alone — a dispatch gap: `current` empty, root still loaded, which is what
+the residency half exists to cover — is refused as inconsistent.
+
+The `155fd8d8` occurrence has the same signature. Its attribution to mirror lag is therefore not
+established, and the repair is not shown to have removed this verdict. The repair stays: it reads
+each CPU's own state, which is correct whatever the verifier models. The verifier's missing
+residency input is an open witness defect, named here and not repaired by SCHED-LOCK1-ACCEPTANCE.
+As before, no withheld fence and no premature reclamation was observed, and none is claimed.
+
 ### 16.6 What is not changed
 
 Scheduling policy (priorities, FIFO, selection filter, quanta), CPU admission order, fixed
@@ -1934,7 +1954,8 @@ The round population (2 rounds at 2 CPUs, `2n` otherwise), the attempt limit (3)
 them.
 
 **Limits.** A claim's incarnation is confirmed only if its task runs again inside the window, so
-the grader reports the confirmed count. In development boots every claim was confirmed but one.
+the grader reports the confirmed count. Over the 15 qualification boots, 1480 of 1485 claims
+were confirmed; the other five tasks did not run again inside the window.
 The confirmation relies on the activation table showing the running task's address space at a
 kernel entry: kernel code runs with interrupts masked except in the idle halt loop, where no task
 is current. A claim for a task without an address space is bound to its commit but carries no
