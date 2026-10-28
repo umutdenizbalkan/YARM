@@ -170,13 +170,14 @@ def grade(text, expect_cpus=None):
     if rs[-1]["f"][0] != end["ok"] or rs[-1]["f"][1] != rounds:
         fail("validity", "CENSUS_END disagrees with SL1W_END")
     # ── cell-map: one authoritative CPU → lock-instance map ──────────────────────────────────
-    if snap_cells != cen_cells:
+    if snap_cells != cen_cells:  # repair:cell-map
         fail("cell-map", "a CPU's cell changed inside the window (SNAP %s, CENSUS %s)"
              % (snap_cells, cen_cells))
     cell = {c: snap_cells[c][0] for c in range(n)}
-    if 0 in cell.values() or len(set(cell.values())) != n or len({l for _, l in snap_cells.values()}) != n:
+    distinct = 0 not in cell.values() and len(set(cell.values())) == n and len({l for _, l in snap_cells.values()}) == n
+    if not distinct:  # repair:cell-map
         fail("cell-map", "CPU cells are not distinct non-null instances %s" % snap_cells)
-    if len({l - c for c, l in snap_cells.values()}) != 1:
+    if len({l - c for c, l in snap_cells.values()}) != 1:  # repair:cell-map
         fail("cell-map", "the lock does not sit at one offset in every cell %s" % snap_cells)
     body = rs[i:ci]
     # ── sections ──────────────────────────────────────────────────────────────────────────────
@@ -202,10 +203,10 @@ def grade(text, expect_cpus=None):
         if gen <= last_gen[r["cpu"]]:
             fail("validity", "cpu %d generations not increasing at seq %d" % (r["cpu"], r["seq"]))
         last_gen[r["cpu"]] = gen
-        if inst != cell[r["cpu"]]:
+        if inst != cell[r["cpu"]]:  # repair:lock-instance
             fail("lock-instance", "section seq %d on cpu %d names lock instance %#x; cpu %d's cell is %#x"
                  % (r["seq"], r["cpu"], inst, r["cpu"], cell[r["cpu"]]))
-        if bcur == acur and na == 0 and nr == 0:
+        if bcur == acur and na == 0 and nr == 0:  # repair:no-op-section
             fail("no-op-section", "section seq %d on cpu %d changes nothing (current %s kept, 0 added, "
                  "0 removed): the producer never records one, and it is no scheduling commit"
                  % (r["seq"], r["cpu"], dec(bcur)))
@@ -290,12 +291,12 @@ def grade(text, expect_cpus=None):
             continue
         tid, inc, igen, tgen, iseq = r["f"][:5]
         bad = installation(iseq, r["cpu"], igen, tid, "RUN seq %d" % r["seq"])
-        if bad:
+        if bad:  # repair:run
             fail("run", bad)
-        if not iseq < r["seq"] or tgen < igen or r["exec"] != r["cpu"] or inc == INC_UNBOUND \
-                or r["f"][5] not in (0, 1):
+        later = iseq < r["seq"] and tgen >= igen and r["exec"] == r["cpu"] and inc != INC_UNBOUND and r["f"][5] in (0, 1)
+        if not later:  # repair:run
             fail("run", "RUN seq %d is not a later tick on cpu %d of installation seq %d" % (r["seq"], r["cpu"], iseq))
-        if iseq in run_of_install:
+        if iseq in run_of_install:  # repair:run
             fail("run", "installation seq %d observed running twice (RUN seq %d)" % (iseq, r["seq"]))
         run_of_install[iseq] = r
         runs.append(r)
@@ -306,26 +307,27 @@ def grade(text, expect_cpus=None):
             continue
         t, e = r["cpu"], r["exec"]
         tid, inc, _rnd, cgen, cseq = r["f"][:5]
-        if inc == INC_UNBOUND:
+        if inc == INC_UNBOUND:  # repair:claim-incarnation
             fail("claim-incarnation", "CLAIM seq %d (cpu %d → cpu %d tid %d) carries no incarnation staged by "
                  "its owner" % (r["seq"], e, t, tid))
         s = sec_by_seq.get(cseq)
-        if s is None or not cseq < r["seq"] or s["cpu"] != t or s["exec"] != e or s["gen"] != cgen \
-                or tid not in s["add"]:
+        bound = s is not None and cseq < r["seq"] and s["cpu"] == t and s["exec"] == e and s["gen"] == cgen and tid in s["add"]
+        if not bound:  # repair:claim-commit
             fail("claim-commit", "CLAIM seq %d (cpu %d → cpu %d tid %d) names commit seq %d gen %d, which did "
                  "not add tid %d to cpu %d on cpu %d (dropped publication, or substituted destination, "
                  "task or commit)" % (r["seq"], e, t, tid, cseq, cgen, tid, t, e))
-        if (cseq, tid) in claimed:
+        if (cseq, tid) in claimed:  # repair:claim-commit
             fail("claim-commit", "CLAIM seq %d claims commit seq %d for tid %d a second time" % (r["seq"], cseq, tid))
         claimed.add((cseq, tid))
         claims.append((r, s))
+    claims = [(r, s) for r, s in claims if s is not None]
     for idx, (r, s) in enumerate(claims):
         t, tid, inc = r["cpu"], r["f"][0], r["f"][1]
         nxt = [c for c, _ in claims[idx + 1:] if c["cpu"] == t and c["f"][0] == tid]
         horizon = nxt[0]["f"][4] if nxt else float("inf")
         seen = [x for x in runs if x["cpu"] == t and x["f"][0] == tid and s["seq"] < x["f"][4] < horizon]
         if seen and inc != INC_NO_ASID:
-            if seen[0]["f"][1] != inc:
+            if seen[0]["f"][1] != inc:  # repair:claim-incarnation
                 fail("claim-incarnation", "CLAIM seq %d placed tid %d with incarnation code %d; when it next ran "
                      "(RUN seq %d) cpu %d had code %d active (stale or substituted incarnation)"
                      % (r["seq"], tid, inc, seen[0]["seq"], t, seen[0]["f"][1]))
@@ -360,18 +362,19 @@ def grade(text, expect_cpus=None):
 
     def check_progress(p, a, obs, b, e, rnd):
         tid, tgen, igen, inc, iseq = p["f"][1], p["f"][2], p["f"][3], p["f"][4], p["f"][5]
-        if p["cpu"] != obs or p["exec"] != obs:
+        if p["cpu"] != obs or p["exec"] != obs:  # repair:progress
             fail("progress", "round %d: PROGRESS seq %d on cpu %d/exec %d, the observer is %d"
                  % (rnd, p["seq"], p["cpu"], p["exec"], obs))
         bad = installation(iseq, obs, igen, tid, "round %d: PROGRESS seq %d" % (rnd, p["seq"]))
-        if bad:
+        if bad:  # repair:progress
             fail("progress", bad + " (progress linked to the wrong installation)")
-        s = sec_by_seq[iseq]
-        if s["exec"] != obs or not b["seq"] < iseq < p["seq"] or tgen <= igen or inc == INC_UNBOUND:
+        s = sec_by_seq.get(iseq)
+        own = s is not None and s["exec"] == obs and b["seq"] < iseq < p["seq"] and tgen > igen and inc != INC_UNBOUND
+        if not own:  # repair:progress
             fail("progress", "round %d: PROGRESS seq %d's installation seq %d is not the observer's own "
                  "commit inside the hold, before a later tick" % (rnd, p["seq"], iseq))
         run = run_of_install.get(iseq)
-        if run is not None and run["f"][1] != inc:
+        if run is not None and run["f"][1] != inc:  # repair:progress
             fail("progress", "round %d: PROGRESS seq %d reports incarnation code %d; RUN seq %d of the same "
                  "installation saw %d" % (rnd, p["seq"], inc, run["seq"], run["f"][1]))
         return s
@@ -386,22 +389,22 @@ def grade(text, expect_cpus=None):
         if rnd >= rounds or b["cpu"] != a or obs_f != obs or b["exec"] != a or e["exec"] != a:
             fail("attempt", "seq %d: round %d held by cpu %d for %d, schedule says %d for %d"
                  % (b["seq"], rnd, b["cpu"], obs_f, a, obs))
-        if (rnd, f5 >> 8) != (expect_round, expect_try):
+        if (rnd, f5 >> 8) != (expect_round, expect_try):  # repair:attempt-order
             fail("attempt", "seq %d: attempt %d of round %d out of order (expected attempt %d of round %d)"
                  % (b["seq"], f5 >> 8, rnd, expect_try, expect_round))
         # (2) the holder's lock, its mask state and its lock count
-        if inst != cell[a]:
+        if inst != cell[a]:  # repair:lock-instance
             fail("lock-instance", "round %d attempt seq %d holds instance %#x; cpu %d's cell is %#x"
                  % (rnd, b["seq"], inst, a, cell[a]))
-        if (f5 & 1) != 1 or (e["f"][5] & 1) != 1:
+        if (f5 & 1) != 1 or (e["f"][5] & 1) != 1:  # repair:attempt-ownership
             fail("attempt", "round %d attempt seq %d: the holder's lock was not held at begin and end" % (rnd, b["seq"]))
-        if (f5 >> 1) & 1 or (e["f"][5] >> 2) & 1:
+        if (f5 >> 1) & 1 or (e["f"][5] >> 2) & 1:  # repair:attempt-ownership
             fail("attempt", "round %d attempt seq %d: interrupts were enabled during the hold" % (rnd, b["seq"]))
         held_1l, held_1g = held & 0xFFFFFFFF, held >> 32
-        if held_1l != 1 or held_1g != 0:
+        if held_1l != 1 or held_1g != 0:  # repair:attempt-ownership
             fail("attempt", "round %d attempt seq %d: the holder held 1L=%d 1G=%d (exactly its own 1L required)"
                  % (rnd, b["seq"], held_1l, held_1g))
-        if (e["f"][5] >> 8) != bgen:
+        if (e["f"][5] >> 8) != bgen:  # repair:attempt-ownership
             fail("attempt", "round %d attempt seq %d: the holder's lock was re-acquired during the hold" % (rnd, b["seq"]))
         # (3) the holder's own sections are ordered around the hold
         for s in secs:
@@ -410,18 +413,19 @@ def grade(text, expect_cpus=None):
             if b["seq"] < s["seq"] < e["seq"]:
                 fail("attempt", "round %d — a section on the HOLDER's cpu %d inside its hold (its lock did not "
                      "exclude)" % (rnd, a))
-            if (s["seq"] < b["seq"] and s["gen"] >= bgen) or (s["seq"] > e["seq"] and s["gen"] < bgen):
+            if (s["seq"] < b["seq"] and s["gen"] >= bgen) or (s["seq"] > e["seq"] and s["gen"] < bgen):  # repair:attempt-order
                 fail("attempt", "round %d attempt seq %d: holder generation %d disagrees with section seq %d gen %d"
                      % (rnd, b["seq"], bgen, s["seq"], s["gen"]))
         # (4) the reported outcome against its own counters and the fixed bounds
         commits_r, prog_r, rel_r, spins, ok = e["f"][1], e["f"][2], e["f"][3], e["f"][4], (e["f"][5] >> 1) & 1
-        if ok and not (commits_r >= COMMITS_REQUIRED and prog_r >= 1 and rel_r == 0 and spins < HOLD_SPINS):
+        consistent_ok = commits_r >= COMMITS_REQUIRED and prog_r >= 1 and rel_r == 0 and spins < HOLD_SPINS
+        if ok and not consistent_ok:  # repair:attempt-outcome
             fail("attempt", "round %d attempt seq %d reports success with commits=%d progress=%d related=%d spins=%d"
                  % (rnd, b["seq"], commits_r, prog_r, rel_r, spins))
-        if not ok and not (rel_r > 0 or spins >= HOLD_SPINS):
+        if not ok and not (rel_r > 0 or spins >= HOLD_SPINS):  # repair:attempt-outcome
             fail("attempt", "round %d attempt seq %d reports failure with neither interference nor its bound "
                  "(related=%d spins=%d)" % (rnd, b["seq"], rel_r, spins))
-        if at["related"] and ok:
+        if at["related"] and ok:  # repair:attempt-outcome
             fail("attempt", "round %d attempt seq %d reports success despite RELATED records" % (rnd, b["seq"]))
         for rr in at["related"] + [x for x in at["late"] if x["kind"] == "RELATED"]:
             if rr["cpu"] != a or rr["exec"] != obs:
@@ -443,9 +447,10 @@ def grade(text, expect_cpus=None):
         commits = [s for s in secs if b["seq"] < s["seq"] < e["seq"] and s["cpu"] == obs and s["exec"] == obs]
         installs = {s["seq"] for s in commits if s["install"] is not None}
         ran = [s for s in good_prog if s["seq"] in installs]
-        if ok and not at["related"] and len({s["gen"] for s in commits}) >= COMMITS_REQUIRED and ran:
+        enough = len({s["gen"] for s in commits}) >= COMMITS_REQUIRED  # repair:commit-count
+        if ok and not at["related"] and enough and ran:
             credited.setdefault(rnd, (a, obs, len(commits), len(ran)))
-    if ok_attempts != end["ok"]:
+    if ok_attempts != end["ok"]:  # repair:attempt-outcome
         fail("attempt", "%d attempts report success; the producer counted %d" % (ok_attempts, end["ok"]))
     missing = [r for r in range(rounds) if r not in credited]
     if missing:
