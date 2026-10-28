@@ -432,7 +432,11 @@ def grade(text, expect_cpus=None):
                      % (rnd, b["seq"], bgen, s["seq"], s["gen"]))
         # (4) the reported outcome against its own counters and the fixed bounds
         commits_r, prog_r, rel_r, spins, ok = e["f"][1], e["f"][2], e["f"][3], e["f"][4], (e["f"][5] >> 1) & 1
-        consistent_ok = commits_r >= COMMITS_REQUIRED and prog_r >= 1 and rel_r == 0 and spins < HOLD_SPINS
+        # The hold's one outcome may be decided by the observer while the holder reaches its bound,
+        # so a success may report spins == HOLD_SPINS; no hold spins past it.
+        if spins > HOLD_SPINS:  # repair:attempt-outcome
+            fail("attempt", "round %d attempt seq %d spun %d times, past the bound %d" % (rnd, b["seq"], spins, HOLD_SPINS))
+        consistent_ok = commits_r >= COMMITS_REQUIRED and prog_r >= 1 and rel_r == 0
         if ok and not consistent_ok:  # repair:attempt-outcome
             fail("attempt", "round %d attempt seq %d reports success with commits=%d progress=%d related=%d spins=%d"
                  % (rnd, b["seq"], commits_r, prog_r, rel_r, spins))

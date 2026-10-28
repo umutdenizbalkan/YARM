@@ -1897,17 +1897,24 @@ are unchanged):**
   (the activation table) and the installing section. `PROGRESS` carries the same link for the
   observer during a hold.
 * `HOLD_BEGIN` and `HOLD_END` record the holder's interrupt-mask state.
-* **One closer per hold.** A hold is open while its token (round and attempt) is published, and
-  it is closed exactly once, by a compare-and-swap of that token to 0:
-  * either the holder closes it with its decision (success, or its bound);
-  * or the observer's acquisition of the holder's lock closes it, recording `RELATED` with the
-    token's round and attempt.
+* **One outcome per hold.** While a hold is in progress, its state carries its token (round and
+  attempt) and, once decided, its outcome. A compare-and-swap from open decides the outcome
+  exactly once, while A still holds 1L[A]:
+  * **success**, by whichever CPU first sees the evidence complete: B at the commit or progress
+    that completes it, or A spinning;
+  * **`RELATED`**, by B's acquisition of A's lock, recorded with the token's round and attempt;
+  * **the bound**, by A.
 
-  `HOLD_END` reports the closer's outcome, `related` 0 or 1. So a success and a `RELATED` never
-  coexist, and the `RELATED` record may follow its `HOLD_END`. The first freeze reported the
-  holder's decision but cleared the hold afterwards. In the gap, a stalled holder's observer
-  added a `RELATED`, and `HOLD_END` reported success with `related=1`. The grader refused that
-  as an inconsistent outcome (KERNEL_UNLOCKING, SCHED-LOCK1-ACCEPTANCE qualification).
+  `HOLD_END` reports that one outcome, so a success and a `RELATED` never coexist. A `RELATED`
+  record may follow its `HOLD_END`. A's vCPU need not run while B completes the evidence: the
+  lock is held regardless.
+
+  Two earlier forms failed live (KERNEL_UNLOCKING, SCHED-LOCK1-ACCEPTANCE):
+  * In the first freeze, A read its counters and cleared the hold after its decision. A
+    `RELATED` landed in between, and `HOLD_END` reported success with `related=1`.
+  * The first repair let only A decide success. On x86_64 at 2 CPUs under load, B repeatedly
+    completed the evidence and then needed A's lock before A ran again, so every such hold
+    closed as `RELATED`.
 
 **Grader obligations** (each failure is `reason=<obligation>: …`):
 * `validity`;

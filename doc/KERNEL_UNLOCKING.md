@@ -1815,18 +1815,35 @@ above in full, and every result is kept. Two scheduled samples failed:
   success with `related=1`. The repaired grader was right to refuse it. The witness was wrong to
   produce it.
 
-  Repair (witness only): the hold now has one closer. Holder and observer both close it by a
-  compare-and-swap of the hold's token, and `HOLD_END` reports the closer's outcome. `RELATED`
-  names the hold's round and attempt, and the grader attributes it to exactly that hold, even
-  after its `HOLD_END`. The grader requires each attempt's `RELATED` count to equal what it
-  reports. Five corpus cases are added:
+  Repair (witness only): each hold has exactly one outcome. A compare-and-swap from open decides
+  it while the holder still holds its lock:
+  * success, by whichever CPU first sees the evidence complete (the observer at its completing
+    commit or progress, or the holder);
+  * `RELATED`, by the observer's acquisition of the holder's lock;
+  * the bound, by the holder.
+
+  `HOLD_END` reports that outcome. `RELATED` names the hold's round and attempt, and the grader
+  attributes it to exactly that hold, even after its `HOLD_END`. The grader requires each
+  attempt's `RELATED` count to equal what it reports, and no hold to spin past its bound.
+  Seven corpus cases are added (55 in all):
   * that sample's shape;
   * a success with a later `RELATED`;
   * interference without a record;
   * a `RELATED` naming no hold;
-  * an accepted `RELATED` after its `HOLD_END`.
+  * a hold past its bound;
+  * an accepted `RELATED` after its `HOLD_END`;
+  * an accepted success decided at the bound.
 
-  A source pin keeps the single compare-and-swap. Contract §17.8 states the rule.
+  Source pins keep the single compare-and-swap and its four callers. Contract §17.8 states the
+  rule.
+
+  A first form of this repair (`e160e261`, never frozen) let only the holder decide success.
+  Development boots of it failed coverage twice in three x86_64 2-CPU loaded runs (RISC-V 2-CPU
+  idle and AArch64 4-CPU loaded passed). Round 1's first attempt had the same records each time:
+  the observer's `PROGRESS` (seq 58) completed the evidence, then its acquisition of the holder's
+  lock (`RELATED`, seq 67) came before the holder's vCPU ran again. So the hold closed as
+  interference, and the retries that followed reached their bound without progress. The evidence
+  was complete before the interference; the final form records it as such.
 * **Q8 RISC-V SMP3 live confirmation: not candidate-caused.** It failed
   `SMP3_VERDICT result=fail reason=ipi_merge_inconsistent at=129`. This is the mirror image of the
   AP-SCHED3 checker race. `send_reschedule` records a publication after its `fetch_or`, and

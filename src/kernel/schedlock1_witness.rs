@@ -21,9 +21,11 @@
 //!   holder; `HOLD_END` records the flag again — so nothing but A's 1L was held, and it was held
 //!   throughout. B acquiring A's lock (B needing A) during the hold is recorded as `RELATED` and
 //!   ends the attempt unawarded. The hold is closed exactly once, by one compare-and-swap of its
-//!   token: either the holder closes it (its decision: success, or its bound) or B's acquisition
-//!   does (`RELATED`), never both — so a success never coexists with interference, and the
-//!   `HOLD_END` outcome and its `RELATED` count (0 or 1) are the closer's, not a later reading.
+//!   state from open to an outcome, while A still holds 1L[A]: SUCCESS by whichever CPU first sees
+//!   the evidence complete (B at the commit or progress that completes it, or A spinning),
+//!   `RELATED` by B's acquisition of A's lock, or the BOUND by A. Never two outcomes — so a
+//!   success never coexists with interference — and `HOLD_END` reports the one outcome, whichever
+//!   CPU decided it (A's vCPU may not run at all while B completes the evidence).
 //! * **NATURAL — the membership trace.** From a coherent `SNAP` (every CPU's queue and current,
 //!   under every 1L) to a coherent `CENSUS`, every 1L critical section that changed a CPU's
 //!   membership is recorded as its net change (`SEC` + `ADD`/`REM`), with the executing CPU, the
@@ -154,10 +156,37 @@ static NCPU: AtomicU64 = AtomicU64::new(0);
 static ROUND: AtomicU64 = AtomicU64::new(0);
 static ATTEMPT: AtomicU64 = AtomicU64::new(0);
 static ROUNDS_OK: AtomicU64 = AtomicU64::new(0);
-/// The open hold's token ([`hold_token`]: its round and attempt) while a hold is in progress, else 0.
-/// Closed exactly once, by a compare-and-swap to 0: by the holder (its decision) or by the
-/// observer acquiring the holder's lock (`RELATED`).
+/// While a hold is in progress (from just after `HOLD_BEGIN` to just after `HOLD_END`), its token
+/// ([`hold_token`]: round and attempt) in the low bits and its outcome in the top two bits — 0
+/// while open; set exactly once by [`close_hold`]. 0 when no hold is in progress.
 static HOLD_ACTIVE: AtomicU64 = AtomicU64::new(0);
+const OUTCOME_SHIFT: u32 = 62;
+const OUT_SUCCESS: u64 = 1;
+const OUT_RELATED: u64 = 2;
+const OUT_BOUND: u64 = 3;
+
+/// The token of the hold in progress, if it is still open.
+fn open_hold() -> Option<u64> {
+    let s = HOLD_ACTIVE.load(Ordering::Acquire);
+    (s != 0 && s >> OUTCOME_SHIFT == 0).then_some(s)
+}
+
+/// Close the open hold `token` with `outcome`; false if it was already closed.
+fn close_hold(token: u64, outcome: u64) -> bool {
+    HOLD_ACTIVE
+        .compare_exchange(
+            token,
+            token | (outcome << OUTCOME_SHIFT),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// The observer has made the owner commits and the progress a hold waits for.
+fn evidence_complete() -> bool {
+    B_COMMITS.load(Ordering::Acquire) >= 2 && B_PROGRESS.load(Ordering::Acquire) >= 1
+}
 
 /// A hold's token: nonzero, unique per (round, attempt).
 fn hold_token(round: u64, attempt: u64) -> u64 {
@@ -335,14 +364,11 @@ pub(crate) fn trap_entered(shared: &SharedKernel, cpu: CpuId) {
 
 /// Before CPU `idx`'s 1L is acquired by the executing CPU.
 pub(crate) fn before_acquire(idx: usize) {
-    let token = HOLD_ACTIVE.load(Ordering::Acquire);
-    if token != 0
+    if let Some(token) = open_hold()
         && idx == HOLDER.load(Ordering::Acquire) as usize
         && exec_cpu() == OBSERVER.load(Ordering::Acquire) as usize
-        // The observer's acquisition closes the hold — unless the holder closed it first.
-        && HOLD_ACTIVE
-            .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        // The observer's acquisition closes the hold — unless it was already closed.
+        && close_hold(token, OUT_RELATED)
     {
         record(
             K_RELATED,
@@ -469,10 +495,11 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
         slot[2].store(sec_seq, Ordering::Relaxed);
         slot[0].store(after_cur, Ordering::Release);
     }
-    // An OWNER COMMIT by the observer on its own CPU, during a hold.
-    let active = HOLD_ACTIVE.load(Ordering::Acquire);
-    if active != 0 && exec == idx && idx == OBSERVER.load(Ordering::Acquire) as usize {
-        B_COMMITS.fetch_add(1, Ordering::AcqRel);
+    // An OWNER COMMIT by the observer on its own CPU, during an open hold.
+    if let Some(token) = open_hold()
+        && exec == idx
+        && idx == OBSERVER.load(Ordering::Acquire) as usize
+    {
         if after_cur != 0 && after_cur != before_cur {
             let i = B_INSTALLED_N.fetch_add(1, Ordering::AcqRel);
             if let Some(slot) = B_INSTALLED.get(i) {
@@ -480,6 +507,10 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
                 slot[2].store(sec_seq, Ordering::Release);
                 slot[0].store(after_cur, Ordering::Release);
             }
+        }
+        B_COMMITS.fetch_add(1, Ordering::AcqRel);
+        if evidence_complete() {
+            let _ = close_hold(token, OUT_SUCCESS);
         }
     }
 }
@@ -617,7 +648,9 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
     }
     let active = HOLD_ACTIVE.load(Ordering::Acquire);
     if active != 0 && c == OBSERVER.load(Ordering::Acquire) as usize {
-        if let Some(cur) = sched.witness_current() {
+        if let Some(token) = open_hold()
+            && let Some(cur) = sched.witness_current()
+        {
             let n = B_INSTALLED_N.load(Ordering::Acquire).min(B_INSTALLED.len());
             if let Some(slot) = B_INSTALLED[..n]
                 .iter()
@@ -629,7 +662,7 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
                     K_PROGRESS,
                     c,
                     [
-                        token_round(active),
+                        token_round(token),
                         cur.0,
                         ACQ_GEN[c].load(Ordering::Acquire),
                         slot[1].load(Ordering::Acquire),
@@ -638,6 +671,9 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
                     ],
                 );
                 B_PROGRESS.fetch_add(1, Ordering::AcqRel);
+                if evidence_complete() {
+                    let _ = close_hold(token, OUT_SUCCESS);
+                }
             }
         }
         return;
@@ -679,28 +715,25 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
     let token = hold_token(round, ATTEMPT.load(Ordering::Acquire));
     HOLD_ACTIVE.store(token, Ordering::SeqCst);
     let mut spins = 0u64;
-    // The holder's decision takes effect only if its compare-and-swap closes the hold; if the
-    // observer's acquisition closed it first, the attempt is related and unawarded.
-    let close = || {
-        HOLD_ACTIVE
-            .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    };
-    let (ok, related) = loop {
-        if HOLD_ACTIVE.load(Ordering::Acquire) != token {
-            break (false, true);
+    // Wait for the hold's one outcome. The observer may have decided it (success at its completing
+    // commit or progress, or RELATED); otherwise the holder decides success or its bound.
+    let outcome = loop {
+        let state = HOLD_ACTIVE.load(Ordering::Acquire);
+        if state >> OUTCOME_SHIFT != 0 {
+            break state >> OUTCOME_SHIFT;
         }
-        if B_COMMITS.load(Ordering::Acquire) >= 2 && B_PROGRESS.load(Ordering::Acquire) >= 1 {
-            let won = close();
-            break (won, !won);
+        if evidence_complete() {
+            let _ = close_hold(token, OUT_SUCCESS);
+            continue;
         }
         if spins >= HOLD_SPINS {
-            let won = close();
-            break (false, !won);
+            let _ = close_hold(token, OUT_BOUND);
+            continue;
         }
         spins += 1;
         core::hint::spin_loop();
     };
+    let (ok, related) = (outcome == OUT_SUCCESS, outcome == OUT_RELATED);
     record(
         K_HOLD_END,
         a,
@@ -716,6 +749,7 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
                 | (ACQ_GEN[a].load(Ordering::Acquire) << 8),
         ],
     );
+    HOLD_ACTIVE.store(0, Ordering::SeqCst);
     if ok {
         ROUNDS_OK.fetch_add(1, Ordering::AcqRel);
         ATTEMPT.store(0, Ordering::Release);

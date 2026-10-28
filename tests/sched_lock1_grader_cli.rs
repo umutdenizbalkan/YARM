@@ -291,15 +291,20 @@ fn producer_facts_the_grader_relies_on() {
             && claim.contains("LAST_ADD"),
         "a claim must not reconstruct the incarnation from a bare TID"
     );
-    // One closer per hold: the holder's decision and the observer's RELATED both close the hold
-    // by the same compare-and-swap of its token, so the grader may require a success to have no
-    // RELATED at all and a related attempt exactly one.
+    // One outcome per hold: success (by whichever CPU sees the evidence complete), RELATED (the
+    // observer's acquisition) and the bound all close it through the same compare-and-swap from
+    // open, so the grader may require a success to have no RELATED at all and a related attempt
+    // exactly one; the state is cleared only after HOLD_END.
     assert_eq!(
-        WITNESS.matches(".compare_exchange(token, 0,").count(),
-        2,
-        "the hold must be closed by one compare-and-swap, by the holder or the observer"
+        WITNESS
+            .matches("HOLD_ACTIVE\n        .compare_exchange(")
+            .count(),
+        1
     );
-    assert!(!WITNESS.contains("HOLD_ACTIVE.store(0"));
+    assert_eq!(WITNESS.matches("close_hold(token, OUT_SUCCESS)").count(), 3);
+    assert_eq!(WITNESS.matches("close_hold(token, OUT_RELATED)").count(), 1);
+    assert_eq!(WITNESS.matches("close_hold(token, OUT_BOUND)").count(), 1);
+    assert_eq!(WITNESS.matches("HOLD_ACTIVE.store(0").count(), 1);
     // The cell map comes from the domain's own cell array, under the coherent view.
     assert!(SCHEDULER.contains("pub(crate) fn witness_cell_addrs(&self, idx: usize)"));
     assert!(WITNESS.contains("domain.witness_cell_addrs(cpu)"));

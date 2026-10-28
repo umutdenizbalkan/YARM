@@ -361,6 +361,11 @@ def cases():
     neg("success reported together with a RELATED (two closers)", H, success_related, "attempt:")
     neg("success with a RELATED reserved after its HOLD_END", H,
         lambda ev: ev.insert(idx(ev, "HOLD_END") + 1, ("RELATED", 0, 1, [0, 0])), "attempt:")
+    neg("a hold spinning past its bound", R, lambda ev: setf(ev, idx(ev, "HOLD_END"), 4, SPINS + 1),
+        "attempt:")
+    ev = copy(H); setf(ev, idx(ev, "HOLD_END"), 4, SPINS)
+    out.append(("success decided by the observer as the holder reached its bound (accepted)",
+                render(ev, 2), "pass", "-"))
     neg("interference reported with no RELATED record", X, lambda ev: ev.pop(idx(ev, "RELATED")), "attempt:")
     neg("RELATED naming no hold of the trace", X, lambda ev: setf(ev, idx(ev, "RELATED"), 1, 2), "attempt:")
     neg("attempt number out of order", R, lambda ev: setf(ev, idx(ev, "HOLD_BEGIN", 1), 5, 1 | (2 << 8)),
