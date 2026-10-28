@@ -28,7 +28,12 @@
  *                       P2_ROUNDS bounded attempts per direction, each window closed only after
  *                       the waker's post-send step saw the arrival consumed (QEMU-SMP3-SEAL)
  *   P3  serial remote-fence attempts (TLB_ROUNDS): odd r C replaces S's W while S spins in its
- *       window; even r the mirror
+ *       window; even r the mirror. SMP3-EVIDENCE1 — the last two (r >= GAP_FROM, one per
+ *       direction) are DISPATCH-GAP rounds, labelled witness synchronization: once the requester's
+ *       readiness is recorded (M_GO) the target YIELDS in a loop instead of spinning, so its CPU
+ *       keeps passing through the dispatch gap (no current task, its root still loaded) while the
+ *       requester's shootdown waits, bounded, for that gap before deciding. Uncredited by design
+ *       (the target enters the kernel); its fence and completion are graded like any other
  *   P4  mutual rounds: both replace each other's W at once
  *
  * Context windows load x1, x3..x29 (P + N) and compare them, and SP, after. t5/t6 (x30/x31) are
@@ -72,6 +77,7 @@
     /* QEMU-SMP3-SEAL: fixed attempt budgets (P2 per direction; P3 serial, half per direction). */
     .set P2_ROUNDS, 6
     .set TLB_ROUNDS, 24
+    .set GAP_FROM, 23
     .set MUT_ROUNDS, YARM_MUT_ROUNDS
     .set PARK_TICKS, 60
 
@@ -92,6 +98,7 @@
     .set M_A_DONE, 0xC00
     .set M_B_OPEN, 0xD00
     .set M_B_DONE, 0xE00
+    .set M_GO, 0xF00
 
     /* Long-range conditional branches (a B-type branch reaches only +-4 KiB). */
     .macro BNEZ_FAR reg, target
@@ -430,6 +437,12 @@
     MWAITR M_PRIMED, s4
     mv a2, s4
     LOG \pfx\()_m_req
+    /* A gap round: readiness is recorded, so release the target into its yield loop. */
+    RND_GET s4
+    li t5, GAP_FROM
+    bltu s4, t5, 5f
+    MSETR M_GO, s4
+5:
     REPLACE_W \ascap, \pfx\()_vmmap_fail
     RND_GET s4
     MSETR M_DONE, s4
@@ -459,7 +472,10 @@
     add t6, t6, t4
     sd t6, 0x20(s5)
     MSETR M_PRIMED, s4
-    LOAD_CTX
+    li t5, GAP_FROM
+    bltu s4, t5, 5f
+    j \pfx\()_gap
+5:  LOAD_CTX
     .global yarm_smp3_\pfx\()_tlb_win_begin
 yarm_smp3_\pfx\()_tlb_win_begin:
     li t6, (PAT + 0x320)
@@ -470,6 +486,7 @@ yarm_smp3_\pfx\()_tlb_win_begin:
 yarm_smp3_\pfx\()_tlb_win_end:
     CAPTURE
     CHECK WIN_MASK, \pfx\()_resident_fail
+\pfx\()_observe:
     /* W must now read the replacement's zero page. */
     li t6, W_VA
     ld a3, 0(t6)
@@ -523,6 +540,19 @@ yarm_smp3_\pfx\()_tlb_win_end:
     MSETR \chk, s4
     MWAITR \ochk, s4
     j \pfx\()_mloop
+    /* ── a dispatch-gap round's target: wait for the requester's readiness, then yield until its
+       operation is done (labelled witness synchronization), then observe like any target ── */
+\pfx\()_gap:
+    MWAITR M_GO, s4
+6:  li a7, NR_YIELD
+    ecall
+    RND_GET t4
+    slli t4, t4, 3
+    li t6, (MBX + M_DONE)
+    add t6, t6, t4
+    ld t5, 0(t6)
+    beqz t5, 6b
+    j \pfx\()_observe
 \pfx\()_mstale:
     mv a2, s4
     LOG \pfx\()_m_mut_stale

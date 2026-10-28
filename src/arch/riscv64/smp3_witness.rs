@@ -495,11 +495,43 @@ pub fn note_release_published(boot: CpuId, target: CpuId, hart: usize) {
     note_publication(boot, target, hart, rec::PUB_RELEASE, false);
 }
 
+/// SMP3-EVIDENCE1 — per (sender, target): the number of FRESH publications the sender has made
+/// (its publication groups). Only the sender sets its own bit in the target's mailbox, so a merged
+/// publication merged into the sender's own latest fresh one: its group. Written only by the sender.
+static PUB_GROUP: [[AtomicU64; MAX_CPUS]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; MAX_CPUS] }; MAX_CPUS];
+
 fn note_publication(sender: CpuId, target: CpuId, hart: usize, kind: u64, merged: bool) {
+    // Groups are numbered from the arming of the record, as consumptions are: before it nothing is
+    // recorded and the secondary is still parked.
+    if !rec::armed() {
+        return;
+    }
+    let delay = merged && kind == rec::PUB_WAKE && sender != target;
+    // The group this publication belongs to, decided from its own `fetch_or` result (`merged`):
+    // a fresh one opens the sender's next group, a merged one joins its current group. A release
+    // is not a mailbox publication and has no group.
+    let group = match PUB_GROUP
+        .get(sender.0 as usize)
+        .and_then(|row| row.get(target.0 as usize))
+    {
+        Some(g) if kind != rec::PUB_RELEASE && !merged => g.fetch_add(1, Ordering::AcqRel) + 1,
+        Some(g) if kind != rec::PUB_RELEASE => g.load(Ordering::Acquire),
+        _ => 0,
+    };
+    if delay {
+        delay_merged_record(sender, target, group);
+    }
     rec::push(
         Kind::IpiPublished,
         sender.0,
-        [u64::from(target.0), hart as u64, kind, u64::from(merged), 0],
+        [
+            u64::from(target.0),
+            hart as u64,
+            kind,
+            u64::from(merged),
+            group,
+        ],
     );
 }
 
@@ -628,10 +660,14 @@ pub fn note_arrival(
             sstatus,
         ],
     );
-    if let Some(row) = CONSUMED.get(cpu.0 as usize) {
+    // SMP3-EVIDENCE1 — each source bit this swap consumed, with this CPU's ordinal of consumptions
+    // of that source (only this CPU swaps its own mailbox, so the ordinal is its program order):
+    // the k-th consumption of a source's bit takes that source's k-th publication group.
+    if let Some(row) = CONSUMED.get(cpu.0 as usize).filter(|_| rec::armed()) {
         for (src, n) in row.iter().enumerate() {
             if arrival.sources & (1u64 << src) != 0 {
-                n.fetch_add(1, Ordering::AcqRel);
+                let k = n.fetch_add(1, Ordering::AcqRel) + 1;
+                rec::push(Kind::IpiConsumed, cpu.0, [src as u64, k, 0, 0, 0]);
             }
         }
     }
@@ -884,6 +920,103 @@ fn mutual_rendezvous(me: usize, round: u64) {
     MUT_SYNC_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
 }
 
+/// SMP3-EVIDENCE1 — the dispatch-gap rounds: from this P3 round on (one per direction, the last
+/// two), the target yields in a loop instead of spinning, and the requester's shootdown waits for
+/// its dispatch gap (`await_dispatch_gap`). The user program's `GAP_FROM` is the same number.
+const GAP_FROM: u64 = 23;
+/// The gap round a requester armed against each target CPU (0 = none).
+static GAP_ARMED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static GAP_MET: AtomicU64 = AtomicU64::new(0);
+static GAP_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+const GAP_SPINS: u64 = 50_000_000;
+static MERGED_MET: AtomicU64 = AtomicU64::new(0);
+static MERGED_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+/// Merged-publication records delayed per boot, and each delay's bound.
+const MERGED_BUDGET: u64 = 8;
+const MERGED_SPINS: u64 = 5_000_000;
+
+/// WITNESS SYNCHRONIZATION (SMP3-EVIDENCE1) — labelled, not production behaviour. In a gap round
+/// the requester's shootdown, before its decision, waits, bounded, until the target's CPU is in its
+/// dispatch gap: no current task there while the target's root is still loaded (the target is
+/// between its yield's re-enqueue and its re-selection, which keeps the root). The owner calls
+/// `note_shoot_begin` with no domain lock held; each read is one rank-1 acquisition or one atomic
+/// load; and it waits only for the other hart's own scheduling, never for anything that hart needs
+/// from this one. Nothing about the decision, the fence or the mailbox changes: the decision is
+/// taken from what is there when it runs, which the gap may or may not still be.
+fn await_dispatch_gap(target_cpu: usize, asid: u16, round: u64) {
+    let shared = crate::arch::riscv64::boot::trap_shared_kernel_riscv();
+    let mut met = false;
+    for _ in 0..GAP_SPINS {
+        let cur = shared.map_or(1, |k| {
+            k.current_tid_split_read(CpuId(target_cpu as u8))
+                .unwrap_or(0)
+        });
+        let loaded = crate::arch::hal::address_space_loaded_bitmap(crate::kernel::vm::Asid(asid))
+            & (1u64 << target_cpu)
+            != 0;
+        if cur == 0 && loaded {
+            met = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if met {
+        GAP_MET.fetch_add(1, Ordering::AcqRel);
+    } else {
+        GAP_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+    }
+    rec::push(
+        Kind::WitnessSync,
+        this_cpu(),
+        [rec::SYNC_GAP, target_cpu as u64, round, u64::from(met), 0],
+    );
+}
+
+/// WITNESS SYNCHRONIZATION (SMP3-EVIDENCE1) — labelled, not production behaviour: a RECORD delay.
+/// A merged publication's `fetch_or` has already happened (it found its bit set); before its record
+/// is pushed, wait, bounded, until the target has consumed that group, so the record lands after
+/// the arrival that consumed it — the order the delivered verifier misread. The publisher holds no
+/// domain lock (`notify_enqueued`'s contract); the mailbox bit, the firmware request that follows
+/// and their order are untouched — only their timing moves, which any interleaving may do.
+/// Bounded per wait and per boot (`MERGED_BUDGET`).
+fn delay_merged_record(sender: CpuId, target: CpuId, group: u64) {
+    if MERGED_MET.load(Ordering::Acquire) + MERGED_TIMED_OUT.load(Ordering::Acquire)
+        >= MERGED_BUDGET
+    {
+        return;
+    }
+    let Some(n) = CONSUMED
+        .get(target.0 as usize)
+        .and_then(|row| row.get(sender.0 as usize))
+    else {
+        return;
+    };
+    let mut met = false;
+    for _ in 0..MERGED_SPINS {
+        if n.load(Ordering::Acquire) >= group {
+            met = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if met {
+        MERGED_MET.fetch_add(1, Ordering::AcqRel);
+    } else {
+        MERGED_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+    }
+    rec::push(
+        Kind::WitnessSync,
+        sender.0,
+        [
+            rec::SYNC_MERGED,
+            u64::from(target.0),
+            group,
+            u64::from(met),
+            0,
+        ],
+    );
+}
+
 // ──────────────────────────── QEMU-SMP3-SEAL: readiness and evidence ────────────────────────────
 
 /// Arrivals each CPU consumed from each source CPU: `[dst][src]` (observation only).
@@ -894,6 +1027,9 @@ static CONSUMED: [[AtomicU64; 2]; MAX_CPUS] =
 static ACT_ARMED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 /// Each requesting CPU's last live-ASID snapshot: asid, bitmap, CPU 0's and CPU 1's current tid.
 static SNAP_ASID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MAX_CPUS];
+/// SMP3-EVIDENCE1 — the same computation's own inputs: online, wake-only, its placement result and
+/// its loaded-root residency result (both already filtered to the candidates it consumed).
+static SNAP_IN: [[AtomicU64; 4]; MAX_CPUS] = [const { [const { AtomicU64::new(0) }; 4] }; MAX_CPUS];
 static SNAP_CUR: [[AtomicU64; 2]; MAX_CPUS] =
     [const { [const { AtomicU64::new(0) }; 2] }; MAX_CPUS];
 /// The P2 target hart's consumed-from-waker count at readiness, per target CPU.
@@ -931,17 +1067,23 @@ pub fn note_activation(satp: u64) {
     }
 }
 
-/// `live_cpu_bitmap_for_asid_split` computed `bitmap` for `asid` from `current` (observation only).
-pub fn note_live_snapshot(asid: u16, _bitmap: u64, current: &[Option<u64>]) {
+/// `live_cpu_bitmap_for_asid_split` decided for `asid` from `inputs` — `[online, wake_only,
+/// placement, loaded]`, the values it consumed — and the per-CPU `current` it read (observation
+/// only; nothing is read again here).
+pub fn note_live_snapshot(asid: u16, inputs: [u64; 4], current: &[Option<u64>]) {
     if !enabled() {
         return;
     }
     let cpu = this_cpu() as usize;
-    let (Some(a), Some(cur)) = (SNAP_ASID.get(cpu), SNAP_CUR.get(cpu)) else {
+    let (Some(a), Some(cur), Some(inp)) = (SNAP_ASID.get(cpu), SNAP_CUR.get(cpu), SNAP_IN.get(cpu))
+    else {
         return;
     };
     for (slot, tid) in cur.iter().zip(current.iter()) {
         slot.store(tid.unwrap_or(0), Ordering::Release);
+    }
+    for (slot, v) in inp.iter().zip(inputs) {
+        slot.store(v, Ordering::Release);
     }
     a.store(u64::from(asid), Ordering::Release);
 }
@@ -954,6 +1096,10 @@ pub fn note_shoot_begin(asid: u16, va: u64) {
     }
     if let Some(cpu) = cpu_of_asid(u64::from(asid)) {
         ACT_ARMED[cpu].store(true, Ordering::Release);
+        let round = GAP_ARMED[cpu].swap(0, Ordering::AcqRel);
+        if round != 0 {
+            await_dispatch_gap(cpu, asid, round);
+        }
     }
     if let Some(a) = SNAP_ASID.get(this_cpu() as usize) {
         a.store(u64::MAX, Ordering::Release);
@@ -980,6 +1126,25 @@ pub fn note_shoot_targets(requester: CpuId, asid: u16, va: u64, targets: u64) {
             u64::MAX
         }
     };
+    let inp = |i: usize| {
+        if fresh {
+            SNAP_IN[cpu][i].load(Ordering::Acquire)
+        } else {
+            u64::MAX
+        }
+    };
+    // SMP3-EVIDENCE1: the decision's own inputs, recorded with its result.
+    rec::push(
+        Kind::ShootInputs,
+        requester.0,
+        [
+            u64::from(asid),
+            va,
+            (inp(0) & 0xffff_ffff) | (inp(1) << 32),
+            inp(2),
+            inp(3),
+        ],
+    );
     rec::push(
         Kind::ShootTargets,
         requester.0,
@@ -1122,8 +1287,19 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u6
     match step {
         "C_P2A_CALL" => return establish_ready(rec::PHASE_P2, 1, S_TID, round),
         "S_P2B_CALL" => return establish_ready(rec::PHASE_P2, 0, C_TID, round),
-        "C_REQ" => return establish_ready(rec::PHASE_P3, 1, S_TID, round),
-        "S_REQ" => return establish_ready(rec::PHASE_P3, 0, C_TID, round),
+        "C_REQ" | "S_REQ" => {
+            let (t, tid) = if step == "C_REQ" {
+                (1, S_TID)
+            } else {
+                (0, C_TID)
+            };
+            establish_ready(rec::PHASE_P3, t, tid, round);
+            // SMP3-EVIDENCE1: a gap round's operation waits for the target's dispatch gap.
+            if round >= GAP_FROM {
+                GAP_ARMED[usize::from(t)].store(round, Ordering::Release);
+            }
+            return;
+        }
         "C_P2A_SENT" => return await_consumed(1),
         "S_P2B_SENT" => return await_consumed(0),
         "S_WIN_A_OK" | "C_WIN_B_OK" | "S_OBSERVED" | "C_OBSERVED" | "S_MUT_OK" | "C_MUT_OK" => {
@@ -1296,8 +1472,11 @@ fn dump() {
             ));
         }
         emit(alloc::format!(
-            "SMP3_COUNTS_IPI records={} arrivals={} consumed={} empty={} merged={} user_fp_vs_off={}",
+            "SMP3_COUNTS_IPI records={} published={} fresh={} requests={} arrivals={} consumed={} empty={} merged={} user_fp_vs_off={}",
             v.records,
+            v.ipi_published,
+            v.ipi_fresh,
+            v.ipi_requests,
             v.ipi_arrivals,
             v.ipi_consumed,
             v.ipi_empty,
@@ -1305,13 +1484,14 @@ fn dump() {
             v.user_fp_vs_off
         ));
         emit(alloc::format!(
-            "SMP3_COUNTS_WAKE p1_parked={} p1_ipi_to_s={} p1_ipi_to_c={} p1_timer_first={} p1_busy={} p1_preceded={}",
+            "SMP3_COUNTS_WAKE p1_parked={} p1_ipi_to_s={} p1_ipi_to_c={} p1_timer_first={} p1_busy={} p1_preceded={} p1_merged={}",
             v.p1_parked,
             v.p1_ipi_to_s,
             v.p1_ipi_to_c,
             v.p1_timer_first,
             v.p1_busy,
-            v.p1_preceded
+            v.p1_preceded,
+            v.p1_merged
         ));
         emit(alloc::format!(
             "SMP3_COUNTS_P2 p2_attempts={} p2_credited_s={} p2_credited_c={} p2_uncredited={} p2_in_window={} p2_outside={} p2_displaced={}",
@@ -1324,20 +1504,22 @@ fn dump() {
             v.p2_displaced
         ));
         emit(alloc::format!(
-            "SMP3_COUNTS_TLB tlb_rounds={} credited_s={} credited_c={} interfered={} off_cpu={} not_ready={}",
+            "SMP3_COUNTS_TLB tlb_rounds={} credited_s={} credited_c={} interfered={} off_cpu={} not_ready={} not_current={}",
             v.tlb_rounds,
             v.tlb_credited_s,
             v.tlb_credited_c,
             v.tlb_interfered,
             v.tlb_off_cpu,
-            v.tlb_not_ready
+            v.tlb_not_ready,
+            v.tlb_not_current
         ));
         emit(alloc::format!(
-            "SMP3_COUNTS_MUT mutual_rounds={} overlapped={} contended={} mutual_off_cpu={} settled_after_completion={} settled_local_only={}",
+            "SMP3_COUNTS_MUT mutual_rounds={} overlapped={} contended={} mutual_off_cpu={} mutual_not_current={} settled_after_completion={} settled_local_only={}",
             v.mutual_rounds,
             v.mutual_overlapped,
             v.mutual_contended,
             v.mutual_off_cpu,
+            v.mutual_not_current,
             v.settled_after_completion,
             v.settled_local_only
         ));
@@ -1358,6 +1540,14 @@ fn dump() {
             SENT_TIMED_OUT.load(Ordering::Acquire),
             READY_MET[1].load(Ordering::Acquire),
             READY_TIMED_OUT[1].load(Ordering::Acquire)
+        ));
+        // SMP3-EVIDENCE1: the labelled synchronizations (gap waits, merged-record delays).
+        emit(alloc::format!(
+            "SMP3_EVID_SYNC gap_wait_met={} gap_wait_timed_out={} merged_delay_met={} merged_delay_timed_out={}",
+            GAP_MET.load(Ordering::Acquire),
+            GAP_TIMED_OUT.load(Ordering::Acquire),
+            MERGED_MET.load(Ordering::Acquire),
+            MERGED_TIMED_OUT.load(Ordering::Acquire)
         ));
         emit(alloc::format!(
             "SMP3_VERDICT result={} reason={} at={}",

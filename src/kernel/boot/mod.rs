@@ -9,8 +9,8 @@ mod capability_lifecycle_state;
 /// QEMU-SMP2 — the AArch64 two-CPU witness's bounded transaction record and its pure verifier.
 #[cfg(any(test, feature = "aarch64-smp2-witness"))]
 pub mod smp2_record;
-/// QEMU-SMP3 — the RISC-V two-hart witness's bounded transaction record and its pure verifier.
-#[cfg(any(test, feature = "riscv64-smp3-witness"))]
+/// QEMU-SMP3 — the RISC-V two-hart witness's record and its pure verifier (hosted: differential).
+#[cfg(any(test, feature = "riscv64-smp3-witness", feature = "hosted-dev"))]
 pub mod smp3_record;
 pub(crate) mod smp_request_txn;
 /// U9-XFER2 §2 — NR 4's revoke reservation and its commit outcome cross the module boundary,
