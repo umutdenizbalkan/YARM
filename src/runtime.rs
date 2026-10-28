@@ -6238,6 +6238,9 @@ impl SharedKernel {
                 return Err(KernelError::WouldBlock);
             }
             let tcb = tcbs[idx].as_mut().expect("slot present");
+            // SCHED-LOCK1 witness only: the incarnation this owner places, under rank 2.
+            #[cfg(feature = "sched-lock1-witness")]
+            crate::kernel::schedlock1_witness::stage_incarnation(tid.0, tcb.asid);
             if !matches!(old_status, TaskStatus::Runnable) {
                 tcb.status = TaskStatus::Runnable;
             }
@@ -15929,6 +15932,9 @@ impl SharedKernel {
         // Phase 1 (rank 2): validate + set Runnable, capture affinity.
         let plan = self.with_task_tcbs_split_mut(|tcbs| {
             let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
+            // SCHED-LOCK1 witness only: the incarnation this owner places, under rank 2.
+            #[cfg(feature = "sched-lock1-witness")]
+            crate::kernel::schedlock1_witness::stage_incarnation(tid, tcb.asid);
             let old = tcb.status;
             if !matches!(
                 old,
@@ -16361,6 +16367,12 @@ impl SharedKernel {
             // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
             None => TaskPriority::Normal,
         };
+        // SCHED-LOCK1 witness only: the receiver incarnation this seam places, under rank 2, beside
+        // the owner's own class read above.
+        #[cfg(feature = "sched-lock1-witness")]
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid)
+        });
         self.enqueue_committed_receiver_inner(tid, priority, affinity, false)
     }
 
@@ -16389,6 +16401,12 @@ impl SharedKernel {
             // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
             None => TaskPriority::Normal,
         };
+        // SCHED-LOCK1 witness only: the receiver incarnation this seam places, under rank 2, beside
+        // the owner's own class read above.
+        #[cfg(feature = "sched-lock1-witness")]
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid)
+        });
         self.enqueue_committed_receiver_inner(tid, priority, affinity, true)
     }
 
@@ -17737,6 +17755,9 @@ impl SharedKernel {
             None => TaskPriority::Normal,
         };
         let affinity = self.with_task_tcbs_split_mut(|tcbs| {
+            // SCHED-LOCK1 witness only: the incarnation this owner places, under rank 2.
+            #[cfg(feature = "sched-lock1-witness")]
+            crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid);
             tcbs.iter()
                 .flatten()
                 .find(|t| t.tid.0 == tid)

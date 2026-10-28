@@ -30,6 +30,24 @@
 //!   wake lost, none consumed twice, every claim matched by the ADD it names, every remote ADD
 //!   followed by its notification.
 //!
+//! **Identity evidence (SCHED-LOCK1-ACCEPTANCE).**
+//!
+//! * `CELL` — at SNAP and again at CENSUS, under the coherent view, each CPU's cell address and
+//!   its lock's address, taken from the domain's own cell array. Every `SEC` and `HOLD_BEGIN`
+//!   names the cell of the lock its producer actually held; the grader checks each against this
+//!   one map.
+//! * `CLAIM` carries the task incarnation the waking owner staged from the authoritative TCB in
+//!   its own rank-2 phase ([`stage_incarnation`]), and the generation and record number of the
+//!   exact 1L section, on this executing CPU, that added the task. A claim with no staged
+//!   incarnation, or no such section, is recorded as unbound and fails the grade.
+//! * `RUN` — the first kernel entry (a syscall, a fault or the timer tick) by a task after its
+//!   installation on a CPU records the task, the CPU's ACTIVE address space at that entry (the
+//!   activation table, independent of every wake owner) and the installing section. Kernel code
+//!   runs with interrupts masked except in the idle halt loop, where no task is current, so an
+//!   entry with a task current interrupted that task or is its own call. `PROGRESS` carries the
+//!   same evidence for the observer during a hold.
+//! * `HOLD_BEGIN` and `HOLD_END` record the holder's interrupt-mask state.
+//!
 //! The record ring is bounded; an overflow is reported and refuses coverage. All output is the
 //! synchronous dump after the AP-scheduling witness's own, at P's last step.
 
@@ -74,7 +92,9 @@ pub const K_CENSUS_CUR: u8 = 14;
 pub const K_CENSUS_Q: u8 = 15;
 pub const K_CENSUS_END: u8 = 16;
 pub const K_ALL_MUTATED: u8 = 17;
-const KINDS: [&str; 18] = [
+pub const K_CELL: u8 = 18;
+pub const K_RUN: u8 = 19;
+const KINDS: [&str; 20] = [
     "-",
     "SNAP_BEGIN",
     "SNAP_CUR",
@@ -93,7 +113,17 @@ const KINDS: [&str; 18] = [
     "CENSUS_Q",
     "CENSUS_END",
     "ALL_MUTATED",
+    "CELL",
+    "RUN",
 ];
+
+/// Incarnation encodings carried by `CLAIM`, `RUN` and `PROGRESS`: 0 = unbound (no authority),
+/// 1 = a task with no address space, `asid + 2` otherwise.
+const INC_UNBOUND: u64 = 0;
+const INC_NO_ASID: u64 = 1;
+fn inc_code(asid: Option<crate::kernel::vm::Asid>) -> u64 {
+    asid.map_or(INC_NO_ASID, |a| u64::from(a.0) + 2)
+}
 
 struct Rec {
     valid: AtomicBool,
@@ -128,13 +158,26 @@ static OBSERVER: AtomicU8 = AtomicU8::new(0);
 static B_COMMITS: AtomicU64 = AtomicU64::new(0);
 static B_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static B_RELATED: AtomicU64 = AtomicU64::new(0);
-/// Tasks B's commits installed during the current hold (tid + 1), with the installing generation.
-static B_INSTALLED: [[AtomicU64; 2]; 8] = [const { [const { AtomicU64::new(0) }; 2] }; 8];
+/// Tasks B's commits installed during the current hold (tid + 1), with the installing generation
+/// and the installing section's record number.
+static B_INSTALLED: [[AtomicU64; 3]; 8] = [const { [const { AtomicU64::new(0) }; 3] }; 8];
 static B_INSTALLED_N: AtomicUsize = AtomicUsize::new(0);
 /// Per CPU, from its own last tick: it had a task current AND another queued — local scheduling
 /// work a hold's observer can make progress on. A hold starts only when its observer has some.
 static BUSY: [AtomicBool; MAX_W_CPUS] = [const { AtomicBool::new(false) }; MAX_W_CPUS];
 static OPENED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Per EXECUTING CPU: the incarnation `(tid + 1, inc_code)` its current wake owner staged in that
+/// owner's rank-2 phase, consumed by the owner's claim.
+static STAGED: [[AtomicU64; 2]; MAX_CPUS] = [const { [const { AtomicU64::new(0) }; 2] }; MAX_CPUS];
+/// Per EXECUTING CPU: the last recorded section in which it ADDED to some CPU's queue —
+/// `(target + 1, generation, record number)`. Read by that CPU's own claim right after the commit.
+static LAST_ADD: [[AtomicU64; 3]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 3] }; MAX_CPUS];
+/// Per CPU (written and read only under that CPU's own 1L): the last installation recorded on it —
+/// `(tid + 1, generation, record number, observed running)`.
+static LAST_INSTALL: [[AtomicU64; 4]; MAX_W_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 4] }; MAX_W_CPUS];
 
 /// Per-CPU 1L acquisition generation (by the CELL acquired), and per EXECUTING CPU the number of
 /// 1L and 1G guards it holds.
@@ -206,6 +249,14 @@ fn record(kind: u8, cpu: usize, f: [u64; 6]) {
     }
 }
 
+/// Whether the executing CPU has interrupts enabled (sampled without changing them).
+fn irqs_enabled() -> bool {
+    let st = crate::arch::irq_guard::irq_save();
+    let on = st.interrupts_were_enabled;
+    crate::arch::irq_guard::irq_restore(st);
+    on
+}
+
 fn enc(t: Option<ThreadId>) -> u64 {
     t.map_or(0, |t| t.0 + 1)
 }
@@ -224,6 +275,46 @@ fn take_snap(idx: usize, sched: &CpuSched) {
     });
     s.n.store(n, Ordering::Relaxed);
     s.valid.store(true, Ordering::Relaxed);
+}
+
+/// Record `RUN` for CPU `c`'s last installation if `cur` is that task and it has not been observed.
+/// `src` is 1 for a trap entry, 0 for the tick hook.
+fn observe_run(c: usize, cur: u64, src: u64) -> Option<u64> {
+    let slot = LAST_INSTALL.get(c)?;
+    if !recording()
+        || slot[0].load(Ordering::Acquire) != cur + 1
+        || slot[3].swap(1, Ordering::AcqRel) != 0
+    {
+        return None;
+    }
+    let inc = inc_code(crate::arch::hal::active_address_space(CpuId(c as u8)));
+    record(
+        K_RUN,
+        c,
+        [
+            cur,
+            inc,
+            slot[1].load(Ordering::Relaxed),
+            ACQ_GEN[c].load(Ordering::Acquire),
+            slot[2].load(Ordering::Relaxed),
+            src,
+        ],
+    );
+    Some(inc)
+}
+
+/// A kernel entry on `cpu` (the shared trap entry, before anything else): if a just-installed
+/// task is current there (its published current), this is its first observed execution.
+pub(crate) fn trap_entered(shared: &SharedKernel, cpu: CpuId) {
+    let c = cpu.0 as usize;
+    if c >= MAX_W_CPUS || !recording() {
+        return;
+    }
+    if let Some(cur) = shared.sched_domain().current_mirror(c)
+        && cur.0 != 0
+    {
+        let _ = observe_run(c, cur.0, 1);
+    }
 }
 
 // ── hooks called by the scheduler domain ─────────────────────────────────────────────────────
@@ -310,7 +401,9 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
         return;
     }
     let acq_gen = ACQ_GEN[idx].load(Ordering::Acquire);
+    let mut sec_seq = 0u64;
     if let Some(base) = reserve(1 + n_add + n_rem) {
+        sec_seq = base as u64 + 1;
         write(
             base,
             K_SEC,
@@ -341,6 +434,23 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
             k += 1;
         }
     }
+    if n_add > 0
+        && let Some(slot) = LAST_ADD.get(exec)
+    {
+        slot[0].store(idx as u64 + 1, Ordering::Relaxed);
+        slot[1].store(acq_gen, Ordering::Relaxed);
+        slot[2].store(sec_seq, Ordering::Release);
+    }
+    if after_cur > 1
+        && after_cur != before_cur
+        && let Some(slot) = LAST_INSTALL.get(idx)
+    {
+        slot[0].store(0, Ordering::Release);
+        slot[1].store(acq_gen, Ordering::Relaxed);
+        slot[3].store(0, Ordering::Relaxed);
+        slot[2].store(sec_seq, Ordering::Relaxed);
+        slot[0].store(after_cur, Ordering::Release);
+    }
     // An OWNER COMMIT by the observer on its own CPU, during a hold.
     let active = HOLD_ACTIVE.load(Ordering::Acquire);
     if active != 0 && exec == idx && idx == OBSERVER.load(Ordering::Acquire) as usize {
@@ -349,6 +459,7 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
             let i = B_INSTALLED_N.fetch_add(1, Ordering::AcqRel);
             if let Some(slot) = B_INSTALLED.get(i) {
                 slot[1].store(acq_gen, Ordering::Release);
+                slot[2].store(sec_seq, Ordering::Release);
                 slot[0].store(after_cur, Ordering::Release);
             }
         }
@@ -375,16 +486,57 @@ pub(crate) fn admission_released() {
     HELD_1G[exec_cpu()].fetch_sub(1, Ordering::AcqRel);
 }
 
-/// A remote-wake owner committed `tid` onto `target` (read after the commit returned).
-pub(crate) fn claim(shared: &SharedKernel, target: CpuId, tid: u64) {
+/// A wake owner, in its own rank-2 phase, names the incarnation it is about to place: `tid` with
+/// the address space the authoritative TCB holds now. Consumed by that owner's [`claim`].
+pub(crate) fn stage_incarnation(tid: u64, asid: Option<crate::kernel::vm::Asid>) {
+    let Some(slot) = STAGED.get(exec_cpu()) else {
+        return;
+    };
+    slot[1].store(inc_code(asid), Ordering::Relaxed);
+    slot[0].store(tid + 1, Ordering::Release);
+}
+
+/// [`stage_incarnation`] from the owner's own rank-2 view of the task table (`tcbs` is held).
+pub(crate) fn stage_from_tcbs(tcbs: &[Option<crate::kernel::task::ThreadControlBlock>], tid: u64) {
+    if let Some(t) = tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
+        stage_incarnation(tid, t.asid);
+    }
+}
+
+/// A remote-wake owner committed `tid` onto `target` (called right after the commit returned).
+/// The claim carries the incarnation this owner staged and the commit — the last section on this
+/// executing CPU that added to `target`'s queue — with no lookup by bare TID.
+pub(crate) fn claim(_shared: &SharedKernel, target: CpuId, tid: u64) {
+    let exec = exec_cpu();
+    let staged = STAGED.get(exec).map_or(INC_UNBOUND, |s| {
+        let t = s[0].swap(0, Ordering::AcqRel);
+        if t == tid + 1 {
+            s[1].load(Ordering::Relaxed)
+        } else {
+            INC_UNBOUND
+        }
+    });
     if !recording() {
         return;
     }
-    let asid = shared.task_asid_for_tid_split_read(tid);
+    let (commit_gen, seq) = LAST_ADD.get(exec).map_or((0, 0), |s| {
+        if s[0].load(Ordering::Acquire) == u64::from(target.0) + 1 {
+            (s[1].load(Ordering::Relaxed), s[2].load(Ordering::Relaxed))
+        } else {
+            (0, 0)
+        }
+    });
     record(
         K_CLAIM,
         target.0 as usize,
-        [tid, asid, ROUND.load(Ordering::Acquire), 0, 0, 0],
+        [
+            tid,
+            staged,
+            ROUND.load(Ordering::Acquire),
+            commit_gen,
+            seq,
+            0,
+        ],
     );
 }
 
@@ -436,6 +588,15 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
             Ordering::Release,
         );
     }
+    // RUN: the first tick on this CPU after an installation finds the installed task current —
+    // kernel entries run masked, so this tick interrupted that task. The address space the CPU
+    // has ACTIVE now is that task's incarnation, from the activation table (no wake owner's word).
+    let running_inc = inc_code(crate::arch::hal::active_address_space(cpu));
+    if let Some(cur) = sched.witness_current()
+        && cur.0 != 0
+    {
+        let _ = observe_run(c, cur.0, 0);
+    }
     let active = HOLD_ACTIVE.load(Ordering::Acquire);
     if active != 0 && c == OBSERVER.load(Ordering::Acquire) as usize {
         if let Some(cur) = sched.witness_current() {
@@ -454,8 +615,8 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
                         cur.0,
                         ACQ_GEN[c].load(Ordering::Acquire),
                         slot[1].load(Ordering::Acquire),
-                        0,
-                        0,
+                        running_inc,
+                        slot[2].load(Ordering::Acquire),
                     ],
                 );
                 B_PROGRESS.fetch_add(1, Ordering::AcqRel);
@@ -493,7 +654,9 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
             instance as u64,
             acq_gen,
             HELD_1L[a].load(Ordering::Acquire) | (HELD_1G[a].load(Ordering::Acquire) << 32),
-            u64::from(held_at_begin) | (ATTEMPT.load(Ordering::Acquire) << 8),
+            u64::from(held_at_begin)
+                | (u64::from(irqs_enabled()) << 1)
+                | (ATTEMPT.load(Ordering::Acquire) << 8),
         ],
     );
     HOLD_ACTIVE.store(round + 1, Ordering::SeqCst);
@@ -520,6 +683,7 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
             spins,
             u64::from(held_flag())
                 | (u64::from(ok) << 1)
+                | (u64::from(irqs_enabled()) << 2)
                 | (ACQ_GEN[a].load(Ordering::Acquire) << 8),
         ],
     );
@@ -554,6 +718,22 @@ fn snapshot(
             ROUND.load(Ordering::Acquire),
         ],
     );
+    // The authoritative CPU → lock-instance map: from the domain's own cell array, under every 1L.
+    for cpu in 0..n {
+        let (cell, lock) = domain.witness_cell_addrs(cpu);
+        record(
+            K_CELL,
+            cpu,
+            [
+                cell as u64,
+                lock as u64,
+                u64::from(kinds.0 == K_CENSUS_BEGIN),
+                0,
+                0,
+                0,
+            ],
+        );
+    }
     for cpu in 0..n {
         let sched = view.witness_cell(CpuId(cpu as u8));
         record(

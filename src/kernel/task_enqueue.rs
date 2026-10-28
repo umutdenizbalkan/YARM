@@ -113,6 +113,9 @@ pub(crate) fn plan_pinned_enqueue_locked(
     tid: u64,
     cpu: CpuId,
 ) -> Result<EnqueuePlan, KernelError> {
+    // SCHED-LOCK1 witness only: the incarnation this owner places, from its own rank-2 view.
+    #[cfg(feature = "sched-lock1-witness")]
+    crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid);
     let idx = refuse_reservation_locked(tcbs, tid)?;
     let priority = if tid == 0 {
         TaskPriority::Normal
@@ -141,6 +144,9 @@ pub(crate) fn plan_balanced_enqueue_locked(
     tid: u64,
     current_cpu: CpuId,
 ) -> Result<EnqueuePlan, KernelError> {
+    // SCHED-LOCK1 witness only: the incarnation this owner places, from its own rank-2 view.
+    #[cfg(feature = "sched-lock1-witness")]
+    crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid);
     let idx = refuse_reservation_locked(tcbs, tid)?;
     if tid == 0 {
         return Ok(EnqueuePlan {

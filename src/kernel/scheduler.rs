@@ -963,6 +963,17 @@ impl SchedDomain {
         TickInstant(self.clock.load(Ordering::Acquire))
     }
 
+    /// SCHED-LOCK1 witness only: CPU `idx`'s cell and its lock, as addresses — the authoritative
+    /// CPU → lock-instance map the witness records under the coherent view.
+    #[cfg(feature = "sched-lock1-witness")]
+    pub(crate) fn witness_cell_addrs(&self, idx: usize) -> (usize, usize) {
+        let cell = &self.cpus[idx];
+        (
+            cell as *const CpuCell as usize,
+            &cell.lock as *const SpinLockIrq<CpuSched> as usize,
+        )
+    }
+
     /// CPU `idx`'s published current task (see [`CpuMirror`]). `None` for an out-of-range CPU.
     pub(crate) fn current_mirror(&self, idx: usize) -> Option<ThreadId> {
         let raw = self.cpus.get(idx)?.mirror.current.load(Ordering::SeqCst);

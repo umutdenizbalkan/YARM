@@ -908,6 +908,10 @@ pub fn handle_trap_entry_shared(
     // dispatch, not just around `with_cpu`. See `TrapPathWindow`; it is the one owner of this
     // flag and of clearing it on every path out of this function.
     let cpu_idx = cpu.0 as usize;
+    // SCHED-LOCK1 witness only: a kernel entry by a just-installed task is its first observed
+    // execution (no lock taken; observation only).
+    #[cfg(feature = "sched-lock1-witness")]
+    crate::kernel::schedlock1_witness::trap_entered(shared, cpu);
     let trap_path = TrapPathWindow::establish(cpu);
 
     // Stage 29: pre-global-lock split-dispatch seam (whitelist-only, default-deny).

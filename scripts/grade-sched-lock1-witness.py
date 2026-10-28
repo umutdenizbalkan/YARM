@@ -6,22 +6,37 @@
 Usage: grade-sched-lock1-witness.py [--expect-cpus N] BOOT_LOG
        grade-sched-lock1-witness.py --self-test
 
-Every record is VALIDATED before anything is awarded (CRC, contiguous sequence, known kind,
-in-range CPUs, section structure, per-CPU generations, hold pairing). Then two separately
-labelled verdicts:
+A failure prints `SL1W_GRADE result=fail reason=<obligation>: <detail>`. The obligations, in the
+order they are checked:
 
-* NATURAL (membership trace): the trace is replayed from the coherent SNAP and must arrive
-  exactly at the coherent CENSUS. Every section's `before` current must equal the model's; every
-  REM must remove a queued task; no task may hold two placements; an installed current must come
-  off this CPU's queue (or be a restore from nowhere); every remote-wake CLAIM must be matched by
-  the ADD it names (same target, same executing CPU, same task); every remote ADD must be followed
-  by its notification from the same CPU to the same target.
-* SYNCHRONIZED (independence holds): for every round of the schedule an attempt is awarded only
-  if the holder's own 1L was held at begin and end with no other acquisition of it in between
-  (equal generations), the holder held exactly one 1L and no admission lock, NO section touched
-  the holder's CPU inside the window, and the observer made at least two owner commits on its own
-  CPU — under a different lock instance — and one unit of progress by a task one of those commits
-  installed.
+* `validity` — transport and structure: CRC, identical redundant copies, contiguous sequence,
+  known kinds, CPUs in range, the SNAP ... CENSUS framing, section membership, generations.
+* `cell-map` — the authoritative CPU → lock-instance map (`CELL`, recorded from the domain's cell
+  array at SNAP and again at CENSUS): complete, distinct per CPU, one lock offset, unchanged.
+* `lock-instance` — every `SEC` and every `HOLD_BEGIN` (credited or not) names its CPU's cell.
+* `no-op-section` — the producer never records a section with an unchanged current, no
+  addition and no removal; such a record is not a scheduling commit and is refused.
+* `natural` — the replay from SNAP reaches CENSUS exactly (one placement per task, no lost,
+  duplicated or phantom wake, every remote addition notified).
+* `claim-commit` — every `CLAIM` names the exact section (record number, CPU, executing CPU,
+  generation) that added its task, and each such addition is claimed at most once.
+* `claim-incarnation` — every `CLAIM` carries the incarnation its owner staged under rank 2, and
+  that incarnation agrees with the address space the CPU had active when the task next ran.
+* `run` — every `RUN` (the first kernel entry by an installed task: its tick, call or fault)
+  names the installation it observed, once, after it, on the same CPU.
+* `attempt` — EVERY hold attempt is valid before any coverage is counted: the schedule's pair and
+  attempt order, the holder's cell, its lock held and interrupts masked at begin and end, exactly
+  its own 1L and no admission lock, no reacquisition, holder sections ordered around it, and a
+  reported outcome consistent with its own counters and the fixed bounds.
+* `progress` — every `PROGRESS` names an installation by the observer's own production owner, in
+  its hold, of the task it reports, with the running address space.
+* `coverage` — every scheduled round has a credited attempt. A valid attempt is credited when it
+  reported success, its window holds at least two distinct genuine commits by the observer on its
+  own cell, one of them installed (selected or restored) a task, and that task's execution was
+  observed in the hold. A valid attempt may be uncredited; that alone is not a failure.
+
+The round population and the thresholds are fixed here, from the CPU count; the log cannot
+redefine them.
 """
 import re
 import sys
@@ -29,15 +44,25 @@ import zlib
 
 KINDS = {"SNAP_BEGIN", "SNAP_CUR", "SNAP_Q", "SEC", "ADD", "REM", "CLAIM", "NOTIFY",
          "HOLD_BEGIN", "PROGRESS", "HOLD_END", "RELATED", "CENSUS_BEGIN", "CENSUS_CUR",
-         "CENSUS_Q", "CENSUS_END", "ALL_MUTATED"}
+         "CENSUS_Q", "CENSUS_END", "ALL_MUTATED", "CELL", "RUN"}
 REC = re.compile(r"(SL1W_R seq=(\d+) kind=(\w+) cpu=(\d+) exec=(\d+) f0=(\d+) f1=(\d+) f2=(\d+) "
                  r"f3=(\d+) f4=(\d+) f5=(\d+)) crc=([0-9a-f]{8})")
 END = re.compile(r"(SL1W_END count=(\d+) overflow=(\d) phase=(\d) ncpu=(\d+) rounds=(\d+) "
                  r"rounds_ok=(\d+)) crc=([0-9a-f]{8})")
 
+# Fixed by the producer (`kernel::schedlock1_witness`): never read from the log.
+HOLD_SPINS = 400_000_000
+ATTEMPTS = 3
+COMMITS_REQUIRED = 2
+INC_UNBOUND, INC_NO_ASID = 0, 1
+
 
 class Fail(Exception):
     pass
+
+
+def fail(obligation, detail):
+    raise Fail("%s: %s" % (obligation, detail))
 
 
 def crc_ok(body, crc):
@@ -53,12 +78,15 @@ def parse(text):
         r = {"seq": seq, "kind": m.group(3), "cpu": int(m.group(4)), "exec": int(m.group(5)),
              "f": [int(m.group(i)) for i in range(6, 12)]}
         if seq in recs and recs[seq] != r:
-            raise Fail("validity: two different CRC-valid copies of seq %d" % seq)
+            fail("validity", "two different CRC-valid copies of seq %d" % seq)
         recs[seq] = r
     for m in END.finditer(text):
         if crc_ok(m.group(1), m.group(8)):
-            end = {"count": int(m.group(2)), "overflow": int(m.group(3)), "phase": int(m.group(4)),
-                   "ncpu": int(m.group(5)), "rounds": int(m.group(6)), "ok": int(m.group(7))}
+            e = {"count": int(m.group(2)), "overflow": int(m.group(3)), "phase": int(m.group(4)),
+                 "ncpu": int(m.group(5)), "rounds": int(m.group(6)), "ok": int(m.group(7))}
+            if end is not None and end != e:
+                fail("validity", "two different CRC-valid SL1W_END lines")
+            end = e
     return recs, end
 
 
@@ -76,89 +104,120 @@ def dec(v):
 
 def grade(text, expect_cpus=None):
     recs, end = parse(text)
-    # ── validity ──────────────────────────────────────────────────────────────────────────────
+    # ── validity: transport, completeness, framing ───────────────────────────────────────────
     if end is None:
-        raise Fail("validity: no CRC-valid SL1W_END")
+        fail("validity", "no CRC-valid SL1W_END")
     if end["overflow"]:
-        raise Fail("validity: the record ring overflowed")
+        fail("validity", "the record ring overflowed")
     if end["phase"] != 2:
-        raise Fail("validity: the window never closed (phase=%d)" % end["phase"])
+        fail("validity", "the window never closed (phase=%d)" % end["phase"])
     n = end["ncpu"]
     if not 2 <= n <= 8 or (expect_cpus is not None and n != min(expect_cpus, 8)):
-        raise Fail("validity: ncpu=%d (expected %s)" % (n, expect_cpus))
+        fail("validity", "ncpu=%d (expected %s)" % (n, expect_cpus))
     rounds = 2 if n == 2 else 2 * n
     if end["rounds"] != rounds:
-        raise Fail("validity: %d rounds recorded, schedule has %d" % (end["rounds"], rounds))
+        fail("validity", "%d rounds recorded, schedule has %d" % (end["rounds"], rounds))
     if sorted(recs) != list(range(1, end["count"] + 1)):
         missing = sorted(set(range(1, end["count"] + 1)) - set(recs))
-        raise Fail("validity: records missing or extra (first missing %s)" % missing[:5])
+        fail("validity", "records missing or extra (first missing %s)" % missing[:5])
     rs = [recs[i] for i in range(1, end["count"] + 1)]
+    by_seq = {r["seq"]: r for r in rs}
     for r in rs:
         if r["kind"] not in KINDS:
-            raise Fail("validity: seq %d unknown kind %s" % (r["seq"], r["kind"]))
+            fail("validity", "seq %d unknown kind %s" % (r["seq"], r["kind"]))
         if r["cpu"] >= n or r["exec"] >= n:
-            raise Fail("validity: seq %d names a CPU outside 0..%d" % (r["seq"], n - 1))
+            fail("validity", "seq %d names a CPU outside 0..%d" % (r["seq"], n - 1))
         if r["kind"] == "ALL_MUTATED":
-            raise Fail("validity: a coherent view mutated membership (seq %d)" % r["seq"])
+            fail("validity", "a coherent view mutated membership (seq %d)" % r["seq"])
     if rs[0]["kind"] != "SNAP_BEGIN" or rs[-1]["kind"] != "CENSUS_END":
-        raise Fail("validity: the trace must run SNAP_BEGIN ... CENSUS_END")
-    # snapshot / census blocks
-    def block(start_kind, cur_kind, q_kind, i):
+        fail("validity", "the trace must run SNAP_BEGIN ... CENSUS_END")
+
+    def block(start_kind, cur_kind, q_kind, i, phase):
         if rs[i]["kind"] != start_kind or rs[i]["f"][0] != n:
-            raise Fail("validity: %s malformed at seq %d" % (start_kind, rs[i]["seq"]))
+            fail("validity", "%s malformed at seq %d" % (start_kind, rs[i]["seq"]))
         i += 1
+        cells = {}
+        while i < len(rs) and rs[i]["kind"] == "CELL":
+            r = rs[i]
+            if r["cpu"] in cells or r["f"][2] != phase:
+                fail("cell-map", "%s: CELL seq %d repeats cpu %d or names phase %d"
+                     % (start_kind, r["seq"], r["cpu"], r["f"][2]))
+            cells[r["cpu"]] = (r["f"][0], r["f"][1])
+            i += 1
+        if sorted(cells) != list(range(n)):
+            fail("cell-map", "%s does not map every CPU to its cell (has %s)" % (start_kind, sorted(cells)))
         cur, q = {}, {c: {} for c in range(n)}
         while i < len(rs) and rs[i]["kind"] in (cur_kind, q_kind):
             r = rs[i]
             if r["kind"] == cur_kind:
                 if r["cpu"] in cur:
-                    raise Fail("validity: two %s for cpu %d" % (cur_kind, r["cpu"]))
-                cur[r["cpu"]] = dec(r["f"][0])
+                    fail("validity", "two %s for cpu %d" % (cur_kind, r["cpu"]))
+                cur[r["cpu"]] = (dec(r["f"][0]), r["f"][1])
             else:
                 if r["cpu"] not in cur:
-                    raise Fail("validity: %s before its CPU's current" % q_kind)
+                    fail("validity", "%s before its CPU's current" % q_kind)
                 q[r["cpu"]][r["f"][0]] = r["f"][1]
             i += 1
         if sorted(cur) != list(range(n)):
-            raise Fail("validity: %s does not cover every CPU" % start_kind)
-        return cur, q, i
-    snap_cur, snap_q, i = block("SNAP_BEGIN", "SNAP_CUR", "SNAP_Q", 0)
+            fail("validity", "%s does not cover every CPU" % start_kind)
+        return cells, cur, q, i
+
+    snap_cells, snap_cur, snap_q, i = block("SNAP_BEGIN", "SNAP_CUR", "SNAP_Q", 0, 0)
     ci = max(k for k, r in enumerate(rs) if r["kind"] == "CENSUS_BEGIN")
-    cen_cur, cen_q, j = block("CENSUS_BEGIN", "CENSUS_CUR", "CENSUS_Q", ci)
+    cen_cells, cen_cur, cen_q, j = block("CENSUS_BEGIN", "CENSUS_CUR", "CENSUS_Q", ci, 1)
     if j != len(rs) - 1:
-        raise Fail("validity: records between the census and CENSUS_END")
+        fail("validity", "records between the census and CENSUS_END")
     if rs[-1]["f"][0] != end["ok"] or rs[-1]["f"][1] != rounds:
-        raise Fail("validity: CENSUS_END disagrees with SL1W_END")
+        fail("validity", "CENSUS_END disagrees with SL1W_END")
+    # ── cell-map: one authoritative CPU → lock-instance map ──────────────────────────────────
+    if snap_cells != cen_cells:
+        fail("cell-map", "a CPU's cell changed inside the window (SNAP %s, CENSUS %s)"
+             % (snap_cells, cen_cells))
+    cell = {c: snap_cells[c][0] for c in range(n)}
+    if 0 in cell.values() or len(set(cell.values())) != n or len({l for _, l in snap_cells.values()}) != n:
+        fail("cell-map", "CPU cells are not distinct non-null instances %s" % snap_cells)
+    if len({l - c for c, l in snap_cells.values()}) != 1:
+        fail("cell-map", "the lock does not sit at one offset in every cell %s" % snap_cells)
     body = rs[i:ci]
-    # sections: SEC followed by exactly n_add ADD and n_rem REM of the same (cpu, exec, gen)
-    secs, k, last_gen = [], 0, {}
+    # ── sections ──────────────────────────────────────────────────────────────────────────────
+    secs, k, last_gen = [], 0, {c: snap_cur[c][1] for c in range(n)}
+    sec_by_seq = {}
     while k < len(body):
         r = body[k]
         if r["kind"] in ("ADD", "REM"):
-            raise Fail("validity: seq %d %s outside a section" % (r["seq"], r["kind"]))
+            fail("validity", "seq %d %s outside a section" % (r["seq"], r["kind"]))
         if r["kind"] != "SEC":
             k += 1
             continue
         gen, bcur, acur, na, nr, inst = r["f"]
         part = body[k + 1:k + 1 + na + nr]
         if len(part) != na + nr or [p["kind"] for p in part] != ["ADD"] * na + ["REM"] * nr:
-            raise Fail("validity: section seq %d is not followed by its %d ADD/%d REM" % (r["seq"], na, nr))
+            fail("validity", "section seq %d is not followed by its %d ADD/%d REM" % (r["seq"], na, nr))
         for p in part:
             if (p["cpu"], p["exec"], p["f"][0]) != (r["cpu"], r["exec"], gen):
-                raise Fail("validity: section seq %d has a foreign member seq %d" % (r["seq"], p["seq"]))
+                fail("validity", "section seq %d has a foreign member seq %d" % (r["seq"], p["seq"]))
         tids = [p["f"][1] for p in part]
         if len(set(tids)) != len(tids):
-            raise Fail("validity: section seq %d lists a task twice (a net change cannot)" % r["seq"])
-        if gen <= last_gen.get(r["cpu"], 0):
-            raise Fail("validity: cpu %d generations not increasing at seq %d" % (r["cpu"], r["seq"]))
+            fail("validity", "section seq %d lists a task twice (a net change cannot)" % r["seq"])
+        if gen <= last_gen[r["cpu"]]:
+            fail("validity", "cpu %d generations not increasing at seq %d" % (r["cpu"], r["seq"]))
         last_gen[r["cpu"]] = gen
-        secs.append({"seq": r["seq"], "cpu": r["cpu"], "exec": r["exec"], "gen": gen,
-                     "before": dec(bcur), "after": dec(acur), "inst": inst,
-                     "add": {p["f"][1]: p["f"][2] for p in part if p["kind"] == "ADD"},
-                     "rem": {p["f"][1] for p in part if p["kind"] == "REM"}})
+        if inst != cell[r["cpu"]]:
+            fail("lock-instance", "section seq %d on cpu %d names lock instance %#x; cpu %d's cell is %#x"
+                 % (r["seq"], r["cpu"], inst, r["cpu"], cell[r["cpu"]]))
+        if bcur == acur and na == 0 and nr == 0:
+            fail("no-op-section", "section seq %d on cpu %d changes nothing (current %s kept, 0 added, "
+                 "0 removed): the producer never records one, and it is no scheduling commit"
+                 % (r["seq"], r["cpu"], dec(bcur)))
+        s = {"seq": r["seq"], "cpu": r["cpu"], "exec": r["exec"], "gen": gen,
+             "before": dec(bcur), "after": dec(acur),
+             "add": {p["f"][1]: p["f"][2] for p in part if p["kind"] == "ADD"},
+             "rem": {p["f"][1] for p in part if p["kind"] == "REM"}}
+        secs.append(s)
+        sec_by_seq[r["seq"]] = s
         k += 1 + na + nr
     # ── NATURAL: replay ──────────────────────────────────────────────────────────────────────
-    cur = dict(snap_cur)
+    cur = {c: snap_cur[c][0] for c in range(n)}
     q = {c: dict(snap_q[c]) for c in range(n)}
 
     def placements(tid):
@@ -166,53 +225,43 @@ def grade(text, expect_cpus=None):
 
     for tid in {t for c in range(n) for t in q[c]} | {t for t in cur.values() if t is not None}:
         if tid != 0 and len(placements(tid)) > 1:
-            raise Fail("natural: SNAP places tid %d twice" % tid)
+            fail("natural", "SNAP places tid %d twice" % tid)
     restores = 0
     for s in secs:
         c = s["cpu"]
         if cur[c] != s["before"]:
-            raise Fail("natural: seq %d cpu %d section starts from current %s, model has %s (a lost or "
-                       "unrecorded transition)" % (s["seq"], c, s["before"], cur[c]))
+            fail("natural", "seq %d cpu %d section starts from current %s, model has %s (a lost or "
+                 "unrecorded transition)" % (s["seq"], c, s["before"], cur[c]))
         for tid in s["rem"]:
             if tid not in q[c]:
-                raise Fail("natural: seq %d removes tid %d not queued on cpu %d (duplicate consumption)"
-                           % (s["seq"], tid, c))
+                fail("natural", "seq %d removes tid %d not queued on cpu %d (duplicate consumption)"
+                     % (s["seq"], tid, c))
             del q[c][tid]
         for tid, prio in s["add"].items():
             if tid in q[c]:
-                raise Fail("natural: seq %d queues tid %d twice on cpu %d" % (s["seq"], tid, c))
+                fail("natural", "seq %d queues tid %d twice on cpu %d" % (s["seq"], tid, c))
             q[c][tid] = prio
+        s["install"] = None
         if s["after"] != s["before"] and s["after"] is not None:
             a = s["after"]
+            s["install"] = "selected" if a in s["rem"] else "restored"
             if a not in s["rem"] and a != 0:
                 if placements(a):
-                    raise Fail("natural: seq %d installs tid %d, which is placed elsewhere" % (s["seq"], a))
+                    fail("natural", "seq %d installs tid %d, which is placed elsewhere" % (s["seq"], a))
                 restores += 1
         cur[c] = s["after"]
         for tid in {s["before"], s["after"], *s["add"], *s["rem"]}:
             if tid not in (None, 0) and len(placements(tid)) > 1:
-                raise Fail("natural: after seq %d tid %d holds %d placements %s"
-                           % (s["seq"], tid, len(placements(tid)), placements(tid)))
+                fail("natural", "after seq %d tid %d holds %d placements %s"
+                     % (s["seq"], tid, len(placements(tid)), placements(tid)))
     for c in range(n):
-        if cur[c] != cen_cur[c] or q[c] != cen_q[c]:
-            raise Fail("natural: the replay ends at cpu %d current=%s queue=%s; the CENSUS has current=%s "
-                       "queue=%s (a lost, phantom or substituted wake)" % (c, cur[c], sorted(q[c]),
-                                                                         cen_cur[c], sorted(cen_q[c])))
-    # claims ↔ adds
-    claimed = set()
-    for r in body:
-        if r["kind"] != "CLAIM":
-            continue
-        t, e, tid = r["cpu"], r["exec"], r["f"][0]
-        cands = [s for s in secs if s["seq"] < r["seq"] and s["cpu"] == t and s["exec"] == e
-                 and tid in s["add"] and s["seq"] not in claimed]
-        if not cands:
-            raise Fail("natural: CLAIM seq %d (cpu %d → cpu %d tid %d) has no ADD it names (dropped "
-                       "publication, or substituted destination/incarnation)" % (r["seq"], e, t, tid))
-        claimed.add(cands[-1]["seq"])
+        if cur[c] != cen_cur[c][0] or q[c] != cen_q[c]:
+            fail("natural", "the replay ends at cpu %d current=%s queue=%s; the CENSUS has current=%s "
+                 "queue=%s (a lost, phantom or substituted wake)" % (c, cur[c], sorted(q[c]),
+                                                                     cen_cur[c][0], sorted(cen_q[c])))
     # remote adds → notification
     pending, remote_adds, notifies = {}, 0, 0
-    for idx, r in enumerate(body):
+    for r in body:
         if r["kind"] == "SEC" and r["exec"] != r["cpu"] and r["f"][3] > 0:
             pending.setdefault((r["exec"], r["cpu"]), []).append(r["seq"])
             remote_adds += 1
@@ -225,77 +274,194 @@ def grade(text, expect_cpus=None):
         for seq in lst:
             later = [s for s in secs if s["exec"] == e and s["seq"] > seq]
             if later:
-                raise Fail("natural: remote ADD seq %d (cpu %d → cpu %d) was never notified" % (seq, e, t))
-    # ── SYNCHRONIZED: holds ──────────────────────────────────────────────────────────────────
+                fail("natural", "remote ADD seq %d (cpu %d → cpu %d) was never notified" % (seq, e, t))
+
+    def installation(seq, cpu, gen, tid, what):
+        s = sec_by_seq.get(seq)
+        if s is None or s["cpu"] != cpu or s["gen"] != gen or s["after"] != tid or s["install"] is None:
+            return "%s names installation seq %d (cpu %d gen %d tid %d), which is not one" % (
+                what, seq, cpu, gen, tid)
+        return None
+
+    # ── RUN: observed executions of installed tasks ──────────────────────────────────────────
+    runs, run_of_install = [], {}
+    for r in body:
+        if r["kind"] != "RUN":
+            continue
+        tid, inc, igen, tgen, iseq = r["f"][:5]
+        bad = installation(iseq, r["cpu"], igen, tid, "RUN seq %d" % r["seq"])
+        if bad:
+            fail("run", bad)
+        if not iseq < r["seq"] or tgen < igen or r["exec"] != r["cpu"] or inc == INC_UNBOUND \
+                or r["f"][5] not in (0, 1):
+            fail("run", "RUN seq %d is not a later tick on cpu %d of installation seq %d" % (r["seq"], r["cpu"], iseq))
+        if iseq in run_of_install:
+            fail("run", "installation seq %d observed running twice (RUN seq %d)" % (iseq, r["seq"]))
+        run_of_install[iseq] = r
+        runs.append(r)
+    # ── claims: bound to the commit and to the incarnation ───────────────────────────────────
+    claimed, claims, verified = set(), [], 0
+    for r in body:
+        if r["kind"] != "CLAIM":
+            continue
+        t, e = r["cpu"], r["exec"]
+        tid, inc, _rnd, cgen, cseq = r["f"][:5]
+        if inc == INC_UNBOUND:
+            fail("claim-incarnation", "CLAIM seq %d (cpu %d → cpu %d tid %d) carries no incarnation staged by "
+                 "its owner" % (r["seq"], e, t, tid))
+        s = sec_by_seq.get(cseq)
+        if s is None or not cseq < r["seq"] or s["cpu"] != t or s["exec"] != e or s["gen"] != cgen \
+                or tid not in s["add"]:
+            fail("claim-commit", "CLAIM seq %d (cpu %d → cpu %d tid %d) names commit seq %d gen %d, which did "
+                 "not add tid %d to cpu %d on cpu %d (dropped publication, or substituted destination, "
+                 "task or commit)" % (r["seq"], e, t, tid, cseq, cgen, tid, t, e))
+        if (cseq, tid) in claimed:
+            fail("claim-commit", "CLAIM seq %d claims commit seq %d for tid %d a second time" % (r["seq"], cseq, tid))
+        claimed.add((cseq, tid))
+        claims.append((r, s))
+    for idx, (r, s) in enumerate(claims):
+        t, tid, inc = r["cpu"], r["f"][0], r["f"][1]
+        nxt = [c for c, _ in claims[idx + 1:] if c["cpu"] == t and c["f"][0] == tid]
+        horizon = nxt[0]["f"][4] if nxt else float("inf")
+        seen = [x for x in runs if x["cpu"] == t and x["f"][0] == tid and s["seq"] < x["f"][4] < horizon]
+        if seen and inc != INC_NO_ASID:
+            if seen[0]["f"][1] != inc:
+                fail("claim-incarnation", "CLAIM seq %d placed tid %d with incarnation code %d; when it next ran "
+                     "(RUN seq %d) cpu %d had code %d active (stale or substituted incarnation)"
+                     % (r["seq"], tid, inc, seen[0]["seq"], t, seen[0]["f"][1]))
+            verified += 1
+    # ── SYNCHRONIZED: attempts — validity first, then coverage ───────────────────────────────
     attempts, open_hold, late = [], None, 0
     for r in body:
         if r["kind"] == "HOLD_BEGIN":
             if open_hold is not None:
-                raise Fail("validity: nested hold at seq %d" % r["seq"])
+                fail("attempt", "nested hold at seq %d" % r["seq"])
             open_hold = {"begin": r, "progress": [], "related": []}
         elif r["kind"] in ("PROGRESS", "RELATED"):
             if open_hold is not None and r["f"][0] == open_hold["begin"]["f"][0]:
                 open_hold["progress" if r["kind"] == "PROGRESS" else "related"].append(r)
             elif attempts and r["f"][0] == attempts[-1]["begin"]["f"][0] and (
                     open_hold is None or open_hold["begin"]["f"][0] != r["f"][0]):
-                # Observed during the hold that has just ended (the observer read the hold as
-                # active, then the holder ended it by its bound before this record's slot was
-                # reserved). It is after HOLD_END, so it can contribute to no award: not counted.
+                # Observed during the hold that has just ended (the holder ended it by its bound
+                # before this record's slot was reserved). Validated, but credits nothing.
+                attempts[-1]["late"].append(r)
                 late += 1
             else:
-                raise Fail("validity: %s seq %d outside its hold" % (r["kind"], r["seq"]))
+                fail("attempt", "%s seq %d outside its hold" % (r["kind"], r["seq"]))
         elif r["kind"] == "HOLD_END":
             if open_hold is None or r["f"][0] != open_hold["begin"]["f"][0] or r["cpu"] != open_hold["begin"]["cpu"]:
-                raise Fail("validity: unpaired HOLD_END seq %d" % r["seq"])
+                fail("attempt", "unpaired HOLD_END seq %d" % r["seq"])
             open_hold["end"] = r
+            open_hold["late"] = []
             attempts.append(open_hold)
             open_hold = None
     if open_hold is not None:
-        raise Fail("validity: a hold never ended")
-    awarded = {}
+        fail("attempt", "a hold never ended")
+
+    def check_progress(p, a, obs, b, e, rnd):
+        tid, tgen, igen, inc, iseq = p["f"][1], p["f"][2], p["f"][3], p["f"][4], p["f"][5]
+        if p["cpu"] != obs or p["exec"] != obs:
+            fail("progress", "round %d: PROGRESS seq %d on cpu %d/exec %d, the observer is %d"
+                 % (rnd, p["seq"], p["cpu"], p["exec"], obs))
+        bad = installation(iseq, obs, igen, tid, "round %d: PROGRESS seq %d" % (rnd, p["seq"]))
+        if bad:
+            fail("progress", bad + " (progress linked to the wrong installation)")
+        s = sec_by_seq[iseq]
+        if s["exec"] != obs or not b["seq"] < iseq < p["seq"] or tgen <= igen or inc == INC_UNBOUND:
+            fail("progress", "round %d: PROGRESS seq %d's installation seq %d is not the observer's own "
+                 "commit inside the hold, before a later tick" % (rnd, p["seq"], iseq))
+        run = run_of_install.get(iseq)
+        if run is not None and run["f"][1] != inc:
+            fail("progress", "round %d: PROGRESS seq %d reports incarnation code %d; RUN seq %d of the same "
+                 "installation saw %d" % (rnd, p["seq"], inc, run["seq"], run["f"][1]))
+        return s
+
+    expect_round, expect_try, ok_attempts = 0, 0, 0
+    credited = {}
     for at in attempts:
         b, e = at["begin"], at["end"]
-        rnd = b["f"][0]
+        rnd, obs_f, inst, bgen, held, f5 = b["f"]
         a, obs = pair(rnd, n)
-        if b["cpu"] != a or b["f"][1] != obs:
-            raise Fail("validity: round %d held by cpu %d for %d, schedule says %d for %d"
-                       % (rnd, b["cpu"], b["f"][1], a, obs))
-        ok_flag = (e["f"][5] >> 1) & 1
-        win = [s for s in secs if b["seq"] < s["seq"] < e["seq"]]
-        if any(s["cpu"] == a for s in win):
-            raise Fail("synchronized: round %d — a section on the HOLDER's cpu %d inside its hold "
-                       "(its lock did not exclude)" % (rnd, a))
-        if not ok_flag:
-            continue
-        held_1l, held_1g = b["f"][4] & 0xFFFFFFFF, b["f"][4] >> 32
-        if (b["f"][5] & 1) != 1 or (e["f"][5] & 1) != 1:
-            raise Fail("synchronized: round %d — the holder's lock was not held at begin and end" % rnd)
-        if (e["f"][5] >> 8) != b["f"][3]:
-            raise Fail("synchronized: round %d — the holder's lock was re-acquired during the hold" % rnd)
+        # (1) the schedule and the attempt order
+        if rnd >= rounds or b["cpu"] != a or obs_f != obs or b["exec"] != a or e["exec"] != a:
+            fail("attempt", "seq %d: round %d held by cpu %d for %d, schedule says %d for %d"
+                 % (b["seq"], rnd, b["cpu"], obs_f, a, obs))
+        if (rnd, f5 >> 8) != (expect_round, expect_try):
+            fail("attempt", "seq %d: attempt %d of round %d out of order (expected attempt %d of round %d)"
+                 % (b["seq"], f5 >> 8, rnd, expect_try, expect_round))
+        # (2) the holder's lock, its mask state and its lock count
+        if inst != cell[a]:
+            fail("lock-instance", "round %d attempt seq %d holds instance %#x; cpu %d's cell is %#x"
+                 % (rnd, b["seq"], inst, a, cell[a]))
+        if (f5 & 1) != 1 or (e["f"][5] & 1) != 1:
+            fail("attempt", "round %d attempt seq %d: the holder's lock was not held at begin and end" % (rnd, b["seq"]))
+        if (f5 >> 1) & 1 or (e["f"][5] >> 2) & 1:
+            fail("attempt", "round %d attempt seq %d: interrupts were enabled during the hold" % (rnd, b["seq"]))
+        held_1l, held_1g = held & 0xFFFFFFFF, held >> 32
         if held_1l != 1 or held_1g != 0:
-            raise Fail("synchronized: round %d — the holder held 1L=%d 1G=%d (exactly its own 1L "
-                       "required)" % (rnd, held_1l, held_1g))
-        commits = [s for s in win if s["cpu"] == obs and s["exec"] == obs]
-        if any(s["inst"] == b["f"][2] for s in commits):
-            raise Fail("synchronized: round %d — the observer's commits used the holder's lock" % rnd)
-        prog = [p for p in at["progress"] if p["cpu"] == obs and any(
-            s["after"] == p["f"][1] and s["gen"] == p["f"][3] and s["seq"] < p["seq"]
-            and p["f"][2] > s["gen"] for s in commits)]
-        if len(commits) >= 2 and prog and not at["related"]:
-            awarded.setdefault(rnd, (a, obs, len(commits), len(prog)))
-    missing = [r for r in range(rounds) if r not in awarded]
+            fail("attempt", "round %d attempt seq %d: the holder held 1L=%d 1G=%d (exactly its own 1L required)"
+                 % (rnd, b["seq"], held_1l, held_1g))
+        if (e["f"][5] >> 8) != bgen:
+            fail("attempt", "round %d attempt seq %d: the holder's lock was re-acquired during the hold" % (rnd, b["seq"]))
+        # (3) the holder's own sections are ordered around the hold
+        for s in secs:
+            if s["cpu"] != a:
+                continue
+            if b["seq"] < s["seq"] < e["seq"]:
+                fail("attempt", "round %d — a section on the HOLDER's cpu %d inside its hold (its lock did not "
+                     "exclude)" % (rnd, a))
+            if (s["seq"] < b["seq"] and s["gen"] >= bgen) or (s["seq"] > e["seq"] and s["gen"] < bgen):
+                fail("attempt", "round %d attempt seq %d: holder generation %d disagrees with section seq %d gen %d"
+                     % (rnd, b["seq"], bgen, s["seq"], s["gen"]))
+        # (4) the reported outcome against its own counters and the fixed bounds
+        commits_r, prog_r, rel_r, spins, ok = e["f"][1], e["f"][2], e["f"][3], e["f"][4], (e["f"][5] >> 1) & 1
+        if ok and not (commits_r >= COMMITS_REQUIRED and prog_r >= 1 and rel_r == 0 and spins < HOLD_SPINS):
+            fail("attempt", "round %d attempt seq %d reports success with commits=%d progress=%d related=%d spins=%d"
+                 % (rnd, b["seq"], commits_r, prog_r, rel_r, spins))
+        if not ok and not (rel_r > 0 or spins >= HOLD_SPINS):
+            fail("attempt", "round %d attempt seq %d reports failure with neither interference nor its bound "
+                 "(related=%d spins=%d)" % (rnd, b["seq"], rel_r, spins))
+        if at["related"] and ok:
+            fail("attempt", "round %d attempt seq %d reports success despite RELATED records" % (rnd, b["seq"]))
+        for rr in at["related"] + [x for x in at["late"] if x["kind"] == "RELATED"]:
+            if rr["cpu"] != a or rr["exec"] != obs:
+                fail("attempt", "RELATED seq %d is not the observer touching the holder's lock" % rr["seq"])
+        # (5) every progress record, counted or late, is a genuine linked execution
+        good_prog = [check_progress(p, a, obs, b, e, rnd) for p in at["progress"]]
+        for p in at["late"]:
+            if p["kind"] == "PROGRESS":
+                check_progress(p, a, obs, b, e, rnd)
+        # the producer's own round progression
+        if ok:
+            ok_attempts += 1
+            expect_round, expect_try = rnd + 1, 0
+        elif expect_try + 1 >= ATTEMPTS:
+            expect_round, expect_try = rnd + 1, 0
+        else:
+            expect_try += 1
+        # ── coverage: credit a valid attempt ─────────────────────────────────────────────────
+        commits = [s for s in secs if b["seq"] < s["seq"] < e["seq"] and s["cpu"] == obs and s["exec"] == obs]
+        installs = {s["seq"] for s in commits if s["install"] is not None}
+        ran = [s for s in good_prog if s["seq"] in installs]
+        if ok and not at["related"] and len({s["gen"] for s in commits}) >= COMMITS_REQUIRED and ran:
+            credited.setdefault(rnd, (a, obs, len(commits), len(ran)))
+    if ok_attempts != end["ok"]:
+        fail("attempt", "%d attempts report success; the producer counted %d" % (ok_attempts, end["ok"]))
+    missing = [r for r in range(rounds) if r not in credited]
     if missing:
-        raise Fail("synchronized: rounds %s were never awarded (schedule %s)"
-                   % (missing, [pair(r, n) for r in missing]))
-    dirs = sorted({(a, b) for a, b, _, _ in awarded.values()})
-    return ("SL1W_GRADE result=pass ncpu=%d | SYNCHRONIZED holds: %d/%d rounds awarded over %d attempts, "
-            "directions %s, %d late observer records not counted | NATURAL trace: %d sections (%d remote adds, %d notifications, %d claims "
-            "matched, %d restores) replayed SNAP→CENSUS exactly"
-            % (n, len(awarded), rounds, len(attempts), dirs, late, len(secs), remote_adds, notifies,
-               len(claimed), restores))
+        fail("coverage", "rounds %s were never credited (schedule %s)" % (missing, [pair(r, n) for r in missing]))
+    dirs = sorted({(a, b) for a, b, _, _ in credited.values()})
+    uncredited = len(attempts) - len(credited)
+    return ("SL1W_GRADE result=pass ncpu=%d | SYNCHRONIZED holds: %d/%d rounds credited over %d valid attempts "
+            "(%d uncredited), directions %s, %d late observer records not counted | NATURAL trace: %d sections "
+            "(%d remote adds, %d notifications, %d claims bound to their commits, %d incarnations confirmed by "
+            "a later run, %d runs, %d restores) replayed SNAP→CENSUS exactly; cells %s"
+            % (n, len(credited), rounds, len(attempts), uncredited, dirs, late, len(secs), remote_adds,
+               notifies, len(claims), verified, len(runs), restores,
+               " ".join("%d:%#x" % (c, cell[c]) for c in range(n))))
 
 
-# ── self-test ─────────────────────────────────────────────────────────────────────────────────
+# ── self-test (the full corpus is tests/fixtures/sched_lock1/mkcases.py) ───────────────────────
 def line(seq, kind, cpu, ex, f):
     body = "SL1W_R seq=%d kind=%s cpu=%d exec=%d f0=%d f1=%d f2=%d f3=%d f4=%d f5=%d" % (
         seq, kind, cpu, ex, *f)
@@ -303,150 +469,80 @@ def line(seq, kind, cpu, ex, f):
 
 
 def build(events, ncpu=2, phase=2, overflow=0, ok=2):
-    out = [line(i + 1, k, c, e, f + [0] * (6 - len(f))) for i, (k, c, e, f) in enumerate(events)]
+    """`events`: (kind, cpu, exec, fields[, label]); a field may be ("@", label) for the record
+    number of the labelled event."""
+    seq_of = {ev[4]: i + 1 for i, ev in enumerate(events) if len(ev) > 4}
+    out = []
+    for i, ev in enumerate(events):
+        f = [seq_of[x[1]] if isinstance(x, tuple) else x for x in ev[3]]
+        out.append(line(i + 1, ev[0], ev[1], ev[2], f + [0] * (6 - len(f))))
     endb = "SL1W_END count=%d overflow=%d phase=%d ncpu=%d rounds=%d rounds_ok=%d" % (
         len(events), overflow, phase, ncpu, 2 if ncpu == 2 else 2 * ncpu, ok)
     out.append("%s crc=%08x" % (endb, zlib.crc32(endb.encode()) & 0xFFFFFFFF))
     return "\n".join(o + "\n" + o for o in out)
 
 
+C0, C1, LOCK_OFF = 0x80001000, 0x80002000, 0x40
+A2 = lambda asid: asid + 2  # noqa: E731 — incarnation code for an address space
+
+
 def good():
-    # Two CPUs; T=100 runs on cpu 1; cpu 0 wakes T2=200 onto cpu 1; both rounds held.
+    """Two CPUs. Round 0: cpu 0 holds; cpu 1 requeues 100 and selects 300, which runs. Then cpu 0
+    wakes 200 onto cpu 1 (claimed with its incarnation). Round 1: cpu 1 holds; cpu 0 selects 500,
+    which runs. Finally cpu 1 selects 200, which runs in the claimed address space."""
     ev = [("SNAP_BEGIN", 0, 0, [2, 3, 3, 10, 0, 0]),
+          ("CELL", 0, 0, [C0, C0 + LOCK_OFF, 0]), ("CELL", 1, 1, [C1, C1 + LOCK_OFF, 0]),
           ("SNAP_CUR", 0, 0, [0, 5]), ("SNAP_CUR", 1, 1, [101, 7]), ("SNAP_Q", 1, 1, [300, 1])]
-    # round 0: cpu 0 holds; cpu 1 preempts 100 (requeue), dispatches 300, ticks with 300 current
-    ev += [("HOLD_BEGIN", 0, 0, [0, 1, 0xA0, 6, 1, 1]),
-           ("SEC", 1, 1, [8, 101, 0, 1, 0, 0xB0]), ("ADD", 1, 1, [8, 100, 1]),
-           ("SEC", 1, 1, [9, 0, 301, 0, 1, 0xB0]), ("REM", 1, 1, [9, 300]),
-           ("PROGRESS", 1, 1, [0, 300, 10, 9]),
+    ev += [("HOLD_BEGIN", 0, 0, [0, 1, C0, 6, 1, 1]),
+           ("SEC", 1, 1, [8, 101, 0, 1, 0, C1]), ("ADD", 1, 1, [8, 100, 1]),
+           ("SEC", 1, 1, [9, 0, 301, 0, 1, C1], "i300"), ("REM", 1, 1, [9, 300]),
+           ("RUN", 1, 1, [300, A2(3), 9, 10, ("@", "i300")]),
+           ("PROGRESS", 1, 1, [0, 300, 10, 9, A2(3), ("@", "i300")]),
            ("HOLD_END", 0, 0, [0, 2, 1, 0, 50, 1 | 2 | (6 << 8)])]
-    # natural: cpu 0 wakes 200 onto cpu 1 and notifies; the claim names it
-    ev += [("SEC", 1, 0, [11, 301, 301, 1, 0, 0xB0]), ("ADD", 1, 0, [11, 200, 1]),
-           ("NOTIFY", 1, 0, [11]), ("CLAIM", 1, 0, [200, 9, 0])]
-    # round 1: cpu 1 holds; cpu 0 installs 400 from nowhere? no — cpu 0 dispatches its queued 500
-    ev += [("SEC", 0, 0, [7, 0, 0, 1, 0, 0xA0]), ("ADD", 0, 0, [7, 500, 1]),
-           ("HOLD_BEGIN", 1, 1, [1, 0, 0xB0, 12, 1, 1]),
-           ("SEC", 0, 0, [8, 0, 501, 0, 1, 0xA0]), ("REM", 0, 0, [8, 500]),
-           ("SEC", 0, 0, [9, 501, 501, 1, 0, 0xA0]), ("ADD", 0, 0, [9, 600, 1]),
-           ("PROGRESS", 0, 0, [1, 500, 10, 8]),
+    ev += [("SEC", 1, 0, [11, 301, 301, 1, 0, C1], "c200"), ("ADD", 1, 0, [11, 200, 1]),
+           ("CLAIM", 1, 0, [200, A2(9), 1, 11, ("@", "c200")]), ("NOTIFY", 1, 0, [11])]
+    ev += [("SEC", 0, 0, [7, 0, 0, 1, 0, C0]), ("ADD", 0, 0, [7, 500, 1]),
+           ("HOLD_BEGIN", 1, 1, [1, 0, C1, 12, 1, 1]),
+           ("SEC", 0, 0, [8, 0, 501, 0, 1, C0], "i500"), ("REM", 0, 0, [8, 500]),
+           ("SEC", 0, 0, [9, 501, 501, 1, 0, C0]), ("ADD", 0, 0, [9, 600, 1]),
+           ("RUN", 0, 0, [500, A2(5), 8, 10, ("@", "i500")]),
+           ("PROGRESS", 0, 0, [1, 500, 10, 8, A2(5), ("@", "i500")]),
            ("HOLD_END", 1, 1, [1, 2, 1, 0, 70, 1 | 2 | (12 << 8)])]
+    ev += [("SEC", 1, 1, [13, 301, 201, 1, 1, C1], "i200"), ("ADD", 1, 1, [13, 300, 1]),
+           ("REM", 1, 1, [13, 200]),
+           ("RUN", 1, 1, [200, A2(9), 13, 14, ("@", "i200")])]
     ev += [("CENSUS_BEGIN", 0, 0, [2, 3, 3, 20, 2, 2]),
-           ("CENSUS_CUR", 0, 0, [501]), ("CENSUS_Q", 0, 0, [600, 1]),
-           ("CENSUS_CUR", 1, 1, [301]), ("CENSUS_Q", 1, 1, [100, 1]), ("CENSUS_Q", 1, 1, [200, 1]),
+           ("CELL", 0, 0, [C0, C0 + LOCK_OFF, 1]), ("CELL", 1, 1, [C1, C1 + LOCK_OFF, 1]),
+           ("CENSUS_CUR", 0, 0, [501, 10]), ("CENSUS_Q", 0, 0, [600, 1]),
+           ("CENSUS_CUR", 1, 1, [201, 14]), ("CENSUS_Q", 1, 1, [100, 1]), ("CENSUS_Q", 1, 1, [300, 1]),
            ("CENSUS_END", 0, 0, [2, 2])]
     return ev
 
 
-def mutate(ev, fn):
-    ev = [list(e) for e in ev]
-    for e in ev:
-        e[3] = list(e[3])
-    fn(ev)
-    return [tuple(e) for e in ev]
-
-
-def find(ev, kind, k=0):
-    return [i for i, e in enumerate(ev) if e[0] == kind][k]
-
-
 def self_test():
-    cases = []
     g = good()
-    cases.append(("valid trace", build(g), None))
 
-    def drop_add(ev):  # the publication claimed but never queued (dropped / stranded wake)
-        i = [i for i, e in enumerate(ev) if e[0] == "ADD" and e[3][1] == 200][0]
-        del ev[i]
-        ev[i - 1][3][3] = 0
-        ev[:] = [e for e in ev if not (e[0] == "CENSUS_Q" and e[3][0] == 200)]
-    cases.append(("dropped publication", build(mutate(g, drop_add)), "natural:"))
+    def sub(kind, k, idx, val):
+        ev = [list(e) for e in g]
+        i = [i for i, e in enumerate(ev) if e[0] == kind][k]
+        ev[i][3] = list(ev[i][3])
+        ev[i][3][idx] = val
+        return [tuple(e) for e in ev]
 
-    def wrong_dest(ev):  # the claim names cpu 1, the wake landed on cpu 0
-        i = find(ev, "CLAIM")
-        ev[i][1] = 0
-    cases.append(("substituted destination", build(mutate(g, wrong_dest)), "natural: CLAIM"))
-
-    def wrong_tid(ev):
-        ev[find(ev, "CLAIM")][3][0] = 201
-    cases.append(("substituted incarnation", build(mutate(g, wrong_tid)), "natural: CLAIM"))
-
-    def dup(ev):  # 300 consumed twice
-        i = find(ev, "REM")
-        ev.insert(i + 1, ("REM", 1, 1, [9, 300]))
-        ev[i - 1][3][4] = 2
-    cases.append(("duplicate consumption", build(mutate(g, dup)), "lists a task twice"))
-
-    def dup2(ev):  # a second section consuming 300 again
-        i = find(ev, "PROGRESS")
-        ev.insert(i, ("REM", 1, 1, [10, 300]))
-        ev.insert(i, ("SEC", 1, 1, [10, 301, 301, 0, 1, 0xB0]))
-    cases.append(("duplicate consumption (second section)", build(mutate(g, dup2)), "duplicate consumption"))
-
-    def no_notify(ev):
-        del ev[find(ev, "NOTIFY")]
-    cases.append(("dropped wake notification", build(mutate(g, no_notify)), "never notified"))
-
-    def serialized(ev):  # global serialization: the observer could not commit during the hold
-        del ev[find(ev, "PROGRESS")]
-        b, e = find(ev, "HOLD_BEGIN"), find(ev, "HOLD_END")
-        end = ev.pop(e)
-        end[3][1], end[3][2], end[3][5] = 0, 0, 1 | (6 << 8)
-        ev.insert(b + 1, end)
-    cases.append(("global serialization", build(mutate(g, serialized)), "synchronized: rounds"))
-
-    def holder_section(ev):  # a section on the holder's CPU inside its hold
-        b = find(ev, "HOLD_BEGIN", 1)
-        ev.insert(b + 1, ("SEC", 1, 1, [13, 301, 301, 1, 0, 0xB0]))
-        ev.insert(b + 2, ("ADD", 1, 1, [13, 700, 1]))
-        ev[find(ev, "CENSUS_END") - 1:find(ev, "CENSUS_END") - 1] = []
-        ev.insert(find(ev, "CENSUS_END"), ("CENSUS_Q", 1, 1, [700, 1]))
-    cases.append(("holder lock did not exclude", build(mutate(g, holder_section)), "HOLDER"))
-
-    def reacquired(ev):
-        e = find(ev, "HOLD_END")
-        ev[e][3][5] = 1 | 2 | (7 << 8)
-    cases.append(("holder lock re-acquired", build(mutate(g, reacquired)), "re-acquired"))
-
-    def two_locks(ev):
-        ev[find(ev, "HOLD_BEGIN")][3][4] = 2
-    cases.append(("holder held a second lock", build(mutate(g, two_locks)), "exactly its own 1L"))
-
-    def census_mismatch(ev):
-        i = [i for i, e in enumerate(ev) if e[0] == "CENSUS_Q" and e[3][0] == 100][0]
-        del ev[i]
-    cases.append(("lost wake at census", build(mutate(g, census_mismatch)), "CENSUS"))
-
-    def no_progress(ev):
-        del ev[find(ev, "PROGRESS")]
-    cases.append(("no task progress", build(mutate(g, no_progress)), "never awarded"))
-
-    def late_progress(ev):  # a second progress record lands after round 0's HOLD_END: not counted
-        i = find(ev, "HOLD_END")
-        ev.insert(i + 1, ("PROGRESS", 1, 1, [0, 300, 11, 9]))
-    cases.append(("late progress after its hold (accepted)", build(mutate(g, late_progress)), None))
-
-    def stray_progress(ev):  # progress naming a round that never began
-        ev.insert(find(ev, "HOLD_END") + 1, ("PROGRESS", 1, 1, [5, 300, 11, 9]))
-    cases.append(("progress for a round never held", build(mutate(g, stray_progress)),
-                  "outside its hold"))
-
-    def only_late_progress(ev):  # round 0's only progress lands after its HOLD_END
-        p = ev.pop(find(ev, "PROGRESS"))
-        ev.insert(find(ev, "HOLD_END") + 1, p)
-    cases.append(("only progress is late", build(mutate(g, only_late_progress)), "never awarded"))
-
-    cases.append(("overflow", build(g, overflow=1), "overflowed"))
-    cases.append(("window not closed", build(g, phase=1), "never closed"))
-    torn = build(g).replace("kind=SEC cpu=1 exec=0", "kind=SEC cpu=1 exec=1")
-    cases.append(("torn record (bad CRC)", torn, "validity: records missing"))
+    cases = [("valid trace", build(g), None),
+             ("section names a third lock instance", build(sub("SEC", 0, 5, 0x7E570000)), "lock-instance:"),
+             ("claim incarnation substituted", build(sub("CLAIM", 0, 1, A2(77))), "claim-incarnation:"),
+             ("claim names another commit", build(sub("CLAIM", 0, 3, 9)), "claim-commit:"),
+             ("holder without its lock", build(sub("HOLD_BEGIN", 0, 5, 0)), "attempt:"),
+             ("overflow", build(g, overflow=1), "validity:"),
+             ("window not closed", build(g, phase=1), "validity:")]
     bad = 0
     for name, text, want in cases:
         try:
-            out = grade(text)
-            got = None
+            out, got = grade(text), None
         except Fail as e:
             out, got = str(e), str(e)
-        verdict = (got is None) if want is None else (got is not None and want in got)
+        verdict = (got is None) if want is None else (got is not None and got.startswith(want))
         print("[%s] %-40s %s" % ("ok" if verdict else "BAD", name, out))
         bad += 0 if verdict else 1
     accepted = sum(1 for _, _, w in cases if w is None)

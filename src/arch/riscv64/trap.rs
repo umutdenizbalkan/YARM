@@ -1137,6 +1137,10 @@ pub fn handle_riscv_trap_entry_shared(
 ) -> Result<RiscvTrapEntryOutcome, TrapHandleError> {
     use core::sync::atomic::Ordering;
     let cpu_idx = cpu.0 as usize;
+    // SCHED-LOCK1 witness only: a kernel entry by a just-installed task is its first observed
+    // execution (no lock taken; observation only).
+    #[cfg(feature = "sched-lock1-witness")]
+    crate::kernel::schedlock1_witness::trap_entered(shared, cpu);
     let is_syscall = matches!(decode_trap_context(context), TrapEvent::Syscall);
 
     // U9-QA §2: open the trap-path-active window BEFORE the pre-lock split dispatch, not just
