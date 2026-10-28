@@ -19,8 +19,11 @@
 //!   therefore been resumed and run). `HOLD_BEGIN` records the holder's scheduler-lock depth (its
 //!   own 1L only, no admission lock), the held instance, and the lock's held flag observed by the
 //!   holder; `HOLD_END` records the flag again — so nothing but A's 1L was held, and it was held
-//!   throughout. A commit by B on A's lock (B needing A) is recorded as `RELATED` and ends the
-//!   attempt unawarded.
+//!   throughout. B acquiring A's lock (B needing A) during the hold is recorded as `RELATED` and
+//!   ends the attempt unawarded. The hold is closed exactly once, by one compare-and-swap of its
+//!   token: either the holder closes it (its decision: success, or its bound) or B's acquisition
+//!   does (`RELATED`), never both — so a success never coexists with interference, and the
+//!   `HOLD_END` outcome and its `RELATED` count (0 or 1) are the closer's, not a later reading.
 //! * **NATURAL — the membership trace.** From a coherent `SNAP` (every CPU's queue and current,
 //!   under every 1L) to a coherent `CENSUS`, every 1L critical section that changed a CPU's
 //!   membership is recorded as its net change (`SEC` + `ADD`/`REM`), with the executing CPU, the
@@ -151,13 +154,24 @@ static NCPU: AtomicU64 = AtomicU64::new(0);
 static ROUND: AtomicU64 = AtomicU64::new(0);
 static ATTEMPT: AtomicU64 = AtomicU64::new(0);
 static ROUNDS_OK: AtomicU64 = AtomicU64::new(0);
-/// `round + 1` while a hold is in progress, else 0.
+/// The open hold's token ([`hold_token`]: its round and attempt) while a hold is in progress, else 0.
+/// Closed exactly once, by a compare-and-swap to 0: by the holder (its decision) or by the
+/// observer acquiring the holder's lock (`RELATED`).
 static HOLD_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+/// A hold's token: nonzero, unique per (round, attempt).
+fn hold_token(round: u64, attempt: u64) -> u64 {
+    1 + (round & 0xFFFF_FFFF) + (attempt << 32)
+}
+
+/// The round of an open hold's token.
+fn token_round(token: u64) -> u64 {
+    (token - 1) & 0xFFFF_FFFF
+}
 static HOLDER: AtomicU8 = AtomicU8::new(0);
 static OBSERVER: AtomicU8 = AtomicU8::new(0);
 static B_COMMITS: AtomicU64 = AtomicU64::new(0);
 static B_PROGRESS: AtomicU64 = AtomicU64::new(0);
-static B_RELATED: AtomicU64 = AtomicU64::new(0);
 /// Tasks B's commits installed during the current hold (tid + 1), with the installing generation
 /// and the installing section's record number.
 static B_INSTALLED: [[AtomicU64; 3]; 8] = [const { [const { AtomicU64::new(0) }; 3] }; 8];
@@ -321,15 +335,19 @@ pub(crate) fn trap_entered(shared: &SharedKernel, cpu: CpuId) {
 
 /// Before CPU `idx`'s 1L is acquired by the executing CPU.
 pub(crate) fn before_acquire(idx: usize) {
-    if HOLD_ACTIVE.load(Ordering::Acquire) != 0
+    let token = HOLD_ACTIVE.load(Ordering::Acquire);
+    if token != 0
         && idx == HOLDER.load(Ordering::Acquire) as usize
         && exec_cpu() == OBSERVER.load(Ordering::Acquire) as usize
+        // The observer's acquisition closes the hold — unless the holder closed it first.
+        && HOLD_ACTIVE
+            .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     {
-        B_RELATED.fetch_add(1, Ordering::AcqRel);
         record(
             K_RELATED,
             idx,
-            [HOLD_ACTIVE.load(Ordering::Acquire) - 1, 0, 0, 0, 0, 0],
+            [token_round(token), (token - 1) >> 32, 0, 0, 0, 0],
         );
     }
 }
@@ -611,7 +629,7 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
                     K_PROGRESS,
                     c,
                     [
-                        active - 1,
+                        token_round(active),
                         cur.0,
                         ACQ_GEN[c].load(Ordering::Acquire),
                         slot[1].load(Ordering::Acquire),
@@ -639,7 +657,6 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
     // ── THE HOLD: this CPU's 1L is held by this very tick, interrupts masked ──
     B_COMMITS.store(0, Ordering::Release);
     B_PROGRESS.store(0, Ordering::Release);
-    B_RELATED.store(0, Ordering::Release);
     B_INSTALLED_N.store(0, Ordering::Release);
     HOLDER.store(a as u8, Ordering::Release);
     OBSERVER.store(b as u8, Ordering::Release);
@@ -659,19 +676,31 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
                 | (ATTEMPT.load(Ordering::Acquire) << 8),
         ],
     );
-    HOLD_ACTIVE.store(round + 1, Ordering::SeqCst);
+    let token = hold_token(round, ATTEMPT.load(Ordering::Acquire));
+    HOLD_ACTIVE.store(token, Ordering::SeqCst);
     let mut spins = 0u64;
-    let ok = loop {
-        if B_COMMITS.load(Ordering::Acquire) >= 2 && B_PROGRESS.load(Ordering::Acquire) >= 1 {
-            break true;
+    // The holder's decision takes effect only if its compare-and-swap closes the hold; if the
+    // observer's acquisition closed it first, the attempt is related and unawarded.
+    let close = || {
+        HOLD_ACTIVE
+            .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    };
+    let (ok, related) = loop {
+        if HOLD_ACTIVE.load(Ordering::Acquire) != token {
+            break (false, true);
         }
-        if B_RELATED.load(Ordering::Acquire) != 0 || spins >= HOLD_SPINS {
-            break false;
+        if B_COMMITS.load(Ordering::Acquire) >= 2 && B_PROGRESS.load(Ordering::Acquire) >= 1 {
+            let won = close();
+            break (won, !won);
+        }
+        if spins >= HOLD_SPINS {
+            let won = close();
+            break (false, !won);
         }
         spins += 1;
         core::hint::spin_loop();
     };
-    HOLD_ACTIVE.store(0, Ordering::SeqCst);
     record(
         K_HOLD_END,
         a,
@@ -679,7 +708,7 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
             round,
             B_COMMITS.load(Ordering::Acquire),
             B_PROGRESS.load(Ordering::Acquire),
-            B_RELATED.load(Ordering::Acquire),
+            u64::from(related),
             spins,
             u64::from(held_flag())
                 | (u64::from(ok) << 1)

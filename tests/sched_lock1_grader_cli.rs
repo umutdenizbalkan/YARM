@@ -291,6 +291,15 @@ fn producer_facts_the_grader_relies_on() {
             && claim.contains("LAST_ADD"),
         "a claim must not reconstruct the incarnation from a bare TID"
     );
+    // One closer per hold: the holder's decision and the observer's RELATED both close the hold
+    // by the same compare-and-swap of its token, so the grader may require a success to have no
+    // RELATED at all and a related attempt exactly one.
+    assert_eq!(
+        WITNESS.matches(".compare_exchange(token, 0,").count(),
+        2,
+        "the hold must be closed by one compare-and-swap, by the holder or the observer"
+    );
+    assert!(!WITNESS.contains("HOLD_ACTIVE.store(0"));
     // The cell map comes from the domain's own cell array, under the coherent view.
     assert!(SCHEDULER.contains("pub(crate) fn witness_cell_addrs(&self, idx: usize)"));
     assert!(WITNESS.contains("domain.witness_cell_addrs(cpu)"));

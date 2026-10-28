@@ -152,11 +152,12 @@ def retry_after_bound():
 
 
 def retry_after_related():
-    """Round 0's first attempt ends early: the observer needed the holder's lock (RELATED) —
-    valid, uncredited; the second attempt is healthy."""
+    """Round 0's first attempt ends early: the observer needed the holder's lock (RELATED, naming
+    the hold's round and attempt; its acquisition closed the hold) — valid, uncredited; the second
+    attempt is healthy."""
     ev = snap()
     ev += [hb(0, 0, 1, C0, 6, attempt=0),
-           ("RELATED", 0, 1, [0]),
+           ("RELATED", 0, 1, [0, 0]),
            he(0, 0, 0, 0, 1, 1200, 0, 6),
            hb(0, 0, 1, C0, 7, attempt=1),
            ("SEC", 1, 1, [8, 101, 0, 1, 0, C1]), ("ADD", 1, 1, [8, 100, 1]),
@@ -234,6 +235,12 @@ def cases():
         ev.insert(idx(ev, "HOLD_END") + 1, ("PROGRESS", 1, 1, [0, 300, 11, 9, inc(3), ("@", "i300")]))
     ev = copy(H); late_prog(ev)
     out.append(("late observer progress (accepted)", render(ev, 2), "pass", "-"))
+
+    def late_related(ev):  # the observer closed the hold, then reserved its RELATED after HOLD_END
+        r = ev.pop(idx(ev, "RELATED"))
+        ev.insert(idx(ev, "HOLD_END") + 1, r)
+    ev = copy(X); late_related(ev)
+    out.append(("RELATED reserved after its hold's HOLD_END (accepted)", render(ev, 2), "pass", "-"))
 
     def neg(name, base, fn, ob, ok=2, **kw):
         ev = copy(base)
@@ -345,6 +352,17 @@ def cases():
         lambda ev: setf(ev, idx(ev, "HOLD_END"), 4, 12), "attempt:")
     neg("invalid uncredited attempt: success claimed with one commit", R,
         lambda ev: setf(ev, idx(ev, "HOLD_END"), 5, 1 | 2 | (6 << 8)), "attempt:")
+    # One closer per hold (the Q9 x86 2-CPU loaded sample of 64c9fdcf: success reported with
+    # related=1, the observer having acquired the holder's lock after the holder's decision).
+    def success_related(ev):
+        e = idx(ev, "HOLD_END")
+        setf(ev, e, 3, 1)
+        ev.insert(e, ("RELATED", 0, 1, [0, 0]))
+    neg("success reported together with a RELATED (two closers)", H, success_related, "attempt:")
+    neg("success with a RELATED reserved after its HOLD_END", H,
+        lambda ev: ev.insert(idx(ev, "HOLD_END") + 1, ("RELATED", 0, 1, [0, 0])), "attempt:")
+    neg("interference reported with no RELATED record", X, lambda ev: ev.pop(idx(ev, "RELATED")), "attempt:")
+    neg("RELATED naming no hold of the trace", X, lambda ev: setf(ev, idx(ev, "RELATED"), 1, 2), "attempt:")
     neg("attempt number out of order", R, lambda ev: setf(ev, idx(ev, "HOLD_BEGIN", 1), 5, 1 | (2 << 8)),
         "attempt:")
     neg("holder generation disagrees with its sections", H,

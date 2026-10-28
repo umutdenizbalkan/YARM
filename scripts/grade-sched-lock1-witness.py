@@ -334,14 +334,27 @@ def grade(text, expect_cpus=None):
             verified += 1
     # ── SYNCHRONIZED: attempts — validity first, then coverage ───────────────────────────────
     attempts, open_hold, late = [], None, 0
+    by_try = {}
     for r in body:
         if r["kind"] == "HOLD_BEGIN":
             if open_hold is not None:
                 fail("attempt", "nested hold at seq %d" % r["seq"])
             open_hold = {"begin": r, "progress": [], "related": []}
-        elif r["kind"] in ("PROGRESS", "RELATED"):
+        elif r["kind"] == "RELATED":
+            # The observer's acquisition closed the hold named by its token (round, attempt); the
+            # record may follow that hold's HOLD_END. It belongs to exactly that hold.
+            key = (r["f"][0], r["f"][1])
+            if open_hold is not None and key == (open_hold["begin"]["f"][0], open_hold["begin"]["f"][5] >> 8):
+                open_hold["related"].append(r)
+            elif key in by_try:
+                by_try[key]["related"].append(r)
+                late += 1
+            else:
+                fail("attempt", "RELATED seq %d names round %d attempt %d, no hold of this trace"
+                     % (r["seq"], key[0], key[1]))
+        elif r["kind"] == "PROGRESS":
             if open_hold is not None and r["f"][0] == open_hold["begin"]["f"][0]:
-                open_hold["progress" if r["kind"] == "PROGRESS" else "related"].append(r)
+                open_hold["progress"].append(r)
             elif attempts and r["f"][0] == attempts[-1]["begin"]["f"][0] and (
                     open_hold is None or open_hold["begin"]["f"][0] != r["f"][0]):
                 # Observed during the hold that has just ended (the holder ended it by its bound
@@ -356,6 +369,7 @@ def grade(text, expect_cpus=None):
             open_hold["end"] = r
             open_hold["late"] = []
             attempts.append(open_hold)
+            by_try[(open_hold["begin"]["f"][0], open_hold["begin"]["f"][5] >> 8)] = open_hold
             open_hold = None
     if open_hold is not None:
         fail("attempt", "a hold never ended")
@@ -425,9 +439,14 @@ def grade(text, expect_cpus=None):
         if not ok and not (rel_r > 0 or spins >= HOLD_SPINS):  # repair:attempt-outcome
             fail("attempt", "round %d attempt seq %d reports failure with neither interference nor its bound "
                  "(related=%d spins=%d)" % (rnd, b["seq"], rel_r, spins))
+        # One closer: the observer's acquisition closes the hold (one RELATED, related=1) or the
+        # holder does (none, related=0). A success never coexists with a RELATED, even a late one.
+        if rel_r not in (0, 1) or len(at["related"]) != rel_r:  # repair:attempt-outcome
+            fail("attempt", "round %d attempt seq %d reports related=%d with %d RELATED record(s) for it"
+                 % (rnd, b["seq"], rel_r, len(at["related"])))
         if at["related"] and ok:  # repair:attempt-outcome
             fail("attempt", "round %d attempt seq %d reports success despite RELATED records" % (rnd, b["seq"]))
-        for rr in at["related"] + [x for x in at["late"] if x["kind"] == "RELATED"]:
+        for rr in at["related"]:
             if rr["cpu"] != a or rr["exec"] != obs:
                 fail("attempt", "RELATED seq %d is not the observer touching the holder's lock" % rr["seq"])
         # (5) every progress record, counted or late, is a genuine linked execution

@@ -1754,7 +1754,7 @@ installation. Details: contract §17.8.
   made.
 
 **6. Tests and controls.**
-* `tests/sched_lock1_grader_cli.rs` runs the real grader CLI on the 48-case corpus from
+* `tests/sched_lock1_grader_cli.rs` runs the real grader CLI on the 53-case corpus from
   `tests/fixtures/sched_lock1/mkcases.py`, checking exit status and named obligation.
 * It undoes each of 11 tagged repairs independently. Each must change verdicts only for cases of
   its own obligation, re-admit its named original reproduction, and leave the healthy traces
@@ -1803,6 +1803,57 @@ Every image is built and booted through BUILD-GATES1 (`artifact_build_kernel`,
 
 The parallel hosted-test race (`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`) and the unrelated red CI jobs
 stay named and open; global test concurrency is not changed here.
+
+**The first freeze failed; schedule revision.** The first freeze, `64c9fdcf`, ran the schedule
+above in full, and every result is kept. Two scheduled samples failed:
+
+* **Q9 x86_64, 2 CPUs, loaded host: candidate-caused.** The grader refused round 1's attempt
+  (`attempt: … reports success with commits=7 progress=1 related=1`). The holder's success
+  condition was met at `PROGRESS` seq 58. The holder then cleared the hold only after
+  `HOLD_END`'s counters were read. In that gap (the holder's vCPU stalled on the loaded host), the
+  observer acquired the holder's lock and recorded `RELATED` (seq 67). `HOLD_END` (seq 68) reported
+  success with `related=1`. The repaired grader was right to refuse it. The witness was wrong to
+  produce it.
+
+  Repair (witness only): the hold now has one closer. Holder and observer both close it by a
+  compare-and-swap of the hold's token, and `HOLD_END` reports the closer's outcome. `RELATED`
+  names the hold's round and attempt, and the grader attributes it to exactly that hold, even
+  after its `HOLD_END`. The grader requires each attempt's `RELATED` count to equal what it
+  reports. Five corpus cases are added:
+  * that sample's shape;
+  * a success with a later `RELATED`;
+  * interference without a record;
+  * a `RELATED` naming no hold;
+  * an accepted `RELATED` after its `HOLD_END`.
+
+  A source pin keeps the single compare-and-swap. Contract §17.8 states the rule.
+* **Q8 RISC-V SMP3 live confirmation: not candidate-caused.** It failed
+  `SMP3_VERDICT result=fail reason=ipi_merge_inconsistent at=129`. This is the mirror image of the
+  AP-SCHED3 checker race. `send_reschedule` records a publication after its `fetch_or`, and
+  `take_arrival` records an arrival after its swap. CPU 0's publication found CPU 1's bit still set
+  (merged, seq 129), CPU 1's swap consumed it, and its arrival record (seq 128) was stamped first.
+  The extra firmware request then arrived empty (seq 132, `empty=1`). Neither `ipi.rs` nor
+  `smp3_record.rs` changed since `b7f33257`. It stays open and named, and is not repaired here.
+
+The re-frozen candidate is qualified by the whole schedule above, run again (Q1–Q11), plus:
+* **Q12**: fresh boots of every differing image class Q6/Q8 found:
+  * the strict default cores (three ports);
+  * the RISC-V VMI, x86 SMP1 and AArch64 SMP2 witnesses;
+  * the SCHED-LOCK1 regression list:
+    * x86 LOCK3, overtaken, UART IRQ, exit-current-task, reply-timeout retirement,
+      shared-region direct with offset selection, `ipccall` reply direct;
+    * the AArch64 SMP2, LOCK2, overtaken, PL011 IRQ, exit, retirement, shared-region and
+      `ipccall` runs;
+    * RISC-V LOCK1, UART IRQ, shared-region replace, exit, retirement, shared-region and
+      `ipccall`;
+    * CONTEXT1 on x86_64 and AArch64.
+
+  Three more RISC-V SMP3 samples are run and labelled as additions beside the kept failure.
+* **Q13**: the line-shift control. `b7f33257`'s source is laid out on the candidate's line
+  numbers: every line the candidate adds outside the witness module becomes an empty comment, and
+  the script verifies each file reduces to the base exactly. Its three default kernels and the
+  eight Q8 witness kernels are built and required to equal the candidate's byte for byte. That
+  proves the image differences are line positions in panic locations only.
 
 The qualification record follows in a documentation-only commit, bound to the candidate that
 produced it.

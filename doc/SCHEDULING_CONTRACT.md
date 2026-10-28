@@ -1787,7 +1787,8 @@ The brief explicitly authorized this.
     * exactly one 1L and no 1G;
     * no reacquisition;
     * A's own sections ordered around the hold;
-    * a reported outcome consistent with its counters and the fixed bounds;
+    * a reported outcome consistent with its counters and the fixed bounds, with exactly as many
+      `RELATED` records for it (0 or 1) as it reports;
     * every progress record linked to a real installation.
 
     A valid attempt is then **credited** for its round if:
@@ -1896,6 +1897,17 @@ are unchanged):**
   (the activation table) and the installing section. `PROGRESS` carries the same link for the
   observer during a hold.
 * `HOLD_BEGIN` and `HOLD_END` record the holder's interrupt-mask state.
+* **One closer per hold.** A hold is open while its token (round and attempt) is published, and
+  it is closed exactly once, by a compare-and-swap of that token to 0:
+  * either the holder closes it with its decision (success, or its bound);
+  * or the observer's acquisition of the holder's lock closes it, recording `RELATED` with the
+    token's round and attempt.
+
+  `HOLD_END` reports the closer's outcome, `related` 0 or 1. So a success and a `RELATED` never
+  coexist, and the `RELATED` record may follow its `HOLD_END`. The first freeze reported the
+  holder's decision but cleared the hold afterwards. In the gap, a stalled holder's observer
+  added a `RELATED`, and `HOLD_END` reported success with `related=1`. The grader refused that
+  as an inconsistent outcome (KERNEL_UNLOCKING, SCHED-LOCK1-ACCEPTANCE qualification).
 
 **Grader obligations** (each failure is `reason=<obligation>: …`):
 * `validity`;
