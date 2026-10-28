@@ -1161,7 +1161,8 @@ CPU executes.
 | SC-FP-1…3, SC-KT-5 | **done** (KERNEL-NOFP1, §8.2) | — | final-image check on every artifact build | — |
 | SC-FP-5 | QEMU only | execution cost on hardware | N | hardware bring-up |
 | SC-FP-4 | none | static per-task FP policy with enforced non-use | P + L | FP-POLICY1 |
-| SC-LOCK-1…7 (§12) | **done** (SCHED-LOCK1, §16–§17): per-CPU 1L, admission 1G, atomic clock / bitmaps / mirrors | — | P + L + S (progress argument), §17 | — |
+| SC-LOCK-1, SC-LOCK-3…7 (§12) | **done** (SCHED-LOCK1, §16–§17): per-CPU 1L, admission 1G, atomic clock / bitmaps / mirrors | — | P + L + S, §17 | — |
+| SC-LOCK-2 (§12) | **partial**: lock order excludes the scheduler-lock cycles; no progress argument (§17.3, corrected by SCHED-LOCK1-ACCEPTANCE) | fair lock or bounded-contention proof | S + N | RT-SCHED1 |
 | SC-INV-1, W1 for 1L / 1G | TTAS `SpinLockIrq`, now per CPU | fair lock or bounded-contention proof | S + N | RT-SCHED1 |
 
 **Not started and not part of this contract:** VFS work and hardware bring-up remain on the
@@ -1207,8 +1208,11 @@ record `doc/KERNEL_UNLOCKING.md` §0.8). The requirements and their status:
 * **SC-LOCK-1 — CPU-local scheduling state has explicit local ownership.** **ENFORCED**
   (SCHED-LOCK1: one rank-1L lock per CPU, §16.2, §17.1). Each CPU's runnable queues, current slot and quantum belong to that CPU. Another
   CPU's scheduling operation does not enter that CPU's critical section, except through SC-LOCK-3.
-* **SC-LOCK-2 — Local exclusion is bounded.** **ENFORCED as a progress argument (§17.3); the
-  acquisition wait stays kind W1 (A / N): no time bound is claimed.** The exclusion that
+* **SC-LOCK-2 — Local exclusion is bounded.** **PARTIAL (corrected by SCHED-LOCK1-ACCEPTANCE,
+  §17.3).** The lock order excludes cycles among the scheduler locks and between them and
+  shootdown waits. No progress argument is established: the 1L/1G wait is the unfair W1 kind, and
+  sections can wait on the task-table and printk locks. No starvation-freedom or time bound is
+  claimed; a fair lock or a bounded-contention proof is still owed (RT-SCHED1). The exclusion that
   protects CPU-local state has a stated progress argument and a bound in the §6 kinds. A local
   lock is acceptable only with that argument. An owner-consumed queue is acceptable only with
   that argument. **"Lock-free" is not mandated and is not by itself an argument.**
@@ -1333,8 +1337,8 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-GP-1 (differential, for the mechanisms exercised);
   * SC-KT-0;
   * SC-KT-5, SC-FP-1, SC-FP-2, SC-FP-3 (KERNEL-NOFP1);
-  * SC-LOCK-1, SC-LOCK-3…7 (SCHED-LOCK1), and SC-LOCK-2 as a progress argument (its wait stays
-    W1: no time bound).
+  * SC-LOCK-1, SC-LOCK-3…7 (SCHED-LOCK1). SC-LOCK-2 is PARTIAL: the lock order excludes the
+    scheduler-lock deadlock cycles, but no progress argument is established (§17.3).
 * **DISCHARGED:** SC-LOCK-9 (it held until SCHED-LOCK1, which is the split).
 * **SPECIFIED, with an implementing package:**
   * SC-LOCK-8 (roadmap order: SCHED-LOCK1 before KTHREAD1 kernel preemption and RT-SCHED1).
@@ -1570,18 +1574,32 @@ loaded). Splitting the read therefore cannot recreate the empty-current / root-s
 omission: that omission was closed by the residency term, not by the placement scan's
 coherence.
 
-The placement read is per-CPU locked, not a mirror read, because of what a mirror shows during a
-section in progress. A mirror is published when 1L[c] is released, so while CPU `c` is installing
-a task its mirror still shows the state before the install, possibly no current task, while the
-residency term may already name `c`. The set stays safe, but it then names `c` with no placement
-behind it, a combination the base's per-CPU fact never produced. The RISC-V SMP3 witness's
-`shoot_targets_inconsistent` check rejects exactly that combination. It caught it during the
-first SCHED-LOCK1 qualification (candidate `155fd8d8`, fence attempt 18, recorded in
-KERNEL_UNLOCKING). Reading under 1L[c] waits for the section in progress, so the result is again
-the per-CPU fact the base read. Teardown's `address_space_loaded_cpus_split` uses the same read.
-These are cross-CPU operations by nature, so they wait for the CPU they read. The concurrent test
+The placement read is per-CPU locked, not a mirror read. A mirror is published when 1L[c] is
+released, so while CPU `c` is in a section that changes its current task, its mirror still shows
+the state before that section.
+
+*What was reproduced.* During the first SCHED-LOCK1 qualification (candidate `155fd8d8`, RISC-V
+SMP3 witness, fence attempt 18, recorded in KERNEL_UNLOCKING), the kernel's SMP3 verifier ended
+the boot with `shoot_targets_inconsistent`. In that attempt the requester was CPU 1 and the
+computed target mask was `0x1`: CPU 0 was a target. The placement input the computation recorded
+for CPU 0 was its mirror, which showed no current task. The verifier checks the target set against
+the placement facts it was computed from, and a CPU named while its recorded current named no task
+of the address space is the disagreement it rejects. CPU 0 was in the set, so its fence was
+requested.
+
+*What was not reproduced.* No missed invalidation, no fence withheld from a CPU running the
+address space, and no premature reclamation was observed. None is claimed. Whether a
+mirror-based set can omit a CPU in some other interleaving was not established either way. The
+delivered text called that set "safe"; that rested on the residency argument above, not on any
+reproduction, and the word is withdrawn.
+
+*The repair (delivered, unchanged).* Each candidate CPU's current is read under 1L[c], one CPU at
+a time, so a section in progress completes first and the placement half again agrees with the
+CPU's own state. Teardown's `address_space_loaded_cpus_split` uses the same read. Both are
+cross-CPU operations and wait for the CPU they read. The concurrent test
 `sl1_production_seams_on_cpu1_complete_while_cpu0_is_held` pins that they complete only after
-CPU 0's section ends, while CPU 1's local operations do not wait.
+CPU 0's section ends, while CPU 1's local operations do not wait. After the repair the SMP3
+witness passed in its scheduled run on `00edb00f`.
 
 ### 16.6 What is not changed
 
@@ -1671,21 +1689,48 @@ shootdown, an address-space switch or cross-CPU work.
 
 ### 17.3 Progress, fairness and retained dependencies
 
-* **Progress argument (SC-LOCK-2).** Every 1L critical section runs with interrupts masked and
-  contains no wait on another CPU: no IPI or shootdown wait, no other CPU's 1L (except the
-  coherent view's ascending acquisition, which waits only for sections that themselves wait for
-  nothing), and no 1G. Each section therefore finishes in a finite number of its own steps once
-  its holder runs. A CPU waiting for 1L[c] waits only for a finite succession of such sections,
-  issued by operations that name `c`.
-* **Fairness.** None. 1L and 1G are TTAS `SpinLockIrq` (§6 W1): a waiter can be overtaken
-  indefinitely, in principle. **No time bound and no WCET is claimed.**
+* **What the lock order establishes (SC-LOCK-2).** Some deadlock cycles are excluded by
+  construction:
+  * No 1L section holds another CPU's 1L, except the coherent view, which takes every 1L in
+    ascending order after 1G.
+  * No 1L section takes 1G.
+  * No 1L section waits for an IPI acknowledgement or a shootdown (W4 waits are never under a
+    1L).
+
+  That excludes cycles among the scheduler locks themselves and between them and shootdown
+  waits. It is a statement about cycles, not about progress.
+* **What it does not establish.** A 1L section is not free of waits on other CPUs. Inside some
+  sections the code takes:
+  * the rank-2 task-table lock (the selection filter and the planners);
+  * `PRINTK_DRAIN_LOCK` (W7, logging inside scheduler closures).
+
+  Each of those can be held by another CPU. So a section's completion depends on those locks
+  being released, and on the holders of those locks progressing.
+
+  A bounded amount of work per section does not make a waiter acquire 1L[c]. The locks are
+  unfair TTAS `SpinLockIrq` (§6 W1): the waiter can lose every race to other CPUs, without
+  bound, even when every section is short.
+
+  Having finitely many CPUs does not bound the number of competing holders either: the same CPUs
+  can return to 1L[c] again and again.
+
+  **No starvation-freedom, latency, WCET or kernel-preemption property is claimed for 1L, 1G or
+  the coherent view.** A fair-lock redesign is outside SCHED-LOCK1 and SCHED-LOCK1-ACCEPTANCE.
+* **Fairness.** None (§6 W1, unchanged).
 * **Who contends for 1L[c]:** routes executing on `c`; remote enqueues, withdrawals and
   "anywhere" scans that name `c`; the coherent view. Previously every CPU's every scheduling
   operation contended for the one rank-1 lock.
-* **Retained shared dependencies** (unchanged, §16.7): rank 2 (task table) inside the selection
-  filter and the planners; the IPC and timeout domains; `PRINTK_DRAIN_LOCK` (W7, inside
-  scheduler closures); shootdown waits (W4, never under a 1L); and the coherent view on the five
-  rare paths.
+* **Retained shared dependencies** (unchanged, §16.7):
+  * rank 2 (task table), inside the selection filter and the planners;
+  * the IPC and timeout domains;
+  * `PRINTK_DRAIN_LOCK` (W7, inside scheduler closures);
+  * shootdown waits (W4, never under a 1L);
+  * the coherent view (1G and every 1L) on five rare paths, all in `src/runtime.rs`:
+    `entering_frame_authority_split_read`, `tid_placed_anywhere_split`,
+    `post_lock_exit_validation_split`, `recv_unwind_placement_outcome_split` and
+    `yield_forfeited_placement_split_read`.
+
+  Removing those five paths and redesigning the locks for fairness are outside this package.
 
 ### 17.4 Invariants and where each is checked
 
@@ -1734,32 +1779,46 @@ The brief explicitly authorized this.
   `scripts/qemu-sched-lock1-witness-smoke.sh`, graded by `scripts/grade-sched-lock1-witness.py`):
   * **Synchronized** (labelled): in phase A of the AP-scheduling workload (two spinners per CPU,
     rotated by timer preemption), CPU A holds its **actual** 1L inside its own production timer
-    tick, interrupts masked, while observer CPU B runs its ordinary production scheduling. For
-    every ordered pair of the schedule (`(a, a+1)` and `(a+1, a)` around the ring), a hold is
-    awarded only if: A's lock is held at begin and end with the same acquisition generation; A
-    holds exactly one 1L and no 1G; no section on A's CPU is recorded inside the hold; B makes
-    ≥ 2 owner commits on its own lock instance; and a task B installed is then observed running
-    on B. A RELATED record (B touching A's lock) aborts the attempt.
+    tick, interrupts masked, while observer CPU B runs its ordinary production scheduling. Every
+    attempt, credited or not, is first validated (§17.8):
+    * the schedule's pair and the attempt order;
+    * A's cell from the cell map;
+    * A's lock held, and interrupts masked, at begin and end;
+    * exactly one 1L and no 1G;
+    * no reacquisition;
+    * A's own sections ordered around the hold;
+    * a reported outcome consistent with its counters and the fixed bounds;
+    * every progress record linked to a real installation.
+
+    A valid attempt is then **credited** for its round if:
+    * it reported success;
+    * no RELATED record (B touching A's lock) occurred;
+    * its window holds ≥ 2 distinct genuine commits by B's own production owner on B's own cell;
+    * one of them installed (selected or restored) a task;
+    * that task's execution was then observed on B with the CPU's active address space.
+
+    A valid attempt may stay uncredited (its bound, or interference); every round needs one credited
+    attempt.
   * **Fixture synchronization** (labelled, not production behaviour): a hold starts only when B
     has a task current and another queued, and until the rounds are done the AP-scheduling
     witness withholds its preemption counts from the workload so phase A continues.
   * **Natural**: from SNAP (taken under the coherent view once phase-A spinners run on every
     CPU) to CENSUS (taken under the coherent view at the workload's last step), every mutating
-    1L section is recorded with its CPU, executing CPU, acquisition generation, the current slot
-    before and after, and the queue entries added and removed. The grader replays the trace and
-    requires it to reproduce the CENSUS exactly, each task in at most one place, every remote
-    CLAIM matched by the ADD it names on that destination and incarnation, and every remote add
-    followed by its notification.
-  * Every record carries a CRC; the grader validates every record before awarding any coverage.
-    An observer record reserved after its hold's HOLD_END (the hold ended by its bound while the
-    observer was recording) is counted as late and contributes to no award; one naming a round
-    that never began is invalid. The witness reserves a progress record before counting it, so a
-    counted event always precedes HOLD_END. The self-test corpus has 19 cases: 2 accepted (the
-    valid trace; a late progress record) and 17 rejected (dropped publication, substituted
-    destination, substituted incarnation, duplicate consumption ×2, missing notification, global
-    serialization, a holder section, a reacquired lock, two locks held, census mismatch, no
-    progress, progress only after its hold, progress for a round never held, overflow, an
-    unclosed window, a torn record).
+    1L section is recorded with its CPU, executing CPU, cell, acquisition generation, the current
+    slot before and after, and the queue entries added and removed. The grader:
+    * replays the trace and requires it to reproduce the CENSUS exactly, each task in at most one
+      place;
+    * binds every remote CLAIM to the exact section that added its task, claimed once, and to the
+      incarnation its owner staged;
+    * requires that incarnation to agree with the address space the CPU had active when the task
+      next ran;
+    * requires every remote addition to be followed by its notification.
+  * Every record carries a CRC, and redundant copies must be identical. The grader validates the
+    whole trace, every attempt included, before awarding any coverage, and names the failed
+    obligation. An observer record reserved after its hold's HOLD_END is validated but credits
+    nothing; one naming a round that never began is invalid. The grader's own `--self-test` keeps
+    a 7-case smoke set; the full 48-case corpus is `tests/fixtures/sched_lock1/mkcases.py`, run
+    through the CLI by `tests/sched_lock1_grader_cli.rs`.
 * **AP-scheduling witness parity (witness builds only).** Its grader accepts one benign race —
   the idle CPU's own timer dispatches a woken sleeper before the wake IPI arrives — only with a
   record that the IPI did arrive later. AArch64 recorded that; x86_64 and RISC-V did not, so an
@@ -1796,3 +1855,69 @@ What is **not** claimed:
 * any latency, contention or WCET bound (W1 unchanged), or anything about kernel preemption
   (KTHREAD1 is not started) or RT scheduling (RT-SCHED1);
 * anything about hardware: all live evidence is QEMU TCG.
+
+### 17.8 SCHED-LOCK1-ACCEPTANCE: the witness evidence contract
+
+The delivered grader (`b7f33257`) accepted four kinds of trace that do not show what it credited.
+Each was reproduced through its CLI on checksum-valid alterations of its own passing fixture and of
+a real passing RISC-V boot log (KERNEL_UNLOCKING, SCHED-LOCK1-ACCEPTANCE). These are checker
+defects, not scheduler failures:
+
+1. **Wrong lock instance.** Every section naming a third address passed. The grader compared a
+   section's instance only with the holder's self-declared one.
+2. **Wrong claim identity.** A claim's ASID was ignored. A claim matched any earlier addition of
+   the same TID, so two repetitions of one claim could be "matched" without either being bound.
+3. **Invalid uncredited attempt.** An attempt whose holder did not hold its lock and held two
+   locks was skipped because its success flag was 0. A later healthy attempt then covered the
+   round.
+4. **No scheduling mutation.** Sections with an unchanged current task and no queue change
+   counted as the observer's commits, and a progress record naming that unchanged task completed
+   the award.
+
+**Witness instrumentation added (default-off, `sched-lock1-witness` builds only; production images
+are unchanged):**
+
+* `CELL` records the authoritative CPU → lock-instance map at SNAP and again at CENSUS. It is
+  taken under the coherent view from the domain's own cell array (`witness_cell_addrs`); each
+  record gives the cell and its lock. Section and hold instances are the cell of the lock their
+  producer actually holds.
+* Each wake owner stages the incarnation it places, `{tid, asid}`, from the authoritative TCB
+  while it holds rank 2 (`stage_incarnation`, `stage_from_tcbs`). Five owners do so inside their
+  own rank-2 closure: the two planners, the wake path, the shared-region wake and the
+  reply-timeout wake. The two receiver seams do so in a rank-2 read beside their own class
+  read.
+
+  A claim consumes that staging. It also carries the generation and record number of the
+  section on the same executing CPU that last added to the target's queue. A claim with no
+  staging for its TID, or no such section, is recorded unbound. Nothing is looked up by bare TID
+  after the commit.
+* `RUN` records an installed task's first kernel entry on its CPU: the shared trap entry on
+  x86_64 and AArch64, the RISC-V trap entry, or the tick. It gives the CPU's active address space
+  (the activation table) and the installing section. `PROGRESS` carries the same link for the
+  observer during a hold.
+* `HOLD_BEGIN` and `HOLD_END` record the holder's interrupt-mask state.
+
+**Grader obligations** (each failure is `reason=<obligation>: …`):
+* `validity`;
+* `cell-map`;
+* `lock-instance` (every section and every hold, credited or not);
+* `no-op-section` (the producer suppresses them, and the verifier now refuses them);
+* `natural`;
+* `claim-commit`;
+* `claim-incarnation`;
+* `run`;
+* `attempt` (every attempt, before coverage);
+* `progress`;
+* `coverage`.
+
+The round population (2 rounds at 2 CPUs, `2n` otherwise), the attempt limit (3), the hold bound
+(4·10⁸ spins) and the commit requirement (2) are fixed in the grader; the log cannot redefine
+them.
+
+**Limits.** A claim's incarnation is confirmed only if its task runs again inside the window, so
+the grader reports the confirmed count. In development boots every claim was confirmed but one.
+The confirmation relies on the activation table showing the running task's address space at a
+kernel entry: kernel code runs with interrupts masked except in the idle halt loop, where no task
+is current. A claim for a task without an address space is bound to its commit but carries no
+ASID to confirm.
+
