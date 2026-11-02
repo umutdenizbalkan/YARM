@@ -2869,6 +2869,15 @@ drains settle the same refusal as typed idle; the D2 drains should too.
   made it busy. The witness now starts once phase B is over (the first `P_PING`, or a terminal
   step such as `P_NO_AP` or a timeout); the IPC and churn phases still run user tasks on every
   secondary beside it. Re-frozen; the whole schedule runs again.
+
+*Schedule revision before the second freeze* (written before it runs). The first run's AArch64
+SMP2 regression failed `sgi_unexplained_arrival`. Its verifier (`smp2_record::check_sgi_population`)
+lets one arrival consume every earlier unconsumed send to that CPU, so two sends that the GIC
+delivers as two arrivals leave the second unexplained. That is a record-order race in the existing
+verifier, with no kernel thread in that boot. Measured on this host, four boots each: the base
+`298c591b` passed 0 of 4, the candidate 1 of 4, every failure `sgi_unexplained_arrival`. It is
+named and kept, not counted as a KTHREAD1 failure; repairing that verifier is outside KTHREAD1.
+Every other step and expectation is unchanged.
 * Integration, first full run: the broad-lock census guard read the hosted interrupt model's
   thread-local `IRQ_ENABLED.with(|c| …)` as three broad-lock calls (now `get`/`set`), and the two
   guards above failed on the AArch64 tail and the third mailbox consumer.
@@ -2926,7 +2935,9 @@ The steps, with the outcome each is expected to have:
 * **Q12** affected regressions, booted fresh:
   * the strict default cores (three ports);
   * the AP-scheduling and SCHED-LOCK1 witnesses at 2 CPUs (three ports each);
-  * SMP3-EVIDENCE1's RISC-V SMP3 witness; CONTEXT1; x86 SMP1; AArch64 SMP2;
+  * SMP3-EVIDENCE1's RISC-V SMP3 witness; CONTEXT1; x86 SMP1; AArch64 SMP2 (expected to fail
+    intermittently `sgi_unexplained_arrival`, a pre-existing failure: see the schedule revision
+    below);
   * x86 VMI2; RISC-V LOCK1, VMI and shared-region replace;
   * RISC-V and x86 UART IRQ; AArch64 PL011 IRQ;
   * the IPC residual-park witness;
