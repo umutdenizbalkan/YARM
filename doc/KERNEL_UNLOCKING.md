@@ -2962,6 +2962,109 @@ unchanged:
 not bounded; no latency, fairness, starvation-freedom or WCET property is established; nothing is
 a certification claim.
 
+**4. Qualification.** All three scheduled runs are kept. Each ran `qualify.sh` from a fresh
+detached worktree of the frozen commit, against a fresh worktree of `298c591b`, on one idle host
+(rustc 1.101.0-nightly `32dba69d6`), steps in the order Q4, Q2, Q9, Q10, Q1, Q3, Q5, Q6, Q7, Q11,
+Q12.
+
+*Run 1, first freeze `d095890c` (tree `fbe20a22`), 16:36–18:35Z.* Failed Q9; repaired; re-frozen.
+* Q4 clean. Q2: 20/20 ×3, 13/13 ×3, grader self-test pass.
+* Q9: 15 of 18 sealed `result=pass`. KT1's own grade passed all 18 (`KT1_VERDICT failures=0`).
+  The three RISC-V 2-CPU boots (`smp2-a`, `smp2-b`, `smp2-loaded`) sealed `result=fail
+  reason=workload`: the AP-scheduling workload's phase B saw no IPI taken at CPU 1's idle boundary
+  after the wake. Candidate-caused: KT1's kernel threads kept CPU 1 busy while phase B needed it
+  idle. Repaired in `3bc04d0e` (the witness starts once phase B is over; §2, "First freeze").
+  The 1-CPU boots of all three ports reported the workload's grade as failing (it needs a
+  secondary), as the schedule allows.
+* Q10: every control refused.
+
+  | Control | Refused by |
+  |---|---|
+  | `corrupt_continuation` | a fatal kernel-thread fault (`KTHREAD_FAULT scause=0x5 … result=fatal`, a load from the corrupted register); no records, the boot timed out at 400 s |
+  | `stale_incarnation` | `stale_wake_accepted` (and `cycle_not_reclaimed`) |
+  | `suppressed_remote_wake` | `reschedule_not_pending_at_decision`, `remote_wake_without_reschedule_arrival` |
+  | `lost_wakeup` | `lost_wakeup` (and `thread_left_behind`) |
+  | `switch_under_guard` | `switch_under_guard_not_refused probe=masked_section` |
+  | `premature_stack_reuse` | `reclaimed_before_switch_away` |
+  | `missing_irq_population` | `round_interrupt_unrecorded` |
+  | `no_kthread_vector` | the first timer interrupt on a kernel thread reached the user-trap vector: `RISCV_TRAP_UNHANDLED scause=0x8000000000000005 reason=trap_from_s_mode`; no records, the boot timed out |
+
+* Q1: 6,245 passed, 0 failed, 2 ignored. Q3: every suite passed.
+* Q5: different exactly as predicted: `with_cpu_sched_split(` 42 → 49, `.lock()` 174 → 184;
+  every other pattern equal.
+* Q6: three-port builds and hosted, both sides; images differ on every port; warnings equal
+  (222, 399, 237, hosted 306), none new, none gone. Q7: the no-FP suites pass, self-test 101 cases
+  0 mismatches, each candidate image `result=pass`.
+* Q11 `.bss`: x86_64 +540,440 bytes, AArch64 +541,008, RISC-V +544,033 (each ≥ 524,288).
+* Q12: every regression passed except AArch64 SMP2: `SMP2_VERDICT result=fail
+  reason=sgi_unexplained_arrival at=56`. Four boots each on this host: base 0 of 4, candidate 1
+  of 4; the schedule revision above records it as pre-existing.
+
+*Run 2, second freeze `27da1400` (tree `013e867f`, carrying the repair and the schedule revision),
+18:57–20:52Z.* Failed Q9 on one boot; repaired; re-frozen.
+* Q4 clean. Q2: 20/20 ×3, 13/13 ×3, self-test pass. Q1: 6,245 passed, 0 failed. Q3: every suite
+  passed.
+* Q9: 17 of 18 sealed `result=pass`, the three RISC-V 2-CPU boots among them (run 1's failure is
+  gone). The AArch64 8-CPU boot failed validity (`sequence_gap records=1024 max=1024`,
+  `seal_count records=1025 taken=10235 parsed=1024`, `seal_hash`): record 423 was split by a raw
+  console byte from `activate_asid` (§2, "Second freeze"). Candidate-caused (the witness's dump
+  had no second copy); repaired by the two-pass dump.
+* Q10: every control refused. Seven for their expected reasons (`stale_wake_accepted`;
+  `reschedule_not_pending_at_decision` on both CPUs; `lost_wakeup`;
+  `switch_under_guard_not_refused` for both probes; `reclaimed_before_switch_away`;
+  `round_interrupt_unrecorded`; `no_kthread_vector`'s `RISCV_TRAP_UNHANDLED … trap_from_s_mode`
+  and no records). `corrupt_continuation` this time dumped, but invalid: the corrupted register
+  reached the dumper, and 370 records carried the one checksum `0x86714dd0` (`record_checksum`,
+  `seal_count … parsed=16`, `seal_hash`); nothing was awarded. The schedule revision for the third
+  freeze names that outcome.
+* Q5 as predicted (42 → 49, 174 → 184). Q6: default images byte-identical to run 1's on every
+  port (the changes since `d095890c` are witness-only), so they differ from the base exactly as
+  before; warnings equal, none new. Q7 pass on every image. Q11 as run 1.
+* Q12: every regression passed except AArch64 SMP2, `sgi_unexplained_arrival at=58`, the
+  predeclared pre-existing failure.
+
+*Run 3, third freeze `a6a7b93f` (tree `8d505adb`), 21:06–22:55Z.* **Qualified.**
+* Q4 clean. Q2: 20/20 ×3, 14/14 ×3, self-test pass. Q1: 6,245 passed, 0 failed, 2 ignored. Q3:
+  every suite passed.
+* Q9: 18 of 18 sealed `result=pass` with the AP-scheduling workload passing beside each (at 1 CPU
+  the workload's grade, which needs a secondary, reported failing, as the schedule allows). No
+  damaged dump line in any of the 18. Record counts: RISC-V 284 / 379 / 390 / 394 / 597 / 1,912,
+  AArch64 281 / 374 / 373 / 373 / 563 / 1,001, x86_64 281 / 386 / 387 / 373 / 583 / 976 (1 CPU,
+  2 ×3 with the third loaded, 4, 8).
+* Q10: every control refused, nothing awarded.
+
+  | Control | Refused by |
+  |---|---|
+  | `corrupt_continuation` | an invalid record set: `record_conflict seq=0`, `record_conflict seq=144`, `seal_conflicting count=2`, a record with `cpu=65` (the corrupted register reached the dump) |
+  | `stale_incarnation` | `stale_wake_accepted` (and `cycle_not_reclaimed`, `thread_left_behind`) |
+  | `suppressed_remote_wake` | `reschedule_not_pending_at_decision` on both CPUs |
+  | `lost_wakeup` | `lost_wakeup` (and `thread_left_behind`) |
+  | `switch_under_guard` | `switch_under_guard_not_refused` for both probes |
+  | `premature_stack_reuse` | `reclaimed_before_switch_away` |
+  | `missing_irq_population` | `round_interrupt_unrecorded` |
+  | `no_kthread_vector` | no records; the boot timed out at 400 s |
+
+  *Named deviation, kept:* `no_kthread_vector` did not show the predicted fatal trap this time.
+  CPU 0 took the kernel thread's interrupts through the production vector (`unknown trap event
+  cpu=0 arch_code=0x1`, `IRQ1_UNKNOWN_SETTLED`, then `RISCV_S_MODE_TIMER_DISPATCH` and
+  `DISPATCH_MARK_REFUSED` naming the director's kernel-thread id) and then went silent while CPU 1
+  idled. Runs 1 and 2 stopped on `RISCV_TRAP_UNHANDLED … trap_from_s_mode`. The defect the control
+  injects was refused either way; which way depends on which interrupt reaches the missing vector
+  first.
+* Q5: different exactly as predicted (`with_cpu_sched_split(` 42 → 49, `.lock()` 174 → 184).
+* Q6: default images byte-identical to runs 1 and 2 on every port (sha256 `0285ed46…`,
+  `50d840d2…`, `3ff52999…`), different from the base; warnings equal, none new, none gone.
+  Q7: the no-FP suites pass, self-test 101 cases, every image `result=pass`. Q11 as run 1.
+* Q12: all 27 regressions passed, AArch64 SMP2 among them (the predeclared pre-existing failure
+  did not occur in this run).
+
+*Pre-checks between the second and third freeze, kept.* RISC-V 2 and 1 CPU (the fixtures' boots),
+AArch64 8 CPUs three times, RISC-V 8 CPUs (both dump passes at 168 s of a 600 s budget) and x86_64
+2 CPUs: all passed except one AArch64 8-CPU boot that never ran: the fixtures were re-captured
+into the checkout while it was building, and BUILD-GATES1 refused to boot an image whose source no
+longer matched the checkout (`ARTIFACT-BINDING … a cached artifact from another source`), as it
+should.
+
 ---
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
