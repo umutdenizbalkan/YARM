@@ -207,7 +207,12 @@ fn record(cpu: CpuId, kind: u64, f: [u64; 5]) {
 
 /// The drain owner ran on `cpu`: start the director once, on CPU 0.
 pub(crate) fn maybe_start(shared: &SharedKernel, cpu: CpuId) {
-    if cpu.0 != 0 || STARTED.load(Ordering::Acquire) || STARTED.swap(true, Ordering::AcqRel) {
+    // Not during the user workload's idle-wake phase, which needs its secondaries idle.
+    if cpu.0 != 0
+        || !crate::kernel::apsched_witness::idle_phase_over()
+        || STARTED.load(Ordering::Acquire)
+        || STARTED.swap(true, Ordering::AcqRel)
+    {
         return;
     }
     match shared

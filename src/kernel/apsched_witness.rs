@@ -676,6 +676,18 @@ mod x86_late_ipi {
     }
 }
 
+/// KTHREAD1 — set once P's idle-wake phase (B) is over: P has begun its IPC phase, or ended early.
+/// Phase B wakes each sleeper while its CPU sits idle and checks the wake arrives at the idle
+/// boundary; a kernel thread running there would make that CPU busy, so the kernel-thread witness
+/// starts only after it. The later phases (IPC, churn) still run user tasks on every secondary.
+static IDLE_PHASE_OVER: AtomicBool = AtomicBool::new(false);
+
+/// KTHREAD1 — whether P's idle-wake phase is over (see [`IDLE_PHASE_OVER`]).
+#[cfg(feature = "kthread1-witness")]
+pub(crate) fn idle_phase_over() -> bool {
+    IDLE_PHASE_OVER.load(Ordering::Acquire)
+}
+
 /// The DebugLog observation point. Returns `true` when the message was this witness's.
 pub fn observe_user_marker(
     shared: &SharedKernel,
@@ -691,6 +703,16 @@ pub fn observe_user_marker(
     }
     let step = msg.trim_end().trim_start_matches("APS ");
     let c = u64::from(cpu.0);
+    if step == "P_PING"
+        || step == "P_END"
+        || step == "P_NO_AP"
+        || step.ends_with("_TIMEOUT")
+        || step.ends_with("_FAIL")
+        || step == "P_NO_IDLE"
+        || step == "P_NO_ACK"
+    {
+        IDLE_PHASE_OVER.store(true, Ordering::Release);
+    }
     match step {
         "P_FORKED" => {
             // A churn child: the reaper accepts only TIDs P reported here.

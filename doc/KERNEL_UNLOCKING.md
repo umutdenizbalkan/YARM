@@ -2862,6 +2862,13 @@ drains settle the same refusal as typed idle; the D2 drains should too.
   That gate was withdrawn. The cause was the placement measure: any uneven kernel-thread presence
   skewed the permanent home of user tasks placed meanwhile. Balanced placement's load now counts
   user tasks only (a policy decision recorded in contract §18.1).
+* **First freeze, `d095890c`:** its scheduled run (kept in full in the qualification record) failed
+  Q9's three RISC-V 2-CPU boots on the workload's idle wake (`no IPI taken at CPU 1's idle
+  boundary after the wake`), as one pre-check had once before; KT1 itself passed each. The
+  workload's phase B wakes each sleeper while its CPU is idle; KT1's kernel threads running there
+  made it busy. The witness now starts once phase B is over (the first `P_PING`, or a terminal
+  step such as `P_NO_AP` or a timeout); the IPC and churn phases still run user tasks on every
+  secondary beside it. Re-frozen; the whole schedule runs again.
 * Integration, first full run: the broad-lock census guard read the hosted interrupt model's
   thread-local `IRQ_ENABLED.with(|c| …)` as three broad-lock calls (now `get`/`set`), and the two
   guards above failed on the AArch64 tail and the third mailbox consumer.
