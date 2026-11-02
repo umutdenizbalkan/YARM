@@ -817,18 +817,18 @@ never by adding an alternative dispatcher selected by profile.
 
 | ID | Prerequisite | x86_64 today | AArch64 today | RISC-V today | Status |
 |---|---|---|---|---|---|
-| SC-KT-1 | Owned kernel stack, from a bounded pool, with a guard page; distinct from user and idle stacks (idle is a diverging primitive at a per-CPU anchor, §1.7). Stacks are pre-mapped: supervisor page faults are kernel-fatal (§1.9). | `KernelExecutionContext {stack_base, stack_top, owns_stack}` exists (D6 scaffolding); `refresh_boot_tss_rsp0` | same field | same field | **SPECIFIED → KTHREAD1** |
-| SC-KT-2 | Kernel continuation saved and resumed, distinct from the user `UserRegisterContext` | `yarm_x86_switch_frame` (callee-saved, `rsp`, `rip`) | `yarm_aarch64_switch_frame` | `yarm_riscv64_switch_frame` | **SPECIFIED → KTHREAD1** (cooperative switch exists on all three; production-dormant) |
-| SC-KT-3 | First entry: an explicit entry ABI (stack alignment, argument registers, return-to-exit) | `yarm_kernel_thread_switch_trampoline` (D6 proof) | not established | not established | **SPECIFIED → KTHREAD1** (canonical 202A already requires the ABI contract) |
-| SC-KT-4 | Asynchronous preemption of kernel mode. Not to be enabled before SCHED-LOCK1 (SC-LOCK-8) and KERNEL-NOFP1 (SC-FP-1); both are done, and neither enables or qualifies it. | none: masked kernel | none | none; S-mode traps other than idle halt | **SPECIFIED → KTHREAD1**, gated by SCHED-LOCK1 and KERNEL-NOFP1 |
+| SC-KT-1 | Owned kernel stack, from a bounded pool, with a guard page; distinct from user and idle stacks (idle is a diverging primitive at a per-CPU anchor, §1.7). Stacks are pre-mapped: supervisor page faults are kernel-fatal (§1.9). | `KernelExecutionContext {stack_base, stack_top, owns_stack}` exists (D6 scaffolding); `refresh_boot_tss_rsp0` | same field | same field | **PARTIAL (KTHREAD1, §18.2)**: 32 owned 16 KiB stacks reserved in `.bss`, distinct from user, trap and idle stacks; **no guard page** on any port (RISC-V kernel runs in Bare translation; x86_64 and AArch64 map the kernel with shared 2 MiB / block mappings). Owner of the guard: unassigned |
+| SC-KT-2 | Kernel continuation saved and resumed, distinct from the user `UserRegisterContext` | `yarm_x86_switch_frame` (callee-saved, `rsp`, `rip`) | `yarm_aarch64_switch_frame` | `yarm_riscv64_switch_frame` | **ENFORCED (KTHREAD1, §18.1)**: `KSwitchContext` per ISA (callee-saved, `sp`, return address) in `src/arch/<isa>/kthread.rs`; the D6 switch frames stay dormant |
+| SC-KT-3 | First entry: an explicit entry ABI (stack alignment, argument registers, return-to-exit) | `yarm_kernel_thread_switch_trampoline` (D6 proof) | not established | not established | **ENFORCED (KTHREAD1, §18.1)**: per-ISA trampoline → `yarm_kthread_first_entry(pool, slot)`, 16-byte-aligned stack, interrupts enabled before the body, return reaches `exit` |
+| SC-KT-4 | Asynchronous preemption of kernel mode. Not to be enabled before SCHED-LOCK1 (SC-LOCK-8) and KERNEL-NOFP1 (SC-FP-1); both are done, and neither enables or qualifies it. | none: masked kernel | none | none; S-mode traps other than idle halt | **NOT ENABLED.** KTHREAD1 is cooperative (§18.3): interrupts on a kernel thread are serviced and return to the interrupted instruction; a reschedule is honoured at the next explicit scheduling point. Owner: unassigned |
 | SC-KT-5 | Kernel FP/SIMD state. Ordinary kernel code and its linked runtime helpers use no FP/SIMD registers, so a kernel thread carries no FP/SIMD state; audited context routines are the exceptions (§8.2). | 0 in ordinary code (was 22 779 FP/SIMD-classified instructions) | 0 in ordinary code (was 2 547) | 0 | **ENFORCED by KERNEL-NOFP1** (final-image check on every artifact build) |
-| SC-KT-6 | Flags and TLS: the kernel's per-CPU base and flags are restored on a kernel-to-kernel switch | not traced in this package | not traced | not traced | **UNRESOLVED**: missing inventory of kernel per-CPU and TLS registers; owner KTHREAD1 |
-| SC-KT-7 | Interrupt nesting and safe preemption points: preemption only at points holding none of SC-BND-2's items | no nesting | no nesting | no nesting | **SPECIFIED → KTHREAD1** |
-| SC-KT-8 | No blocking or switching while a prohibited guard is held. Today non-hosted lock-rank tracking is placeholder-only (`doc/KERNEL_LOCKING.md`). A per-CPU held-guard count must make a switch under a guard fail closed. | `SpinLockIrqGuard` is `!Send`; no run-time check | same | same | **SPECIFIED → KTHREAD1** |
-| SC-KT-9 | Wake arbitration through the existing exact-incarnation owners and `DispatchMarkToken`; no kernel-thread-only wake path | shared owners | shared | shared | **SPECIFIED → KTHREAD1** |
-| SC-KT-10 | Exit and stack reclamation only after execution has provably ceased: a stack-residency record, cleared only after the CPU has switched away and is no longer on that stack (by analogy with VMI2's root residency) | none | none | none | **SPECIFIED → KTHREAD1** |
-| SC-KT-11 | Trap classifiers accept kernel-thread-origin traps. Every "kernel mode is idle or fatal" site in §1.9 must distinguish a kernel thread from idle and from a kernel bug. | ring-0 `#GP`, supervisor `#PF`, idle-only IRQ conversion | current-EL vectors, idle take point | `!from_u` → halt | **SPECIFIED → KTHREAD1** |
-| SC-KT-12 | Every kernel thread has a budgeted scheduling context (SC-EXEC-3) and a home CPU (SC-CPU-2) | — | — | — | **SPECIFIED → KTHREAD1 / RT-SCHED1** |
+| SC-KT-6 | Flags and TLS: the kernel's per-CPU base and flags are restored on a kernel-to-kernel switch | not traced in this package | not traced | not traced | **ENFORCED (KTHREAD1, §18.3)**: kernel threads never migrate, so the per-CPU base is the CPU's own and never written per thread (AArch64 `TPIDR_EL1` set at boot; x86_64 `IA32_GS_BASE` set once at bring-up to the CPU's record, identity from the APIC map; RISC-V identity from `sscratch` / the stack). Flags: both sides of every switch run masked; the thread saves and restores its interrupt state around the switch |
+| SC-KT-7 | Interrupt nesting and safe preemption points: preemption only at points holding none of SC-BND-2's items | no nesting | no nesting | no nesting | **ENFORCED (KTHREAD1, §18.3–§18.4)**: no nesting (hardware masks on entry); switches only at explicit points |
+| SC-KT-8 | No blocking or switching while a prohibited guard is held. Today non-hosted lock-rank tracking is placeholder-only (`doc/KERNEL_LOCKING.md`). A per-CPU held-guard count must make a switch under a guard fail closed. | `SpinLockIrqGuard` is `!Send`; no run-time check | same | same | **ENFORCED for interrupt-masking guards (KTHREAD1, §18.3)**: a switch requires interrupts enabled and no `KMasked` section, else `KTHREAD_SWITCH_REFUSED`. A plain `SpinLock` held with interrupts enabled is not counted |
+| SC-KT-9 | Wake arbitration through the existing exact-incarnation owners and `DispatchMarkToken`; no kernel-thread-only wake path | shared owners | shared | shared | **ENFORCED with a stated deviation (KTHREAD1, §18.5)**: placement and announcement use the shared owners (enqueue under the home 1L, `notify_enqueued`); the exact incarnation is the pool generation, not `DispatchMarkToken` (a kernel thread has no TCB) |
+| SC-KT-10 | Exit and stack reclamation only after execution has provably ceased: a stack-residency record, cleared only after the CPU has switched away and is no longer on that stack (by analogy with VMI2's root residency) | none | none | none | **ENFORCED (KTHREAD1, §18.2)**: `running[cpu]` cleared only after the switch away; only the dispatcher reclaims |
+| SC-KT-11 | Trap classifiers accept kernel-thread-origin traps. Every "kernel mode is idle or fatal" site in §1.9 must distinguish a kernel thread from idle and from a kernel bug. | ring-0 `#GP`, supervisor `#PF`, idle-only IRQ conversion | current-EL vectors, idle take point | `!from_u` → halt | **ENFORCED (KTHREAD1, §18.4)**: kernel-thread vectors while one runs; timer and reschedule interrupts authenticated and serviced; every other kernel-thread trap fatal; idle vectors unchanged |
+| SC-KT-12 | Every kernel thread has a budgeted scheduling context (SC-EXEC-3) and a home CPU (SC-CPU-2) | — | — | — | **PARTIAL**: home CPU fixed at creation (KTHREAD1); no budgeted scheduling context — **RT-SCHED1** |
 
 ---
 
@@ -1154,7 +1154,11 @@ CPU executes.
 | SC-POOL-2/3/4 | fixed arrays; `BootExclusive` phase | configured pools, queue sizing, OPERATIONAL transition | P | RT-SCHED1 / PARTITION1 |
 | SC-EXEC-1…6 | inline kernel work, uncounted | accounting points, system allowance, overrun events | P + N bounds | RT-SCHED1 / PARTITION1 |
 | SC-IPC-1/2/3 | `direct_eligibility`, ordinary selection | eligibility-checked handoff; donation stays off | P | RT-SCHED1 / PARTITION1 |
-| SC-BND-2, SC-KT-1…12 | D6 scaffolding (dormant), diverging idle | kernel stacks, entry ABI, kernel preemption (after SCHED-LOCK1 and KERNEL-NOFP1), TLS policy, guard check, stack residency, trap classifiers | P + L on three ports | KTHREAD1 |
+| SC-KT-2, 3, 6, 7, 9, 10, 11 | **done** (KTHREAD1, §18) | — | P + L on three ports, §18.7 | — |
+| SC-KT-1 guard page | 16 KiB pool stacks, no guard | split shared kernel mappings (x86_64, AArch64); a translated kernel space (RISC-V) | P + L | unassigned |
+| SC-KT-4 | cooperative kernel threads (§18.3) | asynchronous kernel preemption | P + L on three ports | unassigned |
+| SC-KT-8 plain `SpinLock` | interrupt-masking guards counted | a held-guard count for non-masking locks | P | unassigned |
+| SC-KT-12, SC-EXEC-3, SC-BND-2 | kernel threads with a home CPU (KTHREAD1) | budgeted contexts; boundary preemption at safe points | P + L | RT-SCHED1 / PARTITION1 |
 | SC-BND-3, SC-INV-2/3 | none | configuration validation (shared regions, ceilings) | P | PARTITION1 / RT-SCHED1 |
 | SC-INV-1, W1 | TTAS `SpinLockIrq` | fair lock or bounded-contention proof; per-rank section bounds | S + N | RT-SCHED1 |
 | SC-WCET-1/2, W3/W7 | synchronous logging, unbounded routes | per-route bounds, buffered diagnostics | S + N | RT-SCHED1 |
@@ -1337,12 +1341,16 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-GP-1 (differential, for the mechanisms exercised);
   * SC-KT-0;
   * SC-KT-5, SC-FP-1, SC-FP-2, SC-FP-3 (KERNEL-NOFP1);
+  * SC-KT-2, SC-KT-3, SC-KT-6, SC-KT-7, SC-KT-10, SC-KT-11 (KTHREAD1, §18); SC-KT-8 for
+    interrupt-masking guards; SC-KT-9 with the deviation stated in §8;
   * SC-LOCK-1, SC-LOCK-3…7 (SCHED-LOCK1). SC-LOCK-2 is PARTIAL: the lock order excludes the
     scheduler-lock deadlock cycles, but no progress argument is established (§17.3).
 * **DISCHARGED:** SC-LOCK-9 (it held until SCHED-LOCK1, which is the split).
 * **SPECIFIED, with an implementing package:**
   * SC-LOCK-8 (roadmap order: SCHED-LOCK1 before KTHREAD1 kernel preemption and RT-SCHED1).
-  * **KTHREAD1:** SC-KT-1…4, SC-KT-7…12, SC-BND-2, SC-EXEC-3.
+  * **KTHREAD1** (done, §18) left these open: SC-KT-1 (guard page), SC-KT-4 (asynchronous kernel
+    preemption, not enabled) and SC-KT-8 for plain `SpinLock`, without an owner package; SC-KT-12,
+    SC-BND-2 and SC-EXEC-3 move to RT-SCHED1 / PARTITION1.
   * **RT-SCHED1:**
     * SC-CPU-2;
     * SC-PRI-10…13;
@@ -1367,7 +1375,6 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-EXEC-6;
   * SC-INV-1;
   * SC-TIME-3, SC-TIME-4, SC-TIME-6;
-  * SC-KT-6;
   * SC-FP-5 (hardware execution cost; the rest is measured).
 
 ---
@@ -2206,3 +2213,181 @@ the order of each CPU's own operations and the mailbox causality above. It canno
   side;
 * that a completed SBI remote fence retired a translation on real hardware. Completion is the
   pinned OpenSBI's answer, and staleness is observed only as QEMU models TLBs.
+
+---
+
+## 18. KTHREAD1: independent kernel threads (cooperative)
+
+KTHREAD1 adds kernel threads to production on x86_64, AArch64 and RISC-V, with no knob. A kernel
+thread is a privileged continuation with its own stack, scheduled by the ordinary GP scheduler and
+switched only at explicit scheduling points. Kernel-mode execution stays non-preemptive:
+interrupts are taken while a kernel thread runs, serviced, and returned to the interrupted
+instruction; a pending reschedule is honoured at the thread's next scheduling point. No RT
+scheduling, partition window, budget, donation, inheritance, migration or asynchronous kernel
+preemption is added. Code: `src/kernel/kthread.rs` (pool, state machine, scheduling points, wait
+owner), `src/arch/kthread.rs` and `src/arch/<isa>/kthread.rs` (switch, first entry, vectors).
+
+### 18.1 Ownership (base `298c591b` → KTHREAD1)
+
+| Concern | Existing owner (kept) | KTHREAD1 addition |
+|---|---|---|
+| Creation / placement | user: `task_enqueue` planner → `enqueue_with_priority` under the target CPU's 1L → `notify_enqueued` | `KThreadPool::create`: slot from the free list (pool lock), incarnation and first frame written while Reserved (no id, no queue names it), then enqueue + Ready in ONE 1L section of the home CPU, then `notify_enqueued`; refused placement returns the slot at once |
+| Run queues | `PriorityScheduler` per CPU under 1L | kernel-thread ids share the queues. The unfiltered dequeue/peek (`dequeue_highest`, `peek_highest`, the preferred-handoff scan) skip them in place |
+| Balanced placement | `least_loaded` over each CPU's published load (queued + current) | the load counts user tasks only: a kernel thread is pinned to its home and runs cooperatively, so its passing presence in a queue does not steer the permanent home chosen for a user task. Unchanged when no kernel thread is queued |
+| Selection | `queue_advance_select_step_split` (acceptance-filtered) | the filter admits a kernel thread by the pool's predicate (Ready, this incarnation, this home, no kernel-thread stack resident here); the step RUNS a selected kernel thread and selects again, so every queue-advancing drain (FutexWait, Yield, timer/IPI idle advance, D2 recv/send, U9-QA commit) runs kernel threads and still sees only user/idle outcomes |
+| Current install | `d6_genuine_mark_running_via_task_seam` (TCB) | `dispatch_selected`: Ready→Running under the home 1L (confirmed current), quantum reset; no TCB, no ASID |
+| Context | user `UserRegisterContext` + async-preempt tag in the TCB | `KSwitchContext` per slot and a dispatcher context per CPU: callee-saved + sp + return address |
+| First entry | `enter_user` / exact-token resume | trampoline → `yarm_kthread_first_entry` → interrupts enabled → body → `exit` |
+| Idle | diverging per-CPU primitive | unchanged; a CPU with only blocked kernel threads idles through the existing typed outcome |
+| Block / exit | `block_current_exact`, `task_transition` | `block_current_exact(ktid)` under the home 1L with the slot state, then switch to the dispatcher |
+| Kernel-origin interrupts | idle boundary or fatal (§1.9) | while a kernel thread runs, its CPU's vector base names kernel-thread vectors (RISC-V `stvec`; x86_64 a copy of the production IDT with the timer and 0xF1 gates replaced; AArch64 `VBAR_EL1`); timer and reschedule interrupts are authenticated and serviced on the thread's stack; every other trap is kernel-fatal |
+| Stacks | per-CPU trap stacks, idle anchor | 32 stacks × 16 KiB reserved in `.bss`; the residency record (`running[cpu]`) is cleared only after the switch away; reclamation only by the dispatcher |
+| Address space | `activate_asid` on every user resume; `leave_user_root` | the dispatcher leaves any user root before entering a kernel thread; residency bookkeeping (`ACTIVE_ASID`) therefore never names a CPU running one. x86_64 records its kernel root when secondary bring-up starts, so the root exists with one CPU |
+| IRQ masking | trap context masked; `SpinLockIrq` saves/masks | a kernel thread's body runs unmasked; kernel-owner calls run in a `KMasked` section; a switch requires interrupts enabled and no section open |
+| Preemption state | per-CPU quantum under 1L; clock on CPU 0 | a timer interrupt on a kernel thread ticks the same quantum and records `need_resched`; a reschedule IPI records it too |
+| Executing CPU | RISC-V from the trap-stack sp; AArch64 `TPIDR_EL1`; x86_64 APIC map | RISC-V: `riscv_executing_cpu` resolves a kernel-thread stack to the CPU whose residency names its slot (repair, §18.6) |
+
+### 18.2 Storage, identity, lifecycle
+
+* Capacity `KTHREAD_CAPACITY = 32`; stacks `KTHREAD_STACK_BYTES = 16 KiB`, page-aligned slots,
+  16-byte-aligned initial stack pointer; one static array per image (`KSTACKS`, 512 KiB of
+  `.bss`, zero-initialised, never allocated at run time). The pool itself lives in
+  `SharedKernel::kthreads`, initialised with the boot singleton.
+* Id = tag `0x4B54` ≪ 48 | generation ≪ 16 | slot. User thread ids are small counters and never
+  carry the tag. The generation is written before the slot leaves Reserved, so a stale id fails
+  every check (`wake` → Stale, `state_of` → None) against a later incarnation.
+* States: Free → Reserved → Ready ⇄ Running → (Blocked → Ready) … → Exited → Free. Every live
+  transition is made under the home CPU's 1L with the queue change it implies.
+* Exhaustion: `create` returns `Exhausted`, changing nothing. A refused placement (offline,
+  wake-only, queue full) returns the slot immediately; that generation is never valid.
+* A returning body reaches `exit`. The thread never frees its own stack: the dispatcher reclaims the
+  slot after the switch away, once the slot is Exited, in no queue, not current and not resident.
+* Stack use is MEASURED from the creation paint (`stack_high_water`) — observed depth, not a proven
+  bound. **No guard page.** RISC-V runs the kernel space in Bare translation (`satp = 0`): there is
+  no page table in which a page could be made non-present. x86_64 maps the kernel image window with
+  2 MiB pages in the boot `PD` shared by every root, and AArch64 with block mappings; a 4 KiB guard
+  needs splitting those shared kernel mappings, which KTHREAD1 does not do. Overflow is therefore
+  not caught by hardware on any port (a canary would not be equivalent and is not claimed).
+
+### 18.3 Scheduling points, deferral and safety
+
+* Switches happen only in `yield_now`, `sched_point` (yields iff `need_resched` was set), a wait's
+  park, and `exit`. A thread never switches inside a syscall, a lock, or an interrupt.
+* Switch-safety check (`KThreadCtx::switch_check`), refused through `KTHREAD_SWITCH_REFUSED`:
+  interrupts must be ENABLED (so no `SpinLockIrqGuard` — every one masks — and no interrupt context),
+  no `KMasked` section open, this CPU's residency names the caller, the stack pointer is inside the
+  caller's own stack, and the slot holds this incarnation as Running. A refusal changes nothing.
+  Not covered mechanically: a plain (non-masking) `SpinLock` guard held with interrupts enabled —
+  no kernel-thread operation takes one outside a masked section, but nothing counts them.
+* Flags and per-CPU state: both sides of every switch run masked. The thread saves its interrupt
+  state, masks, switches, and restores it when dispatched again; the dispatcher switches masked
+  under its own section. Kernel threads never migrate, so the per-CPU base (AArch64 `TPIDR_EL1`,
+  x86_64 `IA32_GS_BASE`, RISC-V `sscratch`) is the CPU's own and is never written per thread.
+* IRQ mask, preemption eligibility and SMP ownership are separate: the mask is the CPU's; the
+  eligibility is `need_resched` + an explicit point; ownership is the home CPU's 1L.
+* No lost wake at the boundary: `need_resched` is swapped at the point with interrupts enabled; an
+  interrupt after the swap sets it again for the next point.
+* Cooperative limitation: a kernel thread that does not reach a scheduling point keeps its CPU; user
+  tasks and other kernel threads of that CPU wait. No latency bound is claimed.
+
+### 18.4 Kernel-origin interrupts
+
+Accepted only when the interrupted stack is a pool stack, the slot's home is the CPU the hardware
+names (RISC-V: `sscratch` is exactly that hart's canonical trap-stack top; x86_64: APIC id map;
+AArch64: `TPIDR_EL1`), that CPU's residency names this slot, and the slot holds the resident
+incarnation as Running. Otherwise `KTHREAD_IRQ_UNAUTHENTICATED` (fatal). The entry saves every
+general register and the interrupted PC/status on the thread's stack and restores them exactly
+(`sret` / `iretq` / `eret`). The handler never logs, never allocates, takes only the CPU's 1L
+(interrupt-safe), never touches user FP/TLS, and never schedules. Timer: the split route's tick,
+acknowledgement and re-arm, plus `need_resched` on quantum expiry. Reschedule: RISC-V consumes the
+mailbox (`take_arrival`, origin `KernelThread`); x86_64 continues into the production 0xF1 handler
+(wake accounting, TLB-mailbox acknowledgement, EOI); AArch64 claims and completes the SGI. Idle stays
+distinct: kernel threads never run at the idle anchor and the idle vectors are untouched.
+
+Entering a kernel thread from inside an exception: the dispatcher runs within the selection step of
+the trap that selected it. On AArch64 that exception's GIC claim is completed before the thread is
+entered (otherwise the running priority would hold off every timer and SGI until the vector tail);
+the tail completes the claim only if it is still in flight, so each claim is completed exactly
+once. On RISC-V and AArch64 an AP's parked timer is re-armed before the thread is entered.
+
+### 18.5 Waiting
+
+`KWaitQueue::wait_until(ctx, cond)`: the condition is evaluated under the queue's lock and the
+waiter registers before releasing it; a waker changes the inputs and then `wake_all`, which takes
+the same lock. A wake that reaches a registered thread before it parks sets `wake_pending` under the
+home 1L, which the park consumes in the same 1L section that would block. Every return re-checks.
+Covered: wake before registration, during park, after block, duplicate (one placement), stale
+(generation), cross-CPU to an idle target (enqueue + IPI), exit/reuse with an old wake outstanding
+(`wake_pending` reset at creation). No user ABI, IPC or capability change.
+
+### 18.6 Re-audit of earlier assumptions
+
+Every earlier assumption that "kernel mode is idle or a bug" was re-read against kernel threads.
+
+| Area | Finding | Disposition |
+|---|---|---|
+| SMP3 mailbox / consumption windows | A reschedule IPI landing on a kernel thread is consumed by the same `take_arrival` (clear `SSIP`, swap the mailbox once) with origin `KernelThread`; the publication-before-notification order is unchanged. The woken work is dispatched at the thread's next scheduling point instead of at a user return. | holds |
+| Per-CPU trap scratch | RISC-V `sscratch` is never written by the kernel-thread vector (it stays this hart's canonical trap-stack top and serves as the hardware identity). The drains' per-CPU deferral cells and the RISC-V resume decisions are set before / published after the selection step, never touched by a kernel thread or its interrupt handler. x86_64 `TRAP_DISPATCH_DEPTH` stays at the enclosing trap's value. | holds |
+| Executing CPU on RISC-V | `riscv_executing_cpu` derived the CPU from the stack pointer's trap-stack region and named the boot CPU for any other stack, so `notify_enqueued` from a kernel thread on a secondary would have announced from the wrong CPU. | **repaired**: a pool stack resolves to the CPU whose residency names its slot |
+| Current / root publication | While a kernel thread runs, its id is `current` (mirror included); it has no TCB and no ASID, so every consumer that maps current → task → ASID (shootdown targets, residency) finds nothing; `leave_user_root` already released `ACTIVE_ASID`. | holds |
+| Logging and nesting | The kernel-thread interrupt path never logs and does not nest (hardware masks on entry). Thread bodies may log with interrupts enabled: the printk drain lock is interrupt-masking. | holds |
+| Lock rank and IRQ restore | 1L and the printk drain lock are `SpinLockIrq` (save/mask/restore to the caller's state). The interrupt handler takes only its own CPU's 1L, which the interrupted thread cannot hold with interrupts enabled. Orders: wait-queue lock → 1L; free-list lock never nested with 1L; reclaim takes 1L then the free list, sequentially. | holds |
+| Coherent-view operations | `lock_all` takes every 1L ascending; a kernel thread holds only its home 1L, briefly and masked. | holds |
+| A parked call resumed on its own trap | The selection step now runs kernel threads, so the outgoing task's own blocking call can complete (a delivery, its deadline) while its drain is still selecting, and the drain can pick it. The bridge sees no task switch and installs the trap's provisional return. x86_64 already adopted the restored lanes (AP-SCHED4); RISC-V did not, and a deadline receive returned `WouldBlock` instead of `TimedOut` (RISC-V `-smp 8`). AArch64 publishes only a parked completion record, consumed at its resume boundary; its self-resume route was not separately exercised (AArch64 `-smp 8` passed). | **repaired** on RISC-V: the same-task arm adopts the restored lanes when an exact-token resume on this trap named the frame's owner and no completion consumer encoded the result |
+| D2 drains on RISC-V | `NoneAcceptable` with nothing current returns through the stale frame (F1). Triggered in KT1 development when only kernel threads were queued; the trigger is gone (every selection now runs kernel threads). | **recorded, not repaired** (pre-existing; see F1) |
+
+### 18.7 Evidence contract
+
+**Deterministic (hosted).** `src/kernel/kthread_tests.rs` (20 tests) runs the production pool and
+the real x86_64 switch on two hosted CPUs: tagged incarnation-exact ids, bounded creation and
+exhaustion, refused placement, slot reuse against stale ids, alternation with intact stacks,
+exit and reclamation by the dispatcher, measured stack use, every wait interleaving of §18.5
+(including cross-CPU and exit/reuse with a wake outstanding), the switch-safety refusals (guard,
+masked, foreign context, non-resident, wrong stack), a pending reschedule honoured only at the next
+point, unfiltered selection never returning a kernel thread, balanced-placement load counting
+user tasks only, no TCB or user root, and the drain
+owner running kernel threads while reporting only user or idle outcomes. Interrupt
+authentication is checked hosted against the right CPU, another CPU and a non-pool frame; the
+vector entry and return are exercised live only (§18.4).
+
+**Live (QEMU, all three ports).** Feature `<isa>-kthread1-witness` (default-off; it also enables
+the AP-scheduling witness, whose ordinary user workload runs alongside) builds
+`src/kernel/kthread_witness.rs`. A director on CPU 0 declares the population and creates, per CPU,
+a sleeper and two alternators, plus a waker. Alternators spin with patterned registers until an
+interrupt of their own lands, check their private stack, and yield with a callee-saved check. One
+alternator per CPU holds its CPU until another CPU wakes the sleeper there; it records its
+decision input (reschedule pending) before its scheduling point. Then come the probes (a masked
+section, an interrupt-masking guard, a lost wakeup, a stale id against the same slot's next
+incarnation), create/exit/reuse cycles and pool exhaustion. Each record is written BEFORE the
+action it describes when the action can be observed elsewhere (wake request, decision, reclaim),
+so record order never contradicts causality. Records sit in per-CPU rings with one global sequence,
+each line carries an FNV-1a checksum, and a `KT1_SEAL` closes the set.
+
+`scripts/grade-kthread1-witness.py` grades validity (checksums, a contiguous sequence, the seal)
+before coverage, and only from the sealed records. The coverage obligations are listed in its
+header; each is required on every CPU of the declared population. `tests/kthread1_witness_grader.rs`
+pins it: a real record set (`tests/fixtures/kthread1/base.rec`) passes, and named alterations are
+refused, each for its own reason. `scripts/qemu-kthread1-witness-smoke.sh` binds the image through
+BUILD-GATES1 and prints `KT1W_SEAL`. Results are in the KTHREAD1 record of
+`doc/KERNEL_UNLOCKING.md`.
+
+**What the evidence does not show.** QEMU timing is not hardware timing. Stack depth is observed,
+not bounded. No latency, fairness, starvation-freedom or WCET property of kernel threads is
+established, and nothing here is a certification claim.
+
+### 18.8 Limitations
+
+* Cooperative only: no asynchronous kernel preemption (SC-KT-4). A kernel thread that never
+  reaches a scheduling point keeps its CPU.
+* No guard page on any port (SC-KT-1, §18.2).
+* No migration: a kernel thread runs only on its home CPU.
+* A plain non-masking `SpinLock` held across a scheduling point is not detected (SC-KT-8).
+* Kernel threads run inside the selection step of the trap that selected them, on their own
+  stacks. The enclosing trap resumes after the CPU has no runnable kernel thread left.
+* No budget, priority beyond the GP levels, partition or donation (SC-KT-12, RT-SCHED1).
+* No production subsystem uses kernel threads yet. The mechanism is in every build; only the
+  witness creates threads.
+* F1 (RISC-V D2 drain `NoneAcceptable` with nothing current) is pre-existing and not repaired.
+* With one CPU, user progress beside kernel threads is not shown on x86_64 and AArch64: the only
+  user workload (the AP-scheduling witness) needs a secondary, and no user task was runnable during
+  the kernel-thread phase. The grader reports it there instead of requiring it.

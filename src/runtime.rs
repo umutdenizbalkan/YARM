@@ -263,6 +263,10 @@ impl core::fmt::Debug for KernelStateCell {
 #[derive(Debug)]
 pub struct SharedKernel {
     state: KernelStateCell,
+    /// KTHREAD1 — this kernel's kernel-thread pool (`kernel::kthread`). Its own synchronization:
+    /// a free-list lock, per-slot atomics whose live transitions are made under the home CPU's 1L,
+    /// and switch contexts touched only by their home CPU with interrupts masked.
+    pub(crate) kthreads: crate::kernel::kthread::KThreadPool,
     /// Hosted tests only: serializes the test-only whole-state helpers ([`SharedKernel::with`],
     /// [`SharedKernel::with_cpu`], [`SharedKernel::lock`]) against each other. It is NOT the
     /// retired broad lock — no production path can name it, and freestanding images do not
@@ -1585,6 +1589,7 @@ impl SharedKernel {
     pub fn new(state: KernelState) -> Self {
         Self {
             state: KernelStateCell(core::cell::UnsafeCell::new(state)),
+            kthreads: crate::kernel::kthread::KThreadPool::new(),
             #[cfg(test)]
             test_exclusive: SpinLock::new(()),
         }
@@ -1619,13 +1624,16 @@ impl SharedKernel {
     /// # Safety
     /// As `state_ptr_for_construction`, and the state field must be fully initialized.
     pub(crate) unsafe fn finish_in_place_construction(shared: *mut SharedKernel) {
+        // SAFETY: caller-owned storage; the field is written, never read, here.
+        unsafe {
+            core::ptr::addr_of_mut!((*shared).kthreads)
+                .write(crate::kernel::kthread::KThreadPool::new());
+        }
         #[cfg(test)]
         // SAFETY: caller-owned storage; the field is written, never read, here.
         unsafe {
             core::ptr::addr_of_mut!((*shared).test_exclusive).write(SpinLock::new(()));
         }
-        #[cfg(not(test))]
-        let _ = shared;
     }
 
     /// # Validation status
@@ -2912,12 +2920,17 @@ impl SharedKernel {
             }
         });
         match marked {
-            Ok(incarnation) => DispatchMarkOutcome::Marked(DispatchMarkToken::new(
-                cpu,
-                tid,
-                incarnation,
-                selection,
-            )),
+            Ok(incarnation) => {
+                // KTHREAD1 witness (default-off): a user task marked Running on this CPU.
+                #[cfg(feature = "kthread1-witness")]
+                crate::kernel::kthread_witness::note_user_dispatch(cpu);
+                DispatchMarkOutcome::Marked(DispatchMarkToken::new(
+                    cpu,
+                    tid,
+                    incarnation,
+                    selection,
+                ))
+            }
             Err(refusal) => {
                 if refusal == MarkRefusal::MissingIncarnation {
                     crate::yarm_log!(
@@ -3533,123 +3546,150 @@ impl SharedKernel {
     /// It deliberately emits NO success marker: the consumers own different telemetry families
     /// (`QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK` vs `D6_GLOBAL_LOCK_DROP_PLAN_READY`) and a shared
     /// step must not fabricate either.
+    ///
+    /// KTHREAD1: kernel threads run HERE, in the one selection owner every queue-advancing drain
+    /// reaches the run queue through. The caller holds this CPU's live trap authority and no lock,
+    /// so this is a safe point to switch. A selected kernel thread runs until it next leaves the
+    /// CPU, and the selection is then made again: callers see only a user task, idle or a refusal.
     pub(crate) fn queue_advance_select_step_split(
         &self,
         authority: DispatchAuthority,
         site: &'static str,
     ) -> CpuDispatch {
+        // KTHREAD1: the loop runs selected kernel threads (see the last paragraph above).
+        #[cfg(feature = "kthread1-witness")]
+        crate::kernel::kthread_witness::maybe_start(self, authority.cpu());
         let cpu = authority.cpu();
-        // The window check is OUTSIDE the scheduler acquisition on purpose: a stale authority must
-        // not even take rank 1.
-        if !authority.is_live() {
-            crate::yarm_log!(
-                "DISPATCH_STEP_REFUSED site={} requested={} reason=stale_window",
-                site,
-                cpu.0
-            );
-            return CpuDispatch::Refused {
-                requested: cpu,
-                reason: DispatchAuthorityRefusal::StaleWindow,
-            };
-        }
-        // SCHED-LOCK1: `cpu`'s own 1L, with the rank-2 acceptance filter nested inside it exactly
-        // as it was nested inside the old rank 1.
-        let outcome = self.with_cpu_sched_split(cpu, |c| {
-            // The CPU must be an ONLINE scheduler CPU — the same predicate
-            // `current_tid_authoritative` applies, and the reason `CpuOutOfRange` is no longer a
-            // reachable selection refusal (an out-of-range CPU cannot mint a live authority).
-            if c.validate_online().is_err() {
+        loop {
+            // The window check is OUTSIDE the scheduler acquisition on purpose: a stale authority
+            // must not even take rank 1.
+            if !authority.is_live() {
                 crate::yarm_log!(
-                    "DISPATCH_STEP_REFUSED site={} requested={} reason=cpu_offline",
+                    "DISPATCH_STEP_REFUSED site={} requested={} reason=stale_window",
                     site,
                     cpu.0
                 );
                 return CpuDispatch::Refused {
                     requested: cpu,
-                    reason: DispatchAuthorityRefusal::CpuOffline,
+                    reason: DispatchAuthorityRefusal::StaleWindow,
                 };
             }
-            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
-            //
-            // U9-DISPATCH-CPU1 §1: and the candidate is ACCEPTANCE-FILTERED. `accept` asks the
-            // read-only sibling of the very transition the mark will apply, so the scheduler
-            // dequeues only a task the mark will take — instead of dequeuing the head, failing to
-            // mark it and rolling the dequeue back. Rank 1 is held across the rank-2 read, which
-            // is the canonical ascending direction.
-            //
-            // U9-RECV-BLOCK2b §3: and the filter asks the RESUME CONVENTION too, which it did
-            // not. The two questions it already asked — "will the dispatch transition be
-            // accepted" and "does the ASID resolve" — are not the question the APPLY asks.
-            // `x86_post_lock_resume_marked_incoming` calls
-            // `direct_dispatch_classify_and_consume_convention_split`, which is
-            // `classify_incoming_resume_convention(tcb, ExactTokenResume)`, and a `None` there is
-            // `X86ResumeRefusal::Context` — after the dequeue, after the mark, with the scheduler
-            // already believing the task is running. The caller's only remaining move is
-            // `d2_resume_refused_fatal`.
-            //
-            // So a task with a non-restorable `user_context`, or one whose first-resume snapshot
-            // has already been consumed, passed selection and took the machine down. That is a
-            // LIVE reachable path, not a theoretical one: the apply's own comment records that
-            // "admission classified the peeked candidate; a higher-priority wake can displace it
-            // before the authoritative dequeue", and the filtered dequeue can also skip past the
-            // peeked head to a task admission never looked at.
-            //
-            // Asking the classifier here is the fix in its own terms — the same owner, read-only
-            // (the consuming variant belongs to the apply, which is the one place a one-shot
-            // startup snapshot may be spent), evaluated inside the same rank-1/rank-2 nesting as
-            // the other two predicates. A task it refuses is left in the queue rather than
-            // dequeued-and-fataled, and a drain that finds no acceptable candidate settles
-            // through its existing typed idle.
-            //
-            // Every consumer of this owner applies through the exact-token resume — the D2 recv
-            // and send drains, the FutexWait and yield retirement drains, and the U9-QA commit —
-            // so `ExactTokenResume` is the convention to screen for, and it is the same value
-            // those applies pass.
-            let selection = c.dispatch_next_accepted_selection(|tid| {
-                self.with_task_tcbs_split_mut(|tcbs| {
-                    if !crate::kernel::task_transition::dispatch_transition_would_be_accepted(
-                        tcbs,
-                        tid.0,
-                        crate::kernel::task_transition::TaskTransition::DispatchIncoming,
-                    ) {
-                        return false;
-                    }
-                    let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == tid.0) else {
-                        return false;
-                    };
-                    if MarkedIncarnation::resolve(tid.0, tcb.asid).is_none() {
-                        return false;
-                    }
-                    crate::kernel::boot::classify_incoming_resume_convention(
-                        tcb,
-                        crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
-                    )
-                    .is_some()
-                })
-            });
-            match selection {
-                crate::kernel::scheduler::AcceptedSelection::Selected(selection) => {
-                    CpuDispatch::Selected { cpu, selection }
-                }
-                crate::kernel::scheduler::AcceptedSelection::Empty => CpuDispatch::Selected {
-                    cpu,
-                    selection: crate::kernel::scheduler::DispatchSelection::Idle,
-                },
-                crate::kernel::scheduler::AcceptedSelection::NoneAcceptable { examined } => {
+            // SCHED-LOCK1: `cpu`'s own 1L, with the rank-2 acceptance filter nested inside it
+            // exactly as it was nested inside the old rank 1.
+            let outcome = self.with_cpu_sched_split(cpu, |c| {
+                // The CPU must be an ONLINE scheduler CPU — the same predicate
+                // `current_tid_authoritative` applies, and the reason `CpuOutOfRange` is no longer
+                // a reachable selection refusal (an out-of-range CPU cannot mint a live authority).
+                if c.validate_online().is_err() {
                     crate::yarm_log!(
-                        "DISPATCH_STEP_NONE_ACCEPTABLE site={} cpu={} examined={}",
+                        "DISPATCH_STEP_REFUSED site={} requested={} reason=cpu_offline",
                         site,
-                        cpu.0,
-                        examined
+                        cpu.0
                     );
-                    CpuDispatch::NoneAcceptable { examined }
+                    return CpuDispatch::Refused {
+                        requested: cpu,
+                        reason: DispatchAuthorityRefusal::CpuOffline,
+                    };
+                }
+                // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
+                //
+                // U9-DISPATCH-CPU1 §1: and the candidate is ACCEPTANCE-FILTERED. `accept` asks the
+                // read-only sibling of the very transition the mark will apply, so the scheduler
+                // dequeues only a task the mark will take — instead of dequeuing the head, failing
+                // to mark it and rolling the dequeue back. Rank 1 is held across the rank-2 read,
+                // which is the canonical ascending direction.
+                //
+                // U9-RECV-BLOCK2b §3: and the filter asks the RESUME CONVENTION too, which it did
+                // not. The two questions it already asked — "will the dispatch transition be
+                // accepted" and "does the ASID resolve" — are not the question the APPLY asks.
+                // `x86_post_lock_resume_marked_incoming` calls
+                // `direct_dispatch_classify_and_consume_convention_split`, which is
+                // `classify_incoming_resume_convention(tcb, ExactTokenResume)`, and a `None` there
+                // is `X86ResumeRefusal::Context` — after the dequeue, after the mark, with the
+                // scheduler already believing the task is running. The caller's only remaining move
+                // is `d2_resume_refused_fatal`.
+                //
+                // So a task with a non-restorable `user_context`, or one whose first-resume
+                // snapshot has already been consumed, passed selection and took the machine down.
+                // That is a LIVE reachable path, not a theoretical one: the apply's own comment
+                // records that "admission classified the peeked candidate; a higher-priority wake
+                // can displace it before the authoritative dequeue", and the filtered dequeue can
+                // also skip past the peeked head to a task admission never looked at.
+                //
+                // Asking the classifier here is the fix in its own terms — the same owner,
+                // read-only (the consuming variant belongs to the apply, which is the one place a
+                // one-shot startup snapshot may be spent), evaluated inside the same rank-1/rank-2
+                // nesting as the other two predicates. A task it refuses is left in the queue
+                // rather than dequeued-and-fataled, and a drain that finds no acceptable candidate
+                // settles through its existing typed idle.
+                //
+                // Every consumer of this owner applies through the exact-token resume — the D2 recv
+                // and send drains, the FutexWait and yield retirement drains, and the U9-QA commit
+                // — so `ExactTokenResume` is the convention to screen for, and it is the same value
+                // those applies pass.
+                let selection = c.dispatch_next_accepted_selection(|tid| {
+                    // KTHREAD1: a kernel thread has no TCB. It is admitted by the pool's own
+                    // predicate (Ready, this incarnation, this home, no kernel-thread stack live
+                    // here) and run by the caller of this step below; otherwise it is skipped in
+                    // place.
+                    if crate::kernel::kthread::is_kthread_tid(tid.0) {
+                        return self.kthreads.admit_dispatch(cpu, tid);
+                    }
+                    self.with_task_tcbs_split_mut(|tcbs| {
+                        if !crate::kernel::task_transition::dispatch_transition_would_be_accepted(
+                            tcbs,
+                            tid.0,
+                            crate::kernel::task_transition::TaskTransition::DispatchIncoming,
+                        ) {
+                            return false;
+                        }
+                        let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == tid.0) else {
+                            return false;
+                        };
+                        if MarkedIncarnation::resolve(tid.0, tcb.asid).is_none() {
+                            return false;
+                        }
+                        crate::kernel::boot::classify_incoming_resume_convention(
+                            tcb,
+                            crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+                        )
+                        .is_some()
+                    })
+                });
+                match selection {
+                    crate::kernel::scheduler::AcceptedSelection::Selected(selection) => {
+                        CpuDispatch::Selected { cpu, selection }
+                    }
+                    crate::kernel::scheduler::AcceptedSelection::Empty => CpuDispatch::Selected {
+                        cpu,
+                        selection: crate::kernel::scheduler::DispatchSelection::Idle,
+                    },
+                    crate::kernel::scheduler::AcceptedSelection::NoneAcceptable { examined } => {
+                        crate::yarm_log!(
+                            "DISPATCH_STEP_NONE_ACCEPTABLE site={} cpu={} examined={}",
+                            site,
+                            cpu.0,
+                            examined
+                        );
+                        CpuDispatch::NoneAcceptable { examined }
+                    }
+                }
+            });
+            match outcome {
+                Ok(CpuDispatch::Selected {
+                    cpu,
+                    selection: crate::kernel::scheduler::DispatchSelection::Dequeued { tid },
+                }) if crate::kernel::kthread::is_kthread_tid(tid.0) => {
+                    let _ = self.kthreads.dispatch_selected(cpu, tid);
+                }
+                other => {
+                    return other.unwrap_or(CpuDispatch::Refused {
+                        requested: cpu,
+                        reason: DispatchAuthorityRefusal::CpuOffline,
+                    });
                 }
             }
-        });
-        outcome.unwrap_or(CpuDispatch::Refused {
-            requested: cpu,
-            reason: DispatchAuthorityRefusal::CpuOffline,
-        })
+        }
     }
 
     /// U9-DISPATCH-CPU1 §2 — **acquire an incoming task for this CPU, or report honestly that it

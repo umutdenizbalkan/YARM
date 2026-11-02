@@ -248,6 +248,13 @@ fn is_root(fn_name: &str, before: &str, tok: &str) -> bool {
                 "let {tok} = crate::kernel::scheduler::CpuId(cpu_id as u8);"
             ))
             && before.contains("parked_cpu = Some(cpu_id);"))
+        // KTHREAD1: an interrupt on a kernel thread names its CPU by `sscratch` (this hart's
+        // canonical trap-stack top), confirmed by the pool's authentication of the frame.
+        || (fn_name == "yarm_riscv64_kthread_trap"
+            && before.contains("let Some(hardware) = hardware_cpu() else {")
+            && before.contains(&format!(
+                "let ({tok}, id) = match pool.authenticate_interrupt(frame as usize, hardware) {{"
+            )))
 }
 
 /// The call sites that can reach a fn: method calls `.name(`, module-qualified `tail::name(`
@@ -561,9 +568,10 @@ fn the_mailbox_is_consumed_only_by_the_enumerated_consumer() {
     );
     assert!(fn_body(ipi, "pub fn take_arrival(").contains("row[3].fetch_add(sources.count_ones()"));
 
-    // take_arrival: exactly the two RISC-V software-interrupt trap entries, with the trap's CPU.
+    // take_arrival: exactly the two RISC-V software-interrupt trap entries, plus (KTHREAD1) the
+    // kernel-thread vector's software-interrupt arm, each with the trap's CPU.
     let consumers = sites(&t, "riscv64::ipi::take_arrival(");
-    assert_eq!(consumers.len(), 2, "two consumption sites");
+    assert_eq!(consumers.len(), 3, "three consumption sites");
     let mut log = Vec::new();
     let bad = trace(
         &t,
@@ -580,7 +588,32 @@ fn the_mailbox_is_consumed_only_by_the_enumerated_consumer() {
         log.join("\n")
     );
     let boot = &t["arch/riscv64/boot.rs"];
-    for c in &consumers {
+    let kthread = &t["arch/riscv64/kthread.rs"];
+    for c in consumers
+        .iter()
+        .filter(|c| c.file == "arch/riscv64/kthread.rs")
+    {
+        let (efn, ..) = enclosing(kthread, c.at).unwrap();
+        assert_eq!(efn, "yarm_riscv64_kthread_trap");
+        let body = fn_body(kthread, "extern \"C\" fn yarm_riscv64_kthread_trap(");
+        // Anything but a supervisor timer or software interrupt is fatal first; the consumer is
+        // the non-timer arm, with the kernel-thread origin.
+        assert!(
+            body.contains(
+                "if !is_irq || (code != SUPERVISOR_TIMER && code != SUPERVISOR_SOFTWARE) {"
+            )
+        );
+        let arm = pos_in(body, "if code == SUPERVISOR_TIMER {");
+        let call = pos_in(body, "riscv64::ipi::take_arrival(");
+        assert!(arm < call && body[arm..call].contains("} else {"));
+        assert!(body[call..].starts_with(
+            "riscv64::ipi::take_arrival(\n            cpu,\n            crate::arch::riscv64::ipi::ArrivalOrigin::KernelThread,"
+        ));
+    }
+    for c in consumers
+        .iter()
+        .filter(|c| c.file != "arch/riscv64/kthread.rs")
+    {
         assert_eq!(c.file, "arch/riscv64/boot.rs");
         let (efn, ..) = enclosing(boot, c.at).unwrap();
         let ctx = &boot[c.at.saturating_sub(400)..c.at];
@@ -600,4 +633,8 @@ fn the_mailbox_is_consumed_only_by_the_enumerated_consumer() {
     assert_eq!(efn, "take_arrival");
     let ta = fn_body(ipi, "pub fn take_arrival(");
     assert!(ta.find(".swap(0").unwrap() < ta.find("lock1_witness::note_arrival(").unwrap());
+}
+
+fn pos_in(s: &str, needle: &str) -> usize {
+    s.find(needle).unwrap_or_else(|| panic!("{needle} missing"))
 }

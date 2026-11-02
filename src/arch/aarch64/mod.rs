@@ -14,6 +14,7 @@ pub mod context_switch;
 pub mod context_witness;
 pub mod dtb;
 pub mod irq;
+pub mod kthread;
 /// QEMU-SMP3-ACCEPTANCE §2 — the overtaken-deferral witness's AArch64 provisioning. Built only with
 /// `aarch64-overtaken-witness`; no default or production profile carries it.
 #[cfg(all(

@@ -200,6 +200,22 @@ impl TrapFrame {
         self.ret1 = self.user_gprs[7];
     }
 
+    /// KTHREAD1 — RISC-V twin of `adopt_restored_syscall_returns`: make this trap's syscall return
+    /// the result lanes of the continuation just applied (`a0`, `a1`, `a2`; the publishers put an
+    /// error code in `a0`, so no separate error lane is set).
+    ///
+    /// The bridge's same-task arm installs the syscall's return fields. A blocking call that parked
+    /// and was resumed on its own trap — it completed (a delivery, or its deadline) while this
+    /// trap's queue advance was still selecting, and the advance picked it — must return what that
+    /// completion published into its saved lanes, not the call's provisional `WouldBlock`.
+    #[cfg(any(target_arch = "riscv64", test))]
+    pub(crate) fn adopt_restored_riscv_syscall_returns(&mut self) {
+        self.ret0 = self.user_gprs[10];
+        self.ret1 = self.user_gprs[11];
+        self.ret2 = self.user_gprs[12];
+        self.error = 0;
+    }
+
     /// QEMU-SMP1-ACCEPTANCE §1 — name the incarnation whose continuation this frame now holds.
     /// Called only by an owner that has just put that continuation here from that incarnation.
     pub(crate) fn bind_resume_owner(&mut self, owner: crate::runtime::FpuHomeOwner) {
@@ -225,6 +241,27 @@ impl TrapFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KTHREAD1: a RISC-V park resumed on its own trap returns the lanes its completion published
+    /// (here a deadline's `TimedOut`), not the provisional `WouldBlock` the trap's syscall set.
+    #[test]
+    fn a_riscv_self_resume_adopts_the_published_lanes() {
+        let mut frame = TrapFrame::zeroed();
+        frame.set_err(7);
+        let mut context = frame.capture_user_context();
+        context.user_gprs[10] = 9;
+        context.user_gprs[11] = 0;
+        context.arg0 = 9;
+        frame.apply_user_context(context);
+        assert_eq!(
+            frame.error_code(),
+            Some(7),
+            "applying alone keeps the provisional return"
+        );
+        frame.adopt_restored_riscv_syscall_returns();
+        assert_eq!(frame.error_code(), None);
+        assert_eq!((frame.ret0(), frame.ret1()), (9, 0));
+    }
 
     #[test]
     fn new_zeroes_return_fields() {

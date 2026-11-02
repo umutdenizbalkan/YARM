@@ -810,6 +810,11 @@ fn bound_apic_id(cpu: CpuId) -> Option<u32> {
 }
 
 pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelError> {
+    // KTHREAD1: a kernel thread runs on the kernel root on EVERY CPU count, so the root is recorded
+    // here, before any secondary is considered (with one CPU the loop below prepares none). It is
+    // still the boot root: no user entry has happened yet. The per-secondary record below agrees.
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    super::descriptor_tables::record_kernel_root_cr3(current_cr3());
     let present = kernel.present_cpu_bitmap();
     let mut rust_online_aps = 0usize;
 

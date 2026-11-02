@@ -7417,6 +7417,11 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     // never closed.)
     crate::runtime::refuse_shared_entry_during_boot_exclusive("aarch64_vector_entry");
     let trap_cpu = crate::kernel::scheduler::CpuId(crate::arch::aarch64::this_cpu_index() as u8);
+    // KTHREAD1: the claim is in flight until its one completion (the tail below, or earlier if a
+    // kernel thread is entered from this exception's drain).
+    if let Some(ack) = claimed {
+        crate::arch::aarch64::irq::note_claim_in_flight(trap_cpu, ack);
+    }
     // QEMU-CONTEXT1 §2 — COMMIT. Kinds 9..=16 are lower-EL (EL0) exceptions: the asm prologue
     // captured the interrupted task's q0..q31, FPCR, FPSR and TPIDR_EL0 into this frame before
     // any compiled code ran; before anything can block, switch or diverge into idle, that state
@@ -7555,7 +7560,10 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     // reprogrammed `CNTP_TVAL_EL0`, so the level source is deasserted and the distributor will
     // not immediately re-present it.
     if let Some(ack) = claimed {
-        crate::arch::aarch64::irq::complete_interrupt(ack);
+        // KTHREAD1: unless a kernel-thread dispatch already completed this claim.
+        if crate::arch::aarch64::irq::take_in_flight(trap_cpu).is_some() {
+            crate::arch::aarch64::irq::complete_interrupt(ack);
+        }
         #[cfg(feature = "aarch64-pl011-irq-witness")]
         crate::arch::aarch64::pl011_irq_witness::note_completion_written(ack);
         // QEMU-SMP2 §5: the reschedule SGI's completion, recorded after the one EOIR write.

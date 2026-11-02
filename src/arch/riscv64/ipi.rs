@@ -64,6 +64,9 @@ pub enum ArrivalOrigin {
     /// Taken at this CPU's armed idle boundary (the stack-free `wfi` loop): an idle queue advance
     /// is owed.
     Idle,
+    /// KTHREAD1: taken while a kernel thread ran (its own vector, its own stack): the thread owes
+    /// a scheduling point; nothing is dispatched from the interrupt.
+    KernelThread,
 }
 
 /// One supervisor software interrupt, as its entry owner consumed it. Carried to the shared trap
@@ -378,10 +381,12 @@ pub fn take_arrival(cpu: CpuId, origin: ArrivalOrigin) -> IpiArrival {
         .map_or(0, |p| p.swap(0, Ordering::AcqRel));
     if let Some(row) = TAKEN.get(cpu.0 as usize) {
         bump(&row[0]);
-        bump(match origin {
-            ArrivalOrigin::User => &row[1],
-            ArrivalOrigin::Idle => &row[2],
-        });
+        match origin {
+            ArrivalOrigin::User => bump(&row[1]),
+            ArrivalOrigin::Idle => bump(&row[2]),
+            // Counted among all arrivals (`row[0]`) only; the per-origin lanes keep their meaning.
+            ArrivalOrigin::KernelThread => {}
+        }
         if sources == 0 {
             bump(&row[4]);
         } else {

@@ -348,6 +348,38 @@ pub fn controller_configured() -> bool {
     GIC_CONFIGURED.load(Ordering::Relaxed)
 }
 
+/// KTHREAD1 — per CPU: the claim this CPU's exception vector took and has not completed yet
+/// (`raw + 1`; 0 = none). A kernel thread entered from the drain of that exception would otherwise
+/// run with the claimed interrupt still active, and the GIC's running priority would hold off every
+/// timer and reschedule interrupt until the vector tail. The claim is completed before the thread
+/// is entered ([`complete_in_flight`]); the tail then completes only what is still in flight, so
+/// each claim is still completed exactly once.
+static IN_FLIGHT: [core::sync::atomic::AtomicU64; crate::arch::platform_constants::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::arch::platform_constants::MAX_CPUS];
+
+/// Record `ack` as `cpu`'s in-flight claim (called by the vector entry right after the claim).
+pub fn note_claim_in_flight(cpu: crate::kernel::scheduler::CpuId, ack: GicAck) {
+    if let Some(slot) = IN_FLIGHT.get(cpu.0 as usize) {
+        slot.store(u64::from(ack.raw()) + 1, Ordering::Release);
+    }
+}
+
+/// Take `cpu`'s in-flight claim, if it still has one, leaving none. The vector tail takes it and
+/// completes it itself; `Some` means no kernel-thread dispatch completed it first.
+pub fn take_in_flight(cpu: crate::kernel::scheduler::CpuId) -> Option<GicAck> {
+    let raw = IN_FLIGHT.get(cpu.0 as usize)?.swap(0, Ordering::AcqRel);
+    (raw != 0).then(|| GicAck((raw - 1) as u32))
+}
+
+/// Complete `cpu`'s in-flight claim, if it still has one; returns the completed claim. The
+/// kernel-thread dispatch calls this before it enters a thread (by then the handler has re-armed
+/// the timer and drained any device, as the tail would require).
+pub fn complete_in_flight(cpu: crate::kernel::scheduler::CpuId) -> Option<GicAck> {
+    let ack = take_in_flight(cpu)?;
+    complete_interrupt(ack);
+    Some(ack)
+}
+
 /// One GICv2 acknowledgement: the raw `GICC_IAR` value a claim returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GicAck(u32);

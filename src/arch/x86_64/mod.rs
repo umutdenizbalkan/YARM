@@ -11,6 +11,7 @@ pub mod console;
 pub mod context_switch;
 pub mod descriptor_tables;
 pub mod irq;
+pub mod kthread;
 pub mod page_table;
 pub mod percpu;
 pub mod platform_layout;

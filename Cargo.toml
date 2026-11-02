@@ -94,6 +94,13 @@ aarch64-smp2-witness = []
 # to each hart, the bounded IPI / fence / context transaction record, and its synchronous dump.
 # Armed only together with `yarm.ap_user_dispatch=1` on a `-smp 2` boot.
 riscv64-smp3-witness = []
+# KTHREAD1: the kernel-thread witness — genuine privileged threads alongside the user workload on
+# every admitted CPU, with a sealed record of dispatches, switches, kernel-origin interrupts,
+# remote wakes and create/exit/reuse cycles. Default off; no worker exists without it.
+kthread1-witness = []
+x86-kthread1-witness = ["x86-apsched-witness", "kthread1-witness"]
+aarch64-kthread1-witness = ["aarch64-apsched-witness", "kthread1-witness"]
+riscv64-kthread1-witness = ["riscv64-apsched-witness", "kthread1-witness"]
 # SHARED-REGION-LIFETIME2: the RISC-V shared-region replacement witness — a receive installs over a
 # page whose translation is live on the other hart. Reuses the QEMU-SMP3 secondary bring-up and
 # replaces its tasks; armed by `yarm.ap_user_dispatch=1`.

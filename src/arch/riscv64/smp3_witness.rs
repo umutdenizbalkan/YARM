@@ -638,6 +638,8 @@ pub fn note_arrival(
             (rec::ORIGIN_USER, window_of(tid, sepc as u64))
         }
         crate::arch::riscv64::ipi::ArrivalOrigin::Idle => (rec::ORIGIN_IDLE, rec::WINDOW_NONE),
+        // Not an SMP3 population (that witness runs no kernel thread).
+        crate::arch::riscv64::ipi::ArrivalOrigin::KernelThread => return,
     };
     // QEMU-SMP3-SEAL: the hart's supervisor-entry count (this entry included) — its entry history
     // — and the address space `satp` names as the interrupt is taken (the interrupted task's).

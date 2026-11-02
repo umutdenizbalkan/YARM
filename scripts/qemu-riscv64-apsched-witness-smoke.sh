@@ -40,9 +40,12 @@ BOOT_LOG="$LOGDIR/boot.log"
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
 # SCHED-LOCK1: `APSW_FEATURE=riscv64-sched-lock1-witness` runs the same workload with the
 # independence/wake witness co-enabled (`scripts/qemu-sched-lock1-witness-smoke.sh`); nothing else.
+# KTHREAD1: `APSW_FEATURE=riscv64-kthread1-witness` co-enables the kernel-thread witness
+# (`scripts/qemu-kthread1-witness-smoke.sh`); `APSW_ALSO_STOP` names a second marker the boot must
+# also reach before it is stopped.
 FEATURE=${APSW_FEATURE:-riscv64-apsched-witness}
 case "$FEATURE" in
-  riscv64-apsched-witness|riscv64-sched-lock1-witness) ;;
+  riscv64-apsched-witness|riscv64-sched-lock1-witness|riscv64-kthread1-witness) ;;
   *) echo "APSW_WITNESS_SEAL arch=riscv64 result=fail reason=unsupported_feature feature=$FEATURE"; exit 2 ;;
 esac
 PIN=scripts/firmware/riscv64-opensbi.pin
@@ -93,7 +96,7 @@ STOP_AT=APSW_DUMP_END
 python3 - "$QEMU_BIN" "$BUILD_DIR" "$BOOT_LOG" "${TIMEOUT_SECS:-600}" "$CMDLINE" "$SMP" "$STOP_AT" <<'PY'
 import subprocess, sys, time, os, select
 qemu, build, log, budget, cmdline, smp = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), sys.argv[5], sys.argv[6]
-stop_at = sys.argv[7].encode()
+pending = {sys.argv[7].encode()} | ({os.environ["APSW_ALSO_STOP"].encode()} if os.environ.get("APSW_ALSO_STOP") else set())
 args = [qemu, "-machine", "virt", "-cpu", "rv64", "-m", "512M", "-smp", smp,
         "-nographic", "-monitor", "none", "-serial", "stdio",
         "-bios", os.path.join(build, "opensbi-fw_dynamic.bin"), "-no-reboot",
@@ -110,8 +113,10 @@ with open(log, "wb") as out:
             if not chunk:
                 break
             out.write(chunk); out.flush()
-            tail = (tail + chunk)[-4096:]
-            if seen is None and stop_at in tail:
+            window = tail + chunk
+            pending = {m for m in pending if m not in window}
+            tail = window[-4096:]
+            if seen is None and not pending:
                 seen = time.time()
         now = time.time()
         if (seen is not None and now - seen > 3) or now - start > budget:

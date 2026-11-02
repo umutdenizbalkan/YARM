@@ -257,7 +257,8 @@ fn ap_ist_tops(cpu: usize) -> Option<(u64, u64, u64)> {
 
 /// AP-SCHED4 §B — the kernel's own address space on x86_64: the boot root the boot CPU ran before
 /// its first user entry (the kernel image, the direct map, the LAPIC/IOAPIC window and the low
-/// identity; no user mapping). Recorded once, at the first secondary's preparation.
+/// identity; no user mapping). Recorded once, when secondary bring-up starts (KTHREAD1: with or
+/// without secondaries), and again, to the same value, at each secondary's preparation.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static KERNEL_ROOT_CR3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -315,6 +316,75 @@ pub(crate) fn load_production_idt_on_this_cpu() -> u64 {
         let mut out = [0u8; 10];
         core::arch::asm!("sidt [{}]", in(reg) out.as_mut_ptr(), options(nostack, preserves_flags));
         u64::from_le_bytes(out[2..10].try_into().unwrap_or([0; 8]))
+    }
+}
+
+/// KTHREAD1 — the IDT a CPU runs while a kernel thread executes: a copy of the production IDT
+/// whose timer (0x20) and reschedule (0xF1) gates enter the kernel-thread stubs instead. Every
+/// other gate — exceptions, NMI, the IST assignments — is the production gate, so a fault on a
+/// kernel thread is the same kernel-fatal fault it is anywhere in ring 0. Built once, from the
+/// final production IDT, by the first CPU that needs it; read-only afterwards.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut KTHREAD_IDT: [X86IdtEntry; IDT_ENTRIES] =
+    [const { X86IdtEntry::missing() }; IDT_ENTRIES];
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static KTHREAD_IDT_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// KTHREAD1 — load the kernel-thread IDT on this CPU (building it on first use).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn load_kthread_idt() {
+    use core::sync::atomic::Ordering as O;
+    if KTHREAD_IDT_STATE.load(O::Acquire) != 2 {
+        if KTHREAD_IDT_STATE
+            .compare_exchange(0, 1, O::AcqRel, O::Acquire)
+            .is_ok()
+        {
+            // SAFETY: BOOT_IDT is complete (a kernel thread runs only after boot publication) and
+            // never rewritten; KTHREAD_IDT is written only here, before state 2 publishes it.
+            unsafe {
+                let src = core::ptr::addr_of!(BOOT_IDT).cast::<X86IdtEntry>();
+                let dst = core::ptr::addr_of_mut!(KTHREAD_IDT).cast::<X86IdtEntry>();
+                core::ptr::copy_nonoverlapping(src, dst, IDT_ENTRIES);
+                core::ptr::write(
+                    dst.add(VEC_TIMER),
+                    X86IdtEntry::new_interrupt(
+                        super::kthread::yarm_x86_64_kthread_timer_stub as *const () as u64,
+                        KERNEL_CODE_SELECTOR,
+                        0,
+                        0,
+                    ),
+                );
+                core::ptr::write(
+                    dst.add(AP_REMOTE_WAKE_VECTOR as usize),
+                    X86IdtEntry::new_interrupt(
+                        super::kthread::yarm_x86_64_kthread_resched_stub as *const () as u64,
+                        KERNEL_CODE_SELECTOR,
+                        0,
+                        0,
+                    ),
+                );
+            }
+            KTHREAD_IDT_STATE.store(2, O::Release);
+        } else {
+            while KTHREAD_IDT_STATE.load(O::Acquire) != 2 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+    // SAFETY: KTHREAD_IDT is complete (state 2) and never rewritten.
+    unsafe {
+        let idtr = X86IdtPointer::from_ptr(core::ptr::addr_of!(KTHREAD_IDT).cast::<X86IdtEntry>());
+        core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
+    }
+}
+
+/// KTHREAD1 — load the production IDT on this CPU (the kernel thread switched away).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn load_production_idt() {
+    // SAFETY: BOOT_IDT is populated once, before any secondary starts, and never rewritten.
+    unsafe {
+        let idtr = X86IdtPointer::from_ptr(core::ptr::addr_of!(BOOT_IDT).cast::<X86IdtEntry>());
+        core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
     }
 }
 

@@ -6,6 +6,7 @@ pub mod console;
 pub mod context_switch;
 pub mod ipi;
 pub mod irq;
+pub mod kthread;
 pub mod page_table;
 pub mod platform_layout;
 pub mod plic;

@@ -739,6 +739,46 @@ pub(crate) fn riscv_trap_stack_top_for_cpu(cpu: usize) -> Option<u64> {
     None
 }
 
+/// KTHREAD1 — the logical CPU whose CANONICAL trap-stack top is `top`, or `None` when `top` is no
+/// CPU's canonical top. The kernel-thread trap handler reads `sscratch` (left at this hart's top by
+/// every return path) and requires an exact match, so the hardware's answer is checked, not assumed.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub(crate) fn riscv_cpu_of_canonical_trap_stack_top(
+    top: usize,
+) -> Option<crate::kernel::scheduler::CpuId> {
+    use core::sync::atomic::Ordering;
+    if top as u64 == riscv_trap_stack_top() {
+        return Some(crate::kernel::scheduler::CpuId(
+            crate::arch::platform_constants::BOOTSTRAP_CPU_ID,
+        ));
+    }
+    for slot in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
+        let t = RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].load(Ordering::Acquire);
+        let cpu = RISCV64_SECONDARY_CPU_IDS[slot].load(Ordering::Acquire);
+        if t != 0 && (t & !0xf) == top && cpu != usize::MAX && cpu <= u8::MAX as usize {
+            return Some(crate::kernel::scheduler::CpuId(cpu as u8));
+        }
+    }
+    None
+}
+
+/// KTHREAD1 — a trap on a kernel thread that is not a serviced interrupt is kernel-fatal.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub(crate) fn kthread_fatal_halt() -> ! {
+    riscv_trap_halt("kthread_fault")
+}
+
+/// KTHREAD1 — the CPU running the kernel thread whose stack holds `sp`, when that thread is the one
+/// resident on its home CPU. `None` for any other stack.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn kthread_executing_cpu(sp: usize) -> Option<crate::kernel::scheduler::CpuId> {
+    let pool = &trap_shared_kernel_riscv()?.kthreads;
+    let slot = pool.slot_of_stack_addr(sp)?;
+    (0..crate::kernel::scheduler::MAX_CPUS)
+        .map(|c| crate::kernel::scheduler::CpuId(c as u8))
+        .find(|&c| pool.resident_on(c).is_some_and(|id| id.slot() == slot))
+}
+
 /// QEMU-SMP3 witness — the logical CPU executing this kernel code, from `sscratch`. On every trap
 /// entry the vector leaves `sscratch` at the trapping hart's canonical trap-stack top, and a
 /// released secondary set it to its own before its first trap, so the region lookup names the
@@ -766,6 +806,12 @@ pub(crate) fn riscv_executing_cpu() -> crate::kernel::scheduler::CpuId {
     let sp: usize;
     unsafe {
         core::arch::asm!("mv {0}, sp", out(reg) sp, options(nostack, nomem, preserves_flags));
+    }
+    // KTHREAD1: a kernel thread runs on its own stack, which is in no trap-stack region — the
+    // region lookup below would name the boot CPU for it. Its CPU is the one whose residency
+    // record names that stack's slot.
+    if let Some(cpu) = kthread_executing_cpu(sp) {
+        return cpu;
     }
     let on_trap_stack = riscv_logical_cpu_for_trap_frame(sp);
     if on_trap_stack.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
@@ -1492,6 +1538,20 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         } else {
             // Same task continuing past its own ecall: YARM ABI returns
             // a0=ret0, a1=ret1, a2=ret2, a3=error (mirrors AArch64).
+            //
+            // KTHREAD1: a drain on this trap re-selected the trap's own task and applied its saved
+            // continuation (only the exact-token resume names a frame's owner, and this frame was
+            // built fresh for this trap). Unless a completion consumer already encoded the result,
+            // return what the completion published into those lanes, not the provisional return.
+            if !continuation && tframe.resume_owner().is_some_and(|o| o.tid == resume_tid) {
+                tframe.adopt_restored_riscv_syscall_returns();
+                crate::yarm_log!(
+                    "RISCV_PARK_SELF_RESUME cpu={} tid={} a0={} result=ok",
+                    cpu.0,
+                    resume_tid,
+                    tframe.ret0()
+                );
+            }
             if let Some(err) = tframe.error_code() {
                 frame.regs[RiscvTrapFrame::A0] = err as u64;
                 frame.regs[RiscvTrapFrame::A1] = 0;

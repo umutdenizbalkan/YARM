@@ -170,6 +170,24 @@ impl RingQueue {
         Some(tid)
     }
 
+    /// KTHREAD1 — the first entry that is not a kernel thread, in FIFO order. Read-only.
+    /// KTHREAD1 — the queued entries that are user tasks (kernel-thread ids excluded).
+    fn user_len(&self) -> usize {
+        (0..self.len)
+            .filter(|offset| {
+                !crate::kernel::kthread::is_kthread_tid(
+                    self.tids[Self::index(self.head + offset)].0,
+                )
+            })
+            .count()
+    }
+
+    fn first_user(&self) -> Option<ThreadId> {
+        (0..self.len)
+            .map(|offset| self.tids[Self::index(self.head + offset)])
+            .find(|tid| !crate::kernel::kthread::is_kthread_tid(tid.0))
+    }
+
     /// Non-mutating peek of the head (the TID `pop` would return next). Read-only.
     fn peek(&self) -> Option<ThreadId> {
         if self.len == 0 {
@@ -407,11 +425,21 @@ impl PriorityScheduler {
         Ok(())
     }
 
+    /// The unfiltered dequeue. KTHREAD1: it never returns a kernel thread — only the
+    /// acceptance-filtered selection, under an authority whose caller can run one, does — so a
+    /// queued kernel thread is skipped in place here and keeps its FIFO position.
     fn dequeue_highest(&mut self) -> Option<ScheduledTask> {
         for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            if let Some(tid) = self.queues[Self::priority_index(priority)].pop() {
-                return Some(ScheduledTask { tid, priority });
+            let queue = &mut self.queues[Self::priority_index(priority)];
+            let Some(tid) = queue.first_user() else {
+                continue;
+            };
+            if queue.peek() == Some(tid) {
+                queue.pop();
+            } else {
+                queue.remove_tid(tid);
             }
+            return Some(ScheduledTask { tid, priority });
         }
         None
     }
@@ -421,7 +449,7 @@ impl PriorityScheduler {
     /// WITHOUT dequeuing it. Read-only — same priority scan order as `dequeue_highest`.
     fn peek_highest(&self) -> Option<ThreadId> {
         for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            if let Some(tid) = self.queues[Self::priority_index(priority)].peek() {
+            if let Some(tid) = self.queues[Self::priority_index(priority)].first_user() {
                 return Some(tid);
             }
         }
@@ -634,8 +662,12 @@ impl PriorityScheduler {
                 return DispatchSelection::ContinuedCurrent { tid: running.tid };
             }
         }
-        // Scan queues in priority order for the preferred TID.
+        // Scan queues in priority order for the preferred TID. KTHREAD1: a kernel thread is never
+        // a preferred handoff target (it is dispatched only by the filtered selection).
         for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            if crate::kernel::kthread::is_kthread_tid(preferred.0) {
+                break;
+            }
             if self.queues[Self::priority_index(priority)].remove_tid(preferred) {
                 self.current = Some(ScheduledTask {
                     tid: preferred,
@@ -743,6 +775,18 @@ impl PriorityScheduler {
     pub fn runnable_count(&self) -> usize {
         self.queues.iter().map(|queue| queue.len).sum()
     }
+
+    /// KTHREAD1 — user tasks queued or current here: balanced placement's load measure. A kernel
+    /// thread is pinned to its home and runs cooperatively, so its passing presence in a queue
+    /// does not steer the permanent home balanced placement chooses for a user task. With no
+    /// kernel thread present this equals queued + current.
+    fn user_load(&self) -> usize {
+        let queued: usize = self.queues.iter().map(RingQueue::user_len).sum();
+        let current = self
+            .current
+            .is_some_and(|t| !crate::kernel::kthread::is_kthread_tid(t.tid.0));
+        queued + usize::from(current)
+    }
 }
 
 /// SCHED-LOCK1 — the clock owner: the one CPU whose timer interrupts advance the scheduler tick.
@@ -766,8 +810,9 @@ impl CpuSched {
         }
     }
 
+    /// Balanced placement's load: the user tasks queued or current here (KTHREAD1).
     fn load(&self) -> usize {
-        self.rq.runnable_count() + usize::from(self.rq.current.is_some())
+        self.rq.user_load()
     }
 
     /// SCHED-LOCK1 witness only: the current slot, read-only.
@@ -991,7 +1036,7 @@ impl SchedDomain {
         })
     }
 
-    /// CPU `idx`'s published load (queued + current).
+    /// CPU `idx`'s published load (user tasks queued + current; KTHREAD1 excludes kernel threads).
     pub(crate) fn load_mirror(&self, idx: usize) -> usize {
         self.cpus
             .get(idx)

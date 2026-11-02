@@ -34,9 +34,12 @@ BOOT_LOG="$LOGDIR/boot.log"
 QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64}
 # SCHED-LOCK1: `APSW_FEATURE=aarch64-sched-lock1-witness` runs the same workload with the
 # independence/wake witness co-enabled (`scripts/qemu-sched-lock1-witness-smoke.sh`); nothing else.
+# KTHREAD1: `APSW_FEATURE=aarch64-kthread1-witness` co-enables the kernel-thread witness
+# (`scripts/qemu-kthread1-witness-smoke.sh`); `APSW_ALSO_STOP` names a second marker the boot must
+# also reach before it is stopped.
 FEATURE=${APSW_FEATURE:-aarch64-apsched-witness}
 case "$FEATURE" in
-  aarch64-apsched-witness|aarch64-sched-lock1-witness) ;;
+  aarch64-apsched-witness|aarch64-sched-lock1-witness|aarch64-kthread1-witness) ;;
   *) echo "APSW_WITNESS_SEAL arch=aarch64 result=fail reason=unsupported_feature feature=$FEATURE"; exit 2 ;;
 esac
 
@@ -81,6 +84,7 @@ args = [qemu, "-machine", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "102
         "-initrd", os.path.join(build, "initramfs-core.cpio")]
 p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
 start, seen, tail = time.time(), None, b""
+pending = {b"APSW_DUMP_END"} | ({os.environ["APSW_ALSO_STOP"].encode()} if os.environ.get("APSW_ALSO_STOP") else set())
 with open(log, "wb") as out:
     while True:
         r, _, _ = select.select([p.stdout], [], [], 0.5)
@@ -89,8 +93,10 @@ with open(log, "wb") as out:
             if not chunk:
                 break
             out.write(chunk); out.flush()
-            tail = (tail + chunk)[-4096:]
-            if seen is None and b"APSW_DUMP_END" in tail:
+            window = tail + chunk
+            pending = {m for m in pending if m not in window}
+            tail = window[-4096:]
+            if seen is None and not pending:
                 seen = time.time()
         now = time.time()
         if (seen is not None and now - seen > 3) or now - start > budget:

@@ -191,6 +191,12 @@ pub enum ArrivalOrigin {
     Kernel,
 }
 
+/// KTHREAD1 witness — the logical CPU that requested the reschedule SGI `raw_token` names.
+#[cfg(feature = "kthread1-witness")]
+pub fn sgi_source_cpu(raw_token: u32) -> Option<usize> {
+    TARGETS.cpu_of_interface(sgi_source_interface(raw_token))
+}
+
 /// Count one claimed reschedule SGI. `raw_token` is the whole `GICC_IAR` value.
 pub fn note_sgi_arrival(cpu: CpuId, raw_token: u32, origin: ArrivalOrigin, elr: u64) {
     let Some(row) = ARRIVALS.get(cpu.0 as usize) else {

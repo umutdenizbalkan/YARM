@@ -36,6 +36,9 @@ pub mod idle_boundary;
 pub mod ipc;
 pub mod ipccall_direct;
 pub mod ipccall_direct_txn;
+pub mod kthread;
+#[cfg(feature = "kthread1-witness")]
+pub mod kthread_witness;
 pub mod lock;
 /// SCHED-LOCK1 — the QEMU independence and wake witness (default-off; layered on the AP-scheduling
 /// witness, whose workload it runs on). No default or production profile carries it.

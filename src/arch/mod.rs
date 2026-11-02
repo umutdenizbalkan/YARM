@@ -64,6 +64,7 @@ pub mod hal;
 pub mod hal_adapters;
 pub mod irq_description;
 pub mod irq_guard;
+pub mod kthread;
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 /// AP-SCHED2 §2 — the RISC-V hart-admission policy (identity, dispatch capability, real limits,
