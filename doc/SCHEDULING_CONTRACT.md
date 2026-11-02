@@ -2360,11 +2360,14 @@ decision input (reschedule pending) before its scheduling point. Then come the p
 section, an interrupt-masking guard, a lost wakeup, a stale id against the same slot's next
 incarnation), create/exit/reuse cycles and pool exhaustion. Each record is written BEFORE the
 action it describes when the action can be observed elsewhere (wake request, decision, reclaim),
-so record order never contradicts causality. Records sit in per-CPU rings with one global sequence,
-each line carries an FNV-1a checksum, and a `KT1_SEAL` closes the set.
+so record order never contradicts causality. Records sit in per-CPU rings with one global sequence.
+The set is dumped twice, because the console is shared with raw byte writers that take no line
+lock (AArch64 `activate_asid`'s progress bytes); each line, the `KT1_SEAL` that closes each pass
+included, carries an FNV-1a checksum.
 
 `scripts/grade-kthread1-witness.py` grades validity (checksums, a contiguous sequence, the seal)
-before coverage, and only from the sealed records. The coverage obligations are listed in its
+before coverage, and only from the sealed records. A damaged line counts for nothing and is never
+repaired; a record whose every copy is damaged is missing, and the run is invalid. The coverage obligations are listed in its
 header; each is required on every CPU of the declared population. `tests/kthread1_witness_grader.rs`
 pins it: a real record set (`tests/fixtures/kthread1/base.rec`) passes, and named alterations are
 refused, each for its own reason. `scripts/qemu-kthread1-witness-smoke.sh` binds the image through

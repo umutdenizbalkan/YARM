@@ -3,8 +3,8 @@
 
 //! KTHREAD1 — the kernel-thread witness grader, exercised through its CLI.
 //!
-//! `tests/fixtures/kthread1/base.rec` holds the `KT1_REC` / `KT1_SEAL` lines of a passing two-CPU
-//! RISC-V witness boot. Every case below derives one record set from it by a named edit, re-seals
+//! `tests/fixtures/kthread1/base.rec` holds the `KT1_REC` / `KT1_SEAL` lines (both dump passes) of a
+//! passing two-CPU RISC-V witness boot. Every case below derives one record set from it by a named edit, re-seals
 //! it (each record's checksum and the seal recomputed, so only the edit itself is under test,
 //! except where the case tampers with the integrity data on purpose), writes it to a file, runs
 //! `scripts/grade-kthread1-witness.py --expect-cpus N <file>` and requires the exit status and the
@@ -65,7 +65,9 @@ fn parse_from(text: &str) -> Vec<Rec> {
         }
         out.push(r);
     }
+    // The dump has two passes; each record is taken once.
     out.sort_by_key(|r| r.seq);
+    out.dedup_by_key(|r| r.seq);
     assert!(out.len() > 100, "the fixture holds a full record set");
     out
 }
@@ -77,8 +79,8 @@ fn body(r: &Rec) -> String {
     )
 }
 
-/// The record set as a dump: per-record checksums and a seal over them.
-fn seal(recs: &[Rec]) -> String {
+/// One pass of a dump: per-record checksums, then a seal over them with its own checksum.
+fn pass(recs: &[Rec]) -> String {
     let mut s = String::new();
     let mut h: u32 = 0x811C_9DC5;
     for r in recs {
@@ -87,12 +89,33 @@ fn seal(recs: &[Rec]) -> String {
         h = (h ^ crc).wrapping_mul(0x0100_0193);
         s.push_str(&format!("{b} crc=0x{crc:08x}\n"));
     }
-    s.push_str(&format!(
-        "KT1_SEAL records={} taken={} overflow=0 seal=0x{h:08x}\nKT1_DUMP_END\n",
+    let seal = format!(
+        "KT1_SEAL records={} taken={} overflow=0 seal=0x{h:08x}",
         recs.len(),
         recs.len()
-    ));
+    );
+    s.push_str(&format!("{seal} crc=0x{:08x}\n", fnv(seal.as_bytes())));
     s
+}
+
+/// The record set as a single-pass dump.
+fn seal(recs: &[Rec]) -> String {
+    pass(recs) + "KT1_DUMP_END\n"
+}
+
+/// The record set as the witness dumps it: two passes.
+fn dumped(recs: &[Rec]) -> String {
+    pass(recs) + &pass(recs) + "KT1_DUMP_END\n"
+}
+
+/// The `n`th `KT1_REC` line of `seq` damaged as a stray console byte damages it (the byte seen
+/// live: `seq=423 3kind=decide`).
+fn damage(text: &str, seq: u64, n: usize) -> String {
+    let key = format!("KT1_REC seq={seq} kind=");
+    let at = text.match_indices(&key).nth(n).expect("that copy").0;
+    let mut out = text.to_string();
+    out.insert(at + key.len() - "kind=".len(), '3');
+    out
 }
 
 fn grade(text: &str, cpus: u32, tag: &str) -> (i32, String) {
@@ -168,11 +191,12 @@ fn integrity_failures_award_nothing() {
         .to_string();
     let bad = line.replacen("f1=0x1 ", "f1=0x2 ", 1);
     assert_ne!(bad, line);
+    // The edited line fails its checksum: it counts for nothing, so its record is missing.
     expect_fail(
         "checksum",
         &tampered.replacen(&line, &bad, 1),
         2,
-        "invalid record_checksum",
+        "invalid sequence_gap",
     );
     // A record removed: the sequence has a gap (and the seal no longer matches).
     expect_fail(
@@ -183,21 +207,84 @@ fn integrity_failures_award_nothing() {
         2,
         "invalid sequence_gap",
     );
-    // The seal's count disagrees with the records.
+    // The seal's count disagrees with the records (re-sealed, so the seal's own checksum holds).
     let s = seal(&parse());
     let n = parse().len();
+    let reseal = |old: &str, new: &str| {
+        let line = s.lines().find(|l| l.starts_with("KT1_SEAL ")).unwrap();
+        let text = line.split(" crc=").next().unwrap().replace(old, new);
+        s.replace(line, &format!("{text} crc=0x{:08x}", fnv(text.as_bytes())))
+    };
     expect_fail(
         "seal_count",
-        &s.replace(&format!("records={n} "), &format!("records={} ", n + 1)),
+        &reseal(&format!("records={n} "), &format!("records={} ", n + 1)),
         2,
         "invalid seal_count",
     );
     // Ring overflow declared.
     expect_fail(
         "overflow",
-        &s.replace("overflow=0", "overflow=3"),
+        &reseal("overflow=0", "overflow=3"),
         2,
         "invalid ring_overflow",
+    );
+    // A seal edited without its checksum is no seal.
+    expect_fail(
+        "seal_checksum",
+        &s.replace("overflow=0", "overflow=3"),
+        2,
+        "invalid seal_missing",
+    );
+}
+
+#[test]
+fn a_record_needs_one_intact_copy() {
+    let recs = parse();
+    // Both passes intact: pass, nothing damaged.
+    let (code, out) = grade(&dumped(&recs), 2, "two_pass");
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("damaged_lines"), "{out}");
+    // One copy damaged: the other copy carries the record; the damage is reported.
+    let (code, out) = grade(&damage(&dumped(&recs), 40, 0), 2, "one_damaged");
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("[info] damaged_lines=1 "), "{out}");
+    let (code, out) = grade(&damage(&dumped(&recs), 40, 1), 2, "other_damaged");
+    assert_eq!(code, 0, "{out}");
+    // Both copies damaged: the record is missing.
+    expect_fail(
+        "both_damaged",
+        // (the first damage leaves one intact copy, now the first match)
+        &damage(&damage(&dumped(&recs), 40, 0), 40, 0),
+        2,
+        "invalid sequence_gap",
+    );
+    // Two intact copies that differ: refused, whichever came first.
+    let mut other = recs.clone();
+    other[40].f[0] ^= 1;
+    expect_fail(
+        "conflict",
+        &(pass(&recs) + &pass(&other) + "KT1_DUMP_END\n"),
+        2,
+        "invalid record_conflict seq=40",
+    );
+    // A seal per pass; one damaged seal is recovered from the other, two intact seals must agree.
+    let one_seal = dumped(&recs).replacen("KT1_SEAL records=", "KT1_SEAL 4records=", 1);
+    let (code, out) = grade(&one_seal, 2, "one_seal_damaged");
+    assert_eq!(code, 0, "{out}");
+    let mut fewer = recs.clone();
+    fewer.pop();
+    let pass2 = pass(&recs);
+    let seal_fewer = pass(&fewer)
+        .lines()
+        .find(|l| l.starts_with("KT1_SEAL "))
+        .unwrap()
+        .to_string();
+    let seal_all = pass2.lines().find(|l| l.starts_with("KT1_SEAL ")).unwrap();
+    expect_fail(
+        "seals_disagree",
+        &(pass(&recs) + &pass2.replace(seal_all, &seal_fewer) + "KT1_DUMP_END\n"),
+        2,
+        "invalid seal_conflicting",
     );
 }
 

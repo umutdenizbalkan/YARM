@@ -2862,22 +2862,6 @@ drains settle the same refusal as typed idle; the D2 drains should too.
   That gate was withdrawn. The cause was the placement measure: any uneven kernel-thread presence
   skewed the permanent home of user tasks placed meanwhile. Balanced placement's load now counts
   user tasks only (a policy decision recorded in contract §18.1).
-* **First freeze, `d095890c`:** its scheduled run (kept in full in the qualification record) failed
-  Q9's three RISC-V 2-CPU boots on the workload's idle wake (`no IPI taken at CPU 1's idle
-  boundary after the wake`), as one pre-check had once before; KT1 itself passed each. The
-  workload's phase B wakes each sleeper while its CPU is idle; KT1's kernel threads running there
-  made it busy. The witness now starts once phase B is over (the first `P_PING`, or a terminal
-  step such as `P_NO_AP` or a timeout); the IPC and churn phases still run user tasks on every
-  secondary beside it. Re-frozen; the whole schedule runs again.
-
-*Schedule revision before the second freeze* (written before it runs). The first run's AArch64
-SMP2 regression failed `sgi_unexplained_arrival`. Its verifier (`smp2_record::check_sgi_population`)
-lets one arrival consume every earlier unconsumed send to that CPU, so two sends that the GIC
-delivers as two arrivals leave the second unexplained. That is a record-order race in the existing
-verifier, with no kernel thread in that boot. Measured on this host, four boots each: the base
-`298c591b` passed 0 of 4, the candidate 1 of 4, every failure `sgi_unexplained_arrival`. It is
-named and kept, not counted as a KTHREAD1 failure; repairing that verifier is outside KTHREAD1.
-Every other step and expectation is unchanged.
 * Integration, first full run: the broad-lock census guard read the hosted interrupt model's
   thread-local `IRQ_ENABLED.with(|c| …)` as three broad-lock calls (now `get`/`set`), and the two
   guards above failed on the AArch64 tail and the third mailbox consumer.
@@ -2894,6 +2878,22 @@ Every other step and expectation is unchanged.
   showed why: every user switch came before the witness's active window, and no user task was
   runnable during it (the only user workload, the AP-scheduling witness, needs a secondary). With
   one CPU the grader therefore reports user progress and does not require it.
+* **First freeze, `d095890c`:** its scheduled run (kept in full in the qualification record) failed
+  Q9's three RISC-V 2-CPU boots on the workload's idle wake (`no IPI taken at CPU 1's idle
+  boundary after the wake`), as one pre-check had once before; KT1 itself passed each. The
+  workload's phase B wakes each sleeper while its CPU is idle; KT1's kernel threads running there
+  made it busy. The witness now starts once phase B is over (the first `P_PING`, or a terminal
+  step such as `P_NO_AP` or a timeout); the IPC and churn phases still run user tasks on every
+  secondary beside it. Re-frozen; the whole schedule runs again.
+* **Second freeze, `27da1400`:** its scheduled run (kept in the qualification record) failed Q9's
+  AArch64 8-CPU boot on validity: `sequence_gap`, `seal_count`, `seal_hash`. Record 423 arrived as
+  `KT1_REC seq=423 3kind=decide …`: another CPU's `raw_uart_marker(b'3')` in AArch64
+  `activate_asid` (pre-existing progress bytes, written to the UART with no line lock) landed
+  inside the dump line, which then no longer parsed, so the record was missing. The grader was
+  right to refuse it; the witness lacked the guard SMP2 and SMP3 already use. The record set is
+  now dumped twice, each pass closed by a seal that carries its own checksum; a damaged line
+  counts for nothing and is reported, and a record is missing only when both copies are damaged.
+  Re-frozen; the whole schedule runs again.
 
 **3. Qualification schedule, fixed before the freeze.** The run is of the frozen commit carrying
 this text, from a fresh worktree, by the scratch runner `qualify.sh`. Every scheduled result is
@@ -2903,7 +2903,7 @@ reported: no reruns, no retries until passes accumulate.
 
 The steps, with the outcome each is expected to have:
 * **Q1** hosted lib, serial: 0 failed.
-* **Q2** the kernel-thread hosted tests ×3 (20 each); the grader CLI tests ×3 (13 each); the
+* **Q2** the kernel-thread hosted tests ×3 (20 each); the grader CLI tests ×3 (14 each); the
   grader self-test.
 * **Q3** integration: every suite passes. **Q4** `cargo fmt --check`: clean.
 * **Q5** the lock-site census against `298c591b`: different only by the new sites in
@@ -2943,6 +2943,20 @@ The steps, with the outcome each is expected to have:
   * the IPC residual-park witness;
   * exit of the current task on three ports;
   * shared-region direct on three ports (offset selection).
+
+*Schedule revisions*, each written before the run it governs; every other step and expectation is
+unchanged:
+* Before the second freeze: the first run's AArch64 SMP2 regression failed
+  `sgi_unexplained_arrival`. Its verifier (`smp2_record::check_sgi_population`) lets one arrival
+  consume every earlier unconsumed send to that CPU, so two sends that the GIC delivers as two
+  arrivals leave the second unexplained. That is a record-order race in the existing verifier,
+  with no kernel thread in that boot. Measured on this host, four boots each: the base `298c591b`
+  passed 0 of 4, the candidate 1 of 4, every failure `sgi_unexplained_arrival`. It is named and
+  kept, not counted as a KTHREAD1 failure; repairing that verifier is outside KTHREAD1.
+* Before the third freeze: Q2's grader CLI tests are 14 (the new case: a record needs one intact
+  copy). Q10 `corrupt_continuation` may also be refused as an invalid record set: in the second
+  run the corrupted register reached the dump itself, and 370 records carried one constant
+  checksum.
 
 **What the evidence will not show:** QEMU timing is not hardware timing; stack depth is observed,
 not bounded; no latency, fairness, starvation-freedom or WCET property is established; nothing is

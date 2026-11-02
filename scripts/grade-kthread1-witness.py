@@ -9,11 +9,15 @@ Usage: grade-kthread1-witness.py --expect-cpus N <boot.log>
 Grades the sealed KT1 record set a `kthread1-witness` boot dumps (`src/kernel/kthread_witness.rs`)
 in two separate steps, and never from console order:
 
-1. VALIDITY. Every `KT1_REC` line carries an FNV-1a checksum of its own text; a line that fails it is
-   rejected, never repaired. The surviving records must be exactly the sequence 0..n-1 (one record per
-   sequence number; a repeated number must repeat identical content), must match the `KT1_SEAL`
-   (record count, taken count, no ring overflow, and the seal hash recomputed over the per-record
-   checksums in sequence order), and every field must be well formed for its kind. An invalid set
+1. VALIDITY. The witness dumps the record set twice, each pass closed by a `KT1_SEAL`: the console
+   is shared with raw byte writers that take no line lock, so a line can arrive damaged. Every
+   `KT1_REC` and `KT1_SEAL` line carries an FNV-1a checksum of its own text; a line that fails it
+   (or no longer parses) is damaged: it counts for nothing and is never repaired, and the number of
+   damaged lines is reported. The intact records must be exactly the sequence 0..n-1 (a record whose
+   every copy is damaged is missing; two intact copies of a number must be identical), the intact
+   seals must agree, and the records must match that seal (record count, taken count, no ring
+   overflow, and the seal hash recomputed over the per-record checksums in sequence order), and
+   every field must be well formed for its kind. An invalid set
    is graded no further: nothing is awarded from records that cannot be trusted.
 2. COVERAGE. The population is DECLARED by the run (`pop`, the dispatching CPUs at the start) and must
    equal the CPUs the caller expects. Every obligation below is then required on every CPU of that
@@ -57,7 +61,7 @@ KID_TAG = 0x4B54 << 48
 
 REC = re.compile(r"(KT1_REC seq=(\d+) kind=(\w+) cpu=(\d+) f0=0x([0-9a-f]+) f1=0x([0-9a-f]+) "
                  r"f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+)) crc=0x([0-9a-f]{8})")
-SEAL = re.compile(r"KT1_SEAL records=(\d+) taken=(\d+) overflow=(\d+) seal=0x([0-9a-f]{8})")
+SEAL = re.compile(r"(KT1_SEAL records=(\d+) taken=(\d+) overflow=(\d+) seal=0x([0-9a-f]{8})) crc=0x([0-9a-f]{8})")
 
 
 def fnv(data):
@@ -75,32 +79,39 @@ class Rec:
 
 
 def parse(text):
-    """Return (records by seq, seal, problems)."""
+    """Return (records by seq, intact seals, problems, damaged line count)."""
     problems = []
     by_seq = {}
+    intact = 0
     for m in REC.finditer(text):
         body, crc = m.group(1), int(m.group(10), 16)
         if fnv(body.encode()) != crc:
-            problems.append("record_checksum seq=%s" % m.group(2))
             continue
+        intact += 1
         r = Rec(int(m.group(2)), m.group(3), int(m.group(4)), [int(m.group(i), 16) for i in range(5, 10)], crc)
         old = by_seq.get(r.seq)
         if old is not None and (old.kind, old.cpu, old.f) != (r.kind, r.cpu, r.f):
             problems.append("record_conflict seq=%d" % r.seq)
         by_seq.setdefault(r.seq, r)
-    seals = SEAL.findall(text)
-    return by_seq, seals, problems
+    seals = []
+    for m in SEAL.finditer(text):
+        if fnv(m.group(1).encode()) == int(m.group(6), 16):
+            seals.append(m.groups()[1:5])
+    damaged = text.count("KT1_REC") + text.count("KT1_SEAL") - intact - len(seals)
+    return by_seq, seals, problems, damaged
 
 
-def validate(by_seq, seals, problems):
+def validate(by_seq, seals, problems, damaged=0):
     fails = list(problems)
     n = len(by_seq)
     if n == 0:
         return ["no_records"]
     if sorted(by_seq) != list(range(n)):
         fails.append("sequence_gap records=%d max=%d" % (n, max(by_seq)))
-    if len(set(seals)) != 1:
-        fails.append("seal_missing_or_conflicting count=%d" % len(set(seals)))
+    if not seals:
+        fails.append("seal_missing")
+    elif len(set(seals)) != 1:
+        fails.append("seal_conflicting count=%d" % len(set(seals)))
     else:
         records, taken, overflow, seal = int(seals[0][0]), int(seals[0][1]), int(seals[0][2]), int(seals[0][3], 16)
         if records != n or taken != n:
@@ -121,7 +132,7 @@ def validate(by_seq, seals, problems):
 
 
 def grade(text, expect_cpus):
-    by_seq, seals, problems = parse(text)
+    by_seq, seals, problems, _ = parse(text)
     fails = validate(by_seq, seals, problems)
     if fails:
         return ["invalid " + f for f in fails]
@@ -363,12 +374,23 @@ def self_test():
     body = "KT1_REC seq=0 kind=pop cpu=0 f0=0x1 f1=0x1 f2=0x20 f3=0x4000 f4=0x5"
     line = "%s crc=0x%08x" % (body, fnv(body.encode()))
     h = ((0x811C9DC5 ^ fnv(body.encode())) * 0x01000193) & 0xFFFFFFFF
-    good = line + "\nKT1_SEAL records=1 taken=1 overflow=0 seal=0x%08x\n" % h
-    by, se, pr = parse(good)
-    assert validate(by, se, pr) == [], validate(by, se, pr)
+    seal = "KT1_SEAL records=1 taken=1 overflow=0 seal=0x%08x" % h
+    good = line + "\n" + "%s crc=0x%08x\n" % (seal, fnv(seal.encode()))
+
+    def resealed(text, old, new):
+        s2 = seal.replace(old, new)
+        return text.replace(seal, s2).replace("crc=0x%08x\n" % fnv(seal.encode()), "crc=0x%08x\n" % fnv(s2.encode()))
+
+    assert validate(*parse(good)) == [], validate(*parse(good))
+    assert parse(good)[3] == 0
     assert validate(*parse(good.replace("f0=0x1 ", "f0=0x3 "))) != []      # checksum
-    assert validate(*parse(good.replace("taken=1", "taken=2"))) != []      # seal count
-    assert validate(*parse(good.replace("overflow=0", "overflow=1"))) != []
+    assert parse(good.replace("f0=0x1 ", "f0=0x3 "))[3] == 1                # counted damaged
+    assert validate(*parse(good.replace("taken=1", "taken=2"))) != []      # seal checksum
+    assert validate(*parse(resealed(good, "taken=1", "taken=2"))) != []    # seal count
+    assert validate(*parse(resealed(good, "overflow=0", "overflow=1"))) != []
+    damaged = line.replace("kind=", "3kind=")                              # a stray console byte
+    assert validate(*parse(damaged + "\n" + good)) == []                   # the other copy is intact
+    assert validate(*parse(damaged + "\n" + good.replace(line, damaged))) != []
     assert grade(good, 2)[0].startswith("population_mismatch")
     print("KT1_GRADER_SELF_TEST result=pass")
 
@@ -382,7 +404,9 @@ def main(argv):
         return 2
     text = open(argv[3], "rb").read().decode("utf-8", "replace")
     fails = grade(text, int(argv[2]))
-    by_seq, _, _ = parse(text)
+    by_seq, _, _, damaged = parse(text)
+    if damaged:
+        print("[info] damaged_lines=%d (a damaged line counts for nothing; each record needs one intact copy)" % damaged)
     for f in fails:
         print("[fail] " + f)
     print("KT1_VERDICT records=%d failures=%d result=%s" % (len(by_seq), len(fails), "pass" if not fails else "fail"))

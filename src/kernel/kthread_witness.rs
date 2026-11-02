@@ -1095,7 +1095,11 @@ impl core::fmt::Write for Line {
     }
 }
 
-/// Every record, in sequence order, with a checksum per record and a seal over all of them.
+/// Every record, in sequence order, with a checksum per record and a seal over all of them, dumped
+/// twice. The console is shared with raw byte writers that take no line lock (AArch64
+/// `activate_asid` writes progress bytes straight to the UART), so a line can arrive damaged. A
+/// damaged line fails its checksum and counts for nothing; the record is lost only when both
+/// copies are damaged. The seal line carries its own checksum for the same reason.
 fn dump(ctx: &KThreadCtx) {
     use core::fmt::Write;
     let total = SEQ.load(Ordering::Acquire);
@@ -1103,6 +1107,30 @@ fn dump(ctx: &KThreadCtx) {
     for r in &RINGS {
         overflow += r.overflow.load(Ordering::Acquire);
     }
+    for _pass in 0..2 {
+        let (emitted, seal) = dump_pass(ctx, total);
+        let mut line = Line {
+            buf: [0; 224],
+            len: 0,
+        };
+        let _ = write!(
+            line,
+            "KT1_SEAL records={} taken={} overflow={} seal=0x{:08x}",
+            emitted, total, overflow, seal
+        );
+        let body = &line.buf[..line.len];
+        crate::kernel::printk::printk_emit_sync(format_args!(
+            "{} crc=0x{:08x}",
+            core::str::from_utf8(body).unwrap_or("KT1_SEAL invalid"),
+            fnv(body)
+        ));
+    }
+    crate::kernel::printk::printk_emit_sync(format_args!("KT1_DUMP_END"));
+}
+
+/// One pass of the dump: every record in sequence order. Returns the count and the seal.
+fn dump_pass(ctx: &KThreadCtx, total: u64) -> (u64, u32) {
+    use core::fmt::Write;
     let mut seal: u32 = 0x811C_9DC5;
     let mut emitted = 0u64;
     for seq in 0..total {
@@ -1153,9 +1181,5 @@ fn dump(ctx: &KThreadCtx) {
             crc
         ));
     }
-    crate::kernel::printk::printk_emit_sync(format_args!(
-        "KT1_SEAL records={} taken={} overflow={} seal=0x{:08x}",
-        emitted, total, overflow, seal
-    ));
-    crate::kernel::printk::printk_emit_sync(format_args!("KT1_DUMP_END"));
+    (emitted, seal)
 }
