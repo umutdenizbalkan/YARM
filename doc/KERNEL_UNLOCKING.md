@@ -2572,6 +2572,181 @@ The steps:
 * The dispatch-gap decision is exercised under labelled synchronization. Its natural rate is
   whatever the scheduled boots show.
 
+
+**Qualification record** (docs only; the code and tests are those of the frozen candidate).
+
+The frozen candidate is `a375c8ad`, tree `0d23219b`, base `0e21b2a6`. It was run from a fresh
+worktree by the scratch runner `qualify.sh`, with these scripts:
+
+| Script | sha256 |
+|---|---|
+| `qualify.sh` | `492d6bb7…` (the first form, `148749f2…`, without the resume override) |
+| `ctl.py` | `48826528…` |
+| `vmut.py` | `ea971bd5…` |
+| `undo.py` | `d74a5bb0…` |
+| `undo-run.sh` | `359c8cba…` |
+| `natural.py` | `4df174ee…` |
+
+Toolchain: rustc 1.101.0-nightly (32dba69d6 2026-10-09), QEMU 8.2.2.
+
+The run went 2026-10-28 16:19Z → 2026-11-02 06:03Z, with one interruption:
+* The first launch was stopped after Q4 because the background tool capped its run time; it was
+  relaunched detached, from the start.
+* A container restart then killed the runner during Q10's `no_rfence` boot. That boot's partial
+  log is kept, and the runner was resumed from that control. No completed result was rerun.
+* No scheduled run failed, so there was no re-freeze.
+
+*Hosted, source and checker evidence:*
+
+| Gate | Result |
+|---|---|
+| Q1 hosted lib, serial | 6224 passed, 0 failed, 2 ignored |
+| Q2 `smp3_record` tests ×3 | 31/31 each |
+| Q2 differential test ×3 | 5/5 each: 44 corpus cases agreed and matched, base record, step tables, producer pins |
+| Q2 corpus regeneration | identical to the committed `cases.txt` |
+| Q2 records CLI on `base.rec` | `result=ok` |
+| Q3 integration | every suite passed |
+| Q4 `cargo fmt --check` | clean |
+| Q5 lock-site census against `0e21b2a6` | identical |
+
+*Undo controls* (Q2), each repair reverted alone in a worktree of the candidate:
+
+| Repair undone | What failed |
+|---|---|
+| Rust decision check | 4 `smp3_record` tests, the base-record test and the differential (every case disagrees: the real base record, with its gap decisions, is refused) |
+| Rust group attribution | 6 `smp3_record` tests, the base-record test and the differential (42 cases) |
+| Python decision check | the base-record test and the differential (44 cases) |
+| Python group attribution | the base-record test and the differential (42 cases) |
+
+In every undo the named reproductions are among the cases that changed: the dispatch gap,
+another task of the address space, and both delayed-record orders.
+
+*Historical regrade* (labelled, apart from qualification). The frozen grader was run on the three
+retained failing logs: `64c9fdcf` (`ee0a3ba3…`), `3403a1e9` (`f0cbcdd7…`) and `155fd8d8`
+(`f385b77d…`). Each exits 1 with `ipi_group_inconsistent at=3`.
+* They predate the group and consumption records: every publication carries group 0, so the
+  group check fires before any consumption is examined.
+* The predeclared expectation, `ipi_consumption_unbound`, named the wrong first refusal. That was
+  my error in the prediction, not a candidate defect.
+* Their original verdicts under the delivered grader are in §1.
+
+*Images* (Q6–Q8, Q11), through BUILD-GATES1:
+* **The default kernels are byte-identical to `0e21b2a6`'s:** x86_64 `cb0a42ab…`, AArch64
+  `9bb5df05…`, RISC-V `d7b8663b…`.
+  * Every initramfs and rootfs binary is identical.
+  * The x86_64 and AArch64 output directories differ only in their own build logs.
+  * Warnings are identical (222 / 399 / 237; hosted 306, with the verifier now compiled hosted),
+    and section sizes are identical.
+* **Q8 witness kernels:**
+  * Identical to `0e21b2a6`'s: the three AP-scheduling witnesses, x86 VMI2, x86 SMP1 and AArch64
+    SMP2.
+  * Different, as expected: RISC-V SMP3 (`e5f4a28a…`), LOCK1 (`f2f3634c…`), VMI (`6f312fa5…`) and
+    shared-region replace (`e466f35b…`). These are the four builds containing the SMP3 witness.
+* No-FP passes on all 26 Q6/Q8 images (self-test: 101 cases, 0 mismatches).
+
+The default images are unchanged, so the production behaviour qualified at `0e21b2a6` is the
+candidate's. This is shown by image identity, not by a live run of its own.
+
+*Live, on the frozen candidate.*
+
+**Q9 — 20 scheduled strict two-hart SMP3 boots, 20/20 pass.** They alternated idle and loaded
+host, with the pinned OpenSBI and the 300 s budget; none was rerun. Columns:
+* fresh / merged: publication groups opened, and merged publications;
+* empty: empty arrivals;
+* P2: credited toward S / toward C (uncredited);
+* P3: credited S / credited C / `not_current`;
+* `interfered`: P3 attempts uncredited as interfered;
+* P4: overlapped rounds.
+
+Every boot settled 32 displaced pages after completion.
+
+| Boot | boot.log | Records | Fresh / merged | Empty | P2 | P3 | `interfered` | P4 |
+|---|---|---|---|---|---|---|---|---|
+| idle-1 | `498d9365…` | 1075 | 59 / 24 | 9 | 6 / 6 (0) | 11 / 8 / 2 | 3 | 4/4 |
+| idle-2 | `c3f51362…` | 1083 | 62 / 21 | 8 | 6 / 6 (0) | 11 / 10 / 2 | 1 | 4/4 |
+| idle-3 | `b752512d…` | 1104 | 62 / 22 | 8 | 6 / 6 (0) | 11 / 9 / 2 | 2 | 4/4 |
+| idle-4 | `837507e5…` | 1098 | 64 / 24 | 8 | 6 / 5 (1) | 11 / 7 / 2 | 4 | 4/4 |
+| idle-5 | `c0eddb70…` | 1112 | 64 / 22 | 8 | 6 / 5 (1) | 11 / 8 / 2 | 3 | 4/4 |
+| idle-6 | `746ed6bd…` | 1089 | 64 / 21 | 8 | 6 / 5 (1) | 11 / 8 / 2 | 3 | 4/4 |
+| idle-7 | `63a79671…` | 1111 | 63 / 21 | 8 | 6 / 6 (0) | 11 / 9 / 2 | 2 | 4/4 |
+| idle-8 | `d87a939c…` | 1102 | 61 / 22 | 8 | 6 / 6 (0) | 11 / 10 / 2 | 1 | 4/4 |
+| idle-9 | `e1e61d15…` | 1119 | 66 / 20 | 8 | 6 / 6 (0) | 11 / 9 / 2 | 2 | 4/4 |
+| idle-10 | `621d27c6…` | 1089 | 62 / 22 | 8 | 6 / 6 (0) | 11 / 9 / 2 | 2 | 4/4 |
+| loaded-1 | `a25bc47a…` | 1043 | 48 / 30 | 8 | 6 / 6 (0) | 11 / 6 / 2 | 5 | 4/4 |
+| loaded-2 | `85a3165b…` | 1084 | 51 / 31 | 9 | 6 / 5 (1) | 11 / 2 / 2 | 9 | 4/4 |
+| loaded-3 | `0eeea4d0…` | 1079 | 49 / 30 | 10 | 6 / 6 (0) | 11 / 5 / 1 | 7 | 4/4 |
+| loaded-4 | `1d4d97f1…` | 1108 | 48 / 31 | 8 | 6 / 6 (0) | 11 / 8 / 3 | 2 | 4/4 |
+| loaded-5 | `d490f0fd…` | 1051 | 49 / 32 | 9 | 6 / 5 (1) | 11 / 8 / 2 | 3 | 4/4 |
+| loaded-6 | `4277d178…` | 1108 | 57 / 26 | 8 | 6 / 4 (2) | 11 / 8 / 2 | 3 | 4/4 |
+| loaded-7 | `e6111bf7…` | 1061 | 54 / 28 | 8 | 6 / 6 (0) | 11 / 6 / 2 | 5 | 4/4 |
+| loaded-8 | `06898f54…` | 1021 | 49 / 27 | 8 | 6 / 6 (0) | 11 / 7 / 2 | 4 | 4/4 |
+| loaded-9 | `63f098e2…` | 1049 | 48 / 32 | 9 | 6 / 6 (0) | 11 / 5 / 2 | 6 | 4/4 |
+| loaded-10 | `e8cd111f…` | 1063 | 53 / 32 | 8 | 6 / 5 (1) | 11 / 5 / 2 | 6 | 4/4 |
+
+Every boot met the fixed thresholds: P2 ≥ 1 per direction, P3 ≥ 2 per direction (minimum: 2 with
+C as the target, loaded boot 2), and 4/4 mutual rounds overlapped. Synchronized and natural cases:
+* **Delayed merged-publication records:** 152 synchronized (7 or 8 per boot), 0 natural.
+* **Dispatch-gap decisions:** a target named by loaded-root residency with its current empty,
+  fenced, completed and graded `not_current`:
+  * 38 synchronized;
+  * 1 natural (loaded boot 4, P3 round 22);
+  * also natural, in loaded boot 9's P3 round 10: another task (tid 2) was current on C's CPU
+    while C's root was still loaded (placement 0, loaded `0x1`). It was fenced, completed and
+    graded `not_current`;
+  * twice (loaded boots 3 and 9) the wait was met but the target had been re-selected before the
+    decision. Those decisions were ordinary resident ones and verified as such.
+
+**Q10 — controls.**
+
+Live, one exact substitution each (RISC-V `-smp 2`, 300 s):
+
+| Control | Result |
+|---|---|
+| `no_ipi` | timed out; image check: `send_reschedule: ipi_ecall missing` |
+| `no_ssip_clear` | timed out; image check: `take_arrival: clear_ssip missing` |
+| `no_consume` | sealed; kernel and grader `ipi_unexplained_arrival at=52`; image check: consume missing |
+| `no_rfence` | `S_FAIL_STALE_AFTER_INVALIDATION round=1`; image check: `rfence_ecall missing` |
+| `fail_completion` | fails closed: `C_FAIL_VM_MAP round=1`, no record dump |
+| `substitute_completion` | `S_FAIL_STALE_AFTER_INVALIDATION round=1` (the firmware fenced the requester's hart) |
+| `corrupt_ctx` | `S_FAIL_P1_CONTEXT round=1 aux=0x80`, exactly x7 |
+| `narrowed_mask` (new) | sealed; kernel and grader `shoot_targets_not_the_policy` at gap rounds 23 and 24 and at the settled page; QEMU showed no stale read, so only the decision check caught it |
+
+Verifier only, one sealed record altered in Q9's first idle boot (`498d9365…`), both copies
+re-checksummed:
+
+| Alteration | Refused as |
+|---|---|
+| duplicate attribution | `ipi_duplicate_attribution` |
+| wrong source | `ipi_consumption_unbound` |
+| phantom source | `ipi_consumption_unbound` |
+| merged into another group | `ipi_group_inconsistent` |
+| stale group | `ipi_group_inconsistent` |
+| a gap decision's target dropped | `shoot_targets_not_the_policy` |
+| a gap CPU claimed as placement | `shoot_placement_inconsistent` |
+| a failed fence on a gap decision | `fence_failed` |
+| the fence naming the requester's hart | `requester_fenced_itself` |
+| settlement swapped before completion | `shootdown_outside_operation` (the acknowledgement then precedes completion) |
+| an IPI dispatch relabelled as the timer's | `ipi_dispatch_substituted` |
+| a step moved to another round | `p1_client_resume_missing` |
+
+**Q12 — affected regressions, booted fresh, 19/19 exit 0:**
+* the strict default cores (three ports);
+* the AP-scheduling and SCHED-LOCK1 witnesses at 2 CPUs on each port (SCHED-LOCK1: 2/2 rounds;
+  52 / 98 / 86 installations, every one observed by a user-mode `RUN`);
+* x86 VMI2 (`contract_rounds=8`);
+* RISC-V LOCK1, VMI, shared-region replace and UART IRQ;
+* x86 UART IRQ; AArch64 PL011 IRQ;
+* shared-region direct on three ports (offset selection, 0 misplaced).
+
+*What the evidence is, kept apart:*
+* **Hosted:** the serial suite, the verifier tests and integration.
+* **Source:** fmt, the census and the producer pins.
+* **Checker:** the 44-case differential corpus on both verifiers, four undo controls, twelve
+  record alterations, and the reproductions.
+* **Image:** byte identity of every default kernel and six witness kernels, warnings, sections
+  and no-FP.
+* **Live:** 20 SMP3 boots, eight controls and 19 regressions.
+
 Open and unchanged: the parallel hosted-test race, the red CI jobs and lock fairness (§17.3).
 KTHREAD1 is next and is not started.
 
