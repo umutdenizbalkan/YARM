@@ -1146,12 +1146,17 @@ fn a_user_deadline_is_delivered_while_kernel_threads_keep_running() {
         seen != 0 && seen < 40,
         "the timeout must be settled at a kernel-thread boundary while they still run (seen at {seen})"
     );
-    k.with(|s| {
-        assert!(
-            s.consume_ipc_timeout_fired_for_tid(0).expect("consume"),
-            "and the TimedOut fact is staged for the receive's return"
-        );
+    // Read through the task domain's split owner (no broad acquisition).
+    let fired = k.with_task_tcbs_split_mut(|tcbs| {
+        tcbs.iter()
+            .flatten()
+            .find(|t| t.tid.0 == 0)
+            .is_some_and(|t| t.ipc_timeout_fired)
     });
+    assert!(
+        fired,
+        "and the TimedOut fact is staged for the receive's return"
+    );
 }
 
 // ── KTHREAD1-ACCEPTANCE §2: device interrupts on a running kernel thread ─────────────────────────
@@ -1314,6 +1319,6 @@ fn x86_kernel_thread_device_vectors_enter_the_device_bridge() {
         "stub per line, and its table"
     );
     let load = fn_body(IDT, "pub(crate) fn load_kthread_idt()");
-    assert!(load.contains("yarm_x86_64_kthread_dev_stubs.iter().enumerate()"));
+    assert!(load.contains("super::kthread::yarm_x86_64_kthread_dev_stubs"));
     assert!(load.contains("KTHREAD_DEVICE_VECTOR_FIRST + i"));
 }

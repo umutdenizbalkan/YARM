@@ -119383,6 +119383,10 @@ mod stage199d_runqueue_withdrawal_foundation {
             "src/kernel/boot/tests.rs",
             "src/kernel/sched_lock1_tests/tests.rs",
             "src/runtime.rs",
+            // KTHREAD1-ACCEPTANCE §3: the default-off `riscv64-d2-settle-witness` fixture withdraws
+            // the phantom entry it queued itself. Instrumentation only: no oracle, no production
+            // path, compiled into no default or production profile.
+            "src/arch/riscv64/d2_settle_witness.rs",
         ];
         let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
         let mut owners_seen = 0usize;
