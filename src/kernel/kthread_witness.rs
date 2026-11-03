@@ -324,7 +324,9 @@ pub(crate) fn note_user_step(
     }
 }
 
-/// The one mark seam (`d6_genuine_mark_running_via_task_seam`) marked a USER task Running on `cpu`.
+/// A USER task was dispatched on `cpu`: marked Running by the one mark seam
+/// (`d6_genuine_mark_running_via_task_seam`), or resumed from idle by an idle advance
+/// (`apsched_witness::note_idle_dispatch`, KTHREAD-CLOSURE1 §A).
 pub(crate) fn note_user_dispatch(cpu: CpuId) {
     if ACTIVE.load(Ordering::Acquire)
         && let Some(c) = USER_DISPATCHES.get(cpu.0 as usize)

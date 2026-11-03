@@ -633,6 +633,15 @@ pub fn note_idle_dispatch(shared: &SharedKernel, cpu: CpuId, tid: u64, by_ipi: b
     if !enabled() {
         return;
     }
+    // KTHREAD-CLOSURE1 §A: a user task resumed from idle is user progress on this CPU too. The
+    // kernel-thread witness counted only dispatches through the mark seam, which an idle advance
+    // does not take, so a CPU whose user work arrived only from idle showed none (measured: an
+    // 8-CPU AArch64 boot, `no_user_progress cpu=1`, with a user task dispatched there from idle
+    // during the window).
+    #[cfg(feature = "kthread1-witness")]
+    if !crate::kernel::kthread::is_kthread_tid(tid) {
+        crate::kernel::kthread_witness::note_user_dispatch(cpu);
+    }
     if cpu.0 != 0 && (cpu.0 as usize) < MBX_CPUS {
         publish(M_IDLE + 8 * u64::from(cpu.0), 0);
     }
