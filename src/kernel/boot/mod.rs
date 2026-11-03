@@ -10168,5 +10168,8 @@ pub struct Bootstrap;
 mod tests;
 
 #[cfg(test)]
+#[path = "d2_settle_tests/tests.rs"]
+mod d2_settle_tests;
+#[cfg(test)]
 #[path = "overtaken_tests/tests.rs"]
 mod overtaken_tests;

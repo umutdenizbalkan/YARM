@@ -2635,8 +2635,19 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_REVERIFY_OK tid={}", out);
             }
             crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
+            #[cfg(feature = "riscv64-d2-settle-witness")]
+            crate::arch::riscv64::d2_settle_witness::before_drain(
+                shared,
+                cpu,
+                crate::arch::riscv64::d2_settle_witness::CLASS_SEND,
+                outgoing,
+            );
             let dispatch = shared.d2_send_dispatch_step_mut(trap_path.authority());
             // All five WA3A outcomes matched explicitly, each with its own evidence.
+            // KTHREAD1-ACCEPTANCE §3: a CLEAN idle publishes the blocked send's return provenance
+            // (as the receive drain does); a refusal is settled below, never by the tail.
+            let mut clean_idle = false;
+            let mut refused: Option<&'static str> = None;
             let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
                 Mark::Marked(token) => Some(token),
                 Mark::Idle => {
@@ -2644,6 +2655,7 @@ pub fn handle_riscv_trap_entry_shared(
                         "D2_SEND_GENUINE_DISPATCH_DECLINED cpu={} reason=idle",
                         cpu.0
                     );
+                    clean_idle = true;
                     None
                 }
                 Mark::RefusedRolledBack => {
@@ -2651,6 +2663,7 @@ pub fn handle_riscv_trap_entry_shared(
                         "D2_SEND_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
                         cpu.0
                     );
+                    refused = Some("refused_dequeue_undone");
                     None
                 }
                 Mark::RefusedNoSchedulerChange => {
@@ -2658,6 +2671,7 @@ pub fn handle_riscv_trap_entry_shared(
                         "D2_SEND_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
                         cpu.0
                     );
+                    refused = Some("refused_scheduler_untouched");
                     None
                 }
                 Mark::RefusedTorn => dispatch_torn_fatal(
@@ -2666,6 +2680,22 @@ pub fn handle_riscv_trap_entry_shared(
                     "riscv_d2_send_dispatch",
                 ),
             };
+            // KTHREAD1-ACCEPTANCE §3 (finding F1): a refusal leaves NOTHING current — the in-lock
+            // block cleared it and the refused entry stays queued or was put back — so the tail's
+            // `ReturnToCurrent` would `sret` through the blocked sender's stale frame. It settles
+            // here exactly as the acquire-based drains settle the same refusal: typed kernel idle,
+            // whose next tick advances the queue again. The deferral is cleared first.
+            if let Some(reason) = refused {
+                crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
+                crate::yarm_log!(
+                    "D2_SEND_GENUINE_DISPATCH_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                    cpu.0,
+                    reason
+                );
+                return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                    reason: RiscvIdleReason::QueueAdvanceNoIncoming,
+                });
+            }
             if let Some(token) = marked {
                 let inc = token.tid();
                 let Some(asid) = direct_dispatch_resume_incoming(shared, token, &mut *frame) else {
@@ -2699,6 +2729,26 @@ pub fn handle_riscv_trap_entry_shared(
                 // Typed SUCCESSFUL idle: the outgoing caller stays blocked in its class,
                 // `current` stays clear, no frame is restored and no `sret` is attempted. The
                 // wrapper's existing terminal-idle handling produces the typed idle outcome.
+                //
+                // KTHREAD1-ACCEPTANCE §3: it needs this drain's provenance to do so. The send
+                // bypass returns before the arch-neutral classification that publishes it, so
+                // without this a blocked send with nothing runnable met the tail's defensive
+                // error. Same preconditions as the receive drain's publication: exact identity
+                // re-verified, the block committed, a clean idle, exactly once, no lock held.
+                if clean_idle {
+                    if let Some(out) = outgoing {
+                        crate::kernel::boot::blocked_syscall_idle_provenance_set(
+                            cpu_idx,
+                            out,
+                            crate::kernel::boot::BlockingSyscallClass::IpcSend,
+                        );
+                        crate::yarm_log!(
+                            "D2_SEND_GENUINE_IDLE_PROVENANCE_PUBLISHED cpu={} tid={} class=IpcSend",
+                            cpu.0,
+                            out
+                        );
+                    }
+                }
                 crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
                 crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_DONE result=idle cpu={}", cpu.0);
             }
@@ -2753,12 +2803,20 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid={}", out);
             }
             crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
+            #[cfg(feature = "riscv64-d2-settle-witness")]
+            crate::arch::riscv64::d2_settle_witness::before_drain(
+                shared,
+                cpu,
+                crate::arch::riscv64::d2_settle_witness::CLASS_RECV,
+                outgoing,
+            );
             let dispatch = shared.d2_recv_dispatch_step_mut(trap_path.authority());
             // All five WA3A outcomes matched explicitly, each with its own evidence.
             // 199E-R1(A): only a CLEAN idle outcome may publish return provenance. The two
             // refusal outcomes below also produce `None`, and they are errors — they must
             // publish nothing.
             let mut clean_idle = false;
+            let mut refused: Option<&'static str> = None;
             let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
                 Mark::Marked(token) => Some(token),
                 Mark::Idle => {
@@ -2774,6 +2832,7 @@ pub fn handle_riscv_trap_entry_shared(
                         "D2_RECV_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
                         cpu.0
                     );
+                    refused = Some("refused_dequeue_undone");
                     None
                 }
                 Mark::RefusedNoSchedulerChange => {
@@ -2781,6 +2840,7 @@ pub fn handle_riscv_trap_entry_shared(
                         "D2_RECV_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
                         cpu.0
                     );
+                    refused = Some("refused_scheduler_untouched");
                     None
                 }
                 Mark::RefusedTorn => dispatch_torn_fatal(
@@ -2789,6 +2849,21 @@ pub fn handle_riscv_trap_entry_shared(
                     "riscv_d2_recv_dispatch",
                 ),
             };
+            // KTHREAD1-ACCEPTANCE §3 (finding F1): as the send drain above — a refusal leaves
+            // nothing current, so it settles here as typed kernel idle and never reaches the
+            // tail's `ReturnToCurrent` (the blocked receiver's stale frame). It publishes no
+            // provenance: that is the clean idle's alone.
+            if let Some(reason) = refused {
+                crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+                crate::yarm_log!(
+                    "D2_RECV_GENUINE_DISPATCH_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                    cpu.0,
+                    reason
+                );
+                return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                    reason: RiscvIdleReason::QueueAdvanceNoIncoming,
+                });
+            }
             if let Some(token) = marked {
                 let inc = token.tid();
                 let Some(asid) = direct_dispatch_resume_incoming(shared, token, &mut *frame) else {

@@ -1301,6 +1301,9 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // lands on the `wfi` below (fixture synchronization only).
             #[cfg(feature = "riscv-uart-irq-witness")]
             crate::arch::riscv64::uart_irq_witness::gate_at_idle(shared, cpu);
+            // KTHREAD1-ACCEPTANCE §3 fixture: record and withdraw (observation only).
+            #[cfg(feature = "riscv64-d2-settle-witness")]
+            crate::arch::riscv64::d2_settle_witness::at_idle(shared, cpu);
             riscv_idle_halt(cpu, "kernel_idle_awaiting_io");
         }
         // Genuine internal trap-handling failure — NEVER idle, regardless of `current`.
@@ -2072,6 +2075,9 @@ fn riscv_s_mode_idle_landing(
             if matches!(trigger, SModeIdleTrigger::Timer { .. }) {
                 crate::arch::riscv64::uart_irq_witness::gate_at_idle(shared, cpu);
             }
+            // KTHREAD1-ACCEPTANCE §3 fixture: record and withdraw (observation only).
+            #[cfg(feature = "riscv64-d2-settle-witness")]
+            crate::arch::riscv64::d2_settle_witness::at_idle(shared, cpu);
             // QEMU-SMP3 witness: back into the idle wait (observation only).
             #[cfg(feature = "riscv64-smp3-witness")]
             crate::arch::riscv64::smp3_witness::note_idle_reached(cpu.0 as usize);

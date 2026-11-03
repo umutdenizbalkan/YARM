@@ -36,6 +36,8 @@ pub mod vmi_witness;
     feature = "riscv64-sr-replace-witness"
 ))]
 compile_error!("riscv64-vmi-witness and riscv64-sr-replace-witness each replace the SMP3 tasks");
+#[cfg(all(feature = "riscv64-d2-settle-witness", not(feature = "hosted-dev")))]
+pub mod d2_settle_witness;
 pub mod syscall_abi;
 pub mod timer;
 pub mod trap;
