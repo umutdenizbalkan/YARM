@@ -129,13 +129,49 @@ def replay(recs):
     holder_of = {kslot(dkid): dkid}
     waker = None
     exhaust = None
+    # KTHREAD-CLOSURE1 §A: one execution owner per CPU, from the producer's execution stamp
+    # (`res` = the incarnation resident on the CPU, `ord` = its dispatch ordinal). A dispatch opens
+    # a new ordinal; until the CPU's next ordinal, every record of that CPU belongs to that
+    # interval. The director's dispatches are not recorded (it polls by yielding), so an interval
+    # whose ordinal has no dispatch record is the director's, and only the director may be resident
+    # in it. Nothing is exempted by role: the director's own records must carry it as resident in
+    # one of its own intervals.
+    owner = {}           # cpu -> kid of the open RECORDED interval (None: closed)
+    cur_ord = {}         # cpu -> ordinal the CPU's records currently belong to
+    recorded_ival = {}   # cpu -> True when the current ordinal opened with a dispatch record
+    RES_NONE_KINDS = {"switch", "reclaim"} | USER_KINDS
     for r in recs:
         k, kid = r.kind, r.f[0]
+        c = r.cpu
+        if c in cur_ord and r.ord < cur_ord[c]:
+            bad.append("ord_backwards seq=%d cpu=%d ord=%d after=%d" % (r.seq, c, r.ord, cur_ord[c]))
+        elif c not in cur_ord or r.ord != cur_ord[c]:
+            # The CPU dispatched since its last record: whatever interval was open has ended.
+            if owner.get(c) is not None:
+                bad.append("interval_ended_without_switch seq=%d cpu=%d kid=0x%x" % (r.seq, c, owner[c]))
+                owner[c] = None
+            cur_ord[c] = r.ord
+            recorded_ival[c] = k == "dispatch"
+        elif k == "dispatch":
+            bad.append("dispatch_without_new_interval seq=%d cpu=%d kid=0x%x" % (r.seq, c, kid))
+        # Who the producer saw resident when it took this record.
+        if k == "dispatch":
+            if r.res != kid:
+                bad.append("dispatch_resident_mismatch seq=%d kid=0x%x res=0x%x" % (r.seq, kid, r.res))
+        elif r.res == 0:
+            if k not in RES_NONE_KINDS:
+                bad.append("record_without_resident seq=%d kind=%s" % (r.seq, k))
+        elif r.res == dkid:
+            if c != dhome or recorded_ival.get(c):
+                bad.append("director_resident_outside_its_interval seq=%d cpu=%d" % (r.seq, c))
+        elif owner.get(c) != r.res:
+            bad.append("resident_not_the_cpu_owner seq=%d cpu=%d res=0x%x owner=%s"
+                       % (r.seq, c, r.res, "0x%x" % owner[c] if owner.get(c) else "none"))
         if k in ("pop", "director"):
             continue
         if k == "create":
             role, home, low, high = r.f[1], r.f[2], r.f[3], r.f[4]
-            if r.cpu != dhome:
+            if r.cpu != dhome or r.res != dkid:
                 bad.append("create_not_by_director seq=%d" % r.seq)
             if not kid_ok(kid):
                 bad.append("create_identity seq=%d kid=0x%x" % (r.seq, kid))
@@ -175,7 +211,13 @@ def replay(recs):
                     bad.append("dispatch_while_%s seq=%d kid=0x%x" % (t["state"], r.seq, kid))
                     continue
                 t["state"], t["runs"] = "running", t["runs"] + 1
+                owner[r.cpu] = kid
             elif k == "switch":
+                if owner.get(r.cpu) != kid:
+                    bad.append("switch_by_non_owner seq=%d cpu=%d kid=0x%x owner=%s"
+                               % (r.seq, r.cpu, kid, "0x%x" % owner[r.cpu] if owner.get(r.cpu) else "none"))
+                else:
+                    owner[r.cpu] = None
                 if t["state"] != "running":
                     bad.append("switch_while_%s seq=%d kid=0x%x" % (t["state"], r.seq, kid))
                     continue
@@ -185,6 +227,8 @@ def replay(recs):
                     bad.append("switch_reason seq=%d" % r.seq)
                 t["state"] = "exited" if r.f[1] == SW_EXIT else "off"
             else:
+                if owner.get(r.cpu) is not None or r.res != 0:
+                    bad.append("reclaimed_while_cpu_owned seq=%d cpu=%d" % (r.seq, r.cpu))
                 if t["state"] != "exited":
                     bad.append("reclaimed_before_switch_away seq=%d kid=0x%x state=%s" % (r.seq, kid, t["state"]))
                     continue
@@ -196,14 +240,14 @@ def replay(recs):
             t = th.get(kid)
             if t is None:
                 bad.append("%s_unknown_thread seq=%d kid=0x%x" % (k, r.seq, kid))
-            elif t["state"] != "running" or r.cpu != t["home"]:
-                bad.append("%s_outside_running_interval seq=%d kid=0x%x state=%s cpu=%d"
-                           % (k, r.seq, kid, t["state"], r.cpu))
+            elif t["state"] != "running" or r.cpu != t["home"] or r.res != kid:
+                bad.append("%s_outside_running_interval seq=%d kid=0x%x state=%s cpu=%d res=0x%x"
+                           % (k, r.seq, kid, t["state"], r.cpu, r.res))
             elif k == "blip" and (r.f[1], r.f[2]) != (kslot(kid), kgen(kid)):
                 bad.append("blip_identity kid=0x%x" % kid)
             continue
         if k == "probe":
-            if r.cpu != dhome:
+            if r.cpu != dhome or r.res != dkid:
                 bad.append("probe_not_by_director seq=%d" % r.seq)
             if r.f[1] in (P_MASKED, P_IRQ_GUARD):
                 if kid != dkid:
@@ -215,19 +259,23 @@ def replay(recs):
                 bad.append("probe_kind seq=%d" % r.seq)
             continue
         if k in ("wakereq", "wake"):
-            by_waker = waker is not None and r.cpu == th[waker]["home"] and th[waker]["state"] == "running"
-            if r.cpu != dhome and not by_waker:
+            by_waker = (waker is not None and r.res == waker and r.cpu == th[waker]["home"]
+                        and th[waker]["state"] == "running")
+            if r.res != dkid and not by_waker:
                 bad.append("%s_issuer_not_running seq=%d cpu=%d" % (k, r.seq, r.cpu))
             if kid not in th or th[kid]["role"] != R_SLEEPER:
                 bad.append("%s_subject_not_a_sleeper seq=%d" % (k, r.seq))
             continue
         if k in USER_KINDS:
-            # A user-origin entry the trap path authenticated as P's, on a CPU of the population.
+            # A user-origin entry the trap path authenticated as P's, on a CPU of the population,
+            # with no kernel thread resident and no recorded kernel-thread interval open there.
             if kid != P_TID or r.cpu not in cpus:
                 bad.append("user_record_identity seq=%d tid=%d cpu=%d" % (r.seq, kid, r.cpu))
+            if r.res != 0 or owner.get(r.cpu) is not None:
+                bad.append("user_execution_while_kernel_thread_owns_cpu seq=%d cpu=%d" % (r.seq, r.cpu))
             continue
         if k in DIRECTOR_ONLY:
-            if r.cpu != dhome:
+            if r.cpu != dhome or r.res != dkid:
                 bad.append("%s_not_by_director seq=%d" % (k, r.seq))
             if k == "final":
                 t = th.get(kid)
@@ -277,8 +325,12 @@ def replay(recs):
             bad.append("unknown_role kid=0x%x role=%d" % (kid, t["role"]))
     return bad, incomplete
 
+# KTHREAD-CLOSURE1 §A: `res`/`ord` are the CPU's execution stamp, taken by the producer from the
+# dispatcher's own state in the same masked section as the sequence number: the incarnation resident
+# on the CPU (0 = none) and the CPU's kernel-thread dispatch ordinal.
 REC = re.compile(r"(KT1_REC seq=(\d+) kind=(\w+) cpu=(\d+) f0=0x([0-9a-f]+) f1=0x([0-9a-f]+) "
-                 r"f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+)) crc=0x([0-9a-f]{8})")
+                 r"f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+) res=0x([0-9a-f]+) ord=0x([0-9a-f]+))"
+                 r" crc=0x([0-9a-f]{8})")
 SEAL = re.compile(r"(KT1_SEAL records=(\d+) taken=(\d+) overflow=(\d+) seal=0x([0-9a-f]{8})) crc=0x([0-9a-f]{8})")
 
 
@@ -290,10 +342,11 @@ def fnv(data):
 
 
 class Rec:
-    __slots__ = ("seq", "kind", "cpu", "f", "crc")
+    __slots__ = ("seq", "kind", "cpu", "f", "res", "ord", "crc")
 
-    def __init__(self, seq, kind, cpu, f, crc):
+    def __init__(self, seq, kind, cpu, f, crc, res=0, ord_=0):
         self.seq, self.kind, self.cpu, self.f, self.crc = seq, kind, cpu, f, crc
+        self.res, self.ord = res, ord_
 
 
 def parse(text):
@@ -302,13 +355,14 @@ def parse(text):
     by_seq = {}
     intact = 0
     for m in REC.finditer(text):
-        body, crc = m.group(1), int(m.group(10), 16)
+        body, crc = m.group(1), int(m.group(12), 16)
         if fnv(body.encode()) != crc:
             continue
         intact += 1
-        r = Rec(int(m.group(2)), m.group(3), int(m.group(4)), [int(m.group(i), 16) for i in range(5, 10)], crc)
+        r = Rec(int(m.group(2)), m.group(3), int(m.group(4)), [int(m.group(i), 16) for i in range(5, 10)], crc,
+                int(m.group(10), 16), int(m.group(11), 16))
         old = by_seq.get(r.seq)
-        if old is not None and (old.kind, old.cpu, old.f) != (r.kind, r.cpu, r.f):
+        if old is not None and (old.kind, old.cpu, old.f, old.res, old.ord) != (r.kind, r.cpu, r.f, r.res, r.ord):
             problems.append("record_conflict seq=%d" % r.seq)
         by_seq.setdefault(r.seq, r)
     seals = []
@@ -648,7 +702,7 @@ def grade(text, expect_cpus):
 
 
 def self_test():
-    body = "KT1_REC seq=0 kind=pop cpu=0 f0=0x1 f1=0x1 f2=0x20 f3=0x4000 f4=0x5"
+    body = "KT1_REC seq=0 kind=pop cpu=0 f0=0x1 f1=0x1 f2=0x20 f3=0x4000 f4=0x5 res=0x0 ord=0x0"
     line = "%s crc=0x%08x" % (body, fnv(body.encode()))
     h = ((0x811C9DC5 ^ fnv(body.encode())) * 0x01000193) & 0xFFFFFFFF
     seal = "KT1_SEAL records=1 taken=1 overflow=0 seal=0x%08x" % h

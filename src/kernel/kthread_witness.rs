@@ -124,7 +124,9 @@ const P_LOST_WAKE: u64 = 4;
 struct Ring {
     next: AtomicUsize,
     overflow: AtomicU64,
-    slots: [[AtomicU64; 8]; RING],
+    /// [seq, kind|cpu<<8, f0..f4, valid, res, ord]: `res`/`ord` are the CPU's execution stamp
+    /// (`KThreadPool::witness_stamp`) taken in the same masked section as the sequence number.
+    slots: [[AtomicU64; 10]; RING],
 }
 
 impl Ring {
@@ -132,13 +134,16 @@ impl Ring {
         Self {
             next: AtomicUsize::new(0),
             overflow: AtomicU64::new(0),
-            slots: [const { [const { AtomicU64::new(0) }; 8] }; RING],
+            slots: [const { [const { AtomicU64::new(0) }; 10] }; RING],
         }
     }
 }
 
 static RINGS: [Ring; W_CPUS] = [const { Ring::new() }; W_CPUS];
 static SEQ: AtomicU64 = AtomicU64::new(0);
+/// The pool whose execution stamps every record carries (set when the director is created).
+static POOL: core::sync::atomic::AtomicPtr<crate::kernel::kthread::KThreadPool> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// Records are taken only between the population record and the seal.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -210,7 +215,18 @@ fn record(cpu: CpuId, kind: u64, f: [u64; 5]) {
         ring.overflow.fetch_add(1, Ordering::AcqRel);
     } else {
         let seq = SEQ.fetch_add(1, Ordering::AcqRel);
+        // KTHREAD-CLOSURE1 §A: who owns this CPU right now, from the dispatcher's own state, in
+        // the same masked section as the sequence number. Records of CPU `cpu` are written on it.
+        let pool = POOL.load(Ordering::Acquire);
+        let (res, ord) = if pool.is_null() {
+            (0, 0)
+        } else {
+            // SAFETY: the pool lives in the `'static` shared kernel (see `maybe_start`).
+            unsafe { (*pool).witness_stamp(cpu) }
+        };
         let slot = &ring.slots[i];
+        slot[8].store(res, Ordering::Relaxed);
+        slot[9].store(ord, Ordering::Relaxed);
         slot[0].store(seq, Ordering::Relaxed);
         slot[1].store(kind | ((cpu.0 as u64) << 8), Ordering::Relaxed);
         for (j, v) in f.iter().enumerate() {
@@ -234,6 +250,10 @@ pub(crate) fn maybe_start(shared: &SharedKernel, cpu: CpuId) {
     {
         return;
     }
+    POOL.store(
+        &shared.kthreads as *const crate::kernel::kthread::KThreadPool as *mut _,
+        Ordering::Release,
+    );
     PENDING_ROLE.store(R_DIRECTOR, Ordering::Release);
     CREATOR_CPU.store(cpu.0 as u64, Ordering::Release);
     match shared
@@ -1263,7 +1283,7 @@ fn dump_pass(ctx: &KThreadCtx, total: u64) -> (u64, u32) {
         };
         let _ = write!(
             line,
-            "KT1_REC seq={} kind={} cpu={} f0=0x{:x} f1=0x{:x} f2=0x{:x} f3=0x{:x} f4=0x{:x}",
+            "KT1_REC seq={} kind={} cpu={} f0=0x{:x} f1=0x{:x} f2=0x{:x} f3=0x{:x} f4=0x{:x} res=0x{:x} ord=0x{:x}",
             seq,
             kind_name(kc & 0xFF),
             (kc >> 8) & 0xFF,
@@ -1271,7 +1291,9 @@ fn dump_pass(ctx: &KThreadCtx, total: u64) -> (u64, u32) {
             s[3].load(Ordering::Relaxed),
             s[4].load(Ordering::Relaxed),
             s[5].load(Ordering::Relaxed),
-            s[6].load(Ordering::Relaxed)
+            s[6].load(Ordering::Relaxed),
+            s[8].load(Ordering::Relaxed),
+            s[9].load(Ordering::Relaxed)
         );
         let body = &line.buf[..line.len];
         let crc = fnv(body);

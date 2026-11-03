@@ -992,6 +992,20 @@ impl KThreadPool {
         self.cpus[cpu.0 as usize].device_interrupts.as_ptr() as *const u64
     }
 
+    /// KTHREAD-CLOSURE1 §A — the authoritative execution stamp of `cpu` for the witness: the
+    /// incarnation resident on it right now (0 = none) and its kernel-thread dispatch ordinal. The
+    /// dispatcher sets residency and advances the ordinal before it switches into a thread, and
+    /// clears residency after the thread switched back; both change only on that CPU with
+    /// interrupts masked. Observation only.
+    #[cfg(feature = "kthread1-witness")]
+    pub(crate) fn witness_stamp(&self, cpu: CpuId) -> (u64, u64) {
+        let k = &self.cpus[cpu.0 as usize];
+        (
+            k.running.load(Ordering::Acquire),
+            k.dispatches.load(Ordering::Acquire),
+        )
+    }
+
     /// Is a reschedule pending on `cpu` (observation only)?
     pub fn resched_pending(&self, cpu: CpuId) -> bool {
         self.cpus

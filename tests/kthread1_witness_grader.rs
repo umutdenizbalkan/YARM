@@ -25,6 +25,10 @@ struct Rec {
     kind: String,
     cpu: u64,
     f: [u64; 5],
+    /// The producer's execution stamp: the incarnation resident on the CPU (0: none) and the
+    /// CPU's kernel-thread dispatch ordinal, read when the record was taken.
+    res: u64,
+    ord: u64,
 }
 
 fn fnv(data: &[u8]) -> u32 {
@@ -51,6 +55,8 @@ fn parse_from(text: &str) -> Vec<Rec> {
             kind: String::new(),
             cpu: 0,
             f: [0; 5],
+            res: 0,
+            ord: 0,
         };
         for tok in line.split_whitespace().skip(1) {
             let (k, v) = tok.split_once('=').expect("key=value");
@@ -60,6 +66,8 @@ fn parse_from(text: &str) -> Vec<Rec> {
                 "kind" => r.kind = v.to_string(),
                 "cpu" => r.cpu = v.parse().expect("cpu"),
                 "f0" | "f1" | "f2" | "f3" | "f4" => r.f[(k.as_bytes()[1] - b'0') as usize] = hex(v),
+                "res" => r.res = hex(v),
+                "ord" => r.ord = hex(v),
                 _ => {}
             }
         }
@@ -74,8 +82,9 @@ fn parse_from(text: &str) -> Vec<Rec> {
 
 fn body(r: &Rec) -> String {
     format!(
-        "KT1_REC seq={} kind={} cpu={} f0=0x{:x} f1=0x{:x} f2=0x{:x} f3=0x{:x} f4=0x{:x}",
-        r.seq, r.kind, r.cpu, r.f[0], r.f[1], r.f[2], r.f[3], r.f[4]
+        "KT1_REC seq={} kind={} cpu={} f0=0x{:x} f1=0x{:x} f2=0x{:x} f3=0x{:x} f4=0x{:x} \
+         res=0x{:x} ord=0x{:x}",
+        r.seq, r.kind, r.cpu, r.f[0], r.f[1], r.f[2], r.f[3], r.f[4], r.res, r.ord
     )
 }
 
@@ -361,8 +370,9 @@ fn a_suppressed_remote_wake_is_detected() {
             x.cpu = 1;
         }),
         2,
-        // The replay refuses it first: CPU 1 issued a wake while not running the waker.
-        "invalid lifecycle_wake_issuer_not_running",
+        // The replay refuses it first: the director's record, stamped with the director resident,
+        // taken on a CPU where the director has no interval.
+        "invalid lifecycle_director_resident_outside_its_interval",
     );
     // The holder never honoured the pending reschedule.
     expect_fail(
@@ -515,6 +525,8 @@ fn the_holder_s_honoured_point_is_its_turn() {
                 kind: "yield".into(),
                 cpu,
                 f: [kid, round, 1, 0, 0],
+                res: r[at].res,
+                ord: r[at].ord,
             };
             insert_after(r, at, y);
         }),
@@ -583,6 +595,8 @@ fn a_single_cpu_record_set_is_graded_by_the_single_cpu_rules() {
                 kind: "decide".into(),
                 cpu,
                 f: [kid, 0, 0, 0, 1],
+                res: r[at].res,
+                ord: r[at].ord,
             };
             insert_after(r, at, d);
         }),
@@ -644,11 +658,20 @@ fn the_reproduced_false_passes_are_refused() {
                 .find(|x| x.kind == "create" && x.f[0] == rec.f[0])
                 .unwrap()
                 .clone();
+            // Stamped as the thread itself would stamp it, in the CPU's latest interval.
+            let ord = r
+                .iter()
+                .filter(|x| x.cpu == cr.f[2])
+                .map(|x| x.ord)
+                .max()
+                .unwrap();
             r.push(Rec {
                 seq: 0,
                 kind: "irq".into(),
                 cpu: cr.f[2],
                 f: [rec.f[0], 1, 0xffff_ffff_8000_1234, cr.f[3] + 0x100, cr.f[1]],
+                res: rec.f[0],
+                ord,
             });
             renumber(r);
         }),
@@ -803,7 +826,8 @@ fn a_changed_role_does_not_make_obligations_disappear() {
 
 /// Legitimate orders the producer can emit pass: slot reuse with a new generation (present in the
 /// fixture), and a final "gone" observed before its reclaim record (the slot is free before the
-/// record is written).
+/// record is written). The reclaim moves only past other CPUs' records: a CPU's own records keep
+/// their order (each is taken on that CPU, in its program order).
 #[test]
 fn legitimate_reuse_and_concurrent_orders_pass() {
     let recs = parse();
@@ -823,8 +847,14 @@ fn legitimate_reuse_and_concurrent_orders_pass() {
                     && !r.iter().any(|c| {
                         c.kind == "create" && c.seq > x.seq && slot(c.f[0]) == slot(x.f[0])
                     })
-                    && r.iter()
-                        .any(|f| f.kind == "final" && f.f[0] == x.f[0] && f.seq > x.seq)
+                    && r.iter().any(|f| {
+                        f.kind == "final"
+                            && f.f[0] == x.f[0]
+                            && f.seq > x.seq
+                            && !r
+                                .iter()
+                                .any(|y| y.cpu == x.cpu && y.seq > x.seq && y.seq < f.seq)
+                    })
             })
             .expect("a last reclaim of its slot");
         let kid = r[rec].f[0];
@@ -890,5 +920,184 @@ fn single_cpu_coexistence_and_timeout_delivery_are_required() {
         &edited_from(SINGLE, |r| first(r, |x| x.kind == "uwork").f[0] = 1),
         1,
         "invalid lifecycle_user_record_identity",
+    );
+}
+
+// ── KTHREAD-CLOSURE1 §A: one execution owner per CPU ─────────────────────────────────────────────
+
+/// Position of the next record of `cpu` after position `at`.
+fn next_on(recs: &[Rec], cpu: u64, at: usize) -> Option<usize> {
+    (at + 1..recs.len()).find(|&j| recs[j].cpu == cpu)
+}
+
+/// A switch-away on CPU 0 whose CPU's next record is another thread's dispatch.
+fn switch_then_other_dispatch(r: &[Rec]) -> (usize, usize) {
+    (0..r.len())
+        .filter(|&i| r[i].kind == "switch" && r[i].cpu == 0)
+        .find_map(|i| {
+            let j = next_on(r, 0, i)?;
+            (r[j].kind == "dispatch" && r[j].f[0] != r[i].f[0]).then_some((i, j))
+        })
+        .expect("a switch followed by another thread's dispatch on CPU 0")
+}
+
+/// The KTHREAD-CLOSURE1 §A1 reproduction (passed by the delivered grader at `a7da04f1`): thread
+/// B's dispatch moved before thread A's switch-away on the same CPU, so both own CPU 0 at once.
+/// With each record's stamp as the producer took it, the CPU's ordinals run backwards; restamped
+/// so the ordinals are consistent, A's switch-away happens while B owns the CPU.
+#[test]
+fn overlapping_owners_on_one_cpu_are_refused() {
+    expect_fail(
+        "overlap_moved",
+        &edited(|r| {
+            let (i, j) = switch_then_other_dispatch(r);
+            let d = r.remove(j);
+            r.insert(i, d);
+            renumber(r);
+        }),
+        2,
+        "invalid lifecycle_ord_backwards",
+    );
+    expect_fail(
+        "overlap_restamped",
+        &edited(|r| {
+            let (i, j) = switch_then_other_dispatch(r);
+            let d = r.remove(j);
+            r[i].ord = d.ord;
+            r.insert(i, d);
+            renumber(r);
+        }),
+        2,
+        "invalid lifecycle_switch_by_non_owner",
+    );
+    // The switch-away names a thread that does not own the CPU (another thread homed there).
+    expect_fail(
+        "wrong_owner_switch",
+        &edited(|r| {
+            let (i, j) = switch_then_other_dispatch(r);
+            r[i].f[0] = r[j].f[0];
+        }),
+        2,
+        "invalid lifecycle_switch_by_non_owner",
+    );
+    // An interval that ends without its switch-away (the record deleted).
+    expect_fail(
+        "missing_switch",
+        &edited(|r| {
+            let (i, _) = switch_then_other_dispatch(r);
+            r.remove(i);
+            renumber(r);
+        }),
+        2,
+        "invalid lifecycle_interval_ended_without_switch",
+    );
+    // A dispatch that opens no new interval (its ordinal is the previous interval's).
+    expect_fail(
+        "dispatch_same_interval",
+        &edited(|r| {
+            let (i, j) = switch_then_other_dispatch(r);
+            r[j].ord = r[i].ord;
+        }),
+        2,
+        "invalid lifecycle_dispatch_without_new_interval",
+    );
+    // A dispatch whose CPU did not have the dispatched thread resident.
+    expect_fail(
+        "dispatch_not_resident",
+        &edited(|r| first(r, |x| x.kind == "dispatch").res = 0),
+        2,
+        "invalid lifecycle_dispatch_resident_mismatch",
+    );
+    // A CPU's ordinal running backwards.
+    expect_fail(
+        "ord_backwards",
+        &edited(|r| {
+            let at = (1..r.len())
+                .find(|&i| r[i].kind == "run" && r[i].ord > 0)
+                .unwrap();
+            r[at].ord -= 1;
+        }),
+        2,
+        "invalid lifecycle_ord_backwards",
+    );
+    // An in-thread record taken with nothing resident.
+    expect_fail(
+        "run_without_resident",
+        &edited(|r| first(r, |x| x.kind == "run").res = 0),
+        2,
+        "invalid lifecycle_record_without_resident",
+    );
+    // An in-thread record whose resident is another thread than the CPU's owner.
+    expect_fail(
+        "run_other_resident",
+        &edited(|r| {
+            let (_, j) = switch_then_other_dispatch(r);
+            let kid = r[j].f[0];
+            let at = (j + 1..r.len())
+                .find(|&k| r[k].cpu == 0 && r[k].res == kid && r[k].kind != "switch")
+                .unwrap();
+            r[at].res = kid + (1 << 16);
+        }),
+        2,
+        "invalid lifecycle_resident_not_the_cpu_owner",
+    );
+    // A director record taken inside a recorded kernel-thread interval.
+    expect_fail(
+        "director_in_thread_interval",
+        &edited(|r| {
+            let at = r.iter().rposition(|x| x.kind == "create").unwrap();
+            let ival = (0..at)
+                .rev()
+                .find(|&k| r[k].kind == "dispatch" && r[k].cpu == r[at].cpu)
+                .unwrap();
+            let kid = r[ival].f[0];
+            r[at].res = kid;
+        }),
+        2,
+        "invalid lifecycle_create_not_by_director",
+    );
+    // A reclaim recorded while a thread owns the CPU.
+    expect_fail(
+        "reclaim_while_owned",
+        &edited(|r| {
+            let x = first(r, |x| x.kind == "reclaim");
+            x.res = x.f[0];
+        }),
+        2,
+        "invalid lifecycle_reclaimed_while_cpu_owned",
+    );
+}
+
+/// User execution cannot coexist with a kernel thread that still owns the CPU.
+#[test]
+fn user_execution_inside_a_kernel_thread_interval_is_refused() {
+    // P's work stamped with a kernel thread resident.
+    expect_fail(
+        "user_with_resident",
+        &edited_from(SINGLE, |r| {
+            let kid = first(r, |x| x.kind == "dispatch").f[0];
+            first(r, |x| x.kind == "uwork").res = kid;
+        }),
+        1,
+        "invalid lifecycle_user_execution_while_kernel_thread_owns_cpu",
+    );
+    // P's arm moved into the recorded kernel-thread interval that follows it (stamped with that
+    // interval's ordinal, nothing resident; the user sequence itself unchanged): the interval's
+    // owner never switched away.
+    expect_fail(
+        "user_inside_interval",
+        &edited_from(SINGLE, |r| {
+            let a = r.iter().position(|x| x.kind == "uarm").unwrap();
+            let d = (a + 1..r.len())
+                .find(|&k| r[k].kind == "dispatch")
+                .expect("a kernel-thread interval after the arm");
+            let mut u = r.remove(a);
+            u.ord = r[d - 1].ord;
+            u.res = 0;
+            r.insert(d, u);
+            renumber(r);
+        }),
+        1,
+        "invalid lifecycle_user_execution_while_kernel_thread_owns_cpu",
     );
 }
