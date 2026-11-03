@@ -449,15 +449,42 @@ fn the_vm_operation_is_recorded_by_its_owner_at_every_exit() {
         !code(VM_TXN).contains("mutual_rendezvous"),
         "the owner itself carries no wait"
     );
-    // The P1 handoff wait: C's call step waits, bounded, until CPU 1 has parked; labelled, and
-    // only a read of CPU 1's current task.
-    assert!(WITNESS_RS.contains("if step == \"C_P1_CALL\" {\n        wait_until_cpu1_parked();"));
-    let park = code(fn_body(WITNESS_RS, "fn wait_until_cpu1_parked("));
+    // The P1 handoff waits: C's call step waits, bounded, until CPU 1 has parked, and (KTHREAD-
+    // CLOSURE1 §A3) S's reply step until CPU 0 has; labelled, and only a read of that CPU's
+    // current task.
+    assert!(
+        WITNESS_RS.contains("if step == \"C_P1_CALL\" {\n        wait_until_parked(CpuId(1));")
+    );
+    assert!(
+        WITNESS_RS.contains("if step == \"S_P1_REPLY\" {\n        wait_until_parked(CpuId(0));")
+    );
+    let park = code(fn_body(WITNESS_RS, "fn wait_until_parked("));
     assert!(
         park.contains("for _ in 0..P1_PARK_SPINS {")
-            && park.contains("current_tid_split_read(CpuId(1))")
+            && park.contains("current_tid_split_read(target)")
     );
     assert!(!park.contains("lock") && !park.contains("with("));
+    // KTHREAD-CLOSURE1 §A3 — the P2 waits: readiness at the call step, the target's arrival at the
+    // SENT step; labelled, bounded, reads only.
+    for (step, call) in [
+        ("C_P2A_CALL", "p2_ready(CpuId(1), S_TID, H1_TID, cpu)"),
+        ("S_P2B_CALL", "p2_ready(CpuId(0), C_TID, H0_TID, cpu)"),
+        ("C_P2A_SENT", "p2_await_arrival(CpuId(1), cpu)"),
+        ("S_P2B_SENT", "p2_await_arrival(CpuId(0), cpu)"),
+    ] {
+        assert!(
+            WITNESS_RS.contains(&format!("\"{step}\" => return {call},")),
+            "{step}"
+        );
+    }
+    for f in ["fn p2_ready(", "fn p2_await_arrival("] {
+        let b = code(fn_body(WITNESS_RS, f));
+        assert!(
+            b.contains("for _ in 0..P2_SPINS {") && b.contains("TIMED_OUT"),
+            "{f}"
+        );
+        assert!(!b.contains("lock()") && !b.contains("with("), "{f}");
+    }
     let end = code(fn_body(WITNESS_RS, "pub fn vm_op_end("));
     assert!(
         end.contains("Ok((addr, _)) => (0, *addr as u64),")

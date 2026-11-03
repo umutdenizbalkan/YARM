@@ -325,7 +325,7 @@ def retired(b, d):
     st = [i for i, r in enumerate(recs) if r["kind"] == "vm_settled" and r["f"][0] == asid and r["f"][2] == old]
     if len(st) != 1 or st[0] < sd: return "displaced frame settled %d time(s), first at %s (shootdown at %d)" % (len(st), st[:1], sd)
     return None
-tlb = 0
+tlb, tlb_void, tlb_valid = 0, 0, set()
 for rnd in (1, 2, 3, 4):
     (T, TA, TC, tp), (Q, QC, qp) = ((S_TID, S_ASID, 1, "S"), (C_TID, 0, "C")) if rnd % 2 else ((C_TID, C_ASID, 0, "C"), (S_TID, 1, "S"))
     p = user(0, T, tp + "_PRIMED", rnd)
@@ -338,10 +338,23 @@ for rnd in (1, 2, 3, 4):
     if why: fail("TLB round %d: %s" % (rnd, why)); continue
     why = retired(b, d)
     if why: fail("TLB round %d: %s" % (rnd, why)); continue
+    # KTHREAD-CLOSURE1 §A3: a target switched out during the round reports it VOID instead of
+    # observing (everything above is still required); it counts for nothing, and each direction
+    # needs a valid round.
     o = user(p, T, tp + "_OBSERVED", rnd)
-    if o is None or o < d or recs[o]["cpu"] != TC:
-        fail("TLB round %d: target observation missing, before the completion, or on another CPU" % rnd); continue
-    tlb += 1
+    vd = user(p, T, tp + "_ROUND_VOID", rnd)
+    if (o is None) == (vd is None):
+        fail("TLB round %d: the target must either observe or report the round void (exactly one)" % rnd); continue
+    at = o if o is not None else vd
+    if at < d or recs[at]["cpu"] != TC:
+        fail("TLB round %d: target observation before the completion, or on another CPU" % rnd); continue
+    if o is not None:
+        tlb += 1; tlb_valid.add(tp)
+    else:
+        tlb_void += 1
+
+for side in ("S", "C"):
+    if side not in tlb_valid: fail("TLB rounds: no valid round with %s as the target" % side)
 
 # ── MUTUAL PROGRESS ──
 # Graded on the production operations, not on the announcements: each task's NR 3 is the VM
@@ -397,13 +410,15 @@ for m in (1, 2, 3, 4):
         fail("mutual %d: the two production operations did not overlap (one completed before the other began)" % m)
 
 # ── CONTEXT ──
-ctx_steps = {"S_P1_RESUMED": 4, "C_P1_RESUMED": 4, "S_WIN_A_OK": 1, "C_WIN_B_OK": 1, "S_OBSERVED": 2, "C_OBSERVED": 2}
+voids = {s: sum(r["kind"] == "user" and r["step"] == s + "_ROUND_VOID" for r in recs) for s in ("S", "C")}
+ctx_steps = {"S_P1_RESUMED": 4, "C_P1_RESUMED": 4, "S_WIN_A_OK": 1, "C_WIN_B_OK": 1,
+             "S_OBSERVED": 2 - voids["S"], "C_OBSERVED": 2 - voids["C"]}
 for step, want in ctx_steps.items():
     n = sum(r["kind"] == "user" and r["step"] == step for r in recs)
     if n != want: fail("context step %s seen %d time(s), want %d" % (step, n, want))
 
 # ── the kernel verifier must agree ──
-for want in ["p1_parked=8", "p2_el0=2", "tlb_rounds=4", "mutual_rounds=%d" % mutual, "mutual_overlapped=%d" % overlapped,
+for want in ["p1_parked=8", "p2_el0=2", "tlb_rounds=%d" % tlb, "tlb_void=%d" % tlb_void, "mutual_rounds=%d" % mutual, "mutual_overlapped=%d" % overlapped,
              "mutual_announced=%d" % announced, "settled_after_ack=12",
              "p1_sgi_to_s=%d" % sgi_to_s, "p1_sgi_to_c=%d" % sgi_to_c, "p1_timer_first=%d" % timer_first,
              "p1_busy=%d" % busy]:
@@ -412,8 +427,8 @@ for want in ["p1_parked=8", "p2_el0=2", "tlb_rounds=4", "mutual_rounds=%d" % mut
 if not verdict.startswith("SMP2_VERDICT result=ok "):
     fail("kernel verdict: %s" % verdict)
 
-summary = "records=%d damaged_lines=%d sgi_arrivals=%d p1_rounds=%d sgi_to_s=%d sgi_to_c=%d timer_first=%d busy=%d el0=%d tlb_rounds=%d mutual=%d mutual_overlapped=%d mutual_announced=%d" % (
-    len(recs), damaged, sgi_arrivals, parked_n, sgi_to_s, sgi_to_c, timer_first, busy, el0, tlb, mutual, overlapped, announced)
+summary = "records=%d damaged_lines=%d sgi_arrivals=%d p1_rounds=%d sgi_to_s=%d sgi_to_c=%d timer_first=%d busy=%d el0=%d tlb_rounds=%d tlb_void=%d mutual=%d mutual_overlapped=%d mutual_announced=%d" % (
+    len(recs), damaged, sgi_arrivals, parked_n, sgi_to_s, sgi_to_c, timer_first, busy, el0, tlb, tlb_void, mutual, overlapped, announced)
 print("[smp2-witness] " + summary)
 print("[smp2-witness] kernel: " + counts + " | " + verdict)
 # The labelled witness rendezvous at the VM owner's entry (smp2_witness::mutual_rendezvous):

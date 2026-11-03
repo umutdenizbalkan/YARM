@@ -153,6 +153,7 @@ pub const STEPS: &[(&str, u64)] = &[
     ("S_MUT_OK", 12),
     ("S_DONE", 13),
     ("S_P2B_SENT", 14),
+    ("S_ROUND_VOID", 15),
     ("C_ENTERED", 21),
     ("C_P1_CALL", 22),
     ("C_P1_RESUMED", 23),
@@ -167,6 +168,7 @@ pub const STEPS: &[(&str, u64)] = &[
     ("C_MUT_OK", 32),
     ("C_DONE", 33),
     ("C_P2A_SENT", 34),
+    ("C_ROUND_VOID", 35),
     ("H_ENTERED", 41),
     ("H_SERVED", 42),
 ];
@@ -426,6 +428,10 @@ pub struct Verdict {
     pub p1_busy: usize,
     pub p2_el0: usize,
     pub tlb_rounds: usize,
+    /// KTHREAD-CLOSURE1 §A3: remote-invalidation rounds whose target reported it lost residency
+    /// (switched out during the round): the requester's operation is still graded in full, the
+    /// round is excluded from coverage.
+    pub tlb_void: usize,
     /// Mutual rounds whose two production operations each completed successfully with their own
     /// invalidation, displacement, settlement and observation inside or after them.
     pub mutual_rounds: usize,
@@ -635,6 +641,71 @@ pub fn mutual_round(recs: &[Rec], roles: &Roles, m: u64) -> Result<MutualRound, 
 }
 
 /// Grade a sealed record. Pure; the kernel runs it at the dump and the grader re-derives it.
+/// KTHREAD-CLOSURE1 §A3: one serial remote-invalidation round (`r` odd: S is the target, C the
+/// requester; even: the reverse). `Ok(true)`: the target observed the invalidation;
+/// `Ok(false)`: the target reported the round void (it was switched out during it). Either way
+/// the requester's whole operation must be present and acknowledged.
+fn tlb_round(recs: &[Rec], roles: &Roles, r: u64) -> Result<bool, &'static str> {
+    let (s, c) = (roles.s, roles.c);
+    let (t, q) = if r % 2 == 1 { (s, c) } else { (c, s) };
+    let (primed_name, observed_name, void_name, arm_name) = if r % 2 == 1 {
+        ("S_PRIMED", "S_OBSERVED", "S_ROUND_VOID", "C_ARM_R")
+    } else {
+        ("C_PRIMED", "C_OBSERVED", "C_ROUND_VOID", "S_ARM_R")
+    };
+    let primed = user(recs, 0, t, primed_name, Some(r)).ok_or("tlb_primed_missing")?;
+    let arm = user(recs, primed, q, arm_name, Some(r)).ok_or("tlb_arm_missing")?;
+    find_from(recs, arm, |x| {
+        x.kind == Kind::RRepoint && x.f[0] == t.asid && x.f[3] == r
+    })
+    .ok_or("tlb_probe_not_repointed")?;
+    let begin = find_from(recs, arm, |x| {
+        x.kind == Kind::InvalBegin && x.cpu == q.cpu && x.f[0] == t.asid && x.f[1] == roles.w_va
+    })
+    .ok_or("tlb_request_missing")?;
+    let done = match match_invalidation(recs, begin) {
+        Ok(d) => d,
+        Err(InvalRefusal::StaleGeneration) => return Err("tlb_stale_acknowledgement"),
+        Err(InvalRefusal::Duplicate) => return Err("tlb_duplicate_acknowledgement"),
+        Err(InvalRefusal::Missing) => return Err("tlb_acknowledgement_missing"),
+    };
+    let p = recs[primed];
+    if p.cpu == q.cpu || recs[begin].f[0] != p.f[1] {
+        return Err("tlb_target_not_resident_remote");
+    }
+    // KTHREAD-CLOSURE1 §A3: a target that was switched out during the round reports it
+    // void instead of observing; everything above (the requester's whole operation) is
+    // still required, and the void is reported on the target's own CPU after the
+    // completion, exactly as an observation would be.
+    let observed = user(recs, primed, t, observed_name, Some(r));
+    let void = user(recs, primed, t, void_name, Some(r));
+    let (at, valid) = match (observed, void) {
+        (Some(o), None) => (o, true),
+        (None, Some(x)) => (x, false),
+        (Some(_), Some(_)) => return Err("tlb_observed_and_void"),
+        (None, None) => return Err("tlb_observation_missing"),
+    };
+    if at < done {
+        return Err("tlb_observed_before_acknowledgement");
+    }
+    if recs[at].cpu != p.cpu {
+        return Err("tlb_target_not_resident_remote");
+    }
+    Ok(valid)
+}
+
+/// Coverage of the serial rounds (`rounds[i]` is round `i + 1`'s result): a void round shows
+/// nothing about remote invalidation, so each direction needs one valid round.
+fn tlb_coverage(rounds: &[Result<bool, &'static str>; 4]) -> Option<&'static str> {
+    if !(rounds[0] == Ok(true) || rounds[2] == Ok(true)) {
+        return Some("tlb_no_valid_round_to_s");
+    }
+    if !(rounds[1] == Ok(true) || rounds[3] == Ok(true)) {
+        return Some("tlb_no_valid_round_to_c");
+    }
+    None
+}
+
 pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
     let mut v = Verdict {
         records: recs.len(),
@@ -729,51 +800,18 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
     }
 
     // P3 — serial remote-invalidation rounds.
+    let mut rounds = [Err("tlb_round_unchecked"); 4];
     for r in 1..=4u64 {
-        let (t, q) = if r % 2 == 1 { (s, c) } else { (c, s) };
-        let (tp, tq) = if r % 2 == 1 { ("S", "C") } else { ("C", "S") };
-        let primed_name = if tp == "S" { "S_PRIMED" } else { "C_PRIMED" };
-        let observed_name = if tp == "S" {
-            "S_OBSERVED"
-        } else {
-            "C_OBSERVED"
-        };
-        let arm_name = if tq == "S" { "S_ARM_R" } else { "C_ARM_R" };
-        let round = (|| -> Result<(), &'static str> {
-            let primed = user(recs, 0, t, primed_name, Some(r)).ok_or("tlb_primed_missing")?;
-            let arm = user(recs, primed, q, arm_name, Some(r)).ok_or("tlb_arm_missing")?;
-            find_from(recs, arm, |x| {
-                x.kind == Kind::RRepoint && x.f[0] == t.asid && x.f[3] == r
-            })
-            .ok_or("tlb_probe_not_repointed")?;
-            let begin = find_from(recs, arm, |x| {
-                x.kind == Kind::InvalBegin
-                    && x.cpu == q.cpu
-                    && x.f[0] == t.asid
-                    && x.f[1] == roles.w_va
-            })
-            .ok_or("tlb_request_missing")?;
-            let done = match match_invalidation(recs, begin) {
-                Ok(d) => d,
-                Err(InvalRefusal::StaleGeneration) => return Err("tlb_stale_acknowledgement"),
-                Err(InvalRefusal::Duplicate) => return Err("tlb_duplicate_acknowledgement"),
-                Err(InvalRefusal::Missing) => return Err("tlb_acknowledgement_missing"),
-            };
-            let observed =
-                user(recs, primed, t, observed_name, Some(r)).ok_or("tlb_observation_missing")?;
-            if observed < done {
-                return Err("tlb_observed_before_acknowledgement");
-            }
-            let p = recs[primed];
-            if recs[observed].cpu != p.cpu || p.cpu == q.cpu || recs[begin].f[0] != p.f[1] {
-                return Err("tlb_target_not_resident_remote");
-            }
-            Ok(())
-        })();
+        let round = tlb_round(recs, roles, r);
         match round {
-            Ok(()) => v.tlb_rounds += 1,
+            Ok(true) => v.tlb_rounds += 1,
+            Ok(false) => v.tlb_void += 1,
             Err(why) => v.fail(why, r as u32),
         }
+        rounds[r as usize - 1] = round;
+    }
+    if let Some(why) = tlb_coverage(&rounds) {
+        v.fail(why, 0);
     }
 
     // P4 — mutual rounds, graded on the production operations themselves.
@@ -837,7 +875,7 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
     if premature {
         v.fail("settled_before_acknowledgement", 0);
     }
-    if v.tlb_rounds + v.mutual_rounds * 2 > v.settled_after_ack {
+    if v.tlb_rounds + v.tlb_void + v.mutual_rounds * 2 > v.settled_after_ack {
         v.fail("displaced_pages_unsettled", 0);
     }
     if user(recs, 0, s, "S_DONE", None).is_none() || user(recs, 0, c, "C_DONE", None).is_none() {
@@ -1254,6 +1292,111 @@ mod tests {
 
     fn cat(parts: Vec<Vec<Ev>>) -> Vec<Rec> {
         seqd(parts.into_iter().flatten().collect())
+    }
+
+    #[test]
+    fn a_void_tlb_round_still_requires_the_whole_operation_and_counts_for_nothing() {
+        let roles = mutual_roles();
+        let (s, c) = (roles.s, roles.c);
+        let inval = [s.asid, W, 0x6000 + s.asid * 0x1000, 0, 77];
+        let round1 = |end: Vec<Ev>| -> Vec<Rec> {
+            let mut ev = vec![
+                step(s, "S_PRIMED", 1),
+                step(c, "C_ARM_R", 1),
+                (Kind::RRepoint, c.cpu, [s.asid, 0, 0, 1, 0]),
+                (Kind::InvalBegin, c.cpu, inval),
+                (Kind::InvalDone, c.cpu, inval),
+            ];
+            ev.extend(end);
+            seqd(ev)
+        };
+        // Observed: a valid round; void: accepted, but not as a valid round.
+        assert_eq!(
+            tlb_round(&round1(vec![step(s, "S_OBSERVED", 1)]), &roles, 1),
+            Ok(true)
+        );
+        assert_eq!(
+            tlb_round(&round1(vec![step(s, "S_ROUND_VOID", 1)]), &roles, 1),
+            Ok(false)
+        );
+        // Exactly one of the two.
+        assert_eq!(
+            tlb_round(
+                &round1(vec![step(s, "S_OBSERVED", 1), step(s, "S_ROUND_VOID", 1)]),
+                &roles,
+                1
+            ),
+            Err("tlb_observed_and_void")
+        );
+        assert_eq!(
+            tlb_round(&round1(vec![]), &roles, 1),
+            Err("tlb_observation_missing")
+        );
+        // The other task's void, or a void for another round, is not this round's.
+        assert_eq!(
+            tlb_round(&round1(vec![step(c, "C_ROUND_VOID", 1)]), &roles, 1),
+            Err("tlb_observation_missing")
+        );
+        assert_eq!(
+            tlb_round(&round1(vec![step(s, "S_ROUND_VOID", 3)]), &roles, 1),
+            Err("tlb_observation_missing")
+        );
+        // A void does not excuse the requester: without the acknowledged invalidation it fails.
+        let no_ack = seqd(vec![
+            step(s, "S_PRIMED", 1),
+            step(c, "C_ARM_R", 1),
+            (Kind::RRepoint, c.cpu, [s.asid, 0, 0, 1, 0]),
+            (Kind::InvalBegin, c.cpu, inval),
+            step(s, "S_ROUND_VOID", 1),
+        ]);
+        assert_eq!(
+            tlb_round(&no_ack, &roles, 1),
+            Err("tlb_acknowledgement_missing")
+        );
+        // A void before the completion, or reported from another CPU, fails like an observation.
+        let early = seqd(vec![
+            step(s, "S_PRIMED", 1),
+            step(c, "C_ARM_R", 1),
+            (Kind::RRepoint, c.cpu, [s.asid, 0, 0, 1, 0]),
+            (Kind::InvalBegin, c.cpu, inval),
+            step(s, "S_ROUND_VOID", 1),
+            (Kind::InvalDone, c.cpu, inval),
+        ]);
+        assert_eq!(
+            tlb_round(&early, &roles, 1),
+            Err("tlb_observed_before_acknowledgement")
+        );
+        let moved = Role { cpu: c.cpu, ..s };
+        assert_eq!(
+            tlb_round(&round1(vec![step(moved, "S_ROUND_VOID", 1)]), &roles, 1),
+            Err("tlb_target_not_resident_remote")
+        );
+    }
+
+    #[test]
+    fn each_direction_needs_a_valid_tlb_round() {
+        let (ok, void) = (Ok(true), Ok(false));
+        assert_eq!(tlb_coverage(&[ok, ok, ok, ok]), None);
+        assert_eq!(tlb_coverage(&[void, ok, ok, void]), None);
+        assert_eq!(tlb_coverage(&[ok, void, void, ok]), None);
+        assert_eq!(
+            tlb_coverage(&[void, ok, void, ok]),
+            Some("tlb_no_valid_round_to_s")
+        );
+        assert_eq!(
+            tlb_coverage(&[ok, void, ok, void]),
+            Some("tlb_no_valid_round_to_c")
+        );
+        // A failed round is not coverage either.
+        let bad = Err("tlb_request_missing");
+        assert_eq!(
+            tlb_coverage(&[bad, ok, void, ok]),
+            Some("tlb_no_valid_round_to_s")
+        );
+        assert_eq!(
+            tlb_coverage(&[ok, bad, ok, void]),
+            Some("tlb_no_valid_round_to_c")
+        );
     }
 
     #[test]

@@ -862,8 +862,9 @@ fn dump() {
         v.p2_el0
     ));
     lines.push(alloc::format!(
-        "SMP2_COUNTS tlb_rounds={} mutual_rounds={} mutual_overlapped={} mutual_announced={} settled_after_ack={}",
+        "SMP2_COUNTS tlb_rounds={} tlb_void={} mutual_rounds={} mutual_overlapped={} mutual_announced={} settled_after_ack={}",
         v.tlb_rounds,
+        v.tlb_void,
         v.mutual_rounds,
         v.mutual_overlapped,
         v.mutual_announced,

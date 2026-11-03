@@ -555,10 +555,17 @@ yarm_smp2_\pfx\()_tlb_win_end:
     mov x2, x20
     LOG \pfx\()_m_mut_stale
     b \pfx\()_park
+    /* KTHREAD-CLOSURE1 §A3: R no longer reads the primed value, so this task's translations were
+       reloaded during the round: it was switched out (a timer preemption under host load, measured)
+       and the round cannot show anything about remote invalidation. It is reported VOID and the
+       protocol continues; the graders exclude it from coverage, require the requester's whole
+       operation regardless, and require a valid round in each direction. */
 \pfx\()_residency_lost:
     RND_GET x2
-    LOG \pfx\()_m_lost
-    b \pfx\()_park
+    LOG \pfx\()_m_void
+    RND_GET x20
+    MSETR M_OBS, x20
+    b \pfx\()_round
 \pfx\()_stale:
     RND_GET x2
     LOG \pfx\()_m_stale
@@ -725,7 +732,7 @@ yarm_smp2_s_cap_as: .word 0x54545454
     SMP2STR s_m_payload_fail, "SMP2 S_FAIL_PAYLOAD"
     SMP2STR s_m_ipc_fail, "SMP2 S_FAIL_IPC"
     SMP2STR s_m_mut_stale, "SMP2 S_FAIL_MUT_STALE"
-    SMP2STR s_m_lost, "SMP2 S_FAIL_RESIDENCY_LOST"
+    SMP2STR s_m_void, "SMP2 S_ROUND_VOID"
     SMP2STR s_m_stale, "SMP2 S_FAIL_STALE_AFTER_INVALIDATION"
     SMP2STR s_m_resident_fail, "SMP2 S_FAIL_TLB_WINDOW_CONTEXT"
     SMP2STR s_m_unexpected, "SMP2 S_FAIL_UNEXPECTED_W"
@@ -874,7 +881,7 @@ yarm_smp2_c_cap_as: .word 0x64646464
     SMP2STR c_m_payload_fail, "SMP2 C_FAIL_PAYLOAD"
     SMP2STR c_m_ipc_fail, "SMP2 C_FAIL_IPC"
     SMP2STR c_m_mut_stale, "SMP2 C_FAIL_MUT_STALE"
-    SMP2STR c_m_lost, "SMP2 C_FAIL_RESIDENCY_LOST"
+    SMP2STR c_m_void, "SMP2 C_ROUND_VOID"
     SMP2STR c_m_stale, "SMP2 C_FAIL_STALE_AFTER_INVALIDATION"
     SMP2STR c_m_resident_fail, "SMP2 C_FAIL_TLB_WINDOW_CONTEXT"
     SMP2STR c_m_unexpected, "SMP2 C_FAIL_UNEXPECTED_W"
