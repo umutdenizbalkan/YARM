@@ -431,13 +431,53 @@ def single_cpu_coexistence(recs):
             after_kt = False
     if turns < 2:
         out.append("user_and_kernel_threads_not_interleaved turns=%d" % turns)
-    # Timeout service: armed, then kernel threads ran, then TimedOut with the deadline elapsed and
-    # no idle arrival in between, then kernel threads still running and P's next round.
-    arms = {r.f[1]: r for r in recs if r.kind == "uarm"}
-    outs = [r for r in recs if r.kind == "utimeout"]
-    for r in outs:
-        if r.f[2] != TIMED_OUT:
-            out.append("user_deadline_result round=%d result=%d" % (r.f[1], r.f[2]))
+    # KTHREAD-CLOSURE1 §A — every round is validated before any coverage is awarded. P's rounds
+    # run work(k) -> arm(k) -> timeout(k) -> work(k+1) on one CPU, one system call at a time, so
+    # the only legal user-record sequence is exactly that, each step once, rounds consecutive. The
+    # census boundaries may cut the two outer rounds: recording starts when the director is
+    # created, asynchronously to P, so the FIRST recorded round may begin at its arm or its result
+    # (it earns no coverage: its arm is unrecorded); the director stops P's phase, then recording,
+    # so the LAST round may end after its work or its arm. That is valid unfinished work. Anything
+    # else — a duplicate arm or result, a step for another round, a result before its arm, a round
+    # without its result before the next round, another address space — is an impossible
+    # completed operation and fails, whatever other rounds earn. (Task and CPU identity, and the
+    # CPU's ownership, are the replay's: it refuses a user record from another task, outside the
+    # population, or inside a kernel-thread interval before any of this runs.)
+    users = [r for r in recs if r.kind in USER_KINDS]
+    expect, rnd, asid = "uwork", None, None
+    arms, outs, invalid = {}, [], []
+    for r in users:
+        if r.kind == "uwork":
+            if asid is None:
+                asid = r.f[3]
+            elif r.f[3] != asid:
+                invalid.append("user_round_address_space_changed seq=%d" % r.seq)
+        if rnd is None and r.kind != "uwork":
+            # The leading round, cut by the start of recording.
+            rnd, expect = r.f[1], r.kind
+        want = rnd if r.kind != "uwork" else (r.f[1] if rnd is None else rnd + 1)
+        if r.kind != expect or r.f[1] != want:
+            invalid.append("user_sequence_invalid seq=%d got=%s round=%d expected=%s round=%s"
+                           % (r.seq, r.kind, r.f[1], expect, want))
+            break
+        if r.kind == "uwork":
+            rnd, expect = r.f[1], "uarm"
+        elif r.kind == "uarm":
+            arms[rnd], expect = r, "utimeout"
+        else:
+            a = arms.get(rnd)
+            if r.f[2] != TIMED_OUT:
+                invalid.append("user_deadline_result round=%d result=%d" % (r.f[1], r.f[2]))
+            if a is None:
+                pass  # the leading round's arm precedes recording
+            elif r.f[3] - a.f[3] < a.f[2]:
+                invalid.append("user_deadline_not_elapsed round=%d armed=%d at=%d deadline=%d"
+                               % (r.f[1], a.f[3], r.f[3], a.f[2]))
+            if a is not None and r.f[4] < a.f[4]:
+                invalid.append("user_idle_count_backwards round=%d" % r.f[1])
+            outs.append(r)
+            expect = "uwork"
+    out.extend(invalid)
     delivered = 0
     for t in outs:
         a = arms.get(t.f[1])

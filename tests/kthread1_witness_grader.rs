@@ -1101,3 +1101,173 @@ fn user_execution_inside_a_kernel_thread_interval_is_refused() {
         "invalid lifecycle_user_execution_while_kernel_thread_owns_cpu",
     );
 }
+
+// ── KTHREAD-CLOSURE1 §A: every user timeout sequence is valid ────────────────────────────────────
+
+fn user_rec(r: &[Rec], kind: &str, round: u64) -> usize {
+    r.iter()
+        .position(|x| x.kind == kind && x.f[1] == round)
+        .unwrap_or_else(|| panic!("{kind} round {round}"))
+}
+
+/// Move record `from` to just before position `to`, stamped as the record it lands next to.
+fn move_restamped(r: &mut Vec<Rec>, from: usize, to: usize) {
+    let mut x = r.remove(from);
+    let to = if from < to { to - 1 } else { to };
+    x.res = r[to].res;
+    x.ord = r[to].ord;
+    r.insert(to, x);
+    renumber(r);
+}
+
+/// The KTHREAD-CLOSURE1 §A1 reproduction (passed by the delivered grader at `a7da04f1`): round
+/// 2's result moved before round 2's arm. Every round is now validated before any coverage is
+/// awarded, so the invalid round fails although other rounds still deliver their deadlines.
+#[test]
+fn every_user_timeout_sequence_is_validated() {
+    // As reproduced, each record keeping its own stamp: the CPU's ordinals run backwards.
+    expect_fail(
+        "timeout_before_arm_moved",
+        &edited_from(SINGLE, |r| {
+            let (a, t) = (user_rec(r, "uarm", 2), user_rec(r, "utimeout", 2));
+            let x = r.remove(t);
+            r.insert(a, x);
+            renumber(r);
+        }),
+        1,
+        "invalid lifecycle_ord_backwards",
+    );
+    // Restamped so the replay accepts the CPU's order: the sequence rule refuses the round.
+    let cases: [(&str, fn(&mut Vec<Rec>), &str); 9] = [
+        (
+            "timeout_before_arm",
+            |r| {
+                let (a, t) = (user_rec(r, "uarm", 2), user_rec(r, "utimeout", 2));
+                move_restamped(r, t, a);
+            },
+            "user_sequence_invalid",
+        ),
+        (
+            "timeout_missing",
+            |r| {
+                r.remove(user_rec(r, "utimeout", 3));
+                renumber(r);
+            },
+            "user_sequence_invalid",
+        ),
+        (
+            "arm_missing",
+            |r| {
+                r.remove(user_rec(r, "uarm", 3));
+                renumber(r);
+            },
+            "user_sequence_invalid",
+        ),
+        (
+            "arm_duplicated",
+            |r| {
+                let a = user_rec(r, "uarm", 3);
+                let x = r[a].clone();
+                insert_after(r, a, x);
+            },
+            "user_sequence_invalid",
+        ),
+        (
+            "timeout_duplicated",
+            |r| {
+                let t = user_rec(r, "utimeout", 3);
+                let x = r[t].clone();
+                insert_after(r, t, x);
+            },
+            "user_sequence_invalid",
+        ),
+        (
+            "timeout_round_substituted",
+            |r| {
+                let t = user_rec(r, "utimeout", 3);
+                r[t].f[1] = 4;
+            },
+            "user_sequence_invalid",
+        ),
+        (
+            "rounds_backwards",
+            |r| {
+                for x in r.iter_mut() {
+                    if matches!(x.kind.as_str(), "uwork" | "uarm" | "utimeout") {
+                        x.f[1] = match x.f[1] {
+                            3 => 4,
+                            4 => 3,
+                            n => n,
+                        };
+                    }
+                }
+            },
+            "user_sequence_invalid",
+        ),
+        (
+            "deadline_not_elapsed",
+            |r| {
+                let (a, t) = (user_rec(r, "uarm", 3), user_rec(r, "utimeout", 3));
+                r[t].f[3] = r[a].f[3];
+            },
+            "user_deadline_not_elapsed round=3",
+        ),
+        (
+            "address_space_changed",
+            |r| {
+                let w = user_rec(r, "uwork", 3);
+                r[w].f[3] ^= 1;
+            },
+            "user_round_address_space_changed",
+        ),
+    ];
+    for (name, edit, reason) in cases {
+        expect_fail(name, &edited_from(SINGLE, edit), 1, reason);
+    }
+}
+
+/// Valid unfinished work at the census boundaries is not an impossible operation: recording
+/// starts asynchronously to P (the first recorded round begins at its arm or result) and stops
+/// after the director ends P's phase (the last round ends after its work or arm).
+#[test]
+fn valid_unfinished_rounds_at_the_census_boundaries_pass() {
+    let recs = parse_from(SINGLE);
+    let users: Vec<&Rec> = recs
+        .iter()
+        .filter(|x| matches!(x.kind.as_str(), "uwork" | "uarm" | "utimeout"))
+        .collect();
+    assert_ne!(
+        users[0].kind, "uwork",
+        "the fixture's first round is cut by recording's start"
+    );
+    assert_ne!(
+        users.last().unwrap().kind,
+        "utimeout",
+        "the fixture's last round is cut by the census"
+    );
+    // Cut differently: the leading round from its arm (every user record before the first arm
+    // removed), the last round right after its work.
+    let cut = edited_from(SINGLE, |r| {
+        let first_arm = r.iter().position(|x| x.kind == "uarm").unwrap();
+        let mut i = 0;
+        r.retain(|x| {
+            i += 1;
+            i - 1 >= first_arm || !matches!(x.kind.as_str(), "uwork" | "utimeout")
+        });
+        let last = r.iter().rposition(|x| x.kind == "uarm").unwrap();
+        r.remove(last);
+        renumber(r);
+    });
+    let (code, out) = grade(&cut, 1, "cut_rounds");
+    assert_eq!(code, 0, "{out}");
+    // But an unfinished round in the middle is not at a boundary.
+    expect_fail(
+        "unfinished_middle_round",
+        &edited_from(SINGLE, |r| {
+            r.retain(|x| !(x.f[1] == 3 && matches!(x.kind.as_str(), "uarm" | "utimeout")));
+            renumber(r);
+        }),
+        1,
+        "user_sequence_invalid",
+    );
+}
