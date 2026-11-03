@@ -646,7 +646,9 @@ yarm_smp2_s_win_a_end:
     MWAIT M_B_OPEN
     LOG s_m_p2b_call
     CALL_RETRY yarm_smp2_s_cap_eh0, yarm_smp2_s_cap_rs, s_call_fail
-    DELAY 0x100000
+    /* KTHREAD-CLOSURE1 §A3: the kernel holds this step until CPU 0 has taken this call's SGI, so
+       C leaves window B on the arrival, never on a delay a slow delivery can outlast. */
+    LOG s_m_p2b_sent
     MSET M_B_DONE
     ZERO_PAYLOAD
     RECV_ARGS yarm_smp2_s_cap_rs
@@ -707,6 +709,7 @@ yarm_smp2_s_cap_as: .word 0x54545454
     SMP2STR s_m_p1_reply, "SMP2 S_P1_REPLY"
     SMP2STR s_m_win_a_ok, "SMP2 S_WIN_A_OK"
     SMP2STR s_m_p2b_call, "SMP2 S_P2B_CALL"
+    SMP2STR s_m_p2b_sent, "SMP2 S_P2B_SENT"
     SMP2STR s_m_p2b_reply_ok, "SMP2 S_P2B_REPLY_OK"
     SMP2STR s_m_arm, "SMP2 S_ARM_R"
     SMP2STR s_m_req_done, "SMP2 S_REQ_DONE"
@@ -780,7 +783,8 @@ c_p2a:
     MWAIT M_A_OPEN
     LOG c_m_p2a_call
     CALL_RETRY yarm_smp2_c_cap_eh1, yarm_smp2_c_cap_rc, c_call_fail
-    DELAY 0x100000
+    /* KTHREAD-CLOSURE1 §A3: held until CPU 1 has taken this call's SGI (see S_P2B_SENT). */
+    LOG c_m_p2a_sent
     MSET M_A_DONE
     ZERO_PAYLOAD
     RECV_ARGS yarm_smp2_c_cap_rc
@@ -854,6 +858,7 @@ yarm_smp2_c_cap_as: .word 0x64646464
     SMP2STR c_m_p1_call, "SMP2 C_P1_CALL"
     SMP2STR c_m_p1_resumed, "SMP2 C_P1_RESUMED"
     SMP2STR c_m_p2a_call, "SMP2 C_P2A_CALL"
+    SMP2STR c_m_p2a_sent, "SMP2 C_P2A_SENT"
     SMP2STR c_m_p2a_reply_ok, "SMP2 C_P2A_REPLY_OK"
     SMP2STR c_m_win_b_ok, "SMP2 C_WIN_B_OK"
     SMP2STR c_m_arm, "SMP2 C_ARM_R"

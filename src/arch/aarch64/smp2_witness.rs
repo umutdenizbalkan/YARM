@@ -521,19 +521,94 @@ const P1_PARK_SPINS: u64 = 50_000_000;
 /// before its NR 6, therefore waits here, bounded, until CPU 1 has no current task: S has blocked
 /// and CPU 1 parked (H1 is blocked throughout P1). This is the off-lock DebugLog path — no lock is
 /// held — and it waits only for CPU 1 to go idle, never for anything CPU 1 needs from CPU 0.
-fn wait_until_cpu1_parked() {
+///
+/// KTHREAD-CLOSURE1 §A3: S's `S_P1_REPLY` waits the same way for CPU 0 (C blocked on its reply
+/// endpoint). Under host load S could reply while C was still on its way into the receive: C then
+/// took the reply without blocking, no wake — so no SGI — was owed, and the round was not the one P1
+/// exists to exercise (reproduced in loaded boots of `a7da04f1` and the Stage A candidate).
+fn wait_until_parked(target: CpuId) {
     let Some(shared) = crate::arch::aarch64::boot::trap_shared_kernel() else {
         P1_PARK_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
         return;
     };
     for _ in 0..P1_PARK_SPINS {
-        if shared.current_tid_split_read(CpuId(1)).unwrap_or(0) == 0 {
+        if shared.current_tid_split_read(target).unwrap_or(0) == 0 {
             P1_PARK_MET.fetch_add(1, Ordering::AcqRel);
             return;
         }
         core::hint::spin_loop();
     }
     P1_PARK_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// KTHREAD-CLOSURE1 §A3 — arrivals each CPU took from each source CPU: `[dst][src]`
+/// (observation only).
+static ARRIVED: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
+/// The target CPU's taken-from-waker count at each P2 waker's readiness, per target CPU.
+static P2_BASE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static P2_READY_MET: AtomicU64 = AtomicU64::new(0);
+static P2_READY_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+static P2_SENT_MET: AtomicU64 = AtomicU64::new(0);
+static P2_SENT_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+const P2_SPINS: u64 = 50_000_000;
+
+/// WITNESS SYNCHRONIZATION — labelled, not production behaviour (ported from QEMU-SMP3-SEAL).
+/// A P2 attempt is a call that wakes the helper parked on the target CPU while the target task is
+/// resident there in EL0. The waker's `x_P2y_CALL` step waits here, bounded, until both hold, then
+/// records the target CPU's taken-from-this-CPU count. Off-lock DebugLog path; it waits only for
+/// the target CPU's own state. A timeout leaves the attempt to be graded as whatever happened.
+fn p2_ready(target: CpuId, target_tid: u64, helper: u64, waker: CpuId) {
+    let t = usize::from(target.0 == 1);
+    let Some(shared) = crate::arch::aarch64::boot::trap_shared_kernel() else {
+        P2_READY_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+        return;
+    };
+    let parked = |k: &crate::runtime::SharedKernel| {
+        let asid = k.task_asid_for_tid_split_read(helper);
+        asid != 0
+            && matches!(
+                k.task_incarnation_status_split_read(helper, Asid(asid as u16)),
+                Some(crate::kernel::task::TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(_)
+                ))
+            )
+    };
+    let mut met = false;
+    for _ in 0..P2_SPINS {
+        if shared.current_tid_split_read(target).unwrap_or(0) == target_tid && parked(shared) {
+            met = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if met {
+        P2_READY_MET.fetch_add(1, Ordering::AcqRel);
+    } else {
+        P2_READY_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+    }
+    P2_BASE[t].store(
+        ARRIVED[target.0 as usize][usize::from(waker.0 == 1)].load(Ordering::Acquire),
+        Ordering::Release,
+    );
+}
+
+/// WITNESS SYNCHRONIZATION — labelled, not production behaviour (ported from QEMU-SMP3-SEAL).
+/// After the waker's production call returned, wait, bounded, until the target CPU has taken an
+/// SGI from this CPU since readiness, so the target's window closes on the arrival, never on a
+/// fixed delay a slow delivery can outlast. A suppressed SGI makes this time out; the attempt then
+/// fails on its own missing arrival, never on this wait.
+fn p2_await_arrival(target: CpuId, waker: CpuId) {
+    let t = usize::from(target.0 == 1);
+    let base = P2_BASE[t].load(Ordering::Acquire);
+    let taken = &ARRIVED[target.0 as usize][usize::from(waker.0 == 1)];
+    for _ in 0..P2_SPINS {
+        if taken.load(Ordering::Acquire) > base {
+            P2_SENT_MET.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    P2_SENT_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
 }
 
 /// The round each mutual requester (S = 0, C = 1) has announced and not yet entered the VM owner.
@@ -606,6 +681,14 @@ pub fn note_arrival(cpu: CpuId, raw: u32, source: u64, origin: u64, elr: u64) {
         cpu.0,
         [u64::from(raw), source, origin | (window << 8), elr, tid],
     );
+    // KTHREAD-CLOSURE1 §A3: arrivals this CPU took from each source CPU, for the P2 post-send
+    // wait below. Counted after the arrival record, so a waker that sees the count also has it.
+    if let Some(n) = ARRIVED
+        .get(cpu.0 as usize)
+        .and_then(|row| row.get(source as usize))
+    {
+        n.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// The DebugLog route saw a user step. Every `SMP2 ` step becomes one record; a failure is also
@@ -659,10 +742,24 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u6
         );
         return;
     }
-    // C is about to call a PARKED S: see `wait_until_cpu1_parked`.
+    // C is about to call a PARKED S, or S to reply to a PARKED C: see `wait_until_parked`.
     if step == "C_P1_CALL" {
-        wait_until_cpu1_parked();
+        wait_until_parked(CpuId(1));
         return;
+    }
+    if step == "S_P1_REPLY" {
+        wait_until_parked(CpuId(0));
+        return;
+    }
+    // KTHREAD-CLOSURE1 §A3: a P2 waker calls only once its target task is resident on the target
+    // CPU and the helper it wakes is parked in its receive (only a wake owes an SGI), and it opens
+    // the target's window only once the target CPU has taken this call's SGI.
+    match step {
+        "C_P2A_CALL" => return p2_ready(CpuId(1), S_TID, H1_TID, cpu),
+        "S_P2B_CALL" => return p2_ready(CpuId(0), C_TID, H0_TID, cpu),
+        "C_P2A_SENT" => return p2_await_arrival(CpuId(1), cpu),
+        "S_P2B_SENT" => return p2_await_arrival(CpuId(0), cpu),
+        _ => {}
     }
     // The mutual requester's announcement arms its next VM operation for the rendezvous.
     if step == "S_MUT_NR3" || step == "C_MUT_NR3" {
@@ -778,6 +875,15 @@ fn dump() {
         MUT_SYNC_TIMED_OUT.load(Ordering::Acquire),
         P1_PARK_MET.load(Ordering::Acquire),
         P1_PARK_TIMED_OUT.load(Ordering::Acquire)
+    ));
+    // A line of its own: every dump line, with its pass and checksum, must fit the console's
+    // line buffer (`printk::PRB_MSG_MAX`).
+    lines.push(alloc::format!(
+        "SMP2_SYNC_P2 ready_met={} ready_timed_out={} sent_met={} sent_timed_out={}",
+        P2_READY_MET.load(Ordering::Acquire),
+        P2_READY_TIMED_OUT.load(Ordering::Acquire),
+        P2_SENT_MET.load(Ordering::Acquire),
+        P2_SENT_TIMED_OUT.load(Ordering::Acquire)
     ));
     lines.push(alloc::format!(
         "SMP2_VERDICT result={} reason={} at={}",

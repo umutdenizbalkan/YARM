@@ -152,6 +152,7 @@ pub const STEPS: &[(&str, u64)] = &[
     ("S_MUT_NR3", 11),
     ("S_MUT_OK", 12),
     ("S_DONE", 13),
+    ("S_P2B_SENT", 14),
     ("C_ENTERED", 21),
     ("C_P1_CALL", 22),
     ("C_P1_RESUMED", 23),
@@ -165,6 +166,7 @@ pub const STEPS: &[(&str, u64)] = &[
     ("C_MUT_NR3", 31),
     ("C_MUT_OK", 32),
     ("C_DONE", 33),
+    ("C_P2A_SENT", 34),
     ("H_ENTERED", 41),
     ("H_SERVED", 42),
 ];
