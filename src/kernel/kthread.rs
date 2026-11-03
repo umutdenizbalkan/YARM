@@ -157,7 +157,8 @@ pub enum KCreateError {
     InvalidCpu,
     /// The home CPU's scheduler refused the placement (offline, wake-only, queue full).
     Placement(SchedulerError),
-    /// Stack storage could not be provided (hosted model only).
+    /// Stack storage could not be provided (hosted model), or the stacks could not enter the
+    /// plain-lock accounting table (KTHREAD-CLOSURE1 §B).
     NoStorage,
 }
 
@@ -169,6 +170,12 @@ pub enum KSwitchRefusal {
     IrqMasked,
     /// A [`KMasked`] section of this thread is open.
     GuardHeld,
+    /// KTHREAD-CLOSURE1 §B: a plain (non-masking) `SpinLock` guard taken on this thread's stack is
+    /// live.
+    PlainLockHeld,
+    /// KTHREAD-CLOSURE1 §B: this thread's plain-lock accounting is poisoned (overflow, underflow,
+    /// or a guard released on another stack). Permanent: nothing restores eligibility.
+    PlainLockAccounting,
     /// This CPU's stack-residency record does not name the caller.
     NotResident,
     /// The stack pointer is outside the caller's own stack.
@@ -184,6 +191,8 @@ impl KSwitchRefusal {
         match self {
             Self::IrqMasked => "irq_masked",
             Self::GuardHeld => "guard_held",
+            Self::PlainLockHeld => "plain_lock_held",
+            Self::PlainLockAccounting => "plain_lock_accounting",
             Self::NotResident => "not_resident",
             Self::WrongStack => "wrong_stack",
             Self::Stale => "stale",
@@ -426,9 +435,15 @@ pub struct KThreadPool {
     free: SpinLockIrq<FreeList>,
     cpus: [KCpu; MAX_CPUS],
     stats: KPoolStats,
+    /// KTHREAD-CLOSURE1 §B: this pool's stacks are in the plain-lock accounting table.
+    plain_registered: AtomicBool,
     /// Hosted model only: this pool's own stack storage, allocated on first creation.
     #[cfg(feature = "hosted-dev")]
     hosted_stacks: AtomicUsize,
+    /// Hosted model only: this pool's plain-lock counters (`[AtomicU32; KTHREAD_CAPACITY]`),
+    /// allocated with the stacks so they never move with the pool.
+    #[cfg(feature = "hosted-dev")]
+    hosted_plain: AtomicUsize,
 }
 
 // SAFETY: every field is an atomic, a lock, or a switch context touched only by its home CPU
@@ -457,8 +472,11 @@ impl KThreadPool {
             free: SpinLockIrq::new(FreeList::new()),
             cpus: [const { KCpu::new() }; MAX_CPUS],
             stats: KPoolStats::new(),
+            plain_registered: AtomicBool::new(false),
             #[cfg(feature = "hosted-dev")]
             hosted_stacks: AtomicUsize::new(0),
+            #[cfg(feature = "hosted-dev")]
+            hosted_plain: AtomicUsize::new(0),
         }
     }
 
@@ -509,6 +527,11 @@ impl KThreadPool {
         if ptr.is_null() {
             return false;
         }
+        let plain: &'static [AtomicU32; KTHREAD_CAPACITY] = alloc::boxed::Box::leak(
+            alloc::boxed::Box::new([const { AtomicU32::new(0) }; KTHREAD_CAPACITY]),
+        );
+        self.hosted_plain
+            .store(plain.as_ptr() as usize, Ordering::Release);
         self.hosted_stacks.store(ptr as usize, Ordering::Release);
         true
     }
@@ -642,11 +665,29 @@ impl KThreadPool {
         if !self.ensure_stacks() {
             return Err(KCreateError::NoStorage);
         }
-        let Some(slot) = self.free.lock().pop() else {
+        let slot = {
+            let mut free = self.free.lock();
+            // KTHREAD-CLOSURE1 §B: the stacks enter the plain-lock accounting before any thread of
+            // this pool can run, under the pool lock so no concurrent creation overtakes it.
+            if !self.plain_registered.load(Ordering::Acquire) {
+                if !plain_register(self.stack_base(), self.plain_counters()) {
+                    return Err(KCreateError::NoStorage);
+                }
+                self.plain_registered.store(true, Ordering::Release);
+            }
+            free.pop()
+        };
+        let Some(slot) = slot else {
             self.stats.exhausted.fetch_add(1, Ordering::AcqRel);
             return Err(KCreateError::Exhausted);
         };
         let s = &self.slots[slot];
+        // A slot is reused only after its previous incarnation exited, and exit is refused while
+        // any plain guard is live on its stack: a non-zero count here is a broken invariant.
+        let held = self.plain_counters()[slot].load(Ordering::Acquire);
+        if held != 0 {
+            panic!("KTHREAD_PLAIN_LOCK_INVARIANT slot={slot} count={held:#x}");
+        }
         // The home and priority are written BEFORE the generation is published, so a holder of
         // this incarnation's id (which exists only after `create` returns) always reads the home
         // that belongs to it.
@@ -1017,6 +1058,15 @@ impl KThreadPool {
 #[cfg(feature = "hosted-dev")]
 impl Drop for KThreadPool {
     fn drop(&mut self) {
+        plain_unregister(self.stack_base());
+        let plain = self.hosted_plain.load(Ordering::Acquire);
+        if plain != 0 {
+            // SAFETY: leaked from exactly this box type in `ensure_stacks`; its registry entry is
+            // gone and no thread of this pool runs, so no guard can name it.
+            drop(unsafe {
+                alloc::boxed::Box::from_raw(plain as *mut [AtomicU32; KTHREAD_CAPACITY])
+            });
+        }
         let ptr = self.hosted_stacks.load(Ordering::Acquire);
         if ptr != 0
             && let Ok(layout) = core::alloc::Layout::from_size_align(
@@ -1112,6 +1162,10 @@ impl KThreadCtx {
             Some(KSwitchRefusal::IrqMasked)
         } else if self.masked_depth.get() != 0 {
             Some(KSwitchRefusal::GuardHeld)
+        } else if self.pool.plain_guards_held(self.id) == PLAIN_POISON {
+            Some(KSwitchRefusal::PlainLockAccounting)
+        } else if self.pool.plain_guards_held(self.id) != 0 {
+            Some(KSwitchRefusal::PlainLockHeld)
         } else if self.pool.cpus[self.home.0 as usize]
             .running
             .load(Ordering::Acquire)
@@ -1290,6 +1344,195 @@ impl KThreadCtx {
             self.id.raw()
         );
     }
+}
+
+// ── KTHREAD-CLOSURE1 §B: plain-lock guards live on a kernel-thread stack ──────────────────────
+//
+// A plain `SpinLock` does not mask interrupts, so the `irqs_enabled` check cannot see it. Each
+// acquisition finds the stack it runs on: a kernel-thread stack names exactly one slot of one
+// registered pool, and that slot's `plain_held` counts the guard; the guard remembers the counter
+// and its release decrements that same counter. Attribution is by stack, not by CPU or by
+// "current thread": an interrupt handler running on a thread's stack adds and removes its own
+// balanced guards, a handler on another stack (a trap or exception stack) never touches the
+// thread's count, and two CPUs never share a counter. No CPU-identity read, no lock and no logging
+// is involved: the lock path only counts, and a failure is latched as [`PLAIN_POISON`] (counted in
+// `PLAIN_ACCOUNTING_FAULTS`) for the next scheduling point to refuse and report. Interrupt masking
+// (`irqs_enabled`), this count, and inter-CPU ownership (the per-CPU 1L) stay separate checks.
+
+/// The latched value of a slot whose plain-lock accounting went wrong. Never decremented.
+pub(crate) const PLAIN_POISON: u32 = u32::MAX;
+
+/// Production plain-lock counters, one per slot of the one production pool (whose stacks are
+/// `KSTACKS`). Like the stacks, they never move.
+#[cfg(not(feature = "hosted-dev"))]
+static KPLAIN: [AtomicU32; KTHREAD_CAPACITY] = [const { AtomicU32::new(0) }; KTHREAD_CAPACITY];
+
+#[cfg(not(feature = "hosted-dev"))]
+const PLAIN_POOLS: usize = 2;
+/// The hosted suite builds many kernels in one process.
+#[cfg(feature = "hosted-dev")]
+const PLAIN_POOLS: usize = 256;
+
+/// One registered stack region: its base (0 = free entry) and its counters' address. Registered
+/// under the pool's lock before any thread of the pool runs; the counters are written before the
+/// base is published and the base is cleared first, so a reader that sees a base sees its counters.
+struct PlainEntry {
+    base: AtomicUsize,
+    counters: AtomicUsize,
+}
+
+static PLAIN_TABLE: [PlainEntry; PLAIN_POOLS] = [const {
+    PlainEntry {
+        base: AtomicUsize::new(0),
+        counters: AtomicUsize::new(0),
+    }
+}; PLAIN_POOLS];
+/// One past the highest entry ever used: the lock path scans no further.
+static PLAIN_HIGH: AtomicUsize = AtomicUsize::new(0);
+/// Accounting failures latched by the lock path (overflow, underflow, cross-stack release).
+static PLAIN_ACCOUNTING_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+fn plain_register(base: usize, counters: &[AtomicU32; KTHREAD_CAPACITY]) -> bool {
+    if base == 0 {
+        return false;
+    }
+    for (i, e) in PLAIN_TABLE.iter().enumerate() {
+        if e.counters
+            .compare_exchange(
+                0,
+                counters.as_ptr() as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            e.base.store(base, Ordering::Release);
+            PLAIN_HIGH.fetch_max(i + 1, Ordering::AcqRel);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(feature = "hosted-dev")]
+fn plain_unregister(base: usize) {
+    if base == 0 {
+        return;
+    }
+    for e in &PLAIN_TABLE {
+        if e.base
+            .compare_exchange(base, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            e.counters.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// The plain-lock counter of the kernel-thread stack containing `sp`, if any.
+fn plain_counter_at(sp: usize) -> Option<&'static AtomicU32> {
+    let high = PLAIN_HIGH.load(Ordering::Acquire);
+    for e in &PLAIN_TABLE[..high] {
+        let base = e.base.load(Ordering::Acquire);
+        if base == 0 || sp < base || sp >= base + KTHREAD_STACK_BYTES * KTHREAD_CAPACITY {
+            continue;
+        }
+        let counters = e.counters.load(Ordering::Acquire) as *const AtomicU32;
+        // SAFETY: a published base has its counters (`plain_register`); they are a
+        // `[AtomicU32; KTHREAD_CAPACITY]` that lives until the entry is cleared (production: for
+        // the kernel's lifetime; hosted: until the pool's `Drop`, which runs with no thread of the
+        // pool running, so no guard taken on its stacks is live).
+        return Some(unsafe { &*counters.add((sp - base) / KTHREAD_STACK_BYTES) });
+    }
+    None
+}
+
+fn plain_poison(c: &AtomicU32) {
+    c.store(PLAIN_POISON, Ordering::Release);
+    PLAIN_ACCOUNTING_FAULTS.fetch_add(1, Ordering::AcqRel);
+}
+
+/// A plain `SpinLock` was just acquired: count it against the kernel-thread stack it was taken
+/// on. Returns the counter the guard must release, or `None` off every kernel-thread stack.
+#[inline]
+pub(crate) fn plain_guard_taken() -> Option<core::ptr::NonNull<AtomicU32>> {
+    if PLAIN_HIGH.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let c = plain_counter_at(arch::current_sp())?;
+    let r = c.try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+        // Lazy: `v + 1` must not be evaluated for a poisoned counter.
+        (v < PLAIN_POISON - 1).then(|| v + 1)
+    });
+    if r.is_err() {
+        // Already poisoned, or one more would reach the poison value: latch it.
+        plain_poison(c);
+    }
+    Some(core::ptr::NonNull::from(c))
+}
+
+/// A plain `SpinLock` guard is being released. `taken` is what [`plain_guard_taken`] returned for
+/// it. The release must happen on the stack the guard was taken on; anything else — or a counter
+/// already at zero — latches the poison.
+#[inline]
+pub(crate) fn plain_guard_released(taken: Option<core::ptr::NonNull<AtomicU32>>) {
+    if taken.is_none() && PLAIN_HIGH.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let here = plain_counter_at(arch::current_sp());
+    // SAFETY: the counter belongs to a registered pool, live while any guard taken on its stacks
+    // is (see `plain_counter_at`).
+    let taken = taken.map(|p| unsafe { p.as_ref() });
+    match (taken, here) {
+        (None, None) => {}
+        (Some(t), Some(h)) if core::ptr::eq(t, h) => {
+            if t.try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v != 0 && v != PLAIN_POISON).then(|| v - 1)
+            })
+            .is_err()
+            {
+                plain_poison(t);
+            }
+        }
+        (t, h) => {
+            // Taken on one stack, released on another: neither count can be trusted.
+            if let Some(t) = t {
+                plain_poison(t);
+            }
+            if let Some(h) = h {
+                plain_poison(h);
+            }
+        }
+    }
+}
+
+impl KThreadPool {
+    #[cfg(not(feature = "hosted-dev"))]
+    fn plain_counters(&self) -> &'static [AtomicU32; KTHREAD_CAPACITY] {
+        &KPLAIN
+    }
+
+    #[cfg(feature = "hosted-dev")]
+    fn plain_counters(&self) -> &'static [AtomicU32; KTHREAD_CAPACITY] {
+        static NONE: [AtomicU32; KTHREAD_CAPACITY] =
+            [const { AtomicU32::new(0) }; KTHREAD_CAPACITY];
+        let p = self.hosted_plain.load(Ordering::Acquire);
+        if p == 0 {
+            return &NONE;
+        }
+        // SAFETY: leaked in `ensure_stacks` and freed only by this pool's `Drop`.
+        unsafe { &*(p as *const [AtomicU32; KTHREAD_CAPACITY]) }
+    }
+
+    /// Plain-lock guards live on `id`'s stack (`PLAIN_POISON` once poisoned). Observation only.
+    pub fn plain_guards_held(&self, id: KThreadId) -> u32 {
+        self.plain_counters()[id.slot()].load(Ordering::Acquire)
+    }
+}
+
+/// Accounting failures the lock path has latched since boot. Observation only.
+pub fn plain_accounting_faults() -> u64 {
+    PLAIN_ACCOUNTING_FAULTS.load(Ordering::Acquire)
 }
 
 // ── the internal wait owner ───────────────────────────────────────────────────────────────────

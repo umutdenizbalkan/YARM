@@ -1322,3 +1322,503 @@ fn x86_kernel_thread_device_vectors_enter_the_device_bridge() {
     assert!(load.contains("super::kthread::yarm_x86_64_kthread_dev_stubs"));
     assert!(load.contains("KTHREAD_DEVICE_VECTOR_FIRST + i"));
 }
+
+// ── KTHREAD-CLOSURE1 §B: plain (non-masking) lock guards at scheduling points ───────────────
+
+use crate::kernel::lock::SpinLock;
+use core::ptr::NonNull;
+use std::sync::atomic::{AtomicBool as StdAtomicBool, AtomicUsize as StdAtomicUsize};
+
+/// Per-test plain locks (never shared between tests) and what the thread observed.
+struct Plain {
+    a: SpinLock<u64>,
+    b: SpinLock<u64>,
+    c: SpinLock<u64>,
+    seen: Mutex<Vec<(&'static str, Option<KSwitchRefusal>, u32)>>,
+    /// The thread's own counter, published for the dispatcher-side mutation case.
+    counter: StdAtomicUsize,
+}
+
+impl Plain {
+    fn new() -> Self {
+        Self {
+            a: SpinLock::new(0),
+            b: SpinLock::new(0),
+            c: SpinLock::new(0),
+            seen: Mutex::new(Vec::new()),
+            counter: StdAtomicUsize::new(0),
+        }
+    }
+
+    fn seen(&self) -> Vec<(&'static str, Option<KSwitchRefusal>, u32)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+fn plain_fixture(arg: usize) -> &'static Plain {
+    // SAFETY: every test keeps its fixture alive until its dispatcher returns.
+    unsafe { &*(arg as *const Plain) }
+}
+
+fn note(ctx: &KThreadCtx, f: &Plain, what: &'static str, r: Result<(), KSwitchRefusal>) {
+    let held = ctx.pool().plain_guards_held(ctx.id());
+    f.seen.lock().unwrap().push((what, r.err(), held));
+}
+
+/// Test cleanup only: a poisoned thread can never exit (exit is refused, and refusing exit is
+/// fatal), so a test that poisons its own counter on purpose clears it before returning.
+fn clear_poison_for_test_exit(ctx: &KThreadCtx) {
+    ctx.pool().plain_counters()[ctx.id().slot()].store(0, Ordering::Release);
+}
+
+fn plain_across_points(ctx: &KThreadCtx, arg: usize) {
+    let f = plain_fixture(arg);
+    let k = ctx.shared();
+    let g = f.a.lock();
+    let queue_before = queued(k, ctx.home());
+    let refused_before = ctx.pool().counters().switch_refused;
+    note(ctx, f, "yield", ctx.yield_now());
+    note(ctx, f, "sched_point", ctx.sched_point().map(|_| ()));
+    let q = KWaitQueue::new();
+    let w = q.wait_until(ctx, || false);
+    note(
+        ctx,
+        f,
+        "block",
+        match w {
+            Err(KWaitError::Refused(r)) => Err(r),
+            _ => Ok(()),
+        },
+    );
+    assert_eq!(q.registered(), 0, "a refused wait leaves no registration");
+    // `exit` makes this check first and refuses fatally; the check itself is what is tested.
+    note(ctx, f, "exit", ctx.switch_check("exit"));
+    // A refusal changes nothing: still running, still resident, the queue and current unchanged,
+    // the guard still counted; only the refusal counter moved.
+    assert_eq!(ctx.pool().state_of(ctx.id()), Some(KState::Running));
+    assert_eq!(current(k, ctx.home()), Some(ctx.id().raw()));
+    assert_eq!(queued(k, ctx.home()), queue_before);
+    assert_eq!(
+        ctx.pool().counters().switch_refused,
+        refused_before + 4,
+        "one refusal per attempt"
+    );
+    drop(g);
+    note(ctx, f, "after_release", ctx.yield_now());
+    note(ctx, f, "resumed", Ok(()));
+}
+
+#[test]
+fn a_plain_lock_held_across_yield_block_or_exit_is_refused_and_changes_nothing() {
+    let k = kernel();
+    let f = Plain::new();
+    k.kthreads
+        .create(
+            plain_across_points,
+            &f as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    assert_eq!(
+        run_cpu(&k, CPU),
+        2,
+        "one switch: the yield after the release"
+    );
+    let held = Some(KSwitchRefusal::PlainLockHeld);
+    assert_eq!(
+        f.seen(),
+        std::vec![
+            ("yield", held, 1),
+            ("sched_point", held, 1),
+            ("block", held, 1),
+            ("exit", held, 1),
+            ("after_release", None, 0),
+            ("resumed", None, 0),
+        ]
+    );
+    assert!(f.a.try_lock().is_some(), "released");
+}
+
+fn plain_nested(ctx: &KThreadCtx, arg: usize) {
+    let f = plain_fixture(arg);
+    let a = f.a.lock();
+    let b = f.b.try_lock().expect("free");
+    note(ctx, f, "two", ctx.yield_now());
+    drop(a);
+    note(ctx, f, "partial", ctx.yield_now());
+    drop(b);
+    note(ctx, f, "none", ctx.yield_now());
+    // The other order: inner first.
+    let a = f.a.lock();
+    let b = f.b.lock();
+    drop(b);
+    note(ctx, f, "inner_released", ctx.yield_now());
+    drop(a);
+    note(ctx, f, "outer_released", ctx.yield_now());
+}
+
+#[test]
+fn nested_and_partial_releases_keep_the_thread_ineligible_until_the_last_guard() {
+    let k = kernel();
+    let f = Plain::new();
+    k.kthreads
+        .create(
+            plain_nested,
+            &f as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    assert_eq!(run_cpu(&k, CPU), 3);
+    let held = Some(KSwitchRefusal::PlainLockHeld);
+    assert_eq!(
+        f.seen(),
+        std::vec![
+            ("two", held, 2),
+            ("partial", held, 1),
+            ("none", None, 0),
+            ("inner_released", held, 1),
+            ("outer_released", None, 0),
+        ]
+    );
+}
+
+/// An interrupt handler that runs on the interrupted thread's stack (as every port's kernel-thread
+/// vector does) and takes a plain lock of its own.
+fn handler_on_this_stack(ctx: &KThreadCtx, f: &Plain) -> u32 {
+    let _g = f.c.lock();
+    ctx.pool().plain_guards_held(ctx.id())
+}
+
+fn plain_with_handlers(ctx: &KThreadCtx, arg: usize) {
+    let f = plain_fixture(arg);
+    // Balanced handler activity while no guard is held, and while one is.
+    let inside = handler_on_this_stack(ctx, f);
+    note(ctx, f, "handler_unheld", Ok(()));
+    f.seen
+        .lock()
+        .unwrap()
+        .push(("handler_unheld_inside", None, inside));
+    let g = f.a.lock();
+    let inside = handler_on_this_stack(ctx, f);
+    f.seen
+        .lock()
+        .unwrap()
+        .push(("handler_held_inside", None, inside));
+    note(ctx, f, "after_handler", ctx.yield_now());
+    // Activity on other stacks (another host thread taking and releasing plain locks, as a
+    // handler on a trap stack or another CPU would) never touches this thread's count.
+    let stop = StdAtomicBool::new(false);
+    let mut stable = true;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !stop.load(Ordering::Acquire) {
+                let _x = f.b.lock();
+                let _y = f.c.try_lock();
+            }
+        });
+        for _ in 0..20_000 {
+            stable &= ctx.pool().plain_guards_held(ctx.id()) == 1;
+        }
+        stop.store(true, Ordering::Release);
+    });
+    f.seen
+        .lock()
+        .unwrap()
+        .push(("other_stack_activity", None, u32::from(stable)));
+    drop(g);
+    note(ctx, f, "released", ctx.yield_now());
+    // A handler that leaks its guard on this stack leaves the thread ineligible, attributed here.
+    let leaked = f.c.lock();
+    core::mem::forget(leaked);
+    note(ctx, f, "handler_leak", ctx.yield_now());
+    clear_poison_for_test_exit(ctx);
+}
+
+#[test]
+fn interrupt_handlers_on_the_thread_stack_balance_their_guards_and_other_stacks_never_count() {
+    let k = kernel();
+    let f = Plain::new();
+    k.kthreads
+        .create(
+            plain_with_handlers,
+            &f as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    assert_eq!(run_cpu(&k, CPU), 2);
+    let held = Some(KSwitchRefusal::PlainLockHeld);
+    assert_eq!(
+        f.seen(),
+        std::vec![
+            ("handler_unheld", None, 0),
+            ("handler_unheld_inside", None, 1),
+            ("handler_held_inside", None, 2),
+            ("after_handler", held, 1),
+            ("other_stack_activity", None, 1),
+            ("released", None, 0),
+            ("handler_leak", held, 1),
+        ]
+    );
+}
+
+struct TwoCpus {
+    x: Plain,
+    y: Plain,
+    x_held: StdAtomicBool,
+    y_held: StdAtomicBool,
+    x_released: StdAtomicBool,
+}
+
+fn plain_on_cpu_x(ctx: &KThreadCtx, arg: usize) {
+    // SAFETY: the test keeps the fixture alive.
+    let t = unsafe { &*(arg as *const TwoCpus) };
+    let g = t.x.a.lock();
+    t.x_held.store(true, Ordering::Release);
+    while !t.y_held.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    note(ctx, &t.x, "x_held", ctx.yield_now());
+    drop(g);
+    t.x_released.store(true, Ordering::Release);
+    note(ctx, &t.x, "x_released", ctx.yield_now());
+}
+
+fn plain_on_cpu_y(ctx: &KThreadCtx, arg: usize) {
+    // SAFETY: the test keeps the fixture alive.
+    let t = unsafe { &*(arg as *const TwoCpus) };
+    let g = t.y.b.lock();
+    t.y_held.store(true, Ordering::Release);
+    while !t.x_held.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    note(ctx, &t.y, "y_held", ctx.yield_now());
+    // X's release on its own CPU does not make Y eligible.
+    while !t.x_released.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    note(ctx, &t.y, "y_after_x_release", ctx.yield_now());
+    drop(g);
+    note(ctx, &t.y, "y_released", ctx.yield_now());
+}
+
+#[test]
+fn different_cpus_holding_different_plain_locks_are_accounted_independently() {
+    let k = kernel();
+    let t = TwoCpus {
+        x: Plain::new(),
+        y: Plain::new(),
+        x_held: StdAtomicBool::new(false),
+        y_held: StdAtomicBool::new(false),
+        x_released: StdAtomicBool::new(false),
+    };
+    k.kthreads
+        .create(
+            plain_on_cpu_x,
+            &t as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    k.kthreads
+        .create(
+            plain_on_cpu_y,
+            &t as *const _ as usize,
+            OTHER,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    let (nx, ny) = std::thread::scope(|s| {
+        let x = s.spawn(|| run_cpu(&k, CPU));
+        let y = s.spawn(|| run_cpu(&k, OTHER));
+        (x.join().unwrap(), y.join().unwrap())
+    });
+    assert_eq!((nx, ny), (2, 2));
+    let held = Some(KSwitchRefusal::PlainLockHeld);
+    assert_eq!(
+        t.x.seen(),
+        std::vec![("x_held", held, 1), ("x_released", None, 0)]
+    );
+    assert_eq!(
+        t.y.seen(),
+        std::vec![
+            ("y_held", held, 1),
+            ("y_after_x_release", held, 1),
+            ("y_released", None, 0)
+        ]
+    );
+}
+
+fn plain_accounting_failures(ctx: &KThreadCtx, arg: usize) {
+    let f = plain_fixture(arg);
+    let mine = || &ctx.pool().plain_counters()[ctx.id().slot()];
+    let faults = plain_accounting_faults();
+    // 1. Underflow: a release with nothing counted latches the poison.
+    plain_guard_released(Some(NonNull::from(mine())));
+    note(ctx, f, "underflow", ctx.yield_now());
+    // Nothing restores eligibility: another balanced guard, released, leaves it poisoned.
+    drop(f.a.lock());
+    note(ctx, f, "underflow_then_balanced", ctx.yield_now());
+    clear_poison_for_test_exit(ctx);
+    // 2. Overflow: one more guard than the counter can hold latches the poison.
+    mine().store(PLAIN_POISON - 1, Ordering::Release);
+    let g = f.a.lock();
+    drop(g);
+    note(ctx, f, "overflow", ctx.yield_now());
+    clear_poison_for_test_exit(ctx);
+    // 3. A guard taken off every kernel-thread stack but released on this one.
+    plain_guard_released(None);
+    note(ctx, f, "released_here_taken_elsewhere", ctx.yield_now());
+    clear_poison_for_test_exit(ctx);
+    assert!(plain_accounting_faults() >= faults + 3);
+    // 4. Publish this counter, then switch away clean: the dispatcher releases a guard "taken
+    //    here" from its own stack.
+    f.counter
+        .store(mine() as *const AtomicU32 as usize, Ordering::Release);
+    note(ctx, f, "clean", ctx.yield_now());
+    note(ctx, f, "taken_here_released_elsewhere", ctx.yield_now());
+    clear_poison_for_test_exit(ctx);
+    note(ctx, f, "cleared_for_exit", ctx.yield_now());
+}
+
+#[test]
+fn accounting_failures_latch_and_never_restore_eligibility() {
+    let k = kernel();
+    let f = Plain::new();
+    k.kthreads
+        .create(
+            plain_accounting_failures,
+            &f as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    // Run until the thread has published its counter and switched away clean.
+    let mut n = 0;
+    while f.counter.load(Ordering::Acquire) == 0 || n == 0 {
+        let sel = k
+            .with_cpu_sched_split(CPU, |c| {
+                c.dispatch_next_accepted_selection(|t| k.kthreads.admit_dispatch(CPU, t))
+            })
+            .expect("cpu");
+        let AcceptedSelection::Selected(DispatchSelection::Dequeued { tid }) = sel else {
+            panic!("the thread is runnable");
+        };
+        let _ = k.kthreads.dispatch_selected(CPU, tid);
+        n += 1;
+    }
+    // On the dispatcher's own stack: a release naming the thread's counter.
+    // SAFETY: the counter belongs to this test's live pool.
+    let c = unsafe { &*(f.counter.load(Ordering::Acquire) as *const AtomicU32) };
+    plain_guard_released(Some(NonNull::from(c)));
+    assert_eq!(c.load(Ordering::Acquire), PLAIN_POISON);
+    run_cpu(&k, CPU);
+    let acct = Some(KSwitchRefusal::PlainLockAccounting);
+    assert_eq!(
+        f.seen(),
+        std::vec![
+            ("underflow", acct, PLAIN_POISON),
+            ("underflow_then_balanced", acct, PLAIN_POISON),
+            ("overflow", acct, PLAIN_POISON),
+            ("released_here_taken_elsewhere", acct, PLAIN_POISON),
+            // The yield succeeded clean; by the time the thread resumed, the dispatcher's
+            // release had poisoned its counter.
+            ("clean", None, PLAIN_POISON),
+            ("taken_here_released_elsewhere", acct, PLAIN_POISON),
+            ("cleared_for_exit", None, 0),
+        ]
+    );
+}
+
+#[test]
+fn plain_guards_off_kernel_thread_stacks_are_not_counted() {
+    let k = kernel();
+    let f = Plain::new();
+    let id = k
+        .kthreads
+        .create(nop, 0, CPU, TaskPriority::Normal)
+        .expect("create");
+    // The dispatcher (this test thread) holds a plain lock: no kernel-thread counter moves.
+    let g = f.a.lock();
+    assert_eq!(k.kthreads.plain_guards_held(id), 0);
+    drop(g);
+    assert_eq!(run_cpu(&k, CPU), 1);
+    assert_eq!(k.kthreads.plain_guards_held(id), 0);
+}
+
+#[test]
+#[should_panic(expected = "KTHREAD_PLAIN_LOCK_INVARIANT")]
+fn a_slot_reused_with_a_live_count_fails_closed() {
+    let k = kernel();
+    let id = k
+        .kthreads
+        .create(nop, 0, CPU, TaskPriority::Normal)
+        .expect("create");
+    run_cpu(&k, CPU);
+    // The free list is LIFO: the next creation takes the same slot.
+    k.kthreads.plain_counters()[id.slot()].store(1, Ordering::Release);
+    let _ = k.kthreads.create(nop, 0, CPU, TaskPriority::Normal);
+}
+
+struct PlainCost {
+    lock: SpinLock<u64>,
+    on_stack_ns: StdAtomicUsize,
+}
+
+const COST_ROUNDS: usize = 2_000_000;
+
+fn cost_round(l: &SpinLock<u64>) -> u128 {
+    let t = std::time::Instant::now();
+    for _ in 0..COST_ROUNDS {
+        let mut g = l.lock();
+        *g = g.wrapping_add(1);
+    }
+    t.elapsed().as_nanos()
+}
+
+fn plain_cost_on_stack(_ctx: &KThreadCtx, arg: usize) {
+    // SAFETY: the test keeps the fixture alive.
+    let f = unsafe { &*(arg as *const PlainCost) };
+    let ns = cost_round(&f.lock);
+    f.on_stack_ns.store(ns as usize, Ordering::Release);
+}
+
+/// KTHREAD-CLOSURE1 §B — the accounting's cost per plain acquire/release pair, measured on the
+/// host (run explicitly: `cargo test --release --lib -- --ignored plain_lock_cost`). Three
+/// situations: no kernel-thread stack registered (every production boot that creates no kernel
+/// thread), a registered pool and a guard off its stacks, and a guard on a kernel-thread stack.
+#[test]
+#[ignore]
+fn plain_lock_cost() {
+    let l = SpinLock::new(0u64);
+    // Registry state is process-wide: run this benchmark alone.
+    let unregistered = PLAIN_HIGH.load(Ordering::Acquire) == 0;
+    let empty = cost_round(&l);
+    let k = kernel();
+    let f = PlainCost {
+        lock: SpinLock::new(0),
+        on_stack_ns: StdAtomicUsize::new(0),
+    };
+    k.kthreads
+        .create(
+            plain_cost_on_stack,
+            &f as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    let off_stack = cost_round(&l);
+    run_cpu(&k, CPU);
+    let on_stack = f.on_stack_ns.load(Ordering::Acquire) as u128;
+    let per = |ns: u128| ns as f64 / COST_ROUNDS as f64;
+    std::println!(
+        "PLAIN_LOCK_COST rounds={} registry_empty={} empty_ns={:.2} registered_off_stack_ns={:.2} on_kthread_stack_ns={:.2}",
+        COST_ROUNDS,
+        unregistered,
+        per(empty),
+        per(off_stack),
+        per(on_stack)
+    );
+}

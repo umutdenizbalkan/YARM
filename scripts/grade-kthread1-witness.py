@@ -39,8 +39,10 @@ in two separate steps, and never from console order:
    * user progress: user tasks marked Running on the CPU during the kernel-thread phase (with one
      CPU reported, not required: the only user workload needs a secondary);
    and once per run:
-   * switch-safety probes refused by name (a masked section; an interrupt-masking guard), a
-     lost-wakeup probe that did not block, a stale-id wake reported stale;
+   * switch-safety probes refused by name (a masked section; an interrupt-masking guard; a real
+     plain SpinLock across yield, block, nesting, a partial release and a timer interrupt, with
+     scheduling restored after the final release), a lost-wakeup probe that did not block, a
+     stale-id wake reported stale;
    * create/exit/reuse cycles: slot reuse with a strictly newer generation, every reclaim AFTER the
      dispatcher switched away from the exited thread with its residency cleared, pool exhaustion at
      exactly the free count and full recovery; every created thread gone at the end.
@@ -55,7 +57,9 @@ KINDS = {"pop", "create", "run", "irq", "switch", "dispatch", "wake", "woken", "
          "reclaim", "exhaust", "user", "final", "yield", "blip", "wakereq", "decide", "director",
          "uwork", "uarm", "utimeout"}
 R_DIRECTOR, R_ALT, R_SLEEPER, R_WAKER, R_BLIP, R_LOSTWAKE, R_HOLDER = 1, 2, 3, 4, 5, 6, 7
-P_MASKED, P_IRQ_GUARD, P_STALE_WAKE, P_LOST_WAKE = 1, 2, 3, 4
+P_MASKED, P_IRQ_GUARD, P_STALE_WAKE, P_LOST_WAKE, P_PLAIN = 1, 2, 3, 4, 5
+# KSwitchRefusal codes as the producer records them (kthread_witness.rs `refusal_code`).
+R_PLAIN_LOCK_HELD = 7
 TOKEN = 0x4B541000
 SW_YIELD, SW_BLOCK, SW_EXIT = 1, 2, 3
 KID_TAG = 0x4B54 << 48
@@ -249,7 +253,7 @@ def replay(recs):
         if k == "probe":
             if r.cpu != dhome or r.res != dkid:
                 bad.append("probe_not_by_director seq=%d" % r.seq)
-            if r.f[1] in (P_MASKED, P_IRQ_GUARD):
+            if r.f[1] in (P_MASKED, P_IRQ_GUARD, P_PLAIN):
                 if kid != dkid:
                     bad.append("probe_not_by_director seq=%d" % r.seq)
             elif r.f[1] == P_STALE_WAKE:
@@ -690,6 +694,24 @@ def grade(text, expect_cpus):
         got = probes.get(p, [])
         if len(got) != 1 or got[0].f[3] != 0 or got[0].f[2] != 1:
             fail("switch_under_guard_not_refused probe=%s" % name)
+    # KTHREAD-CLOSURE1 §B: a real plain SpinLock held across yield, block, a nested acquisition, a
+    # partial release and a timer interrupt taken on the holder is refused every time, by name;
+    # the count follows the guards exactly; the final release restores scheduling.
+    plain = probes.get(P_PLAIN, [])
+    if len(plain) != 1:
+        fail("switch_under_guard_not_refused probe=plain_lock records=%d" % len(plain))
+    else:
+        f2, f3, f4 = plain[0].f[2], plain[0].f[3], plain[0].f[4]
+        codes = [(f2 >> (8 * i)) & 0xFF for i in range(4)]
+        counts = [(f4 >> (8 * i)) & 0xFF for i in range(4)]
+        if codes != [R_PLAIN_LOCK_HELD] * 4 or f3 & 0xF:
+            fail("switch_under_guard_not_refused probe=plain_lock codes=%s switched=0x%x" % (codes, f3 & 0xF))
+        if not (f3 >> 4) & 1:
+            fail("plain_lock_release_did_not_restore_scheduling")
+        if counts != [1, 2, 1, 0]:
+            fail("plain_lock_count_wrong counts=%s" % counts)
+        if not (f4 >> 32) & 1:
+            fail("plain_lock_probe_without_interrupt")
     lost = probes.get(P_LOST_WAKE, [])
     if len(lost) != 1 or lost[0].f[2] != 0:
         fail("lost_wakeup")

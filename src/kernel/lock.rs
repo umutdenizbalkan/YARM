@@ -97,6 +97,7 @@ impl<T> SpinLock<T> {
         }
         SpinLockGuard {
             lock: self,
+            on_kthread_stack: crate::kernel::kthread::plain_guard_taken(),
             _not_send: PhantomData,
         }
     }
@@ -111,6 +112,7 @@ impl<T> SpinLock<T> {
         {
             Some(SpinLockGuard {
                 lock: self,
+                on_kthread_stack: crate::kernel::kthread::plain_guard_taken(),
                 _not_send: PhantomData,
             })
         } else {
@@ -259,6 +261,10 @@ impl<T> Drop for SpinLockIrqGuard<'_, T> {
 
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    /// KTHREAD-CLOSURE1 §B: the plain-lock counter of the kernel-thread stack this guard was taken
+    /// on (`None` off every kernel-thread stack). A kernel thread cannot yield, block or exit while
+    /// it is non-zero; the release decrements exactly this counter.
+    on_kthread_stack: Option<core::ptr::NonNull<core::sync::atomic::AtomicU32>>,
     _not_send: PhantomData<*const UnsafeCell<()>>,
 }
 
@@ -290,6 +296,7 @@ impl<T> core::ops::DerefMut for SpinLockGuard<'_, T> {
 
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
+        crate::kernel::kthread::plain_guard_released(self.on_kthread_stack);
         self.lock.held.0.store(false, Ordering::Release);
     }
 }

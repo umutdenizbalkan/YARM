@@ -1271,3 +1271,73 @@ fn valid_unfinished_rounds_at_the_census_boundaries_pass() {
         "user_sequence_invalid",
     );
 }
+
+// ── KTHREAD-CLOSURE1 §B: a real plain lock across scheduling points ─────────────────────────────
+
+fn plain_probe(r: &Rec) -> bool {
+    r.kind == "probe" && r.f[1] == 5
+}
+
+/// The director holds a real plain `SpinLock` across a yield, a block, a nested acquisition, a
+/// partial release and a timer interrupt; every attempt must be refused as `plain_lock_held`, the
+/// counts must follow the guards, and the final release must restore scheduling.
+#[test]
+fn a_switch_under_a_plain_lock_is_detected() {
+    let cases: [(&str, fn(&mut Vec<Rec>), &str); 7] = [
+        (
+            "plain_yield_switched",
+            |r| first(r, plain_probe).f[3] |= 1,
+            "switch_under_guard_not_refused probe=plain_lock",
+        ),
+        (
+            "plain_block_not_refused",
+            |r| first(r, plain_probe).f[2] &= !0xFF00,
+            "switch_under_guard_not_refused probe=plain_lock",
+        ),
+        (
+            "plain_refused_for_another_reason",
+            |r| {
+                let x = first(r, plain_probe);
+                x.f[2] = (x.f[2] & !0xFF) | 1;
+            },
+            "switch_under_guard_not_refused probe=plain_lock",
+        ),
+        (
+            "plain_release_not_restored",
+            |r| first(r, plain_probe).f[3] &= !0x10,
+            "plain_lock_release_did_not_restore_scheduling",
+        ),
+        (
+            "plain_count_wrong",
+            |r| first(r, plain_probe).f[4] ^= 3 << 8,
+            "plain_lock_count_wrong",
+        ),
+        (
+            "plain_without_interrupt",
+            |r| first(r, plain_probe).f[4] &= !(1 << 32),
+            "plain_lock_probe_without_interrupt",
+        ),
+        (
+            "plain_probe_missing",
+            |r| {
+                r.retain(|x| !plain_probe(x));
+                renumber(r);
+            },
+            "switch_under_guard_not_refused probe=plain_lock records=0",
+        ),
+    ];
+    for (name, edit, reason) in cases {
+        expect_fail(name, &edited(edit), 2, reason);
+        expect_fail(name, &edited_from(SINGLE, edit), 1, reason);
+    }
+    // The probe is the director's: on a thread, it is refused by the replay.
+    expect_fail(
+        "plain_probe_not_by_director",
+        &edited(|r| {
+            let alt = first(r, |x| x.kind == "create" && x.f[1] == 2).f[0];
+            first(r, plain_probe).f[0] = alt;
+        }),
+        2,
+        "invalid lifecycle_probe_not_by_director",
+    );
+}

@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::arch::kthread as arch;
 use crate::kernel::kthread::{
     KSwitchReason, KSwitchRefusal, KTHREAD_CAPACITY, KTHREAD_STACK_BYTES, KThreadCtx, KThreadId,
-    KWaitQueue, KWake,
+    KWaitError, KWaitQueue, KWake,
 };
 use crate::kernel::scheduler::{CpuId, TaskPriority};
 use crate::runtime::SharedKernel;
@@ -118,6 +118,8 @@ const R_HOLDER: u64 = 7;
 // Probe kinds (K_PROBE f1).
 const P_MASKED: u64 = 1;
 const P_IRQ_GUARD: u64 = 2;
+/// KTHREAD-CLOSURE1 §B: a real plain (non-masking) `SpinLock` held across scheduling points.
+const P_PLAIN: u64 = 5;
 const P_STALE_WAKE: u64 = 3;
 const P_LOST_WAKE: u64 = 4;
 
@@ -681,7 +683,81 @@ fn refusal_code(r: KSwitchRefusal) -> u64 {
         KSwitchRefusal::WrongStack => 4,
         KSwitchRefusal::Stale => 5,
         KSwitchRefusal::Scheduler => 6,
+        KSwitchRefusal::PlainLockHeld => 7,
+        KSwitchRefusal::PlainLockAccounting => 8,
     }
+}
+
+/// KTHREAD-CLOSURE1 §B — the plain-lock probe, on the director's own stack. Two real plain
+/// `SpinLock`s: a yield and a block under one guard, a yield under two (nested), a yield after the
+/// first is released (partial), a yield after a timer interrupt was taken on this thread with the
+/// guard still live, then a yield after the final release. Record: f2 = the four refusal codes
+/// (one byte each: yield, block, nested-then-partial yield, after-interrupt yield), f3 = which of
+/// the five scheduling attempts switched (bit per attempt, the final one bit 4), f4 = the counts
+/// seen (one, two, after the interrupt, after the final release; a byte each) and bit 32 = an
+/// interrupt was taken while the guard was live.
+fn plain_lock_probe(ctx: &KThreadCtx) {
+    static PLAIN_A: crate::kernel::lock::SpinLock<u64> = crate::kernel::lock::SpinLock::new(0);
+    static PLAIN_B: crate::kernel::lock::SpinLock<u64> = crate::kernel::lock::SpinLock::new(0);
+    static PROBE_Q: KWaitQueue = KWaitQueue::new();
+    let pool = ctx.pool();
+    let held = || u64::from(pool.plain_guards_held(ctx.id()) & 0xFF);
+    let code = |r: Result<(), KSwitchRefusal>| r.err().map_or(0, refusal_code);
+    let mut switched = 0u64;
+    let mut counts = 0u64;
+    let a = PLAIN_A.lock();
+    counts |= held();
+    let y1 = ctx.yield_now();
+    switched |= u64::from(y1.is_ok());
+    // The block attempt must not hang a build whose check is missing (a hang proves nothing): a
+    // wake of this thread is left pending first, so an unrefused park returns at once, and the
+    // condition holds on its second evaluation. A refused park consumes neither.
+    {
+        let _m = ctx.masked();
+        let _ = pool.wake(ctx.id());
+    }
+    let evaluations = core::cell::Cell::new(0u32);
+    let w = PROBE_Q.wait_until(ctx, || {
+        evaluations.set(evaluations.get() + 1);
+        evaluations.get() > 1
+    });
+    let block_code = match w {
+        Err(KWaitError::Refused(r)) => refusal_code(r),
+        _ => {
+            switched |= 1 << 1;
+            0
+        }
+    };
+    let b = PLAIN_B.lock();
+    counts |= held() << 8;
+    drop(a);
+    let y2 = ctx.yield_now();
+    switched |= u64::from(y2.is_ok()) << 2;
+    let before = pool.interrupt_count(ctx.id());
+    let mut spins = 0u64;
+    while pool.interrupt_count(ctx.id()) == before && spins < 400_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    let irq_seen = u64::from(pool.interrupt_count(ctx.id()) != before);
+    counts |= held() << 16;
+    let y3 = ctx.yield_now();
+    switched |= u64::from(y3.is_ok()) << 3;
+    drop(b);
+    counts |= held() << 24;
+    let y4 = ctx.yield_now();
+    switched |= u64::from(y4.is_ok()) << 4;
+    record(
+        ctx.home(),
+        K_PROBE,
+        [
+            ctx.id().raw(),
+            P_PLAIN,
+            code(y1) | (block_code << 8) | (code(y2) << 16) | (code(y3) << 24),
+            switched,
+            counts | (irq_seen << 32),
+        ],
+    );
 }
 
 /// The interrupt count of `id`'s slot, as an address the patterned spin can poll.
@@ -1078,6 +1154,7 @@ fn director(ctx: &KThreadCtx, _arg: usize) {
             ],
         );
     }
+    plain_lock_probe(ctx);
     // 5. The lost-wakeup probe, on the second CPU (or here on a single CPU).
     let probe_cpu = CpuId(second.unwrap_or(0) as u8);
     let _ = remember(create(ctx, lost_wake_probe, 0, probe_cpu, R_LOSTWAKE));
