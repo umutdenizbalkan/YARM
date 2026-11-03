@@ -256,16 +256,16 @@ static HELD_1G: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 struct Snap {
     current: AtomicU64,
     n: AtomicUsize,
-    tids: [AtomicU64; 3 * crate::kernel::scheduler::MAX_RUN_QUEUE],
-    prio: [AtomicU8; 3 * crate::kernel::scheduler::MAX_RUN_QUEUE],
+    tids: [AtomicU64; 3 * crate::kernel::scheduler::MAX_QUEUED_PER_PRIORITY],
+    prio: [AtomicU8; 3 * crate::kernel::scheduler::MAX_QUEUED_PER_PRIORITY],
     valid: AtomicBool,
 }
 #[allow(clippy::declare_interior_mutable_const)]
 const EMPTY_SNAP: Snap = Snap {
     current: AtomicU64::new(0),
     n: AtomicUsize::new(0),
-    tids: [const { AtomicU64::new(0) }; 3 * crate::kernel::scheduler::MAX_RUN_QUEUE],
-    prio: [const { AtomicU8::new(0) }; 3 * crate::kernel::scheduler::MAX_RUN_QUEUE],
+    tids: [const { AtomicU64::new(0) }; 3 * crate::kernel::scheduler::MAX_QUEUED_PER_PRIORITY],
+    prio: [const { AtomicU8::new(0) }; 3 * crate::kernel::scheduler::MAX_QUEUED_PER_PRIORITY],
     valid: AtomicBool::new(false),
 };
 static SNAPS: [Snap; MAX_W_CPUS] = [EMPTY_SNAP; MAX_W_CPUS];

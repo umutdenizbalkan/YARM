@@ -570,7 +570,6 @@ fn wake_code(w: KWake) -> u64 {
         KWake::Enqueued => 1,
         KWake::Pending => 2,
         KWake::Stale => 3,
-        KWake::Refused(_) => 4,
     }
 }
 

@@ -769,3 +769,309 @@ fn balanced_placement_load_counts_user_tasks_only() {
     assert_eq!(k.sched_domain().load_mirror(CPU.0 as usize), before + 1);
     assert_eq!(run_cpu(&k, CPU), 1, "the kernel thread still runs");
 }
+
+// ── KTHREAD1-ACCEPTANCE §1: a wake is never refused, so no waiter is left without an owner ────
+//
+// On the delivered base a wake into a full destination queue was refused (`QueueFull`), and
+// `wake_all` had already taken the registration: the thread stayed Blocked with nobody
+// responsible for waking it, and freeing capacity resumed nothing (reproduced on `40132e1a`).
+// The run queue now reserves room for every kernel thread (`MAX_QUEUED_PER_PRIORITY`).
+
+/// Fill `cpu`'s Normal queue with user entries until a user push is refused. Returns how many.
+fn fill_with_users(k: &SharedKernel, cpu: CpuId, base: u64) -> u64 {
+    let mut n = 0;
+    loop {
+        let r = k
+            .with_cpu_sched_split(cpu, |c| {
+                c.enqueue_with_priority(ThreadId(base + n), TaskPriority::Normal)
+            })
+            .expect("cpu");
+        match r {
+            Ok(()) => n += 1,
+            Err(e) => {
+                assert_eq!(e, SchedulerError::QueueFull);
+                return n;
+            }
+        }
+    }
+}
+
+fn user_push(k: &SharedKernel, cpu: CpuId, tid: u64) -> Result<(), SchedulerError> {
+    k.with_cpu_sched_split(cpu, |c| {
+        c.enqueue_with_priority(ThreadId(tid), TaskPriority::Normal)
+    })
+    .expect("cpu")
+}
+
+fn occurrences(k: &SharedKernel, cpu: CpuId, raw: u64) -> usize {
+    queued(k, cpu).iter().filter(|&&t| t == raw).count()
+}
+
+#[test]
+fn a_wake_into_a_user_full_queue_is_placed_and_completes_without_a_second_condition_change() {
+    let k = kernel();
+    let g = Gate::new();
+    let id = k
+        .kthreads
+        .create(
+            gate_waiter,
+            &g as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    run_cpu(&k, CPU);
+    assert_eq!(k.kthreads.state_of(id), Some(KState::Blocked));
+    assert_eq!(g.q.registered(), 1);
+    assert_eq!(
+        fill_with_users(&k, CPU, 900_000),
+        crate::kernel::scheduler::MAX_RUN_QUEUE as u64
+    );
+    // The condition is published once; the one wake places the thread despite the full queue.
+    g.open.store(true, Ordering::Release);
+    assert_eq!(g.q.wake_all(&k.kthreads), 1);
+    assert_eq!(k.kthreads.state_of(id), Some(KState::Ready));
+    assert_eq!(occurrences(&k, CPU, id.raw()), 1);
+    assert_eq!(
+        g.q.registered(),
+        0,
+        "the registration was consumed by a placement"
+    );
+    // The user limit is unchanged: a kernel-thread entry counts against it.
+    assert_eq!(user_push(&k, CPU, 990_000), Err(SchedulerError::QueueFull));
+    assert_eq!(run_cpu(&k, CPU), 1);
+    assert_eq!(g.done.load(Ordering::Acquire), 1);
+    assert_eq!(k.kthreads.state_of(id), None, "exited and reclaimed");
+}
+
+#[test]
+fn every_kernel_thread_fits_beside_a_user_full_queue() {
+    let k = kernel();
+    // Four queues of eight waiters: the whole pool, all on one CPU at one priority.
+    let gates: Vec<Gate> = (0..KTHREAD_CAPACITY / KWAIT_CAPACITY)
+        .map(|_| Gate::new())
+        .collect();
+    let mut ids = Vec::new();
+    for g in &gates {
+        for _ in 0..KWAIT_CAPACITY {
+            ids.push(
+                k.kthreads
+                    .create(
+                        gate_waiter,
+                        g as *const _ as usize,
+                        CPU,
+                        TaskPriority::Normal,
+                    )
+                    .expect("create"),
+            );
+        }
+    }
+    run_cpu(&k, CPU);
+    assert!(
+        ids.iter()
+            .all(|&id| k.kthreads.state_of(id) == Some(KState::Blocked))
+    );
+    assert_eq!(
+        fill_with_users(&k, CPU, 900_000),
+        crate::kernel::scheduler::MAX_RUN_QUEUE as u64
+    );
+    for g in &gates {
+        g.open.store(true, Ordering::Release);
+        assert_eq!(g.q.wake_all(&k.kthreads), KWAIT_CAPACITY);
+    }
+    // 64 user entries and 32 kernel threads: the reserved bound, reached and not exceeded.
+    assert_eq!(
+        queued(&k, CPU).len(),
+        crate::kernel::scheduler::MAX_QUEUED_PER_PRIORITY
+    );
+    for &id in &ids {
+        assert_eq!(occurrences(&k, CPU, id.raw()), 1);
+    }
+    assert_eq!(run_cpu(&k, CPU), KTHREAD_CAPACITY);
+    assert!(
+        gates
+            .iter()
+            .all(|g| g.done.load(Ordering::Acquire) == KWAIT_CAPACITY as u32)
+    );
+    assert_eq!(k.kthreads.free_slots(), KTHREAD_CAPACITY);
+}
+
+#[test]
+fn repeated_and_duplicate_wakes_against_a_full_queue_give_one_placement() {
+    let k = kernel();
+    let g = Gate::new();
+    let id = k
+        .kthreads
+        .create(
+            gate_waiter,
+            &g as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    run_cpu(&k, CPU);
+    fill_with_users(&k, CPU, 900_000);
+    g.open.store(true, Ordering::Release);
+    assert_eq!(k.kthreads.wake(id), KWake::Enqueued);
+    for _ in 0..3 {
+        assert_eq!(k.kthreads.wake(id), KWake::Pending, "already placed");
+    }
+    g.q.wake_all(&k.kthreads);
+    g.q.wake_all(&k.kthreads);
+    assert_eq!(occurrences(&k, CPU, id.raw()), 1, "no duplicate placement");
+    assert_eq!(run_cpu(&k, CPU), 1);
+    assert_eq!(g.done.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn several_waiters_with_different_outcomes_in_one_wake_all() {
+    let k = kernel();
+    let g = Gate::new();
+    // One waiter parked on each of two CPUs, and one woken during its own check (not parked).
+    let a = k
+        .kthreads
+        .create(
+            gate_waiter,
+            &g as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    let b = k
+        .kthreads
+        .create(
+            gate_waiter,
+            &g as *const _ as usize,
+            OTHER,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    run_cpu(&k, CPU);
+    run_cpu(&k, OTHER);
+    assert_eq!(g.q.registered(), 2);
+    fill_with_users(&k, CPU, 900_000);
+    fill_with_users(&k, OTHER, 910_000);
+    g.open.store(true, Ordering::Release);
+    assert_eq!(
+        g.q.wake_all(&k.kthreads),
+        2,
+        "both placed, each on its own home"
+    );
+    assert_eq!(occurrences(&k, CPU, a.raw()), 1);
+    assert_eq!(occurrences(&k, OTHER, b.raw()), 1);
+    assert_eq!(occurrences(&k, CPU, b.raw()), 0);
+    assert_eq!(run_cpu(&k, CPU) + run_cpu(&k, OTHER), 2);
+    assert_eq!(g.done.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn a_wake_during_publication_is_kept_with_a_full_queue() {
+    let k = kernel();
+    let g = Gate::new();
+    g.wake_inside_check.store(true, Ordering::Release);
+    fill_with_users(&k, CPU, 900_000);
+    let id = k
+        .kthreads
+        .create(
+            gate_waiter,
+            &g as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create beside a user-full queue");
+    run_cpu(&k, CPU);
+    assert_eq!(k.kthreads.counters().early_wakes, 1);
+    assert_eq!(k.kthreads.state_of(id), Some(KState::Blocked));
+    g.open.store(true, Ordering::Release);
+    assert_eq!(g.q.wake_all(&k.kthreads), 1);
+    run_cpu(&k, CPU);
+    assert_eq!(g.done.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn a_stale_wake_after_reuse_is_refused_with_a_full_queue() {
+    let k = kernel();
+    let old = k
+        .kthreads
+        .create(nop, 0, CPU, TaskPriority::Normal)
+        .expect("create");
+    run_cpu(&k, CPU);
+    fill_with_users(&k, CPU, 900_000);
+    let g = Gate::new();
+    let replacement = k
+        .kthreads
+        .create(
+            gate_waiter,
+            &g as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    assert_eq!(replacement.slot(), old.slot());
+    run_cpu(&k, CPU);
+    assert_eq!(k.kthreads.wake(old), KWake::Stale);
+    assert_eq!(
+        occurrences(&k, CPU, replacement.raw()),
+        0,
+        "the stale wake placed nothing"
+    );
+    assert_eq!(k.kthreads.state_of(replacement), Some(KState::Blocked));
+    g.open.store(true, Ordering::Release);
+    assert_eq!(g.q.wake_all(&k.kthreads), 1);
+    run_cpu(&k, CPU);
+    assert_eq!(g.done.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn the_user_limit_is_unchanged_and_kernel_threads_have_reserved_room() {
+    let k = kernel();
+    // Kernel-thread ids enqueued directly (the scheduler sees only ids).
+    let kt = |i: usize| ThreadId(KThreadId::encode(i, 1).raw());
+    for i in 0..10 {
+        k.with_cpu_sched_split(CPU, |c| {
+            c.enqueue_with_priority(kt(i), TaskPriority::Normal)
+        })
+        .expect("cpu")
+        .expect("kernel-thread entry");
+    }
+    // Users fill to MAX_RUN_QUEUE entries in total, kernel threads included.
+    assert_eq!(
+        fill_with_users(&k, CPU, 900_000),
+        (crate::kernel::scheduler::MAX_RUN_QUEUE - 10) as u64
+    );
+    for i in 10..KTHREAD_CAPACITY {
+        k.with_cpu_sched_split(CPU, |c| {
+            c.enqueue_with_priority(kt(i), TaskPriority::Normal)
+        })
+        .expect("cpu")
+        .expect("reserved room");
+    }
+    assert_eq!(
+        queued(&k, CPU).len(),
+        crate::kernel::scheduler::MAX_RUN_QUEUE - 10 + KTHREAD_CAPACITY
+    );
+    assert_eq!(user_push(&k, CPU, 990_000), Err(SchedulerError::QueueFull));
+}
+
+#[test]
+#[should_panic(expected = "KTHREAD_WAKE_INVARIANT")]
+fn a_refusal_for_a_live_blocked_thread_fails_closed() {
+    let k = kernel();
+    let g = Gate::new();
+    let id = k
+        .kthreads
+        .create(
+            gate_waiter,
+            &g as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    run_cpu(&k, CPU);
+    assert_eq!(k.kthreads.state_of(id), Some(KState::Blocked));
+    // Break the invariant the reservation relies on: the home stops accepting work.
+    k.with_all_cpus_sched_split(|all| all.set_cpu_wake_only(CPU, true))
+        .expect("wake-only");
+    g.open.store(true, Ordering::Release);
+    let _ = g.q.wake_all(&k.kthreads);
+}

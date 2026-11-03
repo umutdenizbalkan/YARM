@@ -201,8 +201,6 @@ pub enum KWake {
     Pending,
     /// The id names an incarnation that no longer exists (exited, reused, never created).
     Stale,
-    /// The home CPU's scheduler refused the enqueue; the thread stays Blocked.
-    Refused(SchedulerError),
 }
 
 /// Why a kernel-origin interrupt was not accepted as a kernel-thread interrupt.
@@ -823,6 +821,13 @@ impl KThreadPool {
     /// Wake incarnation `id`. A Blocked thread is enqueued on its home CPU under that CPU's 1L
     /// (and the CPU is notified after the lock is released); one that has not parked yet gets a
     /// pending wake its park consumes; any other incarnation is stale and untouched.
+    ///
+    /// KTHREAD1-ACCEPTANCE §1: a wake is never refused. The run queue reserves room for every
+    /// kernel thread (`scheduler::MAX_QUEUED_PER_PRIORITY`), so the enqueue cannot fail for
+    /// capacity, and a live incarnation's home CPU was online and dispatching when it was created
+    /// and stays so (no CPU is taken offline or made wake-only after bring-up). An enqueue refusal
+    /// for a Blocked live incarnation is therefore a broken invariant, and it stops the kernel
+    /// here rather than leaving a thread Blocked with nobody responsible for waking it.
     pub fn wake(&self, id: KThreadId) -> KWake {
         let s = &self.slots[id.slot()];
         let home = CpuId(s.home.load(Ordering::Acquire));
@@ -830,24 +835,33 @@ impl KThreadPool {
             .shared()
             .with_cpu_sched_split(home, |c| {
                 if s.generation.load(Ordering::Acquire) != id.generation() {
-                    return KWake::Stale;
+                    return Ok(KWake::Stale);
                 }
                 match s.state.load(Ordering::Acquire) {
                     BLOCKED => match c.enqueue_with_priority(id.tid(), s.priority()) {
                         Ok(()) => {
                             s.state.store(READY, Ordering::Release);
-                            KWake::Enqueued
+                            Ok(KWake::Enqueued)
                         }
-                        Err(e) => KWake::Refused(e),
+                        Err(e) => Err(e),
                     },
                     RUNNING | READY => {
                         s.wake_pending.store(true, Ordering::Release);
-                        KWake::Pending
+                        Ok(KWake::Pending)
                     }
-                    _ => KWake::Stale,
+                    _ => Ok(KWake::Stale),
                 }
             })
-            .unwrap_or(KWake::Refused(SchedulerError::InvalidCpu));
+            .and_then(|r| r);
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => panic!(
+                "KTHREAD_WAKE_INVARIANT cpu={} kthread={:#x} refused={:?}",
+                home.0,
+                id.raw(),
+                e
+            ),
+        };
         match outcome {
             KWake::Enqueued => {
                 crate::arch::hal::notify_enqueued(home);
@@ -859,7 +873,6 @@ impl KThreadPool {
             KWake::Stale => {
                 self.stats.wakes_stale.fetch_add(1, Ordering::AcqRel);
             }
-            KWake::Refused(_) => {}
         }
         outcome
     }
@@ -1325,8 +1338,11 @@ impl KWaitQueue {
         }
     }
 
-    /// Wake every registered thread. Returns the outcomes' count of threads made ready or given a
-    /// pending wake.
+    /// Wake every registered thread. Returns the count of threads made ready or given a pending
+    /// wake. Taking the registrations is safe because no wake can be refused ([`KThreadPool::wake`]):
+    /// each one is either placed on its home CPU's queue, kept pending for a park that has not
+    /// happened yet, or names an incarnation that no longer exists. A woken thread re-evaluates its
+    /// condition and registers again if it still does not hold.
     pub fn wake_all(&self, pool: &KThreadPool) -> usize {
         let mut taken = [0u64; KWAIT_CAPACITY];
         let n = {

@@ -16,6 +16,16 @@ pub use yarm_kernel::scheduler::{CpuId, SchedulerError, TaskPriority};
 pub const MAX_RUN_QUEUE: usize = 64;
 pub const MAX_CPUS: usize = platform_constants::MAX_CPUS;
 const _: () = assert!(MAX_RUN_QUEUE.is_power_of_two());
+/// KTHREAD1-ACCEPTANCE §1 — the most entries one priority queue can hold. A user push is refused
+/// once a queue holds [`MAX_RUN_QUEUE`] entries (kernel threads included), exactly as before; a
+/// kernel-thread push may use [`KTHREAD_CAPACITY`](crate::kernel::kthread::KTHREAD_CAPACITY) more.
+/// A kernel thread is queued only on its home CPU and at most once there (`AlreadyQueued`), so a
+/// queue never holds more than that many kernel-thread entries, and a kernel thread's enqueue —
+/// its wake, its yield, its creation — is never refused for capacity.
+pub const MAX_QUEUED_PER_PRIORITY: usize = MAX_RUN_QUEUE + crate::kernel::kthread::KTHREAD_CAPACITY;
+/// The ring's physical slots (a power of two, for the index mask).
+const RING_SLOTS: usize = MAX_QUEUED_PER_PRIORITY.next_power_of_two();
+const _: () = assert!(RING_SLOTS >= MAX_QUEUED_PER_PRIORITY);
 
 /// Per-CPU slot for the recv-timeout split-read optimization.
 ///
@@ -44,7 +54,7 @@ struct ScheduledTask {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RingQueue {
-    tids: [ThreadId; MAX_RUN_QUEUE],
+    tids: [ThreadId; RING_SLOTS],
     head: usize,
     len: usize,
 }
@@ -130,14 +140,14 @@ impl AcceptedSelection {
 impl RingQueue {
     const fn new() -> Self {
         Self {
-            tids: [ThreadId(0); MAX_RUN_QUEUE],
+            tids: [ThreadId(0); RING_SLOTS],
             head: 0,
             len: 0,
         }
     }
 
     fn index(offset: usize) -> usize {
-        offset & (MAX_RUN_QUEUE - 1)
+        offset & (RING_SLOTS - 1)
     }
 
     fn contains(&self, tid: ThreadId) -> bool {
@@ -151,7 +161,13 @@ impl RingQueue {
     }
 
     fn push(&mut self, tid: ThreadId) -> Result<(), SchedulerError> {
-        if self.len >= MAX_RUN_QUEUE {
+        // KTHREAD1-ACCEPTANCE §1: the user limit is unchanged; kernel threads have reserved room.
+        let limit = if crate::kernel::kthread::is_kthread_tid(tid.0) {
+            MAX_QUEUED_PER_PRIORITY
+        } else {
+            MAX_RUN_QUEUE
+        };
+        if self.len >= limit {
             return Err(SchedulerError::QueueFull);
         }
         let tail = Self::index(self.head + self.len);
@@ -526,7 +542,7 @@ impl PriorityScheduler {
             let qi = Self::priority_index(priority);
             // Snapshot the entries in FIFO order first: `accept` may take another lock, so it must
             // not be called while indexing a queue this loop is about to mutate.
-            let mut candidates = [ThreadId(0); MAX_RUN_QUEUE];
+            let mut candidates = [ThreadId(0); MAX_QUEUED_PER_PRIORITY];
             let len = self.queues[qi].len;
             for (i, slot) in candidates.iter_mut().enumerate().take(len) {
                 *slot = self.queues[qi].tids[RingQueue::index(self.queues[qi].head + i)];
@@ -2006,6 +2022,12 @@ mod tests {
     #[test]
     fn withdraw_compacts_a_wrapped_ring_queue() {
         let mut q = RingQueue::new();
+        // Advance the head so the layout below wraps the physical ring exactly as it wrapped the
+        // 64-slot ring this test was written against (KTHREAD1-ACCEPTANCE §1 grew the ring).
+        for tid in 0..(RING_SLOTS - MAX_RUN_QUEUE) as u64 {
+            q.push(ThreadId(10_000 + tid)).expect("push");
+            q.pop().expect("pop");
+        }
         // Wrap the ring: fill most of it, drain most of that, then refill past the end.
         for tid in 1..=60u64 {
             q.push(ThreadId(tid)).expect("push");
@@ -2017,7 +2039,7 @@ mod tests {
             q.push(ThreadId(tid)).expect("push past the wrap");
         }
         assert!(
-            q.head + q.len > MAX_RUN_QUEUE,
+            q.head + q.len > RING_SLOTS,
             "the ring must be wrapped (head={}, len={})",
             q.head,
             q.len
