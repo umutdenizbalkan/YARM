@@ -2502,3 +2502,84 @@ threads after the last item, the post-disable user phase, and nothing fatal.
 bound is not established (observed use is not a bound); a plain non-masking `SpinLock` held across
 a scheduling point is not detected (SC-KT-8); cooperative only (SC-KT-4); no migration; QEMU timing
 is not hardware timing; no latency, fairness or WCET property is claimed.
+
+### 18.10 KTHREAD-CLOSURE1: the closure package
+
+Five closures on the KTHREAD1-ACCEPTANCE head `a7da04f1`, delivered in stages, each qualified on
+its own (records in the KTHREAD-CLOSURE1 record of `doc/KERNEL_UNLOCKING.md`). Cooperative
+scheduling, fixed CPU placement, user scheduling and FP preservation, no-FP enforcement, broad-lock
+retirement and the VM invalidation guarantees are unchanged.
+
+#### 18.10.1 Stage A: evidence contracts
+
+| Item | Hole on `a7da04f1` (reproduced through the real CLI or verifier) | Closed by |
+|---|---|---|
+| A2 one owner per CPU | the replay checked each thread's own interval, not the CPU's: thread B's dispatch moved before thread A's switch-away on CPU 0 passed; the director was exempt by identity | every record carries the CPU's execution stamp; the replay keeps one owner per CPU (below) |
+| A2 timeout rounds | arms were indexed by round (a duplicate silently replaced the first) and any one delivered-looking round earned coverage: round 2's result moved before its arm passed | every round is validated before any coverage is awarded (below) |
+| A3 SMP2 race | `sgi_unexplained_arrival`: the kernel and host verifiers let one arrival consume every earlier send of its pair, so two sends delivered as two arrivals left the second unexplained (4 of 16 fresh `a7da04f1` boots) | the per-pair rank rule, one corpus for both verifiers (below). No production defect: the order is legal |
+| A3 SMP2 witness timing | under host load the witness itself raced: a P1 reply sent before its target CPU parked, a P2 call sent before its target was resident (or held for a fixed delay instead of until the SGI arrived), and a TLB-round target preempted by its timer failed the boot (base `a7da04f1` loaded: 11 of 20 not ok in run 1, 13 of 20 in run 2) | handshakes and void rounds (below). No production defect: every observed order is legal |
+
+**The execution stamp** (producer `kthread_witness.rs` `record`, default-off). Every KT1 record
+carries `res` (the kernel thread resident on the record's CPU, `KCpu.running`, 0 = none) and `ord`
+(the CPU's kernel-thread dispatch ordinal, `KCpu.dispatches`), read in the same masked section as
+the record's sequence number. Every record of a CPU is written on that CPU, so a CPU's records are
+in its program order. `dispatch_selected` sets the resident and advances the ordinal before the
+dispatch record, and clears the resident before the switch record.
+
+**One execution owner per CPU** (grader `replay`). A record with a new ordinal opens an interval.
+A dispatch must open one, with itself resident; until the CPU's next ordinal every record belongs
+to that interval and must name its owner as resident (in-thread records, interrupts, the waker's
+wake requests); the switch-away must be by the owner, and an interval may not end without it;
+ordinals never run backwards. The director's dispatches are not recorded (it polls by yielding),
+so an interval with no dispatch record is the director's and only the director may be resident in
+it: its records are checked like any other, and none is exempt by identity. User records require
+nothing resident and no kernel-thread interval open; a reclaim requires the CPU unowned; reuse
+still follows retirement (KTHREAD1-ACCEPTANCE).
+
+**Every user timeout round is valid.** P runs work(k) → arm(k) → timeout(k) → work(k+1), one system
+call at a time, so that is the only legal sequence: each step once, rounds consecutive, one address
+space, the deadline elapsed, the result TimedOut. Recording starts when the director is created,
+asynchronously to P, so the first recorded round may begin at its arm or its result (and earns no
+coverage); the director stops P's phase before recording ends, so the last round may end after its
+work or its arm. That is valid unfinished work. Any other gap or repetition is an impossible
+completed operation and fails, whatever other rounds deliver. Coverage (a deadline delivered while
+kernel threads ran) is then counted from valid rounds only.
+
+**SGI population** (kernel `smp2_record::check_sgi_population`, host
+`scripts/smp2_sgi_population.py`). A send is recorded before its `GICD_SGIR` write and an arrival
+after its `IAR` read. GICv2 keeps an SGI pending per (target, source): writes coalesce while it is
+pending, and a write after the acknowledgement arrives again. Per (source, target), the k-th arrival
+needs at least k sends recorded before it (else unexplained), and every send must be recorded
+before the pair's last arrival (else undelivered); each arrival needs exactly one completion of its
+own token before the target's next arrival. Arrival failures are reported before undelivered sends.
+Both verifiers run the same 17 independently specified cases
+(`tests/fixtures/smp2/sgi_population.cases`): coalescing, re-delivery, both directions, a self
+kick, and each failure kind.
+
+**SMP2 witness handshakes** (`smp2_witness.rs`, witness only; ported from QEMU-SMP3-SEAL). Each P1
+call and reply waits, bounded and without a lock, until its target CPU is parked
+(`wait_until_parked`). A P2 call waits until its target task is resident and the helper is parked
+(`p2_ready`), and the target's window is held by the new `S_P2B_SENT` / `C_P2A_SENT` step until
+that CPU has taken the call's SGI (`p2_await_arrival`, per (target, source) arrival counters),
+replacing a fixed delay. Met and timed-out counts are printed on `SMP2_SYNC_P2`; a timeout is
+reported, never treated as met.
+
+**Void TLB rounds.** A serial TLB-round target that no longer reads its primed probe value after
+the window had its translations reloaded: it was switched out during the round (measured: a timer
+preemption under host load), so the round shows nothing about remote invalidation. It reports
+`S_ROUND_VOID` / `C_ROUND_VOID` and the protocol continues. Both verifiers (kernel `smp2_record`
+`tlb_round` / `tlb_coverage`, and the smoke grader) still require the requester's whole operation
+(arm, probe repoint, invalidation and its own acknowledgement, displacement, settlement), exactly
+one of observation or void, on the target's CPU, after the completion; a void counts for nothing,
+and each direction needs one valid round. The void is self-reported by the witness task; that is
+why it can only lose coverage, never earn it.
+
+**KT1 workload placement (RISC-V).** The KT1 boots' user work is the AP-scheduling workload. Its
+RISC-V program now tops its phase-A spinners up through ordinary placement until one has started
+on CPU 0 and on every expected secondary (`P_W_COVER`), as the AArch64 program already did: an
+8-hart boot placed none on CPU 0, phase A could not finish, and the kernel-thread window had no
+user work.
+
+**KT1 user progress.** A user task resumed from idle (`apsched_witness::note_idle_dispatch`) is a
+user dispatch for the per-CPU progress check, as is one marked by the mark seam (an 8-CPU AArch64
+boot otherwise reported `no_user_progress` for a CPU whose user work only ever resumed from idle).

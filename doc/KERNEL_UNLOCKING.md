@@ -3309,6 +3309,140 @@ scheduling point is not detected (SC-KT-8); cooperative only, no asynchronous ke
 verifier race; parallel hosted-test interference (qualified serially). Only the receive class of
 F1 is exercised live (send is hosted). No production subsystem creates kernel threads yet.
 
+#### KTHREAD-CLOSURE1 (from delivered `a7da04f1`)
+
+Five closures, delivered in stages (A evidence contracts, B scheduling-point lock safety, C hardware
+stack protection, D combined qualification). Remote heads and ancestry were verified first: `main`,
+`claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/kthread1-acceptance` all at `a7da04f1`; `14b61286`,
+every earlier KTHREAD ref and every other ref preserved. Contract §18.10 holds the rules as they now
+stand.
+
+##### Stage A — evidence contracts
+
+**A1, reproduced on `a7da04f1` through the delivered grader's CLI**, on checksum-valid edits of the
+then fixtures (inputs, outputs and the edits kept in scratch):
+
+| Case | Edit | Delivered grader |
+|---|---|---|
+| untouched 2-CPU and 1-CPU fixtures | none | exit 0, pass |
+| `overlap_cpu0` | dispatch seq 22 (kid `…010002`) moved before switch seq 21 (kid `…010001`), both CPU 0 | **exit 0, pass** |
+| `timeout_before_arm_round2` | `utimeout` round 2 (seq 66) moved before `uarm` round 2 (seq 32) | **exit 0, pass** |
+| the three KTHREAD1-ACCEPTANCE holes | no dispatch; one final left; an interrupt after reclaim | exit 1 (still refused) |
+
+**A2, producer audit.** Every record of a CPU is written on that CPU, but nothing in a record named
+who owned the CPU when it was taken: the replay could only check each thread's own state, and the
+director (whose dispatches are not recorded, because it polls by yielding) was exempt from interval
+checks by identity. Recording the director's dispatches would flood its ring; instead each record
+now carries the CPU's execution stamp (`res`, `ord`, contract §18.10.1), read in the same masked
+section as its sequence number from the dispatcher's own residency record and dispatch ordinal
+(`KThreadPool::witness_stamp`, feature-gated). On fresh boots the stamp pattern is exactly the
+producer's: dispatch and in-thread records carry the thread; switch, reclaim and user records
+carry none; director records carry the director; ordinals are monotonic per CPU. The timeout audit
+found the grader's `arms` dictionary keyed by round (a duplicate silently replaced the first) and
+coverage awarded from any one round, with no check of the others.
+
+**A3, the SMP2 race.** *Reproduced* on fresh `a7da04f1` artifacts (one build, 16 boots, every run
+kept): 4 of 16 failed `sgi_unexplained_arrival` (at seq 58, 58, 58, 49; the build boot passed).
+*Traced* (boot 3): CPU 1 sent two reschedule SGIs to CPU 0 (seq 53, 54), CPU 0 claimed one (55),
+completed it (57), claimed a second (58) and completed it (59). The owners: the send is
+`send_reschedule_sgi` (`arch/aarch64/smp.rs`) on the sender, recorded after `dsb ishst` and before the
+`GICD_SGIR` write; the claim is the target's `IAR` read in the trap, recorded after it; the
+consumption is that trap's reschedule handling; the completion is the one `EOIR` write at the trap
+tail, recorded after it. GICv2 keeps an SGI pending per (target, source): the second write landed
+after the first acknowledgement, so it arrived again. That order is legal, so there is no production
+defect; both verifiers paired greedily (one arrival consumed every earlier send of its pair) and
+left the second arrival unexplained. *Repair:* the per-pair rank rule (contract §18.10.1) in the
+kernel verifier and in a host module the smoke script now uses, both run against one corpus of 17
+independently specified cases. Every arrival is still bound to a recorded send, its own token's
+single completion and the INTID and IAR source checks; nothing unexplained is forgiven. All four
+reproduced failures pass the new rule.
+
+**The changes, kept apart:**
+* **Instrumentation** (default-off `kthread1-witness`): the execution stamp in every KT1 record
+  (`kthread.rs` `witness_stamp`, `kthread_witness.rs`).
+* **Checkers:** the per-CPU owner model and the round validation in
+  `scripts/grade-kthread1-witness.py`; `smp2_record::check_sgi_population`;
+  `scripts/smp2_sgi_population.py`; the smoke script uses it.
+* **Fixtures and tests:** both KT1 fixtures re-captured from stamped RISC-V boots (2 CPUs, 457
+  records; 1 CPU, 358); `tests/fixtures/smp2/sgi_population.cases`; 4 new KT1 CLI tests
+  (`overlapping_owners_on_one_cpu_are_refused`, 11 cases;
+  `user_execution_inside_a_kernel_thread_interval_is_refused`, 2;
+  `every_user_timeout_sequence_is_validated`, 10; `valid_unfinished_rounds_at_the_census_boundaries_pass`)
+  and the Rust corpus test. Two older CLI cases changed: `not_remote` (a director wake moved to
+  CPU 1) is now refused first as `director_resident_outside_its_interval`, and the legitimate
+  final-before-reclaim move picks a reclaim with no later record of its own CPU before the final,
+  since a CPU's own records keep their order.
+* **SMP2 witness** (default-off `aarch64-smp2-witness`; added after qualification runs 1 and 2,
+  below): the P1/P2 handshakes and the void TLB round (contract §18.10.1), the `SMP2_SYNC_P2` line
+  (the combined line exceeded printk's 192-byte record and lost its checksum), `tlb_void` in
+  `SMP2_COUNTS`; the kernel verifier's round and coverage checks as separate tested functions; the
+  smoke grader's matching rules, with every coverage shortfall printed; the scope guard pins the
+  handshakes.
+* **KT1 witness:** user tasks resumed from idle count as user dispatches
+  (`apsched_witness::note_idle_dispatch`, feature-gated).
+* **No production change.** QA6 found the default images different from the base only in panic
+  locations inside `kthread.rs`, whose lines moved by the 14-line feature-gated `witness_stamp`
+  (same image sizes; the differing bytes are those line numbers).
+
+**Invariant inventory (Stage A) and where each is checked**
+
+| Invariant | Check | Tests |
+|---|---|---|
+| one owner per CPU; dispatch opens an interval with itself resident | replay `dispatch_without_new_interval`, `dispatch_resident_mismatch`, `ord_backwards` | `overlap_moved`, `dispatch_same_interval`, `dispatch_not_resident`, `ord_backwards` |
+| switch-away removes the actual owner; no interval ends without it | `switch_by_non_owner`, `interval_ended_without_switch` | `overlap_restamped`, `wrong_owner_switch`, `missing_switch` |
+| in-thread events and interrupts belong to the running interval | `*_outside_running_interval` (resident checked), `resident_not_the_cpu_owner`, `record_without_resident` | `run_without_resident`, `run_other_resident`, `irq_after_reclaim`, `off_home` |
+| no director exemption | `director_resident_outside_its_interval`, `create_not_by_director`, `probe_not_by_director` | `director_in_thread_interval`, `not_remote` |
+| user execution never inside a kernel-thread interval | `user_execution_while_kernel_thread_owns_cpu` | `user_with_resident`, `user_inside_interval` |
+| reclaim and reuse never overtake retirement | `reclaimed_while_cpu_owned`, `reclaimed_before_switch_away`, `slot_reused_before_reclaim` | `reclaim_while_owned`, `early_reclaim`, `reuse_before_reclaim` |
+| every timeout round valid before coverage | `user_sequence_invalid`, `user_deadline_not_elapsed`, `user_deadline_result`, `user_round_address_space_changed` | the 10 cases of `every_user_timeout_sequence_is_validated` |
+| valid unfinished work at the census boundaries accepted | round validation (leading and trailing cuts) | `valid_unfinished_rounds_at_the_census_boundaries_pass` (and an unfinished middle round refused) |
+| SGI population: rank rule, completion per arrival | both verifiers | the 17-case corpus, Rust and Python |
+| a void TLB round needs the requester's whole operation, after the completion, on the target's CPU, and earns nothing | `tlb_round` (kernel), the grader's round loop | `a_void_tlb_round_still_requires_the_whole_operation_and_counts_for_nothing`; live forced-void controls |
+| each direction has a valid TLB round | `tlb_coverage`, the grader's coverage | `each_direction_needs_a_valid_tlb_round`; forced-void controls `1 3`, `2 4` |
+
+**Qualification (Stage A).** Predeclared schedule with three revisions, each declared before its
+freeze; every scheduled result kept; a passing retry never replaced a failed scheduled run. Runs
+executed from fresh detached worktrees of the frozen commit; boots and builds never overlapped a
+run except as noted.
+
+| Run | Freeze | Outcome |
+|---|---|---|
+| 1 | `22bb2b92` | stopped after QA6 (one container restart restarted QA9m; partial results kept). Failed: QA9m `aarch64 smp8 no_user_progress cpu=1` (user work resumed from idle was not counted); QA13 candidate loaded 12 of 20 not ok (P1/P2 window races of the witness itself; base the same run: idle 4/20, loaded 11/20 not ok) |
+| 2 | `a42c041d` | full matrix. Failed: QA3 (the SMP2 scope guard still pinned the replaced P1 wait; cargo stopped at that binary); QA13 candidate loaded 19/20 (`C_FAIL_RESIDENCY_LOST`: a legitimate timer preemption of a TLB-round target). Base idle 2/20, loaded 13/20 not ok. A hosted test build ran in the main checkout during QA6/QA7, after QA3 had failed |
+| 3 | `81bf9870` | full matrix. Failed: QA9m `riscv64 smp8` (the RISC-V AP-scheduling program, unchanged since `a7da04f1`, placed no spinner on CPU 0; its phase A could not finish and the kernel-thread window had no user work). Everything else passed: QA13 candidate 40 of 40 (rc 0, verdict ok, seal ok), base idle 3/20, loaded 13/20 not ok; QA14 forced-void controls as declared |
+| 4 | `228b3a51` | the steps whose inputs the RISC-V program reaches (revision 3): all passed: QA4, QA2 (every undo control again), QA8 RISC-V 3/3 seals, QA9m 9/9, QA15 forced top-up to 24 spinners on 8 and 2 harts (24 started, 24 finished, seals pass), QA1, QA3, QA6 (candidate default images byte-identical to run 3's), QA7 |
+
+Repairs between runs, all in witness or verifier code (no production change): run 1 → the SMP2
+handshakes and idle-dispatch progress; run 2 → void TLB rounds, the scope guard, the grader's
+coverage line (found by the forced-void control before the freeze); run 3 → the RISC-V spinner
+top-up (`P_W_COVER`, as the AArch64 program already did).
+
+Results on the delivered freeze `228b3a51` (run 3 for steps its last change cannot reach, run 4
+for the rest):
+* QA2: grader CLI 23/23 ×3; grader self-test; `smp2_record` 17/17 ×3; the 17-case SGI corpus in
+  Python; undo controls: `execution_owner` (`overlap_moved`, `user_with_resident` accepted again),
+  `timeout_sequence` (`timeout_before_arm`, and the unfinished middle round), `sgi_rule_python`
+  and `sgi_rule_rust` (`two_sends_before_the_first_arrival_delivered_twice`), `void_coverage`,
+  `void_excuses_requester`; positives pass.
+* QA8 strict 1-CPU KT1 boots 9/9 seals (the AP workload's own grade needs a secondary and fails
+  at one CPU, as declared); QA9m 2/4/8 CPUs on each ISA; QA15 forced top-up controls.
+* QA13 (AArch64 SMP2): candidate 40 of 40; base `a7da04f1` idle 3/20 and loaded 13/20 not ok
+  (`sgi_unexplained_arrival`, P1 resume/window, `sgi_elr_outside_window`); every base SGI
+  population refusal in runs 1–3 (15, 13, 15) re-grades ok under the new rule. No candidate boot
+  of run 3 reported a void round; the void path is exercised by QA14: one void round → verdict ok
+  with `tlb_rounds=3 tlb_void=1`; both rounds of one direction void →
+  `tlb_no_valid_round_to_s` / `_to_c` from the kernel verifier and the grader.
+* QA1 hosted serial 6266 passed; QA3 every integration binary; QA4 fmt; QA5 lock-site census
+  identical to base; QA6 default builds pass with no new warning, images different from the base
+  only in `kthread.rs` panic lines; QA7 no-FP suites, self-test and image checks; QA12 strict core
+  smokes on three ports.
+
+**Stage A remaining limits.** The void round is self-reported by the witness task (it can only
+lose coverage). The AP-scheduling witness's own timing assumptions on x86_64 (no top-up there;
+placement put two spinners on CPU 0 in every observed 8-CPU boot) are unchanged. QEMU timing is not
+hardware timing.
+
+
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 
 **U6 — COMPLETE. CANONICAL 199C — DELIVERED / CLOSED. CENSUS-DELTA 0.**
