@@ -657,7 +657,7 @@ the production `PriorityScheduler`.
 |---|---|---|---|
 | **KERNEL-NOFP1** | **done** (see the record below) | ordinary kernel code and its linked runtime helpers use no FP/SIMD registers. Audited exceptions are the explicit init and context save/restore routines. Proof is by disassembly of the final linked images, bounded by an allowlist; a blanket zero-FP check is wrong. Eager user preservation and exact continuation-owner authentication are unchanged. No compiler flag or calling convention is prescribed. No lazy FP. Cost measurement is outstanding; no WCET or certification claim | SC-FP-1…3, SC-KT-5 |
 | **SCHED-LOCK1** | **done** (see the record below; contract §16–§17); its witness evidence contract finished and its progress claim corrected by SCHED-LOCK1-ACCEPTANCE (SC-LOCK-2 partial, §17.3, §17.8), and its execution evidence bound to the installation timeline by SCHED-LOCK1-SEAL (§17.9). It was the prerequisite before preemptible kernel threads and before any bounded RT latency claim; it makes neither claim | give CPU-local runnable/current/quantum state explicit local ownership, so unrelated CPUs leave the one shared rank-1 scheduler critical section. Requires bounded local exclusion with a progress argument ("lock-free" is not mandated), and an explicit cross-CPU wake protocol: capacity, full-queue behaviour, publication order, cancellation, no lost wakeups. Preserves incarnation authentication, membership, wake arbitration, dispatch tokens and lock order. Separates global clock, topology and admission. Inventories the remaining shared dependencies. Must explicitly reconcile `AI_AGENT_RULES.md` §14.4 D6, §7.1/§8 below, the `stage106_d6_audit…` source guard and the `KERNEL_LOCKING.md` rank table | SC-LOCK-1…8 |
-| **KTHREAD1** | **done, cooperative** (see the record below; contract §18). Owned stacks, entry ABI, per-CPU base and flags, guard check for interrupt-masking guards, stack residency and reclamation, trap classifiers. Not done: asynchronous kernel preemption (SC-KT-4, not enabled), guard pages (SC-KT-1), plain-`SpinLock` counting (SC-KT-8); budgets move to RT-SCHED1 | independent kernel threads: owned stacks, entry ABI, kernel-mode preemption, kernel TLS policy, guard check, stack residency and reclamation, trap classifiers | SC-KT-1…4, SC-KT-6…12, SC-BND-2, SC-EXEC-3 |
+| **KTHREAD1** | **done, cooperative** (see the record below; contract §18). Owned stacks, entry ABI, per-CPU base and flags, guard check for interrupt-masking guards, stack residency and reclamation, trap classifiers; KTHREAD1-ACCEPTANCE (contract §18.9): wakes never refused, device interrupts on kernel threads on three ports, RISC-V F1, the lifecycle replay, one-CPU coexistence and timeout delivery. Not done: asynchronous kernel preemption (SC-KT-4, not enabled), guard pages (SC-KT-1), plain-`SpinLock` counting (SC-KT-8); budgets move to RT-SCHED1 | independent kernel threads: owned stacks, entry ABI, kernel-mode preemption, kernel TLS policy, guard check, stack residency and reclamation, trap classifiers | SC-KT-1…4, SC-KT-6…12, SC-BND-2, SC-EXEC-3 |
 | **RT-SCHED1** | after SCHED-LOCK1 | 32-level fixed-priority preemptive selection, scheduling contexts and budgets, calibrated time and earliest-deadline programming, structural no-migration, a fair kernel lock or contention bound, buffered diagnostics | SC-PRI-10…13, SC-CTX-*, SC-TIME-3…6, SC-CPU-2, SC-SEP-*, SC-INV-*, SC-WCET-*, SC-EXEC-* |
 | **PARTITION1** | with or after RT-SCHED1 | cyclic schedule, epoch, windows and boundaries, the OPERATIONAL transition, system allowance and health monitoring, configuration validation | SC-PART-*, SC-POOL-2/4, SC-EXEC-5, SC-IPC-3, SC-BND-3 |
 | **FP-POLICY1** | later, after KERNEL-NOFP1 | optional static per-task FP policy and conditional-save optimization. A task flag alone cannot enforce non-use or prevent disclosure. Instruction access, violation handling, initialization, isolation and lifecycle must be defined before any preservation is skipped | SC-FP-4 |
@@ -2802,7 +2802,7 @@ context, first entry, idle, block and exit, kernel-origin interrupts, stacks, th
 masking, preemption state and the executing CPU were read on the base before any code; the table
 is contract §18.1. Every "kernel mode is idle or a bug" site of §1.9 was then re-read (§18.6).
 
-*Finding F1 (pre-existing, RISC-V, recorded, not repaired).* In the D2 receive and send drains of
+*Finding F1 (pre-existing, RISC-V, recorded, not repaired here; repaired by KTHREAD1-ACCEPTANCE §3 below).* In the D2 receive and send drains of
 `src/arch/riscv64/trap.rs`, when the selection step answers `NoneAcceptable` or a mark is rolled
 back, the drain publishes no idle provenance. The `!switched` tail then returns `ReturnToCurrent`
 with nothing current: an `sret` through the blocked caller's stale frame, and the next trap fails
@@ -3066,6 +3066,248 @@ longer matched the checkout (`ARTIFACT-BINDING … a cached artifact from anothe
 should.
 
 ---
+
+#### KTHREAD1-ACCEPTANCE (from delivered `40132e1a`)
+
+Five acceptance items on the KTHREAD1 head. Remote heads and ancestry were verified first: `main`
+and `claude/yarm-kernel-unlock-u0-f2zh8p` both at `40132e1a`; `wip/kthread1` and `14b61286`
+preserved. Contract §18.9 holds the defect/repair table, the lifecycle event semantics and the
+corrected evidence claims; §18.4 and §18.5 hold the interrupt and wake rules as they now stand.
+
+The changes, kept apart:
+* **Production** (every build):
+  * `scheduler.rs`: per-priority run-queue room reserved for every kernel thread
+    (`MAX_QUEUED_PER_PRIORITY = MAX_RUN_QUEUE + KTHREAD_CAPACITY`; user pushes still refused at
+    `MAX_RUN_QUEUE`); `kthread.rs`: a wake is never refused, a refusal for a Blocked live
+    incarnation fails closed (`KTHREAD_WAKE_INVARIANT`), `KWake::Refused` removed (§1);
+  * `kthread.rs` `dispatch_selected`: every return from a kernel thread runs
+    `run_due_ipc_timeout_work` (§5);
+  * RISC-V `trap.rs`: both D2 drains settle a refusal as typed kernel idle; the send drain's clean
+    idle publishes provenance (§3);
+  * `arch/<isa>/kthread.rs`, x86_64 `descriptor_tables.rs`: device interrupts on a kernel thread
+    reach the existing claim, delivery and completion owners; `kthread.rs`: the per-CPU device
+    count and the deferred reschedule (`note_device_interrupt`) (§2).
+* **Instrumentation** (default-off): `kthread1-witness` records `create` inside the pool, records
+  dispatch/switch for every witness thread but the director, and carries each thread's created role
+  into its final; the AP-scheduling witness's user task P runs the one-CPU S1 phase;
+  `riscv64-d2-settle-witness` (§3); `kthread-irq-witness` with the port UART witnesses (§2); the
+  UART receiver and host driver learn `mode=kthread`.
+* **Checkers:** the lifecycle replay and the one-CPU rules in `scripts/grade-kthread1-witness.py`;
+  `scripts/grade-kthread-irq-witness.py`, `scripts/qemu-kthread-irq-witness-smoke.sh`,
+  `scripts/qemu-riscv64-d2-settle-witness-smoke.sh`; re-captured fixtures; new CLI cases.
+* **Existing guards edited, each for a stated reason:** `tests/qemu_lock1_owner_closure.rs` (the
+  RISC-V kernel-thread vector's screen now admits SEI; the mailbox consumer is still reached only by
+  a software interrupt), `tests/riscv64_uart_irq_witness_scope.rs` (items 9.. are kernel-thread
+  items), five older grader CLI cases whose edits the replay now refuses earlier under a more
+  specific reason (named in the test), and the RISC-V source guards around the D2 drains.
+
+**1. Wake refusal (§1).** *Reproduced on `40132e1a`* through the production owners (scratch hosted
+probe, kept): a kernel thread registered and blocked; its CPU's Normal queue filled with 64 user
+entries (the 65th push `Err(QueueFull)`); a direct `pool.wake` answered `Refused(QueueFull)`;
+`wake_all` then returned 0 with `registered=0` and the thread still Blocked; after capacity was
+freed (one dequeue) no dispatch reached it, and a second `wake_all` (no registration left) woke
+nothing. The wake obligation had no owner.
+*Repair:* each per-priority ring reserves room for every kernel thread (a kernel thread is queued
+only on its home CPU and at most once, so `KTHREAD_CAPACITY` more entries are a static bound); user
+pushes keep their `MAX_RUN_QUEUE` limit, with kernel-thread entries counted against it. A wake,
+yield or creation of a kernel thread is therefore never refused for capacity; a refusal for a
+Blocked live incarnation is a broken invariant and panics (`KTHREAD_WAKE_INVARIANT`).
+`KWake::Refused` is removed; its only consumers were `wake_all` and the witness's `wake_code`. No
+caller retries, spins or waits for capacity; lock order is unchanged (the wake takes the home 1L
+inside the queue's lock, as before).
+*Tests* (hosted, production owners): a wake into a user-full queue placed and completed without a
+second condition change; the whole pool (32) beside a user-full queue (96 entries); duplicate and
+repeated wakes give one placement; several waiters on two CPUs in one `wake_all`; a wake during
+publication; a stale wake after reuse refused; the unchanged user limit; the fail-closed invariant
+(`should_panic`). Control `wake_no_reservation` (the reservation removed) fails the wake tests.
+
+**2. Device interrupts on a kernel thread (§2).** *Reproduced* with the new fixture and each port's
+base handler (the routing controls, booted before the freeze; logs kept):
+* RISC-V: `KTHREAD_FAULT arch=riscv64 scause=0x8000000000000009 sepc=0x8025e86a … result=fatal`,
+  `RISCV_TRAP_HALTED reason=kthread_fault` at item 9; the driver timed out.
+* AArch64: `KTHREAD_IRQ_UNSUPPORTED arch=aarch64 cpu=0 intid=33 result=fatal` (the claim had been
+  completed first); the driver timed out.
+* x86_64 (not established by the review; audited here): the kernel-thread IDT was a copy of the
+  production IDT with only 0x20 and 0xF1 replaced, so COM1's vector 0x24 entered the production gate
+  from ring 0 on the kernel thread's stack. The thread runs inside the trap that dispatched it, so
+  `TRAP_DISPATCH_DEPTH` was already 1 and the dispatch took its nested-trap fatal path: the raw
+  breadcrumbs `!F v=…24 … s=…08` and `!B N v=…24`, then `halt_forever`; the driver timed out.
+*Audit.* The device path takes the IPC lock (a `SpinLockIrq`) and the target CPU's 1L, and logs
+through console locks that also mask; a kernel thread running with interrupts enabled holds none of
+them. Plain non-masking `SpinLock`s are not counted (SC-KT-8, unchanged). Device registers: RISC-V
+walks the active `satp` exactly as the other two claim owners (an unreachable claim register settles
+`Unavailable`, nothing completed); AArch64 and x86_64 reach the GIC, LAPIC and I/O APIC through the
+reserved privileged mappings every root carries. Claim lifetime: each claim lives from the vector's
+claim to its completion inside that one handler; a thread entered from an exception's drain never
+holds that exception's claim (AArch64 completes it before the thread is entered).
+*Repair* as in contract §18.4. *Evidence:* `scripts/qemu-kthread-irq-witness-smoke.sh` passed
+before the freeze on all three ports (RISC-V `r46`, AArch64 and x86_64 `r47`); its grader and the
+predeclared controls are run on the frozen candidate below.
+
+**3. RISC-V D2 settlement, F1 (§3).** *Reproduced* on `40132e1a` with the default-off fixture
+alone: the receive drain met a queue whose only entry the acceptance filter refused,
+`DISPATCH_STEP_NONE_ACCEPTABLE`, `D2_RECV_GENUINE_DISPATCH_DECLINED reason=refused_scheduler_untouched`,
+`D2_RECV_GENUINE_DISPATCH_DONE result=idle` — and then the blocked receiver's stale frame was
+resumed: `IPC_RECV_SPLIT_REFUSED reason=no_current_task` 3,626 times in 120 s, no settlement. Traced
+arms that leave current empty, in both drains: `NoneAcceptable` (`refused_scheduler_untouched`) and
+a mark rolled back after the dequeue (`refused_dequeue_undone`); the send drain also published no
+provenance for a clean idle. No overtaken-current arm was found in the D2 drains (an installed task
+resumes only through the mark's authentication, unchanged).
+*Repair:* both refusal arms clear the deferral and return `EnterKernelIdle { QueueAdvanceNoIncoming }`
+with `D2_*_GENUINE_DISPATCH_SETTLED … reason=…`; the send drain's clean idle publishes `IpcSend`
+provenance. Torn stays fatal; no new switch, no speculative enqueue, no manufactured result.
+*Tests:* hosted, driving the real D2 steps and the mark: no acceptable candidate (receive and send),
+a deterministically rolled-back mark, an empty queue then a newly eligible candidate; each checks
+current, the outgoing task's blocked status and the queue; source guards pin both drains. Live:
+the same fixture on the candidate settles (`D2_RECV_GENUINE_DISPATCH_SETTLED … settlement=kernel_idle`,
+`D2SW_SETTLED … current=0 outgoing_blocked_in_class=1 phantom_withdrawn=1`). Only the receive class is
+exercised live; send is covered hosted.
+
+**4. Grader false passes (§4).** *Reproduced* on the delivered grader through its CLI, on
+checksum-valid alterations of `tests/fixtures/kthread1/base.rec` (results kept): untouched exit 0;
+every dispatch record deleted exit 0; all but one final deleted exit 0; an interrupt appended for an
+already reclaimed thread exit 0; the corrupted-register positive control exit 1
+(`registers_clobbered_by_interrupt`). *Producer audit:* the role and the `create` record were written by
+the director after `pool.create` returned, i.e. after the enqueue, so a thread could be dispatched
+before its creation record; dispatches of the director, the waker, and any thread dispatched before
+its role was set were not recorded; finals took the role of whichever incarnation held the slot at
+the end. All three were repaired (contract §18.9 lists what each event now means).
+*Undo controls* (pre-freeze; the frozen run is below): removing the running-interval replay brings
+back `irq_after_reclaim` and `duplicate_dispatch`; removing final coverage brings back
+`one_final_left` and `substituted_final`; removing reuse-after-retirement brings back
+`reuse_before_reclaim`; removing the one-CPU rules brings back `wrong_work_value`. Every undo keeps
+the real record sets passing. A fifth undo (the replay's per-CPU alternator/sleeper population) did
+not bring its case back: the delivered grader already counted that population from the create
+records, so the replay's copy was a duplicate and was removed; the relabelled-role case stays
+refused by the pre-existing check.
+
+**5. One CPU (§5).** *Reproduced* on `40132e1a` through the production owners: two kernel threads
+ticking CPU 0's clock 40 rounds past a 10-tick receive deadline; the timeout was never settled while
+they ran (`seen at 0`). *Repair:* `run_due_ipc_timeout_work` at every kernel-thread return
+(contract §18.9). *Evidence:* P's S1 phase and the grader's one-CPU rules; pre-freeze boots passed
+on RISC-V, AArch64 and x86_64 apart from the witness defect below.
+
+**Development failures, kept** (pre-freeze, each repaired before the freeze):
+* The first boots of the new producer (RISC-V 1 and 2 CPUs, AArch64 and x86_64 1 CPU) all failed
+  `invalid lifecycle_role_changed` on the finals: a final took the slot's current role, so a thread
+  whose slot had been reused reported the reuser's. The witness now remembers each thread's created
+  role. Re-graded with that one check relaxed, all four passed every other rule, including the
+  one-CPU coexistence and timeout rules.
+* Five older grader CLI cases now fail earlier, in the replay, under a more specific reason
+  (`wake_issuer_not_running`, `switched_out_while_resident`, `run_outside_running_interval`,
+  `blip_identity`, and blank probes standing in for deleted interrupts); each case was updated to the
+  reason it now produces, and `relabelled_alternator` now relabels the thread in every record.
+* The selection-owner hook for the device-IRQ witness pushed a pinned guard's fixed-size window
+  (`stage168b…reverify_and_queue_advancing`) off its target; the hook was shrunk to two lines.
+* The pre-freeze full suites found three guard failures in this package's own commits: the Stage
+  199D seam guard (the D2 fixture withdraws its own phantom; listed with its reason), the
+  broad-lock census (the §5 test used the broad `with`; it uses the task split owner), and a source
+  guard that matched rustfmt's wrapping.
+* A container restart stopped one chain of boots mid-run; it was restarted from scratch.
+
+**Schedule** (declared before the freeze; one run). `qualify.sh <frozen> 40132e1a`, from a fresh
+detached worktree of the frozen commit, steps Q4, Q2, Q8, Q9, Q9m, Q10, Q1, Q3, Q5, Q6, Q7, Q11, Q12.
+Every boot is bound by BUILD-GATES1 (commit/tree, features, image hashes, the no-FP check of the
+booted bytes). Populations: Q8 three strict one-CPU KT1 boots per ISA (a, b, loaded host); Q9 one
+kernel-thread device-IRQ boot per ISA; Q9m KT1 at 2, 4 and 8 CPUs per ISA; Q10 nine live controls.
+Expected control refusals:
+
+| Control | Defect | Predeclared refusal |
+|---|---|---|
+| `kirq_route_riscv64` | the base screen (SEI fatal on a kernel thread) | `KTHREAD_FAULT … scause=0x8000000000000009`, no seal |
+| `kirq_route_aarch64` | the base arm (complete, then panic) | `KTHREAD_IRQ_UNSUPPORTED … intid=33`, no seal |
+| `kirq_route_x86_64` | production device gates kept in the kernel-thread IDT | nested-trap halt, no seal |
+| `kirq_double_completion_riscv64` | a second PLIC completion per kernel-thread claim | `completion_accounting` |
+| `kirq_double_completion_aarch64` | a second EOIR per kernel-thread claim | `completion_accounting` |
+| `kirq_corrupt_continuation_x86_64` | the device stub returns with `r14` altered | `registers_clobbered_by_device_interrupt` |
+| `kirq_no_deferral` | no reschedule left by the device path | `reschedule_not_left_pending` |
+| `d2_refusal_returns_to_current` | a refused D2 drain returns to an empty current | the D2 settlement witness fails |
+| `no_timeout_service_at_kthread_return` | §5's service point removed | `user_deadline_not_delivered_while_kernel_threads_ran` |
+
+Hosted control `wake_no_reservation` and the grader undo controls run in Q2. Pre-existing and
+recorded separately: the AArch64 SMP2 verifier race (`sgi_unexplained_arrival`, base parity in the
+KTHREAD1 record) and parallel hosted-test interference (the suite is qualified serially).
+
+**Qualification, run 1, freeze `fa870cb7` (tree `fced35d2`), from 12:17Z.** Toolchain: the
+repository's pinned `1.101.0-nightly 32dba69d6` (the runner's header line printed the scratch
+directory's default `rustc 1.97.0`; every build inside the worktree uses the pinned one, as each
+NOFP line records).
+* Q4 clean.
+* Q2: focused hosted (kthread, scheduler, D2 settlement, D2 receive guards) 93/93 ×3; grader CLI
+  19/19 ×3; grader self-test pass; IRQ scope suites pass. Grader undo controls: each undo brings its
+  false pass back (`irq_after_reclaim`, `duplicate_dispatch`; `one_final_left`, `substituted_final`;
+  `reuse_before_reclaim`; `wrong_work_value`) while the real record sets and the legitimate-order
+  case still pass. `wake_no_reservation`: 7 of 33 kernel-thread tests fail (the wake-reservation
+  tests), 26 pass.
+* Q8: 9 of 9 `KT1W_SEAL result=pass`, the one-CPU coexistence and timeout rules included:
+  RISC-V 358 / 357 / 369 records (a, b, loaded), AArch64 350 ×3, x86_64 356 ×3. The AP-scheduling
+  workload's own grade reports failing at one CPU (it needs a secondary), as the schedule allows.
+* Q9: 3 of 3 `KIRQ_WITNESS_SEAL items=12 kthread_items=4 result=ok`, each image `kernel_nofp=pass`
+  (RISC-V `1698d0ae…`, AArch64 `70a24ba7…`, x86_64 `f1ac0b87…`).
+* Q9m: 9 of 9 `KT1W_SEAL result=pass` with the AP-scheduling workload passing beside each: RISC-V
+  460 / 751 / 3,048 records (2, 4, 8 CPUs), AArch64 451 / 631 / 1,093, x86_64 449 / 641 / 1,004.
+* Q10: every control refused, nothing awarded.
+
+  | Control | Refused by |
+  |---|---|
+  | `kirq_route_riscv64` | `KTHREAD_FAULT arch=riscv64 scause=0x8000000000000009`, halt; driver timeout, no summary |
+  | `kirq_route_aarch64` | `KTHREAD_IRQ_UNSUPPORTED arch=aarch64 cpu=0 intid=33 result=fatal`; driver timeout |
+  | `kirq_route_x86_64` | the nested-trap breadcrumbs for vector 0x24 and `halt_forever`; driver timeout |
+  | `kirq_double_completion_riscv64` | `completion_accounting` (15 completions for 12 claims at the disable; the receiver counted 16), also `entry_origins` and `port_totals` |
+  | `kirq_double_completion_aarch64` | `completion_accounting` (15 completions, 15 deactivations for 12 claims; the receiver counted 16) |
+  | `kirq_corrupt_continuation_x86_64` | `registers_clobbered_by_device_interrupt` for items 9–12 |
+  | `kirq_no_deferral` | `reschedule_not_left_pending` for items 9–12 |
+  | `d2_refusal_returns_to_current` | `recv_not_settled_as_kernel_idle` |
+  | `no_timeout_service_at_kthread_return` | `user_work_missing`, `user_and_kernel_threads_not_interleaved turns=0`, `user_deadline_never_delivered` |
+
+  *Named deviation, kept:* `no_timeout_service_at_kthread_return` was refused for stronger reasons
+  than predeclared. Without the service point P's receive stayed blocked for the whole kernel-thread
+  phase, so no user round was recorded at all; its first S1 round ran only after the witness had
+  stopped recording. The predeclared rule (`…not_delivered_while_kernel_threads_ran`) presupposes
+  at least one delivered timeout.
+* Q1: 6,263 passed, 0 failed, 2 ignored (serial). Q3: every integration suite passed.
+* Q5: census different: `with_cpu_sched_split(` 49 → 51, both new sites in the default-off D2
+  settlement fixture; `.lock()` 184 → 184; every other pattern equal.
+* Q6: default builds pass on three ports and hosted, candidate and fresh base; images differ from
+  the base on every port (production changes); warnings equal (222, 399, 237, hosted 306), none new,
+  none gone. Q7: the no-FP suites pass, self-test 101 cases 0 mismatches, every candidate image
+  `result=pass`.
+* Q11 (base → candidate): `.text` x86_64 +1,552, AArch64 +94,424, RISC-V +1,158 bytes; `.bss` x86_64
+  +98,504, AArch64 +101,360, RISC-V +98,103. The `.bss` growth is the run-queue rings widened for
+  the kernel-thread reservation (§1). On AArch64 the larger per-CPU scheduler state is also
+  initialised and moved in code (largest single growth `prepare_arch_boot`, +12.6 KB); measured, not
+  a correctness finding.
+* Q12: 26 of 27 regressions passed: the strict default cores (three ports); the AP-scheduling and
+  SCHED-LOCK1 witnesses at 2 CPUs (three ports each); SMP3 (RISC-V); CONTEXT1; SMP1 (x86_64); VMI2
+  (x86_64); RISC-V LOCK1, VMI and shared-region replace; the UART/PL011 interrupt witnesses on three
+  ports (feature-off, eight items, unchanged); the IPC residual-park witness; exit of the current
+  task (three ports); shared-region direct (three ports). AArch64 SMP2 failed `SMP2_VERDICT
+  result=fail reason=sgi_unexplained_arrival at=57`, the predeclared pre-existing verifier race.
+  *Base parity, measured after the run* (four boots each, alternating, same host): base `40132e1a`
+  failed 1 of 4 (`sgi_unexplained_arrival at=81`, "arrival on cpu 1 from cpu 0 has no earlier
+  send"), the candidate 0 of 4. The race is in the existing verifier, with no kernel thread in that
+  boot; it is not counted as a KTHREAD1-ACCEPTANCE failure and is not repaired here.
+
+Result: **qualified** on the first freeze; no candidate-caused failure, so no re-freeze.
+
+**Evidence classes, kept apart.** Source: the guards on the three device routes, the D2 drains and
+the census. Hosted: the production owners in `kthread_tests.rs` and `d2_settle_tests` (wake
+reservation, deferred device reschedule, timeout service, D2 settlement). Live (QEMU, BUILD-GATES1
+bound): Q8, Q9, Q9m and the controls. Image: no-FP on every candidate image, section sizes. QEMU
+timing is not hardware timing.
+
+**Closed by this package:** §1 (a wake keeps an owner: it is never refused, and a broken invariant
+fails closed), §2 (device interrupts on running kernel threads on three ports, through the existing
+claim, delivery and completion owners), §3 (F1), §4 (the three grader false passes and the
+producer's ordering), §5 (one-CPU coexistence with authenticated user progress, and timeout
+delivery while kernel threads keep running).
+
+**Still open, not closed here:** no guard page on any port (SC-KT-1); the stack-depth bound is not
+established, and observed stack use is not a bound; a plain non-masking `SpinLock` held across a
+scheduling point is not detected (SC-KT-8); cooperative only, no asynchronous kernel preemption
+(SC-KT-4); no migration; no latency, fairness, starvation-freedom or WCET claim; the AArch64 SMP2
+verifier race; parallel hosted-test interference (qualified serially). Only the receive class of
+F1 is exercised live (send is hosted). No production subsystem creates kernel threads yet.
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 

@@ -2297,12 +2297,40 @@ names (RISC-V: `sscratch` is exactly that hart's canonical trap-stack top; x86_6
 AArch64: `TPIDR_EL1`), that CPU's residency names this slot, and the slot holds the resident
 incarnation as Running. Otherwise `KTHREAD_IRQ_UNAUTHENTICATED` (fatal). The entry saves every
 general register and the interrupted PC/status on the thread's stack and restores them exactly
-(`sret` / `iretq` / `eret`). The handler never logs, never allocates, takes only the CPU's 1L
-(interrupt-safe), never touches user FP/TLS, and never schedules. Timer: the split route's tick,
+(`sret` / `iretq` / `eret`). The handler never allocates, never touches user FP/TLS, and never
+schedules; the timer and reschedule paths never log and take only the CPU's 1L (interrupt-safe).
+Timer: the split route's tick,
 acknowledgement and re-arm, plus `need_resched` on quantum expiry. Reschedule: RISC-V consumes the
 mailbox (`take_arrival`, origin `KernelThread`); x86_64 continues into the production 0xF1 handler
 (wake accounting, TLB-mailbox acknowledgement, EOI); AArch64 claims and completes the SGI. Idle stays
 distinct: kernel threads never run at the idle anchor and the idle vectors are untouched.
+
+Device interrupts (KTHREAD1-ACCEPTANCE §2, §18.9). An authenticated device interrupt is settled by
+the owners the user and idle origins use, then the thread resumes and the reschedule waits for its
+next scheduling point (`KThreadPool::note_device_interrupt`):
+* RISC-V: the kernel-thread vector is a claim entry owner of its own, disjoint by origin from the
+  U-origin bridge and the witness build's idle-origin entry. It reads the PLIC claim once
+  (reachability by the walk of the ACTIVE `satp`, as the other owners: an unreachable or empty
+  claim settles with nothing completed) and hands it to `settle_riscv_external_claim`, whose
+  bridge owner writes the one completion.
+* AArch64: a device SPI goes through `settle_external_interrupt_at_bridge` with the single-step
+  completion (inert on this port); the bridge then writes the claim's one `GICC_EOIR`. Any other
+  private interrupt (SGI/PPI) besides the timer and the reschedule SGI stays fatal.
+* x86_64: the kernel-thread IDT routes every external line above the timer (0x21..0x5F) to a
+  device bridge that settles through the same owner; its single step is the one LAPIC EOI. Before,
+  those vectors kept the production gates, whose dispatch saw a nested trap and halted.
+
+The device path delivers through `deliver_external_irq_split` (the IPC lock is a `SpinLockIrq`, so
+a thread running with interrupts enabled holds none of it) and logs through the settlement's
+markers (the console locks mask interrupts too). A refused delivery (a full notification queue) is
+reported (`KTHREAD_DEVICE_IRQ_DELIVERY_REFUSED`) and the claim is completed anyway, as on the user
+path. Device-register reachability: RISC-V walks whichever translation is active when the interrupt
+arrives (the root the CPU held when the thread was entered); an unreachable claim register settles
+as `Unavailable` with nothing completed, exactly as on the user path, and in the live cell every
+kernel-thread claim was reachable. AArch64 and x86_64 reach the GIC/LAPIC/I/O APIC through the reserved privileged mappings every root
+carries. The claim lives only from the vector's claim to its completion inside that one handler; a
+kernel thread entered from an exception's drain never inherits it (AArch64 completes that claim
+before the thread is entered, §18.4 above).
 
 Entering a kernel thread from inside an exception: the dispatcher runs within the selection step of
 the trap that selected it. On AArch64 that exception's GIC claim is completed before the thread is
@@ -2319,6 +2347,15 @@ home 1L, which the park consumes in the same 1L section that would block. Every 
 Covered: wake before registration, during park, after block, duplicate (one placement), stale
 (generation), cross-CPU to an idle target (enqueue + IPI), exit/reuse with an old wake outstanding
 (`wake_pending` reset at creation). No user ABI, IPC or capability change.
+
+A wake is never refused for capacity (KTHREAD1-ACCEPTANCE §1). On the KTHREAD1 base `wake_all`
+took the registration and then lost the waiter when its enqueue was refused (`QueueFull`): it
+stayed Blocked with no owner. Each priority queue now reserves room for every kernel thread: a user
+push is refused at `MAX_RUN_QUEUE` entries as before (kernel-thread entries count against it), a
+kernel-thread push may use `KTHREAD_CAPACITY` more. A kernel thread is queued only on its home CPU
+and at most once, so the reservation is a static bound, and a refusal for a Blocked live
+incarnation is a broken invariant that fails closed (`KTHREAD_WAKE_INVARIANT`). `KWake::Refused` is
+gone; no caller retries, spins or drops.
 
 ### 18.6 Re-audit of earlier assumptions
 
@@ -2348,7 +2385,10 @@ point, unfiltered selection never returning a kernel thread, balanced-placement 
 user tasks only, no TCB or user root, and the drain
 owner running kernel threads while reporting only user or idle outcomes. Interrupt
 authentication is checked hosted against the right CPU, another CPU and a non-pool frame; the
-vector entry and return are exercised live only (§18.4).
+vector entry and return are exercised live only (§18.4). KTHREAD1-ACCEPTANCE adds 13 tests (33 in all): eight
+for the wake reservation (§18.5), one for timeout delivery while kernel threads run, and four for
+the device-interrupt routes (§18.9); the D2 settlement tests are in
+`src/kernel/boot/d2_settle_tests/tests.rs`.
 
 **Live (QEMU, all three ports).** Feature `<isa>-kthread1-witness` (default-off; it also enables
 the AP-scheduling witness, whose ordinary user workload runs alongside) builds
@@ -2370,7 +2410,8 @@ before coverage, and only from the sealed records. A damaged line counts for not
 repaired; a record whose every copy is damaged is missing, and the run is invalid. The coverage obligations are listed in its
 header; each is required on every CPU of the declared population. `tests/kthread1_witness_grader.rs`
 pins it: a real record set (`tests/fixtures/kthread1/base.rec`) passes, and named alterations are
-refused, each for its own reason. `scripts/qemu-kthread1-witness-smoke.sh` binds the image through
+refused, each for its own reason. KTHREAD1-ACCEPTANCE replaced the validity-then-coverage grade with a
+lifecycle replay ahead of coverage, re-captured both fixtures, and added the one-CPU rules (§18.9). `scripts/qemu-kthread1-witness-smoke.sh` binds the image through
 BUILD-GATES1 and prints `KT1W_SEAL`. Results are in the KTHREAD1 record of
 `doc/KERNEL_UNLOCKING.md`.
 
@@ -2390,7 +2431,74 @@ established, and nothing here is a certification claim.
 * No budget, priority beyond the GP levels, partition or donation (SC-KT-12, RT-SCHED1).
 * No production subsystem uses kernel threads yet. The mechanism is in every build; only the
   witness creates threads.
-* F1 (RISC-V D2 drain `NoneAcceptable` with nothing current) is pre-existing and not repaired.
-* With one CPU, user progress beside kernel threads is not shown on x86_64 and AArch64: the only
-  user workload (the AP-scheduling witness) needs a secondary, and no user task was runnable during
-  the kernel-thread phase. The grader reports it there instead of requiring it.
+* F1 (RISC-V D2 drain `NoneAcceptable` with nothing current) is repaired by KTHREAD1-ACCEPTANCE
+  §3; one-CPU coexistence is shown by its §5 (§18.9).
+
+### 18.9 KTHREAD1-ACCEPTANCE: repairs and the corrected evidence claims
+
+Five acceptance items on the KTHREAD1 head `40132e1a`. Each defect was reproduced through the
+production owners on that base before its repair; results and every failed candidate are in the
+KTHREAD1-ACCEPTANCE record of `doc/KERNEL_UNLOCKING.md`.
+
+| Item | Defect on `40132e1a` (owner) | Repair |
+|---|---|---|
+| §1 wake refusal | `KWaitQueue::wake_all` took the registration, `pool.wake` was refused `QueueFull`: the thread stayed Blocked with no owner; freeing capacity and a second `wake_all` resumed nothing (`kthread.rs`, `scheduler.rs` `RingQueue::push`) | per-priority room reserved for every kernel thread (§18.5); a refusal for a Blocked live incarnation fails closed; `KWake::Refused` removed |
+| §2 device IRQs | RISC-V vector halted on SEI; AArch64 completed then panicked; x86_64 device vectors reached the production gate and halted as a nested trap (`arch/<isa>/kthread.rs`, x86 `descriptor_tables.rs`) | each vector settles through the existing claim/delivery/completion owners and returns to the thread (§18.4) |
+| §3 F1 | both RISC-V D2 drains fell through a refusal (no acceptable candidate, rolled-back mark) to `ReturnToCurrent` with nothing current: an `sret` through the blocked caller's stale frame; the send drain published no provenance for a clean idle (`arch/riscv64/trap.rs`) | a refusal settles as typed `EnterKernelIdle { QueueAdvanceNoIncoming }` with its reason; the send drain's clean idle publishes `IpcSend` provenance; torn stays fatal |
+| §4 grader | the delivered grader passed a set with every dispatch record deleted, one with all but one final deleted, and one with an interrupt appended for a reclaimed thread | a lifecycle replay (below) validates every event before coverage is awarded |
+| §5 one CPU | the timeout pipeline ran only from trap epilogues: a user deadline starved while kernel threads stayed runnable (`kthread.rs` `dispatch_selected`) | every return from a kernel thread to its dispatcher runs `run_due_ipc_timeout_work` (masked, no lock held, cursor-bounded) |
+
+**Lifecycle events: what each record is evidence of** (producer `kthread.rs` /
+`kthread_witness.rs`, grader `scripts/grade-kthread1-witness.py` `replay`):
+* `create` — the incarnation exists with this role, home and stack. Written inside
+  `KThreadPool::create` before the enqueue, so nothing about the incarnation can precede it. A
+  creation is a committed transition, not an intent: a refused creation writes nothing.
+* `dispatch` — entry into execution on the home CPU (residency set, state Running), written
+  immediately before the switch into the thread.
+* `switch` — switch-away completed: the dispatcher has the CPU back and residency is cleared
+  (f2 must be 0); reason yield, block or exit.
+* `reclaim` — the slot returned to the free list after the exit switch, written before the slot is
+  published, so no reuse can precede it.
+* in-thread records (`run`, `yield`, `decide`, `resched`, `blip`, `woken`, `irq`, the lost-wake
+  probe) — written by the thread, or by an interrupt it took, while it runs: each must fall inside
+  one of its own running intervals on its home CPU.
+* `final` — the director's observation at the end, carrying the role the thread was created with.
+  "Gone" may precede the `reclaim` record (the slot is free before the record is written) but never
+  the exit switch.
+
+The director is the one thread with no `create` record: it declares itself as record 1 and is
+exempt from the interval checks by that identity alone. The replay rejects impossible events
+(an unknown or stale incarnation, a dispatch off home or while running, a switch while not running,
+reclaim before the exit switch, reuse before reclaim or without a newer generation, a stack that is
+not the slot's, an in-thread record outside its own interval, a duplicate final, a second director)
+and reports missing ones (a created thread never dispatched, never reclaimed, or without a final).
+Required populations derive from the anchored contract (capacity 32, stack 16 KiB, 5 rounds, 6
+cycles) and the create records, not from a role field a later record reports. Transport redundancy
+is unchanged: identical copies are allowed, one damaged copy is recovered from its intact twin,
+conflicting valid copies, missing records and inconsistent seals fail.
+
+**One-CPU coexistence** (§5). P, the AP-scheduling witness's user task, runs an S1 phase whenever
+its CPU has no secondary: round k stores `k·0x9E3779B97F4A7C15 ⊕ 0x5151000000005151`, reads it back
+and reports the value, then receives on an endpoint with a real deadline (NR 5), which must end
+TimedOut. Each step is recorded from P's own DebugLog entry, authenticated by the trap path (TID and
+ASID). The grader requires user rounds interleaved with kernel-thread turns, every receive timed
+out, and at least one deadline delivered while kernel threads ran: kernel-thread records between
+the arm and the timeout, more after it, no idle arrival in between, the deadline elapsed, and P's
+next round after it.
+
+**Device interrupts on a kernel thread** (§2). Default-off `kthread-irq-witness`, layered on each
+port's UART witness, adds items 9..=12 to its eight idle/user items. A witness thread opens the
+port's gate from a masked section and unmasks inside a register-patterned spin, so the device
+interrupt is taken on that thread. `scripts/grade-kthread-irq-witness.py` requires twelve items
+received exactly once with the bound label and the exact data, four kernel-thread entries each
+naming the witness thread's incarnation and the gate opened for that item with the interrupted PC
+inside the spin (from the ELF symbol table), every patterned register intact, one device interrupt
+per item, a reschedule left pending and the thread resumed after its scheduling point, the order
+injection → entry → thread record → receiver record, the port's own completion accounting (12
+claims, 12 completions, 12 bytes; idle and user origins still 4 and 4), timer interrupts on kernel
+threads after the last item, the post-disable user phase, and nothing fatal.
+
+**Still open, not closed by this package:** no guard page on any port (SC-KT-1); the stack-depth
+bound is not established (observed use is not a bound); a plain non-masking `SpinLock` held across
+a scheduling point is not detected (SC-KT-8); cooperative only (SC-KT-4); no migration; QEMU timing
+is not hardware timing; no latency, fairness or WCET property is claimed.
