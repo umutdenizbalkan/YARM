@@ -1075,3 +1075,81 @@ fn a_refusal_for_a_live_blocked_thread_fails_closed() {
     g.open.store(true, Ordering::Release);
     let _ = g.q.wake_all(&k.kthreads);
 }
+
+// ── KTHREAD1-ACCEPTANCE §5: a user deadline is delivered while kernel threads keep running ─────
+
+struct Ticker {
+    /// The tick count at which a ticker first saw task 0 `Runnable` (0 = never, during the run).
+    seen_at: AtomicU32,
+    rounds: AtomicU32,
+}
+
+fn task0_runnable(shared: &SharedKernel) -> bool {
+    shared.with_task_tcbs_split_mut(|tcbs| {
+        tcbs.iter()
+            .flatten()
+            .find(|t| t.tid.0 == 0)
+            .is_some_and(|t| t.status == crate::kernel::task::TaskStatus::Runnable)
+    })
+}
+
+/// A kernel thread that drives the clock (as CPU 0's timer would) and yields every round, so the
+/// CPU never becomes idle while it runs.
+fn ticking(ctx: &KThreadCtx, arg: usize) {
+    // SAFETY: the test keeps the ticker alive until every thread exited.
+    let t = unsafe { &*(arg as *const Ticker) };
+    for round in 1..=40u32 {
+        let _ = ctx.shared().scheduler_tick_split_mut(CpuId(0));
+        ctx.yield_now().expect("yield");
+        if t.seen_at.load(Ordering::Acquire) == 0 && task0_runnable(ctx.shared()) {
+            t.seen_at.store(round, Ordering::Release);
+        }
+        t.rounds.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[test]
+fn a_user_deadline_is_delivered_while_kernel_threads_keep_running() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("register task 1");
+    state.enqueue_current_cpu(1).expect("queue task 1");
+    let (_eid, _send, recv_cap) = state.create_endpoint(4).expect("endpoint");
+    // The clock starts at 0; the deadline is ten ticks away.
+    let deadline = 10;
+    assert!(
+        state
+            .ipc_recv_until_deadline(recv_cap, deadline)
+            .expect("recv with a deadline")
+            .is_none(),
+        "task 0 blocks on a real deadline"
+    );
+    let k = SharedKernel::new(state);
+    k.with_all_cpus_sched_split(|all| {
+        let present = all.present_cpu_bitmap() | (1 << CPU.0);
+        all.set_present_cpu_bitmap(present);
+        all.bring_up_cpu(CPU).expect("cpu online");
+    });
+    crate::kernel::boot::reset_ipc_timeout_scan_cursor(CPU.0 as usize);
+    let t = Ticker {
+        seen_at: AtomicU32::new(0),
+        rounds: AtomicU32::new(0),
+    };
+    for _ in 0..2 {
+        k.kthreads
+            .create(ticking, &t as *const _ as usize, CPU, TaskPriority::Normal)
+            .expect("create");
+    }
+    assert!(!task0_runnable(&k));
+    run_cpu(&k, CPU);
+    let seen = t.seen_at.load(Ordering::Acquire);
+    assert!(
+        seen != 0 && seen < 40,
+        "the timeout must be settled at a kernel-thread boundary while they still run (seen at {seen})"
+    );
+    k.with(|s| {
+        assert!(
+            s.consume_ipc_timeout_fired_for_tid(0).expect("consume"),
+            "and the TimedOut fact is staged for the receive's return"
+        );
+    });
+}

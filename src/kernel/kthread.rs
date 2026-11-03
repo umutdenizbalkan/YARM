@@ -782,6 +782,13 @@ impl KThreadPool {
         if reason == KSwitchReason::Exit {
             self.reclaim(cpu, id);
         }
+        // KTHREAD1-ACCEPTANCE §5: every return from a kernel thread is a timeout service point.
+        // Kernel threads that yield to each other never reach a trap epilogue, which is where the
+        // production pipeline otherwise runs, so without this a user deadline on this CPU would
+        // starve for as long as kernel threads stayed runnable. This is the dispatcher's context:
+        // interrupts masked, no lock held, the same context the epilogue drives it from. The
+        // collector is cursor-bounded, and every settlement is the pipeline's own exact claim.
+        shared.run_due_ipc_timeout_work(cpu);
         reason
     }
 
