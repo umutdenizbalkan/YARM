@@ -43,8 +43,13 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use super::irq::GicAck;
 
-/// How many data-bearing items the witness exchanges before the source is turned off.
+/// How many data-bearing items the witness exchanges before the source is turned off: eight, and
+/// with `kthread-irq-witness` four KERNEL-THREAD items after them (KTHREAD1-ACCEPTANCE §2,
+/// `kernel::kirq_witness`).
+#[cfg(not(feature = "kthread-irq-witness"))]
 pub const WITNESS_ITEMS: u32 = 8;
+#[cfg(feature = "kthread-irq-witness")]
+pub const WITNESS_ITEMS: u32 = crate::kernel::kirq_witness::TOTAL_ITEMS;
 
 /// Upper bound on bytes drained for one claim. The exchange keeps one byte outstanding, so a
 /// drain that reaches this bound is itself a finding.
@@ -96,6 +101,8 @@ pub const RING_WORD_CLAIMS: usize = 4;
 pub const RING_WORD_COMPLETIONS: usize = 5;
 pub const RING_WORD_IDLE_ORIGIN: usize = 6;
 pub const RING_WORD_USER_ORIGIN: usize = 7;
+/// KTHREAD1-ACCEPTANCE §2: claims taken while a kernel thread ran.
+pub const RING_WORD_KTHREAD_ORIGIN: usize = 10;
 pub const RING_WORD_EMPTY_DRAINS: usize = 8;
 /// The interrupt line (here: the GIC INTID) the provisioning bound to the receiver's notification.
 pub const RING_WORD_BOUND_LINE: usize = 9;
@@ -119,6 +126,14 @@ static BYTES: AtomicU32 = AtomicU32::new(0);
 static IDLE_ORIGIN: AtomicU32 = AtomicU32::new(0);
 static USER_ORIGIN: AtomicU32 = AtomicU32::new(0);
 static OTHER_ORIGIN: AtomicU32 = AtomicU32::new(0);
+static KTHREAD_ORIGIN: AtomicU32 = AtomicU32::new(0);
+/// The interrupted kernel thread's incarnation id while the kernel-thread vector's hook runs
+/// ([`note_kthread_claim_and_drain`]); 0 otherwise.
+static KTHREAD_ENTRY: AtomicU64 = AtomicU64::new(0);
+/// KTHREAD1-ACCEPTANCE §2 — the kernel-thread gate: the item and thread it was last opened for.
+static GATE_ITEM: AtomicU32 = AtomicU32::new(0);
+static GATE_KTHREAD: AtomicU64 = AtomicU64::new(0);
+static GATE_OPENS: AtomicU32 = AtomicU32::new(0);
 static FOREIGN_CLAIMS: AtomicU32 = AtomicU32::new(0);
 static SPECIAL_CLAIMS: AtomicU32 = AtomicU32::new(0);
 /// Set between the drain of a data-bearing claim and its completion, so the completion that
@@ -551,6 +566,11 @@ pub fn note_claim_and_drain(
             ring_store(RING_WORD_IDLE_ORIGIN, n);
             ("idle", n)
         }
+        (6, 0b0101, false) if KTHREAD_ENTRY.load(Ordering::Acquire) != 0 => {
+            let n = KTHREAD_ORIGIN.fetch_add(1, Ordering::AcqRel) + 1;
+            ring_store(RING_WORD_KTHREAD_ORIGIN, n);
+            ("kthread", n)
+        }
         _ => ("other", OTHER_ORIGIN.fetch_add(1, Ordering::AcqRel) + 1),
     };
     let tid = super::boot::trap_shared_kernel()
@@ -611,8 +631,17 @@ pub fn note_claim_and_drain(
         let n = EMPTY_DRAINS.fetch_add(1, Ordering::AcqRel) + 1;
         ring_store(RING_WORD_EMPTY_DRAINS, n);
     } else {
-        DATA_CLAIMS.fetch_add(1, Ordering::AcqRel);
+        let done = DATA_CLAIMS.fetch_add(1, Ordering::AcqRel) + 1;
         COMPLETION_OWED_FOR_DATA.store(true, Ordering::Release);
+        // KTHREAD1-ACCEPTANCE §2: the kernel-thread items are gated. From the first of them on,
+        // the receive interrupt stays masked in the device after every drain, so the next byte
+        // waits in the FIFO until the witness thread opens the gate from its window.
+        #[cfg(feature = "kthread-irq-witness")]
+        if done >= crate::kernel::kirq_witness::BASE_ITEMS {
+            write32(uart + UART_IMSC, 0);
+        }
+        #[cfg(not(feature = "kthread-irq-witness"))]
+        let _ = done;
     }
     crate::yarm_log!(
         "IRQ2_PL011_DRAIN claim={} intid={} bytes={} first=0x{:02x} mis_before=0x{:x} rxfe_after={} ris_after=0x{:x} mis_after=0x{:x} total_bytes={}",
@@ -626,6 +655,71 @@ pub fn note_claim_and_drain(
         mis_after,
         BYTES.load(Ordering::Acquire)
     );
+}
+
+/// KTHREAD1-ACCEPTANCE §2 — the kernel-thread vector's hook before delivery: the same record and
+/// drain as [`note_claim_and_drain`], with the origin named `kthread` and the interrupted thread's
+/// incarnation id recorded. Observation and drain only; never claims or completes.
+pub fn note_kthread_claim_and_drain(
+    intid: u16,
+    spsr_el1: u64,
+    elr_el1: u64,
+    cpu: crate::kernel::scheduler::CpuId,
+    kthread: u64,
+) {
+    KTHREAD_ENTRY.store(kthread, Ordering::Release);
+    crate::yarm_log!(
+        "IRQ2_PL011_KTHREAD_ENTRY intid={} elr=0x{:x} kthread={:#x} gate_item={} gate_kthread={:#x}",
+        intid,
+        elr_el1,
+        kthread,
+        GATE_ITEM.load(Ordering::Acquire),
+        GATE_KTHREAD.load(Ordering::Acquire)
+    );
+    note_claim_and_drain(intid, 6, spsr_el1, elr_el1, cpu);
+    KTHREAD_ENTRY.store(0, Ordering::Release);
+}
+
+/// KTHREAD1-ACCEPTANCE §2 — the port's side of the kernel-thread window (`kernel::kirq_witness`).
+/// Fixture synchronization only: it decides when the device may raise its line, nothing else.
+#[cfg(feature = "kthread-irq-witness")]
+pub mod kirq_port {
+    use super::*;
+
+    pub fn next_item() -> u32 {
+        DATA_CLAIMS.load(Ordering::Acquire) + 1
+    }
+
+    pub fn source_live() -> bool {
+        SOURCE_ENABLED.load(Ordering::Acquire) && !SOURCE_DISABLED.load(Ordering::Acquire)
+    }
+
+    pub fn byte_present() -> bool {
+        let uart = UART_PA.load(Ordering::Acquire);
+        reachable(uart) && read32(uart + UART_FR) & UART_FR_RXFE == 0
+    }
+
+    /// Unmask the receive interrupt in the device for kernel-thread `item`; true iff opened.
+    pub fn open_gate(item: u32, kthread: u64) -> bool {
+        let uart = UART_PA.load(Ordering::Acquire);
+        if item <= crate::kernel::kirq_witness::BASE_ITEMS
+            || item > WITNESS_ITEMS
+            || next_item() != item
+            || !source_live()
+            || !reachable(uart)
+        {
+            return false;
+        }
+        GATE_ITEM.store(item, Ordering::Release);
+        GATE_KTHREAD.store(kthread, Ordering::Release);
+        GATE_OPENS.fetch_add(1, Ordering::AcqRel);
+        write32(uart + UART_IMSC, UART_IMSC_RXIM);
+        true
+    }
+
+    pub fn kthread_origin() -> u32 {
+        KTHREAD_ORIGIN.load(Ordering::Acquire)
+    }
 }
 
 /// A special INTID (1020..=1023) was claimed. The vector entry returns without completing it —
@@ -723,6 +817,12 @@ fn disable_source() {
         BYTES.load(Ordering::Acquire),
         imsc_after,
         enabled_after
+    );
+    #[cfg(feature = "kthread-irq-witness")]
+    crate::yarm_log!(
+        "IRQ2_PL011_KTHREAD_TOTALS kthread_origin={} gate_opens={}",
+        KTHREAD_ORIGIN.load(Ordering::Acquire),
+        GATE_OPENS.load(Ordering::Acquire)
     );
     crate::yarm_log!(
         "IRQ2_PL011_TOTALS empty_drains={} idle_origin={} user_origin={} other_origin={} foreign_claims={} special_claims={}",

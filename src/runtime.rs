@@ -3559,6 +3559,8 @@ impl SharedKernel {
         // KTHREAD1: the loop runs selected kernel threads (see the last paragraph above).
         #[cfg(feature = "kthread1-witness")]
         crate::kernel::kthread_witness::maybe_start(self, authority.cpu());
+        #[cfg(feature = "kthread-irq-witness")]
+        crate::kernel::kirq_witness_maybe_start(self, authority.cpu());
         let cpu = authority.cpu();
         loop {
             // The window check is OUTSIDE the scheduler acquisition on purpose: a stale authority

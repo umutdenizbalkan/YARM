@@ -36,9 +36,40 @@ pub mod idle_boundary;
 pub mod ipc;
 pub mod ipccall_direct;
 pub mod ipccall_direct_txn;
+/// KTHREAD1-ACCEPTANCE §2 — the kernel-thread window of the device-interrupt witnesses
+/// (default-off; layered on one port's device-interrupt witness).
+#[cfg(all(
+    feature = "kthread-irq-witness",
+    not(feature = "hosted-dev"),
+    any(
+        all(target_arch = "riscv64", feature = "riscv-uart-irq-witness"),
+        all(target_arch = "aarch64", feature = "aarch64-pl011-irq-witness"),
+        all(target_arch = "x86_64", feature = "x86_64-uart-irq-witness")
+    )
+))]
+pub mod kirq_witness;
 pub mod kthread;
 #[cfg(feature = "kthread1-witness")]
 pub mod kthread_witness;
+
+/// The selection owner's hook for [`kirq_witness`]: compiled with the feature, and a no-op unless
+/// the port's device-interrupt witness is compiled too.
+#[cfg(feature = "kthread-irq-witness")]
+#[inline(always)]
+pub(crate) fn kirq_witness_maybe_start(
+    _shared: &crate::runtime::SharedKernel,
+    _cpu: crate::kernel::scheduler::CpuId,
+) {
+    #[cfg(all(
+        not(feature = "hosted-dev"),
+        any(
+            all(target_arch = "riscv64", feature = "riscv-uart-irq-witness"),
+            all(target_arch = "aarch64", feature = "aarch64-pl011-irq-witness"),
+            all(target_arch = "x86_64", feature = "x86_64-uart-irq-witness")
+        )
+    ))]
+    kirq_witness::maybe_start(_shared, _cpu);
+}
 pub mod lock;
 /// SCHED-LOCK1 — the QEMU independence and wake witness (default-off; layered on the AP-scheduling
 /// witness, whose workload it runs on). No default or production profile carries it.

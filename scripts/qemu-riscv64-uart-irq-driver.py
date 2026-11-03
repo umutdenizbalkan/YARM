@@ -24,6 +24,9 @@ Synchronisation is by the guest's own acknowledgements, never by sleeping:
 * AArch64 / x86_64: `IRQ1_UART_READY seq=N mode=user` -> inject at once (the receiver is spinning
   in user mode). `mode=idle` -> wait for the port's idle acknowledgement after that line, then
   inject.
+* Every port, `mode=kthread` (KTHREAD1-ACCEPTANCE §2, `kthread-irq-witness` builds only) ->
+  inject at once: the byte waits in the device behind the port's gate until the kernel's witness
+  thread opens it from inside its register-checked section.
 * `IRQ1_UART_POSTDISABLE_READY` (after `IRQ1_UART_SOURCE_DISABLED`) -> inject one more byte, `Z`,
   which a disabled source must NOT deliver.
 
@@ -61,7 +64,7 @@ import sys
 import tempfile
 import time
 
-READY_RE = re.compile(rb"IRQ1_UART_READY seq=(\d+) mode=(idle|user) expect=0x([0-9a-f]{2})")
+READY_RE = re.compile(rb"IRQ1_UART_READY seq=(\d+) mode=(idle|user|kthread) expect=0x([0-9a-f]{2})")
 IDLE_RE_AARCH64 = re.compile(rb"TIMER_IDLE_ADVANCE_SETTLED cpu=0 incoming=none reason=idle settlement=kernel_idle")
 DISABLED_RE_AARCH64 = re.compile(rb"IRQ2_PL011_SOURCE_DISABLED ")
 DISABLED_RE_X86_64 = re.compile(rb"IRQ3_UART_SOURCE_DISABLED ")
@@ -198,6 +201,10 @@ def main() -> int:
                 injected[seq] = byte
                 if mode == b"user":
                     inject(byte, f"seq={seq} mode=user ack=ready")
+                elif mode == b"kthread":
+                    # KTHREAD1-ACCEPTANCE §2: the kernel's witness thread holds the byte behind
+                    # the port's gate and opens it from inside its own register-checked section.
+                    inject(byte, f"seq={seq} mode=kthread ack=ready gate=kernel_thread")
                 elif idle_re is None:
                     inject(byte, f"seq={seq} mode=idle ack=ready gate=kernel")
                 else:

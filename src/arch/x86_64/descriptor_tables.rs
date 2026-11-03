@@ -320,8 +320,9 @@ pub(crate) fn load_production_idt_on_this_cpu() -> u64 {
 }
 
 /// KTHREAD1 — the IDT a CPU runs while a kernel thread executes: a copy of the production IDT
-/// whose timer (0x20) and reschedule (0xF1) gates enter the kernel-thread stubs instead. Every
-/// other gate — exceptions, NMI, the IST assignments — is the production gate, so a fault on a
+/// whose timer (0x20) and reschedule (0xF1) gates enter the kernel-thread stubs instead, and
+/// (KTHREAD1-ACCEPTANCE §2) whose device vectors 0x21.. enter the kernel-thread device bridge.
+/// Every other gate — exceptions, NMI, the IST assignments — is the production gate, so a fault on a
 /// kernel thread is the same kernel-fatal fault it is anywhere in ring 0. Built once, from the
 /// final production IDT, by the first CPU that needs it; read-only afterwards.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -354,6 +355,16 @@ pub(crate) fn load_kthread_idt() {
                         0,
                     ),
                 );
+                // KTHREAD1-ACCEPTANCE §2: device vectors enter the kernel-thread device bridge.
+                for (i, &stub) in super::kthread::yarm_x86_64_kthread_dev_stubs
+                    .iter()
+                    .enumerate()
+                {
+                    core::ptr::write(
+                        dst.add(super::kthread::KTHREAD_DEVICE_VECTOR_FIRST + i),
+                        X86IdtEntry::new_interrupt(stub, KERNEL_CODE_SELECTOR, 0, 0),
+                    );
+                }
                 core::ptr::write(
                     dst.add(AP_REMOTE_WAKE_VECTOR as usize),
                     X86IdtEntry::new_interrupt(

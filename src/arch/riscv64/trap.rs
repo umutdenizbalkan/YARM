@@ -619,8 +619,12 @@ pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
 /// * `Claimed` — a source is in flight. It goes to the SAME delivery policy x86_64 and AArch64
 ///   use, and the bridge owner completes it exactly once against the context it came from,
 ///   including when the line is unbound and when notification delivery fails.
+///
+/// KTHREAD1-ACCEPTANCE §2: also the settlement for a claim the kernel-thread vector's entry owner
+/// read (`arch::riscv64::kthread`), so that origin reaches the same route and the same one
+/// completion owner.
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-fn settle_riscv_external_claim(
+pub(crate) fn settle_riscv_external_claim(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
     claim: crate::arch::external_irq_claim::PlicClaim,

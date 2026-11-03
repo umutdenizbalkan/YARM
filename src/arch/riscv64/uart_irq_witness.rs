@@ -62,13 +62,24 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use super::irq;
 use super::page_table;
 
-/// How many data-bearing items the witness exchanges before the source is turned off.
+/// How many data-bearing items the witness exchanges before the source is turned off: the eight
+/// idle/user items, and with `kthread-irq-witness` four KERNEL-THREAD items after them
+/// (KTHREAD1-ACCEPTANCE §2, `kernel::kirq_witness`).
+#[cfg(not(feature = "kthread-irq-witness"))]
 pub const WITNESS_ITEMS: u32 = 8;
+#[cfg(feature = "kthread-irq-witness")]
+pub const WITNESS_ITEMS: u32 = crate::kernel::kirq_witness::TOTAL_ITEMS;
 
-/// The receiver's item protocol (`init/uart_irq_witness.rs`): item `n` (1-based) is an IDLE item
-/// when `n` is odd and a USER item when it is even. The gate opens each item only in that window.
+/// The receiver's item protocol (`init/uart_irq_witness.rs`): item `n` (1-based) of the first
+/// eight is an IDLE item when `n` is odd and a USER item when it is even; every later item is a
+/// KERNEL-THREAD item. The gate opens each item only in that window.
 pub const fn item_is_idle(item: u32) -> bool {
-    item % 2 == 1
+    item <= 8 && item % 2 == 1
+}
+
+/// See [`item_is_idle`].
+pub const fn item_is_user(item: u32) -> bool {
+    item <= 8 && item % 2 == 0
 }
 
 /// Upper bound on bytes drained for one claim. The exchange keeps one byte outstanding, so a
@@ -102,6 +113,8 @@ pub const RING_WORD_CLAIMS: usize = 4;
 pub const RING_WORD_COMPLETIONS: usize = 5;
 pub const RING_WORD_IDLE_ORIGIN: usize = 6;
 pub const RING_WORD_USER_ORIGIN: usize = 7;
+/// KTHREAD1-ACCEPTANCE §2: claims taken while a kernel thread ran.
+pub const RING_WORD_KTHREAD_ORIGIN: usize = 10;
 pub const RING_WORD_EMPTY_DRAINS: usize = 8;
 /// The interrupt line the provisioning bound to the receiver's notification.
 pub const RING_WORD_BOUND_LINE: usize = 9;
@@ -134,6 +147,10 @@ static GATE_RECORDED: AtomicBool = AtomicBool::new(false);
 static UNGATED_CLAIMS: AtomicU32 = AtomicU32::new(0);
 const WINDOW_IDLE: u32 = 1;
 const WINDOW_USER: u32 = 2;
+/// KTHREAD1-ACCEPTANCE §2: opened by the witness's kernel thread from inside its masked,
+/// register-patterned section (`kernel::kirq_witness`).
+#[cfg_attr(not(feature = "kthread-irq-witness"), allow(dead_code))]
+const WINDOW_KTHREAD: u32 = 3;
 
 static CLAIMS: AtomicU32 = AtomicU32::new(0);
 static DATA_CLAIMS: AtomicU32 = AtomicU32::new(0);
@@ -142,6 +159,7 @@ static COMPLETIONS: AtomicU32 = AtomicU32::new(0);
 static BYTES: AtomicU32 = AtomicU32::new(0);
 static IDLE_ORIGIN: AtomicU32 = AtomicU32::new(0);
 static USER_ORIGIN: AtomicU32 = AtomicU32::new(0);
+static KTHREAD_ORIGIN: AtomicU32 = AtomicU32::new(0);
 static OTHER_SOURCE_CLAIMS: AtomicU32 = AtomicU32::new(0);
 /// Set between the drain of a data-bearing claim and its completion, so the completion that
 /// answers the WITNESS_ITEMS-th data item is the one that turns the source off.
@@ -459,15 +477,19 @@ fn record_gate_opening() {
     marker(format_args!(
         "IRQ1_UART_GATE_OPEN item={} window={} tid={} opens={} sip=0x{:x}",
         GATE_ITEM.load(Ordering::Acquire),
-        if GATE_WINDOW.load(Ordering::Acquire) == WINDOW_IDLE {
-            "idle"
-        } else {
-            "user"
-        },
+        window_name(GATE_WINDOW.load(Ordering::Acquire)),
         GATE_TID.load(Ordering::Acquire),
         GATE_OPENS.load(Ordering::Acquire),
         GATE_SIP.load(Ordering::Acquire)
     ));
+}
+
+fn window_name(window: u32) -> &'static str {
+    match window {
+        WINDOW_IDLE => "idle",
+        WINDOW_USER => "user",
+        _ => "kthread",
+    }
 }
 
 const SIP_SSIP: usize = 1 << 1;
@@ -521,7 +543,7 @@ pub fn gate_at_user_return(resume_tid: u64) {
         return;
     }
     let item = next_item();
-    if !item_is_idle(item) {
+    if item_is_user(item) {
         open_gate(item, WINDOW_USER, resume_tid);
     }
 }
@@ -549,12 +571,70 @@ pub fn note_claim_origin(idle: bool, sepc: usize, tid: u64) {
         sepc,
         tid,
         GATE_ITEM.load(Ordering::Acquire),
-        match (gated, GATE_WINDOW.load(Ordering::Acquire)) {
-            (false, _) => "closed",
-            (true, WINDOW_IDLE) => "idle",
-            (true, _) => "user",
+        if gated {
+            window_name(GATE_WINDOW.load(Ordering::Acquire))
+        } else {
+            "closed"
         }
     ));
+}
+
+/// KTHREAD1-ACCEPTANCE §2 — record a claim the KERNEL-THREAD vector's entry owner took, with the
+/// interrupted thread's incarnation id. Observation only, like [`note_claim_origin`].
+pub fn note_kthread_claim_origin(sepc: u64, kthread: u64) {
+    if GATE_OPEN.load(Ordering::Acquire) {
+        record_gate_opening();
+    }
+    let n = KTHREAD_ORIGIN.fetch_add(1, Ordering::AcqRel) + 1;
+    ring_store(RING_WORD_KTHREAD_ORIGIN, n);
+    let gated = GATE_OPEN.load(Ordering::Acquire);
+    marker(format_args!(
+        "IRQ1_UART_IRQ_ENTRY origin=kthread n={} sepc=0x{:x} tid=0 kthread={:#x} item={} gate={}",
+        n,
+        sepc,
+        kthread,
+        GATE_ITEM.load(Ordering::Acquire),
+        if gated {
+            window_name(GATE_WINDOW.load(Ordering::Acquire))
+        } else {
+            "closed"
+        }
+    ));
+}
+
+/// KTHREAD1-ACCEPTANCE §2 — the port's side of the kernel-thread window (`kernel::kirq_witness`).
+/// The next item, whether its byte is waiting in the device, and the gate opening for a
+/// kernel-thread item, made by the witness thread with interrupts masked. Fixture
+/// synchronization only, exactly as the idle and user openings are.
+#[cfg(feature = "kthread-irq-witness")]
+pub mod kirq_port {
+    use super::*;
+
+    pub fn next_item() -> u32 {
+        super::next_item()
+    }
+
+    pub fn source_live() -> bool {
+        SOURCE_ENABLED.load(Ordering::Acquire) && !SOURCE_DISABLED.load(Ordering::Acquire)
+    }
+
+    pub fn byte_present() -> bool {
+        let uart_pa = UART_PA.load(Ordering::Acquire);
+        mmio_va(uart_pa + UART_LSR, 1).is_some_and(|lsr| read8(lsr) & UART_LSR_DR != 0)
+    }
+
+    /// Open the gate for kernel-thread `item`; true iff it is now open for exactly that item.
+    pub fn open_gate(item: u32, kthread: u64) -> bool {
+        if item_is_idle(item) || item_is_user(item) {
+            return false;
+        }
+        super::open_gate(item, WINDOW_KTHREAD, kthread);
+        GATE_OPEN.load(Ordering::Acquire) && GATE_ITEM.load(Ordering::Acquire) == item
+    }
+
+    pub fn kthread_origin() -> u32 {
+        KTHREAD_ORIGIN.load(Ordering::Acquire)
+    }
 }
 
 /// Drain the device for a claim the entry owner already took, BEFORE delivery and completion.
@@ -679,6 +759,11 @@ fn disable_source() {
         COMPLETIONS.load(Ordering::Acquire),
         BYTES.load(Ordering::Acquire),
         enable_after
+    ));
+    #[cfg(feature = "kthread-irq-witness")]
+    marker(format_args!(
+        "IRQ1_UART_KTHREAD_TOTALS kthread_origin={}",
+        KTHREAD_ORIGIN.load(Ordering::Acquire)
     ));
     marker(format_args!(
         "IRQ1_UART_TOTALS empty_drains={} idle_origin={} user_origin={} foreign_claims={} gate_opens={} ungated_claims={}",

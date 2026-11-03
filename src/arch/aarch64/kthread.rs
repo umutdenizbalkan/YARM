@@ -288,9 +288,20 @@ extern "C" fn yarm_aarch64_kthread_fault(esr: u64, elr: u64, far: u64) -> ! {
     );
 }
 
-/// The kernel-thread IRQ bridge: authenticate the origin, claim the interrupt, service the timer
-/// or the reschedule SGI, complete it, record a pending reschedule, return to the entry. Never
-/// logs on the serviced path, never switches.
+/// The kernel-thread IRQ bridge: authenticate the origin, claim the interrupt, service the timer,
+/// the reschedule SGI or a device interrupt, complete it, record a pending reschedule, return to
+/// the entry. Never switches; the timer and SGI paths never log.
+///
+/// KTHREAD1-ACCEPTANCE §2 — a device INTID is settled exactly as the production vector settles
+/// one taken from EL0 or the idle boundary: `settle_external_interrupt_at_bridge` delivers it
+/// through the production route, its own completion step is the AArch64 single-step
+/// acknowledgement (inert: the claim's one completion belongs to the vector that took it), and
+/// this bridge — that vector's tail — writes the one `GICC_EOIR` afterwards. Delivery may wake a
+/// task; the thread is not switched, a reschedule is left for its next scheduling point.
+/// GICv2: INTIDs 0..=15 are SGIs, 16..=31 PPIs, 32.. shared peripheral interrupts.
+#[cfg(not(feature = "hosted-dev"))]
+const FIRST_SPI_INTID: u16 = 32;
+
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_kthread_interrupt(frame: usize) {
@@ -343,11 +354,48 @@ extern "C" fn yarm_aarch64_kthread_interrupt(frame: usize) {
         );
         pool.note_resched_interrupt(cpu, true);
         crate::arch::aarch64::irq::complete_interrupt(ack);
-    } else {
+    } else if intid < FIRST_SPI_INTID {
+        // A private interrupt (SGI/PPI) other than the two above: this port routes none of them
+        // on a kernel thread, so it stays fatal, as before. Device interrupts are SPIs.
         crate::arch::aarch64::irq::complete_interrupt(ack);
         panic!(
             "KTHREAD_IRQ_UNSUPPORTED arch=aarch64 cpu={} intid={} result=fatal",
             cpu.0, intid
         );
+    } else {
+        // SAFETY: the entry saved SPSR_EL1 (the interrupted PSTATE) at offset 256.
+        let spsr = unsafe { *((frame + 256) as *const u64) };
+        #[cfg(feature = "aarch64-pl011-irq-witness")]
+        crate::arch::aarch64::pl011_irq_witness::note_kthread_claim_and_drain(
+            intid,
+            spsr,
+            elr,
+            cpu,
+            id.raw(),
+        );
+        #[cfg(not(feature = "aarch64-pl011-irq-witness"))]
+        let _ = spsr;
+        let settled = crate::kernel::syscall_split::settle_external_interrupt_at_bridge(
+            shared,
+            cpu,
+            u32::from(intid),
+            crate::arch::hal_adapters::InterruptCompletion::ArchSingleStep { line: intid },
+        );
+        // THE completion for this claim, once.
+        crate::arch::aarch64::irq::complete_interrupt(ack);
+        #[cfg(feature = "aarch64-pl011-irq-witness")]
+        crate::arch::aarch64::pl011_irq_witness::note_completion_written(ack);
+        if let Some(Err(err)) = settled {
+            // The EL0 bridge leaves its trap as an error here (a full notification queue); the
+            // claim is completed either way. A kernel thread has no trap result to carry it.
+            crate::yarm_log!(
+                "KTHREAD_DEVICE_IRQ_DELIVERY_REFUSED arch=aarch64 cpu={} kthread={:#x} intid={} err={:?}",
+                cpu.0,
+                id.raw(),
+                intid,
+                err
+            );
+        }
+        pool.note_device_interrupt(cpu);
     }
 }

@@ -226,6 +226,33 @@ mod bare {
         YARM_KT_POP
         iretq
 
+        // KTHREAD1-ACCEPTANCE §2 — one stub per device vector (0x21 up to the end of the external
+        // line range); each names its vector and continues in the device bridge below, then
+        // `iretq`s to the interrupted instruction.
+        .macro YARM_KT_DEV_STUB vec
+        .global yarm_x86_64_kthread_dev_stub_\vec
+        .type yarm_x86_64_kthread_dev_stub_\vec, @function
+    yarm_x86_64_kthread_dev_stub_\vec:
+        YARM_KT_PUSH
+        mov rdi, rsp
+        mov esi, \vec
+        call yarm_x86_64_kthread_device_interrupt
+        YARM_KT_POP
+        iretq
+        .endm
+        .irp v, 33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95
+        YARM_KT_DEV_STUB \v
+        .endr
+
+        .section .rodata, "a", @progbits
+        .balign 8
+        .global yarm_x86_64_kthread_dev_stubs
+    yarm_x86_64_kthread_dev_stubs:
+        .irp v, 33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95
+        .quad yarm_x86_64_kthread_dev_stub_\v
+        .endr
+        .section .text, "ax", @progbits
+
         .global yarm_x86_64_kthread_resched_stub
         .type yarm_x86_64_kthread_resched_stub, @function
     yarm_x86_64_kthread_resched_stub:
@@ -241,6 +268,74 @@ mod bare {
     unsafe extern "C" {
         pub(crate) fn yarm_x86_64_kthread_timer_stub();
         pub(crate) fn yarm_x86_64_kthread_resched_stub();
+        /// The device stubs' addresses, for vectors [`KTHREAD_DEVICE_VECTOR_FIRST`] onward.
+        pub(crate) static yarm_x86_64_kthread_dev_stubs: [u64; KTHREAD_DEVICE_VECTORS];
+    }
+
+    /// KTHREAD1-ACCEPTANCE §2 — the device vectors the kernel-thread IDT routes to the device
+    /// bridge: every external line above the timer (0x21 .. 0x20 + `MAX_IRQ_LINES`).
+    pub(crate) const KTHREAD_DEVICE_VECTOR_FIRST: usize = 0x21;
+    pub(crate) const KTHREAD_DEVICE_VECTORS: usize =
+        crate::arch::platform_constants::MAX_IRQ_LINES - 1;
+
+    /// KTHREAD1-ACCEPTANCE §2 — the kernel-thread DEVICE bridge. A device vector taken while a
+    /// kernel thread runs used to reach the production gate, whose dispatch saw a nested trap
+    /// (the thread runs inside the trap that dispatched it) and halted. Here the origin is
+    /// authenticated as for the timer, the vector is delivered through the production route by
+    /// `settle_external_interrupt_at_bridge`, whose completion step is the x86 single step: the
+    /// ONE LAPIC EOI. Delivery may wake a task; the thread is not switched, a reschedule is left
+    /// for its next scheduling point.
+    #[unsafe(no_mangle)]
+    extern "C" fn yarm_x86_64_kthread_device_interrupt(frame: usize, vector: u64) {
+        let Some(shared) = crate::arch::x86_64::descriptor_tables::trap_shared_kernel() else {
+            panic!(
+                "KTHREAD_IRQ_UNAUTHENTICATED arch=x86_64 vector={:#x} reason=no_kernel",
+                vector
+            );
+        };
+        let pool = &shared.kthreads;
+        let hardware = crate::arch::x86_64::descriptor_tables::current_cpu_id();
+        let (cpu, id) = match pool.authenticate_interrupt(frame, hardware) {
+            Ok(ok) => ok,
+            Err(r) => panic!(
+                "KTHREAD_IRQ_UNAUTHENTICATED arch=x86_64 cpu={} vector={:#x} reason={}",
+                hardware.0,
+                vector,
+                r.marker()
+            ),
+        };
+        // SAFETY: the stub pushed 15 registers above the CPU's interrupt frame (RIP first).
+        let rip = unsafe { *((frame + 15 * 8) as *const u64) };
+        #[cfg(feature = "x86_64-uart-irq-witness")]
+        crate::arch::x86_64::uart_irq_witness::note_kthread_entry_and_drain(
+            vector,
+            rip,
+            cpu,
+            id.raw(),
+        );
+        #[cfg(not(feature = "x86_64-uart-irq-witness"))]
+        let _ = rip;
+        let line = (vector - 0x20) as u16;
+        let settled = crate::kernel::syscall_split::settle_external_interrupt_at_bridge(
+            shared,
+            cpu,
+            u32::from(line),
+            crate::arch::hal_adapters::InterruptCompletion::ArchSingleStep { line },
+        );
+        #[cfg(feature = "x86_64-uart-irq-witness")]
+        crate::arch::x86_64::uart_irq_witness::note_after_dispatch(vector);
+        if let Some(Err(err)) = settled {
+            // The ring-3 bridge leaves its trap as an error here (a full notification queue); the
+            // EOI is written either way. A kernel thread has no trap result to carry it.
+            crate::yarm_log!(
+                "KTHREAD_DEVICE_IRQ_DELIVERY_REFUSED arch=x86_64 cpu={} kthread={:#x} vector={:#x} err={:?}",
+                cpu.0,
+                id.raw(),
+                vector,
+                err
+            );
+        }
+        pool.note_device_interrupt(cpu);
     }
 
     /// The kernel-thread interrupt bridge. `frame` is the saved register block on the interrupted

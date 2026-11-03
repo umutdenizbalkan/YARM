@@ -453,7 +453,7 @@ fn the_riscv_window_gate_ties_each_arrival_to_its_window() {
     assert!(open.contains("SOURCE_DISABLED.load(Ordering::Acquire)"));
     let user_gate = body_after(&w, "pub fn gate_at_user_return(resume_tid: u64) {");
     assert!(user_gate.contains("resume_tid != receiver"));
-    assert!(user_gate.contains("if !item_is_idle(item) {"));
+    assert!(user_gate.contains("if item_is_user(item) {"));
     let drain = body_after(
         &w,
         "pub fn drain_before_delivery(source: u32, context_index: usize) {",
@@ -463,11 +463,18 @@ fn the_riscv_window_gate_ties_each_arrival_to_its_window() {
         .find("ring_store(RING_WORD_CLAIMS, claim);")
         .expect("publish");
     assert!(close < publish);
-    // The receiver's item protocol and the fixture's agree: odd items are idle.
-    assert!(w.contains("pub const fn item_is_idle(item: u32) -> bool {\n    item % 2 == 1\n}"));
+    // The receiver's item protocol and the fixture's agree: of the first eight, odd items are
+    // idle and even items user; later items (KTHREAD1-ACCEPTANCE §2) are kernel-thread items.
+    assert!(w.contains(
+        "pub const fn item_is_idle(item: u32) -> bool {\n    item <= 8 && item % 2 == 1\n}"
+    ));
+    assert!(w.contains(
+        "pub const fn item_is_user(item: u32) -> bool {\n    item <= 8 && item % 2 == 0\n}"
+    ));
     let receiver = include_str!(
         "../crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs"
     );
-    assert!(receiver.contains("let idle = seq % 2 == 1;"));
+    assert!(receiver.contains("let mode = item_mode(seq);"));
+    assert!(receiver.contains("seq <= 8 && seq % 2 == 1"));
     assert!(receiver.contains("\"lwu s7, 0(s5)\""));
 }

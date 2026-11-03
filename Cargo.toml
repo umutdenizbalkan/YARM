@@ -243,6 +243,13 @@ aarch64-pl011-irq-witness = []
 # notification + ring page, the shared witness-only NR 5 notification arm, and init's receiver cell.
 # A build without it programs no I/O APIC entry and keeps NR 5 endpoint-only.
 x86_64-uart-irq-witness = []
+# KTHREAD1-ACCEPTANCE §2: the kernel-thread window of the device-interrupt witnesses. With one of
+# `riscv-uart-irq-witness`, `aarch64-pl011-irq-witness` or `x86_64-uart-irq-witness`, adds four
+# items after the eight idle/user items whose interrupt lands on a KERNEL THREAD: the witness
+# creates one thread (`src/kernel/kirq_witness.rs`) that opens the port's gate from inside a
+# masked, register-patterned section and then unmasks, so the device interrupt is taken on that
+# thread and settled by the production owners. Without a port witness it compiles nothing.
+kthread-irq-witness = []
 # QEMU-CONTEXT1: the user execution-state witness — init's cell (selector 31) with two real user
 # threads and a fresh thread, the provisioning of its park endpoint, and the kernel's per-trap
 # CTX1_TRAP identity markers. A build without it logs nothing and provisions nothing.

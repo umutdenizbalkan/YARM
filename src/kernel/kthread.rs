@@ -285,6 +285,8 @@ pub(crate) struct KCpu {
     dispatches: AtomicU64,
     timer_interrupts: AtomicU64,
     resched_interrupts: AtomicU64,
+    /// KTHREAD1-ACCEPTANCE §2: device interrupts settled while a kernel thread ran.
+    device_interrupts: AtomicU64,
     resched_honoured: AtomicU64,
 }
 
@@ -297,6 +299,7 @@ impl KCpu {
             dispatches: AtomicU64::new(0),
             timer_interrupts: AtomicU64::new(0),
             resched_interrupts: AtomicU64::new(0),
+            device_interrupts: AtomicU64::new(0),
             resched_honoured: AtomicU64::new(0),
         }
     }
@@ -402,6 +405,7 @@ pub struct KCpuCounters {
     pub dispatches: u64,
     pub timer_interrupts: u64,
     pub resched_interrupts: u64,
+    pub device_interrupts: u64,
     pub resched_honoured: u64,
 }
 
@@ -604,6 +608,7 @@ impl KThreadPool {
             dispatches: k.dispatches.load(Ordering::Acquire),
             timer_interrupts: k.timer_interrupts.load(Ordering::Acquire),
             resched_interrupts: k.resched_interrupts.load(Ordering::Acquire),
+            device_interrupts: k.device_interrupts.load(Ordering::Acquire),
             resched_honoured: k.resched_honoured.load(Ordering::Acquire),
         }
     }
@@ -668,15 +673,15 @@ impl KThreadPool {
             arch::prepare_first_entry(&mut *s.ctx.get(), high, self as *const Self as usize, slot)
         };
         let id = KThreadId::encode(slot, generation);
+        // KTHREAD1-ACCEPTANCE §4 witness (default-off): the creation is recorded before the
+        // enqueue below, so nothing about this incarnation can be recorded before it.
+        #[cfg(feature = "kthread1-witness")]
+        crate::kernel::kthread_witness::note_create(id, cpu, low, high);
         let placed = self
             .shared()
             .with_cpu_sched_split(cpu, |c| {
                 c.enqueue_with_priority(id.tid(), priority).map(|()| {
                     s.state.store(READY, Ordering::Release);
-        // KTHREAD1-ACCEPTANCE §4 witness (default-off): the creation is recorded before the
-        // enqueue below, so nothing about this incarnation can be recorded before it.
-        #[cfg(feature = "kthread1-witness")]
-        crate::kernel::kthread_witness::note_create(id, cpu, low, high);
                 })
             })
             .and_then(|r| r);
@@ -967,6 +972,24 @@ impl KThreadPool {
         if announced {
             k.need_resched.store(true, Ordering::Release);
         }
+    }
+
+    /// KTHREAD1-ACCEPTANCE §2 — a device interrupt that landed on a running kernel thread has been
+    /// settled by the port's existing owners (claimed once, delivered through the production
+    /// route, completed once). Delivery may have made a task runnable on this CPU; the thread is
+    /// not switched here, so the decision is deferred to its next scheduling point. Takes no lock.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn note_device_interrupt(&self, cpu: CpuId) {
+        let k = &self.cpus[cpu.0 as usize];
+        k.device_interrupts.fetch_add(1, Ordering::AcqRel);
+        k.need_resched.store(true, Ordering::Release);
+    }
+
+    /// The address of `cpu`'s device-interrupt counter (the device-IRQ witness polls it from a
+    /// register-patterned spin; observation only).
+    #[cfg(feature = "kthread-irq-witness")]
+    pub(crate) fn device_interrupt_counter_addr(&self, cpu: CpuId) -> *const u64 {
+        self.cpus[cpu.0 as usize].device_interrupts.as_ptr() as *const u64
     }
 
     /// Is a reschedule pending on `cpu` (observation only)?

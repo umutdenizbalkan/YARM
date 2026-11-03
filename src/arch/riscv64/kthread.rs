@@ -276,22 +276,35 @@ fn hardware_cpu() -> Option<CpuId> {
     crate::arch::riscv64::boot::riscv_cpu_of_canonical_trap_stack_top(top)
 }
 
-/// The kernel-thread trap handler. Authenticates the origin, services a supervisor timer or
-/// software interrupt, records a pending reschedule, and returns to the vector, which restores the
-/// interrupted state. Any other trap on a kernel thread is kernel-fatal. Never logs on the
-/// serviced path, never switches.
+/// The kernel-thread trap handler. Authenticates the origin, services a supervisor timer,
+/// software or external interrupt, records a pending reschedule, and returns to the vector, which
+/// restores the interrupted state. Any other trap on a kernel thread is kernel-fatal. Never
+/// switches; the timer and software paths never log.
+///
+/// KTHREAD1-ACCEPTANCE §2 — a supervisor EXTERNAL interrupt is a third entry owner beside the
+/// U-origin bridge and the witness build's idle-origin entry, disjoint from both by origin: this
+/// vector is installed only while a kernel thread runs. It reads the PLIC claim ONCE, here, after
+/// authentication, and hands it to the same settlement the bridge uses
+/// (`settle_riscv_external_claim` → `settle_external_interrupt_at_bridge` → the production route
+/// and the one completion owner). The claim's reachability is the same walk of the ACTIVE `satp`
+/// the other owners use; an unreachable or empty claim settles with nothing completed, exactly as
+/// there. Delivery may wake a task; the thread is not switched, a reschedule is left for its next
+/// scheduling point.
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_riscv64_kthread_trap(frame: *mut crate::arch::riscv64::boot::RiscvTrapFrame) {
     const INTERRUPT: usize = 1 << 63;
     const SUPERVISOR_SOFTWARE: usize = 1;
     const SUPERVISOR_TIMER: usize = 5;
+    const SUPERVISOR_EXTERNAL: usize = 9;
     // SAFETY: the vector passes the frame it just saved on this stack.
     let (scause, sepc, stval) =
         unsafe { ((*frame).scause as usize, (*frame).sepc, (*frame).stval) };
     let code = scause & !INTERRUPT;
     let is_irq = scause & INTERRUPT != 0;
-    if !is_irq || (code != SUPERVISOR_TIMER && code != SUPERVISOR_SOFTWARE) {
+    if !is_irq
+        || (code != SUPERVISOR_TIMER && code != SUPERVISOR_SOFTWARE && code != SUPERVISOR_EXTERNAL)
+    {
         crate::arch::riscv64::boot::early_sbi_marker(format_args!(
             "KTHREAD_FAULT arch=riscv64 scause={:#x} sepc={:#x} stval={:#x} result=fatal",
             scause, sepc, stval
@@ -319,6 +332,28 @@ extern "C" fn yarm_riscv64_kthread_trap(frame: *mut crate::arch::riscv64::boot::
         #[cfg(feature = "kthread1-witness")]
         crate::kernel::kthread_witness::note_interrupt(cpu, id, 1, sepc, frame as usize, 0);
         let _ = pool.service_timer_interrupt(cpu);
+    } else if code == SUPERVISOR_EXTERNAL {
+        // THE claim for this origin, read once, here.
+        let claim = crate::arch::external_irq_claim::claim_external_interrupt_once();
+        #[cfg(feature = "riscv-uart-irq-witness")]
+        if claim.in_flight().is_some() {
+            crate::arch::riscv64::uart_irq_witness::note_kthread_claim_origin(sepc, id.raw());
+        }
+        let (result, reason) =
+            crate::arch::riscv64::trap::settle_riscv_external_claim(shared, cpu, claim);
+        if let Err(err) = result {
+            // The user-origin bridge leaves its trap as an error here (a full notification
+            // queue); the claim is completed either way. A kernel thread has no trap result to
+            // carry it, so the refusal is reported by name and the thread continues.
+            crate::yarm_log!(
+                "KTHREAD_DEVICE_IRQ_DELIVERY_REFUSED arch=riscv64 cpu={} kthread={:#x} reason={} err={:?}",
+                cpu.0,
+                id.raw(),
+                reason,
+                err
+            );
+        }
+        pool.note_device_interrupt(cpu);
     } else {
         let arrival = crate::arch::riscv64::ipi::take_arrival(
             cpu,

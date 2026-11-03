@@ -40,8 +40,13 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// How many data-bearing items the witness exchanges before the source is turned off.
+/// How many data-bearing items the witness exchanges before the source is turned off: eight, and
+/// with `kthread-irq-witness` four KERNEL-THREAD items after them (KTHREAD1-ACCEPTANCE §2,
+/// `kernel::kirq_witness`).
+#[cfg(not(feature = "kthread-irq-witness"))]
 pub const WITNESS_ITEMS: u32 = 8;
+#[cfg(feature = "kthread-irq-witness")]
+pub const WITNESS_ITEMS: u32 = crate::kernel::kirq_witness::TOTAL_ITEMS;
 const MAX_DRAIN_PER_CLAIM: usize = 16;
 
 /// COM1's ISA IRQ, as the executed machine configures it: QEMU 8.2.2 `info qtree` on
@@ -95,6 +100,8 @@ pub const RING_WORD_CLAIMS: usize = 4;
 pub const RING_WORD_COMPLETIONS: usize = 5;
 pub const RING_WORD_IDLE_ORIGIN: usize = 6;
 pub const RING_WORD_USER_ORIGIN: usize = 7;
+/// KTHREAD1-ACCEPTANCE §2: claims taken while a kernel thread ran.
+pub const RING_WORD_KTHREAD_ORIGIN: usize = 10;
 pub const RING_WORD_EMPTY_DRAINS: usize = 8;
 /// The interrupt line (here: the GSI, = vector - 0x20) the provisioning bound to the notification.
 pub const RING_WORD_BOUND_LINE: usize = 9;
@@ -130,6 +137,14 @@ static BYTES: AtomicU32 = AtomicU32::new(0);
 static IDLE_ORIGIN: AtomicU32 = AtomicU32::new(0);
 static USER_ORIGIN: AtomicU32 = AtomicU32::new(0);
 static OTHER_ORIGIN: AtomicU32 = AtomicU32::new(0);
+static KTHREAD_ORIGIN: AtomicU32 = AtomicU32::new(0);
+/// The interrupted kernel thread's incarnation id while the kernel-thread entry's hook runs
+/// ([`note_kthread_entry_and_drain`]); 0 otherwise.
+static KTHREAD_ENTRY: AtomicU64 = AtomicU64::new(0);
+/// KTHREAD1-ACCEPTANCE §2 — the kernel-thread gate: the item and thread it was last opened for.
+static GATE_ITEM: AtomicU32 = AtomicU32::new(0);
+static GATE_KTHREAD: AtomicU64 = AtomicU64::new(0);
+static GATE_OPENS: AtomicU32 = AtomicU32::new(0);
 static TOGETHER_HELD: AtomicU32 = AtomicU32::new(0);
 static COMPLETION_OWED_FOR_DATA: AtomicBool = AtomicBool::new(false);
 /// The production EOI owner's write count when the current claim entered (see `note_after_dispatch`).
@@ -580,6 +595,11 @@ pub fn note_entry_and_drain(vector: u64, cs: u64, rip: u64, cpu: crate::kernel::
             ring_store(RING_WORD_IDLE_ORIGIN, n);
             ("idle", n)
         }
+        (0, false) if KTHREAD_ENTRY.load(Ordering::Acquire) != 0 => {
+            let n = KTHREAD_ORIGIN.fetch_add(1, Ordering::AcqRel) + 1;
+            ring_store(RING_WORD_KTHREAD_ORIGIN, n);
+            ("kthread", n)
+        }
         _ => ("other", OTHER_ORIGIN.fetch_add(1, Ordering::AcqRel) + 1),
     };
     let tid = crate::arch::x86_64::descriptor_tables::trap_shared_kernel()
@@ -640,7 +660,15 @@ pub fn note_entry_and_drain(vector: u64, cs: u64, rip: u64, cpu: crate::kernel::
         0
     } else {
         COMPLETION_OWED_FOR_DATA.store(true, Ordering::Release);
-        DATA_CLAIMS.fetch_add(1, Ordering::AcqRel) + 1
+        let done = DATA_CLAIMS.fetch_add(1, Ordering::AcqRel) + 1;
+        // KTHREAD1-ACCEPTANCE §2: the kernel-thread items are gated. From the first of them on,
+        // the receive interrupt stays disabled in the device after every drain, so the next byte
+        // waits in the receive buffer until the witness thread opens the gate from its window.
+        #[cfg(feature = "kthread-irq-witness")]
+        if done >= crate::kernel::kirq_witness::BASE_ITEMS {
+            outb(COM1 + UART_IER, 0);
+        }
+        done
     };
     crate::yarm_log!(
         "IRQ3_UART_DRAIN claim={} vector=0x{:x} bytes={} first=0x{:02x} iir_before=0x{:02x} iir_after=0x{:02x} lsr_dr_after={} self_irr={} total_bytes={}",
@@ -675,6 +703,64 @@ pub fn note_entry_and_drain(vector: u64, cs: u64, rip: u64, cpu: crate::kernel::
             lapic_bit(LAPIC_ISR_BASE, vector as u32) as u8,
             polls
         );
+    }
+}
+
+/// KTHREAD1-ACCEPTANCE §2 — the kernel-thread entry's hook before delivery: the same record and
+/// drain as [`note_entry_and_drain`], with the origin named `kthread`, followed (after the drain,
+/// since the console is this UART) by a record naming the interrupted thread's incarnation and
+/// PC. Observation and drain only; never acknowledges.
+pub fn note_kthread_entry_and_drain(
+    vector: u64,
+    rip: u64,
+    cpu: crate::kernel::scheduler::CpuId,
+    kthread: u64,
+) {
+    KTHREAD_ENTRY.store(kthread, Ordering::Release);
+    note_entry_and_drain(vector, 0, rip, cpu);
+    KTHREAD_ENTRY.store(0, Ordering::Release);
+    crate::yarm_log!(
+        "IRQ3_UART_KTHREAD_ENTRY vector=0x{:x} rip=0x{:x} kthread={:#x} gate_item={} gate_kthread={:#x}",
+        vector,
+        rip,
+        kthread,
+        GATE_ITEM.load(Ordering::Acquire),
+        GATE_KTHREAD.load(Ordering::Acquire)
+    );
+}
+
+/// KTHREAD1-ACCEPTANCE §2 — the port's side of the kernel-thread window (`kernel::kirq_witness`).
+/// Fixture synchronization only: it decides when the device may raise its line, nothing else.
+#[cfg(feature = "kthread-irq-witness")]
+pub mod kirq_port {
+    use super::*;
+
+    pub fn next_item() -> u32 {
+        DATA_CLAIMS.load(Ordering::Acquire) + 1
+    }
+
+    pub fn source_live() -> bool {
+        SOURCE_ENABLED.load(Ordering::Acquire) && !SOURCE_DISABLED.load(Ordering::Acquire)
+    }
+
+    pub fn byte_present() -> bool {
+        inb(COM1 + UART_LSR) & UART_LSR_DR != 0
+    }
+
+    /// Enable the receive interrupt in the device for kernel-thread `item`; true iff opened.
+    pub fn open_gate(item: u32, kthread: u64) -> bool {
+        if item <= crate::kernel::kirq_witness::BASE_ITEMS
+            || item > WITNESS_ITEMS
+            || next_item() != item
+            || !source_live()
+        {
+            return false;
+        }
+        GATE_ITEM.store(item, Ordering::Release);
+        GATE_KTHREAD.store(kthread, Ordering::Release);
+        GATE_OPENS.fetch_add(1, Ordering::AcqRel);
+        outb(COM1 + UART_IER, UART_IER_ERBFI);
+        true
     }
 }
 
@@ -737,6 +823,12 @@ fn disable_source() {
         BYTES.load(Ordering::Acquire),
         inb(COM1 + UART_IER),
         (redir_after & REDIR_MASKED != 0) as u8
+    );
+    #[cfg(feature = "kthread-irq-witness")]
+    crate::yarm_log!(
+        "IRQ3_UART_KTHREAD_TOTALS kthread_origin={} gate_opens={}",
+        KTHREAD_ORIGIN.load(Ordering::Acquire),
+        GATE_OPENS.load(Ordering::Acquire)
     );
     crate::yarm_log!(
         "IRQ3_UART_TOTALS empty_drains={} idle_origin={} user_origin={} other_origin={} together_held={}",

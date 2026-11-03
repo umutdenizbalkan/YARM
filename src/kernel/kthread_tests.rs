@@ -1153,3 +1153,167 @@ fn a_user_deadline_is_delivered_while_kernel_threads_keep_running() {
         );
     });
 }
+
+// ── KTHREAD1-ACCEPTANCE §2: device interrupts on a running kernel thread ─────────────────────────
+
+/// Spins until the device interrupt the test raises has been settled, then reaches its scheduling
+/// point: the note left a reschedule pending, so the point yields and the thread resumes after.
+fn device_spinner(ctx: &KThreadCtx, arg: usize) {
+    let seen = unsafe { &*(arg as *const AtomicU32) };
+    let before = ctx.pool().cpu_counters(ctx.home()).device_interrupts;
+    // The "interrupt": settled through the pool's note, as the port bridges do after delivery.
+    ctx.pool().note_device_interrupt(ctx.home());
+    assert_eq!(
+        ctx.pool().cpu_counters(ctx.home()).device_interrupts,
+        before + 1
+    );
+    assert!(
+        ctx.pool().resched_pending(ctx.home()),
+        "the decision is deferred, not taken"
+    );
+    seen.store(1, Ordering::Release);
+    assert_eq!(
+        ctx.sched_point(),
+        Ok(true),
+        "the next scheduling point honours it"
+    );
+    seen.store(2, Ordering::Release);
+}
+
+#[test]
+fn a_settled_device_interrupt_defers_scheduling_to_the_next_point() {
+    let k = kernel();
+    let seen = AtomicU32::new(0);
+    k.kthreads
+        .create(
+            device_spinner,
+            &seen as *const _ as usize,
+            CPU,
+            TaskPriority::Normal,
+        )
+        .expect("create");
+    run_cpu(&k, CPU);
+    assert_eq!(
+        seen.load(Ordering::Acquire),
+        2,
+        "the thread resumed after its point and exited"
+    );
+    assert!(!k.kthreads.resched_pending(CPU));
+    assert_eq!(current(&k, CPU), None);
+}
+
+fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+    let at = src.find(sig).unwrap_or_else(|| panic!("{sig}"));
+    let rest = &src[at..];
+    &rest[..rest.find("\n}\n").map_or(rest.len(), |e| e + 2)]
+}
+
+/// RISC-V: the kernel-thread vector is an entry owner of its own. It reads the claim once, after
+/// authentication, only for a supervisor external interrupt, hands it to the bridge's settlement
+/// (which owns the one completion) and writes no completion itself.
+#[test]
+fn riscv_kernel_thread_external_interrupts_reach_the_claim_and_settlement_owners() {
+    const SRC: &str = include_str!("../arch/riscv64/kthread.rs");
+    let h = fn_body(SRC, "extern \"C\" fn yarm_riscv64_kthread_trap(");
+    assert_eq!(h.matches("claim_external_interrupt_once()").count(), 1);
+    assert_eq!(SRC.matches("claim_external_interrupt_once()").count(), 1);
+    let auth = h
+        .find("pool.authenticate_interrupt(")
+        .expect("authentication");
+    let branch = h
+        .find("} else if code == SUPERVISOR_EXTERNAL {")
+        .expect("external branch");
+    let claim = h.find("claim_external_interrupt_once()").unwrap();
+    let settle = h
+        .find("trap::settle_riscv_external_claim(shared, cpu, claim)")
+        .expect("settle");
+    let note = h
+        .find("pool.note_device_interrupt(cpu)")
+        .expect("deferred decision");
+    assert!(auth < branch && branch < claim && claim < settle && settle < note);
+    for completion in [
+        "complete_external_interrupt_claim",
+        "write_claim_completion",
+        ".complete(",
+    ] {
+        assert!(
+            !SRC.contains(completion),
+            "the vector writes no completion: {completion}"
+        );
+    }
+    // Every other trap on a kernel thread stays fatal.
+    assert!(h.contains(
+        "code != SUPERVISOR_TIMER && code != SUPERVISOR_SOFTWARE && code != SUPERVISOR_EXTERNAL"
+    ));
+    assert!(h.contains("kthread_fatal_halt()"));
+    // And it never switches.
+    for switch in ["yield_now", "sched_point", "switch("] {
+        assert!(!h.contains(switch), "{switch}");
+    }
+}
+
+/// AArch64: a device SPI is delivered through the bridge with the inert single-step completion,
+/// and this vector's tail writes the claim's one EOIR afterwards. Private interrupts other than
+/// the timer and the reschedule SGI stay fatal.
+#[test]
+fn aarch64_kernel_thread_device_interrupts_are_settled_and_completed_once() {
+    const SRC: &str = include_str!("../arch/aarch64/kthread.rs");
+    let h = fn_body(SRC, "extern \"C\" fn yarm_aarch64_kthread_interrupt(");
+    let spi = h
+        .find("} else {\n        // SAFETY: the entry saved SPSR_EL1")
+        .expect("device arm");
+    let dev = &h[spi..];
+    assert_eq!(
+        dev.matches("settle_external_interrupt_at_bridge(").count(),
+        1
+    );
+    assert!(dev.contains("InterruptCompletion::ArchSingleStep { line: intid }"));
+    assert_eq!(
+        dev.matches("complete_interrupt(ack)").count(),
+        1,
+        "one EOIR in the device arm"
+    );
+    let settle = dev.find("settle_external_interrupt_at_bridge(").unwrap();
+    let eoi = dev.find("complete_interrupt(ack)").unwrap();
+    assert!(settle < eoi, "the completion follows the delivery");
+    assert!(dev.contains("pool.note_device_interrupt(cpu)"));
+    assert!(h.contains("} else if intid < FIRST_SPI_INTID {"));
+    assert!(h.contains("KTHREAD_IRQ_UNSUPPORTED"));
+}
+
+/// x86_64: the kernel-thread IDT routes every external line above the timer to the device bridge,
+/// which delivers through the bridge (whose single step is the one LAPIC EOI) and writes no EOI of
+/// its own.
+#[test]
+fn x86_kernel_thread_device_vectors_enter_the_device_bridge() {
+    const SRC: &str = include_str!("../arch/x86_64/kthread.rs");
+    const IDT: &str = include_str!("../arch/x86_64/descriptor_tables.rs");
+    let h = fn_body(SRC, "extern \"C\" fn yarm_x86_64_kthread_device_interrupt(");
+    let auth = h
+        .find("pool.authenticate_interrupt(frame, hardware)")
+        .expect("auth");
+    let settle = h
+        .find("settle_external_interrupt_at_bridge(")
+        .expect("settle");
+    assert!(auth < settle);
+    assert_eq!(h.matches("settle_external_interrupt_at_bridge(").count(), 1);
+    assert!(h.contains("InterruptCompletion::ArchSingleStep { line }"));
+    for eoi in ["external_irq_eoi", "lapic_eoi", "acknowledge_interrupt"] {
+        assert!(!h.contains(eoi), "no second EOI: {eoi}");
+    }
+    assert!(h.contains("pool.note_device_interrupt(cpu)"));
+    let vecs: Vec<usize> = (0x21..0x20 + crate::arch::platform_constants::MAX_IRQ_LINES).collect();
+    let list = vecs
+        .iter()
+        .map(|v| std::string::ToString::to_string(v))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(
+        SRC.matches(&std::format!(".irp v, {list}")).count(),
+        2,
+        "stub per line, and its table"
+    );
+    let load = fn_body(IDT, "pub(crate) fn load_kthread_idt()");
+    assert!(load.contains("yarm_x86_64_kthread_dev_stubs.iter().enumerate()"));
+    assert!(load.contains("KTHREAD_DEVICE_VECTOR_FIRST + i"));
+}

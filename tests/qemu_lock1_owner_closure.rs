@@ -596,13 +596,15 @@ fn the_mailbox_is_consumed_only_by_the_enumerated_consumer() {
         let (efn, ..) = enclosing(kthread, c.at).unwrap();
         assert_eq!(efn, "yarm_riscv64_kthread_trap");
         let body = fn_body(kthread, "extern \"C\" fn yarm_riscv64_kthread_trap(");
-        // Anything but a supervisor timer or software interrupt is fatal first; the consumer is
-        // the non-timer arm, with the kernel-thread origin.
-        assert!(
-            body.contains(
-                "if !is_irq || (code != SUPERVISOR_TIMER && code != SUPERVISOR_SOFTWARE) {"
-            )
-        );
+        // Anything but a supervisor timer, software or (KTHREAD1-ACCEPTANCE §2) external
+        // interrupt is fatal first; the consumer is the last arm, after the timer and external
+        // arms, so only a software interrupt reaches it, with the kernel-thread origin.
+        assert!(body.contains(
+            "if !is_irq\n        || (code != SUPERVISOR_TIMER && code != SUPERVISOR_SOFTWARE && code != SUPERVISOR_EXTERNAL)\n    {"
+        ));
+        let ext = pos_in(body, "} else if code == SUPERVISOR_EXTERNAL {");
+        let take = pos_in(body, "riscv64::ipi::take_arrival(");
+        assert!(ext < take && body[ext..take].contains("} else {"));
         let arm = pos_in(body, "if code == SUPERVISOR_TIMER {");
         let call = pos_in(body, "riscv64::ipi::take_arrival(");
         assert!(arm < call && body[arm..call].contains("} else {"));

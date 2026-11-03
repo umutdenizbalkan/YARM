@@ -41,7 +41,45 @@ pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
 pub(super) const SELECTOR: u32 = 30;
 /// Must equal the kernel's `UART_IRQ_WITNESS_RING_VA` (pinned by a hosted test).
 pub(super) const RING_VA: usize = 0x2800_0000;
+/// KTHREAD1-ACCEPTANCE §2: with `kthread-irq-witness`, four kernel-thread items follow the eight
+/// idle/user items.
+#[cfg(not(feature = "kthread-irq-witness"))]
 const ITEMS: u32 = 8;
+#[cfg(feature = "kthread-irq-witness")]
+const ITEMS: u32 = 12;
+
+/// Which window an item's interrupt must land in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The hart idle: the receiver parks with nothing else runnable.
+    Idle,
+    /// The receiver spinning in user mode with sentinel registers live.
+    User,
+    /// A kernel thread running: the receiver parks, the kernel's witness thread opens the
+    /// device's gate from inside its own register-checked section.
+    Kthread,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Idle => "idle",
+            Mode::User => "user",
+            Mode::Kthread => "kthread",
+        }
+    }
+}
+
+/// Items 1..=8: odd idle, even user. Every later item is a kernel-thread item.
+fn item_mode(seq: u32) -> Mode {
+    if seq <= 8 && seq % 2 == 1 {
+        Mode::Idle
+    } else if seq <= 8 {
+        Mode::User
+    } else {
+        Mode::Kthread
+    }
+}
 const BYTE_BASE: u8 = 0x40;
 /// Park deadline for IDLE items, in scheduler ticks. Long enough that the hart is genuinely idle
 /// when the byte arrives, short enough to bound the wait for the next probe.
@@ -81,6 +119,8 @@ const W_IDLE: usize = 6;
 const W_USER: usize = 7;
 const W_EMPTY: usize = 8;
 const W_LINE: usize = 9;
+#[cfg(feature = "kthread-irq-witness")]
+const W_KTHREAD: usize = 10;
 const RING_MAGIC: u32 = 0x4952_5131;
 const RING_BYTES_OFFSET: usize = 256;
 
@@ -811,8 +851,13 @@ pub(super) fn run_once() {
     let (mut received, mut exact_once, mut label_ok, mut data_ok) = (0u32, 0u32, 0u32, 0u32);
     let (mut idle_items, mut user_items, mut regs_bad, mut dup, mut errors) =
         (0u32, 0u32, 0u32, 0u32, 0u32);
+    #[allow(unused_mut)]
+    let mut kthread_items = 0u32;
     for seq in 1..=ITEMS {
-        let idle = seq % 2 == 1;
+        let mode = item_mode(seq);
+        let idle = mode == Mode::Idle;
+        // Idle and kernel-thread items both wait parked; only idle items measure SIMD.
+        let parks = mode != Mode::User;
         let expect = BYTE_BASE + seq as u8;
         let mut rounds = 0u32;
         let mut bad_mask = 0u32;
@@ -820,10 +865,11 @@ pub(super) fn run_once() {
         // elsewhere). Observational — it names the resume path's FP/SIMD loss, it is not graded.
         #[allow(unused_mut)]
         let mut idle_simd_mask = 0u32;
-        if idle {
+        if parks {
             yarm_user_rt::user_log!(
-                "IRQ1_UART_READY seq={} mode=idle expect=0x{:02x}",
+                "IRQ1_UART_READY seq={} mode={} expect=0x{:02x}",
                 seq,
+                mode.name(),
                 expect
             );
         } else {
@@ -848,16 +894,18 @@ pub(super) fn run_once() {
         }
         let got = loop {
             rounds += 1;
-            if idle {
+            if parks {
                 if rounds > MAX_IDLE_ROUNDS {
                     break None;
                 }
                 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-                let parked = {
+                let parked = if idle {
                     let seed = 0x5EED_0000_0000u64 | ((seq as u64) << 16) | rounds as u64;
                     let (r, m) = park_measuring_simd(park, IDLE_PARK_TICKS, seed);
                     idle_simd_mask |= m;
                     r
+                } else {
+                    recv_timeout(park, IDLE_PARK_TICKS)
                 };
                 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 let parked = recv_timeout(park, IDLE_PARK_TICKS);
@@ -909,6 +957,8 @@ pub(super) fn run_once() {
         }
         if idle {
             idle_items += 1;
+        } else if mode == Mode::Kthread {
+            kthread_items += 1;
         } else {
             user_items += 1;
             // Bits 0..15 are graded (GPRs, flags, and AArch64's saved-and-restored SIMD); bits 16+
@@ -920,7 +970,7 @@ pub(super) fn run_once() {
         yarm_user_rt::user_log!(
             "IRQ1_UART_RECV seq={} mode={} label={} payload_len={} once={} byte=0x{:02x} bytes={} data_ok={} rounds={} regs_mask=0x{:x} claims={} completions={} idle_resume_simd_mask=0x{:x}",
             seq,
-            if idle { "idle" } else { "user" },
+            mode.name(),
             label,
             payload_len,
             once as u8,
@@ -939,7 +989,7 @@ pub(super) fn run_once() {
         yarm_user_rt::user_log!(
             "IRQ1_UART_SIMD seq={} mode={} user_simd_mask=0x{:x} idle_resume_simd_mask=0x{:x}",
             seq,
-            if idle { "idle" } else { "user" },
+            mode.name(),
             bad_mask >> 16,
             idle_simd_mask
         );
@@ -992,6 +1042,23 @@ pub(super) fn run_once() {
         && post_timeouts == POST_ROUNDS
         && post_quiet
         && isolated;
+    // KTHREAD1-ACCEPTANCE §2: the kernel-thread items, on a line of their own.
+    #[cfg(feature = "kthread-irq-witness")]
+    let all = all && kthread_items == ITEMS - 8;
+    #[cfg(feature = "kthread-irq-witness")]
+    yarm_user_rt::user_log!(
+        "IRQ1_UART_KTHREAD_ITEMS items={} kthread_items={} kthread_origin={} result={}",
+        ITEMS - 8,
+        kthread_items,
+        ring_word(W_KTHREAD),
+        if kthread_items == ITEMS - 8 {
+            "ok"
+        } else {
+            "fail"
+        }
+    );
+    #[cfg(not(feature = "kthread-irq-witness"))]
+    let _ = kthread_items;
     RESULT.store(u32::from(all), Relaxed);
     yarm_user_rt::user_log!(
         "IRQ1_UART_WITNESS_COUNTS claims={} completions={} empty_drains={} idle_origin={} user_origin={} disabled={} post_rounds={} post_timeouts={} post_notifications={} post_quiet={}",
