@@ -98,6 +98,8 @@
     .set M_T_DONE, 0x050
     .set M_W_STARTED, 0x058
     .set M_CLOCK, 0x060
+    /* The CPUs a spinner has started on, as the kernel observed each W_START. */
+    .set M_W_CPUS, 0x068
     /* KTHREAD1-ACCEPTANCE §5: 1 when the kernel-thread witness is built in (kernel-published at
        provisioning); the director publishes S1_STOP at the end of its run. */
     .set M_S1, 0x070
@@ -112,11 +114,13 @@
     .set B_IPC, 0x900
     .set B_PRESNAP, 0xE00
 
-    /* Worker-stack slot bases: deadline 1..7, spinners 8..23, sleepers 25..31, IPC 33..39. */
+    /* Worker-stack slot bases: deadline 1..7, spinners 8..31 (2N + 2 placed, topped up to cover
+       every CPU, as on AArch64), sleepers 33..39, IPC 41..47 (the kernel maps 48 slots). */
     .set D_SLOT0, 0
     .set SPIN_SLOT0, 8
-    .set SLEEP_SLOT0, 24
-    .set IPC_SLOT0, 32
+    .set SPIN_SLOTS, 24
+    .set SLEEP_SLOT0, 32
+    .set IPC_SLOT0, 40
 
     .set GATE_D, 1
     .set GATE_S, 2
@@ -339,7 +343,7 @@ p_ready:
 p_w:
     li t0, MBX
     ld t1, M_W_STARTED(t0)
-    beq t1, s2, p_w_ok
+    beq t1, s2, p_w_cover
     YIELD
     WAIT_NEXT p_w
     /* Not every spinner ran by the deadline: say so, then grade the preemptions from zero (the
@@ -357,7 +361,30 @@ p_w:
     li t2, 8
     bne t4, t2, 1b
     j p_pre_begin
+    /* KTHREAD-CLOSURE1 §A (ported from the AArch64 program): ordinary placement balances by load,
+       so where 2N + 2 spinners land depends on what else is runnable (measured on 8 harts: none on
+       CPU 0, three each on CPUs 6 and 7, and phase A could never meet CPU 0's minimum). Until a
+       spinner has STARTED on CPU 0 and on every expected secondary, as the kernel observed it
+       (M_W_CPUS), place one more through the same placement, up to the spinner slots and under the
+       same deadline. The grader counts the top-up from P_W_COVER (v0 placed, v1 CPUs covered). */
+p_w_cover:
+    li t0, MBX
+    ld t1, M_W_CPUS(t0)
+    ori t2, s11, 1
+    and t3, t2, t1
+    beq t3, t2, p_w_ok
+    li t3, SPIN_SLOTS
+    bgeu s2, t3, p_w_ok
+    addi t3, s2, SPIN_SLOT0
+    SPAWNR t3, w_spin
+    beqz a0, p_spawn_fail
+    addi s2, s2, 1
+    j p_w
 p_w_ok:
+    mv a2, s2
+    li t0, MBX
+    ld a3, M_W_CPUS(t0)
+    LOG m_p_w_cover
     li t0, MBX
     li t1, (BUF + B_PRESNAP)
     li t4, 0
@@ -1014,6 +1041,7 @@ yarm_apsw_cap_ep_d: .word 0x63636363
     STR m_p_ap, "APS P_AP_READY"
     STR m_p_pre_timeout, "APS P_PRE_TIMEOUT"
     STR m_p_w_timeout, "APS P_W_TIMEOUT"
+    STR m_p_w_cover, "APS P_W_COVER"
     STR m_p_a_done, "APS P_A_DONE"
     STR m_p_b_timeout, "APS P_B_TIMEOUT"
     STR m_p_wake, "APS P_WAKE"

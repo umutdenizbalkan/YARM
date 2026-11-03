@@ -64,8 +64,8 @@ const M_IDLE: u64 = 0x140;
 /// CPU 0's timer interrupts — the global tick's source — that P's bounded waits measure their
 /// deadlines against. CPU 0's timer is never the one a control breaks.
 const M_CLOCK: u64 = 0x060;
-/// The CPUs a spinner has started on, as the kernel observed each `W_START` (AArch64 P tops its
-/// spinners up from it; the RISC-V program does not read it).
+/// The CPUs a spinner has started on, as the kernel observed each `W_START` (the AArch64 and
+/// RISC-V programs' P tops its spinners up from it).
 const M_W_CPUS: u64 = 0x068;
 /// KTHREAD1-ACCEPTANCE §5: 1 when the kernel-thread witness is built in. With one CPU, P then stays
 /// active through the kernel-thread phase (its S1 rounds) instead of ending at `P_NO_AP`.
