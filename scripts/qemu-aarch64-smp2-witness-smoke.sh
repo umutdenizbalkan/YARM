@@ -435,8 +435,14 @@ print("[smp2-witness] kernel: " + counts + " | " + verdict)
 # reported, not graded — overlap is graded from the operations' own records above.
 print("[smp2-witness] " + dump.get("SMP2_SYNC", "SMP2_SYNC missing"))
 print("[smp2-witness] " + dump.get("SMP2_SYNC_P2", "SMP2_SYNC_P2 missing"))
+# Coverage, stated (never a silent failure): every TLB round valid or void (each direction's valid
+# round is required above), and every other phase complete.
+for what, got, want in (("P1 parked rounds", parked_n, 8), ("P2 EL0 arrivals", el0, 2),
+                        ("TLB rounds (valid + void)", tlb + tlb_void, 4), ("mutual rounds", mutual, 4),
+                        ("overlapped mutual rounds", overlapped, 4)):
+    if got != want: fail("coverage: %s %d, want %d" % (what, got, want))
 for f in fails: print("[smp2-witness][fail] " + f)
-ok = not fails and parked_n == 8 and el0 == 2 and tlb == 4 and mutual == 4 and overlapped == 4
+ok = not fails
 print("SMP2_WITNESS_SEAL %s result=%s" % (summary, "ok" if ok else "fail"))
 sys.exit(0 if ok else 1)
 PY
