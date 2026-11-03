@@ -67,6 +67,13 @@ const M_CLOCK: u64 = 0x060;
 /// The CPUs a spinner has started on, as the kernel observed each `W_START` (AArch64 P tops its
 /// spinners up from it; the RISC-V program does not read it).
 const M_W_CPUS: u64 = 0x068;
+/// KTHREAD1-ACCEPTANCE §5: 1 when the kernel-thread witness is built in. With one CPU, P then stays
+/// active through the kernel-thread phase (its S1 rounds) instead of ending at `P_NO_AP`.
+#[cfg(feature = "kthread1-witness")]
+const M_S1: u64 = 0x070;
+/// Published by the kernel-thread witness's director at the end of its run: P's S1 rounds stop.
+#[cfg(feature = "kthread1-witness")]
+const M_S1_STOP: u64 = 0x078;
 static W_CPUS: AtomicU64 = AtomicU64::new(0);
 /// The CPUs the mailbox has per-CPU words for (the 8-slot handoff table's maximum).
 const MBX_CPUS: usize = 8;
@@ -248,6 +255,8 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
 
     ASID.store(u64::from(asid.0), Ordering::Release);
     MBX_PHYS.store(mbx, Ordering::Release);
+    #[cfg(feature = "kthread1-witness")]
+    publish(M_S1, 1);
     ENABLED.store(true, Ordering::Release);
     kernel.enqueue_task(P_TID)?;
     crate::kernel::printk::printk_emit_sync(format_args!(
@@ -525,6 +534,10 @@ fn task_preemptions(tid: u64) -> u64 {
 /// `cpu` arrived at its idle wait from a task (not a return to an interrupted idle).
 /// Secondaries only: CPU 0 also runs the core services, whose idle arrivals are not this witness's.
 pub fn note_idle_reached(cpu: usize) {
+    // KTHREAD1-ACCEPTANCE §5: every CPU's idle arrivals, CPU 0's included, for the kernel-thread
+    // witness's "the CPU never had to idle" evidence (observation only).
+    #[cfg(feature = "kthread1-witness")]
+    crate::kernel::kthread_witness::note_idle_arrival(cpu);
     if !enabled() || cpu == 0 || cpu >= MBX_CPUS {
         return;
     }
@@ -776,6 +789,13 @@ pub fn observe_user_marker(
             }
             return true;
         }
+        // KTHREAD1-ACCEPTANCE §5: P's single-CPU rounds beside the kernel threads, recorded by the
+        // kernel-thread witness (this marker is a user-origin entry, authenticated as P's).
+        "S1_WORK" | "S1_ARM" | "S1_TIMEOUT" | "S1_END" => {
+            #[cfg(feature = "kthread1-witness")]
+            crate::kernel::kthread_witness::note_user_step(shared, cpu, tid, asid, step, a2, a3);
+            return true;
+        }
         _ => {}
     }
     record(K_USER, c, tid, step_code(step), [a2, a3, asid, 0, 0]);
@@ -785,6 +805,18 @@ pub fn observe_user_marker(
         dump();
     }
     true
+}
+
+/// KTHREAD1-ACCEPTANCE §5: the kernel-thread witness's director ends P's single-CPU rounds.
+#[cfg(feature = "kthread1-witness")]
+pub(crate) fn publish_s1_stop() {
+    publish(M_S1_STOP, 1);
+}
+
+/// P's identity, for the kernel-thread witness's user records.
+#[cfg(feature = "kthread1-witness")]
+pub(crate) fn p_asid() -> u64 {
+    ASID.load(Ordering::Acquire)
 }
 
 /// WITNESS REAPER — the churn child's reap, through the production NR 31 transaction on the CPU

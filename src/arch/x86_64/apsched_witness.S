@@ -67,6 +67,11 @@
     .set M_W_STARTED, 0x058
     .set M_CLOCK, 0x060
     .set M_W_CPUS, 0x068
+    /* KTHREAD1-ACCEPTANCE §5: 1 when the kernel-thread witness is built in (kernel-published at
+       provisioning); the director publishes S1_STOP at the end of its run. */
+    .set M_S1, 0x070
+    .set M_S1_STOP, 0x078
+    .set B_S1, 0xF80
     .set M_PRE, 0x100
     .set M_IDLE, 0x140
     .set M_F, 0x180
@@ -100,6 +105,12 @@
     .set IPC_ROUNDS, 4
     .set FORK_ROUNDS, 4
     .set CHILD_SPIN, 30000000
+    /* S1: the checked value of round k is k * S1_MUL ^ S1_SALT (the kernel recomputes it). One
+       global tick (0.8 s here) per deadline. */
+    .set S1_MUL, 0x9E3779B97F4A7C15
+    .set S1_SALT, 0x5151000000005151
+    .set S1_DEADLINE, 1
+    .set S1_ROUNDS, 600
 
     .set WAIT_YIELDS, 400000
     .set WAIT_TICKS, 150
@@ -298,7 +309,11 @@ p_ap:
     mov rdx, qword ptr [MBX + M_EXPECTED]
     mov r10, qword ptr [MBX + M_AP_READY]
     LOG m_p_no_ap
-    jmp p_end
+    /* KTHREAD1-ACCEPTANCE §5: one CPU and the kernel-thread witness built in — stay active
+       through the kernel-thread phase (S1) instead of ending. */
+    cmp qword ptr [MBX + M_S1], 0
+    je p_end
+    jmp p_s1
 p_ready:
     mov r12, qword ptr [MBX + M_EXPECTED]
     /* r13 = the number of bits in r12 (no POPCNT: the qemu64 model lacks it). */
@@ -711,6 +726,51 @@ c_child:
     LOG m_c_run
     EXIT
 
+/* ── S1: one CPU, beside the kernel threads ──────────────────────────────────────────────────
+   Each round: a checked user action (store k*S1_MUL^S1_SALT, read it back, report the value the
+   load returned), then a receive with a real deadline on endpoint D, which nobody sends to, and
+   its result (the error lane when set, else the result). Ends when the director publishes
+   S1_STOP, or after S1_ROUNDS. rbx = k. */
+p_s1:
+    xor ebx, ebx
+s1_round:
+    inc rbx
+    cmp qword ptr [MBX + M_S1_STOP], 0
+    jne s1_done
+    cmp rbx, S1_ROUNDS
+    ja s1_done
+    movabs r14, S1_MUL
+    imul r14, rbx
+    movabs rax, S1_SALT
+    xor r14, rax
+    mov qword ptr [BUF + B_S1], r14
+    mfence
+    mov r10, qword ptr [BUF + B_S1]
+    mov rdx, rbx
+    LOG m_s1_work
+    mov rdx, rbx
+    mov r10d, S1_DEADLINE
+    LOG m_s1_arm
+    mov edi, dword ptr [rip + yarm_apsw_cap_ep_d]
+    mov esi, (BUF + 0x300)
+    mov edx, 16
+    mov r10d, S1_DEADLINE
+    xor r8d, r8d
+    xor r9d, r9d
+    SYS NR_RECV_TO
+    mov r10, rcx
+    test rcx, rcx
+    jnz 1f
+    mov r10, rax
+1:  mov rdx, rbx
+    LOG m_s1_timeout
+    jmp s1_round
+s1_done:
+    mov rdx, rbx
+    xor r10d, r10d
+    LOG m_s1_end
+    jmp p_end
+
 /* ═══════════════════════════════════ workers ══════════════════════════════════════════════ */
 /* A deadline receive on an endpoint nobody sends to, after the spawn gate. */
 w_deadline:
@@ -1039,6 +1099,10 @@ yarm_apsw_cap_ep_n: .long 0x64646464
 
     STR m_p_start, "APS P_START"
     STR m_p_no_ap, "APS P_NO_AP"
+    STR m_s1_work, "APS S1_WORK"
+    STR m_s1_arm, "APS S1_ARM"
+    STR m_s1_timeout, "APS S1_TIMEOUT"
+    STR m_s1_end, "APS S1_END"
     STR m_p_ap, "APS P_AP_READY"
     STR m_p_pre_timeout, "APS P_PRE_TIMEOUT"
     STR m_p_w_timeout, "APS P_W_TIMEOUT"

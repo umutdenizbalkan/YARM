@@ -673,6 +673,10 @@ impl KThreadPool {
             .with_cpu_sched_split(cpu, |c| {
                 c.enqueue_with_priority(id.tid(), priority).map(|()| {
                     s.state.store(READY, Ordering::Release);
+        // KTHREAD1-ACCEPTANCE §4 witness (default-off): the creation is recorded before the
+        // enqueue below, so nothing about this incarnation can be recorded before it.
+        #[cfg(feature = "kthread1-witness")]
+        crate::kernel::kthread_witness::note_create(id, cpu, low, high);
                 })
             })
             .and_then(|r| r);

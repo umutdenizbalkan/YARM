@@ -52,12 +52,230 @@ import re
 import sys
 
 KINDS = {"pop", "create", "run", "irq", "switch", "dispatch", "wake", "woken", "resched", "probe",
-         "reclaim", "exhaust", "user", "final", "yield", "blip", "wakereq", "decide"}
+         "reclaim", "exhaust", "user", "final", "yield", "blip", "wakereq", "decide", "director",
+         "uwork", "uarm", "utimeout"}
 R_DIRECTOR, R_ALT, R_SLEEPER, R_WAKER, R_BLIP, R_LOSTWAKE, R_HOLDER = 1, 2, 3, 4, 5, 6, 7
 P_MASKED, P_IRQ_GUARD, P_STALE_WAKE, P_LOST_WAKE = 1, 2, 3, 4
 TOKEN = 0x4B541000
 SW_YIELD, SW_BLOCK, SW_EXIT = 1, 2, 3
 KID_TAG = 0x4B54 << 48
+
+# KTHREAD1-ACCEPTANCE §4 — the contract the run must declare, anchored here (src/kernel/kthread.rs
+# KTHREAD_CAPACITY / KTHREAD_STACK_BYTES, src/kernel/kthread_witness.rs ROUNDS / CYCLES). Required
+# populations derive from these and from the create records, never from what a run reports alone.
+CAPACITY, STACK_BYTES, ROUNDS_REQ, CYCLES = 32, 16384, 5, 6
+# P, the one-CPU user workload (src/kernel/apsched_witness.rs P_TID; its S1 rounds in
+# src/arch/<isa>/apsched_witness.S): round k stores k * S1_MUL ^ S1_SALT and reports what it reads
+# back; a receive with a real deadline must end TimedOut (9, the receive ABI's error code).
+P_TID, S1_MUL, S1_SALT, TIMED_OUT = 9600, 0x9E3779B97F4A7C15, 0x5151000000005151, 9
+USER_KINDS = {"uwork", "uarm", "utimeout"}
+# Records a thread writes about itself: each must fall inside one of its own running intervals.
+IN_THREAD = {"run", "yield", "decide", "resched", "blip", "woken", "irq"}
+# Records only the director writes, on its own CPU.
+DIRECTOR_ONLY = {"exhaust", "final", "user"}
+
+
+def kid_ok(kid):
+    return kid & (0xFFFF << 48) == KID_TAG and (kid & 0xFFFF) < CAPACITY and (kid >> 16) & 0xFFFFFFFF != 0
+
+
+def kslot(kid):
+    return kid & 0xFFFF
+
+
+def kgen(kid):
+    return (kid >> 16) & 0xFFFFFFFF
+
+
+def replay(recs):
+    """VALIDITY, part 2: replay every lifecycle event in sequence order.
+
+    What each event is evidence of (see the producers in src/kernel/kthread.rs and
+    src/kernel/kthread_witness.rs):
+      create   the incarnation exists, with this role, home and stack; written inside
+               `KThreadPool::create` BEFORE the incarnation is enqueued, so nothing about it can
+               precede this record;
+      dispatch it entered execution on its home CPU (residency set, state Running); written
+               immediately before the switch into it;
+      switch   it left the CPU and the dispatcher cleared residency (f2 must be 0): reason 1 yield,
+               2 block, 3 exit;
+      reclaim  its slot returned to the free list, after an exit switch; written before the slot is
+               published, so no reuse can precede it;
+      in-thread records (run, yield, decide, resched, blip, woken, irq, the lost-wake probe) are
+               written by the thread, or by an interrupt it took, while it runs;
+      final    the director's observation at the end. A final saying "gone" is an observation, not
+               the reclaim itself: it may precede the reclaim record (the slot is Free before the
+               record is written), but never the exit switch.
+    The director is the one thread with no create record: it declares itself (`director`, record
+    1) and is exempt from the interval checks by that identity alone. Returns (impossible,
+    incomplete): events a correct producer cannot emit, and obligations the set does not discharge.
+    """
+    bad, incomplete = [], []
+    pops = [r for r in recs if r.kind == "pop"]
+    dirs = [r for r in recs if r.kind == "director"]
+    if len(pops) != 1 or pops[0].seq != 0:
+        return ["population_not_declared_first"], []
+    if len(dirs) != 1 or dirs[0].seq != 1:
+        return ["director_not_declared"], []
+    pop, d = pops[0], dirs[0]
+    if (pop.f[2], pop.f[3], pop.f[4]) != (CAPACITY, STACK_BYTES, ROUNDS_REQ):
+        bad.append("contract_mismatch capacity=%d stack=%d rounds=%d" % (pop.f[2], pop.f[3], pop.f[4]))
+    cpus = {c for c in range(8) if pop.f[0] & (1 << c)}
+    dkid, dhome, dlow, dhigh = d.f[0], d.f[1], d.f[2], d.f[3]
+    if not kid_ok(dkid) or d.cpu != dhome or dhigh - dlow != STACK_BYTES:
+        bad.append("director_identity kid=0x%x" % dkid)
+    base = dlow - kslot(dkid) * STACK_BYTES
+    th = {}
+    holder_of = {kslot(dkid): dkid}
+    waker = None
+    exhaust = None
+    for r in recs:
+        k, kid = r.kind, r.f[0]
+        if k in ("pop", "director"):
+            continue
+        if k == "create":
+            role, home, low, high = r.f[1], r.f[2], r.f[3], r.f[4]
+            if r.cpu != dhome:
+                bad.append("create_not_by_director seq=%d" % r.seq)
+            if not kid_ok(kid):
+                bad.append("create_identity seq=%d kid=0x%x" % (r.seq, kid))
+                continue
+            if kid in th:
+                bad.append("create_duplicate kid=0x%x" % kid)
+                continue
+            if home not in cpus:
+                bad.append("create_home_outside_population kid=0x%x home=%d" % (kid, home))
+            if high - low != STACK_BYTES or low - kslot(kid) * STACK_BYTES != base:
+                bad.append("create_stack_not_the_slots kid=0x%x" % kid)
+            prev = holder_of.get(kslot(kid))
+            if prev == dkid:
+                bad.append("create_in_director_slot kid=0x%x" % kid)
+            elif prev is not None:
+                if th[prev]["state"] != "reclaimed":
+                    bad.append("slot_reused_before_reclaim slot=%d kid=0x%x" % (kslot(kid), kid))
+                elif kgen(kid) <= kgen(prev):
+                    bad.append("reuse_generation_not_newer slot=%d" % kslot(kid))
+            holder_of[kslot(kid)] = kid
+            th[kid] = dict(role=role, home=home, state="created", finals=[], runs=0)
+            if role == R_WAKER:
+                waker = kid
+            continue
+        if k in ("dispatch", "switch", "reclaim"):
+            t = th.get(kid)
+            if t is None:
+                bad.append("%s_unknown_thread seq=%d kid=0x%x" % (k, r.seq, kid))
+                continue
+            if r.cpu != t["home"]:
+                bad.append("%s_off_home seq=%d kid=0x%x cpu=%d" % (k, r.seq, kid, r.cpu))
+            role_field = {"dispatch": r.f[1], "switch": r.f[3], "reclaim": r.f[4]}[k]
+            if role_field != t["role"]:
+                bad.append("role_changed seq=%d kid=0x%x" % (r.seq, kid))
+            if k == "dispatch":
+                if t["state"] not in ("created", "off"):
+                    bad.append("dispatch_while_%s seq=%d kid=0x%x" % (t["state"], r.seq, kid))
+                    continue
+                t["state"], t["runs"] = "running", t["runs"] + 1
+            elif k == "switch":
+                if t["state"] != "running":
+                    bad.append("switch_while_%s seq=%d kid=0x%x" % (t["state"], r.seq, kid))
+                    continue
+                if r.f[2] != 0:
+                    bad.append("switched_out_while_resident seq=%d kid=0x%x" % (r.seq, kid))
+                if r.f[1] not in (SW_YIELD, SW_BLOCK, SW_EXIT):
+                    bad.append("switch_reason seq=%d" % r.seq)
+                t["state"] = "exited" if r.f[1] == SW_EXIT else "off"
+            else:
+                if t["state"] != "exited":
+                    bad.append("reclaimed_before_switch_away seq=%d kid=0x%x state=%s" % (r.seq, kid, t["state"]))
+                    continue
+                if (r.f[1], r.f[2]) != (kslot(kid), kgen(kid)):
+                    bad.append("reclaim_identity kid=0x%x" % kid)
+                t["state"] = "reclaimed"
+            continue
+        if k in IN_THREAD or (k == "probe" and r.f[1] == P_LOST_WAKE):
+            t = th.get(kid)
+            if t is None:
+                bad.append("%s_unknown_thread seq=%d kid=0x%x" % (k, r.seq, kid))
+            elif t["state"] != "running" or r.cpu != t["home"]:
+                bad.append("%s_outside_running_interval seq=%d kid=0x%x state=%s cpu=%d"
+                           % (k, r.seq, kid, t["state"], r.cpu))
+            elif k == "blip" and (r.f[1], r.f[2]) != (kslot(kid), kgen(kid)):
+                bad.append("blip_identity kid=0x%x" % kid)
+            continue
+        if k == "probe":
+            if r.cpu != dhome:
+                bad.append("probe_not_by_director seq=%d" % r.seq)
+            if r.f[1] in (P_MASKED, P_IRQ_GUARD):
+                if kid != dkid:
+                    bad.append("probe_not_by_director seq=%d" % r.seq)
+            elif r.f[1] == P_STALE_WAKE:
+                if kid not in th or th[kid]["state"] != "reclaimed":
+                    bad.append("stale_probe_names_a_live_or_unknown_thread kid=0x%x" % kid)
+            else:
+                bad.append("probe_kind seq=%d" % r.seq)
+            continue
+        if k in ("wakereq", "wake"):
+            by_waker = waker is not None and r.cpu == th[waker]["home"] and th[waker]["state"] == "running"
+            if r.cpu != dhome and not by_waker:
+                bad.append("%s_issuer_not_running seq=%d cpu=%d" % (k, r.seq, r.cpu))
+            if kid not in th or th[kid]["role"] != R_SLEEPER:
+                bad.append("%s_subject_not_a_sleeper seq=%d" % (k, r.seq))
+            continue
+        if k in USER_KINDS:
+            # A user-origin entry the trap path authenticated as P's, on a CPU of the population.
+            if kid != P_TID or r.cpu not in cpus:
+                bad.append("user_record_identity seq=%d tid=%d cpu=%d" % (r.seq, kid, r.cpu))
+            continue
+        if k in DIRECTOR_ONLY:
+            if r.cpu != dhome:
+                bad.append("%s_not_by_director seq=%d" % (k, r.seq))
+            if k == "final":
+                t = th.get(kid)
+                if t is None:
+                    bad.append("final_unknown_thread kid=0x%x" % kid)
+                    continue
+                if r.f[1] == 0 and t["state"] not in ("exited", "reclaimed"):
+                    bad.append("final_gone_while_%s kid=0x%x" % (t["state"], kid))
+                if r.f[2] != t["role"]:
+                    bad.append("role_changed seq=%d kid=0x%x" % (r.seq, kid))
+                t["finals"].append(r)
+            elif k == "exhaust":
+                exhaust = r
+            continue
+        bad.append("unexpected_record seq=%d kind=%s" % (r.seq, k))
+    for kid, t in th.items():
+        if len(t["finals"]) > 1:
+            bad.append("final_duplicate kid=0x%x" % kid)
+    # Completeness: every created thread ran, exited, was reclaimed, and has its one final state.
+    for kid, t in th.items():
+        if len(t["finals"]) == 0:
+            incomplete.append("final_missing kid=0x%x role=%d" % (kid, t["role"]))
+        elif t["finals"][0].f[1] != 0:
+            incomplete.append("thread_left_behind kid=0x%x state=%d role=%d"
+                              % (kid, t["finals"][0].f[1], t["role"]))
+        elif t["state"] != "reclaimed":
+            incomplete.append("not_reclaimed kid=0x%x state=%s" % (kid, t["state"]))
+        if t["runs"] == 0 and len(t["finals"]) == 1 and t["finals"][0].f[1] == 0:
+            incomplete.append("never_dispatched kid=0x%x" % kid)
+    # Populations, from the create records and the anchored contract.
+    def count(role, home=None):
+        return sum(1 for t in th.values() if t["role"] == role and (home is None or t["home"] == home))
+    # (The per-CPU alternator/sleeper population is graded from the same create records below,
+    # by `creation_population`.)
+    if count(R_WAKER) != (1 if len(cpus) > 1 else 0):
+        incomplete.append("waker_population %d" % count(R_WAKER))
+    if count(R_LOSTWAKE) != 1:
+        incomplete.append("lost_wake_population %d" % count(R_LOSTWAKE))
+    if count(R_BLIP) != CYCLES + 1:
+        incomplete.append("cycle_population %d" % count(R_BLIP))
+    if exhaust is None or count(R_HOLDER) != exhaust.f[0]:
+        incomplete.append("holder_population created=%d declared=%s"
+                          % (count(R_HOLDER), exhaust.f[0] if exhaust else "missing"))
+    known = {R_ALT, R_SLEEPER, R_WAKER, R_BLIP, R_LOSTWAKE, R_HOLDER}
+    for kid, t in th.items():
+        if t["role"] not in known:
+            bad.append("unknown_role kid=0x%x role=%d" % (kid, t["role"]))
+    return bad, incomplete
 
 REC = re.compile(r"(KT1_REC seq=(\d+) kind=(\w+) cpu=(\d+) f0=0x([0-9a-f]+) f1=0x([0-9a-f]+) "
                  r"f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+)) crc=0x([0-9a-f]{8})")
@@ -131,13 +349,70 @@ def validate(by_seq, seals, problems, damaged=0):
     return fails
 
 
+def single_cpu_coexistence(recs):
+    """P's checked work interleaved with kernel-thread execution, and a real deadline delivered
+    while the kernel threads keep running. Every record here is a user-origin entry the trap path
+    authenticated as P's (the replay checked its identity)."""
+    out = []
+    work = [r for r in recs if r.kind == "uwork"]
+    kt = [r.seq for r in recs if r.kind in ("dispatch", "run")]
+    good = [r for r in work if r.f[2] == (r.f[1] * S1_MUL ^ S1_SALT) & 0xFFFFFFFFFFFFFFFF]
+    if len(good) != len(work):
+        out.append("user_work_value_wrong rounds=%s" % [r.f[1] for r in work if r not in good][:4])
+    rounds = [r.f[1] for r in work]
+    if not rounds:
+        out.append("user_work_missing")
+    elif rounds != list(range(rounds[0], rounds[0] + len(rounds))):
+        out.append("user_rounds_not_consecutive")
+    # Interleaving: kernel-thread execution, then P's work, then kernel-thread execution again —
+    # at least twice over.
+    turns, after_kt = 0, False
+    for r in recs:
+        if r.kind in ("dispatch", "run"):
+            after_kt = True
+        elif r.kind == "uwork" and after_kt:
+            # P's work after kernel-thread execution, with kernel-thread execution after it.
+            if any(s > r.seq for s in kt):
+                turns += 1
+            after_kt = False
+    if turns < 2:
+        out.append("user_and_kernel_threads_not_interleaved turns=%d" % turns)
+    # Timeout service: armed, then kernel threads ran, then TimedOut with the deadline elapsed and
+    # no idle arrival in between, then kernel threads still running and P's next round.
+    arms = {r.f[1]: r for r in recs if r.kind == "uarm"}
+    outs = [r for r in recs if r.kind == "utimeout"]
+    for r in outs:
+        if r.f[2] != TIMED_OUT:
+            out.append("user_deadline_result round=%d result=%d" % (r.f[1], r.f[2]))
+    delivered = 0
+    for t in outs:
+        a = arms.get(t.f[1])
+        if a is None or a.seq > t.seq or t.f[2] != TIMED_OUT:
+            continue
+        between = sum(1 for s in kt if a.seq < s < t.seq)
+        later = any(s > t.seq for s in kt)
+        no_idle = a.f[4] == t.f[4]
+        elapsed = t.f[3] - a.f[3] >= a.f[2]
+        nxt = any(w.f[1] == t.f[1] + 1 and w.seq > t.seq for w in work)
+        if between >= 2 and later and no_idle and elapsed and nxt:
+            delivered += 1
+    if not outs:
+        out.append("user_deadline_never_delivered")
+    elif delivered == 0:
+        out.append("user_deadline_not_delivered_while_kernel_threads_ran")
+    return out
+
+
 def grade(text, expect_cpus):
     by_seq, seals, problems, _ = parse(text)
     fails = validate(by_seq, seals, problems)
     if fails:
         return ["invalid " + f for f in fails]
     recs = [by_seq[s] for s in sorted(by_seq)]
-    out = []
+    impossible, incomplete = replay(recs)
+    if impossible:
+        return ["invalid lifecycle_" + f for f in impossible]
+    out = list(incomplete)
 
     def fail(msg):
         out.append(msg)
@@ -303,13 +578,15 @@ def grade(text, expect_cpus):
     # task need be runnable during the kernel-thread phase: there, user progress is reported only.
     users = {r.f[0]: r for r in of("user")}
     for c in cpus:
-        if len(cpus) == 1:
-            print("[info] user_progress cpu=%d dispatches=%d (reported, not required with one CPU)"
-                  % (c, users[c].f[1] if c in users else 0))
-        elif c not in users or users[c].f[1] == 0:
+        if len(cpus) > 1 and (c not in users or users[c].f[1] == 0):
             fail("no_user_progress cpu=%d" % c)
         if c in users and users[c].f[2] == 0:
             fail("no_kernel_thread_dispatch cpu=%d" % c)
+
+    # KTHREAD1-ACCEPTANCE §5 — one CPU: P and the kernel threads in the same measured phase.
+    if len(cpus) == 1:
+        for f_ in single_cpu_coexistence(recs):
+            fail(f_)
 
     # Probes.
     probes = {}
@@ -391,7 +668,8 @@ def self_test():
     damaged = line.replace("kind=", "3kind=")                              # a stray console byte
     assert validate(*parse(damaged + "\n" + good)) == []                   # the other copy is intact
     assert validate(*parse(damaged + "\n" + good.replace(line, damaged))) != []
-    assert grade(good, 2)[0].startswith("population_mismatch")
+    # A one-record set is valid transport but declares no director: the replay refuses it.
+    assert grade(good, 2) == ["invalid lifecycle_director_not_declared"], grade(good, 2)
     print("KT1_GRADER_SELF_TEST result=pass")
 
 

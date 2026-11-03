@@ -123,8 +123,11 @@ fn grade(text: &str, cpus: u32, tag: &str) -> (i32, String) {
     std::fs::create_dir_all(&dir).unwrap();
     let file: PathBuf = dir.join("boot.log");
     std::fs::write(&file, text).unwrap();
+    // `KT1_GRADER` substitutes another copy of the grader (the undo controls run each case
+    // against a grader with one repair removed).
+    let grader = std::env::var("KT1_GRADER").unwrap_or_else(|_| GRADER.to_string());
     let out = Command::new("python3")
-        .args(["-I", GRADER, "--expect-cpus", &cpus.to_string()])
+        .args(["-I", &grader, "--expect-cpus", &cpus.to_string()])
         .arg(&file)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
@@ -320,7 +323,7 @@ fn corrupted_continuations_are_detected() {
             x.cpu = 1 - x.cpu;
         }),
         2,
-        "run_off_home",
+        "invalid lifecycle_run_outside_running_interval",
     );
 }
 
@@ -358,7 +361,8 @@ fn a_suppressed_remote_wake_is_detected() {
             x.cpu = 1;
         }),
         2,
-        "remote_wake_not_remote_or_not_enqueued",
+        // The replay refuses it first: CPU 1 issued a wake while not running the waker.
+        "invalid lifecycle_wake_issuer_not_running",
     );
     // The holder never honoured the pending reschedule.
     expect_fail(
@@ -435,7 +439,8 @@ fn premature_stack_reuse_is_detected() {
             first(r, |x| x.kind == "switch" && x.f[0] == kid && x.f[1] == 3).f[2] = kid;
         }),
         2,
-        "reclaimed_while_resident",
+        // The replay refuses it at the switch: residency was not cleared.
+        "invalid lifecycle_switched_out_while_resident",
     );
     // A reused slot whose generation did not advance.
     expect_fail(
@@ -446,7 +451,8 @@ fn premature_stack_reuse_is_detected() {
             r[blips[1]].f[2] = g;
         }),
         2,
-        "reuse_generation_not_newer",
+        // The replay refuses it first: the blip's record no longer names its own incarnation.
+        "invalid lifecycle_blip_identity",
     );
 }
 
@@ -455,9 +461,9 @@ fn a_missing_kernel_origin_interrupt_population_is_detected() {
     expect_fail(
         "no_irq",
         &edited(|r| {
-            for x in r.iter_mut().filter(|x| x.kind == "irq") {
-                x.kind = "probe".to_string();
-                x.f = [0; 5];
+            r.retain(|x| x.kind != "irq");
+            for (i, x) in r.iter_mut().enumerate() {
+                x.seq = i as u64;
             }
         }),
         2,
@@ -542,7 +548,8 @@ fn the_holder_s_honoured_point_is_its_turn() {
             }
         }),
         2,
-        "alternation_broken",
+        // The replay refuses it first: the relabelled alternator was not running then.
+        "invalid lifecycle_run_outside_running_interval",
     );
 }
 
@@ -581,5 +588,307 @@ fn a_single_cpu_record_set_is_graded_by_the_single_cpu_rules() {
         }),
         1,
         "hold_on_single_cpu",
+    );
+}
+
+// ── KTHREAD1-ACCEPTANCE §4: the lifecycle replay ────────────────────────────────────────────────
+
+fn renumber(recs: &mut [Rec]) {
+    for (i, r) in recs.iter_mut().enumerate() {
+        r.seq = i as u64;
+    }
+}
+
+fn slot(kid: u64) -> u64 {
+    kid & 0xFFFF
+}
+
+/// The three false passes the delivered grader awarded (KTHREAD1-ACCEPTANCE §4 reproduction):
+/// every dispatch record deleted, all but one final deleted, an interrupt for a reclaimed thread.
+#[test]
+fn the_reproduced_false_passes_are_refused() {
+    expect_fail(
+        "no_dispatch",
+        &edited(|r| {
+            r.retain(|x| x.kind != "dispatch");
+            renumber(r);
+        }),
+        2,
+        "invalid lifecycle_",
+    );
+    expect_fail(
+        "one_final_left",
+        &edited(|r| {
+            let first = r.iter().position(|x| x.kind == "final").unwrap();
+            let mut i = 0;
+            r.retain(|x| {
+                i += 1;
+                x.kind != "final" || i - 1 == first
+            });
+            renumber(r);
+        }),
+        2,
+        "final_missing",
+    );
+    expect_fail(
+        "irq_after_reclaim",
+        &edited(|r| {
+            let rec = r
+                .iter()
+                .rev()
+                .find(|x| x.kind == "reclaim" && x.f[4] == 2)
+                .expect("an alternator's reclaim")
+                .clone();
+            let cr = r
+                .iter()
+                .find(|x| x.kind == "create" && x.f[0] == rec.f[0])
+                .unwrap()
+                .clone();
+            r.push(Rec {
+                seq: 0,
+                kind: "irq".into(),
+                cpu: cr.f[2],
+                f: [rec.f[0], 1, 0xffff_ffff_8000_1234, cr.f[3] + 0x100, cr.f[1]],
+            });
+            renumber(r);
+        }),
+        2,
+        "invalid lifecycle_irq_outside_running_interval",
+    );
+}
+
+#[test]
+fn impossible_lifecycle_events_are_refused() {
+    // A second dispatch of a thread already running.
+    expect_fail(
+        "duplicate_dispatch",
+        &edited(|r| {
+            let at = r.iter().position(|x| x.kind == "dispatch").unwrap();
+            let d = r[at].clone();
+            r.insert(at + 1, d);
+            renumber(r);
+        }),
+        2,
+        "invalid lifecycle_dispatch_while_running",
+    );
+    // A dispatch recorded on a CPU that is not the thread's home.
+    expect_fail(
+        "dispatch_off_home",
+        &edited(|r| {
+            let x = first(r, |x| x.kind == "dispatch");
+            x.cpu = 1 - x.cpu;
+        }),
+        2,
+        "invalid lifecycle_dispatch_off_home",
+    );
+    // A run record naming an incarnation that was never created (a generation off by one).
+    expect_fail(
+        "wrong_incarnation",
+        &edited(|r| first(r, |x| x.kind == "run").f[0] += 1 << 16),
+        2,
+        "invalid lifecycle_run_unknown_thread",
+    );
+    // A slot handed to a new incarnation before its previous holder was reclaimed.
+    expect_fail(
+        "reuse_before_reclaim",
+        &edited(|r| {
+            let rec = r
+                .iter()
+                .position(|x| {
+                    x.kind == "reclaim"
+                        && r.iter().any(|c| {
+                            c.kind == "create" && c.seq > x.seq && slot(c.f[0]) == slot(x.f[0])
+                        })
+                })
+                .expect("a reclaimed slot that is reused");
+            let kid = r[rec].f[0];
+            let reuse = r
+                .iter()
+                .position(|c| c.kind == "create" && c.seq > r[rec].seq && slot(c.f[0]) == slot(kid))
+                .unwrap();
+            let rc = r.remove(rec);
+            r.insert(reuse, rc);
+            renumber(r);
+        }),
+        2,
+        "invalid lifecycle_slot_reused_before_reclaim",
+    );
+    // A final state naming one thread substituted for another's: one thread has two, the other none.
+    expect_fail(
+        "substituted_final",
+        &edited(|r| {
+            let finals: Vec<usize> = (0..r.len()).filter(|&i| r[i].kind == "final").collect();
+            let (a, b) = (finals[0], finals[1]);
+            r[b].f[0] = r[a].f[0];
+            r[b].f[2] = r[a].f[2];
+        }),
+        2,
+        "invalid lifecycle_final_duplicate",
+    );
+    // A final saying "gone" for a thread still running at that point.
+    expect_fail(
+        "final_before_exit",
+        &edited(|r| {
+            let last_switch = r
+                .iter()
+                .rposition(|x| x.kind == "switch" && x.f[1] == 3)
+                .expect("an exit switch");
+            let kid = r[last_switch].f[0];
+            let fin = r
+                .iter()
+                .position(|x| x.kind == "final" && x.f[0] == kid)
+                .unwrap();
+            let f = r.remove(fin);
+            let at = r
+                .iter()
+                .position(|x| x.kind == "switch" && x.f[1] == 3 && x.f[0] == kid)
+                .unwrap();
+            r.insert(at, f);
+            renumber(r);
+        }),
+        2,
+        "invalid lifecycle_final_gone_while_running",
+    );
+    // A create record whose stack is not its slot's.
+    expect_fail(
+        "foreign_stack",
+        &edited(|r| first(r, |x| x.kind == "create").f[3] += 0x4000),
+        2,
+        "invalid lifecycle_create_stack",
+    );
+}
+
+/// The obligations are bound to the creation records, not to whatever a role field says later:
+/// relabelling a thread changes nothing about what must be shown for the threads that exist.
+#[test]
+fn a_changed_role_does_not_make_obligations_disappear() {
+    // An alternator relabelled as a cycle thread in EVERY record that carries its role: the
+    // replay sees a consistent thread, and the populations anchored in the creations still miss
+    // an alternator.
+    expect_fail(
+        "relabelled_alternator",
+        &edited(|r| {
+            let kid = first(r, |x| x.kind == "create" && x.f[1] == 2).f[0];
+            for x in r.iter_mut().filter(|x| x.f[0] == kid) {
+                match x.kind.as_str() {
+                    "create" | "dispatch" => x.f[1] = 5,
+                    "switch" => x.f[3] = 5,
+                    "reclaim" => x.f[4] = 5,
+                    "final" => x.f[2] = 5,
+                    _ => {}
+                }
+            }
+        }),
+        2,
+        "creation_population",
+    );
+    expect_fail(
+        "unknown_role",
+        &edited(|r| first(r, |x| x.kind == "create" && x.f[1] == 3).f[1] = 9),
+        2,
+        "unknown_role",
+    );
+    // The director is excluded by its declared identity only; a second declaration is invalid.
+    expect_fail(
+        "second_director",
+        &edited(|r| {
+            let d = r.iter().find(|x| x.kind == "director").unwrap().clone();
+            r.insert(5, d);
+            renumber(r);
+        }),
+        2,
+        "invalid lifecycle_director_not_declared",
+    );
+}
+
+/// Legitimate orders the producer can emit pass: slot reuse with a new generation (present in the
+/// fixture), and a final "gone" observed before its reclaim record (the slot is free before the
+/// record is written).
+#[test]
+fn legitimate_reuse_and_concurrent_orders_pass() {
+    let recs = parse();
+    let reused = recs.iter().any(|c| {
+        c.kind == "create"
+            && recs
+                .iter()
+                .any(|p| p.kind == "create" && p.seq < c.seq && slot(p.f[0]) == slot(c.f[0]))
+    });
+    assert!(reused, "the fixture reuses a slot");
+    let moved = edited(|r| {
+        // A thread whose slot is not handed out again after its reclaim, with a final after it.
+        let rec = r
+            .iter()
+            .position(|x| {
+                x.kind == "reclaim"
+                    && !r.iter().any(|c| {
+                        c.kind == "create" && c.seq > x.seq && slot(c.f[0]) == slot(x.f[0])
+                    })
+                    && r.iter()
+                        .any(|f| f.kind == "final" && f.f[0] == x.f[0] && f.seq > x.seq)
+            })
+            .expect("a last reclaim of its slot");
+        let kid = r[rec].f[0];
+        let rc = r.remove(rec);
+        let fin = r
+            .iter()
+            .position(|x| x.kind == "final" && x.f[0] == kid)
+            .unwrap();
+        r.insert(fin + 1, rc);
+        renumber(r);
+    });
+    let (code, out) = grade(&moved, 2, "final_before_reclaim");
+    assert_eq!(code, 0, "{out}");
+}
+
+/// KTHREAD1-ACCEPTANCE §5 — the one-CPU coexistence phase: user rounds between kernel-thread
+/// turns, and a real deadline delivered while kernel threads stayed runnable.
+#[test]
+fn single_cpu_coexistence_and_timeout_delivery_are_required() {
+    assert!(
+        SINGLE.contains("kind=uwork"),
+        "the single-CPU fixture carries the S1 phase"
+    );
+    expect_fail(
+        "wrong_work_value",
+        &edited_from(SINGLE, |r| first(r, |x| x.kind == "uwork").f[2] ^= 1),
+        1,
+        "user_work_value_wrong",
+    );
+    expect_fail(
+        "no_user_work",
+        &edited_from(SINGLE, |r| {
+            r.retain(|x| !matches!(x.kind.as_str(), "uwork" | "uarm" | "utimeout"));
+            renumber(r);
+        }),
+        1,
+        "user_work_missing",
+    );
+    expect_fail(
+        "deadline_not_timed_out",
+        &edited_from(SINGLE, |r| {
+            for x in r.iter_mut().filter(|x| x.kind == "utimeout") {
+                x.f[2] = 0;
+            }
+        }),
+        1,
+        "user_deadline_result",
+    );
+    // Every timeout preceded by an idle arrival: the CPU went idle to deliver it.
+    expect_fail(
+        "delivered_only_via_idle",
+        &edited_from(SINGLE, |r| {
+            for x in r.iter_mut().filter(|x| x.kind == "utimeout") {
+                x.f[4] += 1;
+            }
+        }),
+        1,
+        "user_deadline_not_delivered_while_kernel_threads_ran",
+    );
+    // A user record from another task is not P's progress.
+    expect_fail(
+        "foreign_user_record",
+        &edited_from(SINGLE, |r| first(r, |x| x.kind == "uwork").f[0] = 1),
+        1,
+        "invalid lifecycle_user_record_identity",
     );
 }

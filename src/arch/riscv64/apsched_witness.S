@@ -98,6 +98,11 @@
     .set M_T_DONE, 0x050
     .set M_W_STARTED, 0x058
     .set M_CLOCK, 0x060
+    /* KTHREAD1-ACCEPTANCE §5: 1 when the kernel-thread witness is built in (kernel-published at
+       provisioning); the director publishes S1_STOP at the end of its run. */
+    .set M_S1, 0x070
+    .set M_S1_STOP, 0x078
+    .set B_S1, 0xF80
     .set M_PRE, 0x100
     .set M_IDLE, 0x140
     .set M_F, 0x180
@@ -123,6 +128,11 @@
     .set IPC_ROUNDS, 4
     .set FORK_ROUNDS, 4
     .set CHILD_SPIN, 3000000
+    /* S1: the checked value of round k is k * S1_MUL ^ S1_SALT (the kernel recomputes it). */
+    .set S1_MUL, 0x9E3779B97F4A7C15
+    .set S1_SALT, 0x5151000000005151
+    .set S1_DEADLINE, 3
+    .set S1_ROUNDS, 600
 
     /* Bounded waits: a yield count AND a deadline on the global clock, whichever ends first.
        The yield count alone could outlast any boot budget: on a contended CPU 0 one yield can
@@ -276,7 +286,12 @@ p_ap:
     ld a2, M_EXPECTED(t0)
     ld a3, M_AP_READY(t0)
     LOG m_p_no_ap
-    j p_end
+    /* KTHREAD1-ACCEPTANCE §5: one CPU and the kernel-thread witness built in — stay active
+       through the kernel-thread phase (S1) instead of ending. */
+    li t0, MBX
+    ld t1, M_S1(t0)
+    beqz t1, p_end
+    j p_s1
 p_ready:
     /* s11 = the expected secondaries for the whole run; s10 = how many. */
     li t0, MBX
@@ -685,6 +700,50 @@ c_child:
     LOG m_c_run
     EXIT
 
+/* ── S1: one CPU, beside the kernel threads ──────────────────────────────────────────────────
+   Each round: a checked user action (store k*S1_MUL^S1_SALT, read it back, report the value the
+   load returned), then a receive with a real deadline on endpoint D, which nobody sends to, and
+   its result. Ends when the director publishes S1_STOP, or after S1_ROUNDS. s1 = k. */
+p_s1:
+    li s1, 0
+s1_round:
+    addi s1, s1, 1
+    li t0, MBX
+    ld t1, M_S1_STOP(t0)
+    bnez t1, s1_done
+    li t2, S1_ROUNDS
+    bgt s1, t2, s1_done
+    li t3, S1_MUL
+    mul t4, s1, t3
+    li t3, S1_SALT
+    xor t4, t4, t3
+    li t5, (BUF + B_S1)
+    sd t4, 0(t5)
+    fence rw, rw
+    ld a3, 0(t5)
+    mv a2, s1
+    LOG m_s1_work
+    mv a2, s1
+    li a3, S1_DEADLINE
+    LOG m_s1_arm
+    lw a0, yarm_apsw_cap_ep_d
+    li a1, (BUF + 0x300)
+    li a2, 16
+    li a3, S1_DEADLINE
+    li a4, 0
+    li a5, 0
+    li a7, NR_RECV_TO
+    ecall
+    mv a3, a0
+    mv a2, s1
+    LOG m_s1_timeout
+    j s1_round
+s1_done:
+    mv a2, s1
+    li a3, 0
+    LOG m_s1_end
+    j p_end
+
 /* ═══════════════════════════════════ workers ══════════════════════════════════════════════ */
 /* A deadline receive on an endpoint nobody sends to, after the spawn gate. */
 w_deadline:
@@ -948,6 +1007,10 @@ yarm_apsw_cap_ep_d: .word 0x63636363
 
     STR m_p_start, "APS P_START"
     STR m_p_no_ap, "APS P_NO_AP"
+    STR m_s1_work, "APS S1_WORK"
+    STR m_s1_arm, "APS S1_ARM"
+    STR m_s1_timeout, "APS S1_TIMEOUT"
+    STR m_s1_end, "APS S1_END"
     STR m_p_ap, "APS P_AP_READY"
     STR m_p_pre_timeout, "APS P_PRE_TIMEOUT"
     STR m_p_w_timeout, "APS P_W_TIMEOUT"

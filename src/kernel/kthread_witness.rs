@@ -71,6 +71,12 @@ pub(crate) const K_YIELD: u64 = 15;
 pub(crate) const K_BLIP: u64 = 16;
 pub(crate) const K_WAKEREQ: u64 = 17;
 pub(crate) const K_DECIDE: u64 = 18;
+/// KTHREAD1-ACCEPTANCE §4: the director declares itself (the one thread with no create record).
+pub(crate) const K_DIRECTOR: u64 = 19;
+/// KTHREAD1-ACCEPTANCE §5: P's single-CPU rounds (user-origin entries, authenticated as P's).
+pub(crate) const K_UWORK: u64 = 20;
+pub(crate) const K_UARM: u64 = 21;
+pub(crate) const K_UTIMEOUT: u64 = 22;
 
 fn kind_name(k: u64) -> &'static str {
     match k {
@@ -92,6 +98,10 @@ fn kind_name(k: u64) -> &'static str {
         K_BLIP => "blip",
         K_WAKEREQ => "wakereq",
         K_DECIDE => "decide",
+        K_DIRECTOR => "director",
+        K_UWORK => "uwork",
+        K_UARM => "uarm",
+        K_UTIMEOUT => "utimeout",
         _ => "unknown",
     }
 }
@@ -162,6 +172,15 @@ static STALE_OPEN: AtomicBool = AtomicBool::new(false);
 static STALE_Q: KWaitQueue = KWaitQueue::new();
 static LOST_FLAG: AtomicBool = AtomicBool::new(false);
 static LOST_Q: KWaitQueue = KWaitQueue::new();
+/// The waker parks here until the director lets it go (it used to poll by yielding).
+static ZERO_Q: KWaitQueue = KWaitQueue::new();
+/// A wake's issuer parks here until the target CPU's holder is spinning (it used to poll).
+static HOLD_Q: [KWaitQueue; W_CPUS] = [const { KWaitQueue::new() }; W_CPUS];
+/// KTHREAD1-ACCEPTANCE §4: the role of the creation in progress, and the creator's CPU, read by
+/// [`note_create`] inside `KThreadPool::create` before the new incarnation is enqueued. Only the
+/// director creates (and `maybe_start` creates the director), one creation at a time.
+static PENDING_ROLE: AtomicU64 = AtomicU64::new(0);
+static CREATOR_CPU: AtomicU64 = AtomicU64::new(0);
 
 fn role_of(id: KThreadId) -> u64 {
     let s = id.slot();
@@ -215,15 +234,73 @@ pub(crate) fn maybe_start(shared: &SharedKernel, cpu: CpuId) {
     {
         return;
     }
+    PENDING_ROLE.store(R_DIRECTOR, Ordering::Release);
+    CREATOR_CPU.store(cpu.0 as u64, Ordering::Release);
     match shared
         .kthreads
         .create(director, 0, cpu, TaskPriority::Normal)
     {
         Ok(id) => {
-            set_role(id, R_DIRECTOR);
             crate::yarm_log!("KT1_WITNESS_START director={:#x} cpu=0", id.raw());
         }
         Err(e) => crate::yarm_log!("KT1_WITNESS_START result=fail reason={:?}", e),
+    }
+}
+
+/// KTHREAD1-ACCEPTANCE §4 — called by `KThreadPool::create` for a new incarnation BEFORE it is
+/// enqueued: its role is set and its creation recorded while no CPU can yet dispatch it, so its
+/// create record precedes every record of its execution and no early dispatch goes unrecorded
+/// for want of a role.
+pub(crate) fn note_create(id: KThreadId, home: CpuId, low: usize, high: usize) {
+    let role = PENDING_ROLE.swap(0, Ordering::AcqRel);
+    if role == 0 {
+        return;
+    }
+    set_role(id, role);
+    record(
+        CpuId(CREATOR_CPU.load(Ordering::Acquire) as u8),
+        K_CREATE,
+        [id.raw(), role, home.0 as u64, low as u64, high as u64],
+    );
+}
+
+static IDLE_ARRIVALS: [AtomicU64; W_CPUS] = [const { AtomicU64::new(0) }; W_CPUS];
+
+/// `cpu` arrived at its idle wait (every port's idle-arrival point; observation only).
+pub(crate) fn note_idle_arrival(cpu: usize) {
+    if let Some(c) = IDLE_ARRIVALS.get(cpu) {
+        c.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// KTHREAD1-ACCEPTANCE §5 — one of P's single-CPU steps, from its DebugLog syscall: a user-origin
+/// entry whose task the trap path authenticated (`tid`, `asid`). Recorded on the CPU it trapped on:
+/// `uwork` [tid, round, the value P's load returned, asid, 0]; `uarm` [tid, round, deadline
+/// ticks, the clock now, this CPU's idle arrivals]; `utimeout` [tid, round, the receive's
+/// result, the clock now, this CPU's idle arrivals].
+pub(crate) fn note_user_step(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    tid: u64,
+    asid: u64,
+    step: &str,
+    a2: u64,
+    a3: u64,
+) {
+    if tid != crate::kernel::apsched_witness::P_TID
+        || asid != crate::kernel::apsched_witness::p_asid()
+    {
+        return;
+    }
+    let idle = IDLE_ARRIVALS
+        .get(cpu.0 as usize)
+        .map_or(0, |c| c.load(Ordering::Acquire));
+    let now = shared.sched_domain().clock_now().0;
+    match step {
+        "S1_WORK" => record(cpu, K_UWORK, [tid, a2, a3, asid, 0]),
+        "S1_ARM" => record(cpu, K_UARM, [tid, a2, a3, now, idle]),
+        "S1_TIMEOUT" => record(cpu, K_UTIMEOUT, [tid, a2, a3, now, idle]),
+        _ => {}
     }
 }
 
@@ -242,19 +319,18 @@ pub(crate) fn note_dispatch(cpu: CpuId, id: KThreadId) {
     {
         c.fetch_add(1, Ordering::AcqRel);
     }
-    // The director and the waker poll by yielding; their dispatches are not recorded, or their
-    // waits would fill the CPU's ring.
+    // The director polls by yielding; its dispatches are not recorded, or its waits would fill
+    // the CPU's ring. It is declared by its own record and exempt by identity, not by role.
     let role = role_of(id);
-    if role != R_DIRECTOR && role != R_WAKER && role != 0 {
+    if role != R_DIRECTOR && role != 0 {
         record(cpu, K_DISPATCH, [id.raw(), role, 0, 0, 0]);
     }
 }
 
 pub(crate) fn note_switched_out(cpu: CpuId, id: KThreadId, reason: KSwitchReason, resident: u64) {
-    // As for dispatches; the waker's exit is still recorded (its reclaim is checked against it).
+    // As for dispatches.
     let role = role_of(id);
-    let polling = role == R_WAKER && reason != KSwitchReason::Exit;
-    if role != R_DIRECTOR && role != 0 && !polling {
+    if role != R_DIRECTOR && role != 0 {
         record(cpu, K_SWITCH, [id.raw(), reason as u64, resident, role, 0]);
     }
 }
@@ -538,6 +614,25 @@ fn wait_for(ctx: &KThreadCtx, ms: u64, cond: impl Fn() -> bool) -> bool {
     }
 }
 
+/// Create a witness thread. Its role and its create record are written by [`note_create`],
+/// inside the pool's creation, before it can run.
+fn create_raw(
+    ctx: &KThreadCtx,
+    entry: crate::kernel::kthread::KEntry,
+    arg: usize,
+    cpu: CpuId,
+    role: u64,
+) -> Result<KThreadId, crate::kernel::kthread::KCreateError> {
+    let pool = ctx.pool();
+    let _m = ctx.masked();
+    PENDING_ROLE.store(role, Ordering::Release);
+    CREATOR_CPU.store(ctx.home().0 as u64, Ordering::Release);
+    let r = pool.create(entry, arg, cpu, TaskPriority::Normal);
+    // A creation refused before its slot was taken never reached the hook.
+    PENDING_ROLE.store(0, Ordering::Release);
+    r
+}
+
 fn create(
     ctx: &KThreadCtx,
     entry: crate::kernel::kthread::KEntry,
@@ -545,24 +640,7 @@ fn create(
     cpu: CpuId,
     role: u64,
 ) -> Option<KThreadId> {
-    let pool = ctx.pool();
-    let id = {
-        let _m = ctx.masked();
-        pool.create(entry, arg, cpu, TaskPriority::Normal)
-    };
-    match id {
-        Ok(id) => {
-            set_role(id, role);
-            let (low, high) = pool.stack_bounds(id.slot());
-            record(
-                ctx.home(),
-                K_CREATE,
-                [id.raw(), role, cpu.0 as u64, low as u64, high as u64],
-            );
-            Some(id)
-        }
-        Err(_) => None,
-    }
+    create_raw(ctx, entry, arg, cpu, role).ok()
 }
 
 fn wake_code(w: KWake) -> u64 {
@@ -634,6 +712,10 @@ fn alternator(ctx: &KThreadCtx, _arg: usize) {
             && !HOLD_CLAIMED[ci].swap(true, Ordering::AcqRel);
         if holder {
             HOLDING[ci].store(true, Ordering::Release);
+            {
+                let _m = ctx.masked();
+                let _ = HOLD_Q[ci].wake_all(pool);
+            }
             // Hold this CPU — spinning, interrupts enabled — until this CPU's sleeper has been
             // woken from another CPU and one more interrupt (the reschedule IPI) has landed here.
             let mut spins = 0u32;
@@ -748,7 +830,7 @@ fn issue_remote_wake(ctx: &KThreadCtx, target: usize) {
             let _m = ctx.masked();
             let _ = PERMIT_Q[target].wake_all(ctx.pool());
         }
-        let _ = wait_for(ctx, 30_000, || HOLDING[target].load(Ordering::Acquire));
+        let _ = HOLD_Q[target].wait_until(ctx, || HOLDING[target].load(Ordering::Acquire));
     }
     TOKENS[target].store(TOKEN + target as u64, Ordering::Release);
     // The request, recorded BEFORE the wake: the reschedule IPI it causes may land on the target
@@ -789,7 +871,7 @@ fn issue_remote_wake(ctx: &KThreadCtx, target: usize) {
 /// Wakes CPU 0's sleeper from another CPU, after the director finished every other CPU's wake
 /// (so no CPU this waker needs is held).
 fn waker(ctx: &KThreadCtx, _arg: usize) {
-    let _ = wait_for(ctx, 60_000, || ZERO_GO.load(Ordering::Acquire));
+    let _ = ZERO_Q.wait_until(ctx, || ZERO_GO.load(Ordering::Acquire));
     issue_remote_wake(ctx, 0);
 }
 
@@ -849,13 +931,18 @@ fn lost_wake_probe(ctx: &KThreadCtx, _arg: usize) {
     );
 }
 
-static CREATED: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+/// Every thread the director created (the whole pool can be created more than once over a run).
+static CREATED: [AtomicU64; 96] = [const { AtomicU64::new(0) }; 96];
+/// The role each remembered thread was created with: a final record names the role of ITS
+/// incarnation, not whatever role a later thread in the same slot holds.
+static CREATED_ROLE: [AtomicU64; 96] = [const { AtomicU64::new(0) }; 96];
 static N_CREATED: AtomicUsize = AtomicUsize::new(0);
 
 fn remember(id: Option<KThreadId>) -> Option<KThreadId> {
     if let Some(id) = id {
         let n = N_CREATED.fetch_add(1, Ordering::AcqRel);
         if n < CREATED.len() {
+            CREATED_ROLE[n].store(role_of(id), Ordering::Release);
             CREATED[n].store(id.raw(), Ordering::Release);
         }
     }
@@ -883,6 +970,20 @@ fn director(ctx: &KThreadCtx, _arg: usize) {
             ROUNDS,
         ],
     );
+    {
+        let (low, high) = pool.stack_bounds(ctx.id().slot());
+        record(
+            ctx.home(),
+            K_DIRECTOR,
+            [
+                ctx.id().raw(),
+                ctx.home().0 as u64,
+                low as u64,
+                high as u64,
+                0,
+            ],
+        );
+    }
     let cpus: [bool; W_CPUS] = core::array::from_fn(|c| pop & (1 << c) != 0);
     let second = (1..W_CPUS).find(|&c| cpus[c]);
     SINGLE.store(second.is_none(), Ordering::Release);
@@ -916,6 +1017,10 @@ fn director(ctx: &KThreadCtx, _arg: usize) {
         issue_remote_wake(ctx, 0);
     }
     ZERO_GO.store(true, Ordering::Release);
+    {
+        let _m = ctx.masked();
+        let _ = ZERO_Q.wake_all(pool);
+    }
     let _ = wait_for(ctx, 60_000, || WAKE_DONE[0].load(Ordering::Acquire));
     // 4. Switch-safety probes, from this kernel thread.
     {
@@ -1003,13 +1108,9 @@ fn director(ctx: &KThreadCtx, _arg: usize) {
     let mut held = 0u64;
     let err;
     loop {
-        let r = {
-            let _m = ctx.masked();
-            pool.create(holder, held as usize, probe_cpu, TaskPriority::Normal)
-        };
-        match r {
+        match create_raw(ctx, holder, held as usize, probe_cpu, R_HOLDER) {
             Ok(id) => {
-                set_role(id, R_HOLDER);
+                let _ = remember(Some(id));
                 held += 1;
             }
             Err(crate::kernel::kthread::KCreateError::Exhausted) => {
@@ -1049,7 +1150,8 @@ fn director(ctx: &KThreadCtx, _arg: usize) {
     for i in 0..n {
         if let Some(id) = KThreadId::from_raw(CREATED[i].load(Ordering::Acquire)) {
             let state = pool.state_of(id).map_or(0, |s| s as u64);
-            record(ctx.home(), K_FINAL, [id.raw(), state, role_of(id), 0, 0]);
+            let role = CREATED_ROLE[i].load(Ordering::Acquire);
+            record(ctx.home(), K_FINAL, [id.raw(), state, role, 0, 0]);
         }
     }
     for c in 0..W_CPUS {
@@ -1067,6 +1169,8 @@ fn director(ctx: &KThreadCtx, _arg: usize) {
             );
         }
     }
+    #[cfg(feature = "kthread1-witness")]
+    crate::kernel::apsched_witness::publish_s1_stop();
     ACTIVE.store(false, Ordering::Release);
     dump(ctx);
 }

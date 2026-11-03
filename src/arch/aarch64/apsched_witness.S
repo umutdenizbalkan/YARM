@@ -69,6 +69,11 @@
     .set M_W_STARTED, 0x058
     .set M_CLOCK, 0x060
     .set M_W_CPUS, 0x068
+    /* KTHREAD1-ACCEPTANCE §5: 1 when the kernel-thread witness is built in (kernel-published at
+       provisioning); the director publishes S1_STOP at the end of its run. */
+    .set M_S1, 0x070
+    .set M_S1_STOP, 0x078
+    .set B_S1, 0xF80
     .set M_PRE, 0x100
     .set M_IDLE, 0x140
     .set M_F, 0x180
@@ -94,6 +99,11 @@
     .set IPC_ROUNDS, 4
     .set FORK_ROUNDS, 4
     .set CHILD_SPIN, 3000000
+    /* S1: the checked value of round k is k * S1_MUL ^ S1_SALT (the kernel recomputes it). */
+    .set S1_MUL, 0x9E3779B97F4A7C15
+    .set S1_SALT, 0x5151000000005151
+    .set S1_DEADLINE, 3
+    .set S1_ROUNDS, 600
 
     /* Bounded waits: a yield count AND a deadline on the global clock (CPU 0's timer, which no
        control breaks), whichever ends first — exactly the RISC-V program's bounds. */
@@ -108,6 +118,14 @@
     .macro LI32 reg, imm
     movz \reg, #((\imm) & 0xffff)
     movk \reg, #(((\imm) >> 16) & 0xffff), lsl #16
+    .endm
+
+    /* Load a 64-bit constant. */
+    .macro LI64 reg, imm
+    movz \reg, #((\imm) & 0xffff)
+    movk \reg, #(((\imm) >> 16) & 0xffff), lsl #16
+    movk \reg, #(((\imm) >> 32) & 0xffff), lsl #32
+    movk \reg, #(((\imm) >> 48) & 0xffff), lsl #48
     .endm
 
     .macro SVC nr
@@ -315,7 +333,12 @@ p_ap:
     ldr x2, [x9, #M_EXPECTED]
     ldr x3, [x9, #M_AP_READY]
     LOG m_p_no_ap
-    b p_end
+    /* KTHREAD1-ACCEPTANCE §5: one CPU and the kernel-thread witness built in — stay active
+       through the kernel-thread phase (S1) instead of ending. */
+    LI32 x9, MBX
+    ldr x10, [x9, #M_S1]
+    cbz x10, p_end
+    b p_s1
 p_ready:
     /* x30 = the expected secondaries for the whole run; x29 = how many. */
     LI32 x9, MBX
@@ -767,6 +790,49 @@ c_child:
     LOG m_c_run
     EXIT
 
+/* ── S1: one CPU, beside the kernel threads ──────────────────────────────────────────────────
+   Each round: a checked user action (store k*S1_MUL^S1_SALT, read it back, report the value the
+   load returned), then a receive with a real deadline on endpoint D, which nobody sends to, and
+   its result. Ends when the director publishes S1_STOP, or after S1_ROUNDS. x19 = k. */
+p_s1:
+    mov x19, #0
+s1_round:
+    add x19, x19, #1
+    LI32 x9, MBX
+    ldr x10, [x9, #M_S1_STOP]
+    cbnz x10, s1_done
+    cmp x19, #S1_ROUNDS
+    b.gt s1_done
+    LI64 x11, S1_MUL
+    mul x12, x19, x11
+    LI64 x11, S1_SALT
+    eor x12, x12, x11
+    LI32 x13, (BUF + B_S1)
+    str x12, [x13]
+    dmb ish
+    ldr x3, [x13]
+    mov x2, x19
+    LOG m_s1_work
+    mov x2, x19
+    mov x3, #S1_DEADLINE
+    LOG m_s1_arm
+    ldr w0, yarm_apsw_cap_ep_d
+    LI32 x1, (BUF + 0x300)
+    mov x2, #16
+    mov x3, #S1_DEADLINE
+    mov x4, #0
+    mov x5, #0
+    SVC NR_RECV_TO
+    mov x3, x0
+    mov x2, x19
+    LOG m_s1_timeout
+    b s1_round
+s1_done:
+    mov x2, x19
+    mov x3, #0
+    LOG m_s1_end
+    b p_end
+
 /* ═══════════════════════════════════ workers ══════════════════════════════════════════════ */
 /* A deadline receive on an endpoint nobody sends to, after the spawn gate. */
 w_deadline:
@@ -1098,6 +1164,10 @@ yarm_apsw_cap_ep_n: .word 0x64646464
 
     STR m_p_start, "APS P_START"
     STR m_p_no_ap, "APS P_NO_AP"
+    STR m_s1_work, "APS S1_WORK"
+    STR m_s1_arm, "APS S1_ARM"
+    STR m_s1_timeout, "APS S1_TIMEOUT"
+    STR m_s1_end, "APS S1_END"
     STR m_p_ap, "APS P_AP_READY"
     STR m_p_pre_timeout, "APS P_PRE_TIMEOUT"
     STR m_p_w_timeout, "APS P_W_TIMEOUT"
