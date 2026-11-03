@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Umut Deniz Balkan
+#
+# KTHREAD-CLOSURE1 §A3 — the SGI population cases, specified independently of either checker and
+# run against BOTH: the kernel verifier (`smp2_record::check_sgi_population`, hosted test) and the
+# host grader (`scripts/smp2_sgi_population.py --cases`).
+#
+# The physical model. A send is recorded by its sender BEFORE its `GICD_SGIR` write; an arrival is
+# recorded by its target AFTER its `GICC_IAR` read; a completion AFTER its `GICC_EOIR` write. A
+# GICv2 SGI is pending per (target, source): writes made while it is still pending merge into one
+# arrival; a write made after the target acknowledged it is pending again and arrives again. Since
+# the record order fixes only "send recorded < its write" and "IAR < arrival recorded", two sends
+# both recorded before an arrival may be delivered as one arrival OR as two. So, per (source,
+# target), the arrivals must split the ordered sends into consecutive non-empty groups, each group
+# recorded before its arrival; every arrival has exactly one completion with its own token before
+# the target's next arrival.
+#
+#   case <name> expect=<ok|unexplained|undelivered|completion>
+#   sent <cpu> <target>                 (the sender is <cpu>)
+#   arrived <cpu> <token> <source>      (taken on <cpu>; token is the raw GICC_IAR value)
+#   completed <cpu> <token>
+#   end
+
+case one_send_one_arrival expect=ok
+sent 0 1
+arrived 1 0x401 0
+completed 1 0x401
+end
+
+case two_sends_merged_into_one_arrival expect=ok
+sent 0 1
+sent 0 1
+arrived 1 0x401 0
+completed 1 0x401
+end
+
+case two_sends_before_the_first_arrival_delivered_twice expect=ok
+sent 0 1
+sent 0 1
+arrived 1 0x401 0
+completed 1 0x401
+arrived 1 0x401 0
+completed 1 0x401
+end
+
+case three_sends_two_arrivals expect=ok
+sent 0 1
+sent 0 1
+arrived 1 0x401 0
+sent 0 1
+completed 1 0x401
+arrived 1 0x401 0
+completed 1 0x401
+end
+
+case both_directions_interleaved expect=ok
+sent 0 1
+sent 1 0
+arrived 0 0x801 1
+arrived 1 0x401 0
+completed 1 0x401
+completed 0 0x801
+end
+
+case self_kick expect=ok
+sent 1 1
+arrived 1 0x801 1
+completed 1 0x801
+end
+
+case arrival_with_no_send expect=unexplained
+arrived 1 0x401 0
+completed 1 0x401
+end
+
+case arrival_recorded_before_its_only_send expect=unexplained
+arrived 1 0x401 0
+completed 1 0x401
+sent 0 1
+end
+
+case more_arrivals_than_sends_before_them expect=unexplained
+sent 0 1
+arrived 1 0x401 0
+completed 1 0x401
+arrived 1 0x401 0
+completed 1 0x401
+end
+
+case arrival_naming_another_source expect=unexplained
+sent 1 1
+arrived 1 0x401 0
+completed 1 0x401
+end
+
+case send_to_another_target_does_not_explain expect=unexplained
+sent 0 0
+arrived 1 0x401 0
+completed 1 0x401
+end
+
+case send_never_delivered expect=undelivered
+sent 0 1
+end
+
+case send_after_the_last_arrival expect=undelivered
+sent 0 1
+arrived 1 0x401 0
+completed 1 0x401
+sent 0 1
+end
+
+case missing_completion expect=completion
+sent 0 1
+arrived 1 0x401 0
+end
+
+case duplicate_completion expect=completion
+sent 0 1
+arrived 1 0x401 0
+completed 1 0x401
+completed 1 0x401
+end
+
+case completion_with_another_token expect=completion
+sent 0 1
+arrived 1 0x401 0
+completed 1 0x001
+end
+
+case first_completion_after_the_next_arrival expect=completion
+sent 0 1
+sent 0 1
+arrived 1 0x401 0
+arrived 1 0x401 0
+completed 1 0x401
+completed 1 0x401
+end

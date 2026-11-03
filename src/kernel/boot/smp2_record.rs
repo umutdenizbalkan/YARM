@@ -338,29 +338,42 @@ pub enum SgiRefusal {
 }
 
 /// Pair every send with the arrival that consumed it and every arrival with its one completion.
-/// Sends from one source to one target that are still pending together are legitimately merged
-/// by a GICv2 into one arrival; that is the only many-to-one allowed. Returns the number of
-/// arrivals. Pure.
+/// Returns the number of arrivals. Pure.
+///
+/// KTHREAD-CLOSURE1 §A3 — the physical model (and the case corpus both this verifier and the host
+/// grader are run against: `tests/fixtures/smp2/sgi_population.cases`). A send is recorded BEFORE
+/// its `GICD_SGIR` write, an arrival AFTER its `GICC_IAR` read. A GICv2 SGI is pending per (target,
+/// source): writes made while it is still pending merge into one arrival, a write made after the
+/// target acknowledged it arrives again. The record order therefore fixes only "send recorded <
+/// its write" and "IAR < arrival recorded", so two sends recorded before an arrival may have been
+/// delivered as one arrival or as two. Per (source, target), the arrivals must split the sends into
+/// consecutive non-empty groups, each recorded before its arrival: the k-th arrival needs at least
+/// k sends recorded before it, and every send must be recorded before the pair's last arrival.
+///
+/// The delivered check let one arrival consume every earlier unconsumed send, so a second
+/// arrival of two sends recorded before the first was refused as unexplained
+/// (`sgi_unexplained_arrival`, a verifier race reproduced on `40132e1a` and `a7da04f1`).
 pub fn check_sgi_population(recs: &[Rec]) -> Result<usize, SgiRefusal> {
-    let mut consumed = [false; SLOTS];
+    let pair_sends_before = |src: u64, dst: u8, before: usize| {
+        recs[..before]
+            .iter()
+            .filter(|s| {
+                s.kind == Kind::SgiSent && u64::from(s.cpu) == src && s.f[0] == u64::from(dst)
+            })
+            .count()
+    };
     let mut arrivals = 0usize;
     for (i, a) in recs.iter().enumerate() {
         if a.kind != Kind::SgiArrived {
             continue;
         }
         arrivals += 1;
-        let mut explained = false;
-        for (j, s) in recs.iter().enumerate().take(i) {
-            if s.kind == Kind::SgiSent
-                && s.f[0] == u64::from(a.cpu)
-                && u64::from(s.cpu) == a.f[1]
-                && !consumed.get(j).copied().unwrap_or(true)
-            {
-                consumed[j] = true;
-                explained = true;
-            }
-        }
-        if !explained {
+        // This arrival's rank among the arrivals of its (source, target) pair.
+        let rank = recs[..=i]
+            .iter()
+            .filter(|r| r.kind == Kind::SgiArrived && r.cpu == a.cpu && r.f[1] == a.f[1])
+            .count();
+        if pair_sends_before(a.f[1], a.cpu, i) < rank {
             return Err(SgiRefusal::Unexplained { arrival: a.seq });
         }
         let next_arrival = recs
@@ -371,14 +384,23 @@ pub fn check_sgi_population(recs: &[Rec]) -> Result<usize, SgiRefusal> {
             .map_or(recs.len(), |(k, _)| k);
         let completions = recs[i + 1..next_arrival]
             .iter()
-            .filter(|r| r.kind == Kind::SgiCompleted && r.cpu == a.cpu && r.f[0] == a.f[0])
+            .filter(|r| r.kind == Kind::SgiCompleted && r.cpu == a.cpu)
             .count();
-        if completions != 1 {
+        let own = recs[i + 1..next_arrival]
+            .iter()
+            .any(|r| r.kind == Kind::SgiCompleted && r.cpu == a.cpu && r.f[0] == a.f[0]);
+        if completions != 1 || !own {
             return Err(SgiRefusal::Completion { arrival: a.seq });
         }
     }
     for (j, s) in recs.iter().enumerate() {
-        if s.kind == Kind::SgiSent && !consumed.get(j).copied().unwrap_or(true) {
+        if s.kind != Kind::SgiSent {
+            continue;
+        }
+        let delivered_later = recs.iter().skip(j + 1).any(|a| {
+            a.kind == Kind::SgiArrived && a.f[1] == u64::from(s.cpu) && u64::from(a.cpu) == s.f[0]
+        });
+        if !delivered_later {
             return Err(SgiRefusal::Undelivered { send: s.seq });
         }
     }
@@ -1046,6 +1068,62 @@ mod tests {
             (Kind::SgiCompleted, 1, [0x401, 0, 0, 0, 0]),
         ]);
         assert_eq!(check_sgi_population(&merged), Ok(1));
+    }
+
+    /// KTHREAD-CLOSURE1 §A3 — the shared corpus, the same cases the host grader is run against.
+    #[test]
+    fn the_shared_sgi_population_corpus() {
+        const CASES: &str = include_str!("../../../tests/fixtures/smp2/sgi_population.cases");
+        let mut n = 0;
+        let mut name = "";
+        let mut expect = "";
+        let mut recs: Vec<Rec> = Vec::new();
+        for line in CASES.lines() {
+            let line = line.split('#').next().unwrap_or("");
+            let t: Vec<&str> = line.split_whitespace().collect();
+            if t.is_empty() {
+                continue;
+            }
+            let hex = |v: &str| u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+            let seq = recs.len() as u32;
+            match t[0] {
+                "case" => {
+                    name = t[1];
+                    expect = t[2].trim_start_matches("expect=");
+                    recs.clear();
+                }
+                "sent" => recs.push(rec(
+                    seq,
+                    Kind::SgiSent,
+                    t[1].parse().unwrap(),
+                    [t[2].parse().unwrap(), 0, 0, 0, 0],
+                )),
+                "arrived" => recs.push(rec(
+                    seq,
+                    Kind::SgiArrived,
+                    t[1].parse().unwrap(),
+                    [hex(t[2]), t[3].parse().unwrap(), 0, 0, 0],
+                )),
+                "completed" => recs.push(rec(
+                    seq,
+                    Kind::SgiCompleted,
+                    t[1].parse().unwrap(),
+                    [hex(t[2]), 0, 0, 0, 0],
+                )),
+                "end" => {
+                    let got = match check_sgi_population(&recs) {
+                        Ok(_) => "ok",
+                        Err(SgiRefusal::Unexplained { .. }) => "unexplained",
+                        Err(SgiRefusal::Undelivered { .. }) => "undelivered",
+                        Err(SgiRefusal::Completion { .. }) => "completion",
+                    };
+                    assert_eq!(got, expect, "case {name}");
+                    n += 1;
+                }
+                other => panic!("bad corpus line {other}"),
+            }
+        }
+        assert_eq!(n, 17, "every case ran");
     }
 
     #[test]

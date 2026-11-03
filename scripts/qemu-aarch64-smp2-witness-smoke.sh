@@ -217,7 +217,13 @@ def user(start, tid, step, rnd=None):
     return find(start, lambda r: r["kind"] == "user" and r["f"][0] == tid and r["step"] == step and (rnd is None or r["f"][3] == rnd))
 
 # ── SGI POPULATION ──
-consumed = set()
+# KTHREAD-CLOSURE1 §A3: the pairing is the shared rule (scripts/smp2_sgi_population.py, the same
+# rule and the same case corpus as the kernel verifier). Per (source, target) the arrivals split the
+# sends into consecutive non-empty groups, each recorded before its arrival; every arrival has
+# exactly one completion of its own token before the target's next arrival. The token's INTID and
+# source field are checked here, per record.
+sys.path.insert(0, "scripts")
+from smp2_sgi_population import check as sgi_population
 for i, a in enumerate(recs):
     if a["kind"] != "sgi_arrived": continue
     tok, src = a["f"][0], a["f"][1]
@@ -225,20 +231,11 @@ for i, a in enumerate(recs):
         fail("seq %d: claimed INTID %d is not the reschedule SGI" % (a["seq"], tok & 0x3ff))
     if iface_cpu.get((tok >> 10) & 7) != src:
         fail("seq %d: IAR source field %d does not name cpu %d" % (a["seq"], (tok >> 10) & 7, src))
-    sends = [j for j in range(i) if recs[j]["kind"] == "sgi_sent" and j not in consumed
-             and recs[j]["cpu"] == src and recs[j]["f"][0] == a["cpu"]]
-    if not sends:
-        fail("seq %d: arrival on cpu %d from cpu %d has no earlier send" % (a["seq"], a["cpu"], src))
-    consumed.update(sends)
-    nxt = find(i + 1, lambda r: r["kind"] == "sgi_arrived" and r["cpu"] == a["cpu"])
-    end = len(recs) if nxt is None else nxt
-    done = [r for r in recs[i + 1:end] if r["kind"] == "sgi_completed" and r["cpu"] == a["cpu"]]
-    if len(done) != 1 or done[0]["f"][0] != tok:
-        fail("seq %d: %d completion(s) before the next arrival, token match=%s" % (a["seq"], len(done), bool(done) and done[0]["f"][0] == tok))
+pop_verdict, pop_seq = sgi_population(recs)
+if pop_verdict != "ok":
+    fail("seq %d: sgi population %s" % (pop_seq, pop_verdict))
 for j, s in enumerate(recs):
     if s["kind"] != "sgi_sent": continue
-    if j not in consumed:
-        fail("seq %d: send from cpu %d to cpu %d never taken" % (s["seq"], s["cpu"], s["f"][0]))
     want = ((2 << 24) | 1) if s["f"][2] == 1 else ((ready.get(s["f"][0], 0) << 16) | 1)
     if s["f"][1] != want:
         fail("seq %d: GICD_SGIR 0x%x does not encode target cpu %d (want 0x%x)" % (s["seq"], s["f"][1], s["f"][0], want))
