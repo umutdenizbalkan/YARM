@@ -56,8 +56,8 @@ import sys
 KINDS = {"pop", "create", "run", "irq", "switch", "dispatch", "wake", "woken", "resched", "probe",
          "reclaim", "exhaust", "user", "final", "yield", "blip", "wakereq", "decide", "director",
          "uwork", "uarm", "utimeout"}
-R_DIRECTOR, R_ALT, R_SLEEPER, R_WAKER, R_BLIP, R_LOSTWAKE, R_HOLDER = 1, 2, 3, 4, 5, 6, 7
-P_MASKED, P_IRQ_GUARD, P_STALE_WAKE, P_LOST_WAKE, P_PLAIN = 1, 2, 3, 4, 5
+R_DIRECTOR, R_ALT, R_SLEEPER, R_WAKER, R_BLIP, R_LOSTWAKE, R_HOLDER, R_PLAINHOLD = 1, 2, 3, 4, 5, 6, 7, 8
+P_MASKED, P_IRQ_GUARD, P_STALE_WAKE, P_LOST_WAKE, P_PLAIN, P_PLAIN_OTHER = 1, 2, 3, 4, 5, 6
 # KSwitchRefusal codes as the producer records them (kthread_witness.rs `refusal_code`).
 R_PLAIN_LOCK_HELD = 7
 TOKEN = 0x4B541000
@@ -253,7 +253,7 @@ def replay(recs):
         if k == "probe":
             if r.cpu != dhome or r.res != dkid:
                 bad.append("probe_not_by_director seq=%d" % r.seq)
-            if r.f[1] in (P_MASKED, P_IRQ_GUARD, P_PLAIN):
+            if r.f[1] in (P_MASKED, P_IRQ_GUARD, P_PLAIN, P_PLAIN_OTHER):
                 if kid != dkid:
                     bad.append("probe_not_by_director seq=%d" % r.seq)
             elif r.f[1] == P_STALE_WAKE:
@@ -323,7 +323,9 @@ def replay(recs):
     if exhaust is None or count(R_HOLDER) != exhaust.f[0]:
         incomplete.append("holder_population created=%d declared=%s"
                           % (count(R_HOLDER), exhaust.f[0] if exhaust else "missing"))
-    known = {R_ALT, R_SLEEPER, R_WAKER, R_BLIP, R_LOSTWAKE, R_HOLDER}
+    if count(R_PLAINHOLD) != (1 if len(cpus) > 1 else 0):
+        incomplete.append("plain_holder_population %d" % count(R_PLAINHOLD))
+    known = {R_ALT, R_SLEEPER, R_WAKER, R_BLIP, R_LOSTWAKE, R_HOLDER, R_PLAINHOLD}
     for kid, t in th.items():
         if t["role"] not in known:
             bad.append("unknown_role kid=0x%x role=%d" % (kid, t["role"]))
@@ -712,6 +714,20 @@ def grade(text, expect_cpus):
             fail("plain_lock_count_wrong counts=%s" % counts)
         if not (f4 >> 32) & 1:
             fail("plain_lock_probe_without_interrupt")
+    # KTHREAD-CLOSURE1 §B: with two CPUs or more, another thread's live plain guard counts against
+    # that thread only (its own yield refused), and the director stays eligible.
+    other = probes.get(P_PLAIN_OTHER, [])
+    if expect_cpus > 1:
+        if len(other) != 1:
+            fail("plain_lock_attribution_probe records=%d" % len(other))
+        else:
+            f2, f3, f4 = other[0].f[2], other[0].f[3], other[0].f[4]
+            mine, theirs, their_code = f2 & 0xFF, (f2 >> 8) & 0xFF, (f2 >> 16) & 0xFF
+            if (mine, theirs, their_code, f3, f4) != (0, 1, R_PLAIN_LOCK_HELD, 0, 1):
+                fail("plain_lock_misattributed director=%d holder=%d holder_refusal=%d director_refusal=%d held_seen=%d"
+                     % (mine, theirs, their_code, f3, f4))
+    elif other:
+        fail("plain_lock_attribution_probe records=%d with one CPU" % len(other))
     lost = probes.get(P_LOST_WAKE, [])
     if len(lost) != 1 or lost[0].f[2] != 0:
         fail("lost_wakeup")

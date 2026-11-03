@@ -1341,3 +1341,57 @@ fn a_switch_under_a_plain_lock_is_detected() {
         "invalid lifecycle_probe_not_by_director",
     );
 }
+
+fn plain_other(r: &Rec) -> bool {
+    r.kind == "probe" && r.f[1] == 6
+}
+
+/// KTHREAD-CLOSURE1 §B: with two CPUs, a holder on the second CPU takes a plain lock (its own yield
+/// refused) while the director's count stays 0, the holder's is 1 and the director can yield.
+/// Every misattribution, a missing probe, and a probe at one CPU are refused.
+#[test]
+fn another_threads_plain_lock_is_attributed_to_that_thread_only() {
+    let cases: [(&str, fn(&mut Vec<Rec>), &str); 6] = [
+        (
+            "counted_on_the_director",
+            |r| first(r, plain_other).f[2] |= 1,
+            "plain_lock_misattributed",
+        ),
+        (
+            "holder_not_counted",
+            |r| first(r, plain_other).f[2] &= !0xFF00,
+            "plain_lock_misattributed",
+        ),
+        (
+            "holder_yield_not_refused",
+            |r| first(r, plain_other).f[2] &= !0xFF_0000,
+            "plain_lock_misattributed",
+        ),
+        (
+            "director_refused",
+            |r| first(r, plain_other).f[3] = 7,
+            "plain_lock_misattributed",
+        ),
+        (
+            "holder_never_held",
+            |r| first(r, plain_other).f[4] = 0,
+            "plain_lock_misattributed",
+        ),
+        (
+            "attribution_probe_missing",
+            |r| {
+                r.retain(|x| !plain_other(x));
+                renumber(r);
+            },
+            "plain_lock_attribution_probe records=0",
+        ),
+    ];
+    for (name, edit, reason) in cases {
+        expect_fail(name, &edited(edit), 2, reason);
+    }
+    // The one-CPU set has no attribution probe and passes; it must not carry one.
+    assert!(
+        parse_from(SINGLE).iter().all(|x| !plain_other(x)),
+        "the one-CPU fixture has no attribution probe"
+    );
+}

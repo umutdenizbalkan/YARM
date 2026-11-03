@@ -114,12 +114,16 @@ const R_WAKER: u64 = 4;
 const R_BLIP: u64 = 5;
 const R_LOSTWAKE: u64 = 6;
 const R_HOLDER: u64 = 7;
+/// KTHREAD-CLOSURE1 §B: holds a plain lock on another CPU while the director must stay eligible.
+const R_PLAINHOLD: u64 = 8;
 
 // Probe kinds (K_PROBE f1).
 const P_MASKED: u64 = 1;
 const P_IRQ_GUARD: u64 = 2;
 /// KTHREAD-CLOSURE1 §B: a real plain (non-masking) `SpinLock` held across scheduling points.
 const P_PLAIN: u64 = 5;
+/// KTHREAD-CLOSURE1 §B: another thread's live plain guard is attributed to that thread only.
+const P_PLAIN_OTHER: u64 = 6;
 const P_STALE_WAKE: u64 = 3;
 const P_LOST_WAKE: u64 = 4;
 
@@ -760,6 +764,60 @@ fn plain_lock_probe(ctx: &KThreadCtx) {
     );
 }
 
+static PH_HELD: AtomicBool = AtomicBool::new(false);
+static PH_RELEASE: AtomicBool = AtomicBool::new(false);
+static PH_REFUSAL: AtomicU64 = AtomicU64::new(0);
+
+/// The attribution probe's holder, on another CPU: it takes a real plain lock, records the
+/// refusal of its own yield, and holds the guard (spinning, as a holder must) until released.
+fn plain_holder(ctx: &KThreadCtx, _arg: usize) {
+    static PLAIN_C: crate::kernel::lock::SpinLock<u64> = crate::kernel::lock::SpinLock::new(0);
+    let g = PLAIN_C.lock();
+    let r = ctx.yield_now();
+    PH_REFUSAL.store(r.err().map_or(0, refusal_code), Ordering::Release);
+    PH_HELD.store(true, Ordering::Release);
+    let mut spins = 0u64;
+    while !PH_RELEASE.load(Ordering::Acquire) && spins < 4_000_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    drop(g);
+}
+
+/// KTHREAD-CLOSURE1 §B — attribution, with two CPUs or more: while `plain_holder` holds its guard
+/// on `second`, the director's own count is 0, the holder's is 1, and the director can yield.
+/// Record: f2 = director count | holder count << 8 | the holder's own refusal code << 16;
+/// f3 = the director's yield refusal code (0 = it switched); f4 = 1 when the holder was seen
+/// holding.
+fn plain_attribution_probe(ctx: &KThreadCtx, second: Option<usize>) {
+    let Some(c) = second else {
+        return;
+    };
+    let pool = ctx.pool();
+    PH_HELD.store(false, Ordering::Release);
+    PH_RELEASE.store(false, Ordering::Release);
+    let Some(h) = remember(create(ctx, plain_holder, 0, CpuId(c as u8), R_PLAINHOLD)) else {
+        return;
+    };
+    let seen = wait_for(ctx, 20_000, || PH_HELD.load(Ordering::Acquire));
+    let mine = u64::from(pool.plain_guards_held(ctx.id()) & 0xFF);
+    let theirs = u64::from(pool.plain_guards_held(h) & 0xFF);
+    let y = ctx.yield_now();
+    PH_RELEASE.store(true, Ordering::Release);
+    let _ = wait_for(ctx, 20_000, || pool.state_of(h).is_none());
+    record(
+        ctx.home(),
+        K_PROBE,
+        [
+            ctx.id().raw(),
+            P_PLAIN_OTHER,
+            mine | (theirs << 8) | ((PH_REFUSAL.load(Ordering::Acquire) & 0xFF) << 16),
+            y.err().map_or(0, refusal_code),
+            u64::from(seen),
+        ],
+    );
+}
+
 /// The interrupt count of `id`'s slot, as an address the patterned spin can poll.
 fn irq_counter(ctx: &KThreadCtx) -> *const u64 {
     ctx.pool().interrupt_counter_addr(ctx.id())
@@ -1155,6 +1213,7 @@ fn director(ctx: &KThreadCtx, _arg: usize) {
         );
     }
     plain_lock_probe(ctx);
+    plain_attribution_probe(ctx, second);
     // 5. The lost-wakeup probe, on the second CPU (or here on a single CPU).
     let probe_cpu = CpuId(second.unwrap_or(0) as u8);
     let _ = remember(create(ctx, lost_wake_probe, 0, probe_cpu, R_LOSTWAKE));
