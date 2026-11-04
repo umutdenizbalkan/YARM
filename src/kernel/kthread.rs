@@ -1682,8 +1682,9 @@ static STACK_FAULT_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// KTHREAD-CLOSURE1 §C: a kernel-mode fault taken while a kernel thread ran, on the port's fault
 /// stack (never the faulting one). `fault` is the faulting data address (or, where the port has
-/// none, the stack pointer). The report is written once per boot through `raw_line` — an
-/// unlocked console path, because the faulting thread may hold any lock — and the caller halts.
+/// none, the stack pointer). The report is written once per boot through `raw_line`, which (like
+/// `printk::emit_fatal_line` around it) only tries the console locks for a bounded time and then
+/// writes anyway, because the faulting thread may hold any lock; the caller halts.
 /// A fault in a guard gap of the pool's window is a stack overflow of the gap's owner.
 #[cfg(not(feature = "hosted-dev"))]
 pub(crate) fn report_kernel_thread_fault(
