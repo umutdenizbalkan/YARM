@@ -3502,6 +3502,71 @@ so the test profile was used).
 good (fail-closed, by design). The underflow and cross-stack latches are exercised hosted only.
 The registry is scanned linearly (two production entries at most). No lock was converted.
 
+##### Stage C — hardware stack protection for kernel threads (SC-KT-1)
+
+**The hole.** On the Stage B head `a540aef2` kernel-thread stacks were 32 adjacent 16 KiB arrays in
+`.bss`; a thread that descended below its stack overwrote its neighbour silently (contract §18.2).
+The live control `no_window` (the pool run on its contiguous storage again) reproduces it on the
+candidate: on every ISA the access probe reads 4 KiB below its stack and survives
+(`KSTACK_PROBE_SURVIVED`).
+
+**Design and rule.** Contract §18.10.3: each stack runs at the bottom of its own 16 MiB stride of a
+kernel-only window whose remainder is unmapped (x86_64 PML4[510], AArch64 L1[64], RISC-V a
+kernel-thread root installed around each switch); fault paths that never push onto the faulting
+stack (x86_64 IST gates; AArch64 synchronous entry on a per-CPU emergency stack; RISC-V a `tp`
+low-bound check before any store); one fatal `KTHREAD_STACK_OVERFLOW` naming the gap's owner; and
+an image check bounding every single stack-pointer decrement within the gap.
+
+**Defects found by development controls and qualification, all repaired before delivery:**
+* the AArch64 bit-14 entry test was believed load-bearing; its control (removed alone) still
+  reported the overflow, because the synchronous entry already moves to the emergency stack (an
+  earlier repair: a pre-indexed store that faults leaves `sp` deep in the gap, where bit 14 is
+  clear, and the frame probe looped). The controls now aim at the load-bearing switch
+  (`a64_sync_on_faulting_stack`, `a64_no_stack_checks`), and the bit-14 control is declared to
+  pass; the vector comment says so;
+* qualification run 1, QC6: one new warning on every build (`unused variable: low`; the run
+  view's low bound was used only by the default-off creation witness). Repaired `ca98bd61`;
+* qualification run 1, QC12: the RISC-V kernel-thread device-interrupt witness failed (22
+  failures: none of the four kernel-thread items arrived). Reproduced outside the run on fresh
+  builds (base `a540aef2` passes, `ca98bd61` fails). The kernel-thread root lacked root slot 255,
+  the device window through which the kernel reaches device pages under any translation other
+  than Bare, so device access and the PLIC claim found nothing while a kernel thread ran. Repaired
+  `bb451a3b` (`enter_root` installs the window's root entry, the one every user root receives);
+  control `rv_no_device_window` fails the witness again. KT1, the probes and the stack controls
+  could not see this: none of them touches a device from a kernel thread.
+
+**Live defect controls** (each applied alone to the frozen candidate; `ctlC.py`):
+
+| Control | Probe | Result |
+|---|---|---|
+| `no_window` | access, each ISA | fails: the probe survives its read below the stack |
+| `x86_no_ist` | recursion, x86_64 | fails: hangs (timeout), no report |
+| `rv_no_tp_check` | recursion, RISC-V | fails: `KTHREAD_FAULT`, not an overflow report |
+| `a64_no_stack_checks` | recursion, AArch64 | fails: hangs (timeout) |
+| `a64_sync_on_faulting_stack` | frame, AArch64 | fails: hangs (timeout) |
+| `a64_no_sp_check` | recursion, AArch64 | passes, as declared (not load-bearing) |
+| `rv_no_device_window` | device-interrupt witness, RISC-V | fails: 22 failures, no kernel-thread item |
+
+**Qualification (Stage C).** Predeclared schedule with three revisions, each declared before its
+freeze (base: the delivered Stage B head `a540aef2`); runs from fresh detached worktrees of the
+frozen commit; every scheduled result kept.
+
+| Run | Freeze | Outcome |
+|---|---|---|
+| 1 | `06f8e682` | full matrix (one container restart during QC14: the six results already recorded were kept and the step restarted; the reruns matched). Failed: QC6 (the new warning) and QC12 `kthread-irq-riscv64` (the device window, above). Runner defect: QC16's KT1 checks on AArch64 and RISC-V were given the raw boot image, not the ELF (recorded failures; superseded by run 2). Everything else passed, including QC14 9/9 probes and QC10 as declared |
+| 2 | `bb451a3b` | full matrix, every step passed: QC4; QC2 hosted `kernel::kthread` 42/42 ×3, `kstack_adjust_cli` 3/3, the plain-lock scope guard 6/6, KT1 grader CLI 25/25 ×3 and self-test; QC14 probes 9/9; QC10 8 controls fail and `a64_no_sp_check` passes, as declared; QC8 1-CPU KT1 9/9 seals (idle and loaded); QC9m 2/4/8 CPUs 9/9; QC1 6275 passed; QC3 41/41 binaries; QC5 census identical; QC6 no new warning on any build; QC7 no-FP pass; QC16 `result=ok` on the three default images and the AArch64 and RISC-V KT1 ELFs; QC12 strict core smokes ×3, AP-scheduling and SCHED-LOCK1 at 2 CPUs ×3, SMP3, CONTEXT1, SMP1, SMP2, VMI2, the RISC-V lock1/VMI/shared-region-replace witnesses, the UART/PL011 interrupt witnesses ×3, the IPC park witness, exit-current-task ×3, shared-region-direct ×3, and the kernel-thread device-interrupt witness ×3 (12 items, 4 on kernel threads). Runner defects, declared during the run (after QC17, before QC16): QC17 (informational image identity) ran before QC6 and printed DIFFERENT with nothing to compare; QC16's x86_64 KT1 check named `kernel_boot.elf.elf` (missing) and failed; the declared post-run QC16x checked the booted file itself (`result=ok`, max `0x51c500`) |
+
+Image check (run 2): largest single decrement x86_64 `0x51c500`, AArch64 `0x42000`, RISC-V
+`0x4dc150` (default) and `0x4dc350` (KT1) against the bound `0x7fd800`; 933 / 1031 / 816
+decrements in the default images; unresolved 0; exempted stack-switch sites 0 / 19 / 1. Sections
+(candidate vs base, default images): x86_64 `.text` +6 688, `.bss` +141 320 (34 table pages);
+AArch64 `.text` +2 564, `.bss` +271 800 (33 table pages, 8 × 16 KiB emergency stacks); RISC-V
+`.text` +2 258, `.bss` +3 440 (only the root table is linked: no default path creates a pool).
+
+**Stage C remaining limits.** Overflow faults, but no stack-depth bound is established. The bound
+argument assumes what compiled code does (contract §18.10.3). The AArch64 bit-14 entry test is a
+reporting aid, not a defence. QEMU only.
+
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 

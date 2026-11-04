@@ -817,7 +817,7 @@ never by adding an alternative dispatcher selected by profile.
 
 | ID | Prerequisite | x86_64 today | AArch64 today | RISC-V today | Status |
 |---|---|---|---|---|---|
-| SC-KT-1 | Owned kernel stack, from a bounded pool, with a guard page; distinct from user and idle stacks (idle is a diverging primitive at a per-CPU anchor, §1.7). Stacks are pre-mapped: supervisor page faults are kernel-fatal (§1.9). | `KernelExecutionContext {stack_base, stack_top, owns_stack}` exists (D6 scaffolding); `refresh_boot_tss_rsp0` | same field | same field | **PARTIAL (KTHREAD1, §18.2)**: 32 owned 16 KiB stacks reserved in `.bss`, distinct from user, trap and idle stacks; **no guard page** on any port (RISC-V kernel runs in Bare translation; x86_64 and AArch64 map the kernel with shared 2 MiB / block mappings). Owner of the guard: unassigned |
+| SC-KT-1 | Owned kernel stack, from a bounded pool, with a guard page; distinct from user and idle stacks (idle is a diverging primitive at a per-CPU anchor, §1.7). Stacks are pre-mapped: supervisor page faults are kernel-fatal (§1.9). | `KernelExecutionContext {stack_base, stack_top, owns_stack}` exists (D6 scaffolding); `refresh_boot_tss_rsp0` | same field | same field | **PARTIAL (KTHREAD1, §18.2)**: 32 owned 16 KiB stacks reserved in `.bss`, distinct from user, trap and idle stacks; **no guard page** on any port (RISC-V kernel runs in Bare translation; x86_64 and AArch64 map the kernel with shared 2 MiB / block mappings). **ENFORCED (KTHREAD-CLOSURE1 Stage C, §18.10.3)**: each stack runs at the bottom of its own 16 MiB stride of a kernel-only window whose remainder is unmapped, on all three ports; an overflow faults in its own gap and is reported fatal by name, on a stack other than the faulting one; an image check bounds every single stack-pointer decrement inside the gap |
 | SC-KT-2 | Kernel continuation saved and resumed, distinct from the user `UserRegisterContext` | `yarm_x86_switch_frame` (callee-saved, `rsp`, `rip`) | `yarm_aarch64_switch_frame` | `yarm_riscv64_switch_frame` | **ENFORCED (KTHREAD1, §18.1)**: `KSwitchContext` per ISA (callee-saved, `sp`, return address) in `src/arch/<isa>/kthread.rs`; the D6 switch frames stay dormant |
 | SC-KT-3 | First entry: an explicit entry ABI (stack alignment, argument registers, return-to-exit) | `yarm_kernel_thread_switch_trampoline` (D6 proof) | not established | not established | **ENFORCED (KTHREAD1, §18.1)**: per-ISA trampoline → `yarm_kthread_first_entry(pool, slot)`, 16-byte-aligned stack, interrupts enabled before the body, return reaches `exit` |
 | SC-KT-4 | Asynchronous preemption of kernel mode. Not to be enabled before SCHED-LOCK1 (SC-LOCK-8) and KERNEL-NOFP1 (SC-FP-1); both are done, and neither enables or qualifies it. | none: masked kernel | none | none; S-mode traps other than idle halt | **NOT ENABLED.** KTHREAD1 is cooperative (§18.3): interrupts on a kernel thread are serviced and return to the interrupted instruction; a reschedule is honoured at the next explicit scheduling point. Owner: unassigned |
@@ -1155,7 +1155,7 @@ CPU executes.
 | SC-EXEC-1…6 | inline kernel work, uncounted | accounting points, system allowance, overrun events | P + N bounds | RT-SCHED1 / PARTITION1 |
 | SC-IPC-1/2/3 | `direct_eligibility`, ordinary selection | eligibility-checked handoff; donation stays off | P | RT-SCHED1 / PARTITION1 |
 | SC-KT-2, 3, 6, 7, 9, 10, 11 | **done** (KTHREAD1, §18) | — | P + L on three ports, §18.7 | — |
-| SC-KT-1 guard page | 16 KiB pool stacks, no guard | split shared kernel mappings (x86_64, AArch64); a translated kernel space (RISC-V) | P + L | unassigned |
+| SC-KT-1 guard page | **closed by KTHREAD-CLOSURE1 Stage C (§18.10.3)** | — | — | — |
 | SC-KT-4 | cooperative kernel threads (§18.3) | asynchronous kernel preemption | P + L on three ports | unassigned |
 | SC-KT-8 plain `SpinLock` | **closed by KTHREAD-CLOSURE1 Stage B (§18.10.2)** | — | — | — |
 | SC-KT-12, SC-EXEC-3, SC-BND-2 | kernel threads with a home CPU (KTHREAD1) | budgeted contexts; boundary preemption at safe points | P + L | RT-SCHED1 / PARTITION1 |
@@ -1341,6 +1341,7 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-GP-1 (differential, for the mechanisms exercised);
   * SC-KT-0;
   * SC-KT-5, SC-FP-1, SC-FP-2, SC-FP-3 (KERNEL-NOFP1);
+  * SC-KT-1 (KTHREAD1, guarded since KTHREAD-CLOSURE1 Stage C, §18.10.3);
   * SC-KT-2, SC-KT-3, SC-KT-6, SC-KT-7, SC-KT-10, SC-KT-11 (KTHREAD1, §18); SC-KT-8 for
     interrupt-masking guards and, since KTHREAD-CLOSURE1 Stage B, plain `SpinLock` (§18.10.2); SC-KT-9 with the deviation stated in §8;
   * SC-LOCK-1, SC-LOCK-3…7 (SCHED-LOCK1). SC-LOCK-2 is PARTIAL: the lock order excludes the
@@ -1349,7 +1350,8 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
 * **SPECIFIED, with an implementing package:**
   * SC-LOCK-8 (roadmap order: SCHED-LOCK1 before KTHREAD1 kernel preemption and RT-SCHED1).
   * **KTHREAD1** (done, §18) left these open: SC-KT-1 (guard page), SC-KT-4 (asynchronous kernel
-    preemption, not enabled) and SC-KT-8 for plain `SpinLock`, without an owner package; SC-KT-12,
+    preemption, not enabled) and SC-KT-8 for plain `SpinLock`, without an owner package (SC-KT-8 and
+    SC-KT-1 were since closed by KTHREAD-CLOSURE1 Stages B and C, §18.10.2–3); SC-KT-12,
     SC-BND-2 and SC-EXEC-3 move to RT-SCHED1 / PARTITION1.
   * **RT-SCHED1:**
     * SC-CPU-2;
@@ -2268,6 +2270,7 @@ owner), `src/arch/kthread.rs` and `src/arch/<isa>/kthread.rs` (switch, first ent
   2 MiB pages in the boot `PD` shared by every root, and AArch64 with block mappings; a 4 KiB guard
   needs splitting those shared kernel mappings, which KTHREAD1 does not do. Overflow is therefore
   not caught by hardware on any port (a canary would not be equivalent and is not claimed).
+  *Superseded by KTHREAD-CLOSURE1 Stage C (§18.10.3): stacks now run in a guarded window.*
 
 ### 18.3 Scheduling points, deferral and safety
 
@@ -2423,9 +2426,10 @@ established, and nothing here is a certification claim.
 
 * Cooperative only: no asynchronous kernel preemption (SC-KT-4). A kernel thread that never
   reaches a scheduling point keeps its CPU.
-* No guard page on any port (SC-KT-1, §18.2).
+* No guard page on any port (SC-KT-1, §18.2). *Closed by KTHREAD-CLOSURE1 Stage C, §18.10.3.*
 * No migration: a kernel thread runs only on its home CPU.
 * A plain non-masking `SpinLock` held across a scheduling point is not detected (SC-KT-8).
+  *Closed by KTHREAD-CLOSURE1 Stage B, §18.10.2.*
 * Kernel threads run inside the selection step of the trap that selected them, on their own
   stacks. The enclosing trap resumes after the CPU has no runnable kernel thread left.
 * No budget, priority beyond the GP levels, partition or donation (SC-KT-12, RT-SCHED1).
@@ -2656,3 +2660,115 @@ per pair with no kernel-thread stack registered (every production boot that crea
 thread) or with a guard off the registered stacks, ≈17.1–17.6 ns for a guard on a kernel-thread
 stack. QEMU and hosted
 timing are not hardware timing.
+
+
+#### 18.10.3 Stage C: hardware stack protection for kernel threads (SC-KT-1)
+
+**The hole on the Stage B head.** Kernel-thread stacks were 32 adjacent 16 KiB arrays in `.bss`
+with nothing between them: a thread that descended below its stack wrote into its neighbour's (or
+whatever `.bss` lay below the first) silently. Only the high-water paint observed depth afterwards.
+
+**Why gaps, not single guard pages.** No kernel target compiles with stack probes (the custom x86_64
+and AArch64 target specs set none; the built-in RISC-V target has none), and the images contain
+single stack adjustments far larger than a page. A one-page guard is jumped by such a frame. Each
+stack therefore sits alone at the bottom of its own `KSTACK_STRIDE` = 16 MiB of a kernel-only
+window whose remainder is never mapped, and an image check bounds every single stack-pointer
+decrement in the image well inside that gap.
+
+**Layout.** Physical backing is unchanged (`KSTACKS`). Threads run on an alias of each stack:
+slot `i` at `W + (i + 1) * 16 MiB`, 16 KiB; slot 0's gap is the window's first stride.
+
+| ISA | Window `W` | Tables | Installed | Root a thread runs on |
+|---|---|---|---|---|
+| x86_64 | `0xFFFF_FF00_0000_0000` (PML4[510]) | PDPT, PD, 32 PTs (static) | into the canonical kernel root when the first user root is cloned from it; every root copies PML4[256..512] | unchanged: the kernel root the dispatcher already enters before a switch |
+| AArch64 | `0x10_0000_0000` (L1[64], formerly an identity block over nothing) | L2, 32 L3s (static) | by `setup_bootstrap_mmu` before the MMU is on; every root copies L1[1..511] | unchanged: the kernel root the dispatcher already enters before a switch |
+| RISC-V | `0xC000_0000` (root slot 3) | root, L1, 32 L0s (static) | built at the pool's first creation | NEW: the kernel-thread root (Sv39, ASID 0, never handed to an address space) instead of Bare; slot 0 devices (R/W), slot 2 the kernel-shared RAM gigapage, slot 3 the window, slot 255 the device window once a boot installs one |
+
+Pages are kernel-only, read/write, never executable (x86_64 NX when EFER.NXE is on). The pool
+fixes its run view at its first creation (before any thread exists) and uses it for stack
+pointers, switch contexts, interrupt authentication, residency and the plain-lock registry; the
+storage view serves creation (paint and the first frame, written through it) and the high-water
+measurement. Contract §18.10.2's registry attributes guards in either view.
+
+**RISC-V root activation.** The dispatcher already leaves the user root (Bare) before switching
+into a thread; it now installs the kernel-thread root (with a full `sfence.vma`) right before the
+switch and returns to Bare right after the thread switches back, with interrupts masked.
+Residency bookkeeping is unchanged. The kernel-thread root carries the same RAM gigapage as every
+user root, so the kernel's reach while a thread runs is what it already is on a user root plus the
+devices below RAM. It also carries the device window (root slot 255), through which the kernel
+reaches a registered device page under any translation other than Bare: `enter_root` copies the
+window's root entry (the one every user root receives) into it, once, before its `satp` write and
+full fence, since the window may be installed after the root is built and never changes after.
+Without it a device access or PLIC claim on a kernel thread finds nothing (found by Stage C
+qualification run 1: the device-interrupt witness's kernel-thread items never arrived).
+
+**Fault paths (no push onto the faulting stack, no allocation).** The report line is formatted on
+a fault stack into a fixed buffer, once per boot; it is written after a bounded attempt at the
+printk drain lock and the console line lock (the faulting thread may hold either), then without
+them; the CPU then halts with interrupts masked.
+* x86_64: the kernel-thread IDT's #PF and #DF gates use the production IST slots (3 and 2), so the
+  CPU never pushes onto the faulting stack. A #PF classifies CR2; a #DF its stack pointer.
+* AArch64: the synchronous entry of the kernel-thread vector table, always fatal on a kernel
+  thread, moves to this CPU's 16 KiB emergency stack (`YARM_AARCH64_KSTACK_EMERGENCY`, indexed by
+  `TPIDR_EL1`) before any store and classifies by FAR (a data abort) or by the stack pointer. This
+  is the load-bearing defence: every overflow is a store into a gap, hence a synchronous fault; a
+  pre-indexed store that faults leaves `sp` where it was, possibly deep in the gap, so no handler
+  may run on that stack. In addition, the current-EL/SPx entries test bit 14 of the stack pointer
+  after reserving their 272-byte frame, without a store (the `sp`/`x0` arithmetic swap), and on a
+  hit report from the emergency stack directly. Bit 14 is set only in the gap's top 16 KiB, so the
+  test catches a shallow overflow at entry (an interrupt then reports the thread's own pc instead
+  of a nested data abort in the vector); it is not load-bearing, and the live control that
+  removes it alone still reports the overflow (§18.10.3, evidence).
+* RISC-V: while a thread runs, `tp` holds its stack's low bound (the switch saves and restores the
+  dispatcher's `tp`; kernel code never uses `tp`). The vector compares the frame's `sp` against
+  `tp` with one branch before any store; a hit runs the report on the overflowed thread's own
+  stack from its top (mapped, and abandoned). A load/store page fault into a gap is classified by
+  `stval`.
+* `KTHREAD_STACK_OVERFLOW arch=… cpu=… kthread=0x… slot=… guard=0x… sp=0x… pc=0x… cause=0x…
+  result=fatal` names the gap's owner (its current incarnation); any other kernel-thread fault on
+  these paths reports `KTHREAD_FAULT … result=fatal`.
+
+**Bound.** `scripts/check-kthread-stack-adjustments.py` decodes an image and fails when any single
+stack-pointer decrement exceeds `(16 MiB − 16 KiB − 4 KiB) / 2`, or when one cannot be resolved
+outside the audited stack-switching code; then the gap exceeds two maximal frames plus a trap
+frame, the deepest a thread can reach before its first store into the gap. That argument assumes
+what compiled code does and the check does not prove: a function that reserves a frame and then
+calls stores into that frame first (its return link or callee-saved registers; on x86_64 the call
+itself stores), and a function that calls nothing reserves no further frame. The check bounds
+stack-pointer decrements, not arbitrary negative offsets from the stack pointer (compiled code
+addresses its own frame, above the stack pointer). Total depth is not bounded: any depth beyond
+the stack faults in the gap; a stack-depth bound is still not established.
+
+**Evidence.** Hosted (`kthread_tests.rs`): the window arithmetic (slot bounds, strides, the gap
+owner of every address around each stack, the storage and run views of one pool). The image check
+through its CLI (`tests/kstack_adjust_cli.rs`): decrements by an immediate and by a constant built
+in a register on each ISA pass within the bound, one past it fails, an unresolvable one fails.
+Live, on each ISA (`scripts/qemu-kstack-probe-smoke.sh`, default-off `kstack-probe-*` on the KT1
+witness kernel, fatal by design): an access probe reads 4 KiB below its stack, a recursion probe
+descends by 512-byte frames, a frame probe reserves one 64 KiB frame and stores at its bottom; each
+must produce exactly one `KTHREAD_STACK_OVERFLOW` naming the probe thread and slot with its guard
+address in that thread's own gap, and nothing else. Guard addresses reported (slot 0, low bound
+`W + 16 MiB`): access `low − 0x1000` on all three; recursion `low − 0x108` (x86_64), `low − 0x140`
+(AArch64), `low − 0xf8` (RISC-V); frame `low − 0xc1b8` (x86_64), `low − 0xc200` (AArch64),
+`low − 0xc1b8` (RISC-V). Live controls, each a single defect: no window (threads on the contiguous
+storage) — every ISA's access probe survives; x86_64 #PF/#DF gates without IST — the recursion
+probe hangs (timeout, no report); RISC-V without the `tp` bound check — the recursion probe ends
+in `KTHREAD_FAULT`, not an overflow report; AArch64 synchronous entry left on the faulting stack —
+the frame probe (stack pointer deep in the gap, bit 14 clear) hangs; AArch64 with both defences
+removed — the recursion probe hangs; RISC-V kernel-thread root without the device window — the
+device-interrupt witness's four kernel-thread items never arrive. The AArch64 bit-14 test removed
+alone still reports the overflow (declared to pass). The KT1 witness (1, 2, 4, 8 CPUs on every
+ISA) records the run view's 16 MiB stride and its grader requires it; the device-interrupt witness
+passes on all three ports with kernel threads on the window. On the default images and the KT1
+witness images the largest single decrements are the boot path's `init_state_into` (x86_64
+`0x51c500`, RISC-V `0x4dc150`) and `remove_asid_root` (`0x40228` to `0x42000`), all within the
+bound `0x7fd800`; none is unresolved.
+
+**Cost.** Memory: x86_64 34 table pages; AArch64 33 table pages and 8 × 16 KiB emergency stacks;
+RISC-V 34 table pages (in a default RISC-V image only the root page is linked: nothing there
+creates a pool). Time: one `satp` write with a full `sfence.vma` on entry to and exit from each
+kernel-thread switch on RISC-V (as Bare entry already cost); the AArch64 entry test is seven
+register instructions and a branch per vector entry, with no memory access; x86_64 none. QEMU timing is not hardware timing.
+
+**Still open.** A stack-depth bound (observed use is still not a bound; overflow now faults). The
+bound argument's compiled-code assumption above. Kernel threads remain cooperative (SC-KT-4).
