@@ -69,9 +69,12 @@ yarm_aarch64_kthread_trampoline:
     // KTHREAD-CLOSURE1 §C — every current-EL/SPx entry first tests the stack pointer it would
     // use, without touching memory: a kernel thread's stack is the bottom 16 KiB of a 16 MiB
     // stride of the window, so bit 14 is clear on it once a 272-byte frame is reserved, and set
-    // in the 16 KiB just below it (its gap). A deeper descent faults on its first store into
-    // the gap and re-enters here, still in the gap. `sp` and `x0` are swapped arithmetically to
-    // get a scratch register (no store); both are restored before the entry continues.
+    // in the 16 KiB just below it (the top of its gap). Deeper in the gap bit 14 repeats, so this
+    // test is not the defence: every overflow is a store into the gap, hence a synchronous
+    // exception, and the synchronous entry always moves to the emergency stack itself. The test
+    // only reports a shallow overflow found at entry (an interrupt) with the thread's own pc.
+    // `sp` and `x0` are swapped arithmetically to get a scratch register (no store); both are
+    // restored before the entry continues.
     .macro KT_SP_CHECK target
     sub sp, sp, #272
     add sp, sp, x0
