@@ -798,7 +798,7 @@ impl KThreadPool {
         }
         s.generation.store(generation, Ordering::Release);
         s.state.store(RESERVED, Ordering::Release);
-        let (low, high) = self.stack_bounds(slot);
+        let (_, high) = self.stack_bounds(slot);
         let (store_low, store_high) = self.storage_view().bounds(slot);
         // SAFETY: the slot's own reserved stack, through the storage view every context reaches;
         // no incarnation of this slot is live (Free → Reserved happened under the free list, and
@@ -825,7 +825,7 @@ impl KThreadPool {
         // KTHREAD1-ACCEPTANCE §4 witness (default-off): the creation is recorded before the
         // enqueue below, so nothing about this incarnation can be recorded before it.
         #[cfg(feature = "kthread1-witness")]
-        crate::kernel::kthread_witness::note_create(id, cpu, low, high);
+        crate::kernel::kthread_witness::note_create(id, cpu, self.stack_bounds(slot).0, high);
         let placed = self
             .shared()
             .with_cpu_sched_split(cpu, |c| {
