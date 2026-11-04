@@ -39,6 +39,76 @@ pub const KTHREAD_STACK_BYTES: usize = 256 * 1024;
 pub const KTHREAD_STACK_ALIGN: usize = 4096;
 /// The byte every stack is filled with at creation, so the deepest use can be measured.
 pub const KTHREAD_STACK_PAINT: u8 = 0x6B;
+/// KTHREAD-CLOSURE1 §C: where a port runs kernel-thread stacks, each stack sits at the bottom of
+/// its own `KSTACK_STRIDE` of a kernel-only window whose remainder is never mapped, so a thread
+/// that descends past its stack faults in the gap below it (contract §18.10.3).
+pub const KSTACK_STRIDE: usize = 16 << 20;
+
+/// KTHREAD-CLOSURE1 §C: one way of addressing the pool's stacks. Slot `i`'s stack is
+/// `[base + i * stride, base + i * stride + KTHREAD_STACK_BYTES)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackView {
+    pub base: usize,
+    pub stride: usize,
+}
+
+impl StackView {
+    /// The contiguous view: the physical storage, every stack next to the last.
+    pub const fn contiguous(base: usize) -> Self {
+        Self {
+            base,
+            stride: KTHREAD_STACK_BYTES,
+        }
+    }
+
+    /// The protected view of a window at `window`: slot `i` at `window + (i + 1) * KSTACK_STRIDE`
+    /// (the window's first stride is slot 0's gap).
+    pub const fn window(window: usize) -> Self {
+        Self {
+            base: window + KSTACK_STRIDE,
+            stride: KSTACK_STRIDE,
+        }
+    }
+
+    /// `[low, high)` of `slot`'s stack.
+    pub const fn bounds(&self, slot: usize) -> (usize, usize) {
+        let low = self.base + slot * self.stride;
+        (low, low + KTHREAD_STACK_BYTES)
+    }
+
+    /// The slot whose stack contains `addr`, if any (the gaps between stacks are no slot's).
+    pub const fn slot_of(&self, addr: usize) -> Option<usize> {
+        if self.base == 0 || addr < self.base {
+            return None;
+        }
+        let off = addr - self.base;
+        let slot = off / self.stride;
+        if slot >= KTHREAD_CAPACITY || off % self.stride >= KTHREAD_STACK_BYTES {
+            return None;
+        }
+        Some(slot)
+    }
+
+    /// The slot whose guard gap (the unmapped bytes below its stack, down to the previous stack's
+    /// top) contains `addr`, if any.
+    pub const fn gap_owner(&self, addr: usize) -> Option<usize> {
+        if self.stride == KTHREAD_STACK_BYTES || addr >= self.base + KTHREAD_CAPACITY * self.stride
+        {
+            return None;
+        }
+        // Slot i's gap is [base + i*stride - (stride - STACK), base + i*stride).
+        let first_gap = self.base - (self.stride - KTHREAD_STACK_BYTES);
+        if addr < first_gap {
+            return None;
+        }
+        let rel = addr + KTHREAD_STACK_BYTES - first_gap;
+        let slot = rel / self.stride;
+        if rel % self.stride < KTHREAD_STACK_BYTES || slot >= KTHREAD_CAPACITY {
+            return None;
+        }
+        Some(slot)
+    }
+}
 
 const TID_TAG: u64 = 0x4B54 << 48;
 const TID_TAG_MASK: u64 = 0xFFFF << 48;
@@ -426,6 +496,12 @@ struct KStacks([[u8; KTHREAD_STACK_BYTES]; KTHREAD_CAPACITY]);
 #[cfg(not(feature = "hosted-dev"))]
 static mut KSTACKS: KStacks = KStacks([[0; KTHREAD_STACK_BYTES]; KTHREAD_CAPACITY]);
 
+/// KTHREAD-CLOSURE1 §C: the production stack storage's address, for the port that maps its window.
+#[cfg(not(feature = "hosted-dev"))]
+pub(crate) fn kstacks_storage() -> usize {
+    core::ptr::addr_of!(KSTACKS) as usize
+}
+
 const _: () = assert!(KTHREAD_STACK_BYTES % KTHREAD_STACK_ALIGN == 0);
 const _: () = assert!(KTHREAD_CAPACITY <= u8::MAX as usize);
 
@@ -437,6 +513,9 @@ pub struct KThreadPool {
     stats: KPoolStats,
     /// KTHREAD-CLOSURE1 §B: this pool's stacks are in the plain-lock accounting table.
     plain_registered: AtomicBool,
+    /// KTHREAD-CLOSURE1 §C: the port's stack window, fixed at the pool's first creation (0 = none:
+    /// threads run on the storage). Never changes afterwards, so no live thread's addresses move.
+    window: AtomicUsize,
     /// Hosted model only: this pool's own stack storage, allocated on first creation.
     #[cfg(feature = "hosted-dev")]
     hosted_stacks: AtomicUsize,
@@ -473,6 +552,7 @@ impl KThreadPool {
             cpus: [const { KCpu::new() }; MAX_CPUS],
             stats: KPoolStats::new(),
             plain_registered: AtomicBool::new(false),
+            window: AtomicUsize::new(0),
             #[cfg(feature = "hosted-dev")]
             hosted_stacks: AtomicUsize::new(0),
             #[cfg(feature = "hosted-dev")]
@@ -536,21 +616,32 @@ impl KThreadPool {
         true
     }
 
-    /// `[low, high)` of `slot`'s stack.
-    pub(crate) fn stack_bounds(&self, slot: usize) -> (usize, usize) {
-        let low = self.stack_base() + slot * KTHREAD_STACK_BYTES;
-        (low, low + KTHREAD_STACK_BYTES)
+    /// KTHREAD-CLOSURE1 §C: the view threads RUN on — the port's protected window when it has
+    /// one, else the storage itself. Stack pointers, switch contexts, interrupt authentication,
+    /// residency checks and the plain-lock registry use it.
+    pub(crate) fn run_view(&self) -> StackView {
+        match self.window.load(Ordering::Acquire) {
+            0 => StackView::contiguous(self.stack_base()),
+            w => StackView::window(w),
+        }
     }
 
-    /// The slot whose stack contains `addr`, if any. An address in no stack — a trap stack, a boot
-    /// stack, a user address — answers `None`.
+    /// KTHREAD-CLOSURE1 §C: the storage view, reachable from every context: creation (paint and
+    /// first frame) and the high-water measurement use it.
+    pub(crate) fn storage_view(&self) -> StackView {
+        StackView::contiguous(self.stack_base())
+    }
+
+    /// `[low, high)` of `slot`'s stack, as its thread runs on it.
+    pub(crate) fn stack_bounds(&self, slot: usize) -> (usize, usize) {
+        self.run_view().bounds(slot)
+    }
+
+    /// The slot whose stack contains `addr` (in the run view), if any. An address in no stack — a
+    /// trap stack, a boot stack, a user address, a guard gap — answers `None`.
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub(crate) fn slot_of_stack_addr(&self, addr: usize) -> Option<usize> {
-        let base = self.stack_base();
-        if base == 0 || addr < base || addr >= base + KTHREAD_STACK_BYTES * KTHREAD_CAPACITY {
-            return None;
-        }
-        Some((addr - base) / KTHREAD_STACK_BYTES)
+        self.run_view().slot_of(addr)
     }
 
     fn stack_contains(&self, slot: usize, addr: usize) -> bool {
@@ -561,7 +652,7 @@ impl KThreadPool {
     /// The deepest byte of `slot`'s stack its current incarnation has written, measured from the
     /// paint laid down at creation. This is OBSERVED depth, not a proven bound.
     pub fn stack_high_water(&self, id: KThreadId) -> usize {
-        let (low, _) = self.stack_bounds(id.slot());
+        let (low, _) = self.storage_view().bounds(id.slot());
         let mut untouched = 0usize;
         while untouched < KTHREAD_STACK_BYTES {
             // SAFETY: inside the slot's own reserved stack.
@@ -670,7 +761,10 @@ impl KThreadPool {
             // KTHREAD-CLOSURE1 §B: the stacks enter the plain-lock accounting before any thread of
             // this pool can run, under the pool lock so no concurrent creation overtakes it.
             if !self.plain_registered.load(Ordering::Acquire) {
-                if !plain_register(self.stack_base(), self.plain_counters()) {
+                // KTHREAD-CLOSURE1 §C: the run view is fixed here, before any thread exists.
+                self.window
+                    .store(arch::kstack_window().unwrap_or(0), Ordering::Release);
+                if !plain_register(self.run_view(), self.plain_counters()) {
                     return Err(KCreateError::NoStorage);
                 }
                 self.plain_registered.store(true, Ordering::Release);
@@ -705,13 +799,27 @@ impl KThreadPool {
         s.generation.store(generation, Ordering::Release);
         s.state.store(RESERVED, Ordering::Release);
         let (low, high) = self.stack_bounds(slot);
-        // SAFETY: the slot's own reserved stack; no incarnation of this slot is live (Free →
-        // Reserved happened under the free list, and the previous one was reclaimed only after
-        // its CPU switched away from it).
-        unsafe { core::ptr::write_bytes(low as *mut u8, KTHREAD_STACK_PAINT, high - low) };
-        // SAFETY: as above — the context belongs to a slot no CPU can enter.
+        let (store_low, store_high) = self.storage_view().bounds(slot);
+        // SAFETY: the slot's own reserved stack, through the storage view every context reaches;
+        // no incarnation of this slot is live (Free → Reserved happened under the free list, and
+        // the previous one was reclaimed only after its CPU switched away from it).
         unsafe {
-            arch::prepare_first_entry(&mut *s.ctx.get(), high, self as *const Self as usize, slot)
+            core::ptr::write_bytes(
+                store_low as *mut u8,
+                KTHREAD_STACK_PAINT,
+                store_high - store_low,
+            )
+        };
+        // SAFETY: as above — the context belongs to a slot no CPU can enter. The thread runs at
+        // `high` (the run view); any first frame is written at `store_high`, the same bytes.
+        unsafe {
+            arch::prepare_first_entry(
+                &mut *s.ctx.get(),
+                high,
+                store_high,
+                self as *const Self as usize,
+                slot,
+            )
         };
         let id = KThreadId::encode(slot, generation);
         // KTHREAD1-ACCEPTANCE §4 witness (default-off): the creation is recorded before the
@@ -815,9 +923,13 @@ impl KThreadPool {
         crate::kernel::kthread_witness::note_dispatch(cpu, id);
         arch::before_kthread_dispatch(cpu);
         arch::enter_kthread_vectors(cpu);
+        // KTHREAD-CLOSURE1 §C: the root the thread's stack window lives in (RISC-V; elsewhere the
+        // kernel root just entered already carries it).
+        arch::enter_kthread_root(cpu);
         // SAFETY: interrupts are masked; the dispatcher context is this CPU's own, and the slot's
         // context was prepared by `create` or saved by the thread's last switch on this CPU.
         unsafe { arch::switch(k.dispatcher.get(), s.ctx.get()) };
+        arch::leave_kthread_root(cpu);
         arch::leave_kthread_vectors(cpu);
         k.running.store(0, Ordering::Release);
         let reason =
@@ -1373,17 +1485,19 @@ const PLAIN_POOLS: usize = 2;
 #[cfg(feature = "hosted-dev")]
 const PLAIN_POOLS: usize = 256;
 
-/// One registered stack region: its base (0 = free entry) and its counters' address. Registered
+/// One registered stack region: its run view (base 0 = free entry) and its counters' address. Registered
 /// under the pool's lock before any thread of the pool runs; the counters are written before the
 /// base is published and the base is cleared first, so a reader that sees a base sees its counters.
 struct PlainEntry {
     base: AtomicUsize,
+    stride: AtomicUsize,
     counters: AtomicUsize,
 }
 
 static PLAIN_TABLE: [PlainEntry; PLAIN_POOLS] = [const {
     PlainEntry {
         base: AtomicUsize::new(0),
+        stride: AtomicUsize::new(0),
         counters: AtomicUsize::new(0),
     }
 }; PLAIN_POOLS];
@@ -1392,7 +1506,8 @@ static PLAIN_HIGH: AtomicUsize = AtomicUsize::new(0);
 /// Accounting failures latched by the lock path (overflow, underflow, cross-stack release).
 static PLAIN_ACCOUNTING_FAULTS: AtomicU64 = AtomicU64::new(0);
 
-fn plain_register(base: usize, counters: &[AtomicU32; KTHREAD_CAPACITY]) -> bool {
+fn plain_register(view: StackView, counters: &[AtomicU32; KTHREAD_CAPACITY]) -> bool {
+    let base = view.base;
     if base == 0 {
         return false;
     }
@@ -1406,6 +1521,7 @@ fn plain_register(base: usize, counters: &[AtomicU32; KTHREAD_CAPACITY]) -> bool
             )
             .is_ok()
         {
+            e.stride.store(view.stride, Ordering::Release);
             e.base.store(base, Ordering::Release);
             PLAIN_HIGH.fetch_max(i + 1, Ordering::AcqRel);
             return true;
@@ -1434,15 +1550,22 @@ fn plain_counter_at(sp: usize) -> Option<&'static AtomicU32> {
     let high = PLAIN_HIGH.load(Ordering::Acquire);
     for e in &PLAIN_TABLE[..high] {
         let base = e.base.load(Ordering::Acquire);
-        if base == 0 || sp < base || sp >= base + KTHREAD_STACK_BYTES * KTHREAD_CAPACITY {
+        if base == 0 {
             continue;
         }
+        let view = StackView {
+            base,
+            stride: e.stride.load(Ordering::Acquire),
+        };
+        let Some(slot) = view.slot_of(sp) else {
+            continue;
+        };
         let counters = e.counters.load(Ordering::Acquire) as *const AtomicU32;
         // SAFETY: a published base has its counters (`plain_register`); they are a
         // `[AtomicU32; KTHREAD_CAPACITY]` that lives until the entry is cleared (production: for
         // the kernel's lifetime; hosted: until the pool's `Drop`, which runs with no thread of the
         // pool running, so no guard taken on its stacks is live).
-        return Some(unsafe { &*counters.add((sp - base) / KTHREAD_STACK_BYTES) });
+        return Some(unsafe { &*counters.add(slot) });
     }
     None
 }
@@ -1533,6 +1656,78 @@ impl KThreadPool {
 /// Accounting failures the lock path has latched since boot. Observation only.
 pub fn plain_accounting_faults() -> u64 {
     PLAIN_ACCOUNTING_FAULTS.load(Ordering::Acquire)
+}
+
+// ── KTHREAD-CLOSURE1 §C: the stack-fault report ───────────────────────────────────────────────
+
+/// A fixed-size line buffer: the report is formatted on the fault stack without allocating.
+#[cfg(not(feature = "hosted-dev"))]
+struct LineBuf {
+    buf: [u8; 200],
+    len: usize,
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+impl core::fmt::Write for LineBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+static STACK_FAULT_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// KTHREAD-CLOSURE1 §C: a kernel-mode fault taken while a kernel thread ran, on the port's fault
+/// stack (never the faulting one). `fault` is the faulting data address (or, where the port has
+/// none, the stack pointer). The report is written once per boot through `raw_line` — an
+/// unlocked console path, because the faulting thread may hold any lock — and the caller halts.
+/// A fault in a guard gap of the pool's window is a stack overflow of the gap's owner.
+#[cfg(not(feature = "hosted-dev"))]
+pub(crate) fn report_kernel_thread_fault(
+    pool: Option<&KThreadPool>,
+    arch_name: &str,
+    cpu: usize,
+    cause: u64,
+    fault: usize,
+    sp: usize,
+    pc: usize,
+    raw_line: fn(&str),
+) {
+    use core::fmt::Write;
+    if STACK_FAULT_REPORTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut line = LineBuf {
+        buf: [0; 200],
+        len: 0,
+    };
+    let view = pool.map(KThreadPool::run_view);
+    let owner = view.and_then(|v| v.gap_owner(fault));
+    let _ = match (owner, pool) {
+        (Some(slot), Some(pool)) => write!(
+            line,
+            "KTHREAD_STACK_OVERFLOW arch={} cpu={} kthread={:#x} slot={} guard={:#x} sp={:#x} pc={:#x} cause={:#x} result=fatal",
+            arch_name,
+            cpu,
+            KThreadId::encode(slot, pool.slots[slot].generation.load(Ordering::Acquire)).raw(),
+            slot,
+            fault,
+            sp,
+            pc,
+            cause
+        ),
+        _ => write!(
+            line,
+            "KTHREAD_FAULT arch={} cpu={} addr={:#x} sp={:#x} pc={:#x} cause={:#x} result=fatal",
+            arch_name, cpu, fault, sp, pc, cause
+        ),
+    };
+    if let Ok(s) = core::str::from_utf8(&line.buf[..line.len]) {
+        crate::kernel::printk::emit_fatal_line(s, raw_line);
+    }
 }
 
 // ── the internal wait owner ───────────────────────────────────────────────────────────────────

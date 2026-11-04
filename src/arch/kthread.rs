@@ -75,6 +75,15 @@ mod hosted {
 
     pub fn before_kthread_dispatch(_cpu: CpuId) {}
 
+    pub fn enter_kthread_root(_cpu: CpuId) {}
+
+    pub fn leave_kthread_root(_cpu: CpuId) {}
+
+    /// No window in the hosted model: threads run on the storage itself.
+    pub fn kstack_window() -> Option<usize> {
+        None
+    }
+
     pub fn enter_kthread_vectors(_cpu: CpuId) {}
 
     pub fn leave_kthread_vectors(_cpu: CpuId) {}
@@ -96,6 +105,7 @@ mod hosted {
     pub unsafe fn prepare_first_entry(
         _c: &mut KSwitchContext,
         _top: usize,
+        _write_top: usize,
         _pool: usize,
         _slot: usize,
     ) {

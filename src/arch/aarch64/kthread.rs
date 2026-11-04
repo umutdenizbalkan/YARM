@@ -66,6 +66,23 @@ yarm_aarch64_kthread_trampoline:
     bl yarm_kthread_first_entry
     brk #0
 
+    // KTHREAD-CLOSURE1 §C — every current-EL/SPx entry first tests the stack pointer it would
+    // use, without touching memory: a kernel thread's stack is the bottom 16 KiB of a 16 MiB
+    // stride of the window, so bit 14 is clear on it once a 272-byte frame is reserved, and set
+    // in the 16 KiB just below it (its gap). A deeper descent faults on its first store into
+    // the gap and re-enters here, still in the gap. `sp` and `x0` are swapped arithmetically to
+    // get a scratch register (no store); both are restored before the entry continues.
+    .macro KT_SP_CHECK target
+    sub sp, sp, #272
+    add sp, sp, x0
+    sub x0, sp, x0
+    tbnz x0, #14, yarm_aarch64_kthread_overflow
+    sub x0, sp, x0
+    sub sp, sp, x0
+    add sp, sp, #272
+    b \target
+    .endm
+
     // The kernel-thread vector table, in `VBAR_EL1` only while a kernel thread runs. Only the
     // "current EL with SPx" IRQ entry is serviced; a synchronous exception at EL1 is reported as
     // a kernel-thread fault and halts; every other entry keeps the production stub's handling.
@@ -82,13 +99,13 @@ yarm_aarch64_kthread_vectors:
     .balign 128
     b yarm_aarch64_vector_serror_lower_a64_sp0
     .balign 128
-    b yarm_aarch64_kthread_sync_entry
+    KT_SP_CHECK yarm_aarch64_kthread_sync_entry
     .balign 128
-    b yarm_aarch64_kthread_irq_entry
+    KT_SP_CHECK yarm_aarch64_kthread_irq_entry
     .balign 128
-    b yarm_aarch64_vector_fiq_current
+    KT_SP_CHECK yarm_aarch64_vector_fiq_current
     .balign 128
-    b yarm_aarch64_vector_serror_current
+    KT_SP_CHECK yarm_aarch64_vector_serror_current
     .balign 128
     b yarm_aarch64_vector_sync_lower_a64
     .balign 128
@@ -157,9 +174,38 @@ yarm_aarch64_kthread_irq_entry:
     add sp, sp, #272
     eret
 
+    // KTHREAD-CLOSURE1 §C — a vector entry found its stack pointer in a guard gap: x0 holds it
+    // (with the 272-byte reservation). Switch to this CPU's emergency stack (`TPIDR_EL1` is the
+    // logical CPU) and report; never returns.
+    .global yarm_aarch64_kthread_overflow
+    .type yarm_aarch64_kthread_overflow, %function
+yarm_aarch64_kthread_overflow:
+    mov x3, x0
+    adrp x1, YARM_AARCH64_KSTACK_EMERGENCY
+    add x1, x1, :lo12:YARM_AARCH64_KSTACK_EMERGENCY
+    mrs x2, tpidr_el1
+    and x2, x2, #7
+    add x1, x1, x2, lsl #14
+    add sp, x1, #16384
+    mrs x0, esr_el1
+    mrs x1, elr_el1
+    mrs x2, far_el1
+    bl yarm_aarch64_kthread_stack_fault
+    b .
+
     .global yarm_aarch64_kthread_sync_entry
     .type yarm_aarch64_kthread_sync_entry, %function
 yarm_aarch64_kthread_sync_entry:
+    // KTHREAD-CLOSURE1 §C: a synchronous exception on a kernel thread is always fatal, and its
+    // stack may be the cause (a store that faulted in a guard gap without moving `sp` would fault
+    // again at once in any handler on that stack). Report from this CPU's emergency stack.
+    mov x3, sp
+    adrp x1, YARM_AARCH64_KSTACK_EMERGENCY
+    add x1, x1, :lo12:YARM_AARCH64_KSTACK_EMERGENCY
+    mrs x2, tpidr_el1
+    and x2, x2, #7
+    add x1, x1, x2, lsl #14
+    add sp, x1, #16384
     mrs x0, esr_el1
     mrs x1, elr_el1
     mrs x2, far_el1
@@ -195,6 +241,7 @@ pub unsafe fn switch(prev: *mut KSwitchContext, next: *const KSwitchContext) {
 pub unsafe fn prepare_first_entry(
     ctx: &mut KSwitchContext,
     stack_top: usize,
+    _write_top: usize,
     pool: usize,
     slot: usize,
 ) {
@@ -203,6 +250,20 @@ pub unsafe fn prepare_first_entry(
     ctx.sp = stack_top & !0xF;
     ctx.x[0] = pool;
     ctx.x[1] = slot;
+}
+
+/// KTHREAD-CLOSURE1 §C: kernel threads run on the kernel root the dispatcher already entered.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn enter_kthread_root(_cpu: CpuId) {}
+
+/// KTHREAD-CLOSURE1 §C: nothing to leave.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn leave_kthread_root(_cpu: CpuId) {}
+
+/// KTHREAD-CLOSURE1 §C: the protected kernel-thread stack window, once installed.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn kstack_window() -> Option<usize> {
+    crate::arch::aarch64::kstack_window::window()
 }
 
 #[cfg(not(feature = "hosted-dev"))]
@@ -276,9 +337,43 @@ pub fn leave_kthread_vectors(_cpu: CpuId) {
 }
 
 /// A synchronous exception on a kernel thread: kernel-fatal, reported by name.
+/// KTHREAD-CLOSURE1 §C — an exception taken with the stack pointer in a guard gap, on this CPU's
+/// emergency stack. Reported raw (the faulting thread may hold the console lock); this CPU halts.
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
-extern "C" fn yarm_aarch64_kthread_fault(esr: u64, elr: u64, far: u64) -> ! {
+extern "C" fn yarm_aarch64_kthread_stack_fault(esr: u64, elr: u64, far: u64, sp: u64) -> ! {
+    let shared = crate::arch::aarch64::boot::trap_shared_kernel();
+    // A data abort reports the faulting address; anything else is located by its stack pointer.
+    let ec = (esr >> 26) & 0x3F;
+    let addr = if ec == 0x25 { far } else { sp };
+    crate::kernel::kthread::report_kernel_thread_fault(
+        shared.map(|s| &s.kthreads),
+        "aarch64",
+        crate::arch::aarch64::this_cpu_index(),
+        esr,
+        addr as usize,
+        sp as usize + 272,
+        elr as usize,
+        crate::arch::aarch64::console::write_line_unlocked,
+    );
+    loop {
+        // SAFETY: halting this CPU with interrupts masked.
+        unsafe { core::arch::asm!("msr daifset, #0xf", "wfi", options(nomem, nostack)) };
+    }
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_kthread_fault(esr: u64, elr: u64, far: u64, sp: u64) -> ! {
+    // KTHREAD-CLOSURE1 §C (on the emergency stack): a data abort in a guard gap, or any exception
+    // taken with the thread's stack pointer in one, is that thread's overflow.
+    let in_gap = |a: u64| {
+        crate::arch::aarch64::boot::trap_shared_kernel()
+            .is_some_and(|s| s.kthreads.run_view().gap_owner(a as usize).is_some())
+    };
+    if ((esr >> 26) & 0x3F == 0x25 && in_gap(far)) || in_gap(sp) {
+        yarm_aarch64_kthread_stack_fault(esr, elr, far, sp - 272);
+    }
     panic!(
         "KTHREAD_FAULT arch=aarch64 cpu={} esr={:#x} elr={:#x} far={:#x} result=fatal",
         crate::arch::aarch64::this_cpu_index(),

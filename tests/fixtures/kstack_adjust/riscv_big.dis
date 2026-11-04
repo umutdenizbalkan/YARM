@@ -1,0 +1,4 @@
+0000000080002000 <_ZN4yarm6kernel3big17h0123456789abcdefE>:
+    80002000:	lui	t0, 0x900
+    80002004:	sub	sp, sp, t0
+    80002008:	ret

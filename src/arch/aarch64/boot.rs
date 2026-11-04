@@ -9491,6 +9491,10 @@ fn setup_bootstrap_mmu() {
             );
         }
 
+        // KTHREAD-CLOSURE1 §C: L1[64] becomes the kernel-thread stack window (replacing an identity
+        // block over no RAM or device).
+        crate::arch::aarch64::kstack_window::install(l1_ptr);
+
         for idx in 0..512 {
             let base = (idx as u64) * AARCH64_BLOCK_2M;
             core::ptr::write(

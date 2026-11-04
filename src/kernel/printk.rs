@@ -353,6 +353,22 @@ pub fn printk_emit_sync(args: fmt::Arguments<'_>) {
 #[cfg(feature = "hosted-dev")]
 pub fn printk_emit_sync(_args: fmt::Arguments<'_>) {}
 
+/// KTHREAD-CLOSURE1 §C: a fatal report line from a context that may itself hold any lock. The drain
+/// lock is tried a bounded number of times (so the line is not byte-interleaved with another CPU's
+/// drained output); if it cannot be had, the line is written anyway. `raw` must not take a lock it
+/// could wait on forever.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn emit_fatal_line(line: &str, raw: fn(&str)) {
+    for _ in 0..1_000_000 {
+        if let Some(_g) = PRINTK_DRAIN_LOCK.try_lock() {
+            raw(line);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    raw(line);
+}
+
 #[macro_export]
 macro_rules! printk {
     ($lvl:expr, $ctx:expr, $($arg:tt)*) => {{

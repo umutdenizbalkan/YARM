@@ -1,0 +1,4 @@
+ffffffff80003000 <_ZN4yarm6kernel3dyn17h0123456789abcdefE>:
+ffffffff80003000:	mov	rax, qword ptr [rdi + 0x8]
+ffffffff80003004:	sub	rsp, rax
+ffffffff80003007:	ret

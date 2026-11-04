@@ -1,0 +1,7 @@
+ffffffff80001000 <_ZN4yarm6kernel3foo17h0123456789abcdefE>:
+ffffffff80001000:	push	rbp
+ffffffff80001001:	sub	rsp, 0x2000
+ffffffff80001008:	mov	eax, 0x100000
+ffffffff8000100d:	sub	rsp, rax
+ffffffff80001010:	add	rsp, 0x102000
+ffffffff80001017:	ret

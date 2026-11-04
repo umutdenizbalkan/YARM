@@ -1,0 +1,5 @@
+0000000040002000 <_ZN4yarm6kernel3big17h0123456789abcdefE>:
+    40002000:	mov	x9, #0x0
+    40002004:	movk	x9, #0x90, lsl #16
+    40002008:	sub	sp, sp, x9
+    4000200c:	ret

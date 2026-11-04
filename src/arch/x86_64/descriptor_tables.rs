@@ -355,6 +355,26 @@ pub(crate) fn load_kthread_idt() {
                         0,
                     ),
                 );
+                // KTHREAD-CLOSURE1 §C: #PF and #DF report a kernel-thread fault (an overflow into
+                // a guard gap included) on the production IST stacks, never the faulting one.
+                core::ptr::write(
+                    dst.add(VEC_PAGE_FAULT),
+                    X86IdtEntry::new_interrupt(
+                        super::kthread::yarm_x86_64_kthread_pf_stub as *const () as u64,
+                        KERNEL_CODE_SELECTOR,
+                        0,
+                        3,
+                    ),
+                );
+                core::ptr::write(
+                    dst.add(VEC_DOUBLE_FAULT),
+                    X86IdtEntry::new_interrupt(
+                        super::kthread::yarm_x86_64_kthread_df_stub as *const () as u64,
+                        KERNEL_CODE_SELECTOR,
+                        0,
+                        2,
+                    ),
+                );
                 // KTHREAD1-ACCEPTANCE §2: device vectors enter the kernel-thread device bridge.
                 for (i, &stub) in super::kthread::yarm_x86_64_kthread_dev_stubs
                     .iter()

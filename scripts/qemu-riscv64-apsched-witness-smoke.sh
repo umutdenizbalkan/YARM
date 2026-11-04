@@ -46,6 +46,8 @@ QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
 FEATURE=${APSW_FEATURE:-riscv64-apsched-witness}
 case "$FEATURE" in
   riscv64-apsched-witness|riscv64-sched-lock1-witness|riscv64-kthread1-witness) ;;
+  # KTHREAD-CLOSURE1 §C: the live stack-overflow probes (scripts/qemu-kstack-probe-smoke.sh).
+  riscv64-kthread1-witness,kstack-probe-access|riscv64-kthread1-witness,kstack-probe-recursion|riscv64-kthread1-witness,kstack-probe-frame) ;;
   *) echo "APSW_WITNESS_SEAL arch=riscv64 result=fail reason=unsupported_feature feature=$FEATURE"; exit 2 ;;
 esac
 PIN=scripts/firmware/riscv64-opensbi.pin
@@ -104,6 +106,9 @@ args = [qemu, "-machine", "virt", "-cpu", "rv64", "-m", "512M", "-smp", smp,
         "-initrd", os.path.join(build, "initramfs-core.cpio"),
         "-append", cmdline]
 p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+# KTHREAD-CLOSURE1 §C: APSW_STOP_ON="A|B" ends the boot at the first of those markers instead
+# (a fatal probe never reaches the dump).
+ANY = [m.encode() for m in os.environ.get("APSW_STOP_ON", "").split("|") if m]
 start, seen, tail = time.time(), None, b""
 with open(log, "wb") as out:
     while True:
@@ -116,7 +121,7 @@ with open(log, "wb") as out:
             window = tail + chunk
             pending = {m for m in pending if m not in window}
             tail = window[-4096:]
-            if seen is None and not pending:
+            if seen is None and (any(m in window for m in ANY) if ANY else not pending):
                 seen = time.time()
         now = time.time()
         if (seen is not None and now - seen > 3) or now - start > budget:

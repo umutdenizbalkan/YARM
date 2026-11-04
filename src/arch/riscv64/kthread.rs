@@ -22,6 +22,9 @@ pub struct KSwitchContext {
     ra: usize,      // 0
     sp: usize,      // 8
     s: [usize; 12], // 16..=104: s0..s11
+    /// KTHREAD-CLOSURE1 §C: a kernel thread's `tp` is its stack's low bound, which the vector
+    /// compares `sp` against; the dispatcher's `tp` (the interrupted user's) is saved and restored.
+    tp: usize, // 112
 }
 
 impl KSwitchContext {
@@ -30,6 +33,7 @@ impl KSwitchContext {
             ra: 0,
             sp: 0,
             s: [0; 12],
+            tp: 0,
         }
     }
 }
@@ -55,6 +59,7 @@ yarm_riscv64_kthread_switch:
     sd s9, 88(a0)
     sd s10, 96(a0)
     sd s11, 104(a0)
+    sd tp, 112(a0)
     ld ra, 0(a1)
     ld sp, 8(a1)
     ld s0, 16(a1)
@@ -69,6 +74,7 @@ yarm_riscv64_kthread_switch:
     ld s9, 88(a1)
     ld s10, 96(a1)
     ld s11, 104(a1)
+    ld tp, 112(a1)
     ret
 
     .global yarm_riscv64_kthread_trampoline
@@ -87,6 +93,9 @@ yarm_riscv64_kthread_trampoline:
     .type yarm_riscv64_kthread_vector, @function
 yarm_riscv64_kthread_vector:
     addi sp, sp, -304
+    // KTHREAD-CLOSURE1 §C: one unsigned compare before any store: `tp` is the running thread's
+    // stack low bound, so a frame that would land below it lands in the guard gap.
+    bltu sp, tp, yarm_riscv64_kthread_overflow
     sd x1,   0(sp)
     sd x3,  16(sp)
     sd x4,  24(sp)
@@ -165,6 +174,21 @@ yarm_riscv64_kthread_vector:
     ld x31, 240(sp)
     addi sp, sp, 304
     sret
+
+    // KTHREAD-CLOSURE1 §C — the vector found its frame below the thread's stack. The report runs
+    // on the overflowed thread's own stack, from its top (`tp` + 16 KiB): mapped, and abandoned,
+    // since the thread never runs again. Interrupts are masked (trap entry). Never returns.
+    .global yarm_riscv64_kthread_overflow
+    .type yarm_riscv64_kthread_overflow, @function
+yarm_riscv64_kthread_overflow:
+    mv a3, sp
+    li t0, 16384
+    add sp, tp, t0
+    csrr a0, scause
+    csrr a1, sepc
+    csrr a2, stval
+    call yarm_riscv64_kthread_stack_fault
+    unimp
 "#
 );
 
@@ -195,14 +219,62 @@ pub unsafe fn switch(prev: *mut KSwitchContext, next: *const KSwitchContext) {
 pub unsafe fn prepare_first_entry(
     ctx: &mut KSwitchContext,
     stack_top: usize,
+    _write_top: usize,
     pool: usize,
     slot: usize,
 ) {
     *ctx = KSwitchContext::zeroed();
     ctx.ra = yarm_riscv64_kthread_trampoline as *const () as usize;
     ctx.sp = stack_top & !0xF;
+    ctx.tp = stack_top - crate::kernel::kthread::KTHREAD_STACK_BYTES;
     ctx.s[0] = pool;
     ctx.s[1] = slot;
+}
+
+/// KTHREAD-CLOSURE1 §C: the protected kernel-thread stack window (built on first use).
+#[cfg(not(feature = "hosted-dev"))]
+pub fn kstack_window() -> Option<usize> {
+    crate::arch::riscv64::kstack_window::window()
+}
+
+/// KTHREAD-CLOSURE1 §C: a thread runs under the kernel-thread root; the hart returns to Bare after.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn enter_kthread_root(_cpu: CpuId) {
+    crate::arch::riscv64::kstack_window::enter_root();
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+pub fn leave_kthread_root(_cpu: CpuId) {
+    crate::arch::riscv64::kstack_window::leave_root();
+}
+
+/// KTHREAD-CLOSURE1 §C — a fault taken with the frame below the thread's stack, or a load/store
+/// page fault into a guard gap: reported raw through SBI, then the hart halts.
+#[cfg(not(feature = "hosted-dev"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_riscv64_kthread_stack_fault(scause: u64, sepc: u64, stval: u64, sp: u64) -> ! {
+    // A load/store page fault carries its address; anything else is located by the stack pointer.
+    let addr = if scause == 13 || scause == 15 {
+        stval
+    } else {
+        sp
+    };
+    crate::kernel::kthread::report_kernel_thread_fault(
+        crate::arch::riscv64::boot::trap_shared_kernel_riscv().map(|s| &s.kthreads),
+        "riscv64",
+        hardware_cpu().map_or(usize::MAX, |c| c.0 as usize),
+        scause,
+        addr as usize,
+        sp as usize + 304,
+        sepc as usize,
+        sbi_line,
+    );
+    crate::arch::riscv64::boot::kthread_fatal_halt();
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+fn sbi_line(s: &str) {
+    crate::arch::riscv64::boot::early_sbi_marker(format_args!("{}", s));
 }
 
 #[cfg(not(feature = "hosted-dev"))]
@@ -302,6 +374,15 @@ extern "C" fn yarm_riscv64_kthread_trap(frame: *mut crate::arch::riscv64::boot::
         unsafe { ((*frame).scause as usize, (*frame).sepc, (*frame).stval) };
     let code = scause & !INTERRUPT;
     let is_irq = scause & INTERRUPT != 0;
+    // KTHREAD-CLOSURE1 §C: a load/store page fault into a guard gap (an access below the stack
+    // with the stack pointer still on it) is that thread's overflow.
+    if !is_irq
+        && (code == 13 || code == 15)
+        && crate::arch::riscv64::boot::trap_shared_kernel_riscv()
+            .is_some_and(|s| s.kthreads.run_view().gap_owner(stval as usize).is_some())
+    {
+        yarm_riscv64_kthread_stack_fault(scause as u64, sepc as u64, stval as u64, frame as u64);
+    }
     if !is_irq
         || (code != SUPERVISOR_TIMER && code != SUPERVISOR_SOFTWARE && code != SUPERVISOR_EXTERNAL)
     {

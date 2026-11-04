@@ -68,6 +68,8 @@ KID_TAG = 0x4B54 << 48
 # KTHREAD_CAPACITY / KTHREAD_STACK_BYTES, src/kernel/kthread_witness.rs ROUNDS / CYCLES). Required
 # populations derive from these and from the create records, never from what a run reports alone.
 CAPACITY, STACK_BYTES, ROUNDS_REQ, CYCLES = 32, 16384, 5, 6
+# KTHREAD-CLOSURE1 §C: the protected window's stride (src/kernel/kthread.rs KSTACK_STRIDE).
+KSTACK_STRIDE = 16 << 20
 # P, the one-CPU user workload (src/kernel/apsched_witness.rs P_TID; its S1 rounds in
 # src/arch/<isa>/apsched_witness.S): round k stores k * S1_MUL ^ S1_SALT and reports what it reads
 # back; a receive with a real deadline must end TimedOut (9, the receive ABI's error code).
@@ -125,10 +127,14 @@ def replay(recs):
     if (pop.f[2], pop.f[3], pop.f[4]) != (CAPACITY, STACK_BYTES, ROUNDS_REQ):
         bad.append("contract_mismatch capacity=%d stack=%d rounds=%d" % (pop.f[2], pop.f[3], pop.f[4]))
     cpus = {c for c in range(8) if pop.f[0] & (1 << c)}
-    dkid, dhome, dlow, dhigh = d.f[0], d.f[1], d.f[2], d.f[3]
+    dkid, dhome, dlow, dhigh, stride = d.f[0], d.f[1], d.f[2], d.f[3], d.f[4]
     if not kid_ok(dkid) or d.cpu != dhome or dhigh - dlow != STACK_BYTES:
         bad.append("director_identity kid=0x%x" % dkid)
-    base = dlow - kslot(dkid) * STACK_BYTES
+    # KTHREAD-CLOSURE1 §C: stacks run either contiguously or one per 16 MiB stride of the window.
+    if stride not in (STACK_BYTES, KSTACK_STRIDE):
+        bad.append("director_stack_stride 0x%x" % stride)
+        stride = STACK_BYTES
+    base = dlow - kslot(dkid) * stride
     th = {}
     holder_of = {kslot(dkid): dkid}
     waker = None
@@ -185,7 +191,7 @@ def replay(recs):
                 continue
             if home not in cpus:
                 bad.append("create_home_outside_population kid=0x%x home=%d" % (kid, home))
-            if high - low != STACK_BYTES or low - kslot(kid) * STACK_BYTES != base:
+            if high - low != STACK_BYTES or low - kslot(kid) * stride != base:
                 bad.append("create_stack_not_the_slots kid=0x%x" % kid)
             prev = holder_of.get(kslot(kid))
             if prev == dkid:

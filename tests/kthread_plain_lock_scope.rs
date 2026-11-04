@@ -204,7 +204,9 @@ fn every_hand_rolled_lock_is_in_the_audited_set() {
         ("src/kernel/boot/mod.rs", 2),
         ("src/kernel/boot/orchestrator_state.rs", 1),
         ("src/kernel/boot/tests.rs", 2),
-        ("src/kernel/lock.rs", 3),
+        // The lock types' own acquisitions (KTHREAD-CLOSURE1 §C added `SpinLockIrq::try_lock`, used
+        // only by the fatal stack-fault report).
+        ("src/kernel/lock.rs", 4),
         ("src/kernel/syscall/process.rs", 1),
     ]
     .into_iter()

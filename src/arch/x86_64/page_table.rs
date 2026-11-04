@@ -235,6 +235,16 @@ impl PageTableState {
         } else {
             let detected = detect_active_root_phys_from_cr3()?;
             self.canonical_kernel_root_phys = Some(detected);
+            // KTHREAD-CLOSURE1 §C: the kernel-thread stack window enters the canonical root before
+            // the first user root is cloned from it, so every root carries it.
+            #[cfg(all(not(feature = "hosted-dev"), not(test)))]
+            // SAFETY: the canonical root, through the direct map; only this writes PML4[510].
+            unsafe {
+                crate::arch::x86_64::kstack_window::install(
+                    detected,
+                    crate::kernel::kthread::kstacks_storage(),
+                )
+            };
             detected
         };
         if let Err(err) = clone_kernel_pml4_half_into_root(canonical_kernel_root_phys, root_phys) {

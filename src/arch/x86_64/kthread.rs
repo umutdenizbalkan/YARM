@@ -90,23 +90,28 @@ pub unsafe fn switch(prev: *mut KSwitchContext, next: *const KSwitchContext) {
     unsafe { yarm_x86_64_kthread_switch(prev, next) }
 }
 
-/// Make `ctx` enter the trampoline on a fresh stack ending at `stack_top`, carrying `pool` and
-/// `slot` in `r12`/`r13`.
+/// Make `ctx` enter the trampoline on a fresh stack ending at `stack_top` (the address the thread
+/// runs at), carrying `pool` and `slot` in `r12`/`r13`. The return slot is written through
+/// `write_top`, the same stack's end in a view the creating context can reach (KTHREAD-CLOSURE1
+/// §C: the run view may be a window mapped only for kernel threads).
 ///
 /// # Safety
-/// `stack_top` is the exclusive end of a writable stack no CPU is using.
+/// `write_top` is the exclusive end of a writable stack no CPU is using, and `stack_top` names the
+/// same bytes for the thread.
 pub unsafe fn prepare_first_entry(
     ctx: &mut KSwitchContext,
     stack_top: usize,
+    write_top: usize,
     pool: usize,
     slot: usize,
 ) {
     let top = stack_top & !0xF;
     let ret_slot = top - 8;
+    let write_slot = (write_top & !0xF) - 8;
     // SAFETY: inside the caller's stack.
     unsafe {
         core::ptr::write(
-            ret_slot as *mut usize,
+            write_slot as *mut usize,
             yarm_x86_64_kthread_trampoline as *const () as usize,
         )
     };
@@ -157,6 +162,17 @@ mod bare {
         };
         sp
     }
+
+    /// KTHREAD-CLOSURE1 §C: the protected kernel-thread stack window, once installed.
+    pub fn kstack_window() -> Option<usize> {
+        crate::arch::x86_64::kstack_window::window()
+    }
+
+    /// KTHREAD-CLOSURE1 §C: kernel threads run on the kernel root the dispatcher already entered.
+    pub fn enter_kthread_root(_cpu: CpuId) {}
+
+    /// KTHREAD-CLOSURE1 §C: nothing to leave.
+    pub fn leave_kthread_root(_cpu: CpuId) {}
 
     /// A kernel thread is about to run on `cpu`. x86_64 parks no idle timer: nothing to restore.
     pub fn before_kthread_dispatch(_cpu: CpuId) {}
@@ -253,6 +269,30 @@ mod bare {
         .endr
         .section .text, "ax", @progbits
 
+        // KTHREAD-CLOSURE1 §C — #PF and #DF while a kernel thread runs. Both gates use an IST
+        // stack (the production slots: 3 for #PF, 2 for #DF), so the CPU never pushes onto the
+        // faulting stack. The CPU pushed an error code: the frame is err, rip, cs, rflags, rsp,
+        // ss. Neither returns.
+        .global yarm_x86_64_kthread_pf_stub
+        .type yarm_x86_64_kthread_pf_stub, @function
+    yarm_x86_64_kthread_pf_stub:
+        mov rdi, rsp
+        mov rsi, cr2
+        mov edx, 14
+        and rsp, -16
+        call yarm_x86_64_kthread_fault
+        ud2
+
+        .global yarm_x86_64_kthread_df_stub
+        .type yarm_x86_64_kthread_df_stub, @function
+    yarm_x86_64_kthread_df_stub:
+        mov rdi, rsp
+        mov rsi, cr2
+        mov edx, 8
+        and rsp, -16
+        call yarm_x86_64_kthread_fault
+        ud2
+
         .global yarm_x86_64_kthread_resched_stub
         .type yarm_x86_64_kthread_resched_stub, @function
     yarm_x86_64_kthread_resched_stub:
@@ -266,6 +306,8 @@ mod bare {
     );
 
     unsafe extern "C" {
+        pub(crate) fn yarm_x86_64_kthread_pf_stub();
+        pub(crate) fn yarm_x86_64_kthread_df_stub();
         pub(crate) fn yarm_x86_64_kthread_timer_stub();
         pub(crate) fn yarm_x86_64_kthread_resched_stub();
         /// The device stubs' addresses, for vectors [`KTHREAD_DEVICE_VECTOR_FIRST`] onward.
@@ -336,6 +378,34 @@ mod bare {
             );
         }
         pool.note_device_interrupt(cpu);
+    }
+
+    /// KTHREAD-CLOSURE1 §C — a #PF or #DF taken while a kernel thread ran, on its IST stack.
+    /// Reported raw (the faulting thread may hold any lock), then this CPU halts; a fault in a
+    /// guard gap of the window is that slot's stack overflow.
+    #[unsafe(no_mangle)]
+    extern "C" fn yarm_x86_64_kthread_fault(frame: *const u64, cr2: u64, vector: u64) -> ! {
+        // SAFETY: the stub passed the CPU's frame: err, rip, cs, rflags, rsp, ss.
+        let (err, rip, rsp) = unsafe { (*frame, *frame.add(1), *frame.add(4)) };
+        let pool =
+            crate::arch::x86_64::descriptor_tables::trap_shared_kernel().map(|s| &s.kthreads);
+        let cpu = crate::arch::x86_64::descriptor_tables::current_cpu_id().0 as usize;
+        // A #DF carries no fault address: its stack pointer locates the overflow.
+        let addr = if vector == 14 { cr2 } else { rsp };
+        crate::kernel::kthread::report_kernel_thread_fault(
+            pool,
+            "x86_64",
+            cpu,
+            (vector << 32) | (err & 0xFFFF_FFFF),
+            addr as usize,
+            rsp as usize,
+            rip as usize,
+            crate::arch::x86_64::console::write_line,
+        );
+        loop {
+            // SAFETY: halting this CPU with interrupts masked.
+            unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
+        }
     }
 
     /// The kernel-thread interrupt bridge. `frame` is the saved register block on the interrupted

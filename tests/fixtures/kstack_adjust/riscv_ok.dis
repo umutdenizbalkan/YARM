@@ -1,0 +1,6 @@
+0000000080001000 <_ZN4yarm6kernel3foo17h0123456789abcdefE>:
+    80001000:	addi	sp, sp, -0x30
+    80001004:	lui	t0, 0x100
+    80001008:	addiw	t0, t0, -0x10
+    8000100c:	sub	sp, sp, t0
+    80001010:	ret

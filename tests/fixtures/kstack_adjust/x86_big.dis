@@ -1,0 +1,4 @@
+ffffffff80002000 <_ZN4yarm6kernel3big17h0123456789abcdefE>:
+ffffffff80002000:	mov	eax, 0x900000
+ffffffff80002005:	sub	rsp, rax
+ffffffff80002008:	ret

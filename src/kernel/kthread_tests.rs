@@ -1822,3 +1822,70 @@ fn plain_lock_cost() {
         per(on_stack)
     );
 }
+
+// ── KTHREAD-CLOSURE1 §C: the protected window's arithmetic ─────────────────────────────────────
+
+#[test]
+fn the_window_view_puts_each_stack_alone_at_the_bottom_of_its_stride() {
+    use crate::kernel::kthread::{KSTACK_STRIDE, StackView};
+    const STACK: usize = 16 * 1024; // the production stack size the window is built for
+    let w = 0xFFFF_FF00_0000_0000usize;
+    let v = StackView::window(w);
+    assert_eq!(
+        v.base,
+        w + KSTACK_STRIDE,
+        "slot 0's gap is the window's first stride"
+    );
+    for slot in [0usize, 1, 7, KTHREAD_CAPACITY - 1] {
+        let (low, high) = v.bounds(slot);
+        assert_eq!(low, w + (slot + 1) * KSTACK_STRIDE);
+        assert_eq!(high - low, KTHREAD_STACK_BYTES);
+        assert_eq!(low % KSTACK_STRIDE, 0, "a stack starts a stride");
+        assert_eq!(v.slot_of(low), Some(slot));
+        assert_eq!(v.slot_of(high - 1), Some(slot));
+        assert_eq!(
+            v.slot_of(high),
+            None,
+            "above a stack is the next slot's gap"
+        );
+        assert_eq!(v.slot_of(low - 1), None);
+        // The gap below the stack belongs to this slot, all the way down to the previous top.
+        assert_eq!(v.gap_owner(low - 1), Some(slot));
+        assert_eq!(v.gap_owner(low - 4096), Some(slot));
+        assert_eq!(
+            v.gap_owner(low - (KSTACK_STRIDE - KTHREAD_STACK_BYTES)),
+            Some(slot)
+        );
+        assert_eq!(v.gap_owner(low), None, "the stack itself is no gap");
+    }
+    // Nothing outside the window is a stack or a gap.
+    assert_eq!(v.slot_of(w + (KTHREAD_CAPACITY + 1) * KSTACK_STRIDE), None);
+    assert_eq!(
+        v.gap_owner(w + (KTHREAD_CAPACITY + 1) * KSTACK_STRIDE),
+        None
+    );
+    assert_eq!(v.gap_owner(w - 1), None);
+    assert_eq!(v.slot_of(0x1000), None);
+    // The production gap leaves room for two maximal frames plus a trap frame (the image check's
+    // bound) with a 16 KiB stack.
+    let bound = (KSTACK_STRIDE - STACK - 4096) / 2;
+    assert!(2 * bound + 4096 <= KSTACK_STRIDE - STACK);
+}
+
+#[test]
+fn the_contiguous_view_has_no_gaps_and_finds_every_stack() {
+    use crate::kernel::kthread::StackView;
+    let base = 0x10_0000usize;
+    let v = StackView::contiguous(base);
+    for slot in 0..KTHREAD_CAPACITY {
+        let (low, high) = v.bounds(slot);
+        assert_eq!(v.slot_of(low), Some(slot));
+        assert_eq!(v.slot_of(high - 1), Some(slot));
+        assert_eq!(v.gap_owner(low.wrapping_sub(1)), None);
+    }
+    assert_eq!(
+        v.slot_of(base + KTHREAD_CAPACITY * KTHREAD_STACK_BYTES),
+        None
+    );
+    assert_eq!(StackView::contiguous(0).slot_of(0x40), None);
+}

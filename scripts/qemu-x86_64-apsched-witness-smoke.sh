@@ -45,6 +45,8 @@ QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
 FEATURE=${APSW_FEATURE:-x86-apsched-witness}
 case "$FEATURE" in
   x86-apsched-witness|x86-sched-lock1-witness|x86-kthread1-witness) ;;
+  # KTHREAD-CLOSURE1 §C: the live stack-overflow probes (scripts/qemu-kstack-probe-smoke.sh).
+  x86-kthread1-witness,kstack-probe-access|x86-kthread1-witness,kstack-probe-recursion|x86-kthread1-witness,kstack-probe-frame) ;;
   *) echo "APSW_WITNESS_SEAL arch=x86_64 result=fail reason=unsupported_feature feature=$FEATURE"; exit 2 ;;
 esac
 KTARGET=targets/x86_64-yarm-none.json
@@ -93,6 +95,9 @@ args = [qemu, "-machine", "q35", "-cpu", "qemu64", "-m", "512M", "-smp", smp,
         "-kernel", os.path.join(build, "kernel_boot.elf"),
         "-initrd", os.path.join(build, "initramfs-core.cpio"), "-append", append]
 p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+# KTHREAD-CLOSURE1 §C: APSW_STOP_ON="A|B" ends the boot at the first of those markers instead
+# (a fatal probe never reaches the dump).
+ANY = [m.encode() for m in os.environ.get("APSW_STOP_ON", "").split("|") if m]
 start, seen, tail = time.time(), None, b""
 pending = {b"APSW_DUMP_END"} | ({os.environ["APSW_ALSO_STOP"].encode()} if os.environ.get("APSW_ALSO_STOP") else set())
 with open(log, "wb") as out:
@@ -106,7 +111,7 @@ with open(log, "wb") as out:
             window = tail + chunk
             pending = {m for m in pending if m not in window}
             tail = window[-4096:]
-            if seen is None and not pending:
+            if seen is None and (any(m in window for m in ANY) if ANY else not pending):
                 seen = time.time()
         now = time.time()
         if (seen is not None and now - seen > 3) or now - start > budget:

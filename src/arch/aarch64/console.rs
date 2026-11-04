@@ -64,6 +64,31 @@ pub fn write_line(msg: &str) {
     let _ = try_write_line(msg);
 }
 
+/// KTHREAD-CLOSURE1 §C: a fatal report's line. The line lock is tried a bounded number of times
+/// (the faulting context may hold it); without it the line is written anyway.
+#[cfg(all(not(feature = "hosted-dev"), not(feature = "rpi5-stage1")))]
+pub fn write_line_unlocked(msg: &str) {
+    let mut guard = None;
+    for _ in 0..1_000_000 {
+        guard = UART_LOG_LOCK.try_lock();
+        if guard.is_some() {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let _guard = guard;
+    for &byte in msg.as_bytes() {
+        let _ = write_byte(byte);
+    }
+    let _ = write_byte(b'\r');
+    let _ = write_byte(b'\n');
+}
+
+#[cfg(all(not(feature = "hosted-dev"), feature = "rpi5-stage1"))]
+pub fn write_line_unlocked(msg: &str) {
+    let _ = try_write_line(msg);
+}
+
 #[cfg(all(not(feature = "hosted-dev"), not(feature = "rpi5-stage1")))]
 pub fn try_write_line(msg: &str) -> bool {
     // Serialize full-line emission under an IRQ-safe lock so SMP CPUs and local

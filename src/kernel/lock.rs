@@ -215,6 +215,30 @@ impl<T> SpinLockIrq<T> {
     }
 }
 
+impl<T> SpinLockIrq<T> {
+    /// KTHREAD-CLOSURE1 §C: one acquisition attempt, for a fatal report that must not wait on a
+    /// lock the faulting context may hold. Not recorded by the lock witness.
+    pub fn try_lock(&self) -> Option<SpinLockIrqGuard<'_, T>> {
+        let irq_state = irq_save();
+        if self
+            .held
+            .0
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(SpinLockIrqGuard {
+                lock: self,
+                irq_state,
+                #[cfg(feature = "lock-witness")]
+                witness_token: 0,
+                _not_send: PhantomData,
+            });
+        }
+        irq_restore(irq_state);
+        None
+    }
+}
+
 pub struct SpinLockIrqGuard<'a, T> {
     lock: &'a SpinLockIrq<T>,
     irq_state: ArchIrqState,

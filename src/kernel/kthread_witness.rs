@@ -260,6 +260,19 @@ pub(crate) fn maybe_start(shared: &SharedKernel, cpu: CpuId) {
         &shared.kthreads as *const crate::kernel::kthread::KThreadPool as *mut _,
         Ordering::Release,
     );
+    #[cfg(feature = "kstack-probe")]
+    {
+        // KTHREAD-CLOSURE1 §C: the overflow probe replaces the director in this build.
+        match shared
+            .kthreads
+            .create(kstack_probe::run, 0, cpu, TaskPriority::Normal)
+        {
+            Ok(id) => crate::yarm_log!("KSTACK_PROBE_CREATED kthread={:#x}", id.raw()),
+            Err(e) => crate::yarm_log!("KSTACK_PROBE_CREATED result=fail reason={:?}", e),
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
     PENDING_ROLE.store(R_DIRECTOR, Ordering::Release);
     CREATOR_CPU.store(cpu.0 as u64, Ordering::Release);
     match shared
@@ -1136,7 +1149,9 @@ fn director(ctx: &KThreadCtx, _arg: usize) {
                 ctx.home().0 as u64,
                 low as u64,
                 high as u64,
-                0,
+                // KTHREAD-CLOSURE1 §C: the distance between consecutive slots' stacks as threads
+                // run on them (16 KiB contiguous storage, or the window's 16 MiB stride).
+                pool.run_view().stride as u64,
             ],
         );
     }
@@ -1445,4 +1460,86 @@ fn dump_pass(ctx: &KThreadCtx, total: u64) -> (u64, u32) {
         ));
     }
     (emitted, seal)
+}
+
+/// KTHREAD-CLOSURE1 §C — the live overflow probes (each build overflows one way; fatal by design).
+#[cfg(feature = "kstack-probe")]
+mod kstack_probe {
+    use crate::kernel::kthread::{KSTACK_STRIDE, KTHREAD_STACK_BYTES, KThreadCtx};
+
+    #[cfg(feature = "kstack-probe-access")]
+    const KIND: &str = "access";
+    #[cfg(all(
+        feature = "kstack-probe-recursion",
+        not(feature = "kstack-probe-access")
+    ))]
+    const KIND: &str = "recursion";
+    #[cfg(all(
+        feature = "kstack-probe-frame",
+        not(feature = "kstack-probe-access"),
+        not(feature = "kstack-probe-recursion")
+    ))]
+    const KIND: &str = "frame";
+    #[cfg(not(any(
+        feature = "kstack-probe-access",
+        feature = "kstack-probe-recursion",
+        feature = "kstack-probe-frame"
+    )))]
+    const KIND: &str = "none";
+
+    /// One level of recursion: a 512-byte frame, touched, then the next level. The frame escapes
+    /// and the depth limit is opaque, so the compiler can neither shrink the frame nor prove the
+    /// recursion endless (which would let it reuse one frame as a loop).
+    #[inline(never)]
+    fn descend(depth: usize) -> usize {
+        let mut buf = [0u8; 512];
+        let p = core::hint::black_box(&mut buf);
+        // SAFETY: writes this frame's own local.
+        unsafe { core::ptr::write_volatile(p.as_mut_ptr(), depth as u8) };
+        if depth >= core::hint::black_box(usize::MAX) {
+            return 0;
+        }
+        let below = descend(depth + 1);
+        // SAFETY: reads this frame's own local (keeps the frame live across the call).
+        below + unsafe { core::ptr::read_volatile(p.as_ptr()) } as usize
+    }
+
+    /// One frame of 64 KiB (a single stack-pointer adjustment far larger than a page), its lowest
+    /// byte written first. The array escapes, so it cannot be split into scalars.
+    #[inline(never)]
+    fn big_frame() -> u8 {
+        let mut buf = [0u8; 64 * 1024];
+        let p = core::hint::black_box(&mut buf);
+        // SAFETY: writes this frame's own local, at its lowest address.
+        unsafe { core::ptr::write_volatile(p.as_mut_ptr(), 1) };
+        // SAFETY: as above.
+        unsafe { core::ptr::read_volatile(p.as_ptr().add(p.len() - 1)) }
+    }
+
+    pub(super) fn run(ctx: &KThreadCtx, _arg: usize) {
+        let (low, high) = ctx.pool().stack_bounds(ctx.id().slot());
+        crate::yarm_log!(
+            "KSTACK_PROBE_START kind={} kthread={:#x} slot={} low={:#x} high={:#x} gap_low={:#x}",
+            KIND,
+            ctx.id().raw(),
+            ctx.id().slot(),
+            low,
+            high,
+            low.saturating_sub(KSTACK_STRIDE - KTHREAD_STACK_BYTES)
+        );
+        match KIND {
+            // SAFETY: deliberately reads below the stack: the guard gap, which must fault.
+            "access" => {
+                let _ = unsafe { core::ptr::read_volatile((low - 4096) as *const u8) };
+            }
+            "recursion" => {
+                let _ = descend(0);
+            }
+            "frame" => {
+                let _ = big_frame();
+            }
+            _ => {}
+        }
+        crate::yarm_log!("KSTACK_PROBE_SURVIVED kind={} result=fail", KIND);
+    }
 }

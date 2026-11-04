@@ -101,6 +101,13 @@ kthread1-witness = []
 x86-kthread1-witness = ["x86-apsched-witness", "kthread1-witness"]
 aarch64-kthread1-witness = ["aarch64-apsched-witness", "kthread1-witness"]
 riscv64-kthread1-witness = ["riscv64-apsched-witness", "kthread1-witness"]
+# KTHREAD-CLOSURE1 §C live overflow probes (default-off, each fatal by design): instead of the KT1
+# director, one kernel thread overflows its stack by a read below it, by recursion, or by one frame
+# larger than a page; the boot must report KTHREAD_STACK_OVERFLOW for it.
+kstack-probe = ["kthread1-witness"]
+kstack-probe-access = ["kstack-probe"]
+kstack-probe-recursion = ["kstack-probe"]
+kstack-probe-frame = ["kstack-probe"]
 # SHARED-REGION-LIFETIME2: the RISC-V shared-region replacement witness — a receive installs over a
 # page whose translation is live on the other hart. Reuses the QEMU-SMP3 secondary bring-up and
 # replaces its tasks; armed by `yarm.ap_user_dispatch=1`.
