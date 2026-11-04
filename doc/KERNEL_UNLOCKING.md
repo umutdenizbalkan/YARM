@@ -3442,6 +3442,66 @@ lose coverage). The AP-scheduling witness's own timing assumptions on x86_64 (no
 placement put two spinners on CPU 0 in every observed 8-CPU boot) are unchanged. QEMU timing is not
 hardware timing.
 
+##### Stage B — plain locks at scheduling points (SC-KT-8)
+
+**The hole, reproduced.** On the Stage A head `136e8ae2` nothing counted a plain `SpinLock`: the
+hosted control `plain_check_removed` (the delivered check order, without the new test) lets a
+kernel thread holding a real plain guard yield, block and exit — five hosted tests fail and, live,
+the KT1 grader sees all four scheduling attempts switch (`codes=[0, 0, 0, 0] switched=0xf`).
+
+**Audit and rule.** Contract §18.10.2 holds the audit of every lock and guard mechanism reachable
+from kernel threads and their interrupt handlers, and the rule: plain guards are counted per
+kernel-thread stack, by stack pointer, released against the same counter, refused at every
+scheduling point, with accounting failures latched. No plain lock was converted to a masking one;
+interrupt masking, the plain count and the per-CPU 1L stay separate checks.
+
+**Defect controls**, each applied alone to the candidate:
+
+| Control | Hosted kthread tests | Live (KT1 boot) |
+|---|---|---|
+| `plain_check_removed` | 5 named tests fail | fails: all four attempts switch (`codes=[0, 0, 0, 0] switched=0xf`; RISC-V 1 CPU, AArch64 1 CPU, x86_64 2 CPUs, where the attribution probe also fails) |
+| `plain_not_counted` | suite aborts: `KTHREAD_EXIT_REFUSED … reason=plain_lock_accounting` | fails: unmatched releases poison other threads, which are refused and left behind (RISC-V 1 CPU: a later probe target found live) |
+| `release_not_decremented` | suite aborts: refused `plain_lock_held` at every later point, exit fatal | fails (dev, RISC-V 2 CPUs): threads refused `plain_lock_held` for good, left behind |
+| `underflow_saturates` | `accounting_failures_latch_and_never_restore_eligibility` fails | hosted only: no live path releases at zero |
+| `cross_stack_trusted` | `accounting_failures_latch_and_never_restore_eligibility` fails | hosted only: no live path releases on another stack |
+| `attributed_to_slot0` | suite aborts: another thread's guard keeps the director refused, exit fatal | fails: `plain_lock_misattributed director=1 holder=0 holder_refusal=0 director_refusal=7` (RISC-V and AArch64, 2 CPUs; the first live probe alone missed it, which is why the attribution probe exists) |
+
+**Development finding.** The first build overflowed in the lock path itself: `then_some(v + 1)`
+evaluated `v + 1` for a poisoned counter (`u32::MAX`). The increment is now lazy; the hosted latch
+test found it.
+
+**Qualification (Stage B).** Predeclared schedule, one run on the frozen `7112c035` (base: the
+delivered Stage A head `136e8ae2`), every step passed on its first run:
+* QB4 fmt; QB2: hosted `kernel::kthread` 40/40 ×3, the scope guard, KT1 grader CLI 25/25 ×3 and its
+  self-test, the cost benchmark ×3, and the six hosted controls each caught as declared;
+* QB8 strict 1-CPU KT1 boots 9/9 seals; QB9m 2/4/8 CPUs on each ISA 9/9;
+* QB10 live controls 6/6 failing as required (table above);
+* QB1 hosted serial 6273 passed; QB3 every integration binary;
+* QB5 lock-site census: `.lock()` 184 → 187, the witness probes' three plain locks; no production
+  site added or removed (the pool's one free-list acquisition now also covers the registration);
+* QB6 default builds pass with no new warning; images differ from the base (the plain guard's
+  counter); QB7 no-FP pass; QB11 sections (candidate vs base): x86_64 `.text` 1 241 486 vs
+  1 245 646, `.bss` 24 389 440 vs 24 386 544; AArch64 `.text` 860 716 vs 936 164, `.bss`
+  75 116 560 vs 75 119 616; RISC-V `.text` 700 262 vs 699 420, `.bss` 92 065 856 vs 92 064 960
+  (inlining around the changed guard explains the smaller `.text`; not investigated further);
+* QB12 strict core smokes ×3, the AP-scheduling and SCHED-LOCK1 witnesses at 2 CPUs on each ISA,
+  and the regression set beyond the declared conditions: SMP3 (RISC-V), CONTEXT1, SMP1 (x86_64),
+  SMP2 (AArch64), VMI2 (x86_64), the RISC-V lock1, VMI and shared-region-replace witnesses, the
+  UART/PL011 interrupt witnesses on three ports and the IPC park witness pass. The last six
+  (exit-current-task ×3, shared-region-direct ×3) recorded rc=1 with empty logs: the disk was
+  exhausted mid-run (the IPC park smoke's 3.2 GB log and the run worktree's 4.4 GB build cache).
+  Kept as recorded; after freeing space the six ran again on the same freeze as a separate
+  supplementary run and all passed (that run does not replace the recorded entries).
+
+Cost: ≈6.2–6.7 ns per lock/unlock pair with no kernel-thread stack registered or a guard off the
+stacks, ≈17.1–17.6 ns on a kernel-thread stack (hosted, opt-level 2, 2 000 000 pairs, three runs;
+the hosted `--release` lib-test build is broken on the base by a `debug_assertions`-gated method,
+so the test profile was used).
+
+**Stage B remaining limits.** A guard that escapes by `mem::forget` keeps its thread ineligible for
+good (fail-closed, by design). The underflow and cross-stack latches are exercised hosted only.
+The registry is scanned linearly (two production entries at most). No lock was converted.
+
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 

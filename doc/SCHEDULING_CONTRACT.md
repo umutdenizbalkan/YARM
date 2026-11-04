@@ -824,7 +824,7 @@ never by adding an alternative dispatcher selected by profile.
 | SC-KT-5 | Kernel FP/SIMD state. Ordinary kernel code and its linked runtime helpers use no FP/SIMD registers, so a kernel thread carries no FP/SIMD state; audited context routines are the exceptions (§8.2). | 0 in ordinary code (was 22 779 FP/SIMD-classified instructions) | 0 in ordinary code (was 2 547) | 0 | **ENFORCED by KERNEL-NOFP1** (final-image check on every artifact build) |
 | SC-KT-6 | Flags and TLS: the kernel's per-CPU base and flags are restored on a kernel-to-kernel switch | not traced in this package | not traced | not traced | **ENFORCED (KTHREAD1, §18.3)**: kernel threads never migrate, so the per-CPU base is the CPU's own and never written per thread (AArch64 `TPIDR_EL1` set at boot; x86_64 `IA32_GS_BASE` set once at bring-up to the CPU's record, identity from the APIC map; RISC-V identity from `sscratch` / the stack). Flags: both sides of every switch run masked; the thread saves and restores its interrupt state around the switch |
 | SC-KT-7 | Interrupt nesting and safe preemption points: preemption only at points holding none of SC-BND-2's items | no nesting | no nesting | no nesting | **ENFORCED (KTHREAD1, §18.3–§18.4)**: no nesting (hardware masks on entry); switches only at explicit points |
-| SC-KT-8 | No blocking or switching while a prohibited guard is held. Today non-hosted lock-rank tracking is placeholder-only (`doc/KERNEL_LOCKING.md`). A per-CPU held-guard count must make a switch under a guard fail closed. | `SpinLockIrqGuard` is `!Send`; no run-time check | same | same | **ENFORCED for interrupt-masking guards (KTHREAD1, §18.3)**: a switch requires interrupts enabled and no `KMasked` section, else `KTHREAD_SWITCH_REFUSED`. A plain `SpinLock` held with interrupts enabled is not counted |
+| SC-KT-8 | No blocking or switching while a prohibited guard is held. Today non-hosted lock-rank tracking is placeholder-only (`doc/KERNEL_LOCKING.md`). A per-CPU held-guard count must make a switch under a guard fail closed. | `SpinLockIrqGuard` is `!Send`; no run-time check | same | same | **ENFORCED for interrupt-masking guards (KTHREAD1, §18.3)**: a switch requires interrupts enabled and no `KMasked` section, else `KTHREAD_SWITCH_REFUSED`. A plain `SpinLock` held with interrupts enabled is not counted. **ENFORCED for plain `SpinLock` (KTHREAD-CLOSURE1 Stage B, §18.10.2)**: refused `plain_lock_held`, accounting failures latched as `plain_lock_accounting` |
 | SC-KT-9 | Wake arbitration through the existing exact-incarnation owners and `DispatchMarkToken`; no kernel-thread-only wake path | shared owners | shared | shared | **ENFORCED with a stated deviation (KTHREAD1, §18.5)**: placement and announcement use the shared owners (enqueue under the home 1L, `notify_enqueued`); the exact incarnation is the pool generation, not `DispatchMarkToken` (a kernel thread has no TCB) |
 | SC-KT-10 | Exit and stack reclamation only after execution has provably ceased: a stack-residency record, cleared only after the CPU has switched away and is no longer on that stack (by analogy with VMI2's root residency) | none | none | none | **ENFORCED (KTHREAD1, §18.2)**: `running[cpu]` cleared only after the switch away; only the dispatcher reclaims |
 | SC-KT-11 | Trap classifiers accept kernel-thread-origin traps. Every "kernel mode is idle or fatal" site in §1.9 must distinguish a kernel thread from idle and from a kernel bug. | ring-0 `#GP`, supervisor `#PF`, idle-only IRQ conversion | current-EL vectors, idle take point | `!from_u` → halt | **ENFORCED (KTHREAD1, §18.4)**: kernel-thread vectors while one runs; timer and reschedule interrupts authenticated and serviced; every other kernel-thread trap fatal; idle vectors unchanged |
@@ -1157,7 +1157,7 @@ CPU executes.
 | SC-KT-2, 3, 6, 7, 9, 10, 11 | **done** (KTHREAD1, §18) | — | P + L on three ports, §18.7 | — |
 | SC-KT-1 guard page | 16 KiB pool stacks, no guard | split shared kernel mappings (x86_64, AArch64); a translated kernel space (RISC-V) | P + L | unassigned |
 | SC-KT-4 | cooperative kernel threads (§18.3) | asynchronous kernel preemption | P + L on three ports | unassigned |
-| SC-KT-8 plain `SpinLock` | interrupt-masking guards counted | a held-guard count for non-masking locks | P | unassigned |
+| SC-KT-8 plain `SpinLock` | **closed by KTHREAD-CLOSURE1 Stage B (§18.10.2)** | — | — | — |
 | SC-KT-12, SC-EXEC-3, SC-BND-2 | kernel threads with a home CPU (KTHREAD1) | budgeted contexts; boundary preemption at safe points | P + L | RT-SCHED1 / PARTITION1 |
 | SC-BND-3, SC-INV-2/3 | none | configuration validation (shared regions, ceilings) | P | PARTITION1 / RT-SCHED1 |
 | SC-INV-1, W1 | TTAS `SpinLockIrq` | fair lock or bounded-contention proof; per-rank section bounds | S + N | RT-SCHED1 |
@@ -1342,7 +1342,7 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-KT-0;
   * SC-KT-5, SC-FP-1, SC-FP-2, SC-FP-3 (KERNEL-NOFP1);
   * SC-KT-2, SC-KT-3, SC-KT-6, SC-KT-7, SC-KT-10, SC-KT-11 (KTHREAD1, §18); SC-KT-8 for
-    interrupt-masking guards; SC-KT-9 with the deviation stated in §8;
+    interrupt-masking guards and, since KTHREAD-CLOSURE1 Stage B, plain `SpinLock` (§18.10.2); SC-KT-9 with the deviation stated in §8;
   * SC-LOCK-1, SC-LOCK-3…7 (SCHED-LOCK1). SC-LOCK-2 is PARTIAL: the lock order excludes the
     scheduler-lock deadlock cycles, but no progress argument is established (§17.3).
 * **DISCHARGED:** SC-LOCK-9 (it held until SCHED-LOCK1, which is the split).
@@ -2583,3 +2583,76 @@ user work.
 **KT1 user progress.** A user task resumed from idle (`apsched_witness::note_idle_dispatch`) is a
 user dispatch for the per-CPU progress check, as is one marked by the mark seam (an 8-CPU AArch64
 boot otherwise reported `no_user_progress` for a CPU whose user work only ever resumed from idle).
+
+#### 18.10.2 Stage B: plain locks at scheduling points (SC-KT-8)
+
+**The hole on `a7da04f1` (unchanged through Stage A).** A plain `SpinLock` masks nothing, so `switch_check`'s
+`irqs_enabled` test could not see one: a kernel thread holding a plain guard could yield, block or
+exit, leaving the lock held by a thread that is not running (a deadlock for the next acquirer on
+that CPU, and an exit that leaks the lock forever).
+
+**Audit of every lock and guard mechanism reachable from kernel threads and their interrupt
+handlers.**
+
+| Mechanism | Masks interrupts | Scheduling point under it |
+|---|---|---|
+| `SpinLockIrq` and every guard built on it (per-CPU 1L `CpuSchedGuard`, `CpuAdmissionGuard`, `SchedAllGuard`, the pool's free list, wait queues, IPC, VM, printk drain, AArch64 console, slab classes) | yes | refused `irq_masked` (unchanged) |
+| `KMasked` (a kernel thread's masked section) | yes | refused `guard_held` (unchanged) |
+| `SpinLock` (plain; production users: the per-port last-invalidated-ASID records, the x86 CPU-identity writer, the boot command line, runtime and syscall transaction locks, the server-death token) | no | **refused `plain_lock_held` (new)** |
+| RISC-V console line lock (hand-rolled) | yes, for the whole hold | the hold contains no scheduling point; any attempt would be `irq_masked` |
+| boot-entry IRQ-description and staged-RAM locks (hand-rolled) | — | boot only, released before any kernel thread exists |
+| one-shot claims and flags (`CONSUMED`, x86 fatal-log latch, audit/first-trap flags) | — | not locks: never released, nothing waits on them |
+| syscall staging-buffer claim | — | syscall paths only; never held by a kernel thread |
+| userspace allocator lock (`yarm-freestanding-alloc`) | — | not linked into the kernel |
+
+The set of hand-rolled sites is pinned (`tests/kthread_plain_lock_scope.rs`): a new one fails the
+guard until it is audited here.
+
+**The rule.** Every plain guard is counted against the kernel-thread stack it was taken on, and
+released against that same stack. Attribution is by stack pointer, not by CPU or "current thread":
+the acquisition finds the registered stack region containing its stack pointer (a table of pool
+stack regions, registered under the pool lock before any thread of the pool runs) and increments
+that slot's counter; the guard carries the counter's address and its release decrements exactly
+that counter. Consequences:
+* an interrupt handler running on a thread's stack (every port's kernel-thread vector) adds and
+  removes its own balanced guards; a handler on another stack (a trap or exception stack) and
+  another CPU never touch the thread's count; two CPUs never share a counter;
+* `switch_check`, which `yield_now`, `sched_point`, the park behind every wait, and `exit` make
+  first, refuses `plain_lock_held` while the count is non-zero and changes nothing (no queue,
+  residency, state or registration change; only the refusal counter moves);
+* interrupt masking, the plain count and inter-CPU ownership (the per-CPU 1L) stay three separate
+  checks, in that order; no plain lock was converted to a masking one;
+* failures latch: an overflow, a release with nothing counted, or a release on a different stack
+  than the acquisition sets the counter to a poison value that is never decremented, so the thread
+  is refused (`plain_lock_accounting`) at every later scheduling point, and its `exit` refusal is
+  fatal. A slot reused with a non-zero count fails closed (`KTHREAD_PLAIN_LOCK_INVARIANT`);
+* the lock path takes no lock, does not log and does not panic; it only counts and latches. The
+  refusal is reported by the scheduling point through the log, whose own locks are all masking
+  (pinned: no plain lock in printk or any console);
+* escaping guards: a guard is `!Send` and released on its own stack; a guard that escapes by
+  `mem::forget` keeps its thread ineligible forever (fail-closed, attributed to the stack it was
+  taken on). Forget primitives exist only at three audited sites (pinned).
+
+The global registry has no lock: entries are claimed with a compare-and-swap and read with acquire
+loads; the lock path scans only the entries ever used (a production boot that creates no kernel
+thread pays one atomic load per acquisition and per release).
+
+**Evidence.** Hosted (`kthread_tests.rs`, real `SpinLock`s on real pool stacks): a guard held
+across yield, block and exit is refused and changes nothing; nested and partial releases keep the
+thread ineligible until the last guard; a handler running on the thread's stack balances its own
+guards and handlers on other stacks never count; two CPUs holding different plain locks are
+accounted independently; accounting failures latch and never restore eligibility; guards off every
+kernel-thread stack are not counted; a slot reused with a live count fails closed. The scope guard
+(`tests/kthread_plain_lock_scope.rs`) pins the check order, the lock-path rules and the audited
+sites. Live (default-off `kthread1-witness`, three ports): the director takes two real plain locks
+and records the refusal of a yield, a block, a nested-then-partial yield and a yield after a timer
+interrupt taken on it with the guard live, the counts 1, 2, 1, 0, and that the final release
+restores scheduling; with two CPUs or more a holder on the second CPU takes a plain lock (its
+own yield refused) while the director's count stays 0, the holder's is 1 and the director still
+switches. The grader requires exactly that.
+
+**Cost** (hosted, opt-level 2, 2 000 000 lock/unlock pairs, three runs in qualification): ≈6.2–6.7 ns
+per pair with no kernel-thread stack registered (every production boot that creates no kernel
+thread) or with a guard off the registered stacks, ≈17.1–17.6 ns for a guard on a kernel-thread
+stack. QEMU and hosted
+timing are not hardware timing.
