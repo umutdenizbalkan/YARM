@@ -10,16 +10,23 @@
 //! root carries (`RISCV_KERNEL_SHARED_BASE`, global R|W|X, S-mode only), slot 3 the window: slot
 //! `i`'s 16 KiB at `WINDOW_BASE + (i + 1) * KSTACK_STRIDE`, aliasing the pool's `.bss` storage,
 //! R|W without X or U. Everything else in the window is invalid, so a thread that descends below
-//! its stack takes a page fault in its own gap. Built once, at the pool's first creation, before
-//! any kernel thread can run; nothing changes it afterwards. The dispatcher installs it right
+//! its stack takes a page fault in its own gap. Slot 255 is the device window when a boot
+//! installs one (`page_table::install_device_window`): under any translation the kernel reaches
+//! a registered device page only through that slot (`mmio_va_under_active_satp` walks the live
+//! root), as every user root carries it, so this root carries it too. Built once, at the pool's
+//! first creation, before any kernel thread can run; afterwards only slot 255 may change, once,
+//! from invalid to the window's entry (the window never changes once installed), and only in
+//! `enter_root`, before its `satp` write and full fence. The dispatcher installs the root right
 //! before switching into a thread and returns the hart to Bare right after the thread switches
 //! back (`enter_root` / `leave_root`), all with interrupts masked; residency bookkeeping is
 //! untouched (the hart left the user root before, as it always did).
 #![cfg(not(feature = "hosted-dev"))]
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use crate::arch::riscv64::page_table::{RISCV_KERNEL_SHARED_BASE, RISCV_KERNEL_SHARED_END};
+use crate::arch::riscv64::page_table::{
+    self, DEVICE_WINDOW_ROOT_SLOT, RISCV_KERNEL_SHARED_BASE, RISCV_KERNEL_SHARED_END,
+};
 use crate::kernel::kthread::{KSTACK_STRIDE, KTHREAD_CAPACITY, KTHREAD_STACK_BYTES};
 
 pub const WINDOW_BASE: usize = 0xC000_0000;
@@ -37,6 +44,7 @@ const SATP_SV39: u64 = 8 << 60;
 const _: () = assert!((KTHREAD_CAPACITY + 1) * KSTACK_STRIDE <= 1 << 30);
 const _: () = assert!(KSTACK_STRIDE % (2 << 20) == 0 && KTHREAD_STACK_BYTES <= 2 << 20);
 const _: () = assert!(RISCV_KERNEL_SHARED_END as usize == WINDOW_BASE);
+const _: () = assert!(DEVICE_WINDOW_ROOT_SLOT > WINDOW_BASE >> 30 && DEVICE_WINDOW_ROOT_SLOT < 512);
 
 #[repr(C, align(4096))]
 struct Table([u64; 512]);
@@ -110,8 +118,19 @@ pub fn enter_root() {
     if STATE.load(Ordering::Acquire) != 2 {
         return;
     }
-    // SAFETY: the root maps everything the kernel touches while a thread runs (RAM, devices, the
-    // window); interrupts are masked.
+    if let Some(entry) = page_table::device_window_root_entry() {
+        // SAFETY: an aligned u64 of the static root, accessed only atomically once built (harts
+        // may enter concurrently; each stores the same value). The fence below orders it for this
+        // hart's walks.
+        let slot = unsafe {
+            AtomicU64::from_ptr(core::ptr::addr_of_mut!(ROOT.0[DEVICE_WINDOW_ROOT_SLOT]))
+        };
+        if slot.load(Ordering::Acquire) != entry {
+            slot.store(entry, Ordering::Release);
+        }
+    }
+    // SAFETY: the root maps everything the kernel touches while a thread runs (RAM, the devices
+    // below RAM, the device window if installed, the stack window); interrupts are masked.
     unsafe {
         core::arch::asm!("csrw satp, {v}", "sfence.vma zero, zero", v = in(reg) root_satp(),
             options(nostack, preserves_flags))

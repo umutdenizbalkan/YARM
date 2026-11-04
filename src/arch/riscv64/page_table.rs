@@ -490,6 +490,15 @@ pub fn device_window_installed() -> bool {
     DEVICE_WINDOW_L1.load(Ordering::Acquire) != 0
 }
 
+/// KTHREAD-CLOSURE1 §C — the root entry for slot [`DEVICE_WINDOW_ROOT_SLOT`] that points a root at
+/// the shared window, exactly as `install_device_window_into_root` writes it into every user root;
+/// `None` until [`install_device_window`] has published the window. The kernel-thread root
+/// (`kstack_window`) is in no ASID table, so it takes the entry from here.
+pub fn device_window_root_entry() -> Option<u64> {
+    let l1 = DEVICE_WINDOW_L1.load(Ordering::Acquire);
+    (l1 != 0).then(|| PageTableEntry::with_addr_and_flags(l1, PageTableEntry::VALID).0)
+}
+
 /// The recorded window layout: the physical page at each slot, `0` for an unused slot.
 fn device_window_layout() -> [u64; DEVICE_WINDOW_MAX_PAGES] {
     let count = DEVICE_WINDOW_PAGE_COUNT
