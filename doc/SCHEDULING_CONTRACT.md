@@ -2772,3 +2772,17 @@ register instructions and a branch per vector entry, with no memory access; x86_
 
 **Still open.** A stack-depth bound (observed use is still not a bound; overflow now faults). The
 bound argument's compiled-code assumption above. Kernel threads remain cooperative (SC-KT-4).
+
+#### 18.10.4 Closure state
+
+| # | Closure | State | Rule | Live evidence on the final head |
+|---|---|---|---|---|
+| 1 | replay permits overlapping execution on one CPU | **closed** | §18.10.1: one owner per CPU from the execution stamp; no director exemption | KT1 at 1, 2, 4, 8 CPUs on three ISAs |
+| 2 | single-CPU timeout grading skips invalid sequences | **closed** | §18.10.1: every round validated before coverage | KT1 at 1 CPU on three ISAs, idle and loaded host |
+| 3 | AArch64 SMP2 verifier race | **closed** (verifier; the GIC order was legal) | §18.10.1: per-pair rank rule; void rounds earn nothing | 40 SMP2 boots, idle and loaded |
+| 4 | no hardware stack protection for kernel threads | **closed** on three ISAs (SC-KT-1) | §18.10.3 | overflow probes 9/9; image check on default and witness images; device interrupts on kernel threads ×3 |
+| 5 | plain non-masking locks held across scheduling points | **closed** (SC-KT-8) | §18.10.2 | KT1 plain-lock probes in every KT1 boot |
+
+Still open after the package: asynchronous kernel preemption (SC-KT-4), a stack-depth bound (only
+overflow detection is established), budgeted kernel-thread contexts (SC-KT-12, RT-SCHED1); QEMU
+only, no hardware timing.

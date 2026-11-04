@@ -3567,6 +3567,46 @@ AArch64 `.text` +2 564, `.bss` +271 800 (33 table pages, 8 × 16 KiB emergency s
 argument assumes what compiled code does (contract §18.10.3). The AArch64 bit-14 entry test is a
 reporting aid, not a defence. QEMU only.
 
+##### Stage D — combined qualification
+
+Predeclared schedule, one run on the delivered Stage C head `fc429b00` (its code tree is the
+Stage C freeze `bb451a3b`'s); package base `a7da04f1` for the census. Every step passed on its
+first run:
+* QD4 fmt; QD2 hosted `kernel::kthread` 42/42, the plain-lock scope guard 6/6,
+  `kstack_adjust_cli` 3/3, KT1 grader CLI 25/25 and self-test, `smp2_record` 17/17, the SGI corpus
+  in Python 17/17, the plain-lock cost ×3;
+* QD8 KT1 at 1 CPU on each ISA, idle and loaded host, 6/6 seals; QD9 KT1 at 2, 4, 8 CPUs, 9/9
+  (the 8-CPU boot images byte-identical to Stage C run 2's);
+* QD13 AArch64 SMP2: one build boot (kept, not counted), then 20 idle and 20 loaded boots of those
+  artifacts, 40/40 rc 0 with verdict and seal ok;
+* QD14 overflow probes 9/9; QD15 the kernel-thread device-interrupt witness on each ISA, 12 items
+  with 4 on kernel threads, 3/3;
+* QD1 6275 hosted tests passed; QD3 41/41 integration binaries;
+* QD5 lock-site census against `a7da04f1`: every pattern unchanged except `.lock()` 184 → 187,
+  the three plain locks the Stage B witness probes take;
+* QD6 default builds on three ISAs, byte-identical to Stage C run 2's; QD7 no-FP pass; QD16 the
+  stack-adjustment check `result=ok` on the three default images and the three 8-CPU KT1 ELFs;
+* QD12 strict core smokes ×3, AP-scheduling and SCHED-LOCK1 witnesses at 2 CPUs on each ISA.
+
+Plain-lock cost on this run's host: ≈8.5–11.2 ns per pair with no registered stack, ≈28.4–36.4 ns
+on a kernel-thread stack, higher than Stage B's figures. Measured right after the run, back to back
+on the same host, three runs each: the Stage B head `a540aef2` 8.2–9.8 / 26.9–35.3 ns, the final
+head 8.3–10.5 / 28.1–35.0 ns. The difference is the host, not Stage C.
+
+##### Closure table
+
+| # | Closure | Hole on `a7da04f1` | State | Delivered in | Rule | Remaining limits |
+|---|---|---|---|---|---|---|
+| 1 | replay permits overlapping execution on one CPU | a dispatch moved inside another thread's interval on one CPU passed the delivered grader | **closed** | Stage A (`136e8ae2`) | contract §18.10.1 | evidence depends on default-off witness instrumentation (the execution stamp) |
+| 2 | single-CPU timeout grading skips invalid sequences | a timeout moved before its arm passed | **closed** | Stage A | §18.10.1 | — |
+| 3 | AArch64 SMP2 verifier race | 4 of 16 boots failed `sgi_unexplained_arrival` | **closed**; the GIC order was legal, so the repair is in both verifiers, plus witness handshakes and void TLB rounds | Stage A | §18.10.1 | a void round is self-reported by the witness task, so it can only lose coverage |
+| 4 | no hardware stack protection for kernel threads | stacks adjacent in `.bss`, overflow silent | **closed** on x86_64, AArch64, RISC-V | Stage C (`fc429b00`) | §18.10.3 | no stack-depth bound; the image bound assumes compiled-code frame behaviour; QEMU only |
+| 5 | plain non-masking locks held across scheduling points | not detected | **closed**: refused at every scheduling point, accounting failures latched | Stage B (`a540aef2`) | §18.10.2 | a forgotten guard keeps its thread ineligible for good (fail-closed); two latches exercised hosted only |
+
+Final refs: `main`, `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/kthread-closure1` at the commit
+that adds this record; `wip/kthread-closure1-a` `136e8ae2`, `-b` `a540aef2`, `-c` `fc429b00`;
+`14b61286` and every earlier ref preserved.
+
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 
