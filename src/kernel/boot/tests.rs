@@ -204935,4 +204935,103 @@ mod ipc_displace1 {
             "#[cfg(all(not(feature = \"hosted-dev\"), feature = \"ipc-displace1-witness\"))]\npub(super) mod ipc_displace1_witness {"
         ));
     }
+
+    // ── IPC-DISPLACE1-MARKER1: refusal telemetry names its own cause ─────────────────────────
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    /// The split exact inverse serves four causes (queue race, ownership busy, receiver already
+    /// waiting, deadline refusal), so it must name none of them: the publish-race pair belongs to
+    /// the `QueueNonEmpty` caller alone, and the inverse attests itself through its own
+    /// `D2_RECV_SPLIT_UNWIND_*` lines.
+    #[test]
+    fn the_shared_exact_unwind_names_no_cause() {
+        let body = code_only(RUNTIME_SRC);
+        let at = body
+            .find("pub(crate) fn recv_block_unwind_exact_split(")
+            .expect("the split exact inverse");
+        let end = at + body[at..].find("\n    }\n").expect("its end");
+        let inverse = &body[at..end];
+        assert!(!inverse.contains("D2_PUBLISH_RACE_UNWIND"));
+        assert!(!inverse.contains("D2_RECV_WAITER_RACE_UNWIND"));
+        assert!(inverse.contains("D2_RECV_SPLIT_UNWIND_FAIL"));
+    }
+
+    /// In the split route the publish-race pair is logged only on the non-busy (`QueueNonEmpty`)
+    /// half of its arm, BEFORE the inverse runs; the ownership-busy refusal does not log it.
+    #[test]
+    fn the_publish_race_pair_is_logged_for_the_queue_race_only() {
+        let split = code_only(SPLIT_SRC);
+        assert_eq!(
+            split
+                .matches("\"D2_PUBLISH_RACE_UNWIND endpoint=split tid={}\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            split
+                .matches("\"D2_RECV_WAITER_RACE_UNWIND tid={}\"")
+                .count(),
+            1
+        );
+        let guard = split.find("if !busy {\n").expect("the race-only guard");
+        let race = split
+            .find("D2_PUBLISH_RACE_UNWIND endpoint=split")
+            .expect("the race marker");
+        let unwind = guard
+            + split[guard..]
+                .find("recv_block_unwind_exact_split(")
+                .expect("then the inverse");
+        assert!(
+            guard < race && race < unwind,
+            "logged under !busy, before the inverse"
+        );
+        let arm = split
+            .rfind("PublishWaiterOutcome::WaiterOwnershipBusy\n        | crate::kernel::recv_waiter_split::PublishWaiterOutcome::QueueNonEmpty => {")
+            .expect("the busy/race arm");
+        assert!(arm < guard, "the guard is inside the busy/race arm");
+    }
+
+    /// A competing-receiver refusal is reported as FAILED_CLOSED exactly when it is NOT settled:
+    /// `settled_refusal` requires `ReceiverAlreadyWaiting` AND an unwind that restored the entering
+    /// incarnation; `InvalidEndpoint` and an unrestored unwind keep the fail-closed marker. The
+    /// settlement owner that reports the settled case runs after the outcome is known.
+    #[test]
+    fn a_refusal_is_fail_closed_unless_its_unwind_restored_it() {
+        let split = code_only(SPLIT_SRC);
+        let at = split
+            .find("let already_waiting = matches!(")
+            .expect("the refusal arm");
+        let end = at
+            + split[at..]
+                .find("reason,\n            ));")
+                .expect("its settle");
+        let body = &split[at..end];
+        let unwind = body.find("recv_block_unwind_exact_split(").expect("unwind");
+        let gate = body
+            .find("let settled_refusal = already_waiting && unwound.may_resume_entering_frame();")
+            .expect("the settlement predicate");
+        let guarded = body.find("if !settled_refusal {").expect("the guard");
+        let closed = body
+            .find("IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED")
+            .expect("the fail-closed marker");
+        let settle = body
+            .find("recv_settle_after_unwind(")
+            .expect("the settlement owner");
+        assert!(unwind < gate && gate < guarded && guarded < closed && closed < settle);
+        assert_eq!(
+            body.matches("IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED").count(),
+            1
+        );
+        // The settlement owner reports outcome and resumability on every refusal.
+        let settle_src = code_only(SPLIT_SRC);
+        let owner = settle_src
+            .find("fn recv_settle_after_unwind(")
+            .expect("owner");
+        let owner_body =
+            &settle_src[owner..owner + settle_src[owner..].find("\n}\n").expect("end")];
+        assert!(owner_body.contains(
+            "\"IPC_RECV_BLOCK_SPLIT_SETTLED cpu={} tid={} asid={} reason={} answer={} outcome={} resumable={}\""
+        ));
+    }
 }

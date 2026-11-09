@@ -7388,8 +7388,12 @@ impl SharedKernel {
         use crate::kernel::recv_waiter_split::RecvUnwindOutcome as U;
         use crate::kernel::task::{TaskStatus, WaitReason};
         let tid = identity.tid;
-        crate::yarm_log!("D2_PUBLISH_RACE_UNWIND endpoint=split tid={}", tid);
-        crate::yarm_log!("D2_RECV_WAITER_RACE_UNWIND tid={}", tid);
+        // IPC-DISPLACE1-MARKER1: this inverse is shared by FOUR causes — the queue-publication
+        // race, the ownership-busy refusal, the receiver-already-waiting refusal and the deadline
+        // reservation refusal — so it names none of them. The `D2_PUBLISH_RACE_UNWIND` /
+        // `D2_RECV_WAITER_RACE_UNWIND` pair belongs to the race alone and is logged by the
+        // `QueueNonEmpty` caller; every cause is settled by its own `IPC_RECV_BLOCK_SPLIT_*`
+        // marker, and this body's own `D2_RECV_SPLIT_UNWIND_*` lines attest the unwind itself.
         // Rank 2 — the exact inverse of Phase B's task half, on the exact incarnation.
         let cleared = self.with_task_tcbs_split_mut(|tcbs| {
             let Some(tcb) = tcbs.iter_mut().flatten().find(|t| {

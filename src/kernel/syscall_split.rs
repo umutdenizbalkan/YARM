@@ -4511,6 +4511,13 @@ fn try_split_blocking_ipc_recv_into_frame(
                 outcome,
                 crate::kernel::recv_waiter_split::PublishWaiterOutcome::WaiterOwnershipBusy
             );
+            // IPC-DISPLACE1-MARKER1: the queue-publication race is THIS arm's `QueueNonEmpty`
+            // half and nothing else, so its marker pair is logged here (moved out of the shared
+            // exact inverse, which also serves three refusals that are not races).
+            if !busy {
+                crate::yarm_log!("D2_PUBLISH_RACE_UNWIND endpoint=split tid={}", tid);
+                crate::yarm_log!("D2_RECV_WAITER_RACE_UNWIND tid={}", tid);
+            }
             let unwound =
                 shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
@@ -4618,17 +4625,26 @@ fn try_split_blocking_ipc_recv_into_frame(
             let unwound =
                 shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
-            crate::yarm_log!(
-                "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=publish outcome={} reason={}",
-                cpu.0,
-                tid,
-                unwound.slug(),
-                if already_waiting {
-                    "receiver_already_waiting"
-                } else {
-                    "publish_refused"
-                }
-            );
+            // IPC-DISPLACE1-MARKER1: a competing-receiver refusal whose exact unwind RESTORED the
+            // entering incarnation is a settled answer, not a fail-closed one: it is reported only
+            // by the `IPC_RECV_BLOCK_SPLIT_SETTLED ... reason=receiver_already_waiting
+            // outcome=restored resumable=1` line `recv_settle_after_unwind` emits below, after
+            // the outcome is known. Everything else stays FAILED_CLOSED — `InvalidEndpoint`
+            // (defensively unreachable), and a refusal whose unwind did NOT restore the task.
+            let settled_refusal = already_waiting && unwound.may_resume_entering_frame();
+            if !settled_refusal {
+                crate::yarm_log!(
+                    "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=publish outcome={} reason={}",
+                    cpu.0,
+                    tid,
+                    unwound.slug(),
+                    if already_waiting {
+                        "receiver_already_waiting"
+                    } else {
+                        "publish_refused"
+                    }
+                );
+            }
             // U9-RECV-BLOCK2 §2 — the two answers are not two errors, they are an answer and a
             // non-answer. `WrongObject` through a resumable frame is the canonical outcome;
             // `Internal` through a frame that is NOT this task's would return into a task the

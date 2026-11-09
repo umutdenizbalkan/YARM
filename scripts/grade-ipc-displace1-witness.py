@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Umut Deniz Balkan
-"""IPC-DISPLACE1-ACCEPTANCE — grade one live competing-receiver witness boot.
+"""IPC-DISPLACE1-ACCEPTANCE / -MARKER1 — grade one live competing-receiver witness boot.
 
 Input: the normalized serial log of a boot with `yarm.ipc_displace1_witness=1`.
 
@@ -12,9 +12,10 @@ lines by task identity, endpoint identity and wait generation, never by marker p
     R1 blocks on the production split route   IPC_RECV_BLOCK_SPLIT_DONE tid=R1 ... wait_gen=W result=blocked
     R2 is refused by the publication owner    WA3C2_WAITER_PUBLISH_REFUSED ... new_tid=R2 ... live_tid=R1 live_wait_gen=W
                                               D2_RECV_WAITER_REFUSED ... tid=R2 ... live_tid=R1 ... reason=receiver_already_waiting
-    R2 is unwound exactly and answered        D2_RECV_SPLIT_UNWIND_OK ... tid=R2 ... via=exact
-                                              IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED ... tid=R2 ... outcome=restored reason=receiver_already_waiting
-                                              IPC_RECV_BLOCK_SPLIT_SETTLED ... tid=R2 ... answer=6 outcome=restored resumable=1
+    R2 is unwound exactly and answered        D2_RECV_SPLIT_UNWIND_OK cpu=C tid=R2 ... via=exact ... status=running placement=current
+                                              IPC_RECV_BLOCK_SPLIT_SETTLED cpu=C tid=R2 ... reason=receiver_already_waiting answer=6 outcome=restored resumable=1
+                                              (MARKER1: a settled refusal is NOT fail-closed and is NOT a publish race, so
+                                               IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED and D2_PUBLISH_RACE_UNWIND must not appear)
     R2 runs again and reports QueueFull       IPCD1_WITNESS_R2 round=k answer=6 canary_ok=1
     S's message reaches R1 exactly once       IPC_RECV_DELIVER_TO_WAITER tid=R1 endpoint=E ...
                                               IPCD1_WITNESS_R1 round=k answer=256 ... ok=1
@@ -151,7 +152,7 @@ def main():
     wa3 = [(i, d) for i, d in k_lines("WA3C2_WAITER_PUBLISH_REFUSED") if d.get("new_tid") == r2 and d.get("reason") == "live_receiver_armed"]
     refused = [(i, d) for i, d in k_lines("D2_RECV_WAITER_REFUSED") if d.get("tid") == r2]
     unwound = [(i, d) for i, d in k_lines("D2_RECV_SPLIT_UNWIND_OK") if d.get("tid") == r2]
-    closed = [(i, d) for i, d in k_lines("IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED") if d.get("tid") == r2]
+    closed = [(i, d) for i, d in k_lines("IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED")]
     settled = [(i, d) for i, d in k_lines("IPC_RECV_BLOCK_SPLIT_SETTLED") if d.get("tid") == r2 and d.get("reason") == "receiver_already_waiting"]
     deliver_r1 = [(i, d) for i, d in k_lines("IPC_RECV_DELIVER_TO_WAITER") if d.get("tid") == r1]
     deliver_r2 = [(i, d) for i, d in k_lines("IPC_RECV_DELIVER_TO_WAITER") if d.get("tid") == r2]
@@ -166,22 +167,22 @@ def main():
     want("R1 split blocks", blocks, rounds)
     want("publication-owner refusals of R2 (WA3C2)", wa3, rounds)
     want("refusals of R2 (D2_RECV_WAITER_REFUSED)", refused, rounds)
-    want("split refusal-arm settlements of R2", closed, rounds)
     want("receiver_already_waiting settles of R2", settled, rounds)
+    want("exact unwinds of R2", unwound, rounds)
+    # MARKER1: a settled refusal is not a fail-closed settlement, and this boot has no queue race.
+    # Either marker here is a real failure (an unwind that did not restore, an InvalidEndpoint, a
+    # race the witness never creates), never something to explain away.
+    if closed:
+        fail(f"{len(closed)} fail-closed receive settlement(s): {[d for _, d in closed][:3]}")
     want("deliveries to R1", deliver_r1, rounds)
     if len(r2_blocks) != 1:
         fail(f"kernel R2 split blocks: {len(r2_blocks)} (want 1: the final phase only)")
-    if len(unwound) < rounds:
-        fail(f"kernel exact unwinds of R2: {len(unwound)} (want >= {rounds})")
     for _, d in unwound:
-        if d.get("via") != "exact":
-            fail(f"R2 unwind not exact: {d}")
+        if d.get("via") != "exact" or d.get("status") != "running" or d.get("placement") != "current":
+            fail(f"R2's unwind did not restore it running and current: {d}")
     for _, d in refused:
         if d.get("live_tid") != r1 or d.get("reason") != "receiver_already_waiting" or d.get("endpoint") != ep_index:
             fail(f"a refusal of R2 did not name R1 on endpoint {ep_index}: {d}")
-    for _, d in closed:
-        if d.get("outcome") != "restored" or d.get("reason") != "receiver_already_waiting" or d.get("phase") != "publish":
-            fail(f"R2's split refusal arm did not restore the entering incarnation: {d}")
     for _, d in settled:
         if d.get("answer") != str(ANSWER_QUEUE_FULL) or d.get("outcome") != "restored" or d.get("resumable") != "1":
             fail(f"R2's settlement was not QueueFull through its own frame: {d}")
@@ -199,27 +200,28 @@ def main():
             fail(f"R1 was not woken on its home CPU {sorted(r1_home)}: {d}")
     if len(wake_r2) != 1 or (deliver_r2 and wake_r2 and wake_r2[0][0] < deliver_r2[0][0]):
         fail(f"IPC wakes of R2: {len(wake_r2)} (want 1, after the final delivery)")
-    # Every D2_PUBLISH_RACE_UNWIND on this boot must be R2's refusal unwind on the split route:
-    # the refusal arm reuses the exact unwind, which logs that marker.
-    for _, d in race_unwinds:
-        if d.get("tid") != r2 or d.get("endpoint") != "split":
-            fail(f"a publish-race unwind that is not R2's refusal: {d}")
-    if len(race_unwinds) != len(closed):
-        fail(f"race unwinds={len(race_unwinds)} but refusal settlements={len(closed)}")
+    # MARKER1: the publish-race pair now names the queue-publication race only. S sends only after
+    # R2 has returned and R1 is blocked, so this boot has none: any occurrence is unexplained.
+    if race_unwinds:
+        fail(f"{len(race_unwinds)} publish-race unwind(s) on a boot with no queue race: {[d for _, d in race_unwinds][:3]}")
 
     # Per-round causal chain, in log order: R1 blocks, then R2 is refused naming THAT block,
     # then the round's message is delivered to R1.
     cross = 0
     per_round = []
-    n = min(len(blocks), len(wa3), len(refused), len(closed), len(deliver_r1))
+    n = min(len(blocks), len(wa3), len(refused), len(unwound), len(settled), len(deliver_r1))
     for k in range(n):
         bi, bd = blocks[k]
         wi, wd = wa3[k]
         ri, rd = refused[k]
-        ci, cd = closed[k]
+        ui, ud = unwound[k]
+        ci, cd = settled[k]
         di, dd = deliver_r1[k]
-        if not (bi < wi <= ri < ci < di):
-            fail(f"round {k + 1}: order block={bi} owner_refusal={wi} refusal={ri} settle={ci} delivery={di}")
+        # The settlement is only authorized by the exact unwind that precedes it, on the same CPU.
+        if not (bi < wi <= ri < ui < ci < di):
+            fail(f"round {k + 1}: order block={bi} owner_refusal={wi} refusal={ri} unwind={ui} settle={ci} delivery={di}")
+        if ud.get("cpu") != cd.get("cpu"):
+            fail(f"round {k + 1}: R2 unwound on cpu {ud.get('cpu')} but settled on cpu {cd.get('cpu')}")
         if k < len(wake_r1) and not (di < wake_r1[k][0]):
             fail(f"round {k + 1}: R1's wake precedes its delivery")
         if wd.get("live_wait_gen") != bd.get("wait_gen"):
