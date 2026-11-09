@@ -797,24 +797,26 @@ impl IpcSubsystem {
         // the ownership pre-flight and the census, so the live record, its ownership slot, its
         // direct-ack lease and the census are exactly as found. A record left over from a
         // superseded endpoint generation is not live and keeps the stale-retirement path below.
-        if let Some(live) = displaced.filter(|old| self.waiter_ownership_record_is_live(idx, *old))
-        {
-            if live.receiver != record.receiver || record.wait_generation <= live.wait_generation {
-                crate::yarm_log!(
-                    "WA3C2_WAITER_PUBLISH_REFUSED endpoint={} new_tid={} new_wait_gen={} reason=live_receiver_armed live_tid={} live_wait_gen={}",
-                    idx,
-                    record.tid().0,
-                    record.wait_generation,
-                    live.tid().0,
-                    live.wait_generation
-                );
-                return (
-                    None,
-                    WaiterOwnershipTransition::LiveReceiverArmed {
-                        holding: live.receiver,
-                    },
-                );
-            }
+        let refused_by = displaced
+            .filter(|old| self.waiter_ownership_record_is_live(idx, *old))
+            .filter(|live| {
+                live.receiver != record.receiver || record.wait_generation <= live.wait_generation
+            });
+        if let Some(live) = refused_by {
+            crate::yarm_log!(
+                "WA3C2_WAITER_PUBLISH_REFUSED endpoint={} new_tid={} new_wait_gen={} reason=live_receiver_armed live_tid={} live_wait_gen={}",
+                idx,
+                record.tid().0,
+                record.wait_generation,
+                live.tid().0,
+                live.wait_generation
+            );
+            return (
+                None,
+                WaiterOwnershipTransition::LiveReceiverArmed {
+                    holding: live.receiver,
+                },
+            );
         }
         // A recycled endpoint index may still name an incarnation of the generation that was
         // destroyed. That incarnation is unclaimable and unretirable by key, so reclaim it here
