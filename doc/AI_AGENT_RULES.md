@@ -1011,6 +1011,13 @@ acceptance table. Declaring without smoke is a hard violation of §13.
 - One live receiver per endpoint (IPC-DISPLACE1, `doc/IPC.md` §8.7): the publish primitive
   refuses a different receiver with zero mutation; `D2_RECV_WAITER_DISPLACED` now only ever
   reports the same receiver superseding its own older record. Never restore overwrite.
+- Refusal telemetry (IPC-DISPLACE1-MARKER1, `doc/IPC.md` §8.7): `D2_PUBLISH_RACE_UNWIND` /
+  `D2_RECV_WAITER_RACE_UNWIND` name the queue-publication race ONLY, never a refusal that
+  shares its exact unwind. A competing receiver refused and restored is reported once, as
+  `IPC_RECV_BLOCK_SPLIT_SETTLED reason=receiver_already_waiting ... outcome=restored
+  resumable=1`. `IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED` stays a zero gate: it is logged for any
+  refusal the unwind did not restore and for `InvalidEndpoint`. Never move a marker to make
+  a gate pass without attributing every emitter first.
 
 ### 14.4 D3/D6 fences
 

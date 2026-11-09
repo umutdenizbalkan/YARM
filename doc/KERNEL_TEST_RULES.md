@@ -5322,6 +5322,14 @@ in `doc/KERNEL_UNLOCKING.md` passed on all three runs.
    smoke run until the SharedKernel seam split lands — a non-zero value
    before then indicates the publish recheck disagreed with the Phase-1
    dequeue under the same global borrow, which is a bug.
+   (IPC-DISPLACE1-MARKER1) The `D2_PUBLISH_RACE_UNWIND` marker counts that
+   race only. A refusal that unwinds through the same exact inverse
+   (receiver already waiting, ownership busy, deadline reservation) must not
+   log it. A restored competing-receiver refusal is
+   `IPC_RECV_BLOCK_SPLIT_SETTLED reason=receiver_already_waiting`, and
+   `IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED` stays a zero gate. A test or smoke of
+   a refusal must prove it from the task-state, unwind and delivery
+   evidence, never from the absence of a marker (`doc/IPC.md` §8.7).
 2. **One live receiver per endpoint (IPC-DISPLACE1; this replaces the
    original overwrite rule).** `publish_recv_waiter_live` returns
    `ReceiverAlreadyWaiting` for a different `{tid, asid}`, or for the same

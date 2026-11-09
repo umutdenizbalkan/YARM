@@ -1750,12 +1750,48 @@ in between is refused with `QueueFull` even though the old receiver has just sto
 waiting. The window is bounded by that drain and the refused caller may retry. The same
 receiver blocking again in that window has a newer wait generation and is admitted.
 
+**Telemetry (IPC-DISPLACE1-MARKER1).** The split route's exact unwind
+(`recv_block_unwind_exact_split`) serves four causes: the queue-publication race
+(`QueueNonEmpty`), the ownership-busy refusal, the receiver-already-waiting refusal and the
+deadline-reservation refusal. It therefore names none of them; its own
+`D2_RECV_SPLIT_UNWIND_OK` / `_FAIL` lines attest the unwind. Each cause is reported by its
+caller:
+
+| cause | race pair `D2_PUBLISH_RACE_UNWIND` + `D2_RECV_WAITER_RACE_UNWIND` | settle line | `IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED` |
+|---|---|---|---|
+| queue-publication race | yes | `reason=queue_non_empty` (`_unwound` when not restored) | no |
+| ownership busy | no | `reason=waiter_ownership_busy` (`_unwound` when not restored) | no |
+| receiver already waiting, unwind restored | no | `reason=receiver_already_waiting answer=6 outcome=restored resumable=1` | no |
+| receiver already waiting, unwind not restored | no | same reason, `resumable=0` | **yes** |
+| `InvalidEndpoint` (defensive) | no | `reason=publish_refused` | **yes** |
+| deadline reservation refused | no | `reason=deadline_reservation` | no |
+
+The settle line is written by `recv_settle_after_unwind` after the unwind's outcome is known,
+so a settled refusal is never reported before the unwind authorizes it. The smoke gates are
+unchanged: the race pair is still a hard blocker and `FAILED_CLOSED` still a zero gate
+(U9-RX4). Before MARKER1 both fired on every competing-receiver refusal, which made any boot
+that exercised the refusal fail its core smoke.
+
+**Live witness.** `scripts/qemu-ipc-displace1-witness-smoke.sh <arch> <smp>` boots the
+shared-region oracle kernel and an `ipc-displace1-witness` initramfs with
+`yarm.ipc_displace1_witness=1` (default off; slot-5 selector 17). Init's threads R1 and R2
+receive on one disposable endpoint and init sends, for 16 rounds plus a final round in which
+R2 receives normally. `scripts/grade-ipc-displace1-witness.py` grades the boot from the
+kernel's own markers: per round, R1's block, the owner's refusal naming R1's wait generation,
+R2's exact unwind and settle on one CPU, one delivery to R1 and one wake of R1. Placement
+comes from the markers, never from assumptions. It also requires the unmodified core smoke
+to pass. `scripts/ipc-displace1-gate-controls.sh` replays mutated witness logs through the
+real core smokes and the grader. A legit log passes. These fail: fail-closed, publish race,
+missing unwind, duplicated or missing delivery, and renamed diagnostics.
+
 **Coverage.** `kernel::boot::tests::ipc_displace1` drives the real blocking receive. On the
 broad trap route it covers: refusal and exact restore, delivery to the live receiver,
 destroy releasing it exactly once, timed live receivers and timed competitors, and repeated
 competition. It drives the split route's three phase owners plus its exact unwind on one
 CPU and across two CPUs. It also covers the record-level generation rule, a live claim
-staying `WaiterOwnershipBusy`, and a source guard on both routes' refusal arms.
+staying `WaiterOwnershipBusy`, and a source guard on both routes' refusal arms. MARKER1
+guards pin the telemetry rules: the shared unwind names no cause, the race pair is logged
+by the race only, and a refusal is fail-closed unless its unwind restored it.
 
 ---
 

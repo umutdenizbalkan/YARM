@@ -3607,6 +3607,65 @@ Final refs: `main`, `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/kthread-closu
 that adds this record; `wip/kthread-closure1-a` `136e8ae2`, `-b` `a540aef2`, `-c` `fc429b00`;
 `14b61286` and every earlier ref preserved.
 
+#### IPC-DISPLACE1-MARKER1 (from delivered `ff132fc5`)
+
+IPC-DISPLACE1 (`ff132fc5`) made the split receive's competing-receiver refusal reachable. The live
+witness built to accept it (IPC-DISPLACE1-ACCEPTANCE, `dfc30148`, preserved on
+`wip/ipc-displace1-acceptance`) then hard-stopped. Every port's standard core smoke rejected any
+boot in which the refusal happened. MARKER1 repairs the telemetry without weakening a gate. Rules:
+`doc/IPC.md` §8.7 (Telemetry, Live witness), `doc/AI_AGENT_RULES.md` §14.3,
+`doc/KERNEL_TEST_RULES.md` Stage 106 rule 1.
+
+**Attribution.** `IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED` has one emitter, the split route's `_ =>`
+refusal arm, and it logged on every `ReceiverAlreadyWaiting` refusal. `D2_PUBLISH_RACE_UNWIND`
+has two emitters. The broad one is `recv_block_unwind_race`, called only for the broad
+`QueueNonEmpty`. The split one is the shared exact inverse `recv_block_unwind_exact_split`. U9-RX3
+(`65a144cd`) put the race pair there for the race; WA3C2 (`612339b5`) reused the inverse for
+ownership-busy, U9-RECV-BLOCK2 (`05d5faf5`) for deadline refusal, and IPC-DISPLACE1 for the
+refusal. The marker's meaning drifted as callers were added, and no gate was ever hit. In all
+six exploratory boots of `dfc30148`, every race marker and every FAILED_CLOSED line was R2's.
+They appeared in strict order refused < race < failed_closed < settled (`answer=6
+outcome=restored resumable=1`). There was no queue race, lost wakeup or ownership violation.
+
+**Repair (`d8b107ba`, no behaviour change).** The shared inverse names no cause. The race pair is
+logged by the `QueueNonEmpty` half of its caller only. The refusal arm logs FAILED_CLOSED unless
+the refusal is `ReceiverAlreadyWaiting` and the unwind restored the entering incarnation. A
+settled refusal is reported once, after the outcome is known, by `recv_settle_after_unwind`'s
+`IPC_RECV_BLOCK_SPLIT_SETTLED`. `InvalidEndpoint` stays fail-closed with `reason=publish_refused`.
+No smoke gate changed. Three source guards pin the rules. The witness grader now requires a
+settle and an exact unwind per round, and rejects any FAILED_CLOSED or race marker.
+
+**Qualification of `d8b107ba`** (predeclared schedule; sequential; no step retried; logs, rcs,
+bindings and hashes kept):
+
+| Step | Result |
+|---|---|
+| fmt; clippy `--features hosted-dev` | clean; 428 warnings vs base 427 — the +1 is `set_ipc_displace1_witness_enabled` never used in hosted builds (from `dfc30148`, same as five sibling witness setters on base); MARKER1 itself adds 0 (`dfc30148` also 428); no new class |
+| hosted lib (serial, `CARGO_INCREMENTAL=0`); integration (incl. census and doc guards) | 6294 passed, 0 failed, 3 ignored; 41 binaries, 396 passed |
+| named subsets ipc_displace1 / wa3c2 / direct / timeout / teardown / vfs | 19 / 16 / 337 / 158 / 41 / 12 passed |
+| default builds ×3 (`kernel_features=none`); recv-v2 oracles ×3 | pass |
+| CI-exact strict builds and `QEMU_SMOKE_STRICT=1` core smokes ×3 | pass |
+| live witness, 16 rounds, x86_64 / AArch64 / RISC-V × SMP1 / SMP2 | 6/6 `witness=ok core_smoke=ok`; per boot 16 blocks, 16 refusals naming R1's wait generation, 16 exact unwinds and settles of R2, 16 deliveries and 16 home-CPU wakes of R1, final R2 receive ok; 0 FAILED_CLOSED, 0 race, 0 displacement; at SMP2 R1 on CPU 0 and R2 on CPU 1 in 16/16 rounds (from the kernel's block, unwind and wake markers); every boot bound to the candidate's tree `55ab0cf4` |
+| gate fixture controls ×3 (`scripts/ipc-displace1-gate-controls.sh`, real unmodified core smokes) | legit passes; fail-closed, publish race, missing unwind, duplicated / missing delivery, renamed FAILED_CLOSED, renamed SETTLED all fail; x86_64 and AArch64 core gates reject fail-closed and race, RISC-V rejects race (it has no fail-closed gate; the grader catches it) |
+| hosted NCs (refusal off / unwind skipped / false `Restored`) | 10 / 2 / 2 `ipc_displace1` tests fail |
+| live NCs ×3 arches, SMP1 | NC1 (no refusal): R2 displaces R1, R1 stranded; the core smoke PASSES these boots, only the witness fails them. NC2 (no unwind): FAILED_CLOSED `incarnation_moved`, `resumable=0`, R2 never runs, panic. NC3 (no unwind, claims `Restored`): a perfect SETTLED line and no FAILED_CLOSED, core smoke passes; rejected on 0 exact unwinds, R2 never returning and 1 of 16 deliveries. 9/9 fail |
+| direct matrix seal; reply-timeout retirement ×3; server-dies ×3; AP SMP direct, recv-v2 block, cross-CPU request and reply | pass |
+| CI profiles on clean default bindings, candidate and base | smp2-core, smp4-core pass on both |
+
+Six checks fail with identical signatures on `b81e0317` and on the candidate, and are recorded
+with evidence and repair prerequisites in `doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md`:
+
+* the reply-timeout matrix (invalid check);
+* `smp2-sender-wake` and `smp4-sender-wake` (baseline debt, confirmed on clean
+  `kernel_features=none` bindings for both commits);
+* `sched-timeout` (invalid check);
+* the SMP-request script's syntax error (baseline debt);
+* the CI strict timer grep (invalid check).
+
+Verdict: **IPC_DISPLACE1_ACCEPTED_WITH_BASELINE_DEBT**. Refs: `claude/yarm-kernel-unlock-u0-f2zh8p`
+and `wip/ipc-displace1-marker1` at the commit that adds this record; `wip/ipc-displace1` `ff132fc5`,
+`wip/ipc-displace1-acceptance` `dfc30148` and `main` `b81e0317` unchanged.
+
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 
