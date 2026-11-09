@@ -5322,9 +5322,13 @@ in `doc/KERNEL_UNLOCKING.md` passed on all three runs.
    smoke run until the SharedKernel seam split lands — a non-zero value
    before then indicates the publish recheck disagreed with the Phase-1
    dequeue under the same global borrow, which is a bug.
-2. **Overwrite semantics are canonical.** `publish_recv_waiter_live` never
-   returns `ReceiverAlreadyWaiting`; tests asserting strict-single-waiter
-   behavior must use the Stage 105 audit primitive, not the live one.
+2. **One live receiver per endpoint (IPC-DISPLACE1; this replaces the
+   original overwrite rule).** `publish_recv_waiter_live` returns
+   `ReceiverAlreadyWaiting` for a different `{tid, asid}`, or for the same
+   receiver without a strictly newer wait generation, with zero mutation.
+   Tests that need a replacement must publish the SAME identity with a newer
+   generation. Tests of a refusal must assert task state, scheduler placement
+   and waiter ownership separately (`doc/IPC.md` §8.7).
 3. **The no-lost-wakeup executable proof**
    (`stage106_d2_no_lost_wakeup_unwind_sequence_drains_message`) replicates
    the exact live unwind sequence (block → racing send → publish

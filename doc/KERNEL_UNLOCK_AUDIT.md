@@ -4144,6 +4144,11 @@ exactly two: the split route's `run_exit_transaction`, through the claim, and th
 | `rt_commit_receiver_runnable` | `complete_reply_timeout_over`, `complete_server_death_over` | 2 |
 | `drain_recv_timeout_post_work` | `run_due_ipc_timeout_work` (the single production timeout entry) | 1 |
 
+Later origins are pinned in `the_helper_writer_direct_caller_sets_are_pinned` rather than
+re-tabulated here: `wake_tid_to_runnable` also gained `destroy_endpoint` (WA3C1 F) and two
+calls in `block_current_on_receive_with_deadline` — the WA3C2 ownership-busy unwind and the
+IPC-DISPLACE1 refused-publication unwind (`doc/IPC.md` §8.7).
+
 > **U9-F — the notification waiter wake, split out.** `revoke_capability_in_cnode`'s sixth
 > obligation (notification destroy + waiter wake) is one of the four that U9-F proved independent
 > of the D3 fence. `wake_destroyed_notification_waiter_split` is its off-broad-lock form: rank 1
@@ -6212,6 +6217,13 @@ owner first — CLAIM(`WaiterOwner::Teardown`) → CANCEL → RETIRE → ARM(new
 makes the transition exclusive: if a direct transaction already owns the departing incarnation the
 claim is refused and the whole displacement is refused with it, rather than raced. CANCEL rather
 than CONSUME, because a displaced receiver was abandoned, not delivered to.
+
+> **Superseded by IPC-DISPLACE1 (2026-11-09).** The transition above ended the departing
+> incarnation's *ownership*, but not the task: the replaced receiver stayed
+> `Blocked(EndpointReceive)` with no record, so delivery and destroy could never reach it. A
+> different receiver is now refused (`ReceiverAlreadyWaiting`, answered `QueueFull`) with zero
+> mutation, and only the same receiver's newer wait supersedes its own record; see `doc/IPC.md`
+> §8.7.
 
 **Terminal balance, and the leak WA3C2 closes.** Every claim site now settles on every terminal
 arm. Two arms previously wrote `let _ = claim;` — the direct request's `ServerGone` and the direct

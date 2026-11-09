@@ -194,6 +194,13 @@ pub(crate) enum WaiterOwnershipTransition {
     ForeignIncarnation { holding: WaiterSlotKind },
     /// The endpoint index has no ownership slot (out of range).
     NoSlot,
+    /// IPC-DISPLACE1 — the endpoint already has a LIVE published receiver (`holding`), and the
+    /// arriving record is not that receiver blocking again (same `{tid, asid}` with a strictly
+    /// newer wait generation). One receiver per endpoint: a second one is refused, never
+    /// substituted, because a replaced receiver would stay `Blocked` with no record left for any
+    /// delivery or teardown wake to find. Nothing was mutated — the live record, its ownership
+    /// slot, its direct-ack lease and the waiter census are exactly as found.
+    LiveReceiverArmed { holding: ReceiverWaiterIdentity },
 }
 
 impl WaiterOwnershipTransition {
@@ -212,6 +219,7 @@ impl WaiterOwnershipTransition {
             Self::ArmRefused { .. } => "arm_refused",
             Self::ForeignIncarnation { .. } => "foreign_incarnation",
             Self::NoSlot => "no_slot",
+            Self::LiveReceiverArmed { .. } => "live_receiver_armed",
         }
     }
 }
@@ -806,6 +814,24 @@ impl IpcSubsystem {
             waiter: record.receiver,
             wait_generation: record.wait_generation,
         })
+    }
+
+    /// IPC-DISPLACE1 — is the record resident at `idx` a LIVE receiver of the CURRENT endpoint
+    /// incarnation, i.e. is its exact incarnation, keyed at the live endpoint generation, armed
+    /// and unclaimed (`Available`)? Mutates nothing.
+    ///
+    /// Every receiver a production path publishes is in exactly this state until delivery, a
+    /// claim, a timeout, destruction or death removes its record. A record whose ownership slot
+    /// names an incarnation of a superseded endpoint generation is NOT live: it is the stale
+    /// shape [`Self::waiter_ownership_retire_superseded`] reclaims, so it must not refuse the
+    /// next receiver and wedge the index.
+    pub(crate) fn waiter_ownership_record_is_live(
+        &self,
+        idx: usize,
+        record: super::defs::EndpointWaiterRecord,
+    ) -> bool {
+        self.waiter_ownership_key_for(idx, record)
+            .is_some_and(|key| self.waiter_ownership_view(&key) == WaiterOwnershipView::Available)
     }
 
     /// Reconcile the ownership slot with a **departing** incarnation: the record the waiter

@@ -748,12 +748,12 @@ impl IpcSubsystem {
         self.endpoint_waiters.get(idx).map(Option::is_some) == Some(true)
     }
 
-    /// Publish the complete record at `idx`, returning the displaced record, if any.
+    /// Publish the complete record at `idx`, returning the superseded record, if any.
     ///
-    /// Stage 199D-WA3C1 deliberately PRESERVES last-receiver-wins: a new receiver may replace an
-    /// existing waiter. That semantic is load-bearing for the relay, direct-request, direct-reply
-    /// and reply-timeout paths, which have their own replacement/rollback contracts, and WA3C2
-    /// keeps it.
+    /// IPC-DISPLACE1: one live receiver per endpoint. A record for a DIFFERENT `{tid, asid}`, or
+    /// for the same receiver without a strictly newer wait generation, is refused with no
+    /// mutation and `None` is returned; only the same receiver blocking again supersedes its own
+    /// record. (Stage 199D-WA3C1 had kept last-receiver-wins, which stranded the replaced task.)
     ///
     /// Stage 199D-WA3C2: [`Self::publish_endpoint_waiter`] is **the one place an arriving
     /// incarnation is armed** in the ownership table, for the same structural reason the
@@ -784,6 +784,38 @@ impl IpcSubsystem {
     ) {
         use crate::kernel::boot::waiter_ownership::WaiterOwnershipTransition;
         let displaced = self.endpoint_waiters.get(idx).copied().flatten();
+        // IPC-DISPLACE1 — ONE LIVE RECEIVER PER ENDPOINT, decided before any mutation.
+        //
+        // A LIVE record — its exact incarnation armed and unclaimed at the current endpoint
+        // generation — names a receiver that is still `Blocked` on this endpoint: every path
+        // that ends a receive wait takes or clears its record (delivery, direct claim, timeout,
+        // destroy, death, reap, every unwind). Replacing it with a DIFFERENT receiver would
+        // leave that task blocked with no record for any wake to find — only a deadline could
+        // ever release it. So a different `{tid, asid}` is refused, and so is the same receiver
+        // unless its wait generation is strictly newer (it blocked again; the old record is
+        // superseded below). The refusal returns before the superseded-generation retirement,
+        // the ownership pre-flight and the census, so the live record, its ownership slot, its
+        // direct-ack lease and the census are exactly as found. A record left over from a
+        // superseded endpoint generation is not live and keeps the stale-retirement path below.
+        if let Some(live) = displaced.filter(|old| self.waiter_ownership_record_is_live(idx, *old))
+        {
+            if live.receiver != record.receiver || record.wait_generation <= live.wait_generation {
+                crate::yarm_log!(
+                    "WA3C2_WAITER_PUBLISH_REFUSED endpoint={} new_tid={} new_wait_gen={} reason=live_receiver_armed live_tid={} live_wait_gen={}",
+                    idx,
+                    record.tid().0,
+                    record.wait_generation,
+                    live.tid().0,
+                    live.wait_generation
+                );
+                return (
+                    None,
+                    WaiterOwnershipTransition::LiveReceiverArmed {
+                        holding: live.receiver,
+                    },
+                );
+            }
+        }
         // A recycled endpoint index may still name an incarnation of the generation that was
         // destroyed. That incarnation is unclaimable and unretirable by key, so reclaim it here
         // — otherwise a destroyed-and-recreated endpoint would refuse every future receiver.
@@ -1968,17 +2000,30 @@ pub(crate) fn publish_recv_waiter_locked(
     if endpoint.queued() > 0 {
         return PublishWaiterOutcome::QueueNonEmpty;
     }
-    // Stage 199D-WA3C1: store the COMPLETE generation-bearing RECORD. Canonical
-    // last-receiver-wins is PRESERVED on purpose — the relay, direct-request,
-    // direct-reply and reply-timeout paths each have their own replacement/rollback
-    // contract built on it, and WA3C2 keeps it.
+    // Stage 199D-WA3C1: store the COMPLETE generation-bearing RECORD.
     //
-    // Stage 199D-WA3C2: what WA3C2 removes is the OWNERLESS form of that replacement. The
-    // displaced record used to be logged and dropped, leaving the old receiver blocked with
-    // neither a waiter nor an owner; `publish_endpoint_waiter` now runs the explicit
-    // CLAIM(Teardown) → CANCEL → RETIRE transition first, and refuses outright when the
-    // departing incarnation is still held by an in-flight direct transaction.
+    // IPC-DISPLACE1: one live receiver per endpoint. A second receiver is refused with
+    // `ReceiverAlreadyWaiting` and NOTHING mutated, and the caller unwinds its own block; the
+    // live receiver keeps its record, so delivery and teardown still reach it. Only the same
+    // receiver blocking again (a strictly newer wait generation) supersedes its own record,
+    // through the CLAIM(Teardown) → CANCEL → RETIRE transition WA3C2 introduced. A publication
+    // over an in-flight direct transaction's claim is still `WaiterOwnershipBusy`.
     let (displaced, ownership) = ipc.publish_endpoint_waiter(endpoint_idx, record);
+    if let crate::kernel::boot::waiter_ownership::WaiterOwnershipTransition::LiveReceiverArmed {
+        holding,
+    } = ownership
+    {
+        crate::yarm_log!(
+            "D2_RECV_WAITER_REFUSED endpoint={} tid={} asid={} wait_gen={} live_tid={} live_asid={} reason=receiver_already_waiting",
+            endpoint_idx,
+            receiver_tid.0,
+            receiver.asid.0,
+            record.wait_generation,
+            holding.tid.0,
+            holding.asid.0
+        );
+        return PublishWaiterOutcome::ReceiverAlreadyWaiting;
+    }
     if !ownership.permits_publication() {
         crate::yarm_log!(
             "D2_RECV_WAITER_OWNERSHIP_BUSY endpoint={} tid={} wait_gen={} reason={}",
@@ -1990,12 +2035,15 @@ pub(crate) fn publish_recv_waiter_locked(
         return PublishWaiterOutcome::WaiterOwnershipBusy;
     }
     if let Some(displaced) = displaced {
+        // IPC-DISPLACE1: only ever the SAME receiver superseding its own older record.
         crate::yarm_log!(
-            "D2_RECV_WAITER_DISPLACED endpoint={} old_tid={} old_wait_gen={} new_tid={} new_wait_gen={}",
+            "D2_RECV_WAITER_DISPLACED endpoint={} old_tid={} old_asid={} old_wait_gen={} new_tid={} new_asid={} new_wait_gen={}",
             endpoint_idx,
             displaced.tid().0,
+            displaced.receiver.asid.0,
             displaced.wait_generation,
             receiver_tid.0,
+            receiver.asid.0,
             record.wait_generation
         );
     }
@@ -4856,13 +4904,37 @@ impl KernelState {
                 let _ = self.dispatch_next_task()?;
                 return Err(KernelError::WouldBlock);
             }
-            // The live primitive preserves canonical overwrite semantics for
-            // a pre-existing waiter (it never returns ReceiverAlreadyWaiting)
-            // and endpoint_idx was validated by resolve_endpoint_index, so
-            // InvalidEndpoint is defensively unreachable here.
-            crate::kernel::recv_waiter_split::PublishWaiterOutcome::ReceiverAlreadyWaiting
-            | crate::kernel::recv_waiter_split::PublishWaiterOutcome::InvalidEndpoint => {
-                return Err(KernelError::WrongObject);
+            // IPC-DISPLACE1 — a REFUSED publication, unwound exactly like the busy arm above:
+            // nothing was published, so reversing ranks 2 (Runnable, deadline cleared) and 1
+            // (re-placed, redispatched) restores the pre-block state. `ReceiverAlreadyWaiting`
+            // means another live receiver holds this endpoint; it answers `QueueFull`
+            // (`EndpointQueueFull`), never `WouldBlock`, which user-rt reads as "no message" and
+            // would retry into the same refusal. `InvalidEndpoint` is defensively unreachable
+            // (`resolve_endpoint_index` validated the index) and keeps its `WrongObject` answer,
+            // now also with the unwind it used to skip.
+            outcome @ (crate::kernel::recv_waiter_split::PublishWaiterOutcome::ReceiverAlreadyWaiting
+            | crate::kernel::recv_waiter_split::PublishWaiterOutcome::InvalidEndpoint) => {
+                let already_waiting = matches!(
+                    outcome,
+                    crate::kernel::recv_waiter_split::PublishWaiterOutcome::ReceiverAlreadyWaiting
+                );
+                crate::yarm_log!(
+                    "D2_RECV_WAITER_REFUSED_UNWIND endpoint={} tid={} reason={}",
+                    plan.endpoint_idx,
+                    plan.blocked_tid.0,
+                    if already_waiting {
+                        "receiver_already_waiting"
+                    } else {
+                        "invalid_endpoint"
+                    }
+                );
+                self.wake_tid_to_runnable(plan.blocked_tid)?;
+                let _ = self.dispatch_next_task()?;
+                return Err(if already_waiting {
+                    KernelError::EndpointQueueFull
+                } else {
+                    KernelError::WrongObject
+                });
             }
         }
         crate::yarm_log!(

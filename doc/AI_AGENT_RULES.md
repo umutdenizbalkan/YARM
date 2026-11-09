@@ -1008,8 +1008,9 @@ acceptance table. Declaring without smoke is a hard violation of §13.
 
 - `d2_publish_race_unwinds` MUST be 0 until the SharedKernel seam split
   lands. Treat any non-zero value in a smoke log as a stop-ship bug.
-- The publish primitive preserves canonical overwrite semantics
-  (`D2_RECV_WAITER_DISPLACED` is observability, not a behavior change).
+- One live receiver per endpoint (IPC-DISPLACE1, `doc/IPC.md` §8.7): the publish primitive
+  refuses a different receiver with zero mutation; `D2_RECV_WAITER_DISPLACED` now only ever
+  reports the same receiver superseding its own older record. Never restore overwrite.
 
 ### 14.4 D3/D6 fences
 

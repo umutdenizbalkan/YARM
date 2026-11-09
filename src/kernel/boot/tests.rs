@@ -71582,21 +71582,27 @@ mod stage198e3b2b_drain_switch {
     #[test]
     fn replacement_waiter_rolls_back_zero_wake() {
         let d = build_blocked(1, Some(2));
-        // A different task 3 replaced the waiter slot after the producer ran.
+        let task3 = crate::kernel::boot::EndpointWaiterRecord::new(
+            crate::kernel::boot::ReceiverWaiterIdentity::new(
+                ThreadId(3),
+                crate::kernel::vm::Asid(0),
+            ),
+            1,
+        );
+        // IPC-DISPLACE1: the publication owner refuses a different task over the live waiter.
         d.shared.with(|k| {
             k.with_ipc_state_mut(|ipc| {
-                let _ = ipc.set_endpoint_waiter(
-                    d.eidx,
-                    crate::kernel::boot::EndpointWaiterRecord::new(
-                        crate::kernel::boot::ReceiverWaiterIdentity::new(
-                            ThreadId(3),
-                            crate::kernel::vm::Asid(0),
-                        ),
-                        1,
-                    ),
+                assert_eq!(ipc.set_endpoint_waiter(d.eidx, task3), None, "refused");
+                assert_eq!(
+                    ipc.endpoint_waiter_identity(d.eidx).map(|w| w.tid),
+                    Some(ThreadId(2))
                 );
             })
         });
+        // Defence in depth: the finalizer must still fail closed if the slot ever named another
+        // task. No production path can build this any more, so it is written raw.
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = Some(task3)));
         assert!(drain(&d).is_err(), "stale finalization fails the drain");
         assert!(
             matches!(status(&d), Some(TaskStatus::Blocked(_))),
@@ -71954,8 +71960,20 @@ mod stage198e3b2b_drain_switch {
             let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
             crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), new_asid)
         });
+        let original = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), orig_asid);
         d.shared.with(|k| {
             k.with_ipc_state_mut(|ipc| {
+                // IPC-DISPLACE1: never over the live original…
+                assert_eq!(
+                    ipc.set_endpoint_waiter(
+                        d.eidx,
+                        crate::kernel::boot::EndpointWaiterRecord::new(replacement, 1),
+                    ),
+                    None
+                );
+                assert_eq!(ipc.endpoint_waiter_identity(d.eidx), Some(original));
+                // …only after the original's death retired its waiter by identity.
+                ipc.clear_endpoint_waiters_for_identity(original);
                 ipc.set_endpoint_waiter(
                     d.eidx,
                     crate::kernel::boot::EndpointWaiterRecord::new(replacement, 1),
@@ -72459,16 +72477,32 @@ mod stage198e3b2b2_waiter_identity {
             let mut s = Bootstrap::init().expect("init");
             s.register_task(2).expect("t2");
             let (eidx, _snd, recv) = s.create_endpoint(4).expect("ep");
-            // Original incarnation publishes, then a replacement (new asid) overwrites (last wins).
+            // Original incarnation publishes. IPC-DISPLACE1: while it is live, a replacement
+            // (same numeric TID, new asid) is refused — it is a different receiver.
             s.publish_recv_waiter_live(
                 eidx,
                 crate::kernel::boot::EndpointWaiterRecord::new(ident(2, 7), 1),
                 recv,
             );
-            s.publish_recv_waiter_live(
-                eidx,
-                crate::kernel::boot::EndpointWaiterRecord::new(ident(2, 8), 1),
-                recv,
+            assert_eq!(
+                s.publish_recv_waiter_live(
+                    eidx,
+                    crate::kernel::boot::EndpointWaiterRecord::new(ident(2, 8), 1),
+                    recv,
+                ),
+                crate::kernel::recv_waiter_split::PublishWaiterOutcome::ReceiverAlreadyWaiting,
+                "a live original is never overwritten by a replacement incarnation"
+            );
+            // A replacement incarnation exists only once the original is gone, and the death
+            // path retires the original's waiters by identity before it can publish.
+            s.with_ipc_state_mut(|ipc| ipc.clear_endpoint_waiters_for_identity(ident(2, 7)));
+            assert_eq!(
+                s.publish_recv_waiter_live(
+                    eidx,
+                    crate::kernel::boot::EndpointWaiterRecord::new(ident(2, 8), 1),
+                    recv,
+                ),
+                crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
             );
             s
         });
@@ -95783,17 +95817,22 @@ mod stage200c_reply_timeout_transaction {
     fn c15_waiter_replacement_before_fire() {
         let fx = caller_fixture();
         let (_idx, _rgen, identity, handle) = setup(&fx);
-        // Replace the endpoint waiter with a DIFFERENT identity (same generation).
+        // A DIFFERENT identity at the same endpoint generation.
         let replacement = ReceiverWaiterIdentity::new(
             crate::kernel::ipc::ThreadId(2),
             crate::kernel::vm::Asid(0x321),
         );
+        let record = crate::kernel::boot::EndpointWaiterRecord::new(replacement, 1);
         fx.k.with(|s| {
             s.with_ipc_state_mut(|ipc| {
-                ipc.set_endpoint_waiter(
-                    identity.reply_endpoint_index,
-                    crate::kernel::boot::EndpointWaiterRecord::new(replacement, 1),
-                )
+                // IPC-DISPLACE1: the publication owner refuses it over the blocked caller…
+                assert_eq!(
+                    ipc.set_endpoint_waiter(identity.reply_endpoint_index, record),
+                    None
+                );
+                // …so the slot naming it is now an unreachable table state, written raw to keep
+                // the transaction's own defence (exact waiter claim → no wake) covered.
+                ipc.endpoint_waiters[identity.reply_endpoint_index] = Some(record);
             });
         });
         let out =
@@ -121862,6 +121901,9 @@ mod stage199d_wa2a_ownership_boundary {
             "waiter_ownership_retire_superseded",
             "waiter_ownership_publication_admits",
             "waiter_ownership_displace",
+            // IPC-DISPLACE1 — the read-only liveness predicate the publication owner asks before
+            // refusing a second receiver. Same surface, same rank-3 requirement; mutates nothing.
+            "waiter_ownership_record_is_live",
         ] {
             assert!(
                 surface.contains(&alloc::format!("pub(crate) fn {method}(")),
@@ -121870,7 +121912,7 @@ mod stage199d_wa2a_ownership_boundary {
         }
         assert_eq!(
             surface.matches("pub(crate) fn ").count(),
-            15,
+            16,
             "and nothing else is exposed"
         );
     }
@@ -124112,10 +124154,14 @@ mod stage199d_wa2b_wake_owner_census {
                     // the same reversal the race unwind performs, and for the same reason
                     // (nothing was published). A new direct caller of this body, recorded here
                     // rather than folded into the race row.
+                    //
+                    // IPC-DISPLACE1: the second call is the REFUSED-publication unwind
+                    // (`ReceiverAlreadyWaiting` / `InvalidEndpoint`), the same reversal for the
+                    // same reason; that arm used to return `WrongObject` with the task Blocked.
                     (
                         "src/kernel/boot/ipc_state.rs",
                         "block_current_on_receive_with_deadline",
-                        1,
+                        2,
                     ),
                     (
                         "src/kernel/boot/ipc_state.rs",
@@ -126830,7 +126876,7 @@ mod stage199d_wa3c1_waiter_record {
         );
     }
 
-    // ── C: last-receiver-wins is PRESERVED ─────────────────────────────────────────────────
+    // ── C: IPC-DISPLACE1 — only the same receiver's newer wait replaces a record ─────────
 
     #[test]
     fn replacement_still_wins_and_carries_a_fresh_record() {
@@ -126840,18 +126886,30 @@ mod stage199d_wa3c1_waiter_record {
         state.with_ipc_state_mut(|ipc| {
             ipc.set_endpoint_waiter(eidx, EndpointWaiterRecord::new(ident(1, 7), 5));
         });
-        let displaced = state.with_ipc_state_mut(|ipc| {
+        let refused = state.with_ipc_state_mut(|ipc| {
             ipc.set_endpoint_waiter(eidx, EndpointWaiterRecord::new(ident(2, 9), 11))
+        });
+        assert_eq!(
+            refused, None,
+            "a different receiver never replaces a live one"
+        );
+        assert_eq!(
+            state.with_ipc_state(|ipc| ipc.endpoint_waiter_record(eidx)),
+            Some(EndpointWaiterRecord::new(ident(1, 7), 5)),
+            "the live record is unchanged"
+        );
+        let displaced = state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, EndpointWaiterRecord::new(ident(1, 7), 11))
         });
         assert_eq!(
             displaced,
             Some(EndpointWaiterRecord::new(ident(1, 7), 5)),
-            "replacement must still succeed and report the displaced record"
+            "the same receiver's newer wait succeeds and reports the superseded record"
         );
         assert_eq!(
             state.with_ipc_state(|ipc| ipc.endpoint_waiter_record(eidx)),
-            Some(EndpointWaiterRecord::new(ident(2, 9), 11)),
-            "last receiver wins, with its own generation"
+            Some(EndpointWaiterRecord::new(ident(1, 7), 11)),
+            "it carries its own fresh generation"
         );
         assert_eq!(
             waiters_linked(),
@@ -154868,18 +154926,30 @@ mod stage199d_wa3c2_ownership_wiring {
 
     // ── 3. The displaced-receiver transition ────────────────────────────────────────────────
 
-    /// Last-receiver-wins is PRESERVED, and the departing incarnation now reaches a terminal
-    /// ownership state under a named owner instead of being dropped.
+    /// IPC-DISPLACE1: only the SAME receiver's newer wait displaces a record (a different one is
+    /// refused), and the departing incarnation reaches a terminal ownership state under a named
+    /// owner instead of being dropped.
     #[test]
     fn a_displacement_retires_the_departing_and_arms_the_arriving() {
         let (mut state, eidx) = fixture();
         let old = rec(1, 7, 3);
-        let new = rec(2, 9, 5);
+        let new = rec(1, 7, 5);
         state.with_ipc_state_mut(|ipc| {
             ipc.set_endpoint_waiter(eidx, old);
         });
+        let foreign = state.with_ipc_state_mut(|ipc| ipc.set_endpoint_waiter(eidx, rec(2, 9, 5)));
+        assert_eq!(foreign, None, "a different receiver is refused");
+        assert_eq!(
+            view(&state, eidx, old),
+            WaiterOwnershipView::Available,
+            "…untouched"
+        );
         let displaced = state.with_ipc_state_mut(|ipc| ipc.set_endpoint_waiter(eidx, new));
-        assert_eq!(displaced, Some(old), "last-receiver-wins is preserved");
+        assert_eq!(
+            displaced,
+            Some(old),
+            "the same receiver's newer wait supersedes it"
+        );
         assert_eq!(
             view(&state, eidx, old),
             WaiterOwnershipView::ForeignIncarnation {
@@ -154907,15 +154977,27 @@ mod stage199d_wa3c2_ownership_wiring {
         state.with_ipc_state_mut(|ipc| {
             ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
         });
-        let outcome = state.with_ipc_state_mut(|ipc| {
-            super::super::ipc_state::publish_recv_waiter_locked(
-                ipc,
-                eidx,
-                rec(2, 9, 5),
-                crate::kernel::capabilities::CapId(0),
-            )
-        });
-        assert_eq!(outcome, PublishWaiterOutcome::Published);
+        let publish = |state: &mut KernelState, r| {
+            state.with_ipc_state_mut(|ipc| {
+                super::super::ipc_state::publish_recv_waiter_locked(
+                    ipc,
+                    eidx,
+                    r,
+                    crate::kernel::capabilities::CapId(0),
+                )
+            })
+        };
+        // IPC-DISPLACE1: a different receiver is reported, not swallowed — as a refusal.
+        assert_eq!(
+            publish(&mut state, rec(2, 9, 5)),
+            PublishWaiterOutcome::ReceiverAlreadyWaiting
+        );
+        assert_eq!(occupied(&state), 1);
+        // The same receiver's newer wait displaces its own record and reports Published.
+        assert_eq!(
+            publish(&mut state, rec(1, 7, 5)),
+            PublishWaiterOutcome::Published
+        );
         assert_eq!(occupied(&state), 1);
     }
 
@@ -203961,6 +204043,825 @@ mod ap_sched4_b {
             } else {
                 None
             }
+        );
+    }
+}
+
+// ── IPC-DISPLACE1: a live receiver is never displaced by a different receiver ──────────────
+//
+// The endpoint waiter table holds ONE receiver per endpoint, and before IPC-DISPLACE1 a second
+// receiver publishing onto an endpoint with a live, untimed receiver silently replaced it. The
+// replaced task stayed `Blocked(EndpointReceive)` with no record anywhere: delivery, endpoint
+// destruction and every other record-driven wake could no longer find it, so only a deadline
+// could ever release it. These cases drive the REAL blocking receive (the broad trap route and
+// the split route's three phase owners) and assert task state, scheduler placement and waiter
+// ownership separately, because a refused publication must leave all three exact.
+mod ipc_displace1 {
+    use super::*;
+    extern crate std;
+    use crate::kernel::boot::waiter_ownership::WaiterOwnershipView;
+    use crate::kernel::boot::{EndpointWaiterRecord, ReceiverWaiterIdentity};
+    use crate::kernel::recv_waiter_split::{
+        PublishWaiterOutcome, RecvBlockIdentity, RecvUnwindOutcome,
+    };
+    use crate::kernel::scheduler::TaskPlacement;
+    use crate::kernel::syscall::{SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+    use std::boxed::Box;
+
+    const BUF_VA: u64 = 0x3000;
+    const CPU0: CpuId = CpuId(0);
+    const CPU1: CpuId = CpuId(1);
+
+    /// Run `f` on a thread with a deep stack (the boxed kernel's trap paths are deep).
+    fn on_big_stack(name: &str, f: fn()) {
+        std::thread::Builder::new()
+            .name(name.into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    struct Fx {
+        state: Box<KernelState>,
+        eidx: usize,
+        send0: CapId,
+        r1: CapId,
+        r2: CapId,
+    }
+
+    /// Two user receivers (tasks 1 and 2, each with its own address space and a mapped receive
+    /// buffer) hold RECEIVE caps on ONE endpoint; task 0 holds the send cap. Task 0 has no
+    /// address space, so its inline-payload send needs no user mapping.
+    fn fixture() -> Fx {
+        fixture_with(false)
+    }
+
+    /// [`fixture`], optionally with CPU 1 online and task 2 placed there instead of on CPU 0.
+    fn fixture_with(r2_on_cpu1: bool) -> Fx {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        if r2_on_cpu1 {
+            state.bring_up_cpu(CPU1).expect("cpu1");
+        }
+        state.register_task(1).expect("t1");
+        state.register_task(2).expect("t2");
+        for (tid, pa) in [(1u64, 0x10000u64), (2, 0x11000)] {
+            let (asid, aspace) = state.create_user_address_space().expect("as");
+            state.bind_task_asid(tid, asid).expect("bind");
+            state
+                .map_user_page(
+                    aspace,
+                    VirtAddr(BUF_VA),
+                    Mapping {
+                        phys: PhysAddr(pa),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map");
+        }
+        let (eidx, send0, recv_global) = state.create_endpoint(4).expect("ep");
+        let r1 = state
+            .grant_capability_task_to_task(0, recv_global, 1)
+            .expect("g1");
+        let r2 = state
+            .grant_capability_task_to_task(0, recv_global, 2)
+            .expect("g2");
+        state.enqueue_current_cpu(1).expect("enq1");
+        if r2_on_cpu1 {
+            state.enqueue_on_cpu(CPU1, 2).expect("enq2 on cpu1");
+        } else {
+            state.enqueue_current_cpu(2).expect("enq2");
+        }
+        Fx {
+            state,
+            eidx,
+            send0,
+            r1,
+            r2,
+        }
+    }
+
+    fn go(state: &mut KernelState, tid: u64) {
+        for _ in 0..64 {
+            if state.current_tid() == Some(tid) {
+                return;
+            }
+            state.yield_current().expect("yield");
+        }
+        panic!(
+            "could not reach tid {tid}; current={:?}",
+            state.current_tid()
+        );
+    }
+
+    /// One real NR 2 / NR 5 receive through the trap dispatcher; returns the answered frame.
+    fn recv(state: &mut KernelState, cap: CapId, timeout: Option<usize>) -> TrapFrame {
+        let mut f = match timeout {
+            None => TrapFrame::new(
+                Syscall::IpcRecv as usize,
+                [cap.0 as usize, BUF_VA as usize, 32, 0, 0, 0],
+            ),
+            Some(t) => TrapFrame::new(
+                Syscall::IpcRecvTimeout as usize,
+                [cap.0 as usize, BUF_VA as usize, 32, t, 0, 0],
+            ),
+        };
+        state
+            .handle_trap(Trap::Syscall, Some(&mut f))
+            .expect("recv trap");
+        f
+    }
+
+    fn send(state: &mut KernelState, send0: CapId, msg: &[u8; 4]) -> TrapFrame {
+        go(state, 0);
+        let mut f = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send0.0 as usize,
+                0,
+                4,
+                inline_payload_word(msg),
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut f))
+            .expect("send trap");
+        f
+    }
+
+    fn blocked_recv(state: &KernelState, tid: u64) -> bool {
+        matches!(
+            state.task_status(tid),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(_)))
+        )
+    }
+
+    /// `(deadline, has blocked_recv_state, blocked_recv_generation)` of a task.
+    fn wait_facts(state: &KernelState, tid: u64) -> (Option<u64>, bool, u64) {
+        state.with_tcbs(|tcbs| {
+            let t = tcbs.iter().flatten().find(|t| t.tid.0 == tid).expect("tcb");
+            (
+                t.ipc_timeout_deadline,
+                t.blocked_recv_state.is_some(),
+                t.blocked_recv_generation,
+            )
+        })
+    }
+
+    fn placement(state: &KernelState, tid: u64) -> TaskPlacement {
+        state.with_scheduler_state(|s| s.placement_of(ThreadId(tid)))
+    }
+
+    /// Exactly one place the scheduler will run it from: queued once, or current once.
+    fn placed_once(state: &KernelState, tid: u64) -> bool {
+        matches!(
+            placement(state, tid),
+            TaskPlacement::Queued(_) | TaskPlacement::Current(_)
+        )
+    }
+
+    fn record(state: &KernelState, eidx: usize) -> Option<EndpointWaiterRecord> {
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_record(eidx))
+    }
+
+    fn view(state: &KernelState, eidx: usize, r: EndpointWaiterRecord) -> WaiterOwnershipView {
+        state.with_ipc_state(|ipc| {
+            let key = ipc
+                .waiter_ownership_key_for(eidx, r)
+                .expect("ownership slot");
+            ipc.waiter_ownership_view(&key)
+        })
+    }
+
+    fn occupied(state: &KernelState) -> usize {
+        state.with_ipc_state(|ipc| ipc.waiter_ownership_occupied_count())
+    }
+
+    fn queued(state: &KernelState, eidx: usize) -> usize {
+        state.with_ipc_state(|ipc| ipc.endpoints[eidx].as_ref().expect("ep").queued())
+    }
+
+    fn census() -> usize {
+        crate::kernel::direct_ack_census::waiters_current()
+    }
+
+    fn refused(f: &TrapFrame) -> bool {
+        f.error_code() == Some(SyscallError::QueueFull.code())
+    }
+
+    /// R1 blocks untimed; R2 then receives on the same endpoint. Returns R1's published record.
+    fn first_blocks_then_second_competes(
+        fx: &mut Fx,
+        r2_timeout: Option<usize>,
+    ) -> (EndpointWaiterRecord, TrapFrame) {
+        go(&mut fx.state, 1);
+        let _ = recv(&mut fx.state, fx.r1, None);
+        assert!(blocked_recv(&fx.state, 1), "R1 blocked");
+        let r1_rec = record(&fx.state, fx.eidx).expect("R1 published");
+        assert_eq!(r1_rec.tid(), ThreadId(1));
+        go(&mut fx.state, 2);
+        let f2 = recv(&mut fx.state, fx.r2, r2_timeout);
+        (r1_rec, f2)
+    }
+
+    // ── §2 R1 / §6.1 / §6.2 / §6.10 — the competitor is refused and restored, exactly ──────
+
+    #[test]
+    fn r1_a_second_receiver_cannot_displace_a_live_first_receiver() {
+        on_big_stack("ipcd1_r1", || {
+            let mut fx = fixture();
+            let census_before = census();
+            let (r1_rec, f2) = first_blocks_then_second_competes(&mut fx, None);
+            let census_published = census();
+            // The competitor's receive is refused with the documented answer…
+            assert!(
+                refused(&f2),
+                "R2 is answered QueueFull, got {:?}",
+                f2.error_code()
+            );
+            // …and it is restored, not parked: not Blocked, no wait state, no deadline, and
+            // placed exactly once where the scheduler will run it.
+            assert!(
+                !blocked_recv(&fx.state, 2),
+                "the refused receiver is not left Blocked"
+            );
+            assert!(matches!(
+                fx.state.task_status(2),
+                Some(TaskStatus::Runnable | TaskStatus::Running)
+            ));
+            assert_eq!(
+                wait_facts(&fx.state, 2).0,
+                None,
+                "no deadline is left behind"
+            );
+            assert!(
+                !wait_facts(&fx.state, 2).1,
+                "no blocked-receive state is left behind"
+            );
+            assert!(placed_once(&fx.state, 2), "{:?}", placement(&fx.state, 2));
+            // The live receiver is untouched: still Blocked, still the published record — same
+            // identity and same wait generation — still armed, and the census did not move.
+            assert!(blocked_recv(&fx.state, 1), "R1 is still waiting");
+            assert_eq!(
+                record(&fx.state, fx.eidx),
+                Some(r1_rec),
+                "R1's record is unchanged"
+            );
+            assert_eq!(
+                view(&fx.state, fx.eidx, r1_rec),
+                WaiterOwnershipView::Available
+            );
+            assert_eq!(occupied(&fx.state), 1, "one armed incarnation, not two");
+            assert_eq!(
+                census_published,
+                census_before + 1,
+                "R1's publication linked one waiter"
+            );
+            assert_eq!(
+                census(),
+                census_published,
+                "the refusal moves the census by zero"
+            );
+        });
+    }
+
+    // ── §2 R2 / §6.3 / §6.5 — delivery after the refusal reaches the live receiver ─────────
+
+    #[test]
+    fn r2_the_first_receiver_takes_the_next_message_after_a_refusal() {
+        on_big_stack("ipcd1_r2", || {
+            let mut fx = fixture();
+            let (_r1_rec, f2) = first_blocks_then_second_competes(&mut fx, None);
+            assert!(refused(&f2));
+            let s = send(&mut fx.state, fx.send0, b"msg1");
+            assert_eq!(s.error_code(), None, "send ok");
+            assert!(
+                !blocked_recv(&fx.state, 1),
+                "R1, the live waiter, was woken by the send"
+            );
+            assert!(placed_once(&fx.state, 1), "R1 woken exactly once");
+            assert!(placed_once(&fx.state, 2), "R2 untouched");
+            assert_eq!(
+                record(&fx.state, fx.eidx),
+                None,
+                "the woken waiter is retired"
+            );
+            assert_eq!(occupied(&fx.state), 0, "ownership returns to quiescent");
+            // The hosted legacy NR 2 model wakes the waiter and leaves the message for its
+            // post-wake take; R1's take consumes exactly that one message.
+            assert_eq!(
+                queued(&fx.state, fx.eidx),
+                1,
+                "one message, held for R1's take"
+            );
+            go(&mut fx.state, 1);
+            let take = recv(&mut fx.state, fx.r1, None);
+            assert_eq!(take.error_code(), None, "R1 takes its message");
+            assert!(!blocked_recv(&fx.state, 1));
+            assert_eq!(queued(&fx.state, fx.eidx), 0, "consumed once, by R1");
+            // No duplicate delivery or wake: with nobody waiting the next message queues.
+            let s2 = send(&mut fx.state, fx.send0, b"msg2");
+            assert_eq!(s2.error_code(), None);
+            assert_eq!(queued(&fx.state, fx.eidx), 1);
+            assert_eq!(record(&fx.state, fx.eidx), None);
+            assert!(placed_once(&fx.state, 1) && placed_once(&fx.state, 2));
+        });
+    }
+
+    // ── §2 R3 / §6.4 — destruction after the refusal releases the live receiver once ───────
+
+    #[test]
+    fn r3_destroy_after_a_refusal_releases_the_first_receiver_exactly_once() {
+        on_big_stack("ipcd1_r3", || {
+            let mut fx = fixture();
+            let (_r1_rec, f2) = first_blocks_then_second_competes(&mut fx, None);
+            assert!(refused(&f2));
+            fx.state.destroy_endpoint(fx.eidx).expect("destroy");
+            assert!(
+                !blocked_recv(&fx.state, 1),
+                "R1 must not be stranded Blocked on a destroyed endpoint"
+            );
+            assert!(placed_once(&fx.state, 1), "R1 woken exactly once");
+            assert!(placed_once(&fx.state, 2), "R2 untouched by the destroy");
+            assert_eq!(record(&fx.state, fx.eidx), None);
+            assert_eq!(occupied(&fx.state), 0);
+        });
+    }
+
+    // ── §2 R4 / §6.6 — a timed live receiver still times out; a timed competitor keeps none ─
+
+    #[test]
+    fn r4_a_timed_first_receiver_still_times_out_after_a_refused_competitor() {
+        on_big_stack("ipcd1_r4", || {
+            let mut fx = fixture();
+            go(&mut fx.state, 1);
+            // A hosted blocking receive returns synchronously, so the frame's answer is the
+            // model's placeholder; the task state is what says R1 parked.
+            let _ = recv(&mut fx.state, fx.r1, Some(5));
+            assert!(blocked_recv(&fx.state, 1));
+            assert!(
+                wait_facts(&fx.state, 1).0.is_some(),
+                "R1 carries its deadline"
+            );
+            go(&mut fx.state, 2);
+            let f2 = recv(&mut fx.state, fx.r2, None);
+            assert!(refused(&f2), "R2 is refused while timed R1 is live");
+            let shared = SharedKernel::new(*fx.state);
+            for _ in 0..8 {
+                shared.run_due_ipc_timeout_work_at(CPU0, 1_000_000, 1_000_000, 1_000_000);
+            }
+            shared.with(|state| {
+                assert!(!blocked_recv(state, 1), "R1 released by its own deadline");
+                assert!(placed_once(state, 1));
+                assert_eq!(
+                    record(state, fx.eidx),
+                    None,
+                    "the timed-out waiter is retired"
+                );
+                assert!(!blocked_recv(state, 2));
+                assert_eq!(occupied(state), 0);
+            });
+        });
+    }
+
+    #[test]
+    fn a_refused_timed_competitor_keeps_no_deadline() {
+        on_big_stack("ipcd1_r4b", || {
+            let mut fx = fixture();
+            let (r1_rec, f2) = first_blocks_then_second_competes(&mut fx, Some(5));
+            assert!(refused(&f2), "a timed competitor is refused too");
+            assert_eq!(
+                wait_facts(&fx.state, 2).0,
+                None,
+                "its deadline did not survive"
+            );
+            let shared = SharedKernel::new(*fx.state);
+            for _ in 0..8 {
+                shared.run_due_ipc_timeout_work_at(CPU0, 1_000_000, 1_000_000, 1_000_000);
+            }
+            shared.with(|state| {
+                assert!(
+                    blocked_recv(state, 1),
+                    "the untimed live receiver is unaffected"
+                );
+                assert_eq!(record(state, fx.eidx), Some(r1_rec));
+                assert!(
+                    placed_once(state, 2),
+                    "nothing fired for the refused receiver"
+                );
+            });
+        });
+    }
+
+    // ── §2 R5 — control: a single receiver is released by destruction ─────────────────────
+
+    #[test]
+    fn r5_control_a_single_receiver_is_released_by_destroy() {
+        on_big_stack("ipcd1_r5", || {
+            let mut fx = fixture();
+            go(&mut fx.state, 1);
+            let _ = recv(&mut fx.state, fx.r1, None);
+            assert!(blocked_recv(&fx.state, 1));
+            fx.state.destroy_endpoint(fx.eidx).expect("destroy");
+            assert!(!blocked_recv(&fx.state, 1));
+            assert!(placed_once(&fx.state, 1));
+        });
+    }
+
+    // ── §6.9 — repeated competing receives strand nobody ────────────────────────────────────
+
+    #[test]
+    fn repeated_competing_receives_strand_nobody() {
+        on_big_stack("ipcd1_repeat", || {
+            let mut fx = fixture();
+            let (r1_rec, f2) = first_blocks_then_second_competes(&mut fx, None);
+            assert!(refused(&f2));
+            let census_live = census();
+            for round in 0..8 {
+                go(&mut fx.state, 2);
+                let f = recv(
+                    &mut fx.state,
+                    fx.r2,
+                    if round % 2 == 0 { None } else { Some(9) },
+                );
+                assert!(refused(&f), "round {round}: refused again");
+                assert!(placed_once(&fx.state, 2), "round {round}");
+                assert_eq!(record(&fx.state, fx.eidx), Some(r1_rec), "round {round}");
+                assert_eq!(census(), census_live, "round {round}: census flat");
+            }
+            // The live receiver is served; the endpoint is then free and R2 publishes normally.
+            let _ = send(&mut fx.state, fx.send0, b"msg1");
+            assert!(!blocked_recv(&fx.state, 1));
+            go(&mut fx.state, 1);
+            let take = recv(&mut fx.state, fx.r1, None);
+            assert_eq!(take.error_code(), None, "R1's post-wake take");
+            assert_eq!(queued(&fx.state, fx.eidx), 0);
+            go(&mut fx.state, 2);
+            let f = recv(&mut fx.state, fx.r2, None);
+            assert_eq!(
+                f.error_code(),
+                None,
+                "a free endpoint admits the next receiver"
+            );
+            assert!(blocked_recv(&fx.state, 2));
+            assert_eq!(
+                record(&fx.state, fx.eidx).map(|r| r.tid()),
+                Some(ThreadId(2))
+            );
+            fx.state.destroy_endpoint(fx.eidx).expect("destroy");
+            assert!(!blocked_recv(&fx.state, 1) && !blocked_recv(&fx.state, 2));
+            assert!(placed_once(&fx.state, 1) && placed_once(&fx.state, 2));
+            assert_eq!(occupied(&fx.state), 0);
+        });
+    }
+
+    // ── §6.7 / §6.8 — the publication owner's rule, at record level ─────────────────────────
+
+    fn rec(tid: u64, asid: u16, wait_gen: u64) -> EndpointWaiterRecord {
+        EndpointWaiterRecord::new(
+            ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid)),
+            wait_gen,
+        )
+    }
+
+    fn publish(
+        state: &mut KernelState,
+        eidx: usize,
+        r: EndpointWaiterRecord,
+    ) -> PublishWaiterOutcome {
+        state.with_ipc_state_mut(|ipc| {
+            super::super::ipc_state::publish_recv_waiter_locked(ipc, eidx, r, CapId(0))
+        })
+    }
+
+    #[test]
+    fn only_the_same_identity_with_a_newer_generation_may_supersede() {
+        let mut state = Bootstrap::init().expect("init");
+        let (eidx, _s, _r) = state.create_endpoint(4).expect("ep");
+        let live = rec(1, 7, 3);
+        assert_eq!(
+            publish(&mut state, eidx, live),
+            PublishWaiterOutcome::Published
+        );
+        let census_live = census();
+        for (who, r) in [
+            ("a different tid", rec(2, 9, 99)),
+            ("the same tid in another address space", rec(1, 8, 99)),
+            ("the same identity, the same generation", rec(1, 7, 3)),
+            ("the same identity, an older generation", rec(1, 7, 2)),
+        ] {
+            assert_eq!(
+                publish(&mut state, eidx, r),
+                PublishWaiterOutcome::ReceiverAlreadyWaiting,
+                "{who} is refused"
+            );
+            assert_eq!(
+                record(&state, eidx),
+                Some(live),
+                "{who}: the live record is unchanged"
+            );
+            assert_eq!(
+                view(&state, eidx, live),
+                WaiterOwnershipView::Available,
+                "{who}"
+            );
+            assert_eq!(occupied(&state), 1, "{who}");
+            assert_eq!(census(), census_live, "{who}: census flat");
+        }
+        // The same receiver blocking again (a newer wait generation) supersedes its own record.
+        let newer = rec(1, 7, 4);
+        assert_eq!(
+            publish(&mut state, eidx, newer),
+            PublishWaiterOutcome::Published
+        );
+        assert_eq!(record(&state, eidx), Some(newer));
+        assert_eq!(view(&state, eidx, newer), WaiterOwnershipView::Available);
+        assert_eq!(occupied(&state), 1, "supersession is net zero");
+        assert_eq!(
+            census(),
+            census_live,
+            "supersession is net zero in the census"
+        );
+    }
+
+    /// A record left over from a SUPERSEDED endpoint generation is not a live receiver: it must
+    /// not refuse the next receiver (that would wedge the index forever); it is retired.
+    #[test]
+    fn a_stale_record_of_a_superseded_endpoint_generation_is_retired_not_refusing() {
+        let mut state = Bootstrap::init().expect("init");
+        let (eidx, _s, _r) = state.create_endpoint(4).expect("ep");
+        let stale = rec(1, 7, 3);
+        assert_eq!(
+            publish(&mut state, eidx, stale),
+            PublishWaiterOutcome::Published
+        );
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_generations[eidx] = ipc.endpoint_generations[eidx].wrapping_add(1);
+        });
+        assert!(
+            !state.with_ipc_state(|ipc| ipc.waiter_ownership_record_is_live(eidx, stale)),
+            "an incarnation of the old endpoint generation is not live"
+        );
+        let next = rec(2, 9, 1);
+        assert_eq!(
+            publish(&mut state, eidx, next),
+            PublishWaiterOutcome::Published
+        );
+        assert_eq!(record(&state, eidx), Some(next));
+        assert_eq!(view(&state, eidx, next), WaiterOwnershipView::Available);
+        assert_eq!(
+            occupied(&state),
+            1,
+            "the stale incarnation was retired, not kept"
+        );
+    }
+
+    /// A live CLAIM keeps its existing answer (`WaiterOwnershipBusy`, never the new refusal),
+    /// for a foreign identity and for the claimed receiver's own newer generation alike.
+    #[test]
+    fn a_live_claim_is_still_answered_busy_and_never_overwritten() {
+        let mut state = Bootstrap::init().expect("init");
+        let (eidx, _s, _r) = state.create_endpoint(4).expect("ep");
+        let live = rec(1, 7, 3);
+        assert_eq!(
+            publish(&mut state, eidx, live),
+            PublishWaiterOutcome::Published
+        );
+        let egen = state.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        let shared = SharedKernel::new(state);
+        let claim = shared
+            .sr_claim_endpoint_waiter_split(
+                eidx,
+                egen,
+                live.receiver,
+                crate::kernel::boot::waiter_ownership::WaiterOwner::DirectRequest,
+            )
+            .expect("claim");
+        shared.with(|state| {
+            for r in [rec(2, 9, 5), rec(1, 7, 4)] {
+                assert_eq!(
+                    publish(state, eidx, r),
+                    PublishWaiterOutcome::WaiterOwnershipBusy
+                );
+                assert_eq!(
+                    record(state, eidx),
+                    None,
+                    "nothing installed under the claim"
+                );
+            }
+        });
+        assert!(shared.sr_consume_endpoint_waiter_claim_split(&claim));
+    }
+
+    // ── §6.11 / §6.12 — the split route's phase owners: refusal + exact unwind ──────────────
+
+    struct SplitFx {
+        k: SharedKernel,
+        eidx: usize,
+        r1: CapId,
+        r2: CapId,
+    }
+
+    fn split_fixture(second_cpu: bool) -> SplitFx {
+        let Fx {
+            state,
+            eidx,
+            r1,
+            r2,
+            ..
+        } = fixture_with(second_cpu);
+        SplitFx {
+            k: SharedKernel::new(*state),
+            eidx,
+            r1,
+            r2,
+        }
+    }
+
+    /// Phases A → B → C of the split receive for `tid`, current on `cpu`.
+    fn split_block(
+        k: &SharedKernel,
+        cpu: CpuId,
+        tid: u64,
+        eidx: usize,
+        cap: CapId,
+        deadline: Option<u64>,
+    ) -> (PublishWaiterOutcome, RecvBlockIdentity) {
+        let (asid, priority) = k.recv_block_phase_a_split(cpu, tid).expect("phase A");
+        let wait_generation = k
+            .recv_block_phase_b_split(tid, asid, cap, deadline, None)
+            .expect("phase B");
+        let (outcome, arm) = k.recv_block_phase_c_split(
+            eidx,
+            EndpointWaiterRecord::new(
+                ReceiverWaiterIdentity::new(ThreadId(tid), asid),
+                wait_generation,
+            ),
+            cap,
+            deadline.is_some(),
+        );
+        assert_eq!(arm, crate::kernel::boot::ReplyWaitArm::NotAReplyWait);
+        (
+            outcome,
+            RecvBlockIdentity {
+                tid,
+                asid,
+                priority,
+                wait_generation,
+            },
+        )
+    }
+
+    fn make_current(k: &SharedKernel, cpu: CpuId, tid: u64) {
+        k.with_cpu(cpu, |state| {
+            for _ in 0..64 {
+                if state.current_tid() == Some(tid) {
+                    return;
+                }
+                if state.current_tid().is_none() {
+                    state.dispatch_next_task().expect("dispatch");
+                } else {
+                    state.yield_current().expect("yield");
+                }
+            }
+            panic!("tid {tid} not current on {cpu:?}");
+        })
+        .expect("with_cpu");
+    }
+
+    fn split_refusal_case(second_cpu: bool, r2_deadline: Option<u64>) {
+        let fx = split_fixture(second_cpu);
+        make_current(&fx.k, CPU0, 1);
+        let (o1, _id1) = split_block(&fx.k, CPU0, 1, fx.eidx, fx.r1, None);
+        assert_eq!(o1, PublishWaiterOutcome::Published);
+        let r1_rec = fx.k.with(|s| record(s, fx.eidx)).expect("R1 published");
+        let census_live = census();
+        let r2_cpu = if second_cpu { CPU1 } else { CPU0 };
+        make_current(&fx.k, r2_cpu, 2);
+        let (o2, id2) = split_block(&fx.k, r2_cpu, 2, fx.eidx, fx.r2, r2_deadline);
+        assert_eq!(
+            o2,
+            PublishWaiterOutcome::ReceiverAlreadyWaiting,
+            "the split phase owner refuses a second live receiver"
+        );
+        fx.k.with(|s| {
+            assert_eq!(record(s, fx.eidx), Some(r1_rec), "R1's record is unchanged");
+            assert!(blocked_recv(s, 1));
+            assert!(
+                blocked_recv(s, 2),
+                "until the route's unwind runs, R2 is still parked"
+            );
+        });
+        assert_eq!(census(), census_live);
+        // The route's exact inverse puts the refused receiver back as the entering incarnation.
+        let unwound = fx.k.recv_block_unwind_exact_split(r2_cpu, id2);
+        assert_eq!(
+            unwound,
+            RecvUnwindOutcome::Restored,
+            "returns through its OWN frame"
+        );
+        fx.k.with(|s| {
+            assert_eq!(s.task_status(2), Some(TaskStatus::Running));
+            assert_eq!(placement(s, 2), TaskPlacement::Current(r2_cpu));
+            assert_eq!(wait_facts(s, 2), (None, false, id2.wait_generation));
+            assert!(blocked_recv(s, 1), "R1 still waiting");
+            assert_eq!(record(s, fx.eidx), Some(r1_rec));
+            assert_eq!(occupied(s), 1);
+        });
+        // And R1 is still reachable by the record-driven wakes.
+        fx.k.with(|s| s.destroy_endpoint(fx.eidx).expect("destroy"));
+        fx.k.with(|s| {
+            assert!(!blocked_recv(s, 1), "R1 released by destroy");
+            assert!(placed_once(s, 1));
+            assert_eq!(placement(s, 2), TaskPlacement::Current(r2_cpu));
+        });
+    }
+
+    #[test]
+    fn split_phase_c_refuses_and_the_exact_unwind_restores_the_competitor() {
+        on_big_stack("ipcd1_split", || split_refusal_case(false, None));
+    }
+
+    #[test]
+    fn split_refusal_of_a_timed_competitor_leaves_no_deadline() {
+        on_big_stack("ipcd1_split_t", || split_refusal_case(false, Some(50)));
+    }
+
+    #[test]
+    fn split_refusal_across_cpus_restores_the_competitor_on_its_own_cpu() {
+        on_big_stack("ipcd1_split_smp", || split_refusal_case(true, None));
+    }
+
+    // ── §6.12 — both routes answer the refusal the same way (source guards) ─────────────────
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn both_routes_answer_receiver_already_waiting_with_queue_full_after_an_exact_unwind() {
+        // The split route: one refusal arm, exact unwind first, then ONE settle whose answer is
+        // `QueueFull` for `ReceiverAlreadyWaiting` and never `WouldBlock`.
+        let split = code_only(SPLIT_SRC);
+        let at = split
+            .find("let already_waiting = matches!(")
+            .expect("the split route names the refusal");
+        let end = at
+            + split[at..]
+                .find("reason,\n            ));")
+                .expect("the settle");
+        let body = &split[at..end];
+        let unwind = body
+            .find("recv_block_unwind_exact_split(")
+            .expect("exact unwind");
+        let settle = body.find("recv_settle_after_unwind(").expect("settle");
+        assert!(unwind < settle, "the unwind precedes the answer");
+        assert!(body.contains("SyscallError::QueueFull"));
+        assert!(body.contains("\"receiver_already_waiting\""));
+        assert!(
+            body.contains("SyscallError::WrongObject"),
+            "InvalidEndpoint keeps its answer"
+        );
+        assert!(
+            !body.contains("WouldBlock"),
+            "never WouldBlock (user-rt maps it to Ok(None))"
+        );
+
+        // The broad route: the same refusal, now unwound like the busy arm (it used to return
+        // `WrongObject` with the task still Blocked).
+        let broad = code_only(IPC_STATE_SRC);
+        let at = broad
+            .find("outcome @ (crate::kernel::recv_waiter_split::PublishWaiterOutcome::ReceiverAlreadyWaiting")
+            .expect("the broad route names the refusal");
+        let end = at
+            + broad[at..]
+                .find("KernelError::WrongObject\n                });")
+                .expect("arm end");
+        let body = &broad[at..end];
+        let wake = body
+            .find("self.wake_tid_to_runnable(plan.blocked_tid)?;")
+            .expect("rank 2");
+        let dispatch = body.find("self.dispatch_next_task()?;").expect("rank 1");
+        let answer = body.find("KernelError::EndpointQueueFull").expect("answer");
+        assert!(
+            wake < dispatch && dispatch < answer,
+            "unwound before it answers"
+        );
+        assert_eq!(
+            crate::kernel::syscall::SyscallError::from(KernelError::EndpointQueueFull),
+            SyscallError::QueueFull
         );
     }
 }

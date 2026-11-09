@@ -1688,6 +1688,75 @@ absence of any broad-lock acquisition with the census held at 50.
 Because the HAL authority changed globally, the **x86_64 live** core-boot and ServerDies
 regressions were re-run in addition to the hosted battery.
 
+### 8.7 One live receiver per endpoint (IPC-DISPLACE1)
+
+An endpoint holds at most **one** published receive waiter — one `EndpointWaiterRecord
+{ receiver: {tid, asid}, wait_generation }` — and that record is the only way delivery,
+direct `IpcCall`/`IpcReply` claims and endpoint destruction find a blocked receiver.
+
+**The defect this replaces.** Until IPC-DISPLACE1 the publication owner kept
+last-receiver-wins: a second receiver blocking on the same endpoint replaced the first
+receiver's record (WA3C2 retired the departing incarnation's ownership, but did not touch
+the task). The replaced task stayed `Blocked(EndpointReceive)` with no record, so no
+delivery, claim or destroy could ever reach it again. An untimed receiver was stranded for
+good, and a timed one was released only by its deadline.
+
+**The rule.** `IpcSubsystem::publish_endpoint_waiter`, the one publication owner shared by
+both receive routes, decides before it mutates anything:
+
+| Existing record | Arriving record | Result |
+|---|---|---|
+| none | any | published (`Published`) |
+| receiver A, generation g | A, generation > g | A's own older record is superseded (CLAIM(Teardown) → CANCEL → RETIRE, then ARM) |
+| receiver A, generation g | A, generation ≤ g | refused: `ReceiverAlreadyWaiting` |
+| receiver A | a different `{tid, asid}` (including the same TID in another address space) | refused: `ReceiverAlreadyWaiting` |
+| none, but an in-flight direct transaction holds a claim | any | refused: `WaiterOwnershipBusy` (unchanged) |
+| a record whose ownership belongs to a superseded endpoint generation (not live) | any | the stale incarnation is retired and the arriving record published (unchanged) |
+
+A record is *live* when its exact incarnation, keyed at the current endpoint generation,
+is armed and unclaimed in the ownership table
+(`IpcSubsystem::waiter_ownership_record_is_live`). Every receiver a production path
+publishes stays in that state until its record is removed. A refusal returns before the
+superseded-generation retirement, the ownership pre-flight,
+the direct-ack lease release and the waiter census. So the live receiver's record,
+generation, ownership slot, lease and census entry are exactly as they were, and the live
+receiver is neither woken nor cancelled. There is no second table and no queue of
+receivers. Endpoint-generation checks and the retirement of a destroyed endpoint's stale
+incarnation are unchanged.
+
+**The refused receiver.** Both routes unwind its block exactly and answer the syscall:
+
+* the split route (`try_split_blocking_ipc_recv_into_frame`) runs
+  `recv_block_unwind_exact_split`, which clears the receive state and deadline on the exact
+  `{tid, asid, wait_generation}` incarnation, then restores it as this CPU's current task
+  (or queues it). It then settles once through `recv_settle_after_unwind`, so the answer
+  reaches the refused task's own frame or saved continuation, never another task's;
+* the broad route (`block_current_on_receive_with_deadline`) reverses rank 2 (`Runnable`,
+  deadline cleared) and rank 1 (re-placed, redispatched), the same unwind its
+  `WaiterOwnershipBusy` arm uses. It used to answer `WrongObject` and leave the task
+  `Blocked` (audit item A4).
+
+**User-visible ABI.** `IpcRecv` (NR 2) and `IpcRecvTimeout` (NR 5) return **`QueueFull`
+(6)** when another live receiver already waits on the endpoint. No syscall number, error
+value or layout changed: `QueueFull` already existed, and no receive path returned it
+before. `WouldBlock` was rejected because `yarm-user-rt`'s `ipc_recv`/`ipc_recv_v2` map it
+to `Ok(None)` ("no message"), and a caller would retry straight into the same refusal.
+`QueueFull` passes through as `Err(QueueFull)`. Every in-tree server receives each endpoint
+from one task, so no default workload observes the new answer.
+
+**Known transient.** The off-lock receive-timeout drain marks a timed-out receiver
+`Runnable` at rank 2 and removes its record at rank 3. A different receiver that publishes
+in between is refused with `QueueFull` even though the old receiver has just stopped
+waiting. The window is bounded by that drain and the refused caller may retry. The same
+receiver blocking again in that window has a newer wait generation and is admitted.
+
+**Coverage.** `kernel::boot::tests::ipc_displace1` drives the real blocking receive. On the
+broad trap route it covers: refusal and exact restore, delivery to the live receiver,
+destroy releasing it exactly once, timed live receivers and timed competitors, and repeated
+competition. It drives the split route's three phase owners plus its exact unwind on one
+CPU and across two CPUs. It also covers the record-level generation rule, a live claim
+staying `WaiterOwnershipBusy`, and a source guard on both routes' refusal arms.
+
 ---
 
 ## 9. Authoring rule

@@ -466,6 +466,16 @@ Blocked recv-v2 completion:
 - Message is consumed exactly once (no enqueue duplication after waiter completion).
 - No syscall re-exec model and no userspace recv retry workaround.
 
+One live receiver per endpoint (IPC-DISPLACE1, `doc/IPC.md` §8.7):
+
+- An endpoint has at most one blocked receiver. A blocking `IpcRecv` / `IpcRecvTimeout` by a
+  different task (different `{tid, asid}`) while another receiver is blocked on the same
+  endpoint returns `QueueFull` (`6`). The caller is not blocked and keeps no deadline. The
+  receiver already waiting is unaffected and still gets the next message or the endpoint's
+  destruction.
+- `QueueFull` (not `WouldBlock`, which `yarm-user-rt` maps to `Ok(None)`) is the answer on
+  both the split and the broad route. No syscall number, error value or layout changed.
+
 Received-cap materialization:
 
 - Reply/transfer capabilities are materialized into receiver-local cap IDs before writing meta.

@@ -4604,37 +4604,58 @@ fn try_split_blocking_ipc_recv_into_frame(
                 },
             );
         }
-        // `ReceiverAlreadyWaiting` and `InvalidEndpoint`. The live publish policy is canonical
-        // last-receiver-wins and never returns the first; step (5) validated index and generation
-        // under the same rank-3 lock, so neither is reachable. The canonical owner answers
-        // `WrongObject` for both — and notably does NOT unwind, leaving the task Blocked. This
-        // route unwinds first, because returning `WrongObject` through the entering frame is only
-        // licensed once the exact incarnation is current again.
+        // `ReceiverAlreadyWaiting` and `InvalidEndpoint`. IPC-DISPLACE1: the shared publish
+        // policy keeps ONE live receiver per endpoint, so the first is reachable — another live
+        // receiver holds this endpoint — and nothing was published. Step (5) validated index and
+        // generation under the same rank-3 lock, so the second stays defensively unreachable.
+        // Both unwind first, because answering through the entering frame is only licensed once
+        // the exact incarnation is current again; the broad owner unwinds the same way.
         _ => {
+            let already_waiting = matches!(
+                outcome,
+                crate::kernel::recv_waiter_split::PublishWaiterOutcome::ReceiverAlreadyWaiting
+            );
             let unwound =
                 shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
             crate::yarm_log!(
-                "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=publish outcome={}",
+                "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=publish outcome={} reason={}",
                 cpu.0,
                 tid,
-                unwound.slug()
+                unwound.slug(),
+                if already_waiting {
+                    "receiver_already_waiting"
+                } else {
+                    "publish_refused"
+                }
             );
             // U9-RECV-BLOCK2 §2 — the two answers are not two errors, they are an answer and a
             // non-answer. `WrongObject` through a resumable frame is the canonical outcome;
             // `Internal` through a frame that is NOT this task's would return into a task the
             // scheduler has parked, which is the contradiction this slice removes.
-            // U9-RECV-BLOCK2 §2 — ONE answer, encoded first. `WrongObject` is what the canonical
-            // owner raises for both `ReceiverAlreadyWaiting` and `InvalidEndpoint`, and it is the
-            // answer whether or not the unwind could put this incarnation back; what the outcome
-            // decides is where the answered frame goes.
+            // U9-RECV-BLOCK2 §2 — ONE answer, encoded first, whether or not the unwind could put
+            // this incarnation back; what the outcome decides is where the answered frame goes.
+            // IPC-DISPLACE1: the canonical owner's answers — `QueueFull` for
+            // `ReceiverAlreadyWaiting` (never `WouldBlock`, which user-rt reads as "no message"),
+            // `WrongObject` for `InvalidEndpoint`.
+            let (answer, reason) = if already_waiting {
+                (
+                    crate::kernel::syscall::SyscallError::QueueFull,
+                    "receiver_already_waiting",
+                )
+            } else {
+                (
+                    crate::kernel::syscall::SyscallError::WrongObject,
+                    "publish_refused",
+                )
+            };
             return BlockingLaneOutcome::Settled(recv_settle_after_unwind(
                 cpu,
                 frame,
                 block_identity(wait_generation).entering(),
                 unwound,
-                crate::kernel::syscall::SyscallError::WrongObject,
-                "publish_refused",
+                answer,
+                reason,
             ));
         }
     }

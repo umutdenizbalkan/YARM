@@ -15341,6 +15341,13 @@ makes the transition exclusive: if a direct transaction already owns the departi
 claim is refused and the whole displacement is refused with it, rather than raced. CANCEL rather
 than CONSUME, because a displaced receiver was abandoned, not delivered to.
 
+> **Superseded by IPC-DISPLACE1 (2026-11-09).** The transition above ended the departing
+> incarnation's *ownership*, but not the task: the replaced receiver stayed
+> `Blocked(EndpointReceive)` with no record, so delivery and destroy could never reach it. A
+> different receiver is now refused (`ReceiverAlreadyWaiting`, answered `QueueFull`) with zero
+> mutation, and only the same receiver's newer wait supersedes its own record; see `doc/IPC.md`
+> §8.7.
+
 **Terminal balance, and the leak WA3C2 closes.** Every claim site now settles on every terminal
 arm. Two arms previously wrote `let _ = claim;` — the direct request's `ServerGone` and the direct
 reply's `CallerGone` — which correctly left the waiter removed but LEAKED the ownership slot,
