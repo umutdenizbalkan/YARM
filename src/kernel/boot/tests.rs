@@ -206243,6 +206243,64 @@ mod notif_lifetime1 {
         exact(&k, idx);
     }
 
+    /// 6 — a holder's capability space dropped WHOLE by the reap (the broad no-alloc reap and the
+    /// split reap) gives back every Notification reference it held; the creator's object lives.
+    #[test]
+    fn a_reaped_holders_cspace_gives_back_its_references_on_both_reap_owners() {
+        for split in [false, true] {
+            let k = kernel();
+            let holder = 4401u64;
+            let (idx, generation) = k.with(|state| {
+                state.register_task(holder).expect("holder");
+                let current = state.current_tid().expect("tid");
+                let (idx, sig, _recv) = state.create_notification(4).expect("notif");
+                state
+                    .grant_capability_task_to_task_with_rights(
+                        current,
+                        sig,
+                        holder,
+                        CapRights::SIGNAL,
+                    )
+                    .expect("a copy for the holder");
+                // The holder dies without the broad cleanup having run (the reap is what drops its
+                // capability space).
+                state
+                    .with_tcbs_mut(|tcbs| {
+                        tcbs.iter_mut()
+                            .flatten()
+                            .find(|t| t.tid.0 == holder)
+                            .expect("tcb")
+                            .status = TaskStatus::Dead;
+                        Ok::<_, KernelError>(())
+                    })
+                    .expect("dead");
+                let generation = state.with_ipc_state(|ipc| ipc.notification_generations[idx]);
+                (idx, generation)
+            });
+            assert_eq!(refs(&k, idx), 3);
+            let pid = k.with(|state| state.process_id(holder).unwrap_or(holder));
+            let reaped = if split {
+                k.reap_process_cnode_split(pid)
+            } else {
+                k.with(|state| state.maybe_cleanup_process_cnode_for_pid_noalloc_reap(pid))
+            };
+            assert!(reaped, "split={split}: the holder's cspace is reaped");
+            k.with(|state| {
+                assert_eq!(live_caps_naming(state, idx, generation), 2, "split={split}");
+            });
+            assert!(
+                present(&k, idx),
+                "split={split}: the creator's object lives"
+            );
+            assert_eq!(
+                refs(&k, idx),
+                2,
+                "split={split}: the reap gave back the holder's reference"
+            );
+            exact(&k, idx);
+        }
+    }
+
     /// 11 / 12 — after the slot is reused, publishing a capability naming the OLD incarnation
     /// is refused on both mint paths, and the new incarnation's references are untouched.
     #[test]
