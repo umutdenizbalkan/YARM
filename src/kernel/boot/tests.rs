@@ -206243,6 +206243,73 @@ mod notif_lifetime1 {
         exact(&k, idx);
     }
 
+    /// 11 / 12 — after the slot is reused, publishing a capability naming the OLD incarnation
+    /// is refused on both mint paths, and the new incarnation's references are untouched.
+    #[test]
+    fn a_stale_publication_onto_a_reused_slot_is_refused_without_touching_the_successor() {
+        let k = kernel();
+        let (idx, sig, recv, tid, cnode) = k.with(|state| {
+            let (idx, sig, recv) = state.create_notification(4).expect("N1");
+            let tid = state.current_tid().expect("tid");
+            (
+                idx,
+                sig,
+                recv,
+                tid,
+                state.current_task_cnode().expect("cnode"),
+            )
+        });
+        let old = k.with(|state| notif_object(state, sig));
+        k.revoke_capability_no_vm_split(CpuId(0), tid, sig)
+            .expect("one");
+        k.revoke_capability_no_vm_split(CpuId(0), tid, recv)
+            .expect("last");
+        let (i2, _sig2, _recv2) = k.with(|s| s.create_notification(4).expect("N2"));
+        assert_eq!(i2, idx);
+        let before = refs(&k, idx);
+        assert_eq!(
+            k.mint_capability_with_memory_ref_split(cnode, Capability::new(old, CapRights::SIGNAL)),
+            Err(KernelError::StaleCapability)
+        );
+        assert_eq!(
+            k.with(|s| s.mint_capability_in_cnode(cnode, Capability::new(old, CapRights::SIGNAL))),
+            Err(KernelError::StaleCapability)
+        );
+        assert_eq!(
+            refs(&k, idx),
+            before,
+            "the successor's references are untouched"
+        );
+        exact(&k, idx);
+    }
+
+    /// The split mint seam publishes a live incarnation's capability with its reference, and
+    /// its rollback gives that reference back.
+    #[test]
+    fn the_split_mint_seam_accounts_for_what_it_publishes_and_rolls_back() {
+        let k = kernel();
+        let (idx, sig, cnode) = k.with(|state| {
+            let (idx, sig, _recv) = state.create_notification(4).expect("notif");
+            (idx, sig, state.current_task_cnode().expect("cnode"))
+        });
+        let object = k.with(|state| notif_object(state, sig));
+        let minted = k
+            .mint_capability_with_memory_ref_split(
+                cnode,
+                Capability::new(object, CapRights::RECEIVE),
+            )
+            .expect("split mint");
+        assert_eq!(refs(&k, idx), 3);
+        exact(&k, idx);
+        k.rollback_minted_cap_split(cnode, minted, object);
+        assert_eq!(refs(&k, idx), 2, "the rollback gives the reference back");
+        exact(&k, idx);
+        // A second rollback of the same, already-cleared slot gives nothing back twice.
+        k.rollback_minted_cap_split(cnode, minted, object);
+        assert_eq!(refs(&k, idx), 2);
+        exact(&k, idx);
+    }
+
     /// 12 — a removal whose reference is still owed (the capability already gone at rank 4, the
     /// release not yet made at rank 3) races a publication from another live capability: the
     /// object survives with the new capability and the accounting ends exact.
