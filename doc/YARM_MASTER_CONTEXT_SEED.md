@@ -5,7 +5,10 @@
 
 Principal handoff for any new ChatGPT, Claude or Codex session. Compiled 2026-11-05 from the
 full Git history (3 186 commits on `main`), the committed records, the one surviving Claude Code
-transcript (Oct 9 – Nov 5 2026) and current source at `b81e0317`. Evidence labels:
+transcript (Oct 9 – Nov 5 2026) and current source at `b81e0317`; **reviewed and reconciled
+2026-11-09** against the owner's original ChatGPT planning conversation (Aug 10 – Nov 4 2026,
+1 240 messages; cited as "Msg ####", see `doc/YARM_RECOVERY_SOURCES.md` §2a and
+`doc/YARM_STAGE_LEDGER.md`). Evidence labels:
 **[VC]** verified in current source; **[VH]** verified from commits/committed records;
 **[SR]** session-reported; **[INF]** inferred; **[UNK]** unknown. Details and provenance:
 `doc/YARM_DEVELOPMENT_HISTORY.md`, `doc/YARM_KERNEL_UNLOCK_HISTORY.md`,
@@ -29,8 +32,11 @@ transcript (Oct 9 – Nov 5 2026) and current source at `b81e0317`. Evidence lab
 > has one recorded authority under ranked domain locks (1 scheduler — now per-CPU — 2 task,
 > 3 IPC, 4 capability, 5 VM, 6 memory, 7 driver, 8 fault, 9 restart, 10 telemetry), acquired in
 > ascending order; `tests/broad_lock_census_guard.rs` rejects reintroduction. Production user
-> scheduling runs on secondary CPUs on all three ports (AArch64 ceiling 8 in source; x86 ≤ 8 per the AP-SCHED4 record). Off-lock
-> direct IPC (NR 6/7) is the production default on all three ports. The kernel is
+> scheduling runs on secondary CPUs on all three ports (production ceiling 8 CPUs per port in
+> source; `MAX_CPUS = 64`). Off-lock direct IPC (NR 6/7) is the production default on all three
+> ports (since `2aab8b77`, 2026-09-02). Endpoint receive waiters keep **last-receiver-wins**
+> semantics with an explicit displacement ownership transition (WA3C2 `612339b5`); strict
+> single-waiter publication was tried and rejected (it hangs the VFS grant relay). The kernel is
 > non-preemptive; kernel threads exist (cooperative, 32 × 16 KiB, guard-gapped stacks on three
 > ISAs) but **no production code creates them yet**. Kernel code uses no FP/SIMD (disassembly
 > checker on every build). Hosted suite: 6 275 tests pass serially; 41 integration binaries
@@ -50,6 +56,16 @@ transcript (Oct 9 – Nov 5 2026) and current source at `b81e0317`. Evidence lab
 > a BOOT-4 high-half heap in June (diagnostic, `rpi5-highhalf` feature); whether EL0 was ever
 > entered on hardware is unknown. Asynchronous kernel preemption (SC-KT-4) is not enabled.
 >
+> **How the owner steers work.** The owner's standing priority during unlocking was "kernel
+> unlocking is the first priority" — bug fixes only when they block a named step (`BLOCKS: …`),
+> every pass naming the metric or dispatcher population it reduces, no open-ended documentation,
+> oracle or hardening chains. Unlocking is now done; the owner's later choices were QEMU-first
+> validation before hardware, then the real-time/mixed-criticality direction (ISO 26262 /
+> DO-178C / ARINC 653 as *motivation*, not a compliance claim), with RPi5 bare-metal bring-up,
+> drivers and futex requeue/bitset/PI as stated later goals. Proposals from the owner or an AI
+> are reviewed against source and corrected before adoption; record what was proposed, what was
+> accepted and what shipped separately.
+>
 > **Mandatory rules.** Verify every claim against current source before acting (code beats
 > comments and docs; several docs are stale). One bounded, independently reviewable issue per
 > delivery. Reproduce a defect on the unmodified base first; repair the owning operation; no
@@ -64,6 +80,10 @@ transcript (Oct 9 – Nov 5 2026) and current source at `b81e0317`. Evidence lab
 > fresh fetch and ancestry check, then verify remote equality. Hosted tests: `CARGO_INCREMENTAL=0`,
 > `--test-threads=1`. Never `pkill -f`; kill by PID. Read `doc/AI_AGENT_RULES.md`,
 > `doc/KERNEL_UNLOCKING.md` §0/§3/§4 and `doc/SCHEDULING_CONTRACT.md` before changing kernel code.
+> Report only numbers your own run produced, measured with the project's tools (census by the
+> guard's scanner, integration suites included); a fabricated test count once entered the
+> record and had to be retracted. Push green checkpoints to a preservation ref immediately —
+> containers are replaced and unpushed work is lost.
 
 ---
 
@@ -89,7 +109,10 @@ transcript (Oct 9 – Nov 5 2026) and current source at `b81e0317`. Evidence lab
 * `main` = `claude/yarm-kernel-unlock-u0-f2zh8p` = `wip/kthread-closure1` = **`b81e0317`**
   (KTHREAD-CLOSURE1 Stage D). Stage refs: `wip/kthread-closure1-a` `136e8ae2`, `-b` `a540aef2`,
   `-c` `fc429b00`. `14b61286` (POST-U9-STABILIZATION, hardware bring-up reference) preserved on
-  `wip/post-u9-stabilization`. 146 branches, 0 tags. **No newer work exists on any branch.** [VH]
+  `wip/post-u9-stabilization`. 146 branches, 0 tags. **No newer work existed on any branch on
+  2026-11-05** [VH]; the only later ref is the documentation branch
+  `wip/yarm-context-recovery-2026-11-05` (`cce15d92`); `main` was still `b81e0317` on 2026-11-09
+  [VH]. Re-check before acting.
 * The local checkout at `/home/user/YARM` may be **shallow and on an older branch** (it was on
   `wip/kthread-closure1-a` during recovery). Always fetch and work from `origin/main`. [VH]
 * Last qualified results (KTHREAD-CLOSURE1 Stage D, tree code-identical to `b81e0317`): hosted lib
@@ -124,6 +147,15 @@ From `doc/KERNEL_UNLOCKING.md` §3–§4, `doc/STATUS.md` §6, `doc/AI_AGENT_RUL
    enqueue on the task's home CPU; `QueueFull` surfaced; no migration after placement for
    pinned plans by discipline. [VH, `doc/SCHEDULING_CONTRACT.md`]
 10. Hosted tests are single-threaded; parallel runs show 58–71 known shared-state failures. [VH]
+11. Endpoint receive waiters: last-receiver-wins; a displaced incarnation is ended through
+    CLAIM(Teardown) → CANCEL → RETIRE before the new one is armed; a publication over a live
+    claim is refused with zero mutation (`WaiterOwnershipBusy`); never weaken `arm_current`;
+    every claim settles on every arm (`let _ = claim;` is forbidden by a source census). [VC]
+12. A split transaction carries its executing/requesting CPU explicitly; never use the
+    process-global `sched.current_cpu` as the executing CPU, and never "fix" that by rebinding it
+    (it moves the race). [VH, Msgs 0366, 1089]
+13. `Complete(Ok(()))` / `Complete(Err)` at a trap bridge returns **through the entering frame**;
+    it is only correct when that exact task still owns the frame. [VH, Msgs 0730, 0907, 0932]
 
 ## 4. Subsystem status
 
@@ -133,16 +165,16 @@ Format: implemented / contract / compromise / risk / next. Unverified items are 
 |---|---|---|
 | 1 | Microkernel split | **Impl:** kernel mechanisms + userspace service crates [VH]. **Risk:** policy creeping into kernel fixes. |
 | 2 | Cross-arch | x86_64 PVH, AArch64 virt (GICv2), RISC-V64 OpenSBI; all three boot the core service chain and pass strict core smokes [VH]. **Compromise:** D6-genuine authoritative dispatch is x86-only [VC]. **RPi5:** diagnostic only (`rpi5-highhalf`). HH-5 bridge implemented 2026-06-21/22 — high-half FDT `/chosen` walker, high-half boot frame allocator and kernel-entry shim, BOOT-4 high-half kernel heap, gated phys↔virt direct map, `.bss` zeroing fix (`1e62310a`, `bbe6b6c7`, `7eb743de`, `ec1a063d`, `d1374f9a`) [VH]; enter-user markers exist in source [VC]; **hardware outcome after 06-22 is [UNK]** (the last commit reports an artifact build only); `doc/RPI5_BRINGUP.md` (last edited 06-15) and `doc/STATUS.md` still describe the pre-bridge deferral. |
-| 3 | Boot / SMP bring-up | BootExclusive single-owner boot, published before first user entry [VC]; production AP admission: RISC-V all supported harts [VH], AArch64 ≤ 8 (`PRODUCTION_CPU_CEILING`) [VC], x86 via an APIC-map admission bitmap [VC], ≤ 8 CPUs per the AP-SCHED4 record [SR — no x86 ceiling constant found in source]. **Risk:** per-CPU setup mismatches (AP `EFER.NXE` history). |
+| 3 | Boot / SMP bring-up | BootExclusive single-owner boot, published before first user entry [VC]; production AP admission with `PRODUCTION_CPU_CEILING = 8` on all three ports (`src/arch/x86_cpu_admission.rs:36`, `aarch64_cpu_admission.rs:45`, `riscv_hart_admission.rs:49`) [VC — corrected 2026-11-09; the 2026-11-05 text said no x86 constant existed]; x86 admission via an APIC-map bitmap [VC]; `MAX_CPUS = 64` [VC]. **Risk:** per-CPU setup mismatches (AP `EFER.NXE` history); RISC-V trap stacks scale per CPU (Msg 1117). |
 | 4 | Kernel threads, scheduler, switching | `PriorityScheduler`, GP levels with quantum round-robin; per-CPU scheduler lock (SCHED-LOCK1); **non-preemptive kernel**; time = count of clock-owner timer interrupts (drifting, uncalibrated); `yarm_log!` flushes synchronously inside masked traps [VH, contract §1]. Kernel threads: cooperative, bounded, guarded, **no production user** [VC]. **Next:** RT-SCHED1. |
 | 5 | Synchronization / unlocking | broad lock deleted; ranked locks; scheduler lock is an unfair TTAS spinlock waited on with interrupts masked (SC-LOCK-2 progress PARTIAL) [VH]. Canonical stages not re-classified [VH]. |
 | 6 | IPC | send/recv/recv-v2/call/reply, shared-region transfers (offset + lifetime contracts), blocking with timeouts (off-lock pipeline on all arches; deadline store only 4 slots [VC]); direct NR6/7 production on all arches [VC]. **Open:** 199D ServerDies cells AArch64/RISC-V; 199F notification parity not qualified as a stage. |
-| 7 | Waiters / wake arbitration / teardown | generation-bearing endpoint waiter records, central removal, authoritative waiter ownership (199D-WA*), terminal arbitration for reply vs timeout vs peer death (200A–C), lossless parked server-death handoff (AP-SCHED4) [VH]. **Risk:** any direct clear of waiter state. |
+| 7 | Waiters / wake arbitration / teardown | generation-bearing endpoint waiter records, central removal (WA3C1 `10b91677`), authoritative waiter ownership with last-receiver-wins displacement and live-claim refusal (WA3C2 `612339b5`, 08-31) [VC], notification waiters as exact `{tid, asid, generation}` records (U9-IRQ-UNKNOWN1) [VC], terminal arbitration for reply vs timeout vs peer death (200A–C), lossless parked server-death handoff (AP-SCHED4) [VH]. **Risk:** any direct clear of waiter state. **Open [INF]:** a displaced untimed receiver's *task* is not woken or re-checked by the publish path and no test covers its liveness. |
 | 8 | Task / process lifecycle | SpawnV5, spawn provisioner with exact rollback, fork via one COW clone owner, reap and exit transactions (U9-*) [VH]. **Open:** RISC-V `ExitCurrentTask` live cell. |
 | 9 | Memory / VM / COW | per-port page tables and ASIDs; MemoryObjects (Anonymous, InitramfsFileSlice); COW fork; typed invalidation completion; x86 IPI shootdown + ACK [VH], RISC-V SBI remote fence [VH], AArch64 inner-shareable broadcast TLBI (`tlbi vaae1is/aside1is/vmalle1is`, `src/arch/aarch64/page_table.rs`) [VC]. **Open:** canonical 201A–G not re-classified. |
 | 10 | Capabilities | CNodes with generation-protected slots; one-shot direct reply caps; transfer materialization with rollback [VH]. **Open:** canonical 200A–D; several cap seams historically `HELPER_ONLY` [VH — current wiring not re-audited here, UNK]. |
 | 11 | Userspace services | init_server, supervisor, process_manager (reply-cap call/reply helpers), initramfs_srv, devfs_srv, vfs_server [VH, STATUS §2 as of 10-13]. |
-| 12 | Drivers / IRQ / DMA / virtio | driver_manager, blkcache_srv, virtio_blk_srv live in QEMU; device-interrupt witnesses (UART/PL011/COM1) live on three ports and on kernel threads [VH]. Production external-IRQ policy per port and DMA: **[UNK — not re-verified]**. |
+| 12 | Drivers / IRQ / DMA / virtio | driver_manager, blkcache_srv, virtio_blk_srv live in QEMU; device-interrupt witnesses (UART/PL011/COM1) live on three ports and on kernel threads [VH]. **Security gap [VC]:** `bind_irq_notification` (`src/kernel/boot/ipc_state.rs:7465`) requires only the Notification's SIGNAL right — no authority over the IRQ line; today it is reachable only from the default-off UART witness (`mod.rs:8750`), so it must gain an IRQ-capability check before any production IRQ-grant path (Msg 0688). Production driver control was `NoopDriverControl` and IRQMUX fake-only on 09-03 (Msg 0688) — not re-verified since. Recorded post-unlock driver ideas: userspace GPIO lease broker for shared lines above the RP1 server (Msg 0738). DMA: **[UNK]**. |
 | 13 | Filesystems / VFS | VFS is implemented: `vfs_server` (mount/fd tables, frozen v1 opcodes) is live in the core chain; shared-memory VFS I/O exists as both direction helpers plus a RAMFS-only live route through `RecvV3SharedIoMapper` (Stages 63–87, 2026-06-05 → 06-10; `VFS_READ_SHARED_REPLY_ENABLED` and `VFS_WRITE_SHARED_REQUEST_ENABLED` are `true` in `crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs`), but the default `handle_request` still returns `Unsupported` for the shared opcodes, FAT live mount is disabled and ext4 is read-only [VC/VH]. Optional FS Milestone 1 (Stage 100) then paused FS work (`doc/AI_AGENT_RULES.md` §12.2). **Open:** a production `VfsSharedIoMapper` for the default dispatch (needs the FS-19 kernel ABI for authoritative object metadata, `doc/VFS.md` §5), FAT live mount, ext4 writes. **Correction note:** an earlier draft of this seed said the VFS roadmap had "not started" — that misread `doc/KERNEL_UNLOCKING.md` §0.8, which says VFS work was "not started **by SCHED-CONTRACT1**". |
 | 14 | Errors / rollback / cleanup | transactional owners with failure tables; refusals settled from ownership; quarantine; no allocation in reap [VH]. **Risk pattern:** rollback gaps (see bugs ledger B9). |
 | 15 | Testing / proof | hosted model + source guards + integration suites; QEMU witnesses with graders and negative controls; BUILD-GATES1 artifact binding; NOFP checker; stack-adjustment checker; census guard [VH]. **Missing:** 205B fault-injection matrix, 205C torture harness, any hardware timing evidence. |
@@ -184,6 +216,13 @@ forgotten plain guards keep a thread ineligible; two plain-lock latches hosted-o
 9. Compiler-generated FP/SIMD in kernel code (KERNEL-NOFP1 `fec063af`).
 10. Plain lock held across scheduling points undetected (KTHREAD-CLOSURE1 B `a540aef2`).
 
+From the August–September record (bugs ledger A29–A49): the waiter-arbitration defects that
+forced direct IPC off (bare-TID notification waiter, timeout before waiter cleanup, a scanner
+cursor advanced by wakes), the ownership leaks `let _ = claim;`, ambient `sched.current_cpu` as
+the executing CPU, a shared bridge that never saved the entering task's registers, AArch64
+`x15` zeroed on EL0 return, kind-blind MemoryObject reclaim that freed initrd memory, fork and
+address-space teardown without inverses, and exit settlements that resumed a frame no task owned.
+
 ## 7. Current blockers and unfinished work
 
 1. Canonical stage re-classification against the post-deletion tree (owed; do stage by stage).
@@ -204,6 +243,16 @@ forgotten plain guards keep a thread ineligible; two plain-lock latches hosted-o
    (June); its hardware result and the next blocker after BOOT-4 are unknown and must be
    re-established on hardware before planning (stale: `doc/RPI5_BRINGUP.md` §12–13).
 10. VFS: production shared I/O in the default dispatch (FS-19 kernel ABI), FAT live mount, ext4 writes.
+11. Displaced-receiver liveness under last-receiver-wins: untested (see subsystem 7) — a bounded
+    test question, not a confirmed bug.
+12. IRQ-line authority in `bind_irq_notification` (subsystem 12) — prerequisite for production
+    userspace drivers.
+13. Carried from POST-U9-STABILIZATION (Msg 0949), not re-verified since: the x86 ordinary-cap
+    cell blocked by init's mapping capacity (`MAX_MAPPINGS` 128/128); AArch64/RISC-V server-death
+    runners never live because no initramfs is supplied (harness gap). Later packages may have
+    changed these — check `doc/KERNEL_UNLOCKING.md` before planning.
+14. Owner-deferred features: futex requeue / `FUTEX_WAIT_BITSET` / PI futexes (Msgs 0339–0342),
+    removal of historical x86 AP debug breadcrumbs (Msg 0113), RPi5 bare-metal bring-up.
 
 ## 8. Next exact implementation priority [INF recommendation; the owner decides]
 
@@ -242,6 +291,17 @@ The recorded roadmap names **RT-SCHED1** next (`doc/KERNEL_UNLOCKING.md` §0.8, 
 10. Operational: never `pkill -f`; never edit tracked files during a boot; never edit a running
     script; watch disk; hosted tests `--test-threads=1`, `CARGO_INCREMENTAL=0`; witness lines
     ≤ 192 bytes.
+11. Prompt discipline inherited from the owner's directive reset (Msg 0012): every package names
+    its objective, the population or metric it changes (before → after), the exact owners or call
+    sites, and its non-goals; a prerequisite with no metric change must name what it unblocks; no
+    more than two such passes in a row; "a marker proves execution, not retirement".
+12. Before declaring a gate unreachable, inventory every existing profile and read the code
+    body, not its header (the WA3C2 false blocker, Msgs 0558/0560).
+13. Commit (or use a separate worktree) before any base-comparison checkout; push green
+    checkpoints to a preservation ref at once; after a container restart, distrust everything on
+    disk until its date and commit are checked.
+14. Never cite a number you did not observe in this session. The retracted "3525 tests / 31
+    failures" (Msg 0001) is the cautionary example.
 
 ## 10. Where to look
 
@@ -256,3 +316,4 @@ The recorded roadmap names **RT-SCHED1** next (`doc/KERNEL_UNLOCKING.md` §0.8, 
 | Per-arch | `doc/ARCH_X86_64.md`, `doc/ARCH_AARCH64.md`, `doc/ARCH_RISCV64.md`, `doc/RPI5_BRINGUP.md` |
 | Test rules | `doc/KERNEL_TEST_RULES.md` |
 | This recovery | `doc/YARM_DEVELOPMENT_HISTORY.md`, `doc/YARM_KERNEL_UNLOCK_HISTORY.md`, `doc/YARM_BUGS_AND_LESSONS.md`, `doc/YARM_RECOVERY_SOURCES.md` |
+| Owner conversation × Git: U0–U9 ladder, 199C/199E/WA3C2 chronologies, stops, lost work, owner proposals | `doc/YARM_STAGE_LEDGER.md`; reconciliation report `doc/YARM_CHATGPT_RECONCILIATION.md` |

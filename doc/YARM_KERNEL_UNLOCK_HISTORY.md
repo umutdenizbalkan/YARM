@@ -8,6 +8,11 @@ committed records; **[SR]** session-reported; **[INF]** inferred; **[UNK]** unkn
 `doc/YARM_RECOVERY_SOURCES.md`. The canonical, line-by-line record of every stage is
 `doc/KERNEL_UNLOCKING.md`; this file is the navigable account of it, not a replacement.
 
+**Reconciled 2026-11-09** with the owner's original ChatGPT conversation (export of
+`6a7a20ea-…`, 1 240 readable messages, 2026-08-10 → 11-04). "Msg ####" cites that export's
+transcript; message-to-commit detail is in `doc/YARM_STAGE_LEDGER.md`. A Msg citation alone is
+**[SR]** (a relayed report or ChatGPT's review); it becomes [VH] only with a commit.
+
 ---
 
 ## 0. What "unlocked" means — and the two things it is easy to confuse
@@ -115,7 +120,7 @@ still wrapped every trap. [VH]
 | **199A** (07-18 → 07-21) | Off-lock direct `IpcCall`/`IpcReply` (NR 6/NR 7): reservation seams, generation-bearing CNode resolver, AckLease; AArch64 round-trip seal (199A2C1); exact-commit 3-arch matrix (199A2C3 `0065f397`); x86 SMP cross-CPU request/reply live (199A2D2*, including the **AP `EFER.NXE` fix** 199A2D2C2B3 `ccceb03d`); freeze seal 199A2D3 `b73a6b35`. **Proof-gated / default OFF.** |
 | **200A–200C** (07-21 → 07-27) | Reply/timeout/peer-death terminal ownership model (hosted), generation-bearing deadline token store (hosted), reply-receive deadline completion; x86 live functional seal + off-lock retirement (200C2A/B); AArch64 (200C2C1B fixes blocked-recv timeout delivery) and RISC-V (200C2C2C-R2A/B) ports; **three-arch reply-timeout matrix `72a4ebff`** (6 cells). |
 | **200D** (07-27 → 07-29) | Server-death mechanism (hosted → deferred post-lock completion); `ExitCurrentTask` NR 16 ABI, x86 cell `0b5e98f3`, AArch64 cell, **RISC-V cell never earned**; ServerDies transition counters; x86 ServerDies live attempts 2B1D2–D5 refused five times before the post-drain restore-owner revalidation (2B1D5A/B). |
-| **199D** (07-29 → 08-10) | ServerDies reverse-link accounting scoped to one transaction — the `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1` "leak" was one counter pair answering two questions, not a leak. **x86 ServerDies live cell** `f5669cb5` (sixth attempt). **x86 NR6/NR7 production default ON** `0b5ec254` (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL`, 53 NR6 + 41 NR7 calls off-lock). Then **199D-WA1-GATE (`029d3562`, 08-05) disabled the default again** pending waiter ownership; WA2A generation-bearing waiter primitive; WA2B wake-owner census; WA3A transition barriers; WA3B one-shot spawn reservation; WA3C1 (`10b91677`) generation-bearing waiter record, central removal, two production defects fixed (displaced waiter's ack lease never released; `destroy_endpoint` raw clear leaked the lease and stranded the receiver); **WA3C2** authoritative endpoint-waiter ownership and the x86 production default restored. |
+| **199D** (07-29 → 08-10) | ServerDies reverse-link accounting scoped to one transaction — the `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1` "leak" was one counter pair answering two questions, not a leak. **x86 ServerDies live cell** `f5669cb5` (sixth attempt). **x86 NR6/NR7 production default ON** `0b5ec254` (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL`, 53 NR6 + 41 NR7 calls off-lock). Then **199D-WA1-GATE (`029d3562`, 08-05) disabled the default again** pending waiter ownership; WA2A generation-bearing waiter primitive; WA2B wake-owner census; WA3A transition barriers; WA3B one-shot spawn reservation; WA3C1 (`10b91677`, 08-10) generation-bearing waiter record, central removal, two production defects fixed (displaced waiter's ack lease never released; `destroy_endpoint` raw clear leaked the lease and stranded the receiver). An earlier one-increment WA3C attempt with **strict single-waiter publication** was stopped and reverted: the relay test `vfs_file_grant_ro_relay_preserves_transferred_cap` hangs under it (Msg 0001 §11). **WA3C2 was not part of this phase**: it was frozen on 08-10 (Msg 0012) and delivered on **08-31** (`612339b5`, Phase E below). *[Correction 2026-11-09: the first version of this row placed WA3C2 and the restored x86 default inside 07-29 → 08-10.]* |
 
 Canonical outcome (§0.3): **199C CLOSED** (via U6-FRAME, blocking-send envelope preserved,
 x86 + RISC-V live; AArch64 pre-admission deferral recorded), **199E CLOSED** (off-lock timeout
@@ -125,15 +130,25 @@ pipeline production-live and default-reachable on all three arches; `MAX_DEADLIN
 
 ## 5. Phase E — the U-series: from 49 acquisitions to zero (2026-08-11 → 09-24)
 
+The ladder U0–U9 was fixed by the owner's directive file on 2026-08-10 (Msg 0012; the file
+itself is not in the export). Census baseline re-derived from source that day: **49** = 39
+`with_cpu` + 10 broad `with` (44 runtime / 3 test-only / 2 obsolete), superseding the seed's
+historical 51/46. Full chronology, stops and lost work: `doc/YARM_STAGE_LEDGER.md` §1–§5.
+
 | Directive | Commit(s) | Effect on the census |
 |---|---|---|
+| U0 | `03f6e5bd` (08-11) | canonical map reconciled with source; delta 0 |
 | U1 | `26364834` | deleted 2 obsolete acquisitions (49 → 47) |
 | U2 | `7bb73d85` | relocated 3 test-only acquisitions (47 → 44) |
-| U3 | `b7d4dcf8` … `0912a279` (24 commits) | retired the post-lock **drain re-acquisition class** (44 → 7); exit condition met; canonical 203C still OPEN |
-| U4 / U4-CLOSE | `4f74f55b`, `c817ab66` | cross-arch queue-advancing dispatch for blocking IpcRecv/IpcSend |
-| U6 | `b83ae3a8` … `b59b7225` | off-lock blocking-send commit (partial cohort); U6-FRAME later closed 199C |
-| U7 | `8275c927` | production IPC-timeout pipeline on all three arches |
-| U9-A … U9-F | 08-24 → 08-25 | inventory; "STOP — the four-site cohort is two fences" (U9-B); reply-cap materialization as an ordered transaction (U9-C); capability-revoke teardown split per class (U9-F); D3 fence discharged (census 6 → 2) |
+| U3 | `b7d4dcf8` … `0912a279` (08-11 → 08-24) | retired the post-lock **drain re-acquisition class** (44 → 7); numeric ≤ 24 reached 08-12 but drains remained, exit met 08-24 (Msg 0395); canonical 203C still OPEN. Many cohorts were stopped, reduced or rebuilt (e.g. 39 → 37 delivered as a *reduced* cohort after four live gates failed, Msgs 0065–0078) |
+| U4 / U4-CLOSE | `4f74f55b`, `c817ab66` | cross-arch queue-advancing dispatch for blocking IpcRecv/IpcSend; blocking-send origins hosted-proven only |
+| U5 | — | **no code**: exit already met by two production callers of `materialize_received_message_cap_routed_with_delegation_split` (Msgs 0166, 0169); canonical 200B open [SR + VC fences] |
+| U6 | `b83ae3a8` … `b59b7225` | partial cohort (08-14) → "199C COMPLETE" `dfaaa648` (08-14, QEMU blocking-send coverage 0/3) → **re-opened** 08-19 (Msg 0319) → deferred (Msg 0416) → **U6-FRAME closed 199C** `b59b7225` (08-24, Msg 0418; canonical 3/11/21) |
+| U7 | `8275c927` → `e019c8aa` | pipeline wired on three arches at `8275c927` (08-17), but default reachability on AArch64/RISC-V needed GIC DTB-order and per-root mapping repairs (`9f0e4896`, `7fe7d066`), AArch64 ProductionTick (`92a99596`), RISC-V timer admission, FP policy and default tick (`afdc9927`, `932bd6fa`, `e019c8aa`); **199E closed 08-19** |
+| U8 | — | **already complete on 08-10** (AArch64 split-return acquisition retired by Stage 199D; "do not reopen", Msg 0012). ChatGPT nevertheless wrote "U8 is next" from 08-14 to 08-19; corrected at Msg 0319/0320 |
+| U9-A … U9-F | 08-24 → 08-25 | inventory (`4e9643fd`); "STOP — the four-site cohort is two fences" (U9-B `c6a4a7db`); reply-cap materialization as an ordered transaction (U9-C `fbe1229c`, 7 → 6); capability-revoke teardown split per class (U9-F `e9a7750c`, first build lost with a container); post-switch restore off the lock (`d3032f8e`); **D3 fence discharged, census 6 → 2** (U9-D3 `d741f88b`, 08-25) |
+| **199D-WA3C2** | `612339b5` (08-31) | **CENSUS-DELTA 0**; authoritative endpoint-waiter ownership; x86 direct-IPC default restored (`cfg!(x86_64)`); re-authorized 08-27 because direct `IpcCall`/`IpcReply` could not leave the terminal dispatcher otherwise (Msg 0551). Semantics: §5a |
+| 199G-B3, 199G-C4/C5, DIRECT3-* | `56802878`, `a3aa7cb6`, `2aab8b77` (08-31 → 09-02) | NR 5, NR 1 and NR 6/7 off both terminal dispatchers; **direct NR 6/7 production default on all three arches from `2aab8b77`** |
 | U9-QA, -TM, -PF, -FT1..4, -RX1..4, -COW2, -MO2, -ASPACE1 | 08-26 → 09-02 | off-lock queue-advance prerequisite, timer checkpoint, PageFault classification and terminal fault routes, receive writeback, reply-cap writeback repair, MemoryObject reclaim |
 | U9-SPAWN-VM1/IC1, -FORK1, -A64-COW2, -REAP1, -EXIT1..4, -RESIDUAL1, -YIELD2 | 09-03 → 09-07 | spawn provisioner with exact rollback; rank-local endpoint+cap provisioning; one COW clone owner; reap and exit transactions (EXIT1's retirement claim corrected by EXIT2; EXIT2's post-clear settlement found unsafe and repaired with a token in EXIT3; EXIT4 removed the remaining races; RESIDUAL1 corrected EXIT4's admission proof) |
 | U9-DISPATCH-CPU1..3 | `26c1c442`, `8265461b`, `a556bbde` | removed ambient CPU authority from queue advance; CPU2 **removed a broad-lock regression CPU1 had introduced**; CPU3 restored the missing `Running` mark |
@@ -145,6 +160,27 @@ pipeline production-live and default-reachable on all three arches; `MAX_DEADLIN
 | U9-TERMINAL-SETTLEMENT, U9-CLOSURE-ACCEPTANCE | → `93900ae0` | declined-Yield frame authority; switch-plan leak; relocated oracle (a regression found and repaired) |
 | **U9 CLOSED** | `93900ae0` | `with_cpu` 0, `with_broad` 0; "No further unlock package follows from this programme." |
 | POST-U9-STABILIZATION | `14b61286` 09-24 | the four failures carried out of U9 settled; **reference tree for hardware bring-up — preserved by every later brief**. |
+
+Workflow facts from the conversation [SR, corroborated by refs where stated]: from 08-26
+ChatGPT proposed letting Claude fast-forward `main` itself after a green, remotely preserved WIP
+checkpoint (Msg 0521), which became the delivery pattern; from 09-14 to 09-24 deliveries went to
+`claude/yarm-kernel-unlock-u0-f2zh8p` only and `main` stayed at `8f30f3b9` until one
+fast-forward to `93900ae0` (Msg 0942) [VH]. Work was lost to container replacement at least four
+times (Msgs 0441/0454, 0500, 0545, 0561/0570); a `git push -f` once overwrote `b84b258` on the
+designated branch and was repaired by merging it back (Msg 0673) [VH: `b84b2582` is on `main`].
+
+### 5a. WA3C2 — what was proposed, rejected and delivered
+
+| | Content | Status |
+|---|---|---|
+| Strict single-waiter publication (first WA3C attempt) | refuse a second receiver | **stopped and reverted** — relay hang (Msg 0001 §11) |
+| Same, re-proposed by ChatGPT 08-10 (Msg 0007) | blame the hang on a missing Phase-C unwind; adopt strict publication | **not accepted**; WA3C2 frozen (Msg 0012) |
+| Directive 08-27 (Msg 0554) | keep last-receiver-wins unless strict passes the relay suite; displacement must not strand the old receiver | accepted |
+| Delivered 08-31 (`612339b5`) | last-receiver-wins **preserved**; displaced incarnation CLAIM(Teardown) → CANCEL → RETIRE → ARM(new); publication over a live claim refused (`WaiterOwnershipBusy` → `WouldBlock`); two `let _ = claim;` leaks now CANCEL | [VH commit, VC `ipc_state.rs:1971-2000`, `waiter_ownership.rs:971-1021`] |
+
+Open [INF]: the repair settles the displaced incarnation's **ownership**; no code or test wakes
+or re-checks the displaced **task**, so whether an untimed displaced receiver can stay `Blocked`
+(the liveness concern of Msg 0007) is not established.
 
 ## 6. Phase F — QEMU SMP evidence (2026-09-25 → 10-08)
 
@@ -172,7 +208,7 @@ section on all three ports). [VH, `doc/KERNEL_UNLOCKING.md` QEMU sections]
   shootdown names its executing CPU; loaded-root teardown gate and permanent quarantine.
 * **AP-SCHED1–4** (`e9c8173c`, `7a76f789`, `8cb30dd1`, `df5ee7b6`): production user scheduling
   on secondary CPUs — RISC-V first (1 then all harts), AArch64 (GICv2, ceiling 8 CPUs,
-  `PRODUCTION_CPU_CEILING = 8` [VC]), x86_64 (APIC-map admission [VC]; ≤ 8 CPUs per the AP-SCHED4 record [SR]; authenticated executing CPU;
+  `PRODUCTION_CPU_CEILING = 8` [VC]), x86_64 (APIC-map admission, `PRODUCTION_CPU_CEILING = 8` in `src/arch/x86_cpu_admission.rs:36` [VC — corrected 2026-11-09, previously recorded as SR only]; authenticated executing CPU;
   lossless parked server-death handoff). **This is production SMP**, not a proof knob.
 * **VM-INVALIDATION2 (+ACCEPTANCE, +SEAL)** (`da591ee8`, `9e4d3c49`, `63537414`): x86
   dispatch-gap invalidation hole — the per-page unmap shootdown must target root residency, not
@@ -228,7 +264,9 @@ interrupts on kernel threads; fixed at `bb451a3b` with a live control. [VH]
 | Canonical stages complete per owner table | 199C, 199E, 204A (table not re-classified since) | [VH] |
 | Direct NR6/NR7 off-lock IPC | **production default on x86_64, AArch64, RISC-V** (`ipccall_direct_production_enabled()`, `src/kernel/boot/mod.rs:4154`) | [VC] |
 | D6-genuine authoritative dispatch | compile-time **x86_64 only** (`d6_genuine_enabled()`, `mod.rs:1134`) | [VC] |
-| Production SMP user scheduling | all three ports (AP-SCHED1–4); AArch64 ceiling 8 [VC]; x86 ≤ 8 [SR] | [VH, VC, SR] |
+| Production SMP user scheduling | all three ports (AP-SCHED1–4); `PRODUCTION_CPU_CEILING = 8` on x86_64, AArch64 and RISC-V; `MAX_CPUS = 64` everywhere | [VH, VC] |
+| Endpoint-waiter replacement | last-receiver-wins with explicit displacement ownership (WA3C2); displaced-task liveness untested | [VC, INF] |
+| IRQ → Notification binding | `bind_irq_notification` checks the Notification SIGNAL right only, no IRQ-line authority; reachable only from the default-off UART witness | [VC] |
 | Scheduler lock | per-CPU 1L (SCHED-LOCK1); SC-LOCK-2 progress argument **not established** | [VH] |
 | Kernel threads | cooperative, qualified, **no production user** (only tests and default-off witnesses create them) | [VC] |
 | Asynchronous kernel preemption (SC-KT-4) | **not enabled** | [VH] |
@@ -262,8 +300,8 @@ does not exist yet.
 
 | Stage | Historical status (§0.3) | Relevance | Why |
 |---|---|---|---|
-| 199C blocking send | complete | current | AArch64 pre-admission deferral recorded |
-| 199D call/reply + crash cleanup | OPEN | L + R | off-lock now; ServerDies live cells AArch64/RISC-V never earned; timeout/cancellation cleanup parity unqualified |
+| 199C blocking send | complete | current | AArch64 pre-admission deferral recorded; status changed four times 08-14 → 08-24 before the U6-FRAME closure (`doc/YARM_STAGE_LEDGER.md` §2) |
+| 199D call/reply + crash cleanup | OPEN | L + R | off-lock now; waiter ownership exclusive since WA3C2 (`612339b5`); ServerDies live cells AArch64/RISC-V never earned (their runners never received an initramfs, Msg 0949); timeout/cancellation cleanup parity unqualified; displaced-receiver liveness untested |
 | 199E timeouts | complete | current (scaling debt) | `MAX_DEADLINE_TOKENS = 4` [VC]; per-arch timebases |
 | 199F notifications | OPEN | L + R | no lock exists on the IRQ path [VC]; wait-with-timeout, multi-signal accumulation, exactly-once wake never qualified as a package |
 | 199G IPC seal | OPEN | L + E | "zero runtime broad-lock acquisitions" now holds structurally [VC]; the seal itself was never produced |

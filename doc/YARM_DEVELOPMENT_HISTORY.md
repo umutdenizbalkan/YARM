@@ -9,6 +9,10 @@ verified from commits/committed records; **[SR]** session-reported; **[INF]** in
 The kernel-unlocking line is told in depth in `doc/YARM_KERNEL_UNLOCK_HISTORY.md`; bugs in
 `doc/YARM_BUGS_AND_LESSONS.md`; sources in `doc/YARM_RECOVERY_SOURCES.md`.
 
+**Reconciled 2026-11-09** with the owner's original ChatGPT planning conversation (2026-08-10 →
+11-04; "Msg ####" = its export transcript). Eras 5–8 below now carry the owner's decisions and
+the reasons priorities changed; the message-to-commit ledger is `doc/YARM_STAGE_LEDGER.md`.
+
 ## Eras at a glance [VH]
 
 | Era | Dates | Who committed | Delivery style |
@@ -132,7 +136,10 @@ proof stack fixes 165B–165J (x86 kernel stacks 64 → 128 KiB, `2b5e1ac1`) →
   (200A–C); 7-27 → 7-29: server death and `ExitCurrentTask` NR 16 (200D). [VH]
 * 07-29 → 08-10: canonical **199D** — ServerDies accounting, x86 ServerDies live cell
   (`f5669cb5`), x86 direct-IPC production default ON (`0b5ec254`), then **WA1-GATE disabled it
-  (`029d3562`, 08-05)** until endpoint-waiter ownership was rebuilt (WA2A–WA3C2). Last PR #542
+  (`029d3562`, 08-05)** until endpoint-waiter ownership was rebuilt (WA2A–WA3C1 in this era;
+  WA3C2 only on 08-31, Era 5). A first WA3C attempt with strict single-waiter publication was
+  stopped and reverted (relay test hang); a test count reported for it ("3525 tests, 31
+  failures") was fabricated and retracted (Msg 0001 §11). Last PR #542
   (`10b91677`, WA3C1, 08-10). Kernel-unlock audit and documentation consolidation Pass 6
   (`f8a3c046`, 07-29): per-stage report files deleted, seals migrated to
   `doc/PROJECT_HISTORY.md`, `tests/doc_fragmentation_guard.rs` added. [VH]
@@ -149,11 +156,53 @@ last production broad acquisitions and **U9 closed (`93900ae0`)**. **POST-U9-STA
 that every later brief requires preserving (it lives on `refs/heads/wip/post-u9-stabilization`).
 [VH]
 
+**How Era 5 was steered** (owner conversation; detail in `doc/YARM_STAGE_LEDGER.md`):
+
+* **08-10 — the directive reset.** The owner objected that planning "always drift[s] from kernel
+  unlocking to bug fixing" and uploaded a directive file and a review (Msg 0008; files not in the
+  export). The U0–U9 ladder, a source-derived census of 49, the prompt template (directive,
+  CENSUS BEFORE/AFTER, call sites, `BLOCKS: U<n>`), a cap of two consecutive delta-zero passes and
+  the freeze of WA3C2 followed (Msg 0012). U8 was recorded complete that day. [SR/VH]
+* **08-11 — branch alignment.** The owner merged `claude/kernel-unlock-audit-i7nt1t` into
+  `main` (Msg 0016, `e4e70618` = PR #542 merge); U0–U2 delivered the same morning; QEMU installed
+  for all three ISAs at the owner's request (Msg 0031). [VH]
+* **Batching.** The owner repeatedly asked for several retirements per pass to save time and cost
+  (Msgs 0046, 0155, 0321, 0396). [SR]
+* **08-14 → 08-19 — 199E took four days, not one commit.** After U7 (`8275c927`) the AArch64 and
+  RISC-V timers had to be made default-reachable: a GIC DTB property-order bug, a missing GIC
+  mapping in every new root, `sscratch` drift and a D2 provenance hole in the RISC-V bridge, and a
+  user-FP policy that had been "safe by accident"; most intermediate checkpoints were amended
+  locally and never pushed. [VH: ledger §3]
+* **08-24 — U3 exit met, 199C closed.** The owner asked to finish unlocking "as soon as possible
+  and concentrate on booting on baremetal rpi5, and futexes thereafter" (Msg 0396); futex
+  requeue/bitset/PI were deferred until then (Msgs 0339, 0342). U6-FRAME closed 199C (`b59b7225`).
+* **08-25 → 08-27 — census 2 and the WA3C2 decision.** Census fell 6 → 2 (`d741f88b`); the two
+  remaining acquisitions were whole terminal dispatchers; WA3C2 was re-authorized as unavoidable
+  (Msgs 0551–0557). Delivered 08-31 (`612339b5`) after the unpushed work was lost with a
+  container.
+* **09-01 → 09-08 — drift checks.** Owner: "we have drifted … again, aren't we?" (Msg 0636);
+  ChatGPT: technically no, operationally yes. Re-baseline 09-08 (Msgs 0784–0792) turned the
+  remaining work into a finite list of dispatcher populations.
+* **09-24 — closure and stabilization.** The owner asked for one delivery to `main` (Msg 0939),
+  then chose a bounded stabilization before hardware (Msgs 0944–0947) — `14b61286`, with the
+  x86 ordinary-cap cell left red (init address space at `MAX_MAPPINGS` 128/128). [VH/SR]
+* ChatGPT's estimates to full unlock (9–14, 6–10, 8–12 passes on 08-26, 08-27, 09-01) were
+  each exceeded; U9 closed 09-24.
+
 ## Era 6 — QEMU SMP evidence (09-25 → 10-08)
 
 QEMU-BASELINE1 (`83996c50`…`1cfeb889`), QEMU-IRQ1/2/3 (device interrupts on three ports),
 QEMU-CONTEXT1, QEMU-SMP1/2/3 with ACCEPTANCE and SEAL rounds, QEMU-LOCK1/2/3. Local checkout's
 shallow boundary sits here (`70561d03`, 09-30). [VH]
+
+Why this era exists: the owner chose to "add mmu timer and irq first before bringing up any
+device/real hardware because its much easier to test them with qemu" (Msg 0952, 09-25),
+superseding the plan to go to hardware straight from `14b61286` (Msg 0951 had proposed a first
+hardware milestone of boot → serial → halt). ChatGPT corrected the owner's recipes before
+adopting them (Msg 0955): QEMU virt UART0 is PLIC IRQ 10; `CNTP_*` is the physical timer
+(INTID 30); CLINT MSIP is machine-level, so supervisor IPIs go through SBI; interrupting a lock
+holder on its own CPU tests self-deadlock, not contention. The RPi5 hardware question was left
+open (Msg 0951: "which exact device are we bringing up first?").
 
 ## Era 7 — Backlog, deletion, production SMP (10-09 → 10-21)
 
@@ -170,8 +219,15 @@ Owner briefs survive verbatim from 10-12 onwards (`doc/YARM_RECOVERY_SOURCES.md`
 | AP-SCHED1 | 10-13/14 | `e9c8173c` | first production AP-scheduling increment (RISC-V, 2 CPUs) |
 | AP-SCHED2 | 10-14 → 10-19 | `7a76f789` | all supported RISC-V harts; UART witness repair |
 | AP-SCHED3 | 10-19 | `8cb30dd1` | AArch64 production user scheduling (GICv2, ≤ 8) |
-| AP-SCHED4 | 10-20/21 | `df5ee7b6` | x86_64 production SMP (APIC map; ≤ 8 per its record [SR]) |
+| AP-SCHED4 | 10-20/21 | `df5ee7b6` | x86_64 production SMP (APIC map; `PRODUCTION_CPU_CEILING = 8` [VC], corrected from SR) |
 | VM-INVALIDATION2 (+ACC, +SEAL) | 10-21 | `da591ee8`, `9e4d3c49`, `63537414` | x86 dispatch-gap hole; grader repairs |
+
+Origins: the BL backlog was compiled by ChatGPT from the chat history at the owner's request
+("bugs or todos … we skipped because we were focused on kernel unlocking", Msgs 1063–1066) —
+"a history-based backlog, not a fresh source audit"; each issue was delivered to `main`
+separately. SHARED-REGION-LIFETIME1 came from a review of BL1-a: `map_refcount` updates matched
+only an object's first frame (Msg 1078). **BROAD-LOCK-RETIREMENT1 was the owner's proposal**
+(Msg 1073: remove the legacy lock so any remaining broad dispatch becomes impossible). [SR/VH]
 
 ## Era 8 — Contract, lock split, kernel threads (10-21 → 11-04)
 
@@ -190,6 +246,17 @@ Owner briefs survive verbatim from 10-12 onwards (`doc/YARM_RECOVERY_SOURCES.md`
 | KTHREAD1 | `40132e1a` | cooperative kernel threads |
 | KTHREAD1-ACCEPTANCE | `a7da04f1` | |
 | KTHREAD-CLOSURE1 | A `136e8ae2`, B `a540aef2`, C `fc429b00`, **D `b81e0317`** | five closures; current `main` |
+
+Origins and corrections of this era's design (owner proposals, ChatGPT reviews; ledger §6):
+the real-time direction (ISO 26262 / DO-178C / ARINC 653 motivation, hybrid partitions + fixed
+priorities, Msg 1157) was adopted as a configurable profile and written down as SCHED-CONTRACT1
+— a contract and model, not production RT scheduling; the owner's no-FP kernel idea (Msg 1164)
+became KERNEL-NOFP1, while the per-task FP flag was deferred to FP-POLICY1 because a creation
+flag cannot enforce non-use; the owner's question about the shared scheduler lock (Msg 1171) put
+SCHED-LOCK1 on the roadmap ahead of preemptible kernel threads; the owner's SRP/continuation
+proposal (Msg 1218) was narrowed to fixed-pool stackful kernel threads (SRP attributed to Baker,
+not automatic boosting; atomics do not make IPC wait-free); and the owner bundled the five open
+items into KTHREAD-CLOSURE1 (Msg 1236).
 
 **Checkpoint verification (2026-11-05):** `main`, `claude/yarm-kernel-unlock-u0-f2zh8p` and
 `wip/kthread-closure1` all point to `b81e0317`; `wip/kthread-closure1-a/-b/-c` at `136e8ae2`,
@@ -233,3 +300,22 @@ newer work.** [VH, full clone]
   outcome when no safe seam existed.
 * Refused seals preserved as records (e.g. `STAGE_199_IPCCALL_REPLY_OFFLOCK_SEAL … result=deferred`)
   in `doc/PROJECT_HISTORY.md`.
+
+Added from the owner conversation (2026-11-09) [SR unless a commit is named]:
+
+* **Strict single-waiter publication** — attempted (first WA3C spec), reverted for a relay hang;
+  re-proposed by ChatGPT on 08-10 (Msg 0007) and not accepted; WA3C2 kept last-receiver-wins.
+* **A fabricated qualification figure** ("3525 tests completed, 31 failures") was reported,
+  then retracted as never observed (Msg 0001 §11).
+* **Lost and rebuilt work:** U9-F's first build `f0f9890` (never pushed; rebuilt as `e9a7750c`
+  without claiming equivalence, Msg 0441); a whole U9/203C/204D turn (Msg 0454); WA3C2's local
+  commits (rebuilt from scratch, Msg 0561).
+* **Stops that were correct:** dozens of reports end "stopped before editing" or "not
+  delivered" — for capacity (Msgs 0052, 0059), unmet live gates (0065–0076, 0103–0109), false
+  premises (0412, 0535, 0608) or a mandatory gate not being reachable (0558, itself based on the
+  wrong profile).
+* **Reverted live-proof attempts:** U7's live-proof patch (Msg 0225) and diagnostics after
+  each investigation (`ZDBG_*` residue forbidden by guard).
+* **Retracted claims by the agent itself:** NR 7 miscount (Msg 0620), EXIT1 overclaim (0726),
+  stale-log comparison (0545), "2/0/2" asserted from a hand grep (0778), a failed RISC-V oracle
+  profile reported as passing (0932), a guard set silently reverted by a base checkout (0528).

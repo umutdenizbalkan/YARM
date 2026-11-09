@@ -6,7 +6,12 @@
 Inventory of the evidence behind `doc/YARM_MASTER_CONTEXT_SEED.md`,
 `doc/YARM_DEVELOPMENT_HISTORY.md`, `doc/YARM_KERNEL_UNLOCK_HISTORY.md` and
 `doc/YARM_BUGS_AND_LESSONS.md`. Compiled 2026-11-05, read-only: no source file, branch, ref
-or transcript was modified, and nothing was committed or pushed.
+or transcript was modified, and nothing was committed or pushed. Preserved on
+`wip/yarm-context-recovery-2026-11-05` at `cce15d92`.
+
+**Reconciliation, 2026-11-09:** the owner supplied the original ChatGPT conversation (§2a).
+Statements below that were true on 2026-11-05 but are no longer true are kept and dated, not
+deleted. New file: `doc/YARM_STAGE_LEDGER.md`.
 
 ## Evidence labels used in all five files
 
@@ -56,8 +61,23 @@ summary #0.
 | Source | Available | Notes |
 |---|---|---|
 | Codex CLI local history (`~/.codex`, `~/.config/codex`) | **no** | Absent. Codex's work is visible only as 43 merged `codex/*` PR branches (Feb–May) and their commits. |
-| **ChatGPT conversation "YARM kernel unlock"** (`6a7a20ea-c638-83eb-8679-0715c202753b`) | **no** | No export, `conversations.json` or transcript exists anywhere on the filesystem (searched `/` for `conversations.json`, `*chatgpt*`, `*6a7a20ea*`). The URL is not readable from here. **None of its content is reproduced; nothing attributed to it is claimed.** [INF] The owner-supplied canonical stage definitions 199C–205D in `doc/KERNEL_UNLOCKING.md` §0 ("owner-supplied and authoritative … not derived from branch history") and the stage briefs are the most likely written residue of that planning, but this cannot be verified. |
+| **ChatGPT conversation "YARM kernel unlock"** (`6a7a20ea-c638-83eb-8679-0715c202753b`) | **no on 2026-11-05; yes from 2026-11-09 (§2a)** | *(As of 2026-11-05:)* No export, `conversations.json` or transcript exists anywhere on the filesystem (searched `/` for `conversations.json`, `*chatgpt*`, `*6a7a20ea*`). The URL is not readable from here. **None of its content is reproduced; nothing attributed to it is claimed.** [INF] The owner-supplied canonical stage definitions 199C–205D in `doc/KERNEL_UNLOCKING.md` §0 ("owner-supplied and authoritative … not derived from branch history") and the stage briefs are the most likely written residue of that planning, but this cannot be verified. |
 | Repository agent instructions | yes | `doc/AGENTS.md` (pointer), `doc/AI_AGENT_RULES.md` (1 121 lines, canonical rules), `doc/KERNEL_TEST_RULES.md`, `doc/DOCUMENTATION_MAP.md`. No root `CLAUDE.md` exists. No earlier context-seed file exists in the tree (the doc guard forbids `*_NEXT_CONTEXT.md`). |
+
+## 2a. The ChatGPT export (added 2026-11-09)
+
+| Item | Value |
+|---|---|
+| Source | owner-supplied official OpenAI account export (2026-11-05 timestamp), repackaged as `YARM_CHATGPT_HISTORY_RECOVERY_2026-11-06.zip`, plus the owner's comparison note `YARM_RECONCILIATION_FINDINGS_2026-11-09.md` |
+| Conversation | "YARM kernel unlock", id `6a7a20ea-c638-83eb-8679-0715c202753b`; export entry `conversations-002.json`, record 43; metadata 2026-08-10 → 2026-11-04 |
+| Coverage | 4 142 tree nodes; 4 024 on the active path; **1 240 readable active-path messages (436 owner turns, 804 assistant turns)**, 2026-08-10 19:05 → 2026-11-04 10:55 UTC; 118 off-path nodes containing **28 readable alternate messages** |
+| Excluded by the export package | content types `thoughts` and `reasoning_recap`; not a byte-exact rendering of the UI |
+| Files examined | `YARM_RECOVERY_MANIFEST.md`, `YARM_CLAUDE_RECONCILIATION_PROMPT.md`, `YARM_MASTER_CONTEXT_SEED_FROM_CHATGPT_EXPORT.md`, `YARM_STAGE_REPORT_INDEX.md` (310 indexed reports, read in full), `YARM_CONVERSATION_VISIBLE_MESSAGES.jsonl` (read by message number in bounded slices), `YARM_ALTERNATE_BRANCH_MESSAGES.md` (all 28). `YARM_ORIGINAL_CONVERSATION.md` and `YARM_USER_STAGE_REPORTS.md` are renderings of the same messages; the raw JSON was used only for counts |
+| Not in the export | the two files the owner uploaded on 2026-08-10 (`yarm_unlocking_directives.txt`, `yarm_microkernel_review_cycle14.txt`) and later attachments/images (Msgs 0440, 0452, 0600) — known only through the replies |
+| Numbering protocol | "Msg ####" = the export's 1-based chronological index of readable active-path messages (identical in the `.md` transcript and the `.jsonl`); "Alt ##" = `YARM_ALTERNATE_BRANCH_MESSAGES.md` |
+| Credibility | owner turns are mostly Claude Code reports pasted by the owner: **[SR]** until a commit or source check confirms them; ChatGPT turns are reviews and prompts, not verification (ChatGPT ran no builds; several of its statements were later corrected, §6) |
+| Handling | the raw export is **not** copied into the repository; quotations are short and technical; nothing personal from it is reproduced |
+| Loss | the uploaded archive and all reconciliation scratch files were destroyed by a container restart during this work on 2026-11-09; findings already extracted were preserved in this conversation and are what these documents cite. The full 310-row mechanical ledger must be regenerated from the export if needed |
 
 ## 3. Git and GitHub
 
@@ -123,11 +143,45 @@ qualification logs exist only as numbers quoted in `doc/KERNEL_UNLOCKING.md` rec
 8. **Session summaries vs. records:** where a compaction summary and a committed record differ,
    the committed record was preferred and the difference noted in the relevant file.
 
+Added 2026-11-09 (owner conversation vs. Git vs. the 2026-11-05 documents):
+
+9. **WA3C2 chronology error in the 2026-11-05 docs (corrected).** `YARM_KERNEL_UNLOCK_HISTORY.md`
+   §4 put WA3C2 and the restored x86 default inside 07-29 → 08-10. WA3C2 was frozen on 08-10
+   (Msg 0012) and delivered on 08-31 (`612339b5`, Msg 0561) [VH].
+10. **x86 CPU ceiling mislabelled (corrected).** The 2026-11-05 docs said the x86 ≤ 8 limit
+    existed "only in a record [SR]". Source has `PRODUCTION_CPU_CEILING = 8` in
+    `src/arch/x86_cpu_admission.rs:36` (and RISC-V `riscv_hart_admission.rs:49`) [VC];
+    `MAX_CPUS = 64` on all three ports (also stated by ChatGPT, Msg 1117).
+11. **WA3C2 semantics: proposal vs. delivery.** ChatGPT's 08-10 verdict "adopt strict
+    single-waiter publication" (Msg 0007) was never accepted; delivery preserved
+    last-receiver-wins (`612339b5`). Both are true historical statements of different things.
+12. **U8 status.** Recorded complete on 08-10 (Msg 0012), then called "next" by ChatGPT from
+    08-14 to 08-19 (Msgs 0190–0318), corrected 08-19 (Msgs 0319/0320). An alternate branch
+    (Alt 05) noticed `U8_RECV_TIMEOUT_*` markers shipped inside 199E. Resolution: U8 = the
+    AArch64 split-return acquisition, already retired; no U8 implementation exists or is owed.
+13. **199C status changed four times** (complete 08-14 → open 08-19 → deferred 08-24 → closed
+    08-24); only the last stands (`b59b7225`).
+14. **The ChatGPT-derived seed** (`YARM_MASTER_CONTEXT_SEED_FROM_CHATGPT_EXPORT.md`) is an
+    owner-side summary, not evidence. Inaccuracies found: it places "U8 / AArch64 split-return"
+    work on 08-19 (none happened); it cites 199C "COMPLETE" at Msg 0188 without the re-opening;
+    it says U3 declined "toward 13" (U3 ended at 7); it leaves the x86 CPU ceiling as an open
+    question (answered in source). Its other claims agree with Git where checked.
+15. **The owner's comparison note** (`YARM_RECONCILIATION_FINDINGS_2026-11-09.md`) is consistent
+    with this reconciliation; its item 2 asked to check the delivered WA3C2 policy in source —
+    done (§11 above and `YARM_KERNEL_UNLOCK_HISTORY.md` §5a).
+16. **Still unresolved:** whether a displaced untimed receiver can stay blocked (no test); the
+    exact text of the 08-10 directive files; the RPi5 hardware outcome after BOOT-4; why the
+    AArch64/RISC-V server-death runners never received an initramfs (harness gap reported at
+    Msg 0949, not traced further).
+
 ## 7. Coverage limitations
 
-* Pre-2026-10-09 conversation text with the owner (including the original U-series, 199-series
-  and QEMU-* briefs) is not available verbatim; only commits, records and PR bodies.
-* The ChatGPT planning conversation is entirely unavailable.
+* *(2026-11-05)* Pre-2026-10-09 conversation text with the owner (including the original
+  U-series, 199-series and QEMU-* briefs) is not available verbatim; only commits, records and PR
+  bodies. *(2026-11-09)* The owner–ChatGPT side of 08-10 → 11-04 is now available (§2a); it
+  contains ChatGPT's prompts to Claude and the owner-relayed reports, but still not the earlier
+  Claude Code transcripts themselves, nor the Feb–Aug planning (if any) outside this conversation.
+* *(2026-11-05)* The ChatGPT planning conversation is entirely unavailable. — superseded by §2a.
 * PR bodies were sampled, not read exhaustively (542 PRs).
 * `doc/KERNEL_UNLOCKING.md` was indexed by headings and read section by section for the parts
   cited; not every one of its 33 747 lines was read.

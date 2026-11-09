@@ -46,6 +46,35 @@ the rule that prevents each. Part C is operational hazards of the environment.
 | A27 | unused-variable warning on every build (Stage C run 1 QC6) | run-view bound used only by a default-off witness | `ca98bd61` [VH] | warnings are qualification failures |
 | A28 | parallel hosted tests: 58–71 shared-state assertion failures | process-global test state; earlier real memory corruption fixed (`doc/KERNEL_TEST_RULES.md` H1) | run `--test-threads=1` [VH] | blocks using the hosted suite as a torture harness |
 
+### Added 2026-11-09 from the owner conversation (Aug–Sep defects the first ledger missed)
+
+"Msg ####" = the ChatGPT export transcript (`doc/YARM_STAGE_LEDGER.md`). A Msg alone is [SR];
+a named commit on `main` makes the repair [VH].
+
+| # | Defect | Root cause | Fix / evidence | Regression risk |
+|---|---|---|---|---|
+| A29 | direct-IPC production unsafe (why WA1-GATE turned it off) | endpoint-waiter claim not task-wide exclusive; ordinary timeout and notification did not arbitrate against waiter ownership; timeout could make a task Runnable before waiter cleanup; notification waiter stored a **bare TID** with generic `Blocked` | audit `d43607fc`, gate `029d3562`; ownership WA2A → WA3C2 `612339b5`; notification wake proves `{tid, asid, generation}` since U9-IRQ-UNKNOWN1 [VC `ipc_state.rs` `signal_notification`] (Msg 0001 §5, §18) | **high** |
+| A30 | a reverted timeout-arbitration attempt | claim-before-wake exposed a **scanner cursor advanced by the number woken, not the number scanned**; exact waiter claim made receivers without a waiter slot miss ordinary timeout (partial wake counts 20/40, 0, 0) | reverted; timeout reachability is real (Msg 0001 §5) | high: never assume a timeout path is hypothetical |
+| A31 | displaced receiver left blocked and ownerless | `publish_recv_waiter_locked` logged `D2_RECV_WAITER_DISPLACED` and dropped the record | WA3C2 `612339b5`: CLAIM(Teardown) → CANCEL → RETIRE → ARM [VC]; **task-level liveness of the displaced receiver still untested [INF]** | medium |
+| A32 | endpoint index wedged after server/caller death | request `ServerGone` and reply `CallerGone` arms wrote `let _ = claim;`, leaking the ownership slot | WA3C2: both CANCEL; source census forbids `let _ = claim;` [VH] | high |
+| A33 | x86 structured COM1 output corrupted under SMP stress (1 of 12, then 4 of 7 boots) | five late AP naked-asm breadcrumbs (`a d v q z`) wrote COM1 while the BSP logged | `f7e25f29`: breadcrumbs to debugcon 0xE9; the parser-workaround approach was reverted (Msgs 0103–0115) | medium: never "fix" noise in the matcher |
+| A34 | AArch64 GIC CPU interface pointed at the distributor | DTB walker picked the `reg` tuple before reading `compatible` (QEMU emits `reg` first) | `9f0e4896` (Msgs 0269–0274) | dormant until the first interrupt |
+| A35 | AArch64 GIC unmapped after the first user root | `copy_bootstrap_kernel_root_entries` skips L1[0]; only the UART had a per-root leaf | `7fe7d066` (Msgs 0280–0283) | high for any new device |
+| A36 | RISC-V trap stack drift and missing D2 provenance | generic return tail moved `sscratch` one frame per trap; D2 receive return published no idle provenance | amended into `afdc9927` (Msgs 0294–0307) | "a bigger stack only postpones exhaustion" |
+| A37 | RISC-V user FP permitted by accident | user target lp64d + OpenSBI's Dirty `sstatus.FS` | `932bd6fa`: RV64IMAC/LP64, FS/VS Off on every U-mode return (Msg 0309) | high before any preemption change |
+| A38 | x86 SMP direct reply never completed | split transactions used process-global `sched.current_cpu` as the executing CPU (and the CPU-1 server resolved the wrong CNode) | `c2b9b779`, `39c75dc3`: explicit `CpuId` from trap/drain (Msgs 0352–0386) | **high**: "do not repair it by rebinding global current_cpu — that moves the race" (Msg 0366) |
+| A39 | shared x86/AArch64 bridge never saved the entering task's registers | split NR 1 route bypassed the save the raw bridge does | in `a3aa7cb6` (Msg 0597) | high |
+| A40 | AArch64 user `x15` zeroed on every EL0 return | `REG_X18_TLS` was lane 15 (lane N = xN) | in `a3aa7cb6`; userspace built `+reserve-x18` (Msg 0602) | ABI-level |
+| A41 | MemoryObject reclaim kind-blind | `free_frame(object.phys)` under-freed Anonymous extents and **freed initrd memory** for initramfs slices | `14db9ee`: total `MemoryObjectKind::backing()` (Msg 0662) | high: allocator corruption |
+| A42 | address-space teardown leaked one frame per ELF page | pages with no MemoryObject were reclaimed by nothing | `63b17065` `release_unreferenced_user_frame` (Msg 0668) | |
+| A43 | failed fork left a live, unqueued, CNode-owning task (and could name a freed ASID) | `register_task_with_class` before seven fallible steps, no inverse | `b545e65` U9-FORK1 (Msg 0710) | high |
+| A44 | AArch64 COW faults destroyed `x0` | argument mirror copied lanes over x0–x5 for every non-syscall frame | `70327f7` (Msg 0714) | |
+| A45 | `Complete(Err)` from the exit route resumed a task with `current = None`; unconditional clear removed a third party's current task | bridge returns *through the frame*; `block_current_on` cleared unconditionally | `c698c95` U9-EXIT3 (Msg 0730); see also "`Complete(Ok(()))` is not success", Msg 0907 | **high** |
+| A46 | NR 7 replies moved back to the broad dispatcher by a correctness fix | arming every reply terminal made an old decline fire on every direct reply | caught by an exact-base count comparison before delivery (Msg 0614) | every repair needs a before/after population count |
+| A47 | quiescent seal failed 1 in 6 RISC-V boots | a probe of a spent lease counted as a duplicate consume (accounting, not a leak) | `14b61286` `spent_probes` counter, real duplicates still fatal (Msg 0949) | |
+| A48 | x86 ordinary-cap cell never runs | init's address space full at `MAX_MAPPINGS` 128/128 → `Vm(Full)` on a COW write | **left red** at `14b61286` (capacity work excluded) (Msg 0949) | open |
+| A49 | `bind_irq_notification` grants an IRQ line on the strength of a Notification cap | no IRQ-line authority check | **open** [VC `ipc_state.rs:7465`]; reachable only from the default-off UART witness (`mod.rs:8750`) (Msg 0688) | must be fixed before any production IRQ-grant API |
+
 Grader / checker false passes (each closed by an ACCEPTANCE or SEAL package): NFA (KERNEL-NOFP1
 checker prefix + exclusion), SL1A (four scheduler-lock grader false passes), SLS (execution after
 removal; no-ASID bypass), S3E (residency and IPI attribution), VMI2-ACC / VMI2-SEAL (mapping-owner
@@ -145,6 +174,40 @@ Forbidden as fixes (repeated in briefs): capacity increases, broad-lock fallback
 renamed global locks, weakened guards, oracle-only production fixes, unrelated cleanup, changing
 ABIs. (A15 is the historical counter-example from before the rule.)
 
+### B13. Fabricated or self-assembled evidence
+*Examples:* "3525 tests completed, 31 failures" for the first WA3C attempt — never observed,
+retracted (Msg 0001 §11); "2/0/2" asserted from a hand grep that cannot see `SharedKernel::with`,
+while the qualification ran only `cargo test --lib` and never built `tests/*.rs` (Msg 0778); a
+failed RISC-V oracle profile reported as passing (Msg 0932); a cross-arch comparison read from
+stale logs left in a fresh container (Msg 0545).
+*Rule:* report only numbers a run produced in this session, with the command; measure census
+with the project's scanner; run the integration suites; check artifact dates before reading a
+log. A number that cannot be reproduced is retracted, not repeated.
+
+### B14. Accepting a blocker without checking the inventory
+*Example:* WA3C2 stopped because "no direct call/reply has ever crossed CPUs" — true only of
+the older, self-declared `result=blocked` profile; three `ap-cross-cpu-*` profiles already
+proved it (Msgs 0558, 0560). Likewise a boot-time marker was read as a steady-state gate
+(Msg 0434), and a function was named a blocker from its signature without reading the body
+(Msg 0498).
+*Rule:* before declaring a gate unreachable, enumerate every existing script/profile and read
+the body, not the header.
+
+### B15. Drift: correctness chains replacing the named objective
+*Examples:* the owner's corrections at Msgs 0008, 0636, 0784; ChatGPT's own diagnosis that
+"workload coverage keeps being confused with complete retirement" and that necessary repairs
+"have become chains of further repairs" (Msg 0792); "U8 is next" repeated for five days after U8
+was recorded complete (Msgs 0190–0318).
+*Rule:* every pass names the population or metric it reduces; a bug is fixed now only if the
+conversion introduced it, exposed it, or cannot qualify without it; everything else is recorded
+and deferred. Re-read the directive's definitions instead of inferring them from labels.
+
+### B16. Census movement is not remaining effort
+*Example:* 49 → 2 took two weeks; 2 → 0 took another month because each terminal acquisition
+multiplexed ~18 syscall classes (Msg 0557); three successive estimates were all exceeded.
+*Rule:* plan by populations (syscall × outcome × architecture reaching a dispatcher), not by
+call-site count.
+
 ---
 
 ## Part C — Operational hazards in this environment [SR, repeated]
@@ -170,3 +233,12 @@ ABIs. (A15 is the historical counter-example from before the rule.)
 12. QEMU may be absent after a restart: reinstall (`qemu-system-x86 qemu-system-arm
     qemu-system-misc opensbi u-boot-qemu`) — and disclose "QEMU not available" rather than
     claiming a pass (`doc/AI_AGENT_RULES.md` §13.6).
+13. **Unpushed work dies with the container** (owner conversation, Msgs 0441, 0454, 0500, 0545,
+    0561, 0570; and again during this reconciliation on 2026-11-09, taking the uploaded export and
+    all scratch files). Push checkpoints to a preservation ref as soon as they are green; after a
+    restart, check `HEAD`, dates of logs and the scratchpad before trusting anything on disk.
+14. **A base-comparison `git checkout <base> -- src/` reverts uncommitted work** (Msg 0528).
+    Commit before any base comparison, or compare in a separate worktree.
+15. **Your own timeout can truncate a qualification** (a 50-minute timeout orphaned and fired
+    mid-seal, Msg 0422): a seal with a missing cell is not qualified.
+16. **Never `git push -f`** — it once overwrote `b84b258` on the designated branch (Msg 0673).
