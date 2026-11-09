@@ -228,6 +228,9 @@ oracle-handshake-race = []
 # carry none of its literals and are byte-identical to a build without it, so every other slot-5
 # profile keeps the headroom it had.
 timer5-idle-return-witness = []
+# IPC-DISPLACE1-ACCEPTANCE: accepted and inert here, so one `--features` argument reaches every package the
+# artifact build touches. Only yarm-control-plane-servers acts on it.
+ipc-displace1-witness = []
 # QEMU-IRQ1: the first real external-interrupt witness — RISC-V UART0 -> PLIC -> YARM on QEMU
 # virt. Compiles the kernel-only device window install, the idle-origin supervisor-external
 # admission, the UART setup/drain fixture, the provisioning of init's notification + ring page, the

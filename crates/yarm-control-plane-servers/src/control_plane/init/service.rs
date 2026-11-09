@@ -2167,6 +2167,456 @@ fn run_ipc_residual2_park_witness() {
     ipc_residual2_park_witness::run_once(entry, stack_top, tls_base);
 }
 
+/// IPC-DISPLACE1-ACCEPTANCE — the LIVE competing-receiver witness (init startup-slot-5 selector 17).
+///
+/// IPC-DISPLACE1 made the endpoint receive-waiter table refuse a second, DIFFERENT receiver
+/// (`ReceiverAlreadyWaiting`, answered `QueueFull`) instead of silently replacing the first, which
+/// used to leave the first `Blocked(EndpointReceive)` with no record for any wake to find. No
+/// ordinary boot has two tasks receiving on one endpoint, so that refusal is never taken live.
+/// This cell makes the shape from existing syscalls only, over the disposable endpoint
+/// `provision_init_shared_region_oracle` already hands init:
+///
+/// ```text
+/// R1 (thread)  NR 2 recv-v2, untimed, on E      -> blocks: E's published waiter
+/// R2 (thread)  NR 2 recv-v2, untimed, on E      -> refused QueueFull, returns, keeps running
+/// S  (init)    NR 1 send round's message to E   -> delivered to R1, which receives it once
+/// ```
+///
+/// repeated for `ROUNDS` rounds on the SAME endpoint, so a leaked waiter, ownership claim or
+/// acknowledgement lease from any round wedges the next one. A final phase has R2 receive
+/// normally once R1 has left, which is only possible if the endpoint is clean.
+///
+/// Hand-offs are flag + yield, never sleeps. R1 publishes `R1_ARMED` immediately before its
+/// receive; that it actually blocked before R2 tried is attested by the kernel, not by this cell:
+/// R2's refusal (`D2_RECV_WAITER_REFUSED ... live_tid=<R1>`) names the receiver that held the
+/// endpoint, and the smoke script checks it. What this cell attests is the userspace half: R2's
+/// answer, R2 running again on its own stack, and R1's payload and sender for every round.
+///
+/// Both children park on a futex at the end rather than spinning, so the boot can still reach its
+/// idle boundary. Gated on the `ipc-displace1-witness` cargo feature as well as the runtime knob,
+/// because init runs at `AddressSpace::MAX_MAPPINGS` on the provisioned oracle profiles.
+#[cfg(all(not(feature = "hosted-dev"), feature = "ipc-displace1-witness"))]
+pub(super) mod ipc_displace1_witness {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+    use yarm_user_rt::syscall::SyscallError;
+
+    /// Refusal rounds on ONE endpoint. More than a handful on purpose: each round re-arms the
+    /// same endpoint's waiter slot, ownership slot and acknowledgement lease, so anything a round
+    /// leaked would refuse or misdeliver in a later one.
+    pub(super) const ROUNDS: u32 = 16;
+    /// A bound on every hand-off so a defective kernel ends the cell with a verdict instead of
+    /// spinning the boot forever. When R1 and R2 are both blocked, S is the only runnable task and
+    /// each yield returns at once, so the bound costs little.
+    const WAIT_YIELDS: u32 = 4_000;
+    /// Yields after R1 announces its receive, so a timer preemption between the announcement and
+    /// the syscall cannot let R2 overtake it.
+    const SETTLE_YIELDS: u32 = 4;
+    const ANSWER_QUEUE_FULL: u32 = SyscallError::QueueFull as u32;
+    /// R2's answer when it received a message instead of an error.
+    const ANSWER_MESSAGE: u32 = 0x100;
+
+    static EP: AtomicU32 = AtomicU32::new(0);
+    static S_TID: AtomicU64 = AtomicU64::new(0);
+    static ROUND: AtomicU32 = AtomicU32::new(0);
+    static R1_ARMED: AtomicU32 = AtomicU32::new(0);
+    static R1_GOT: AtomicU32 = AtomicU32::new(0);
+    static R1_RESUMES: AtomicU32 = AtomicU32::new(0);
+    static R1_BAD: AtomicU32 = AtomicU32::new(0);
+    static R2_GO: AtomicU32 = AtomicU32::new(0);
+    static R2_DONE: AtomicU32 = AtomicU32::new(0);
+    static R2_ANSWER: AtomicU32 = AtomicU32::new(0);
+    static R2_REFUSED: AtomicU32 = AtomicU32::new(0);
+    static R2_MESSAGES: AtomicU32 = AtomicU32::new(0);
+    static R2_CANARY_BAD: AtomicU32 = AtomicU32::new(0);
+    static PARK: AtomicU32 = AtomicU32::new(0);
+
+    /// The children's stacks and TLS, kept small for the headroom reason above. Each child is a
+    /// non-recursive loop whose deepest frame holds one `ReceivedMessage`.
+    #[allow(unused)]
+    pub(super) static mut R1_STACK: [u8; 4096] = [0u8; 4096];
+    #[allow(unused)]
+    pub(super) static mut R1_TLS: [u8; 256] = [0u8; 256];
+    #[allow(unused)]
+    pub(super) static mut R2_STACK: [u8; 4096] = [0u8; 4096];
+    #[allow(unused)]
+    pub(super) static mut R2_TLS: [u8; 256] = [0u8; 256];
+
+    pub(super) fn armed(slot5: Option<u32>) -> bool {
+        matches!(slot5, Some(17))
+    }
+
+    /// `IPCD1` + the round as a big-endian u32, so every round's message is distinct.
+    fn payload(round: u32) -> [u8; 9] {
+        let mut body = [0u8; 9];
+        body[..5].copy_from_slice(b"IPCD1");
+        body[5..].copy_from_slice(&round.to_be_bytes());
+        body
+    }
+
+    fn body_of(m: &yarm_user_rt::syscall::ReceivedMessage) -> &[u8] {
+        let len = usize::from(m.message.len).min(m.message.payload.len());
+        &m.message.payload[..len]
+    }
+
+    /// Exactly this round's message: the 9-byte body, or that body behind `ipc_send`'s own
+    /// 2-byte little-endian opcode frame (opcode 0). Nothing else matches.
+    fn is_round_message(body: &[u8], round: u32) -> bool {
+        let want = payload(round);
+        body == want || (body.len() == 2 + want.len() && body[..2] == [0, 0] && body[2..] == want)
+    }
+
+    /// Leave the runnable set for good without exiting.
+    fn park() -> ! {
+        loop {
+            let v = PARK.load(SeqCst);
+            let _ = yarm_user_rt::syscall::futex_wait(PARK.as_ptr(), v, v);
+        }
+    }
+
+    /// S's bounded wait for `cell == value`.
+    fn wait_for(cell: &AtomicU32, value: u32) -> bool {
+        for _ in 0..WAIT_YIELDS {
+            if cell.load(SeqCst) == value {
+                return true;
+            }
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+        cell.load(SeqCst) == value
+    }
+
+    /// A child's wait for the next round: BLOCKED on the cell's futex word, not spinning, so the
+    /// children never compete with S for the CPU while it waits. Unbounded: a child that waits
+    /// forever only means S stopped, and S reports that.
+    fn wait_change(cell: &AtomicU32, from: u32) -> u32 {
+        loop {
+            let v = cell.load(SeqCst);
+            if v != from {
+                return v;
+            }
+            let _ = yarm_user_rt::syscall::futex_wait(cell.as_ptr(), from, from);
+        }
+    }
+
+    /// S's publication of a new value to a child: store, then wake the child blocked on it.
+    fn publish(cell: &AtomicU32, value: u32) {
+        cell.store(value, SeqCst);
+        let _ = yarm_user_rt::syscall::futex_wake(cell.as_ptr(), 1);
+    }
+
+    fn send(ep: u32, round: u32) -> bool {
+        let Ok(msg) = yarm_user_rt::ipc::Message::new(0, &payload(round)) else {
+            return false;
+        };
+        // SAFETY: `ep` carries SEND.
+        unsafe { yarm_user_rt::syscall::ipc_send(ep, &msg) }.is_ok()
+    }
+
+    /// R1: announce, block, verify the round's message and its sender. Never returns.
+    pub(super) extern "C" fn r1_body() -> ! {
+        let ep = EP.load(SeqCst);
+        let mut seen = 0u32;
+        loop {
+            let round = wait_change(&ROUND, seen);
+            seen = round;
+            if round > ROUNDS {
+                park();
+            }
+            R1_ARMED.store(round, SeqCst);
+            // SAFETY: `ep` carries RECEIVE. Untimed and blocking: this must become E's waiter.
+            let r = unsafe { yarm_user_rt::syscall::ipc_recv_v2(ep) };
+            R1_RESUMES.fetch_add(1, SeqCst);
+            let (ok, answer, len, sender) = match &r {
+                Ok(Some(m)) => (
+                    is_round_message(body_of(m), round) && m.sender_tid == S_TID.load(SeqCst),
+                    ANSWER_MESSAGE,
+                    body_of(m).len(),
+                    m.sender_tid,
+                ),
+                Ok(None) => (false, SyscallError::WouldBlock as u32, 0, 0),
+                Err(e) => (false, *e as u32, 0, 0),
+            };
+            if ok {
+                R1_GOT.store(round, SeqCst);
+            } else {
+                R1_BAD.fetch_add(1, SeqCst);
+            }
+            yarm_user_rt::user_log!(
+                "IPCD1_WITNESS_R1 round={} answer={} len={} sender={} ok={}",
+                round,
+                answer,
+                len,
+                sender,
+                ok as u32
+            );
+        }
+    }
+
+    /// R2: compete for the endpoint R1 holds, and prove it came back on its own stack. In the
+    /// final phase (round > ROUNDS) R1 has left and the receive must succeed. Never returns.
+    pub(super) extern "C" fn r2_body() -> ! {
+        let ep = EP.load(SeqCst);
+        let mut seen = 0u32;
+        loop {
+            let go = wait_change(&R2_GO, seen);
+            seen = go;
+            // A round-dependent sentinel on this thread's own stack, read back after the syscall:
+            // a return through some other context would not find it.
+            let sentinel = 0x1D15_0000_0000_0000u64 | u64::from(go);
+            let mut slot = 0u64;
+            let slot_ptr = &mut slot as *mut u64;
+            // SAFETY: `slot_ptr` points at a live local of this frame.
+            unsafe { core::ptr::write_volatile(slot_ptr, sentinel) };
+            // SAFETY: `ep` carries RECEIVE. Untimed and blocking, exactly as R1's.
+            let r = unsafe { yarm_user_rt::syscall::ipc_recv_v2(ep) };
+            // SAFETY: as above.
+            let canary_ok = unsafe { core::ptr::read_volatile(slot_ptr) } == sentinel;
+            let answer = match &r {
+                Err(SyscallError::QueueFull) => {
+                    R2_REFUSED.fetch_add(1, SeqCst);
+                    ANSWER_QUEUE_FULL
+                }
+                Ok(Some(m)) => {
+                    R2_MESSAGES.fetch_add(1, SeqCst);
+                    if is_round_message(body_of(m), go) && m.sender_tid == S_TID.load(SeqCst) {
+                        ANSWER_MESSAGE
+                    } else {
+                        ANSWER_MESSAGE | 1
+                    }
+                }
+                Ok(None) => SyscallError::WouldBlock as u32,
+                Err(e) => *e as u32,
+            };
+            if !canary_ok {
+                R2_CANARY_BAD.fetch_add(1, SeqCst);
+            }
+            yarm_user_rt::user_log!(
+                "IPCD1_WITNESS_R2 round={} answer={} canary_ok={}",
+                go,
+                answer,
+                canary_ok as u32
+            );
+            R2_ANSWER.store(answer, SeqCst);
+            R2_DONE.store(go, SeqCst);
+            if go > ROUNDS {
+                park();
+            }
+        }
+    }
+
+    pub(super) struct Child {
+        pub(super) entry: usize,
+        pub(super) stack_top: usize,
+        pub(super) tls_base: usize,
+    }
+
+    fn spawn(c: &Child) -> Option<u64> {
+        // SAFETY: `entry` is a valid `extern "C" fn() -> !` for this architecture; the static
+        // stack and TLS outlive the thread, which never returns.
+        unsafe { yarm_user_rt::syscall::spawn_thread(c.tls_base, c.stack_top, c.entry) }.ok()
+    }
+
+    /// S: drive the rounds and report. Spawns R2 BEFORE R1, so on a balanced SMP placement the
+    /// two land on different CPUs (the kernel's placement markers say which).
+    pub(super) fn run_once(s_tid: u64, r1: Child, r2: Child) {
+        let (_mem_cap, ep) = super::shared_region_oracle_core::oracle_caps();
+        if ep == 0 {
+            yarm_user_rt::user_log!("IPCD1_WITNESS step=caps result=missing");
+            return;
+        }
+        EP.store(ep, SeqCst);
+        S_TID.store(s_tid, SeqCst);
+        let Some(r2_tid) = spawn(&r2) else {
+            yarm_user_rt::user_log!("IPCD1_WITNESS step=spawn_r2 result=fail");
+            return;
+        };
+        let Some(r1_tid) = spawn(&r1) else {
+            yarm_user_rt::user_log!("IPCD1_WITNESS step=spawn_r1 result=fail");
+            return;
+        };
+        yarm_user_rt::user_log!(
+            "IPCD1_WITNESS_BEGIN ep_cap={} s_tid={} r1_tid={} r2_tid={} rounds={}",
+            ep,
+            s_tid,
+            r1_tid,
+            r2_tid,
+            ROUNDS
+        );
+
+        let mut ok_rounds = 0u32;
+        let mut failed: (&str, u32) = ("none", 0);
+        for round in 1..=ROUNDS {
+            publish(&ROUND, round);
+            if !wait_for(&R1_ARMED, round) {
+                failed = ("r1_arm", round);
+                break;
+            }
+            for _ in 0..SETTLE_YIELDS {
+                let _ = yarm_user_rt::syscall::yield_now();
+            }
+            publish(&R2_GO, round);
+            // A displaced R1 (refusal reverted) leaves R2 blocked as the waiter, and a refusal
+            // without its unwind leaves R2 blocked with no waiter at all: either way R2 never
+            // comes back, and this is where the cell says so.
+            if !wait_for(&R2_DONE, round) {
+                failed = ("r2_return", round);
+                break;
+            }
+            let answer = R2_ANSWER.load(SeqCst);
+            if answer != ANSWER_QUEUE_FULL {
+                failed = ("r2_answer", round);
+                break;
+            }
+            if !send(ep, round) {
+                failed = ("send", round);
+                break;
+            }
+            if !wait_for(&R1_GOT, round) {
+                failed = ("r1_receive", round);
+                break;
+            }
+            ok_rounds += 1;
+            yarm_user_rt::user_log!(
+                "IPCD1_WITNESS_ROUND round={} r1_tid={} r2_tid={} r2_answer={} r1_got={}",
+                round,
+                r1_tid,
+                r2_tid,
+                answer,
+                R1_GOT.load(SeqCst)
+            );
+        }
+        if failed.0 != "none" {
+            // Give a refused-but-blocked R2 the message, so the log shows who was the waiter.
+            if failed.0 == "r2_return" {
+                let _ = send(ep, failed.1);
+                for _ in 0..SETTLE_YIELDS {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                }
+            }
+            yarm_user_rt::user_log!(
+                "IPCD1_WITNESS_FAIL step={} round={} r1_got={} r1_resumes={} r2_done={} r2_msgs={}",
+                failed.0,
+                failed.1,
+                R1_GOT.load(SeqCst),
+                R1_RESUMES.load(SeqCst),
+                R2_DONE.load(SeqCst),
+                R2_MESSAGES.load(SeqCst)
+            );
+        }
+
+        // Nothing may be left queued: every round's message went to R1, once.
+        // SAFETY: `ep` carries RECEIVE; deadline 0 is the non-blocking probe.
+        let stray = matches!(
+            unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(ep, 0) },
+            Ok(Some(_))
+        );
+
+        // Final phase: R1 parks, R2 receives normally on the same endpoint.
+        let mut final_ok = false;
+        if ok_rounds == ROUNDS {
+            let fin = ROUNDS + 1;
+            publish(&ROUND, fin);
+            publish(&R2_GO, fin);
+            for _ in 0..SETTLE_YIELDS {
+                let _ = yarm_user_rt::syscall::yield_now();
+            }
+            final_ok = send(ep, fin)
+                && wait_for(&R2_DONE, fin)
+                && R2_ANSWER.load(SeqCst) == ANSWER_MESSAGE;
+        }
+
+        let r1_resumes = R1_RESUMES.load(SeqCst);
+        let r1_bad = R1_BAD.load(SeqCst);
+        let r2_refused = R2_REFUSED.load(SeqCst);
+        let r2_msgs = R2_MESSAGES.load(SeqCst);
+        let canary_bad = R2_CANARY_BAD.load(SeqCst);
+        let all = ok_rounds == ROUNDS
+            && r1_resumes == ROUNDS
+            && r1_bad == 0
+            && r2_refused == ROUNDS
+            && r2_msgs == 1
+            && canary_bad == 0
+            && !stray
+            && final_ok;
+        yarm_user_rt::user_log!(
+            "IPCD1_WITNESS rounds_ok={} r1_resumes={} r1_bad={} r2_refused={} r2_msgs={} canary_bad={} stray={} final_ok={} result={}",
+            ok_rounds,
+            r1_resumes,
+            r1_bad,
+            r2_refused,
+            r2_msgs,
+            canary_bad,
+            stray as u32,
+            final_ok as u32,
+            all as u32
+        );
+        yarm_user_rt::user_log!(
+            "IPCD1_WITNESS_DONE r1_tid={} r2_tid={} result={}",
+            r1_tid,
+            r2_tid,
+            if all { "ok" } else { "fail" }
+        );
+    }
+}
+
+/// x86_64 entry trampolines: `spawn_user_thread` installs a 16-byte-aligned RSP verbatim, so each
+/// child is entered through a naked shim whose `call` restores the SysV entry alignment.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "ipc-displace1-witness",
+    target_arch = "x86_64"
+))]
+mod x86_ipc_displace1 {
+    #[unsafe(naked)]
+    pub(super) extern "C" fn r1_entry() -> ! {
+        core::arch::naked_asm!(
+            "call {body}",
+            "ud2",
+            body = sym super::ipc_displace1_witness::r1_body,
+        )
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn r2_entry() -> ! {
+        core::arch::naked_asm!(
+            "call {body}",
+            "ud2",
+            body = sym super::ipc_displace1_witness::r2_body,
+        )
+    }
+}
+
+/// IPC-DISPLACE1-ACCEPTANCE — resolve this architecture's child entries and run the witness.
+#[cfg(all(not(feature = "hosted-dev"), feature = "ipc-displace1-witness"))]
+fn run_ipc_displace1_witness(s_tid: u64) {
+    use ipc_displace1_witness as w;
+    let r1_stack = (core::ptr::addr_of_mut!(w::R1_STACK) as usize + 4096) & !0xF;
+    let r2_stack = (core::ptr::addr_of_mut!(w::R2_STACK) as usize + 4096) & !0xF;
+    let r1_tls = core::ptr::addr_of_mut!(w::R1_TLS) as usize;
+    let r2_tls = core::ptr::addr_of_mut!(w::R2_TLS) as usize;
+    #[cfg(target_arch = "x86_64")]
+    let (r1_entry, r2_entry) = (
+        x86_ipc_displace1::r1_entry as *const () as usize,
+        x86_ipc_displace1::r2_entry as *const () as usize,
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let (r1_entry, r2_entry) = (
+        w::r1_body as *const () as usize,
+        w::r2_body as *const () as usize,
+    );
+    w::run_once(
+        s_tid,
+        w::Child {
+            entry: r1_entry,
+            stack_top: r1_stack,
+            tls_base: r1_tls,
+        },
+        w::Child {
+            entry: r2_entry,
+            stack_top: r2_stack,
+            tls_base: r2_tls,
+        },
+    );
+}
+
 /// U9-TIMER5 §3 — the IDLE-BOUNDARY RETURN witness.
 ///
 /// # The shape, and why no ordinary boot has it
@@ -6969,6 +7419,13 @@ pub fn run() {
     #[cfg(not(feature = "hosted-dev"))]
     if ipc_residual2_park_witness::armed(ctx.supervisor_control_recv_ep) {
         run_ipc_residual2_park_witness();
+    }
+    // IPC-DISPLACE1-ACCEPTANCE: the live competing-receiver witness, selector 17. Mutually
+    // exclusive with every other slot-5 cell and default-off. Three tasks: two receivers that
+    // compete for one endpoint, and init as the sender.
+    #[cfg(all(not(feature = "hosted-dev"), feature = "ipc-displace1-witness"))]
+    if ipc_displace1_witness::armed(ctx.supervisor_control_recv_ep) {
+        run_ipc_displace1_witness(ctx.task_id);
     }
     // Stage 200D-0C1: default-off + feature-gated AArch64 LIVE ExitCurrentTask oracle. The slot-5
     // value is DECODED through the shared `yarm_ipc_abi::exit_current_task_abi` helper rather than

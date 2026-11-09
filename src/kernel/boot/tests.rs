@@ -204864,4 +204864,75 @@ mod ipc_displace1 {
             SyscallError::QueueFull
         );
     }
+
+    // ── IPC-DISPLACE1-ACCEPTANCE: the live witness's kernel-side wiring ─────────────────────
+
+    /// The live witness is armed only by its own knob, and a boot without it leaves it off.
+    #[test]
+    fn the_live_witness_knob_is_default_off_and_parses() {
+        use crate::kernel::boot_command_line::parse_yarm_boot_options;
+        assert_eq!(
+            parse_yarm_boot_options(b"console=ttyS0 rdinit=/init").ipc_displace1_witness,
+            None
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_displace1_witness=1").ipc_displace1_witness,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_displace1_witness=0").ipc_displace1_witness,
+            Some(false)
+        );
+        assert!(
+            !crate::kernel::boot::ipc_displace1_witness_enabled(),
+            "default off"
+        );
+    }
+
+    /// Selector 17 collides with no other slot-5 cell that shares the provisioning, every port
+    /// maps the knob to it, the provisioning predicate includes it, and init's cell is behind its
+    /// cargo feature and answers only to 17.
+    #[test]
+    fn the_live_witness_selector_is_unique_and_wired_on_every_port() {
+        use crate::kernel::boot as b;
+        let sel = b::IPC_DISPLACE1_WITNESS_SELECTOR;
+        assert_eq!(sel, 17);
+        // 2 is the feature-gated direct shared-region oracle's selector (not compiled hosted).
+        for other in [
+            2,
+            b::XFER2_GRANT_WITNESS_SELECTOR,
+            b::IPC_RESIDUAL1_QUEUED_CAP_WITNESS_SELECTOR,
+            b::IPC_RESIDUAL2_PARK_WITNESS_SELECTOR,
+            b::IPC_SEND_FINAL_FAULT_WITNESS_SELECTOR,
+            b::TIMER5_IDLE_RETURN_WITNESS_SELECTOR,
+        ] {
+            assert_ne!(sel, other);
+        }
+        for (port, src) in [
+            ("x86_64", include_str!("../../arch/x86_64/boot.rs")),
+            ("aarch64", include_str!("../../arch/aarch64/boot.rs")),
+            ("riscv64", include_str!("../../arch/riscv64/boot.rs")),
+        ] {
+            assert!(
+                src.contains("} else if crate::kernel::boot::ipc_displace1_witness_enabled() {")
+                    && src.contains("crate::kernel::boot::IPC_DISPLACE1_WITNESS_SELECTOR"),
+                "{port}: the knob must select 17 in the shared provisioning chain"
+            );
+        }
+        let pred = include_str!("mod.rs")
+            .split("pub fn shared_region_oracle_provisioning_armed() -> bool {")
+            .nth(1)
+            .expect("the provisioning predicate")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        assert!(pred.contains("ipc_displace1_witness_enabled()"));
+        let init = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(init.contains("matches!(slot5, Some(17))"));
+        assert!(init.contains(
+            "#[cfg(all(not(feature = \"hosted-dev\"), feature = \"ipc-displace1-witness\"))]\npub(super) mod ipc_displace1_witness {"
+        ));
+    }
 }

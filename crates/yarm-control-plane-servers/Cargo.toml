@@ -68,6 +68,11 @@ oracle-handshake-race = []
 # carry none of its literals and are byte-identical to a build without it, so every other slot-5
 # profile keeps the headroom it had.
 timer5-idle-return-witness = []
+# IPC-DISPLACE1-ACCEPTANCE: gates the live competing-receiver witness cell in init. A cargo feature as well
+# as a runtime knob for the measured reason above: init's address space runs at
+# `AddressSpace::MAX_MAPPINGS` on the provisioned oracle profiles, and this cell adds two child
+# stacks. Feature-off builds carry none of its literals and are byte-identical to a build without it.
+ipc-displace1-witness = []
 riscv-uart-irq-witness = []
 aarch64-pl011-irq-witness = []
 # QEMU-SMP2: kernel-only witness; accepted and inert here so one feature list builds every image.

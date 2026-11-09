@@ -50,6 +50,9 @@ oracle-handshake-race = []
 # carry none of its literals and are byte-identical to a build without it, so every other slot-5
 # profile keeps the headroom it had.
 timer5-idle-return-witness = []
+# IPC-DISPLACE1-ACCEPTANCE: accepted and inert here, so one `--features` argument reaches every package the
+# artifact build touches. Only yarm-control-plane-servers acts on it.
+ipc-displace1-witness = []
 riscv-uart-irq-witness = []
 aarch64-pl011-irq-witness = []
 # QEMU-SMP2: kernel-only witness; accepted and inert here so one feature list builds every image.

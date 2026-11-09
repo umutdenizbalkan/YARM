@@ -8663,6 +8663,31 @@ pub fn timer5_idle_return_witness_enabled() -> bool {
     TIMER5_IDLE_RETURN_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// IPC-DISPLACE1-ACCEPTANCE — the LIVE competing-receiver witness selector. Slot 5 is mutually
+/// exclusive; 17 is the next free value after U9-TIMER5's 16.
+///
+/// No ordinary boot has two tasks receiving on one endpoint at once, so the refusal that
+/// IPC-DISPLACE1 added (`ReceiverAlreadyWaiting`, answered `QueueFull`) is never taken on the
+/// production split route. Init's cell makes the shape with two of its own threads on the
+/// endpoint this provisioning hands it, using only existing syscalls: R1 blocks, R2 is refused
+/// and returns, init sends and R1 receives. It reuses the SAME provisioning and startup slots
+/// 13/14 as selectors 12–16, so it adds no capacity requirement and no second provisioning path.
+pub const IPC_DISPLACE1_WITNESS_SELECTOR: u64 = 17;
+
+static IPC_DISPLACE1_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the IPC-DISPLACE1 live competing-receiver witness (`yarm.ipc_displace1_witness=1`).
+/// Default OFF.
+pub(crate) fn set_ipc_displace1_witness_enabled(enabled: bool) {
+    IPC_DISPLACE1_WITNESS_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the IPC-DISPLACE1 live competing-receiver witness is armed.
+pub fn ipc_displace1_witness_enabled() -> bool {
+    IPC_DISPLACE1_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// QEMU-IRQ1 §3 — init's slot-5 selector for the RISC-V UART external-interrupt witness.
 ///
 /// 30 is claimed by no other slot-5 constant, encoder run or arm on any port (in use: 1–16 and
@@ -8940,6 +8965,7 @@ pub fn shared_region_oracle_provisioning_armed() -> bool {
         || ipc_residual2_park_witness_enabled()
         || ipc_send_final_fault_witness_enabled()
         || timer5_idle_return_witness_enabled()
+        || ipc_displace1_witness_enabled()
 }
 
 /// Stage 198E3C2B: the AArch64 init startup-slot-5 selector for the DIRECT shared-region oracle. On

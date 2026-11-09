@@ -394,6 +394,11 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_timer5_idle_return_witness_enabled(enabled);
         crate::yarm_log!("YARM_TIMER5_IDLE_RETURN_WITNESS_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.ipc_displace1_witness {
+        // IPC-DISPLACE1-ACCEPTANCE: arm the live competing-receiver witness. Default off.
+        crate::kernel::boot::set_ipc_displace1_witness_enabled(enabled);
+        crate::yarm_log!("YARM_IPC_DISPLACE1_WITNESS_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ipc_residual2_park_witness {
         // U9-IPC-RESIDUAL2 §4: arm the full-endpoint park witness. Default off.
         crate::kernel::boot::set_ipc_residual2_park_witness_enabled(enabled);
@@ -927,6 +932,11 @@ pub struct YarmBootOptions<'a> {
     /// changed ports at base). Architecture-neutral; the register-file verification is bracketed
     /// per port.
     pub timer5_idle_return_witness: Option<bool>,
+    /// IPC-DISPLACE1-ACCEPTANCE: `yarm.ipc_displace1_witness=1` DEFAULT-OFF knob. Arms init
+    /// startup slot 5 (=17) so two of init's threads compete for ONE disposable endpoint: the
+    /// second receiver must be refused `QueueFull` and restored while the first stays the waiter.
+    /// No ordinary boot has two receivers on one endpoint. Architecture-neutral.
+    pub ipc_displace1_witness: Option<bool>,
     /// U9-IPC-RESIDUAL2 §4: `yarm.ipc_residual2_park_witness=1` DEFAULT-OFF knob. Arms init
     /// startup slot 5 (=14) so init exercises the one newly-served shape no production workload
     /// reaches: an `IpcCall` onto an endpoint whose queue is FULL, which parks the sender.
@@ -1268,6 +1278,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.timer5_idle_return_witness" {
             options.timer5_idle_return_witness = parse_bool_knob(value);
+        }
+        if key == b"yarm.ipc_displace1_witness" {
+            options.ipc_displace1_witness = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_residual2_park_witness" {
             options.ipc_residual2_park_witness = parse_bool_knob(value);
