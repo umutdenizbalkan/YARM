@@ -108,7 +108,11 @@ impl KernelState {
             )?,
             max_total_cnode_slots: limits.max_total_cnode_slots,
         };
-        let grant = self.with_capability_state_mut(|capability_state| {
+        // NOTIF-LIFETIME1: the destination capability's reference is taken before rank 4 can
+        // publish it, and given back if the body refuses (stale source, full cnode, full link
+        // table — each leaves no destination capability behind).
+        self.reserve_notification_ref(capability.object)?;
+        let grant = match self.with_capability_state_mut(|capability_state| {
             super::spawn_ipc_cap_txn::delegate_capability_locked(
                 capability_state,
                 &identity,
@@ -117,7 +121,13 @@ impl KernelState {
                 capability.object,
                 cnode_limits,
             )
-        })?;
+        }) {
+            Ok(grant) => grant,
+            Err(err) => {
+                self.release_notification_ref(capability.object);
+                return Err(err);
+            }
+        };
         // ── 6: the memory-object refcount, once rank 4 is released. ────────────────────
         if grant.owes_memory_refcount {
             self.adjust_memory_object_cap_refcount(grant.object, 1);
@@ -141,6 +151,10 @@ impl KernelState {
         if released && grant.owes_memory_refcount {
             self.adjust_memory_object_cap_refcount(grant.object, -1);
             self.reclaim_memory_object_if_unreferenced(grant.object);
+        }
+        // NOTIF-LIFETIME1: the destination capability is gone, and so is its reference.
+        if released {
+            self.release_notification_ref(grant.object);
         }
         crate::yarm_log!(
             "SPAWN_DELEGATE_RELEASED dest_cnode={} dest_cap={} released={}",

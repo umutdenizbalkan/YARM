@@ -452,6 +452,10 @@ pub(crate) struct IpcSubsystem {
     /// THIS block, which separates the same incarnation blocking twice.
     pub(crate) notification_waiters: [Option<EndpointWaiterRecord>; MAX_NOTIFICATIONS],
     pub(crate) notification_generations: [u64; MAX_NOTIFICATIONS],
+    /// NOTIF-LIFETIME1 — the live-capability references held on the incarnation whose generation
+    /// is `notification_generations[i]`. Changed only by `notification_lifetime`'s reserve and
+    /// release bodies; the release that brings it to zero destroys the incarnation.
+    pub(crate) notification_refs: [u32; MAX_NOTIFICATIONS],
     pub(crate) irq_routes: [Option<usize>; MAX_IRQ_LINES],
     pub(crate) transfer_envelopes: [Option<TransferEnvelope>; MAX_TRANSFER_ENVELOPES],
     pub(crate) transfer_envelope_generations: [u64; MAX_TRANSFER_ENVELOPES],

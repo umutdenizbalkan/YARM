@@ -216,11 +216,15 @@ pub(crate) fn collect_link_closure_locked(
 /// The source slot is removed LAST, and only if every child that was supposed to go actually
 /// went. If a child refuses (its slot was recycled under us), the source stays too — because a
 /// source removed while a derived child survives leaves live authority with no provenance.
+///
+/// NOTIF-LIFETIME1: every capability removed here is recorded in `notification_refs`, which the
+/// caller gives back at rank 3 once this rank-4 body has returned.
 pub(crate) fn release_provisional_cap_locked(
     capability: &mut CapabilitySubsystem,
     token: &ProvisionalCap,
     candidates: &[Option<DelegatedCapabilityLink>],
     resolved: &[Option<(u64, u64)>],
+    notification_refs: &mut crate::kernel::boot::notification_lifetime::NotificationRefRelease,
 ) -> ProvisionalCapRelease {
     // ── 1. Revalidate the source, before touching anything. ────────────────────────────
     let current = capability
@@ -273,7 +277,7 @@ pub(crate) fn release_provisional_cap_locked(
             pid: dest_pid,
             cap: link.dest_cap,
         };
-        match remove_delegated_child_locked(capability, child, token.object) {
+        match remove_delegated_child_locked(capability, child, token.object, notification_refs) {
             ChildRemoval::Removed | ChildRemoval::AlreadyGone => {
                 remove_link_locked(capability, &link);
                 removed = removed.saturating_add(1);
@@ -295,7 +299,11 @@ pub(crate) fn release_provisional_cap_locked(
         .iter_mut()
         .flatten()
         .find(|space| space.id == token.cnode)
-        .map(|space| kernel_mut(&mut space.cspace).revoke(token.cap).is_ok())
+        .map(|space| {
+            kernel_mut(&mut space.cspace)
+                .revoke_reporting(token.cap, |removed| notification_refs.note(&removed))
+                .is_ok()
+        })
         .unwrap_or(false);
     if !removed_source {
         return ProvisionalCapRelease::AlreadyGone;
@@ -320,6 +328,7 @@ fn remove_delegated_child_locked(
     capability: &mut CapabilitySubsystem,
     child: DelegatedSlot,
     expected: CapObject,
+    notification_refs: &mut crate::kernel::boot::notification_lifetime::NotificationRefRelease,
 ) -> ChildRemoval {
     let Some(cnode) = capability
         .process_cnodes
@@ -347,7 +356,10 @@ fn remove_delegated_child_locked(
     if found.object != expected {
         return ChildRemoval::StaleObject;
     }
-    if cspace.revoke(child.cap).is_ok() {
+    if cspace
+        .revoke_reporting(child.cap, |removed| notification_refs.note(&removed))
+        .is_ok()
+    {
         ChildRemoval::Removed
     } else {
         ChildRemoval::AlreadyGone

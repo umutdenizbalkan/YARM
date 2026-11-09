@@ -6,6 +6,7 @@ mod cap_memory_mint_split;
 mod cap_transfer_delegation_split;
 mod cap_transfer_materialize_split;
 mod capability_lifecycle_state;
+pub(crate) mod notification_lifetime;
 /// QEMU-SMP2 — the AArch64 two-CPU witness's bounded transaction record and its pure verifier.
 #[cfg(any(test, feature = "aarch64-smp2-witness"))]
 pub mod smp2_record;

@@ -649,6 +649,7 @@ impl Bootstrap {
                 notifications: [const { None }; MAX_NOTIFICATIONS],
                 notification_waiters: [None; MAX_NOTIFICATIONS],
                 notification_generations: [0; MAX_NOTIFICATIONS],
+                notification_refs: [0; MAX_NOTIFICATIONS],
                 irq_routes: [None; MAX_IRQ_LINES],
                 transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
                 transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],

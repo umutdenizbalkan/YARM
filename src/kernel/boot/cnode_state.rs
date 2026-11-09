@@ -141,12 +141,24 @@ impl KernelState {
         telemetry.removed_delegation_links = telemetry
             .removed_delegation_links
             .saturating_add(removed_delegation_links);
+        // NOTIF-LIFETIME1: the revoke loop above emptied the space through the owners that give
+        // references back; anything still in it when the space goes is recorded here, so
+        // dropping the space cannot leak a Notification reference either.
+        let mut notification_refs = super::notification_lifetime::CspaceNotificationRefs::new();
         self.with_capability_state_mut(|capability| {
             if let Some(slot) = capability
                 .cnode_spaces
                 .iter_mut()
                 .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
             {
+                if let Some(space) = slot.as_ref() {
+                    let cspace = kernel_ref(&space.cspace);
+                    for cap in cspace.live_cap_ids() {
+                        if let Some(held) = cspace.get(cap) {
+                            notification_refs.note(&held);
+                        }
+                    }
+                }
                 *slot = None;
                 telemetry.removed_cnode_space = true;
             }
@@ -160,6 +172,7 @@ impl KernelState {
                 telemetry.removed_process_record = true;
             }
         });
+        self.release_notification_refs(&notification_refs);
 
         crate::yarm_log!(
             "YARM_PROC_CNODE_CLEANUP pid={} cnode={} slots={} revoked_caps={} removed_links={} removed_cspace={} removed_record={}",
@@ -258,10 +271,12 @@ impl KernelState {
             }
         }
 
+        let mut notification_refs = super::notification_lifetime::CspaceNotificationRefs::new();
         let (removed_cnode_space, removed_process_record) =
             self.with_capability_state_mut(|capability| {
-                reap_process_cspace_locked(capability, pid, cnode)
+                reap_process_cspace_locked(capability, pid, cnode, &mut notification_refs)
             });
+        self.release_notification_refs(&notification_refs);
 
         crate::yarm_log!(
             "YARM_PROC_CNODE_CLEANUP_NOALLOC pid={} cnode={} slots={} removed_links={} removed_cspace={} removed_record={}",
@@ -396,10 +411,15 @@ pub(crate) fn link_names_process(source_pid: u64, dest_pid: u64, pid: u64) -> bo
 /// Capability rank 4 and nothing else. Returns `(removed_cnode_space, removed_process_record)`
 /// so the caller can log exactly what went, which is what the `YARM_PROC_CNODE_CLEANUP_NOALLOC`
 /// marker reports.
+///
+/// NOTIF-LIFETIME1: dropping the space drops every capability still in it, so each Notification
+/// capability it held is recorded in `notification_refs` for the caller to give back at rank 3.
+/// The walk covers this one space's slots and nothing else.
 pub(crate) fn reap_process_cspace_locked(
     capability: &mut CapabilitySubsystem,
     pid: u64,
     cnode: CNodeId,
+    notification_refs: &mut super::notification_lifetime::CspaceNotificationRefs,
 ) -> (bool, bool) {
     let mut removed_cnode_space = false;
     let mut removed_process_record = false;
@@ -408,6 +428,14 @@ pub(crate) fn reap_process_cspace_locked(
         .iter_mut()
         .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
     {
+        if let Some(space) = slot.as_ref() {
+            let cspace = kernel_ref(&space.cspace);
+            for cap in cspace.live_cap_ids() {
+                if let Some(held) = cspace.get(cap) {
+                    notification_refs.note(&held);
+                }
+            }
+        }
         *slot = None;
         removed_cnode_space = true;
     }

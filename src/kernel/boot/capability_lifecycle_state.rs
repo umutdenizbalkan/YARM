@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use super::notification_lifetime::NotificationRefRelease;
 use super::*;
 
 impl KernelState {
@@ -454,10 +455,15 @@ impl KernelState {
         // bounded). Behavior UNCHANGED: reserve-before-materialize, and no
         // refcount increment unless the slot install succeeded (no partial mint).
         let cap_cnode = crate::kernel::boot::cap_cnode_enabled();
+        // NOTIF-LIFETIME1: a Notification capability's reference is taken BEFORE the capability
+        // can be seen, and given back on every failure below. A gone, recycled or zero-reference
+        // incarnation is refused here, so a mint can never resurrect a destroyed object.
+        self.reserve_notification_ref(capability.object)?;
         if let Err(e) = self.ensure_cnode_space(cnode) {
             if cap_cnode {
                 crate::yarm_log!("CAP_CNODE_RESERVE_FAIL cnode={} reason=full", cnode.0);
             }
+            self.release_notification_ref(capability.object);
             return Err(e);
         }
         let minted = match self.with_capability_state_mut(|capability_state| {
@@ -480,6 +486,7 @@ impl KernelState {
                         e
                     );
                 }
+                self.release_notification_ref(capability.object);
                 return Err(e);
             }
         };
@@ -565,6 +572,10 @@ impl KernelState {
             cap,
         };
         let descendants = self.collect_delegated_descendants(root);
+        // NOTIF-LIFETIME1: every capability this revoke removes — the root and its in-cnode
+        // derived descendants — is recorded, so each Notification reference goes back at rank 3.
+        let mut notification_refs: super::notification_lifetime::NotificationRefRelease =
+            super::notification_lifetime::NotificationRefRelease::new();
         self.with_capability_state_mut(|capability_state| {
             capability_state
                 .cnode_spaces
@@ -573,7 +584,7 @@ impl KernelState {
                 .find(|space| space.id == cnode)
                 .map(|space| kernel_mut(&mut space.cspace))
                 .ok_or(KernelError::TaskMissing)?
-                .revoke(cap)
+                .revoke_reporting(cap, |removed| notification_refs.note(&removed))
                 .map_err(|_| KernelError::InvalidCapability)
         })?;
         for delegated in descendants.iter().copied() {
@@ -584,8 +595,8 @@ impl KernelState {
         if let Some(capability) = source_capability {
             self.adjust_memory_object_cap_refcount(capability.object, -1);
             self.reclaim_memory_object_if_unreferenced(capability.object);
-            self.destroy_notification_for_revoked_cap(capability.object);
         }
+        self.release_notification_refs(&notification_refs);
         Ok(())
     }
 
@@ -674,41 +685,11 @@ impl KernelState {
             substep("after_mo_refcount_decrement");
             self.reclaim_memory_object_if_unreferenced(capability.object);
             substep("after_mo_reclaim");
-            self.destroy_notification_for_revoked_cap(capability.object);
+            // NOTIF-LIFETIME1: the leaf was exactly this one capability.
+            self.release_notification_ref(capability.object);
         }
         substep("after_delete_leaf_done");
         Ok(true)
-    }
-
-    /// Stage 22: tear down a Notification object whose cap was just revoked.
-    ///
-    /// Notification caps are single-owner per object (the creator mints exactly a
-    /// SIGNAL + a RECEIVE cap into its own cnode; Notification caps are never
-    /// granted cross-process and carry no refcount — see `create_notification`).
-    /// Revoking ANY Notification cap therefore destroys the underlying object.
-    ///
-    /// Lock-rank: the caller (`revoke_capability_in_cnode` /
-    /// `revoke_capability_direct_in_process_cnode`) has already released
-    /// `capability_state_lock` (rank 4) before reaching here; `destroy_notification`
-    /// acquires `ipc_state_lock` (rank 3) on its own, preserving cap→ipc ordering.
-    ///
-    /// Idempotent: the paired second cap (or a double-revoke) re-enters with the
-    /// object slot already `None`; `destroy_notification` then returns
-    /// `WrongObject`, which is swallowed here as a benign no-op. The snapshotted
-    /// waiter (if any) is unblocked outside both locks via
-    /// `wake_destroyed_notification_waiter`.
-    fn destroy_notification_for_revoked_cap(&mut self, object: CapObject) {
-        let CapObject::Notification { index, .. } = object else {
-            return;
-        };
-        match self.destroy_notification(index) {
-            Ok(Some(waiter)) => {
-                let _ = self.wake_destroyed_notification_waiter(waiter);
-            }
-            // Object already gone (paired cap / double-revoke) or out of range:
-            // benign no-op — nothing left to tear down.
-            Ok(None) | Err(_) => {}
-        }
     }
 
     /// Record a delegation link, through the rank-4 body that owns the table.
@@ -751,6 +732,8 @@ impl KernelState {
 
     pub(crate) fn revoke_capability_direct_in_process_cnode(&mut self, pid: u64, cap: CapId) {
         let mut revoked_capability = None;
+        let mut notification_refs: super::notification_lifetime::NotificationRefRelease =
+            super::notification_lifetime::NotificationRefRelease::new();
         if let Some(cnode) = self.process_cnode_for_pid(pid) {
             self.with_capability_state_mut(|capability_state| {
                 if let Some(cspace) = capability_state
@@ -761,7 +744,8 @@ impl KernelState {
                     .map(|space| kernel_mut(&mut space.cspace))
                 {
                     revoked_capability = cspace.get(cap);
-                    let _ = cspace.revoke(cap);
+                    let _ =
+                        cspace.revoke_reporting(cap, |removed| notification_refs.note(&removed));
                 }
             });
         }
@@ -769,8 +753,8 @@ impl KernelState {
         if let Some(capability) = revoked_capability {
             self.adjust_memory_object_cap_refcount(capability.object, -1);
             self.reclaim_memory_object_if_unreferenced(capability.object);
-            self.destroy_notification_for_revoked_cap(capability.object);
         }
+        self.release_notification_refs(&notification_refs);
     }
 
     fn revoke_active_transfer_mappings_for_cap(&mut self, owner_pid: u64, cap: CapId) {
@@ -1143,8 +1127,15 @@ impl crate::runtime::SharedKernel {
 
     /// rank 4: `CapabilitySpace::revoke` in one named cnode — the recursive in-cspace derivation
     /// revoke the broad path performs, unchanged, under the capability seam alone.
-    fn cspace_revoke_split(&self, cnode: CNodeId, cap: CapId) -> Result<(), KernelError> {
+    /// NOTIF-LIFETIME1: returns the Notification references the revoke removed, owed back at
+    /// rank 3 once the caller's object obligations for this node are done.
+    fn cspace_revoke_split(
+        &self,
+        cnode: CNodeId,
+        cap: CapId,
+    ) -> Result<NotificationRefRelease, KernelError> {
         self.with_capability_state_split_mut(|capability| {
+            let mut notification_refs = NotificationRefRelease::new();
             capability
                 .cnode_spaces
                 .iter_mut()
@@ -1152,8 +1143,9 @@ impl crate::runtime::SharedKernel {
                 .find(|space| space.id == cnode)
                 .map(|space| kernel_mut(&mut space.cspace))
                 .ok_or(KernelError::TaskMissing)?
-                .revoke(cap)
-                .map_err(|_| KernelError::InvalidCapability)
+                .revoke_reporting(cap, |removed| notification_refs.note(&removed))
+                .map_err(|_| KernelError::InvalidCapability)?;
+            Ok(notification_refs)
         })
     }
 
@@ -1161,7 +1153,13 @@ impl crate::runtime::SharedKernel {
     /// `revoke_capability_direct_in_process_cnode`'s inner block. Returns the object that was
     /// live at revoke time (`None` ⇒ the slot was already gone, which the broad path treats as
     /// "no object effects owed").
-    fn cspace_read_then_revoke_split(&self, cnode: CNodeId, cap: CapId) -> Option<CapObject> {
+    ///
+    /// NOTIF-LIFETIME1: also returns the Notification references the revoke removed.
+    fn cspace_read_then_revoke_split(
+        &self,
+        cnode: CNodeId,
+        cap: CapId,
+    ) -> Option<(CapObject, NotificationRefRelease)> {
         self.with_capability_state_split_mut(|capability| {
             let space = capability
                 .cnode_spaces
@@ -1170,8 +1168,9 @@ impl crate::runtime::SharedKernel {
                 .find(|space| space.id == cnode)?;
             let cspace = kernel_mut(&mut space.cspace);
             let object = cspace.get(cap).map(|c| c.object);
-            let _ = cspace.revoke(cap);
-            object
+            let mut notification_refs = NotificationRefRelease::new();
+            let _ = cspace.revoke_reporting(cap, |removed| notification_refs.note(&removed));
+            object.map(|object| (object, notification_refs))
         })
     }
 
@@ -1214,41 +1213,6 @@ impl crate::runtime::SharedKernel {
         })
     }
 
-    /// rank 3: the notification-destroy half of `destroy_notification_for_revoked_cap`, byte for
-    /// byte — IRQ-route teardown, waiter snapshot + clear, slot clear, generation bump. Returns
-    /// the snapshotted waiter for the caller to wake AFTER rank 3 is released.
-    ///
-    /// The broad `destroy_notification` bounds the index by the boot-config
-    /// `max_notifications`; this bounds it by the `notifications` array length instead, which
-    /// differs only over indices whose slot is unconditionally `None` — both are a no-op there,
-    /// and no live `Notification` cap can name such an index (`create_notification` allocates
-    /// within the config bound). The same array bound is what `capability_object_live` already
-    /// uses for this class.
-    fn destroy_notification_split(
-        &self,
-        index: usize,
-    ) -> Option<crate::kernel::boot::EndpointWaiterRecord> {
-        if index >= MAX_NOTIFICATIONS {
-            return None;
-        }
-        self.with_ipc_split_mut(|ipc| {
-            ipc.notifications[index].as_ref()?;
-            for route in ipc.irq_routes.iter_mut() {
-                if *route == Some(index) {
-                    *route = None;
-                }
-            }
-            let waiter = ipc.notification_waiters[index].take();
-            ipc.notifications[index] = None;
-            let mut next_gen = ipc.notification_generations[index].wrapping_add(1);
-            if next_gen == 0 {
-                next_gen = 1;
-            }
-            ipc.notification_generations[index] = next_gen;
-            waiter
-        })
-    }
-
     /// rank 1 → rank 2 → rank 1 (three disjoint acquisitions, never nested): the wake half of
     /// `KernelState::wake_destroyed_notification_waiter`.
     ///
@@ -1276,7 +1240,7 @@ impl crate::runtime::SharedKernel {
     /// that happened to hold the same numeric TID; the record's `{tid, asid}` and
     /// `blocked_recv_generation` name the exact block that was published, and the status test
     /// names the exact operation.
-    fn wake_destroyed_notification_waiter_split(
+    pub(crate) fn wake_destroyed_notification_waiter_split(
         &self,
         record: crate::kernel::boot::EndpointWaiterRecord,
     ) -> bool {
@@ -1323,18 +1287,6 @@ impl crate::runtime::SharedKernel {
             crate::arch::hal::notify_enqueued(target);
         }
         true
-    }
-
-    /// Obligation (6), split out whole: destroy the notification an admitted object names, then
-    /// wake its snapshotted waiter outside every lock. A non-`Notification` object is a no-op,
-    /// exactly as in `destroy_notification_for_revoked_cap`.
-    fn destroy_notification_for_revoked_object_split(&self, object: CapObject) {
-        let CapObject::Notification { index, .. } = object else {
-            return;
-        };
-        if let Some(waiter_tid) = self.destroy_notification_split(index) {
-            let _ = self.wake_destroyed_notification_waiter_split(waiter_tid);
-        }
     }
 
     // ── U9-F preflight (no mutation; the ONLY place a refusal can be raised) ─────────────────
@@ -1809,22 +1761,22 @@ impl crate::runtime::SharedKernel {
     ) -> Result<CapObject, SplitRevokeRefusal> {
         // (1) rank 4: the root revoke. This is the first mutation; if the slot vanished between
         // the preflight and here, nothing has changed yet and the refusal is still clean.
-        if self.cspace_revoke_split(cnode, root.cap).is_err() {
+        let Ok(root_refs) = self.cspace_revoke_split(cnode, root.cap) else {
             return Err(SplitRevokeRefusal::Unresolvable);
-        }
+        };
         // (2) descendants, each complete before the next — the broad interleave, including the
         // per-descendant mapping revocation and memory obligations that
         // `revoke_capability_direct_in_process_cnode` performs between the revoke and the
         // notification destroy.
         for descendant in descendants.iter().flatten().copied() {
-            let object = self
+            let removed = self
                 .process_cnode_for_pid_split(descendant.pid)
                 .and_then(|cnode| self.cspace_read_then_revoke_split(cnode, descendant.cap));
             // The broad form revokes the descendant's transfer mappings whether or not its slot
             // still held a capability, and performs the memory obligations only when it did.
-            if let Some(object) = object {
+            if let Some((object, notification_refs)) = removed {
                 self.memory_obligations_split(requester, descendant.pid, descendant.cap, object);
-                self.destroy_notification_for_revoked_object_split(object);
+                self.release_notification_refs_split(&notification_refs);
             } else {
                 self.revoke_active_transfer_mappings_for_cap_split(
                     requester,
@@ -1837,8 +1789,8 @@ impl crate::runtime::SharedKernel {
         self.clear_delegation_links_split(link_removals);
         // (4) the root's obligations (4) and (5), in the broad order: mappings, refcount, reclaim.
         self.memory_obligations_split(requester, root.pid, root.cap, root_object);
-        // (5) rank 3 then rank 2 → rank 1: the root's notification obligation.
-        self.destroy_notification_for_revoked_object_split(root_object);
+        // (5) rank 3 then rank 2 → rank 1: the root's notification references.
+        self.release_notification_refs_split(&root_refs);
         Ok(root_object)
     }
 
@@ -2034,18 +1986,16 @@ impl crate::runtime::SharedKernel {
         // a slot that was recycled since the reservation cannot present the same `CapId`. Slot
         // identity therefore needs no separate re-check here: `cspace_revoke_split` failing IS
         // "the capability this reservation named is already gone".
-        if self
-            .cspace_revoke_split(reservation.cnode, reservation.root.cap)
-            .is_err()
-        {
+        let Ok(root_refs) = self.cspace_revoke_split(reservation.cnode, reservation.root.cap)
+        else {
             return SplitRevokeCommitOutcome::RootAlreadyRetired;
-        }
+        };
         // (2) descendants, each complete before the next — the broad interleave.
         for descendant in reservation.descendants.iter().flatten().copied() {
-            let object = self
+            let removed = self
                 .process_cnode_for_pid_split(descendant.pid)
                 .and_then(|cnode| self.cspace_read_then_revoke_split(cnode, descendant.cap));
-            if let Some(object) = object {
+            if let Some((object, notification_refs)) = removed {
                 self.memory_obligations_split_gated(
                     requester,
                     descendant.pid,
@@ -2053,7 +2003,7 @@ impl crate::runtime::SharedKernel {
                     object,
                     backing_is_quarantined,
                 );
-                self.destroy_notification_for_revoked_object_split(object);
+                self.release_notification_refs_split(&notification_refs);
             } else {
                 self.revoke_active_transfer_mappings_for_cap_split(
                     requester,
@@ -2082,8 +2032,8 @@ impl crate::runtime::SharedKernel {
             reservation.root_object,
             backing_is_quarantined,
         );
-        // (5) rank 3 then rank 2 → rank 1: the root's notification obligation.
-        self.destroy_notification_for_revoked_object_split(reservation.root_object);
+        // (5) rank 3 then rank 2 → rank 1: the root's notification references.
+        self.release_notification_refs_split(&root_refs);
         SplitRevokeCommitOutcome::Revoked(reservation.root_object)
     }
 

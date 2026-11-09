@@ -375,6 +375,17 @@ impl CapabilitySpace {
     /// a single pass builds a parent->children index, then a stack walk marks
     /// the transitive closure.
     pub fn revoke(&mut self, id: CapId) -> Result<(), CapabilityDeriveError> {
+        self.revoke_reporting(id, |_| {})
+    }
+
+    /// [`Self::revoke`], handing every capability it removes — the root and each derived
+    /// descendant — to `on_removed` before its slot is cleared. NOTIF-LIFETIME1: an owner that
+    /// keeps per-object references learns exactly which capabilities went, without a second scan.
+    pub fn revoke_reporting(
+        &mut self,
+        id: CapId,
+        mut on_removed: impl FnMut(Capability),
+    ) -> Result<(), CapabilityDeriveError> {
         if self.get(id).is_none() {
             return Err(CapabilityDeriveError::NotFound);
         }
@@ -430,8 +441,8 @@ impl CapabilitySpace {
                 .slots
                 .get_mut(idx)
                 .expect("idx derived from marked bounds");
-            if slot.entry.is_some() {
-                slot.entry = None;
+            if let Some(entry) = slot.entry.take() {
+                on_removed(entry.capability);
                 let next = slot.generation.wrapping_add(1);
                 slot.generation = if next == 0 { 1 } else { next };
             }

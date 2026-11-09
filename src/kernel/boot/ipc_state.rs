@@ -7473,6 +7473,12 @@ impl KernelState {
         // Slot selection, generation bump, and object storage are atomic under
         // ipc_state_lock. Capability minting happens outside the lock (cap rank
         // 4 > ipc rank 3; acquiring both simultaneously would invert lock order).
+        //
+        // NOTIF-LIFETIME1: the new incarnation starts with ONE reference — the creation's own
+        // hold — so the object cannot vanish while its first capabilities are minted. Each mint
+        // reserves its own reference through the ordinary path; the hold is given back last, so
+        // the count ends equal to the capabilities that exist and a creation that minted none
+        // destroys what it made.
         let (notification_idx, generation) = self.with_ipc_state_mut(|ipc| {
             let slot = ipc
                 .notifications
@@ -7487,7 +7493,7 @@ impl KernelState {
             ipc.notification_generations[slot] = next_gen;
             // Defence-in-depth (Stage 21): a reused slot must start with no
             // stale waiter and no IRQ route inherited from a prior occupant.
-            // `destroy_notification` already performs this teardown, but a slot
+            // The destruction owner already performs this teardown, but a slot
             // could also be freed by a future path that forgets to; sanitising
             // here guarantees the new notification cannot be targeted by a
             // route bound to the previous generation.
@@ -7498,25 +7504,24 @@ impl KernelState {
                 }
             }
             ipc.notifications[slot] = Some(NotificationObject::new(max_depth)?);
+            ipc.notification_refs[slot] = 1;
             Ok::<_, KernelError>((slot, next_gen))
         })?;
+        let object = CapObject::Notification {
+            index: notification_idx,
+            generation,
+        };
 
-        let notification_cap = self.mint_capability_for_active_cnode(Capability::new(
-            CapObject::Notification {
-                index: notification_idx,
-                generation,
-            },
-            CapRights::SIGNAL,
-        ))?;
-
-        let recv_cap = self.mint_capability_for_active_cnode(Capability::new(
-            CapObject::Notification {
-                index: notification_idx,
-                generation,
-            },
-            CapRights::RECEIVE,
-        ))?;
-
+        let minted = self
+            .mint_capability_for_active_cnode(Capability::new(object, CapRights::SIGNAL))
+            .and_then(|signal| {
+                self.mint_capability_for_active_cnode(Capability::new(object, CapRights::RECEIVE))
+                    .map(|recv| (signal, recv))
+            });
+        // The creation hold goes back whatever happened: on success two capability references
+        // remain; on a failed mint, only the capabilities that were minted keep the object.
+        self.release_notification_ref(object);
+        let (notification_cap, recv_cap) = minted?;
         Ok((notification_idx, notification_cap, recv_cap))
     }
 
@@ -7602,62 +7607,6 @@ impl KernelState {
             }
         }
         Ok(())
-    }
-
-    /// Tear down a notification object and all IRQ routes that target it.
-    ///
-    /// Stage 21 lifetime invariant: an IRQ route must never outlive the
-    /// notification it points at, and a freed notification slot must carry no
-    /// stale waiter.  Teardown order is:
-    ///   1. Drop every `irq_routes` entry whose target is `notification_idx`
-    ///      (route teardown BEFORE the object is removed, so a concurrent
-    ///      `route_external_irq` either sees the live object or no route).
-    ///   2. Clear the `notification_waiters` slot (the waiter, if any, is woken
-    ///      by the task-exit / unblock path; here we only drop the dangling
-    ///      reference so a later signal cannot target a stale TID).
-    ///   3. Remove the object and bump the generation so any surviving
-    ///      `CapObject::Notification` cap fails the generation check in
-    ///      `resolve_notification_index` / `capability_object_live`.
-    ///
-    /// All three steps run under a single `ipc_state_lock` critical section so
-    /// the route/object/generation transition is atomic with respect to IRQ
-    /// delivery. Returns the snapshotted waiter TID (if any) so the caller can
-    /// unblock it outside the lock; `None` if the slot was already empty.
-    ///
-    /// Stage 22: wired into the capability-revoke / cnode-teardown / task-exit
-    /// cleanup paths via `revoke_capability_in_cnode` and
-    /// `revoke_capability_direct_in_process_cnode` (see
-    /// `capability_lifecycle_state.rs`). Callers invoke this AFTER releasing
-    /// `capability_state_lock` (rank 4) so the `ipc_state_lock` (rank 3) acquired
-    /// here never inverts the cap→ipc rank ordering.
-    pub(crate) fn destroy_notification(
-        &mut self,
-        notification_idx: usize,
-    ) -> Result<Option<EndpointWaiterRecord>, KernelError> {
-        if notification_idx >= self.runtime_capacity_config().max_notifications {
-            return Err(KernelError::WrongObject);
-        }
-        self.with_ipc_state_mut(|ipc| {
-            if ipc.notifications[notification_idx].is_none() {
-                return Err(KernelError::WrongObject);
-            }
-            // 1. Route teardown first.
-            for route in ipc.irq_routes.iter_mut() {
-                if *route == Some(notification_idx) {
-                    *route = None;
-                }
-            }
-            // 2. Snapshot + clear waiter.
-            let waiter = ipc.notification_waiters[notification_idx].take();
-            // 3. Remove object and bump generation to invalidate live caps.
-            ipc.notifications[notification_idx] = None;
-            let mut next_gen = ipc.notification_generations[notification_idx].wrapping_add(1);
-            if next_gen == 0 {
-                next_gen = 1;
-            }
-            ipc.notification_generations[notification_idx] = next_gen;
-            Ok::<Option<EndpointWaiterRecord>, KernelError>(waiter)
-        })
     }
 
     /// Stage 22: wake a waiter that was parked on a notification destroyed by a

@@ -96,8 +96,17 @@ impl crate::runtime::SharedKernel {
         cnode: CNodeId,
         capability: Capability,
     ) -> Result<CapId, KernelError> {
+        // NOTIF-LIFETIME1 Phase 0 (rank 3): a Notification capability's reference, taken the
+        // same way — before any slot can name the object. Non-Notification objects: no-op.
+        self.reserve_notification_ref_split(capability.object)?;
         // Phase 1 (rank 6): protect the object BEFORE any slot can reference it.
-        let mem_ref = self.bump_memory_ref_for_mint_split(capability.object)?;
+        let mem_ref = match self.bump_memory_ref_for_mint_split(capability.object) {
+            Ok(mem_ref) => mem_ref,
+            Err(err) => {
+                self.release_notification_ref_split(capability.object);
+                return Err(err);
+            }
+        };
 
         // Phase 2 (rank 4): publish the receiver-local cnode slot.
         match self.install_cnode_slot_for_mint_split(cnode, capability) {
@@ -108,6 +117,7 @@ impl crate::runtime::SharedKernel {
                 if matches!(mem_ref, MintMemoryRef::Bumped) {
                     self.rollback_memory_ref_for_mint_split(capability.object);
                 }
+                self.release_notification_ref_split(capability.object);
                 Err(install_err)
             }
         }
@@ -234,16 +244,21 @@ impl crate::runtime::SharedKernel {
         object: CapObject,
     ) {
         // Phase A (rank 4): clear the published receiver-local cnode slot.
-        self.with_capability_state_split_mut(|cap| {
-            if let Some(space) = cap
-                .cnode_spaces
+        let cleared = self.with_capability_state_split_mut(|cap| {
+            cap.cnode_spaces
                 .iter_mut()
                 .flatten()
                 .find(|space| space.id == cnode)
-            {
-                kernel_mut(&mut space.cspace).fast_revoke_reply_slot(minted, object);
-            }
+                .is_some_and(|space| {
+                    kernel_mut(&mut space.cspace).fast_revoke_reply_slot(minted, object)
+                })
         });
+        // NOTIF-LIFETIME1 (rank 3): the mint's Notification reference goes back with the slot it
+        // published — and only if this rollback is what removed that slot, so a capability
+        // already revoked by someone else is never given back twice.
+        if cleared {
+            self.release_notification_ref_split(object);
+        }
         // Phase B (rank 6): drop the mint's refcount bump and reclaim if the
         // object is now fully unreferenced (drop + reclaim atomic under one lock).
         let id = match object {

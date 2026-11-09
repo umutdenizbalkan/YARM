@@ -1340,11 +1340,20 @@ impl SpawnTxnOwners for BroadSpawnOwners<'_> {
         links: &LinkClosure,
         resolved: &ResolvedLinkPids,
     ) -> ProvisionalCapRelease {
-        self.kernel.with_capability_state_mut(|capability| {
+        // NOTIF-LIFETIME1: the removed capabilities' references go back after rank 4.
+        let mut notification_refs =
+            crate::kernel::boot::notification_lifetime::NotificationRefRelease::new();
+        let outcome = self.kernel.with_capability_state_mut(|capability| {
             crate::kernel::boot::provisional_cap::release_provisional_cap_locked(
-                capability, token, links, resolved,
+                capability,
+                token,
+                links,
+                resolved,
+                &mut notification_refs,
             )
-        })
+        });
+        self.kernel.release_notification_refs(&notification_refs);
+        outcome
     }
     fn delegate_capability(
         &mut self,
@@ -1752,7 +1761,10 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
                 .min(limits.max_capability_slots),
             max_total_cnode_slots: limits.max_total_cnode_slots,
         };
-        self.shared.with_capability_state_split_mut(|state| {
+        // NOTIF-LIFETIME1: reserve before the capability is visible; give back on refusal.
+        self.shared
+            .reserve_notification_ref_split(capability.object)?;
+        let minted = self.shared.with_capability_state_split_mut(|state| {
             crate::kernel::boot::spawn_ipc_cap_txn::mint_in_cnode_locked(
                 state,
                 cnode,
@@ -1760,7 +1772,12 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
                 growth.slot_capacity,
                 growth.max_total_cnode_slots,
             )
-        })
+        });
+        if minted.is_err() {
+            self.shared
+                .release_notification_ref_split(capability.object);
+        }
+        minted
     }
 
     fn provisional_cap_token(
@@ -1801,11 +1818,21 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
         links: &LinkClosure,
         resolved: &ResolvedLinkPids,
     ) -> ProvisionalCapRelease {
-        self.shared.with_capability_state_split_mut(|capability| {
+        // NOTIF-LIFETIME1: the removed capabilities' references go back after rank 4.
+        let mut notification_refs =
+            crate::kernel::boot::notification_lifetime::NotificationRefRelease::new();
+        let outcome = self.shared.with_capability_state_split_mut(|capability| {
             crate::kernel::boot::provisional_cap::release_provisional_cap_locked(
-                capability, token, links, resolved,
+                capability,
+                token,
+                links,
+                resolved,
+                &mut notification_refs,
             )
-        })
+        });
+        self.shared
+            .release_notification_refs_split(&notification_refs);
+        outcome
     }
     fn delegate_capability(
         &mut self,
@@ -1842,7 +1869,10 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
             )?,
             max_total_cnode_slots: limits.max_total_cnode_slots,
         };
-        let grant = self.shared.with_capability_state_split_mut(|state| {
+        // NOTIF-LIFETIME1: the destination's reference before rank 4 publishes it.
+        self.shared
+            .reserve_notification_ref_split(capability.object)?;
+        let grant = match self.shared.with_capability_state_split_mut(|state| {
             crate::kernel::boot::spawn_ipc_cap_txn::delegate_capability_locked(
                 state,
                 &identity,
@@ -1851,7 +1881,14 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
                 capability.object,
                 cnode_limits,
             )
-        })?;
+        }) {
+            Ok(grant) => grant,
+            Err(err) => {
+                self.shared
+                    .release_notification_ref_split(capability.object);
+                return Err(err);
+            }
+        };
         // The memory-object refcount is rank 6 and runs with rank 4 RELEASED. §1 proved this is
         // never owed for a spawn's capabilities — they are `Endpoint`/`AddressSpace` — but the
         // owner returns the fact rather than assuming it, so a future caller delegating a
@@ -1879,6 +1916,10 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
                     -1,
                 );
             });
+        }
+        // NOTIF-LIFETIME1: the destination capability is gone, and so is its reference.
+        if released {
+            self.shared.release_notification_ref_split(grant.object);
         }
         crate::yarm_log!(
             "SPAWN_DELEGATE_RELEASED dest_cnode={} dest_cap={} released={}",

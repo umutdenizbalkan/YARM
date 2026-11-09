@@ -21284,6 +21284,51 @@ fn stage20_reply_cap_creation_does_not_change_memory_cap_refcount() {
 /// notification recv, without driving the full block path. Mirrors the
 /// injection idiom used by the Stage 16 waiter-cleanup tests.
 #[cfg(test)]
+/// NOTIF-LIFETIME1 — destroy a notification through THE destruction owner, by giving back every
+/// reference its incarnation holds (what removing all of its capabilities does). Returns the
+/// waiter the destruction retired.
+pub(crate) fn notif_destroy_through_owner(
+    state: &mut KernelState,
+    notif_idx: usize,
+) -> Option<crate::kernel::boot::EndpointWaiterRecord> {
+    use crate::kernel::boot::notification_lifetime::{
+        NotificationIncarnation, NotificationReleaseOutcome, release_notification_refs_locked,
+    };
+    state.with_ipc_state_mut(|ipc| {
+        let incarnation = NotificationIncarnation {
+            index: notif_idx,
+            generation: ipc.notification_generations[notif_idx],
+        };
+        let held = ipc.notification_refs[notif_idx];
+        match release_notification_refs_locked(ipc, incarnation, held) {
+            NotificationReleaseOutcome::Destroyed { waiter } => waiter,
+            other => panic!("expected the last reference to destroy, got {other:?}"),
+        }
+    })
+}
+
+/// NOTIF-LIFETIME1 — give back a notification's partner capability through the ordinary broad
+/// revoke, so the capability a test then removes is the incarnation's LAST reference. Asserts the
+/// object survived: one remaining reference keeps it alive.
+pub(crate) fn notif_relinquish_partner(state: &mut KernelState, partner: CapId) {
+    let cnode = state.current_task_cnode().expect("cnode");
+    let object = state
+        .capability_for_cnode_local(cnode, partner)
+        .expect("partner cap")
+        .object;
+    state
+        .revoke_capability_in_cnode(cnode, partner)
+        .expect("relinquish partner");
+    let CapObject::Notification { index, generation } = object else {
+        panic!("not a notification cap: {object:?}");
+    };
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[index].is_some()
+            && ipc.notification_generations[index] == generation),
+        "the remaining reference keeps the notification alive"
+    );
+}
+
 fn stage21_block_on_notification(state: &mut KernelState, tid: u64) {
     state
         .with_tcbs_mut(|tcbs| {
@@ -21458,7 +21503,7 @@ fn stage21_destroy_notification_clears_waiter_and_invalidates_caps() {
         );
     });
 
-    let waiter = state.destroy_notification(notif_idx).expect("destroy");
+    let waiter = notif_destroy_through_owner(&mut state, notif_idx);
     assert_eq!(
         waiter,
         Some(crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(
@@ -21573,7 +21618,7 @@ fn stage21_irq_route_registration_and_teardown() {
         "route registered to notification"
     );
 
-    state.destroy_notification(notif_idx).expect("destroy");
+    notif_destroy_through_owner(&mut state, notif_idx);
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.irq_routes[15]),
         None,
@@ -21590,7 +21635,7 @@ fn stage21_irq_delivery_to_destroyed_notification_is_safe_noop() {
     let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
     state.bind_irq_notification(16, notif_cap).expect("bind");
 
-    state.destroy_notification(notif_idx).expect("destroy");
+    notif_destroy_through_owner(&mut state, notif_idx);
     // Normal path: route was cleared, so this is an immediate no-op.
     state.route_external_irq(16).expect("noop after destroy");
 
@@ -21619,7 +21664,8 @@ fn stage21_irq_delivery_to_destroyed_notification_is_safe_noop() {
 fn stage22_notification_cap_revoke_destroys_object() {
     // Revoking a Notification cap frees the object slot and bumps the generation.
     let mut state = Bootstrap::init().expect("init");
-    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
+    notif_relinquish_partner(&mut state, recv);
     let gen_before = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
     assert!(
         state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some()),
@@ -21651,7 +21697,8 @@ fn stage22_notification_cap_revoke_destroys_object() {
 fn stage22_notification_cap_revoke_tears_down_irq_route() {
     // Revoking a Notification cap removes any IRQ route targeting it.
     let mut state = Bootstrap::init().expect("init");
-    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
+    notif_relinquish_partner(&mut state, recv);
     state.bind_irq_notification(20, notif_cap).expect("bind");
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.irq_routes[20]),
@@ -21677,7 +21724,8 @@ fn stage22_notification_cap_revoke_clears_waiter() {
     // Runnable), mirroring the signal-path Blocked-only wake guard.
     let mut state = Bootstrap::init().expect("init");
     state.register_task(2201).expect("task");
-    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
+    notif_relinquish_partner(&mut state, recv);
     stage21_block_on_notification(&mut state, 2201);
     state.with_ipc_state_mut(|ipc| {
         ipc.notification_waiters[notif_idx] = Some(
@@ -21748,8 +21796,10 @@ fn stage22_signal_after_revoke_is_stable_noop() {
 
 #[test]
 fn stage22_wait_after_revoke_is_stable_error() {
-    // After revoke, a recv via the stale RECEIVE cap fails with a stable error
-    // (generation mismatch -> StaleCapability), repeatable, never a panic.
+    // NOTIF-LIFETIME1: revoking the SIGNAL cap relinquishes only ITS reference — the RECEIVE cap
+    // still names a live object and a wait through it is answered normally (nothing pending).
+    // Once the RECEIVE cap is revoked too, a recv through it fails with a stable error,
+    // repeatable, never a panic.
     let mut state = Bootstrap::init().expect("init");
     let (_notif_idx, notif_cap, recv_cap) = state.create_notification(4).expect("notif");
 
@@ -21757,6 +21807,14 @@ fn stage22_wait_after_revoke_is_stable_error() {
     state
         .revoke_capability_in_cnode(cnode, notif_cap)
         .expect("revoke");
+    assert_eq!(
+        state.try_ipc_recv(recv_cap),
+        Ok(None),
+        "the surviving RECEIVE cap still works"
+    );
+    state
+        .revoke_capability_in_cnode(cnode, recv_cap)
+        .expect("revoke the last cap");
 
     let first = state.try_ipc_recv(recv_cap);
     assert!(first.is_err(), "recv via stale cap errors: {first:?}");
@@ -21769,7 +21827,8 @@ fn stage22_route_after_revoke_is_benign_noop() {
     // Defence-in-depth: force a stale route back at the freed slot after revoke;
     // route_external_irq must swallow the dead-object case as a benign no-op.
     let mut state = Bootstrap::init().expect("init");
-    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
+    notif_relinquish_partner(&mut state, recv);
     state.bind_irq_notification(22, notif_cap).expect("bind");
 
     let cnode = state.current_task_cnode().expect("cnode");
@@ -21795,7 +21854,8 @@ fn stage22_create_notification_after_revoke_reuses_slot_cleanly() {
     // After revoke+destroy, a fresh create reusing the same slot starts clean:
     // no stale waiter, no inherited route, fresh generation, live cap.
     let mut state = Bootstrap::init().expect("init");
-    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
+    notif_relinquish_partner(&mut state, recv);
     state.bind_irq_notification(23, notif_cap).expect("bind");
     let gen_first = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
 
@@ -21833,7 +21893,8 @@ fn stage22_double_revoke_notification_cap_is_safe() {
     // First revoke destroys the object; revoking the (now empty) slot a second
     // time is a safe error, never a double-destroy or panic.
     let mut state = Bootstrap::init().expect("init");
-    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
+    notif_relinquish_partner(&mut state, recv);
     let cnode = state.current_task_cnode().expect("cnode");
 
     state
@@ -21864,7 +21925,8 @@ fn stage22_notification_cap_revoke_does_not_affect_unrelated_notification() {
     // Revoking one notification's cap must not disturb a second, unrelated
     // notification (object, route, generation all intact).
     let mut state = Bootstrap::init().expect("init");
-    let (idx_a, cap_a, _recv_a) = state.create_notification(4).expect("notif a");
+    let (idx_a, cap_a, recv_a) = state.create_notification(4).expect("notif a");
+    notif_relinquish_partner(&mut state, recv_a);
     let (idx_b, cap_b, recv_b) = state.create_notification(4).expect("notif b");
     assert_ne!(idx_a, idx_b, "distinct slots");
     state.bind_irq_notification(24, cap_a).expect("bind a");
@@ -21932,7 +21994,8 @@ fn stage23_revoke_notification_cap_destroys_object_and_routes() {
     // Direct revoke helper (the only reachable teardown surface): revoking a
     // Notification cap frees the object AND tears down its IRQ route in one pass.
     let mut state = Bootstrap::init().expect("init");
-    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
+    notif_relinquish_partner(&mut state, recv);
     state.bind_irq_notification(31, notif_cap).expect("bind");
     assert!(
         state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some()),
@@ -21995,7 +22058,8 @@ fn stage23_notification_cleanup_idempotent_double_revoke() {
     // the object; a second revoke of the now-empty slot is a safe error with no
     // double-destroy and no spurious second generation bump.
     let mut state = Bootstrap::init().expect("init");
-    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
+    notif_relinquish_partner(&mut state, recv);
     let cnode = state.current_task_cnode().expect("cnode");
 
     state
@@ -22057,6 +22121,10 @@ fn stage23_stale_notification_cap_after_revoke_cannot_signal_or_recv() {
     // After teardown via the reachable revoke path, the old caps are dead: an IRQ
     // on the (now-cleared) route is a benign no-op, and a recv via the stale
     // RECEIVE cap is a stable error — a stale cap cannot signal or drain.
+    //
+    // NOTIF-LIFETIME1: the route belongs to the incarnation, not to the SIGNAL cap that bound
+    // it — while the RECEIVE cap keeps the object alive the route still delivers to it. Only the
+    // last revoke tears the route down.
     let mut state = Bootstrap::init().expect("init");
     let (_notif_idx, notif_cap, recv_cap) = state.create_notification(4).expect("notif");
     state.bind_irq_notification(33, notif_cap).expect("bind");
@@ -22065,6 +22133,14 @@ fn stage23_stale_notification_cap_after_revoke_cannot_signal_or_recv() {
     state
         .revoke_capability_in_cnode(cnode, notif_cap)
         .expect("revoke");
+    state.route_external_irq(33).expect("live route delivers");
+    assert!(
+        state.try_ipc_recv(recv_cap).expect("recv").is_some(),
+        "the surviving RECEIVE cap drains what the route delivered"
+    );
+    state
+        .revoke_capability_in_cnode(cnode, recv_cap)
+        .expect("revoke the last cap");
 
     // Signal attempt via the old IRQ line: route is gone -> benign no-op, twice.
     state.route_external_irq(33).expect("stale signal noop 1");
@@ -143371,7 +143447,7 @@ mod u9c_reply_cap_ordered_transaction {
             "revoke_capability_in_cnode",
             "revoke_active_transfer_mappings_for_cap",
             "reclaim_memory_object_if_unreferenced",
-            "destroy_notification_for_revoked_cap",
+            "release_notification_refs(",
             "unmap_range_two_phase",
         ] {
             assert!(
@@ -143445,7 +143521,10 @@ mod u9c_reply_cap_ordered_transaction {
             "revoke_active_transfer_mappings_for_cap",
             "adjust_memory_object_cap_refcount",
             "reclaim_memory_object_if_unreferenced",
-            "destroy_notification_for_revoked_cap",
+            // NOTIF-LIFETIME1: the notification obligation is now "give back the references this
+            // revoke removed", reported by the revoke itself.
+            "revoke_reporting(",
+            "release_notification_refs(&notification_refs)",
         ] {
             assert!(
                 body.contains(effect),
@@ -143875,7 +143954,8 @@ mod u9f_split_capability_revocation {
     fn u9f_split_revoke_of_a_notification_cap_destroys_the_object() {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let (notif_idx, notif_cap, tid, gen_before) = k.with(|state| {
-            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            let (idx, cap, recv) = state.create_notification(4).expect("notif");
+            notif_relinquish_partner(state, recv);
             let tid = state.current_tid().expect("current tid");
             let g = state.with_ipc_state(|ipc| ipc.notification_generations[idx]);
             (idx, cap, tid, g)
@@ -143911,7 +143991,8 @@ mod u9f_split_capability_revocation {
     fn u9f_split_revoke_tears_down_the_irq_route() {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let (notif_idx, notif_cap, tid) = k.with(|state| {
-            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            let (idx, cap, recv) = state.create_notification(4).expect("notif");
+            notif_relinquish_partner(state, recv);
             state.bind_irq_notification(20, cap).expect("bind");
             let tid = state.current_tid().expect("current tid");
             (idx, cap, tid)
@@ -143943,7 +144024,8 @@ mod u9f_split_capability_revocation {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let (notif_idx, notif_cap, tid) = k.with(|state| {
             state.register_task(2901).expect("task");
-            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            let (idx, cap, recv) = state.create_notification(4).expect("notif");
+            notif_relinquish_partner(state, recv);
             stage21_block_on_notification(state, 2901);
             state.with_ipc_state_mut(|ipc| {
                 ipc.notification_waiters[idx] = Some(
@@ -143981,7 +144063,8 @@ mod u9f_split_capability_revocation {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let (notif_idx, notif_cap, tid) = k.with(|state| {
             state.register_task(2902).expect("task");
-            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            let (idx, cap, recv) = state.create_notification(4).expect("notif");
+            notif_relinquish_partner(state, recv);
             state.with_ipc_state_mut(|ipc| {
                 ipc.notification_waiters[idx] = Some(
                     crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2902)),
@@ -144029,7 +144112,8 @@ mod u9f_split_capability_revocation {
             state
                 .register_task_with_class(2903, TaskClass::Driver)
                 .expect("driver task");
-            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            let (idx, cap, recv) = state.create_notification(4).expect("notif");
+            notif_relinquish_partner(state, recv);
             stage21_block_on_notification(state, 2903);
             state.with_ipc_state_mut(|ipc| {
                 ipc.notification_waiters[idx] = Some(
@@ -144182,7 +144266,8 @@ mod u9f_split_capability_revocation {
     fn u9f_a_repeated_rollback_refuses_instead_of_destroying_a_successor() {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let (notif_idx, notif_cap, tid) = k.with(|state| {
-            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            let (idx, cap, recv) = state.create_notification(4).expect("notif");
+            notif_relinquish_partner(state, recv);
             (idx, cap, state.current_tid().expect("tid"))
         });
         assert!(k.rollback_materialized_recv_cap_no_vm_split(CpuId(0), tid, notif_cap));
@@ -144221,7 +144306,8 @@ mod u9f_split_capability_revocation {
     fn u9f_a_replacement_task_under_a_reused_tid_is_not_woken() {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let (notif_idx, notif_cap, tid) = k.with(|state| {
-            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            let (idx, cap, recv) = state.create_notification(4).expect("notif");
+            notif_relinquish_partner(state, recv);
             // The waiter slot names TID 2904, but the live task under that TID is Runnable —
             // exactly the shape a death-and-replacement leaves behind.
             state.register_task(2904).expect("replacement task");
@@ -144263,7 +144349,8 @@ mod u9f_split_capability_revocation {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let (notif_idx, notif_cap, tid) = k.with(|state| {
             state.register_task(2905).expect("task");
-            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            let (idx, cap, recv) = state.create_notification(4).expect("notif");
+            notif_relinquish_partner(state, recv);
             stage21_block_on_notification(state, 2905);
             state.with_ipc_state_mut(|ipc| {
                 ipc.notification_waiters[idx] = Some(
@@ -144718,7 +144805,10 @@ mod u9f_split_capability_revocation {
             "revoke_active_transfer_mappings_for_cap",
             "adjust_memory_object_cap_refcount",
             "reclaim_memory_object_if_unreferenced",
-            "destroy_notification_for_revoked_cap",
+            // NOTIF-LIFETIME1: the notification obligation is now "give back the references this
+            // revoke removed", reported by the revoke itself.
+            "revoke_reporting(",
+            "release_notification_refs(&notification_refs)",
         ] {
             assert!(
                 body.contains(effect),
@@ -144839,7 +144929,7 @@ mod u9f_split_capability_revocation {
             "cspace_revoke_split",
             "cspace_read_then_revoke_split",
             "clear_delegation_links_split",
-            "destroy_notification_split",
+            "release_notification_refs_split",
             "wake_destroyed_notification_waiter_split",
             // U9-D3 §6: the obligations the composition now PERFORMS are commit work, and the
             // preflight must still make no mutation.
@@ -144886,10 +144976,10 @@ mod u9f_split_capability_revocation {
             "cspace_read_then_revoke_split(cnode, descendant.cap)",
             // VM-INVALIDATION1: every obligation names the executing CPU as its requester.
             "memory_obligations_split(requester, descendant.pid, descendant.cap, object)",
-            "destroy_notification_for_revoked_object_split(object)",
+            "release_notification_refs_split(&notification_refs)",
             "clear_delegation_links_split(",
             "memory_obligations_split(requester, root.pid, root.cap, root_object)",
-            "destroy_notification_for_revoked_object_split(root_object)",
+            "release_notification_refs_split(&root_refs)",
         ];
         let mut last = 0usize;
         for needle in order {
@@ -144943,7 +145033,7 @@ mod u9f_split_capability_revocation {
                     "cspace_revoke_split(",
                     "cspace_read_then_revoke_split(",
                     "clear_delegation_links_split(",
-                    "destroy_notification_for_revoked_object_split(",
+                    "release_notification_refs_split(",
                 ] {
                     assert!(
                         !body.contains(restated),
@@ -144958,9 +145048,9 @@ mod u9f_split_capability_revocation {
                 "cspace_revoke_split(reservation.cnode, reservation.root.cap)",
                 "cspace_read_then_revoke_split(cnode, descendant.cap)",
                 "memory_obligations_split_gated(",
-                "destroy_notification_for_revoked_object_split(object)",
+                "release_notification_refs_split(&notification_refs)",
                 "clear_reserved_delegation_links_split(&reservation.link_removals)",
-                "destroy_notification_for_revoked_object_split(reservation.root_object)",
+                "release_notification_refs_split(&root_refs)",
             ];
             let mut last = 0usize;
             for needle in order {
@@ -145190,22 +145280,26 @@ mod u9f_split_capability_revocation {
     #[test]
     fn u9f_the_wake_is_snapshot_keyed_and_never_bare_tid() {
         let code = code_of(revoke_split_region());
+        // NOTIF-LIFETIME1: the destruction owner moved to `notification_lifetime.rs`, shared by
+        // the broad and the split release.
+        const LIFETIME: &str = include_str!("notification_lifetime.rs");
         let destroy = body_of(
-            revoke_split_region(),
-            "fn destroy_notification_split(",
-            "\n    /// rank 1",
+            LIFETIME,
+            "pub(crate) fn release_notification_refs_locked(",
+            "\nimpl KernelState",
         );
         assert!(
-            destroy.contains("ipc.notification_waiters[index].take()"),
+            destroy.contains("ipc.notification_waiters[i].take()"),
             "the waiter is TAKEN under rank 3 — snapshot and clear in one acquisition"
         );
         let wake = body_of(
-            revoke_split_region(),
-            "fn destroy_notification_for_revoked_object_split(",
-            "\n    // \u{2500}\u{2500} U9-F preflight",
+            LIFETIME,
+            "pub(crate) fn release_notification_refs_split<",
+            "\n    }\n}",
         );
         assert!(
-            wake.contains("if let Some(waiter_tid) = self.destroy_notification_split(index)"),
+            wake.contains("waiter: Some(record),")
+                && wake.contains("self.wake_destroyed_notification_waiter_split(record)"),
             "the wake consumes the snapshot's identity, not a caller-supplied TID"
         );
         for forbidden in ["current_tid", "task_cnode_split(0)", "ThreadId(0)"] {
@@ -145269,7 +145363,8 @@ mod u9f_split_capability_revocation {
             "pub(crate) fn plan_revoke_capability_no_vm_split(",
             "pub(crate) fn rollback_materialized_recv_cap_no_vm_split(",
             "fn wake_destroyed_notification_waiter_split(",
-            "fn destroy_notification_split(",
+            "fn cspace_revoke_split(",
+            "fn cspace_read_then_revoke_split(",
         ] {
             assert_eq!(
                 code_of(LIFECYCLE).matches(item).count(),
@@ -164291,7 +164386,9 @@ mod u9spawntxn3_provisional_rollback {
             s.with_capability_state_mut(|capability| {
                 let empty = [None; MAX_PROVISIONAL_DESCENDANTS];
                 let none = [None; MAX_PROVISIONAL_DESCENDANTS];
-                release_provisional_cap_locked(capability, &token, &empty, &none)
+                let mut refs =
+                    crate::kernel::boot::notification_lifetime::NotificationRefRelease::new();
+                release_provisional_cap_locked(capability, &token, &empty, &none, &mut refs)
             })
         });
         assert!(
@@ -189350,7 +189447,7 @@ mod u9irq1_delivery {
     fn a_route_that_outlived_its_object_settles_as_target_gone() {
         let (kernel, notif_idx, _recv) = fixture();
         kernel.with(|state| {
-            state.destroy_notification(notif_idx).expect("destroy");
+            notif_destroy_through_owner(state, notif_idx);
             // `destroy_notification` clears matching routes, so force the stale route back: the
             // arm under test is defence in depth for exactly that window.
             state.with_ipc_state_mut(|ipc| {
@@ -189392,7 +189489,7 @@ mod u9irq1_delivery {
 
         // Destroy and recreate. `create_notification` bumps the slot's generation.
         let (reused_idx, second_generation) = kernel.with(|state| {
-            state.destroy_notification(notif_idx).expect("destroy");
+            notif_destroy_through_owner(state, notif_idx);
             let (idx, notif_cap, _recv) = state.create_notification(4).expect("recreate");
             state
                 .bind_irq_notification(LINE, notif_cap)
@@ -205036,33 +205133,36 @@ mod ipc_displace1 {
     }
 }
 
-/// IRQ-GENERATION1 — revoking a Notification capability may destroy ONLY the incarnation that
-/// capability names (`{index, generation}`), on the broad and the split revocation paths alike.
+/// IRQ-GENERATION1 / NOTIF-LIFETIME1 — removing a Notification capability affects ONLY the
+/// incarnation that capability names (`{index, generation}`), on the broad and the split
+/// revocation paths alike.
 ///
-/// Every scenario is built through production owners: `create_notification` allocates and reuses
-/// the slot, revoking one cap of a pair destroys the object and leaves its partner as the stale
-/// `{index, old generation}` capability, and the stale cap is then revoked through the same
-/// revocation entry userspace reaches (`revoke_capability_in_cnode` broad,
-/// `revoke_capability_no_vm_split` split). Survival is asserted on the replacement object itself:
-/// its slot, its generation, its caps still resolving, its IRQ route still delivering and its
-/// waiter still parked — never merely on the stale cap being refused.
+/// Under NOTIF-LIFETIME1 a capability holds one reference, so no production path can leave a
+/// capability naming a destroyed incarnation: the object outlives every capability that names
+/// it. These reproducers therefore PLANT such a capability directly in the cspace — one the
+/// accounting never counted — to prove the destruction owner is generation-exact as a matter of
+/// defence in depth. Every other step goes through production owners: `create_notification`
+/// allocates and reuses the slot, and the revocations are the ones userspace reaches
+/// (`revoke_capability_in_cnode` broad, `revoke_capability_no_vm_split` split). Survival is
+/// asserted on the replacement object itself, and every step checks the accounting oracle.
 mod irq_generation1 {
     use super::*;
     use crate::kernel::boot::EndpointWaiterRecord;
+    use crate::kernel::capabilities::{CapRights, Capability};
     use crate::runtime::SharedKernel;
 
     #[derive(Clone, Copy, Debug)]
-    enum Path {
+    pub(super) enum Path {
         Broad,
         Split,
     }
 
-    fn kernel() -> SharedKernel {
+    pub(super) fn kernel() -> SharedKernel {
         SharedKernel::new(Bootstrap::init().expect("init"))
     }
 
     /// Revoke `cap` in the current task's cnode through `path`, as userspace's revoke would.
-    fn revoke(k: &SharedKernel, path: Path, cap: CapId) {
+    pub(super) fn revoke(k: &SharedKernel, path: Path, cap: CapId) {
         match path {
             Path::Broad => k.with(|s| {
                 let cnode = s.current_task_cnode().expect("cnode");
@@ -205077,16 +205177,20 @@ mod irq_generation1 {
         }
     }
 
-    fn generation(k: &SharedKernel, idx: usize) -> u64 {
+    pub(super) fn generation(k: &SharedKernel, idx: usize) -> u64 {
         k.with(|s| s.with_ipc_state(|ipc| ipc.notification_generations[idx]))
     }
 
-    fn present(k: &SharedKernel, idx: usize) -> bool {
+    pub(super) fn present(k: &SharedKernel, idx: usize) -> bool {
         k.with(|s| s.with_ipc_state(|ipc| ipc.notifications[idx].is_some()))
     }
 
+    pub(super) fn refs(k: &SharedKernel, idx: usize) -> u32 {
+        k.with(|s| s.with_ipc_state(|ipc| ipc.notification_refs[idx]))
+    }
+
     /// The raw cnode slot, read without any liveness filter, so a stale cap can still be named.
-    fn object_of(k: &SharedKernel, cap: CapId) -> CapObject {
+    pub(super) fn object_of(k: &SharedKernel, cap: CapId) -> CapObject {
         k.with(|s| {
             let cnode = s.current_task_cnode().expect("cnode");
             s.capability_for_cnode_local(cnode, cap)
@@ -205096,14 +205200,14 @@ mod irq_generation1 {
     }
 
     /// The incarnation a cap names, as the cap itself carries it.
-    fn names(k: &SharedKernel, cap: CapId) -> (usize, u64) {
+    pub(super) fn names(k: &SharedKernel, cap: CapId) -> (usize, u64) {
         match object_of(k, cap) {
             CapObject::Notification { index, generation } => (index, generation),
             other => panic!("not a notification cap: {other:?}"),
         }
     }
 
-    fn queued(k: &SharedKernel, tid: u64) -> usize {
+    pub(super) fn queued(k: &SharedKernel, tid: u64) -> usize {
         k.with(|s| {
             s.with_scheduler_state(|sched| {
                 let mut n = 0usize;
@@ -205119,25 +205223,106 @@ mod irq_generation1 {
         })
     }
 
-    /// N1 created, destroyed by revoking its SIGNAL cap, N2 created in the same slot. Returns the
-    /// slot, N1's surviving (now stale) RECEIVE cap, and N2's SIGNAL and RECEIVE caps.
-    fn stale_pair_over_reused_slot(k: &SharedKernel, path: Path) -> (usize, CapId, CapId, CapId) {
+    /// Every live capability, in every cspace, naming `{index, generation}`.
+    pub(super) fn live_caps_naming(state: &KernelState, index: usize, generation: u64) -> u32 {
+        let object = CapObject::Notification { index, generation };
+        state.with_capability_state(|capability| {
+            capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .map(|space| {
+                    let cspace = kernel_ref(&space.cspace);
+                    cspace
+                        .live_cap_ids()
+                        .filter(|id| cspace.get(*id).is_some_and(|c| c.object == object))
+                        .count() as u32
+                })
+                .sum()
+        })
+    }
+
+    /// THE accounting oracle: a present incarnation holds exactly one reference per live
+    /// capability naming it, and an absent one holds none and is named by no live capability.
+    pub(super) fn assert_accounting_exact(state: &KernelState, index: usize) {
+        let (is_present, generation, held) = state.with_ipc_state(|ipc| {
+            (
+                ipc.notifications[index].is_some(),
+                ipc.notification_generations[index],
+                ipc.notification_refs[index],
+            )
+        });
+        let live = live_caps_naming(state, index, generation);
+        if is_present {
+            assert_eq!(held, live, "references must equal live capabilities");
+            assert!(held > 0, "a present notification is referenced");
+        } else {
+            assert_eq!(held, 0, "an empty slot holds no references");
+            assert_eq!(
+                live, 0,
+                "no live capability names an empty slot's generation"
+            );
+        }
+    }
+
+    pub(super) fn exact(k: &SharedKernel, index: usize) {
+        k.with(|s| assert_accounting_exact(s, index));
+    }
+
+    /// Plant a capability the accounting never counted, straight into the current cspace. No
+    /// production path produces one; this stands in for a defective one.
+    fn plant_uncounted(k: &SharedKernel, object: CapObject, rights: CapRights) -> CapId {
+        k.with(|s| {
+            let cnode = s.current_task_cnode().expect("cnode");
+            s.with_capability_state_mut(|capability| {
+                let space = capability
+                    .cnode_spaces
+                    .iter_mut()
+                    .flatten()
+                    .find(|space| space.id == cnode)
+                    .expect("space");
+                kernel_mut(&mut space.cspace)
+                    .mint(Capability::new(object, rights))
+                    .expect("plant")
+            })
+        })
+    }
+
+    /// N1 created and destroyed by removing BOTH of its capabilities, N2 created in the same slot,
+    /// and an uncounted capability naming N1 planted. Returns the slot, the stale cap, and N2's
+    /// SIGNAL and RECEIVE caps.
+    fn stale_over_reused_slot(k: &SharedKernel, path: Path) -> (usize, CapId, CapId, CapId) {
         let (i1, sig1, recv1) = k.with(|s| s.create_notification(4).expect("N1"));
         let g1 = generation(k, i1);
         revoke(k, path, sig1);
-        assert!(!present(k, i1), "N1 destroyed by revoking its SIGNAL cap");
-        assert_eq!(
-            names(k, recv1),
-            (i1, g1),
-            "N1's RECEIVE cap still names {{I, G1}}"
+        assert!(
+            present(k, i1),
+            "{path:?}: N1 survives while its RECEIVE cap holds it"
         );
+        exact(k, i1);
+        revoke(k, path, recv1);
+        assert!(
+            !present(k, i1),
+            "{path:?}: N1 destroyed by its LAST capability"
+        );
+        exact(k, i1);
         let (i2, sig2, recv2) = k.with(|s| s.create_notification(4).expect("N2"));
         assert_eq!(i2, i1, "N2 reuses N1's slot");
         assert_ne!(generation(k, i2), g1, "N2 carries a newer generation");
-        (i1, recv1, sig2, recv2)
+        let stale = plant_uncounted(
+            k,
+            CapObject::Notification {
+                index: i1,
+                generation: g1,
+            },
+            CapRights::RECEIVE,
+        );
+        assert_eq!(names(k, stale), (i1, g1));
+        (i1, stale, sig2, recv2)
     }
 
-    /// Everything that makes N2 the same N2: present, same generation, both caps resolve.
+    /// Everything that makes N2 the same N2: present, same generation, both caps live, and the
+    /// accounting still exact.
     fn assert_n2_untouched(
         k: &SharedKernel,
         path: Path,
@@ -205163,283 +205348,293 @@ mod irq_generation1 {
                 "{path:?}: N2's caps must stay live"
             );
         }
+        exact(k, idx);
     }
 
     /// G1 — a stale capability cannot destroy the newer incarnation in its slot.
     fn g1_a_stale_cap_cannot_destroy_the_newer_notification(path: Path) {
-        {
-            let k = kernel();
-            let (idx, stale, sig2, recv2) = stale_pair_over_reused_slot(&k, path);
-            let g2 = generation(&k, idx);
-            revoke(&k, path, stale);
-            assert_n2_untouched(&k, path, idx, g2, sig2, recv2);
-            // N2 still works end to end: a signal through its own cap is received through its own.
-            k.with(|s| s.bind_irq_notification(21, sig2).expect("bind N2"));
-            k.with(|s| s.route_external_irq(21).expect("deliver"));
-            let got = k.with(|s| s.try_ipc_recv(recv2).expect("recv N2"));
-            assert!(got.is_some(), "{path:?}: N2 still receives its own signal");
-        }
+        let k = kernel();
+        let (idx, stale, sig2, recv2) = stale_over_reused_slot(&k, path);
+        let g2 = generation(&k, idx);
+        let refs_before = refs(&k, idx);
+        revoke(&k, path, stale);
+        assert_eq!(
+            refs(&k, idx),
+            refs_before,
+            "{path:?}: no decrement against N2"
+        );
+        assert_n2_untouched(&k, path, idx, g2, sig2, recv2);
+        k.with(|s| s.bind_irq_notification(21, sig2).expect("bind N2"));
+        k.with(|s| s.route_external_irq(21).expect("deliver"));
+        let got = k.with(|s| s.try_ipc_recv(recv2).expect("recv N2"));
+        assert!(got.is_some(), "{path:?}: N2 still receives its own signal");
     }
 
     /// G2 — the replacement's IRQ route survives a stale revocation and still delivers.
     fn g2_a_stale_cap_cannot_remove_the_newer_notifications_irq_route(path: Path) {
-        {
-            let k = kernel();
-            let (idx, stale, sig2, recv2) = stale_pair_over_reused_slot(&k, path);
-            let g2 = generation(&k, idx);
-            k.with(|s| s.bind_irq_notification(20, sig2).expect("bind N2"));
-            revoke(&k, path, stale);
-            assert_n2_untouched(&k, path, idx, g2, sig2, recv2);
-            assert_eq!(
-                k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[20])),
-                Some(idx),
-                "{path:?}: N2's route must survive"
-            );
-            k.with(|s| s.route_external_irq(20).expect("deliver"));
-            assert!(
-                k.with(|s| s.try_ipc_recv(recv2).expect("recv")).is_some(),
-                "{path:?}: the surviving route delivers to N2"
-            );
-        }
+        let k = kernel();
+        let (idx, stale, sig2, recv2) = stale_over_reused_slot(&k, path);
+        let g2 = generation(&k, idx);
+        k.with(|s| s.bind_irq_notification(20, sig2).expect("bind N2"));
+        revoke(&k, path, stale);
+        assert_n2_untouched(&k, path, idx, g2, sig2, recv2);
+        assert_eq!(
+            k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[20])),
+            Some(idx),
+            "{path:?}: N2's route must survive"
+        );
+        k.with(|s| s.route_external_irq(20).expect("deliver"));
+        assert!(
+            k.with(|s| s.try_ipc_recv(recv2).expect("recv")).is_some(),
+            "{path:?}: the surviving route delivers to N2"
+        );
     }
 
     /// G3 — the replacement's parked waiter is neither removed nor woken by a stale revocation.
     fn g3_a_stale_cap_cannot_retire_or_wake_the_newer_notifications_waiter(path: Path) {
-        {
-            let k = kernel();
-            let (idx, stale, sig2, recv2) = stale_pair_over_reused_slot(&k, path);
-            let g2 = generation(&k, idx);
-            let waiter = 3301;
-            k.with(|s| {
-                s.register_task(waiter).expect("task");
-                stage21_block_on_notification(s, waiter);
-                s.with_ipc_state_mut(|ipc| {
-                    ipc.notification_waiters[idx] =
-                        Some(EndpointWaiterRecord::for_bare_tid(ThreadId(waiter)));
-                });
+        let k = kernel();
+        let (idx, stale, sig2, recv2) = stale_over_reused_slot(&k, path);
+        let g2 = generation(&k, idx);
+        let waiter = 3301;
+        k.with(|s| {
+            s.register_task(waiter).expect("task");
+            stage21_block_on_notification(s, waiter);
+            s.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[idx] =
+                    Some(EndpointWaiterRecord::for_bare_tid(ThreadId(waiter)));
             });
-            let queued_before = queued(&k, waiter);
-            revoke(&k, path, stale);
-            assert_n2_untouched(&k, path, idx, g2, sig2, recv2);
-            k.with(|s| {
-                assert_eq!(
-                    s.notification_waiter_count(idx),
-                    1,
-                    "{path:?}: N2's waiter survives"
-                );
-                assert!(s.task_is_blocked(waiter), "{path:?}: no spurious wake");
-            });
+        });
+        let queued_before = queued(&k, waiter);
+        revoke(&k, path, stale);
+        assert_n2_untouched(&k, path, idx, g2, sig2, recv2);
+        k.with(|s| {
             assert_eq!(
-                queued(&k, waiter),
-                queued_before,
-                "{path:?}: nothing enqueued"
+                s.notification_waiter_count(idx),
+                1,
+                "{path:?}: N2's waiter survives"
             );
-            // And it is still N2's: N2's own signal is what wakes it, exactly once.
-            k.with(|s| {
-                s.bind_irq_notification(22, sig2).expect("bind");
-                s.route_external_irq(22).expect("deliver");
-                assert!(
-                    s.task_is_runnable(waiter),
-                    "{path:?}: N2's signal wakes N2's waiter"
-                );
-            });
-            assert_eq!(queued(&k, waiter), queued_before + 1);
-        }
+            assert!(s.task_is_blocked(waiter), "{path:?}: no spurious wake");
+        });
+        assert_eq!(
+            queued(&k, waiter),
+            queued_before,
+            "{path:?}: nothing enqueued"
+        );
+        k.with(|s| {
+            s.bind_irq_notification(22, sig2).expect("bind");
+            s.route_external_irq(22).expect("deliver");
+            assert!(
+                s.task_is_runnable(waiter),
+                "{path:?}: N2's signal wakes N2's waiter"
+            );
+        });
+        assert_eq!(queued(&k, waiter), queued_before + 1);
     }
 
-    /// G4 — a current-generation revocation still destroys the object, clears its route, retires
-    /// its waiter and wakes it exactly once.
+    /// G4 — removing ONE current capability (RECEIVE) leaves the object, its route and its
+    /// waiter alone; removing the LAST (SIGNAL) destroys it, clears its route, retires its waiter
+    /// and wakes it exactly once.
     fn g4_a_current_cap_still_tears_the_notification_down_completely(path: Path) {
-        {
-            let k = kernel();
-            let (idx, sig, recv) = k.with(|s| s.create_notification(4).expect("N"));
-            let g = generation(&k, idx);
-            let waiter = 3401;
-            k.with(|s| {
-                s.bind_irq_notification(23, sig).expect("bind");
-                s.register_task(waiter).expect("task");
-                stage21_block_on_notification(s, waiter);
-                s.with_ipc_state_mut(|ipc| {
-                    ipc.notification_waiters[idx] =
-                        Some(EndpointWaiterRecord::for_bare_tid(ThreadId(waiter)));
-                });
+        let k = kernel();
+        let (idx, sig, recv) = k.with(|s| s.create_notification(4).expect("N"));
+        let g = generation(&k, idx);
+        let waiter = 3401;
+        k.with(|s| {
+            s.bind_irq_notification(23, sig).expect("bind");
+            s.register_task(waiter).expect("task");
+            stage21_block_on_notification(s, waiter);
+            s.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[idx] =
+                    Some(EndpointWaiterRecord::for_bare_tid(ThreadId(waiter)));
             });
-            let queued_before = queued(&k, waiter);
-            revoke(&k, path, sig);
-            assert!(!present(&k, idx), "{path:?}: destroyed");
-            assert_ne!(generation(&k, idx), g, "{path:?}: generation bumped");
-            k.with(|s| {
-                assert_eq!(
-                    s.with_ipc_state(|ipc| ipc.irq_routes[23]),
-                    None,
-                    "{path:?}: route cleared"
-                );
-                assert_eq!(
-                    s.notification_waiter_count(idx),
-                    0,
-                    "{path:?}: waiter retired"
-                );
-                assert!(s.task_is_runnable(waiter), "{path:?}: waiter woken");
-                assert!(
-                    s.capability_object_live(CapObject::Notification {
-                        index: idx,
-                        generation: g
-                    })
-                    .is_none(),
-                    "{path:?}: the partner cap is now stale"
-                );
-            });
+        });
+        let queued_before = queued(&k, waiter);
+        revoke(&k, path, recv);
+        assert!(
+            present(&k, idx),
+            "{path:?}: one capability left keeps the object"
+        );
+        assert_eq!(generation(&k, idx), g, "{path:?}: no generation bump");
+        k.with(|s| {
             assert_eq!(
-                queued(&k, waiter),
-                queued_before + 1,
-                "{path:?}: woken exactly once"
+                s.with_ipc_state(|ipc| ipc.irq_routes[23]),
+                Some(idx),
+                "{path:?}: route kept"
             );
-            // The stale partner's later revocation is a no-op on the empty slot: no second wake.
-            revoke(&k, path, recv);
+            assert_eq!(s.notification_waiter_count(idx), 1, "{path:?}: waiter kept");
+            assert!(s.task_is_blocked(waiter), "{path:?}: no wake");
+        });
+        assert_eq!(queued(&k, waiter), queued_before);
+        exact(&k, idx);
+        revoke(&k, path, sig);
+        assert!(!present(&k, idx), "{path:?}: the last capability destroys");
+        assert_ne!(generation(&k, idx), g, "{path:?}: generation bumped");
+        k.with(|s| {
             assert_eq!(
-                queued(&k, waiter),
-                queued_before + 1,
-                "{path:?}: no second wake"
+                s.with_ipc_state(|ipc| ipc.irq_routes[23]),
+                None,
+                "{path:?}: route cleared"
             );
-        }
-    }
-
-    /// G5 — paired SIGNAL / RECEIVE caps, revoked in either order: the first current-generation
-    /// revoke destroys; the partner, now stale, is harmless — also once the slot has been reused.
-    fn g5_paired_caps_destroy_once_and_the_stale_partner_is_harmless(path: Path) {
-        {
-            for signal_first in [true, false] {
-                let k = kernel();
-                let (idx, sig, recv) = k.with(|s| s.create_notification(4).expect("N1"));
-                let (first, second) = if signal_first {
-                    (sig, recv)
-                } else {
-                    (recv, sig)
-                };
-                revoke(&k, path, first);
-                assert!(
-                    !present(&k, idx),
-                    "{path:?}/{signal_first}: the first revoke destroys"
-                );
-                let (i2, sig2, recv2) = k.with(|s| s.create_notification(4).expect("N2"));
-                assert_eq!(i2, idx);
-                let g2 = generation(&k, idx);
-                k.with(|s| s.bind_irq_notification(24, sig2).expect("bind"));
-                revoke(&k, path, second);
-                assert_n2_untouched(&k, path, idx, g2, sig2, recv2);
-                assert_eq!(
-                    k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[24])),
-                    Some(idx),
-                    "{path:?}/{signal_first}: N2's route survives the stale partner"
-                );
-            }
-        }
-    }
-
-    /// G6 — many destroy/recreate cycles over one slot: no older generation ever destroys a newer
-    /// incarnation, and the current one is still destroyed by its own cap.
-    fn g6_no_older_generation_destroys_a_newer_incarnation_across_cycles(path: Path) {
-        {
-            let k = kernel();
-            let mut stale: alloc::vec::Vec<CapId> = alloc::vec::Vec::new();
-            let mut slot = None;
-            for cycle in 0..6 {
-                let (idx, sig, recv) = k.with(|s| s.create_notification(4).expect("N"));
-                assert_eq!(*slot.get_or_insert(idx), idx, "the same slot every cycle");
-                let g = generation(&k, idx);
-                k.with(|s| s.bind_irq_notification(25, sig).expect("bind"));
-                // Every capability every earlier incarnation left behind is revoked now.
-                for old in stale.drain(..) {
-                    revoke(&k, path, old);
-                    assert_n2_untouched(&k, path, idx, g, sig, recv);
-                    assert_eq!(
-                        k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[25])),
-                        Some(idx),
-                        "{path:?} cycle {cycle}: route survives"
-                    );
+            assert_eq!(
+                s.notification_waiter_count(idx),
+                0,
+                "{path:?}: waiter retired"
+            );
+            assert!(s.task_is_runnable(waiter), "{path:?}: waiter woken");
+        });
+        assert_eq!(
+            queued(&k, waiter),
+            queued_before + 1,
+            "{path:?}: woken exactly once"
+        );
+        exact(&k, idx);
+        assert_eq!(
+            generation(&k, idx),
+            {
+                let mut n = g.wrapping_add(1);
+                if n == 0 {
+                    n = 1;
                 }
-                // The current incarnation is destroyed by its own RECEIVE cap; its SIGNAL cap
-                // becomes the next cycle's stale capability.
-                revoke(&k, path, recv);
-                assert!(
-                    !present(&k, idx),
-                    "{path:?} cycle {cycle}: destroyed by its own cap"
+                n
+            },
+            "{path:?}: exactly one generation advance"
+        );
+    }
+
+    /// G5 — paired SIGNAL / RECEIVE caps, removed in either order: the first removal destroys
+    /// nothing, the second destroys exactly once, and a slot reused afterwards inherits no route,
+    /// no waiter and no accounting.
+    fn g5_paired_caps_destroy_once_and_the_stale_partner_is_harmless(path: Path) {
+        for signal_first in [true, false] {
+            let k = kernel();
+            let (idx, sig, recv) = k.with(|s| s.create_notification(4).expect("N1"));
+            k.with(|s| s.bind_irq_notification(24, sig).expect("bind"));
+            assert_eq!(refs(&k, idx), 2, "two capabilities, two references");
+            let (first, second) = if signal_first {
+                (sig, recv)
+            } else {
+                (recv, sig)
+            };
+            revoke(&k, path, first);
+            assert!(
+                present(&k, idx),
+                "{path:?}/{signal_first}: the first removal destroys nothing"
+            );
+            assert_eq!(
+                k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[24])),
+                Some(idx),
+                "{path:?}/{signal_first}: the route outlives the cap that bound it"
+            );
+            exact(&k, idx);
+            revoke(&k, path, second);
+            assert!(
+                !present(&k, idx),
+                "{path:?}/{signal_first}: the second destroys"
+            );
+            exact(&k, idx);
+            let (i2, _sig2, _recv2) = k.with(|s| s.create_notification(4).expect("N2"));
+            assert_eq!(i2, idx);
+            k.with(|s| {
+                assert_eq!(
+                    s.with_ipc_state(|ipc| ipc.irq_routes[24]),
+                    None,
+                    "no inherited route"
                 );
-                stale.push(sig);
-            }
+                assert_eq!(s.notification_waiter_count(idx), 0, "no inherited waiter");
+            });
+            assert_eq!(
+                refs(&k, idx),
+                2,
+                "{path:?}/{signal_first}: N2 starts with its own two"
+            );
+            exact(&k, idx);
         }
     }
 
-    #[test]
-    fn g1_a_stale_cap_cannot_destroy_the_newer_notification_broad() {
-        g1_a_stale_cap_cannot_destroy_the_newer_notification(Path::Broad);
+    /// G6 — many destroy/recreate cycles over one slot: no older generation ever destroys or
+    /// decrements a newer incarnation, and the current one dies only with its last capability.
+    fn g6_no_older_generation_destroys_a_newer_incarnation_across_cycles(path: Path) {
+        let k = kernel();
+        let mut older: alloc::vec::Vec<CapObject> = alloc::vec::Vec::new();
+        let mut slot = None;
+        for cycle in 0..6 {
+            let (idx, sig, recv) = k.with(|s| s.create_notification(4).expect("N"));
+            assert_eq!(*slot.get_or_insert(idx), idx, "the same slot every cycle");
+            let g = generation(&k, idx);
+            k.with(|s| s.bind_irq_notification(25, sig).expect("bind"));
+            for old in older.iter().copied() {
+                let stale = plant_uncounted(&k, old, CapRights::SIGNAL);
+                revoke(&k, path, stale);
+                assert_n2_untouched(&k, path, idx, g, sig, recv);
+                assert_eq!(
+                    k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[25])),
+                    Some(idx),
+                    "{path:?} cycle {cycle}: route survives"
+                );
+            }
+            older.push(object_of(&k, sig));
+            revoke(&k, path, recv);
+            assert!(
+                present(&k, idx),
+                "{path:?} cycle {cycle}: SIGNAL still holds it"
+            );
+            revoke(&k, path, sig);
+            assert!(
+                !present(&k, idx),
+                "{path:?} cycle {cycle}: destroyed by its last cap"
+            );
+            exact(&k, idx);
+        }
     }
 
-    #[test]
-    fn g1_a_stale_cap_cannot_destroy_the_newer_notification_split() {
-        g1_a_stale_cap_cannot_destroy_the_newer_notification(Path::Split);
+    macro_rules! both_paths {
+        ($($name:ident => $broad:ident, $split:ident;)*) => {$(
+            #[test]
+            fn $broad() {
+                $name(Path::Broad);
+            }
+            #[test]
+            fn $split() {
+                $name(Path::Split);
+            }
+        )*};
     }
 
-    #[test]
-    fn g2_a_stale_cap_cannot_remove_the_newer_notifications_irq_route_broad() {
-        g2_a_stale_cap_cannot_remove_the_newer_notifications_irq_route(Path::Broad);
-    }
-
-    #[test]
-    fn g2_a_stale_cap_cannot_remove_the_newer_notifications_irq_route_split() {
-        g2_a_stale_cap_cannot_remove_the_newer_notifications_irq_route(Path::Split);
-    }
-
-    #[test]
-    fn g3_a_stale_cap_cannot_retire_or_wake_the_newer_notifications_waiter_broad() {
-        g3_a_stale_cap_cannot_retire_or_wake_the_newer_notifications_waiter(Path::Broad);
-    }
-
-    #[test]
-    fn g3_a_stale_cap_cannot_retire_or_wake_the_newer_notifications_waiter_split() {
-        g3_a_stale_cap_cannot_retire_or_wake_the_newer_notifications_waiter(Path::Split);
-    }
-
-    #[test]
-    fn g4_a_current_cap_still_tears_the_notification_down_completely_broad() {
-        g4_a_current_cap_still_tears_the_notification_down_completely(Path::Broad);
-    }
-
-    #[test]
-    fn g4_a_current_cap_still_tears_the_notification_down_completely_split() {
-        g4_a_current_cap_still_tears_the_notification_down_completely(Path::Split);
-    }
-
-    #[test]
-    fn g5_paired_caps_destroy_once_and_the_stale_partner_is_harmless_broad() {
-        g5_paired_caps_destroy_once_and_the_stale_partner_is_harmless(Path::Broad);
-    }
-
-    #[test]
-    fn g5_paired_caps_destroy_once_and_the_stale_partner_is_harmless_split() {
-        g5_paired_caps_destroy_once_and_the_stale_partner_is_harmless(Path::Split);
-    }
-
-    #[test]
-    fn g6_no_older_generation_destroys_a_newer_incarnation_across_cycles_broad() {
-        g6_no_older_generation_destroys_a_newer_incarnation_across_cycles(Path::Broad);
-    }
-
-    #[test]
-    fn g6_no_older_generation_destroys_a_newer_incarnation_across_cycles_split() {
-        g6_no_older_generation_destroys_a_newer_incarnation_across_cycles(Path::Split);
+    both_paths! {
+        g1_a_stale_cap_cannot_destroy_the_newer_notification =>
+            g1_a_stale_cap_cannot_destroy_the_newer_notification_broad,
+            g1_a_stale_cap_cannot_destroy_the_newer_notification_split;
+        g2_a_stale_cap_cannot_remove_the_newer_notifications_irq_route =>
+            g2_a_stale_cap_cannot_remove_the_newer_notifications_irq_route_broad,
+            g2_a_stale_cap_cannot_remove_the_newer_notifications_irq_route_split;
+        g3_a_stale_cap_cannot_retire_or_wake_the_newer_notifications_waiter =>
+            g3_a_stale_cap_cannot_retire_or_wake_the_newer_notifications_waiter_broad,
+            g3_a_stale_cap_cannot_retire_or_wake_the_newer_notifications_waiter_split;
+        g4_a_current_cap_still_tears_the_notification_down_completely =>
+            g4_a_current_cap_still_tears_the_notification_down_completely_broad,
+            g4_a_current_cap_still_tears_the_notification_down_completely_split;
+        g5_paired_caps_destroy_once_and_the_stale_partner_is_harmless =>
+            g5_paired_caps_destroy_once_and_the_stale_partner_is_harmless_broad,
+            g5_paired_caps_destroy_once_and_the_stale_partner_is_harmless_split;
+        g6_no_older_generation_destroys_a_newer_incarnation_across_cycles =>
+            g6_no_older_generation_destroys_a_newer_incarnation_across_cycles_broad,
+            g6_no_older_generation_destroys_a_newer_incarnation_across_cycles_split;
     }
 }
 
-/// IRQ-GENERATION1 §4 — lifetime audit evidence. The Stage 22 ownership note says a Notification
-/// has exactly one holder ("the creator mints exactly one SIGNAL + one RECEIVE cap into its own
-/// cnode ... never granted cross-process"). These pin what the production owners actually permit,
-/// and what revocation by a SECOND holder does to the first holder's object today.
+/// IRQ-GENERATION1 §4 → NOTIF-LIFETIME1 — the multi-holder shapes the production owners permit
+/// (a cap minted into another process, delegation, fork inheritance, process teardown). Under the
+/// IRQ-GENERATION1 contract each of them destroyed the first holder's object; under
+/// NOTIF-LIFETIME1 a second holder's removal relinquishes only its own reference.
 mod irq_generation1_lifetime {
+    use super::irq_generation1::{assert_accounting_exact, live_caps_naming};
     use super::*;
     use crate::kernel::capabilities::{CapRights, Capability};
 
-    fn notification_caps_of(state: &KernelState, tid: u64) -> alloc::vec::Vec<(CapId, CapObject)> {
+    pub(super) fn notification_caps_of(
+        state: &KernelState,
+        tid: u64,
+    ) -> alloc::vec::Vec<(CapId, CapObject)> {
         state
             .snapshot_live_capabilities_for_task(tid)
             .expect("snapshot")
@@ -205449,7 +205644,7 @@ mod irq_generation1_lifetime {
             .collect()
     }
 
-    fn spawn_app(state: &mut KernelState, tid: u64) {
+    pub(super) fn spawn_app(state: &mut KernelState, tid: u64) {
         let (asid, _aspace) = state.create_user_address_space().expect("asid");
         state
             .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
@@ -205463,14 +205658,21 @@ mod irq_generation1_lifetime {
             .expect("spawn");
     }
 
+    fn revoke_own(state: &mut KernelState, cap: CapId) {
+        let cnode = state.current_task_cnode().expect("cnode");
+        state
+            .revoke_capability_in_cnode(cnode, cap)
+            .expect("revoke");
+    }
+
     /// L1 — the shape `provision_init_uart_irq_witness` builds: the creator's pair plus a third
-    /// RECEIVE cap minted into ANOTHER process. Revoking that other process's copy destroys the
-    /// creator's object and removes the IRQ route the creator bound.
+    /// RECEIVE cap minted into ANOTHER process. That process's revoke relinquishes its own
+    /// reference only; the creator's object, route and caps survive until the creator's last.
     #[test]
-    fn l1_a_cap_minted_into_another_process_destroys_the_creators_object_on_revoke() {
+    fn l1_a_cap_minted_into_another_process_keeps_the_creators_object_alive_on_revoke() {
         let mut state = Bootstrap::init().expect("init");
         spawn_app(&mut state, 4101);
-        let (idx, sig, _recv) = state.create_notification(8).expect("notif");
+        let (idx, sig, recv) = state.create_notification(8).expect("notif");
         state.bind_irq_notification(26, sig).expect("bind");
         let object = state.current_task_capability(sig).expect("sig").object;
         let other_cnode = state.task_cnode(4101).expect("cnode");
@@ -205482,29 +205684,54 @@ mod irq_generation1_lifetime {
             1,
             "a second holder exists"
         );
+        assert_eq!(state.with_ipc_state(|ipc| ipc.notification_refs[idx]), 3);
+        assert_accounting_exact(&state, idx);
 
         state
             .revoke_capability_in_cnode(other_cnode, copy)
             .expect("revoke the copy");
         assert!(
-            state.with_ipc_state(|ipc| ipc.notifications[idx].is_none()),
-            "today: the other holder's revoke destroys the creator's notification"
+            state.with_ipc_state(|ipc| ipc.notifications[idx].is_some()),
+            "the other holder's revoke leaves the creator's notification alive"
         );
         assert_eq!(
             state.with_ipc_state(|ipc| ipc.irq_routes[26]),
-            None,
-            "and its IRQ route"
+            Some(idx),
+            "and its route"
         );
         assert!(
-            state.capability_object_live(object).is_none(),
-            "and the creator's own caps are now stale"
+            state.capability_object_live(object).is_some(),
+            "and the creator's caps"
         );
+        assert_accounting_exact(&state, idx);
+
+        // The reverse direction: the creator gives up both of its caps while the other process
+        // still holds a copy — the copy keeps the object alive.
+        let copy = state
+            .mint_capability_in_cnode(other_cnode, Capability::new(object, CapRights::RECEIVE))
+            .expect("mint again");
+        revoke_own(&mut state, sig);
+        revoke_own(&mut state, recv);
+        assert!(
+            state.with_ipc_state(|ipc| ipc.notifications[idx].is_some()),
+            "the remaining holder keeps the object alive after the creator relinquishes"
+        );
+        assert_accounting_exact(&state, idx);
+        state
+            .revoke_capability_in_cnode(other_cnode, copy)
+            .expect("last");
+        assert!(
+            state.with_ipc_state(|ipc| ipc.notifications[idx].is_none()),
+            "last one destroys"
+        );
+        assert_eq!(state.with_ipc_state(|ipc| ipc.irq_routes[26]), None);
+        assert_accounting_exact(&state, idx);
     }
 
-    /// L2 — fork inherits Notification caps (`fork_should_inherit_capability`), so a forked child
-    /// is a second holder; revoking the child's inherited copy destroys the parent's object.
+    /// L2 — fork inherits Notification caps, so a forked child is a second holder; revoking the
+    /// child's inherited copy leaves the parent's object alive.
     #[test]
-    fn l2_fork_inherits_notification_caps_and_the_childs_revoke_destroys_the_parents_object() {
+    fn l2_fork_inherits_notification_caps_and_the_childs_revoke_leaves_the_parents_object() {
         let mut state = Bootstrap::init().expect("init");
         spawn_app(&mut state, 4201);
         let current = state.current_tid().expect("tid");
@@ -205512,6 +205739,7 @@ mod irq_generation1_lifetime {
         let parent_sig = state
             .grant_capability_task_to_task_with_rights(current, sig, 4201, CapRights::SIGNAL)
             .expect("delegation accepts a Notification cap");
+        assert_accounting_exact(&state, idx);
         let parent_object = state
             .capability_for_cnode_local(state.task_cnode(4201).expect("cnode"), parent_sig)
             .expect("parent cap")
@@ -205523,36 +205751,701 @@ mod irq_generation1_lifetime {
             inherited[0].1, parent_object,
             "naming the parent's incarnation"
         );
+        assert_eq!(state.with_ipc_state(|ipc| ipc.notification_refs[idx]), 4);
+        assert_accounting_exact(&state, idx);
 
         let child_cnode = state.task_cnode(child).expect("child cnode");
         state
             .revoke_capability_in_cnode(child_cnode, inherited[0].0)
             .expect("revoke the child's copy");
         assert!(
-            state.with_ipc_state(|ipc| ipc.notifications[idx].is_none()),
-            "today: the child's revoke destroys the parent's (and the creator's) notification"
+            state.with_ipc_state(|ipc| ipc.notifications[idx].is_some()),
+            "the child's revoke leaves the parent's (and the creator's) notification alive"
         );
+        assert!(state.capability_object_live(parent_object).is_some());
+        assert_accounting_exact(&state, idx);
     }
 
-    /// L3 — the same through process teardown: the forked child dies and its cnode cleanup
-    /// revokes every live cap it held, destroying the parent's notification.
+    /// L3 — the same through process teardown: the forked child dies and its cnode cleanup gives
+    /// back the child's references only. Both teardown owners are exercised: the broad cleanup
+    /// and the no-alloc reap that drops the cspace whole.
     #[test]
-    fn l3_a_forked_childs_exit_cleanup_destroys_the_parents_notification() {
+    fn l3_a_forked_childs_exit_cleanup_leaves_the_parents_notification() {
+        for noalloc_reap in [false, true] {
+            let mut state = Bootstrap::init().expect("init");
+            spawn_app(&mut state, 4301);
+            let current = state.current_tid().expect("tid");
+            let (idx, sig, _recv) = state.create_notification(8).expect("notif");
+            state
+                .grant_capability_task_to_task_with_rights(current, sig, 4301, CapRights::SIGNAL)
+                .expect("delegate");
+            let child = state.fork_user_process_cow(4301, None).expect("fork");
+            assert_eq!(notification_caps_of(&state, child).len(), 1);
+            let child_pid = state.process_id(child).unwrap_or(child);
+            let generation = state.with_ipc_state(|ipc| ipc.notification_generations[idx]);
+            state.mark_task_dead(child).expect("dead");
+            if noalloc_reap {
+                assert!(state.maybe_cleanup_process_cnode_for_pid_noalloc_reap(child_pid));
+            } else {
+                state.maybe_cleanup_process_cnode_for_pid(child_pid);
+            }
+            assert!(
+                state.with_ipc_state(|ipc| ipc.notifications[idx].is_some()),
+                "reap={noalloc_reap}: a forked child's exit leaves the parent's notification"
+            );
+            assert_eq!(
+                live_caps_naming(&state, idx, generation),
+                3,
+                "reap={noalloc_reap}: creator's pair + the parent's copy"
+            );
+            assert_accounting_exact(&state, idx);
+        }
+    }
+}
+
+/// NOTIF-LIFETIME1 — the capability-reference lifetime contract, through real capability
+/// operations (`doc/IPC.md` §8.8). Every test checks the accounting oracle: the incarnation's
+/// reference count equals the live capabilities naming it, in every cspace.
+mod notif_lifetime1 {
+    use super::irq_generation1::{
+        assert_accounting_exact, exact, kernel, live_caps_naming, present, refs,
+    };
+    use super::irq_generation1_lifetime::spawn_app;
+    use super::*;
+    use crate::kernel::capabilities::{CapRights, Capability};
+
+    fn notif_object(state: &KernelState, cap: CapId) -> CapObject {
+        state.current_task_capability(cap).expect("cap").object
+    }
+
+    /// 7 — a capability transferred over IPC keeps the object alive after the sender gives up
+    /// every capability of its own.
+    #[test]
+    fn a_transferred_cap_keeps_the_object_alive_after_the_sender_relinquishes() {
         let mut state = Bootstrap::init().expect("init");
-        spawn_app(&mut state, 4301);
-        let current = state.current_tid().expect("tid");
-        let (idx, sig, _recv) = state.create_notification(8).expect("notif");
+        state.register_task(1).expect("task1");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (idx, sig, notif_recv) = state.create_notification(4).expect("notif");
+        let recv_cap_task1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("dup recv to task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
+        state.dispatch_next_task().expect("dispatch task0");
+        assert_eq!(state.current_tid(), Some(0));
+
         state
-            .grant_capability_task_to_task_with_rights(current, sig, 4301, CapRights::SIGNAL)
-            .expect("delegate");
-        let child = state.fork_user_process_cow(4301, None).expect("fork");
-        assert_eq!(notification_caps_of(&state, child).len(), 1);
-        let child_pid = state.process_id(child).unwrap_or(child);
-        state.mark_task_dead(child).expect("dead");
-        state.maybe_cleanup_process_cnode_for_pid(child_pid);
+            .ipc_send_with_cap_transfer(send_cap, ThreadId(0), 0x55, sig, b"nt")
+            .expect("send transfer");
+        state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to receiver");
+        }
+        let msg = state
+            .ipc_recv(recv_cap_task1)
+            .expect("recv")
+            .expect("message");
+        // The receive hands over an envelope handle; the receiver-local capability is minted by
+        // THE materialization owner, which delegates from the sender's capability.
+        let endpoint = state
+            .capability_for_cnode_local(state.task_cnode(1).expect("cnode"), recv_cap_task1)
+            .expect("endpoint cap")
+            .object;
+        let received = CapId(
+            crate::kernel::syscall::ipc_recv_core::materialize_received_message_cap(
+                &mut state, endpoint, 1, 0, &msg,
+            )
+            .expect("materialize")
+            .expect("a receiver-local cap"),
+        );
+        assert_accounting_exact(&state, idx);
+        assert_eq!(state.with_ipc_state(|ipc| ipc.notification_refs[idx]), 3);
+
+        // The sender relinquishes its INDEPENDENT reference (the RECEIVE cap the transfer did not
+        // derive from). The transferred capability keeps the object alive.
+        let sender_cnode = state.task_cnode(0).expect("sender cnode");
+        state
+            .revoke_capability_in_cnode(sender_cnode, notif_recv)
+            .expect("revoke recv");
+        assert!(
+            state.with_ipc_state(|ipc| ipc.notifications[idx].is_some()),
+            "the receiver's transferred capability keeps the notification alive"
+        );
+        let receiver_cnode = state.task_cnode(1).expect("receiver cnode");
+        let held = state
+            .capability_for_cnode_local(receiver_cnode, received)
+            .expect("receiver holds it");
+        assert!(state.capability_object_live(held.object).is_some());
+        assert_eq!(state.with_ipc_state(|ipc| ipc.notification_refs[idx]), 2);
+        assert_accounting_exact(&state, idx);
+        // The receiver gives its copy up: the sender's SIGNAL cap still holds the object.
+        state
+            .revoke_capability_in_cnode(receiver_cnode, received)
+            .expect("receiver relinquishes");
+        assert!(state.with_ipc_state(|ipc| ipc.notifications[idx].is_some()));
+        assert_accounting_exact(&state, idx);
+        // The sender's SIGNAL cap is the last reference: removing it destroys the object.
+        state
+            .revoke_capability_in_cnode(sender_cnode, sig)
+            .expect("revoke the last");
+        assert!(state.with_ipc_state(|ipc| ipc.notifications[idx].is_none()));
+        assert_accounting_exact(&state, idx);
+    }
+
+    /// 12 (real operations) — a transfer still queued holds NO reference. If the sender gives up
+    /// every capability first, the object is destroyed, and the later materialization must not
+    /// resurrect it: no capability naming the dead incarnation may appear.
+    #[test]
+    fn a_queued_transfer_cannot_resurrect_an_object_destroyed_before_it_is_received() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (idx, sig, notif_recv) = state.create_notification(4).expect("notif");
+        let generation = state.with_ipc_state(|ipc| ipc.notification_generations[idx]);
+        let recv_cap_task1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("dup recv to task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
+        state.dispatch_next_task().expect("dispatch task0");
+        assert_eq!(state.current_tid(), Some(0));
+        // The transfer is staged: an envelope names the sender's capability, and nothing has
+        // been materialized for the receiver yet.
+        state
+            .ipc_send_with_cap_transfer(send_cap, ThreadId(0), 0x56, sig, b"q")
+            .expect("stage transfer");
+        let sender_cnode = state.task_cnode(0).expect("sender cnode");
+        state
+            .revoke_capability_in_cnode(sender_cnode, sig)
+            .expect("revoke sig");
+        state
+            .revoke_capability_in_cnode(sender_cnode, notif_recv)
+            .expect("revoke recv");
         assert!(
             state.with_ipc_state(|ipc| ipc.notifications[idx].is_none()),
-            "today: a forked child's exit destroys the parent's notification"
+            "with no capability left the object is destroyed even though a transfer is staged"
+        );
+        let generation_after = state.with_ipc_state(|ipc| ipc.notification_generations[idx]);
+        state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to receiver");
+        }
+        let received = state.ipc_recv(recv_cap_task1);
+        if let Ok(Some(msg)) = received {
+            let endpoint = state
+                .capability_for_cnode_local(state.task_cnode(1).expect("cnode"), recv_cap_task1)
+                .expect("endpoint cap")
+                .object;
+            let materialized =
+                crate::kernel::syscall::ipc_recv_core::materialize_received_message_cap(
+                    &mut state, endpoint, 1, 0, &msg,
+                );
+            assert!(
+                !matches!(materialized, Ok(Some(_))),
+                "nothing may be materialized for a destroyed incarnation: {materialized:?}"
+            );
+        }
+        assert_eq!(
+            live_caps_naming(&state, idx, generation),
+            0,
+            "no capability naming the destroyed incarnation was materialized"
+        );
+        assert!(
+            state.with_ipc_state(|ipc| ipc.notifications[idx].is_none()),
+            "still dead"
+        );
+        assert_eq!(
+            state.with_ipc_state(|ipc| ipc.notification_generations[idx]),
+            generation_after,
+            "and nothing touched the slot"
+        );
+        assert_accounting_exact(&state, idx);
+    }
+
+    /// 9 — recursive revocation removes every delegated descendant and gives back exactly their
+    /// references; the creator's independent capability keeps the object alive.
+    #[test]
+    fn recursive_revocation_accounts_for_every_removed_descendant() {
+        let mut state = Bootstrap::init().expect("init");
+        spawn_app(&mut state, 4901);
+        spawn_app(&mut state, 4902);
+        let current = state.current_tid().expect("tid");
+        let (idx, sig, _recv) = state.create_notification(4).expect("notif");
+        let child = state
+            .grant_capability_task_to_task_with_rights(current, sig, 4901, CapRights::SIGNAL)
+            .expect("child");
+        let _grandchild = state
+            .grant_capability_task_to_task_with_rights(4901, child, 4902, CapRights::SIGNAL)
+            .expect("grandchild");
+        assert_eq!(state.with_ipc_state(|ipc| ipc.notification_refs[idx]), 4);
+        assert_accounting_exact(&state, idx);
+
+        let cnode = state.current_task_cnode().expect("cnode");
+        state
+            .revoke_capability_in_cnode(cnode, sig)
+            .expect("revoke the root");
+        assert_eq!(
+            super::irq_generation1_lifetime::notification_caps_of(&state, 4901).len()
+                + super::irq_generation1_lifetime::notification_caps_of(&state, 4902).len(),
+            0,
+            "both descendants went with the root"
+        );
+        assert!(
+            state.with_ipc_state(|ipc| ipc.notifications[idx].is_some()),
+            "the creator's RECEIVE cap keeps the object"
+        );
+        assert_eq!(state.with_ipc_state(|ipc| ipc.notification_refs[idx]), 1);
+        assert_accounting_exact(&state, idx);
+    }
+
+    /// 9 (split) — the same through the split revocation composition.
+    #[test]
+    fn recursive_split_revocation_accounts_for_every_removed_descendant() {
+        let k = kernel();
+        let (idx, sig, tid) = k.with(|state| {
+            spawn_app(state, 4911);
+            let current = state.current_tid().expect("tid");
+            let (idx, sig, _recv) = state.create_notification(4).expect("notif");
+            state
+                .grant_capability_task_to_task_with_rights(current, sig, 4911, CapRights::SIGNAL)
+                .expect("child");
+            (idx, sig, current)
+        });
+        exact(&k, idx);
+        k.revoke_capability_no_vm_split(CpuId(0), tid, sig)
+            .expect("split revoke");
+        assert!(present(&k, idx), "the RECEIVE cap keeps it");
+        assert_eq!(refs(&k, idx), 1);
+        exact(&k, idx);
+    }
+
+    /// 10 — failed mint and delegation transactions leave no reference behind.
+    #[test]
+    fn failed_mint_and_delegation_do_not_leak_references() {
+        let mut state = Bootstrap::init().expect("init");
+        spawn_app(&mut state, 5001);
+        let current = state.current_tid().expect("tid");
+        let (idx, sig, _recv) = state.create_notification(4).expect("notif");
+        let object = notif_object(&state, sig);
+        // Delegation to a task that does not exist: refused before anything is published.
+        assert!(
+            state
+                .grant_capability_task_to_task_with_rights(current, sig, 59999, CapRights::SIGNAL)
+                .is_err()
+        );
+        assert_accounting_exact(&state, idx);
+        // Fill the destination cnode, then mint and delegate into it: both refused.
+        let dest = state.task_cnode(5001).expect("dest cnode");
+        while state
+            .mint_capability_in_cnode(dest, Capability::new(CapObject::Kernel, CapRights::READ))
+            .is_ok()
+        {}
+        assert!(
+            state
+                .mint_capability_in_cnode(dest, Capability::new(object, CapRights::RECEIVE))
+                .is_err()
+        );
+        assert_accounting_exact(&state, idx);
+        assert!(
+            state
+                .grant_capability_task_to_task_with_rights(current, sig, 5001, CapRights::SIGNAL)
+                .is_err()
+        );
+        assert_accounting_exact(&state, idx);
+        assert_eq!(state.with_ipc_state(|ipc| ipc.notification_refs[idx]), 2);
+    }
+
+    /// 10 — a fork whose capability inheritance fails leaves the parent's references exact.
+    #[test]
+    fn a_fork_that_fails_during_capability_inheritance_does_not_leak_references() {
+        let mut state = Bootstrap::init().expect("init");
+        spawn_app(&mut state, 5101);
+        let current = state.current_tid().expect("tid");
+        let (idx, sig, _recv) = state.create_notification(4).expect("notif");
+        state
+            .grant_capability_task_to_task_with_rights(current, sig, 5101, CapRights::SIGNAL)
+            .expect("parent's copy");
+        // Exhaust the delegation-link table, so the child's first inherited capability cannot
+        // record its link and the fork unwinds.
+        let kernel_cap = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ,
+            ))
+            .expect("kernel cap");
+        let mut dest = 5200u64;
+        state.register_task(dest).expect("sink");
+        loop {
+            match state.grant_capability_task_to_task_with_rights(
+                current,
+                kernel_cap,
+                dest,
+                CapRights::READ,
+            ) {
+                Ok(_) => {}
+                Err(_) => {
+                    let full = state.with_capability_state(|c| {
+                        kernel_ref(&c.delegated_capability_links)
+                            .iter()
+                            .all(Option::is_some)
+                    });
+                    if full {
+                        break;
+                    }
+                    dest += 1;
+                    state.register_task(dest).expect("sink");
+                }
+            }
+        }
+        let before = state.with_ipc_state(|ipc| ipc.notification_refs[idx]);
+        assert!(
+            state.fork_user_process_cow(5101, None).is_err(),
+            "the fork is refused"
+        );
+        assert_eq!(
+            state.with_ipc_state(|ipc| ipc.notification_refs[idx]),
+            before
+        );
+        assert_accounting_exact(&state, idx);
+    }
+
+    /// 10 / 4 — a creation that cannot mint its capabilities destroys what it made; one that
+    /// mints only the first keeps exactly one reference.
+    #[test]
+    fn a_creation_whose_mints_fail_leaves_exact_accounting() {
+        let mut state = Bootstrap::init().expect("init");
+        let cnode = state.current_task_cnode().expect("cnode");
+        let mut fillers = alloc::vec::Vec::new();
+        while let Ok(cap) = state
+            .mint_capability_in_cnode(cnode, Capability::new(CapObject::Kernel, CapRights::READ))
+        {
+            fillers.push(cap);
+        }
+        // No slot at all: the creation fails and its object is gone.
+        assert!(state.create_notification(4).is_err());
+        for idx in 0..state.runtime_capacity_config().max_notifications {
+            assert_accounting_exact(&state, idx);
+        }
+        // Exactly one slot: the SIGNAL mint succeeds, the RECEIVE mint fails.
+        state
+            .revoke_capability_in_cnode(cnode, fillers.pop().expect("filler"))
+            .expect("free one slot");
+        assert!(state.create_notification(4).is_err());
+        let live = (0..state.runtime_capacity_config().max_notifications)
+            .filter(|i| state.with_ipc_state(|ipc| ipc.notifications[*i].is_some()))
+            .collect::<alloc::vec::Vec<_>>();
+        assert_eq!(live.len(), 1, "the minted SIGNAL cap keeps one object");
+        assert_eq!(
+            state.with_ipc_state(|ipc| ipc.notification_refs[live[0]]),
+            1
+        );
+        assert_accounting_exact(&state, live[0]);
+    }
+
+    /// 12 — a publication that RESERVED before a concurrent final removal keeps the object alive
+    /// across that removal: no premature destruction. Driven through the split seams in the
+    /// production order (reserve at rank 3, then insert at rank 4).
+    #[test]
+    fn a_reserved_publication_survives_a_concurrent_final_removal() {
+        let k = kernel();
+        let (idx, sig, recv, tid, cnode) = k.with(|state| {
+            let (idx, sig, recv) = state.create_notification(4).expect("notif");
+            let tid = state.current_tid().expect("tid");
+            (
+                idx,
+                sig,
+                recv,
+                tid,
+                state.current_task_cnode().expect("cnode"),
+            )
+        });
+        let object = k.with(|state| notif_object(state, sig));
+        k.revoke_capability_no_vm_split(CpuId(0), tid, recv)
+            .expect("first");
+        // Publisher, phase 1: the reservation.
+        k.reserve_notification_ref_split(object).expect("reserve");
+        // A concurrent revoker removes the last visible capability.
+        k.revoke_capability_no_vm_split(CpuId(0), tid, sig)
+            .expect("final visible");
+        assert!(present(&k, idx), "the reservation keeps the object alive");
+        assert_eq!(refs(&k, idx), 1);
+        // Publisher, phase 2: the insertion the reservation was for.
+        let published = k.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::spawn_ipc_cap_txn::mint_in_cnode_locked(
+                capability,
+                cnode,
+                Capability::new(object, CapRights::SIGNAL),
+                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                usize::MAX,
+            )
+        });
+        let published = published.expect("insert");
+        exact(&k, idx);
+        k.revoke_capability_no_vm_split(CpuId(0), tid, published)
+            .expect("last");
+        assert!(
+            !present(&k, idx),
+            "and the published capability's removal destroys it"
+        );
+        exact(&k, idx);
+    }
+
+    /// 12 — a publication attempted AFTER the final removal is refused: no resurrection, no
+    /// capability, no slot change.
+    #[test]
+    fn a_publication_after_the_final_removal_is_refused() {
+        let k = kernel();
+        let (idx, sig, recv, tid, cnode) = k.with(|state| {
+            let (idx, sig, recv) = state.create_notification(4).expect("notif");
+            let tid = state.current_tid().expect("tid");
+            (
+                idx,
+                sig,
+                recv,
+                tid,
+                state.current_task_cnode().expect("cnode"),
+            )
+        });
+        let object = k.with(|state| notif_object(state, sig));
+        k.revoke_capability_no_vm_split(CpuId(0), tid, sig)
+            .expect("one");
+        k.revoke_capability_no_vm_split(CpuId(0), tid, recv)
+            .expect("last");
+        assert!(!present(&k, idx));
+        let generation_after = super::irq_generation1::generation(&k, idx);
+        assert_eq!(
+            k.mint_capability_with_memory_ref_split(
+                cnode,
+                Capability::new(object, CapRights::SIGNAL)
+            ),
+            Err(KernelError::WrongObject),
+            "the split mint refuses a destroyed incarnation"
+        );
+        assert_eq!(
+            k.with(
+                |s| s.mint_capability_in_cnode(cnode, Capability::new(object, CapRights::SIGNAL))
+            ),
+            Err(KernelError::WrongObject),
+            "so does the broad mint"
+        );
+        assert!(!present(&k, idx), "no resurrection");
+        assert_eq!(
+            super::irq_generation1::generation(&k, idx),
+            generation_after
+        );
+        exact(&k, idx);
+    }
+
+    /// 12 — a removal whose reference is still owed (the capability already gone at rank 4, the
+    /// release not yet made at rank 3) races a publication from another live capability: the
+    /// object survives with the new capability and the accounting ends exact.
+    #[test]
+    fn a_publication_during_an_owed_release_keeps_the_object() {
+        use crate::kernel::boot::notification_lifetime::NotificationRefRelease;
+        let mut state = Bootstrap::init().expect("init");
+        spawn_app(&mut state, 5301);
+        let current = state.current_tid().expect("tid");
+        let (idx, sig, recv) = state.create_notification(4).expect("notif");
+        let cnode = state.current_task_cnode().expect("cnode");
+        // Remover, phase 1 (rank 4): the RECEIVE capability leaves its cspace.
+        let mut owed: NotificationRefRelease = NotificationRefRelease::new();
+        state.with_capability_state_mut(|capability| {
+            let space = capability
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .expect("space");
+            kernel_mut(&mut space.cspace)
+                .revoke_reporting(recv, |removed| owed.note(&removed))
+                .expect("remove");
+        });
+        // Meanwhile a delegation of the SIGNAL cap publishes a new capability.
+        state
+            .grant_capability_task_to_task_with_rights(current, sig, 5301, CapRights::SIGNAL)
+            .expect("delegate");
+        // Remover, phase 2 (rank 3): the owed release.
+        state.release_notification_refs(&owed);
+        assert!(state.with_ipc_state(|ipc| ipc.notifications[idx].is_some()));
+        assert_eq!(state.with_ipc_state(|ipc| ipc.notification_refs[idx]), 2);
+        assert_accounting_exact(&state, idx);
+    }
+
+    /// The release owner itself: a stale generation, an empty slot and an over-release are
+    /// complete no-ops; the last reference destroys exactly once.
+    #[test]
+    fn the_destruction_owner_is_generation_exact_and_never_over_releases() {
+        use crate::kernel::boot::notification_lifetime::{
+            NotificationIncarnation, NotificationReleaseOutcome, release_notification_refs_locked,
+        };
+        let mut state = Bootstrap::init().expect("init");
+        let (idx, _sig, _recv) = state.create_notification(4).expect("notif");
+        let generation = state.with_ipc_state(|ipc| ipc.notification_generations[idx]);
+        let here = NotificationIncarnation {
+            index: idx,
+            generation,
+        };
+        let stale = NotificationIncarnation {
+            index: idx,
+            generation: generation.wrapping_sub(1),
+        };
+        state.with_ipc_state_mut(|ipc| {
+            assert_eq!(
+                release_notification_refs_locked(ipc, stale, 1),
+                NotificationReleaseOutcome::Ignored
+            );
+            assert_eq!(
+                release_notification_refs_locked(ipc, here, 3),
+                NotificationReleaseOutcome::Ignored
+            );
+            assert_eq!(ipc.notification_refs[idx], 2);
+            assert_eq!(
+                release_notification_refs_locked(ipc, here, 1),
+                NotificationReleaseOutcome::Released { remaining: 1 }
+            );
+            assert!(matches!(
+                release_notification_refs_locked(ipc, here, 1),
+                NotificationReleaseOutcome::Destroyed { .. }
+            ));
+            assert_eq!(
+                release_notification_refs_locked(ipc, here, 1),
+                NotificationReleaseOutcome::Ignored
+            );
+        });
+    }
+
+    /// Structural: every production cspace insertion and removal primitive is one of the
+    /// accounted owners, and each insertion owner reserves BEFORE it can publish.
+    #[test]
+    fn every_cspace_mutation_site_is_an_accounted_owner() {
+        fn code(src: &str) -> alloc::string::String {
+            let cutoff = src.find("\n#[cfg(test)]\nmod tests {").unwrap_or(src.len());
+            src[..cutoff]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n")
+        }
+        // (file, needle, exact production count, why it is accounted)
+        let table: &[(&str, &str, &str, usize)] = &[
+            (
+                "capability_lifecycle_state.rs",
+                include_str!("capability_lifecycle_state.rs"),
+                ".mint(",
+                1,
+            ),
+            (
+                "capability_lifecycle_state.rs",
+                include_str!("capability_lifecycle_state.rs"),
+                ".revoke(",
+                0,
+            ),
+            (
+                "capability_lifecycle_state.rs",
+                include_str!("capability_lifecycle_state.rs"),
+                ".revoke_reporting(",
+                4,
+            ),
+            (
+                "capability_lifecycle_state.rs",
+                include_str!("capability_lifecycle_state.rs"),
+                ".delete_if_leaf(",
+                1,
+            ),
+            (
+                "spawn_ipc_cap_txn.rs",
+                include_str!("spawn_ipc_cap_txn.rs"),
+                ".mint(",
+                1,
+            ),
+            (
+                "spawn_ipc_cap_txn.rs",
+                include_str!("spawn_ipc_cap_txn.rs"),
+                ".revoke(",
+                1,
+            ),
+            (
+                "provisional_cap.rs",
+                include_str!("provisional_cap.rs"),
+                ".revoke(",
+                0,
+            ),
+            (
+                "provisional_cap.rs",
+                include_str!("provisional_cap.rs"),
+                ".revoke_reporting(",
+                2,
+            ),
+            (
+                "cap_memory_mint_split.rs",
+                include_str!("cap_memory_mint_split.rs"),
+                ".mint(",
+                1,
+            ),
+            (
+                "cnode_state.rs",
+                include_str!("cnode_state.rs"),
+                "notification_refs.note(&held)",
+                2,
+            ),
+        ];
+        for (file, src, needle, want) in table {
+            assert_eq!(
+                code(src).matches(needle).count(),
+                *want,
+                "{file}: `{needle}` sites changed — account for the new site's Notification references"
+            );
+        }
+        let lifecycle = code(include_str!("capability_lifecycle_state.rs"));
+        let mint = lifecycle
+            .split("pub(crate) fn mint_capability_in_cnode(")
+            .nth(1)
+            .expect("broad mint");
+        assert!(
+            mint.find("self.reserve_notification_ref(capability.object)?")
+                .expect("reserve")
+                < mint.find(".mint(capability)").expect("mint"),
+            "the broad mint reserves before it publishes"
+        );
+        let seam = code(include_str!("cap_memory_mint_split.rs"));
+        let seam = seam
+            .split("pub(crate) fn mint_capability_with_memory_ref_split(")
+            .nth(1)
+            .expect("split mint");
+        assert!(
+            seam.find("self.reserve_notification_ref_split(capability.object)?")
+                .expect("reserve")
+                < seam
+                    .find("self.install_cnode_slot_for_mint_split(")
+                    .expect("install"),
+            "the split mint reserves before it publishes"
+        );
+        let delegate = code(include_str!("capability_state.rs"));
+        let delegate = delegate
+            .split("pub(crate) fn delegate_capability(")
+            .nth(1)
+            .expect("delegate");
+        assert!(
+            delegate
+                .find("self.reserve_notification_ref(capability.object)?")
+                .expect("reserve")
+                < delegate.find("delegate_capability_locked(").expect("body"),
+            "broad delegation reserves before it publishes"
+        );
+        let spawn = code(include_str!("../syscall/spawn_txn.rs"));
+        assert_eq!(
+            spawn
+                .matches(".reserve_notification_ref_split(capability.object)?")
+                .count(),
+            2,
+            "the split spawn owner's mint and delegation both reserve"
         );
     }
 }

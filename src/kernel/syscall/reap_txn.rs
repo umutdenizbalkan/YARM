@@ -596,9 +596,19 @@ impl ReapOwners for BroadReapOwners<'_> {
             .with_capability_state(|capability| body::cnode_slot_capacity_locked(capability, cnode))
     }
     fn reap_process_cspace(&mut self, pid: u64, cnode: CNodeId) -> (bool, bool) {
-        self.kernel.with_capability_state_mut(|capability| {
-            crate::kernel::boot::cnode_state::reap_process_cspace_locked(capability, pid, cnode)
-        })
+        // NOTIF-LIFETIME1: the dropped space's Notification references go back after rank 4.
+        let mut notification_refs =
+            crate::kernel::boot::notification_lifetime::CspaceNotificationRefs::new();
+        let removed = self.kernel.with_capability_state_mut(|capability| {
+            crate::kernel::boot::cnode_state::reap_process_cspace_locked(
+                capability,
+                pid,
+                cnode,
+                &mut notification_refs,
+            )
+        });
+        self.kernel.release_notification_refs(&notification_refs);
+        removed
     }
 
     fn retire_reap_claim(&mut self, claim: ReapClaim) {
@@ -795,9 +805,20 @@ impl ReapOwners for SharedReapOwners<'_> {
         })
     }
     fn reap_process_cspace(&mut self, pid: u64, cnode: CNodeId) -> (bool, bool) {
-        self.shared.with_capability_state_split_mut(|capability| {
-            crate::kernel::boot::cnode_state::reap_process_cspace_locked(capability, pid, cnode)
-        })
+        // NOTIF-LIFETIME1: the dropped space's Notification references go back after rank 4.
+        let mut notification_refs =
+            crate::kernel::boot::notification_lifetime::CspaceNotificationRefs::new();
+        let removed = self.shared.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::cnode_state::reap_process_cspace_locked(
+                capability,
+                pid,
+                cnode,
+                &mut notification_refs,
+            )
+        });
+        self.shared
+            .release_notification_refs_split(&notification_refs);
+        removed
     }
 
     fn retire_reap_claim(&mut self, claim: ReapClaim) {

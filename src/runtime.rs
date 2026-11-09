@@ -4482,10 +4482,18 @@ impl SharedKernel {
                 removed_delegation_links = removed_delegation_links.saturating_add(1);
             }
         }
+        let mut notification_refs =
+            crate::kernel::boot::notification_lifetime::CspaceNotificationRefs::new();
         let (removed_cnode_space, removed_process_record) =
             self.with_capability_state_split_mut(|capability| {
-                crate::kernel::boot::cnode_state::reap_process_cspace_locked(capability, pid, cnode)
+                crate::kernel::boot::cnode_state::reap_process_cspace_locked(
+                    capability,
+                    pid,
+                    cnode,
+                    &mut notification_refs,
+                )
             });
+        self.release_notification_refs_split(&notification_refs);
         crate::yarm_log!(
             "YARM_PROC_CNODE_CLEANUP_NOALLOC pid={} cnode={} slots=0 removed_links={} removed_cspace={} removed_record={}",
             pid,
