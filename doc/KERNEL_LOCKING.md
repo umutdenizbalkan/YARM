@@ -9414,6 +9414,8 @@ waiter, and bumps the generation.
 
 **Notification caps are single-owner per object: revoke → destroy immediately.**
 
+> **Superseded by NOTIF-LIFETIME1 (2026-11-09).** Notification caps are not single-owner: the UART IRQ witness mints a third cap into init, and delegation, fork inheritance and IPC transfer all copy them. A Notification now lives while any live capability names its exact `{index, generation}`; removing a capability gives back only its own reference, and the last removal destroys the object. See `doc/IPC.md` §8.8.
+
 Audit findings:
 - `create_notification` mints **exactly two** caps for one object — a `SIGNAL`
   cap and a `RECEIVE` cap — both into the creator's active cnode. It never mints
@@ -9863,6 +9865,8 @@ Audit-only (no production code changed in Part B). Findings:
 | Notification | single-owner | never | yes (`destroy_notification_for_revoked_cap`) |
 | Endpoint | multi-owner | yes (spawn delegates SEND to parent) | no (object persists; `destroy_endpoint` is a separate explicit path) |
 | Reply | one-shot, caller+replier slots | never | n/a (consumed by `ipc_reply` or cleared by `revoke_reply_caps_for_caller`) |
+
+> **Superseded by NOTIF-LIFETIME1 (2026-11-09).** Notification caps are not single-owner: the UART IRQ witness mints a third cap into init, and delegation, fork inheritance and IPC transfer all copy them. A Notification now lives while any live capability names its exact `{index, generation}`; removing a capability gives back only its own reference, and the last removal destroys the object. See `doc/IPC.md` §8.8.
 
 ### 42.6 Deferred (Stage 24)
 

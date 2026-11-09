@@ -1793,6 +1793,76 @@ staying `WaiterOwnershipBusy`, and a source guard on both routes' refusal arms. 
 guards pin the telemetry rules: the shared unwind names no cause, the race pair is logged
 by the race only, and a refusal is fail-closed unless its unwind restored it.
 
+### 8.8 Notification lifetime (NOTIF-LIFETIME1)
+
+**Contract.** A Notification is a shareable IPC object. The incarnation `{index, generation}`
+exists while at least one live capability names it. Removing a capability gives back that
+capability's reference and nothing more. Revocation still removes the capability's delegation
+subtree under the existing rules, and each removed capability gives back its own reference. The
+object is destroyed only when the last reference goes. A capability naming any other generation
+of the slot cannot destroy, modify or decrement the incarnation that occupies it. This holds for
+SIGNAL and RECEIVE caps, same-process copies, cross-process delegation, fork inheritance and IPC
+cap transfer. Holding a capability does not confer destruction of an object others still hold.
+
+**Accounting.** `IpcSubsystem::notification_refs[i]` counts the references on the incarnation
+whose generation is `notification_generations[i]`. It lives with the object at IPC rank 3 and is
+changed only by the two bodies in `src/kernel/boot/notification_lifetime.rs`:
+
+* **reserve** runs at rank 3 *before* a capability is inserted at rank 4. It refuses an empty
+  slot (`WrongObject`) and a different generation or a zero count (`StaleCapability`). Zero is
+  terminal, so no publication can resurrect a destroyed object.
+* **release** runs at rank 3 *after* a capability was removed at rank 4, and is THE destruction
+  owner. In one rank-3 critical section it compares the generation, decrements, and at zero
+  clears the IRQ routes naming the slot, takes the waiter, removes the object and advances the
+  generation once. A mismatch, an empty slot or an over-release changes nothing. The retired
+  waiter is woken after rank 3 is released, through the existing exact-identity wake.
+
+Because a reference is always taken before its capability can be seen and given back only
+after it has gone, the count is never below the number of visible capabilities. Ranks 3 and 4
+are never held together. The linearization points are:
+
+* publication: the rank-3 reserve;
+* removal: the rank-4 slot clear;
+* destruction: the rank-3 release that reaches zero.
+
+A removal whose release is still owed only keeps the object alive a little longer.
+
+**Owners.**
+
+* *Insertion* — each reserves first and gives the reference back on every refusal:
+  `create_notification` (one creation hold for the duration of its two mints),
+  `mint_capability_in_cnode`, the split mint seam `mint_capability_with_memory_ref_split`
+  (which carries transfer materialization), broad delegation (also fork and spawn), and the split
+  spawn owner's mint and delegation.
+* *Removal* — each reports exactly what it removed and releases it:
+  `CapabilitySpace::revoke_reporting` (root and every derived descendant), the broad revoke, leaf
+  delete and direct revoke, both split revoke commits, the split mint rollback (only for a slot
+  it actually cleared), the provisional-cap release, `release_delegation` (broad and split), the
+  broad cnode cleanup, and the no-alloc reap that drops a cspace whole.
+* The process-cnode grant is released only before anything is minted into its space.
+
+`kernel::boot::tests::notif_lifetime1::every_cspace_mutation_site_is_an_accounted_owner` pins the
+site counts and the reserve-before-publish order.
+
+**A transfer in flight holds no reference.** Materialization delegates from the sender's
+capability. If the sender has given up every capability before the receiver materializes, the
+object is gone and nothing is materialized.
+
+**Coverage.** Hosted, broad and split:
+
+* `irq_generation1` G1–G6 plant a capability the accounting never counted, because no
+  production path can make one, and prove the owner is generation-exact;
+* `irq_generation1_lifetime` L1–L3: a second holder's revoke or exit leaves the first
+  holder's object;
+* `notif_lifetime1`: transfer, recursive revocation, failed mint / delegation / fork /
+  creation, the reserve/remove interleavings, stale publication onto a reused slot, and the
+  site census.
+
+Every step checks that references equal the live capabilities naming the incarnation. Live
+coverage comes from the UART/PL011 IRQ witnesses, the only production creator: creation, the
+cross-process mint into init, the bind and delivery. No default image creates a Notification,
+and no live path revokes or reaps a Notification holder.
+
 ---
 
 ## 9. Authoring rule

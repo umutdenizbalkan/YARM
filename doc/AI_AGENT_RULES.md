@@ -1018,6 +1018,10 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   resumable=1`. `IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED` stays a zero gate: it is logged for any
   refusal the unwind did not restore and for `InvalidEndpoint`. Never move a marker to make
   a gate pass without attributing every emitter first.
+- Notification lifetime is capability-referenced (NOTIF-LIFETIME1, `doc/IPC.md` §8.8). Never
+  destroy a Notification by slot index or because one capability went. Reserve its reference
+  before a capability becomes visible and release it after the capability is gone, through
+  `notification_lifetime`.
 
 ### 14.4 D3/D6 fences
 

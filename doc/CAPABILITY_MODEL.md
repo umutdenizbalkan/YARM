@@ -450,6 +450,14 @@ consumed exactly once.
 
 ---
 
+### 7.1 Notification capabilities carry a reference (NOTIF-LIFETIME1)
+
+Every cspace site that inserts or removes a capability is an accounted owner. A Notification
+capability takes its object's reference at IPC rank 3 *before* it is inserted at rank 4, and
+gives it back *after* it is removed. A new insertion or removal site must do the same, or the
+`every_cspace_mutation_site_is_an_accounted_owner` census fails. The contract and its owners are
+in `doc/IPC.md` §8.8. No other object class gained a reference count.
+
 ## 8. No cap materialization under IPC lock
 
 The IPC send / recv fast paths must **not** call `mint_capability_*` or
