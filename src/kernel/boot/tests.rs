@@ -17703,20 +17703,24 @@ fn exit_task_clears_notification_waiter_slot() {
         .expect("spawn");
     state.yield_current_to(ThreadId(201)).expect("switch");
 
-    let (notif_idx, _notif_cap, _notif_recv) = state.create_notification(4).expect("notif");
+    let (notif_idx, _notif_cap, notif_recv) = state.create_notification(4).expect("notif");
 
-    // Inject the task as a notification waiter.
-    state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] =
-            Some(crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(
-                crate::kernel::ipc::ThreadId(201),
-            ));
-    });
+    // NOTIF-WAITER1: the task publishes its waiter through the real blocking receive, so the
+    // record names its true identity `{201, asid}`. (The original fixture injected a bare-TID
+    // record with ASID 0 — an identity task 201 does not have; exact-identity teardown rightly
+    // leaves such a record alone, which the companion test below pins.)
+    assert_eq!(
+        state.ipc_recv(notif_recv),
+        Ok(None),
+        "201 blocks on the notification"
+    );
 
     let waiter_before = state.with_ipc_state(|ipc| ipc.notification_waiters[notif_idx]);
     assert!(
-        waiter_before.is_some(),
-        "notification waiter slot occupied before exit"
+        waiter_before
+            .is_some_and(|w| w.receiver
+                == crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(201), asid)),
+        "notification waiter slot occupied before exit, naming 201's real identity"
     );
 
     state.exit_task(201, 0).expect("exit");
@@ -17725,6 +17729,39 @@ fn exit_task_clears_notification_waiter_slot() {
     assert!(
         waiter_after.is_none(),
         "notification waiter slot must be cleared by exit_task"
+    );
+}
+
+/// NOTIF-WAITER1 companion: exit removes the exiting task's notification waiter by its COMPLETE
+/// identity. A record naming the same numeric TID under a different ASID belongs to another
+/// incarnation and survives (it can never wake this task: the signal's exact proof refuses it,
+/// and the next receive reclaims it as stale).
+#[test]
+fn exit_task_leaves_a_same_tid_other_asid_notification_record_alone() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
+            tid: 201,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("spawn");
+    state.yield_current_to(ThreadId(201)).expect("switch");
+    let (notif_idx, _notif_cap, _notif_recv) = state.create_notification(4).expect("notif");
+    assert_ne!(asid, crate::kernel::vm::Asid(0));
+    let other = crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(201));
+    state.with_ipc_state_mut(|ipc| ipc.notification_waiters[notif_idx] = Some(other));
+
+    state.exit_task(201, 0).expect("exit");
+
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.notification_waiters[notif_idx]),
+        Some(other),
+        "a record of another {{tid, asid}} incarnation is not removed by numeric TID"
     );
 }
 
@@ -123066,9 +123103,11 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Can,
         ),
+        // NOTIF-WAITER1: the notification receive's block moved, unchanged, out of
+        // `ipc_recv_with_optional_deadline` into its own owner.
         (
             "src/kernel/boot/ipc_state.rs",
-            "ipc_recv_with_optional_deadline",
+            "notification_recv_blocking",
             1,
             Verdict::IntoBlocked,
         ),
@@ -123642,7 +123681,7 @@ mod stage199d_wa2b_wake_owner_census {
         ),
         (
             "src/kernel/boot/ipc_state.rs",
-            "ipc_recv_with_optional_deadline",
+            "notification_recv_blocking",
             "tcb.status",
             "TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))",
             ".ok_or(KernelError::TaskMissing)?;",
@@ -124223,6 +124262,15 @@ mod stage199d_wa2b_wake_owner_census {
                     // receiver instead of stranding it `Blocked(EndpointReceive)` forever. A new
                     // logical wake origin — recorded here rather than suppressed.
                     ("src/kernel/boot/ipc_state.rs", "destroy_endpoint", 1),
+                    // NOTIF-WAITER1: the notification receive's unpublished unwind — a gone
+                    // incarnation, an event that raced the block, or a competing live waiter.
+                    // Nothing was published, so the block is reversed through this same body,
+                    // the IPC-DISPLACE1 refusal shape. A new direct caller, recorded here.
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "notification_recv_blocking",
+                        1,
+                    ),
                     ("src/kernel/boot/ipc_state.rs", "recv_block_unwind_race", 1),
                     // Stage 199D-WA3C2: the OWNERSHIP-BUSY unwind. When an in-flight direct
                     // transaction still holds the endpoint's previous receive incarnation, the
@@ -206652,5 +206700,939 @@ mod notif_lifetime1 {
             2,
             "the split spawn owner's mint and delegation both reserve"
         );
+    }
+}
+
+/// NOTIF-WAITER1 — the blocking notification receive, through the real receive owner
+/// (`KernelState::ipc_recv` / `ipc_recv_with_deadline` on a RECEIVE capability of a notification)
+/// and the real signal owner (`route_external_irq` over a bound IRQ line).
+///
+/// Reachability: no syscall reaches this receive. NR 2 and NR 5 validate an ENDPOINT capability
+/// first, and the witness builds' only notification door is the non-blocking NR 5 probe, so these
+/// are hosted proofs of the kernel primitive, not of a freestanding route.
+mod notif_waiter1 {
+    use super::*;
+    use crate::kernel::boot::EndpointWaiterRecord;
+    use crate::kernel::boot::ipc_state::notif_recv_phase_hook;
+    use crate::kernel::capabilities::CapRights;
+    use crate::runtime::SharedKernel;
+
+    pub(super) const R1: u64 = 1;
+    pub(super) const R2: u64 = 2;
+    pub(super) const LINE: u16 = 27;
+
+    pub(super) struct Rig {
+        pub(super) state: KernelState,
+        pub(super) idx: usize,
+        pub(super) generation: u64,
+        pub(super) sig: CapId,
+        pub(super) recv: [CapId; 3],
+    }
+
+    /// Task 0 (current) creates N and binds LINE to it; tasks 1 and 2 each get a RECEIVE copy.
+    pub(super) fn rig() -> Rig {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(R1).expect("r1");
+        state.register_task(R2).expect("r2");
+        let (idx, sig, recv0) = state.create_notification(8).expect("notif");
+        state.bind_irq_notification(LINE, sig).expect("bind");
+        let generation = state.with_ipc_state(|ipc| ipc.notification_generations[idx]);
+        let recv1 = state
+            .grant_capability_task_to_task_with_rights(0, recv0, R1, CapRights::RECEIVE)
+            .expect("r1 recv");
+        let recv2 = state
+            .grant_capability_task_to_task_with_rights(0, recv0, R2, CapRights::RECEIVE)
+            .expect("r2 recv");
+        Rig {
+            state,
+            idx,
+            generation,
+            sig,
+            recv: [recv0, recv1, recv2],
+        }
+    }
+
+    /// Make `tid` the current task through the ordinary scheduler.
+    pub(super) fn run_as(state: &mut KernelState, tid: u64) {
+        if state.current_tid() == Some(tid) {
+            return;
+        }
+        if !state.task_present_in_any_runqueue(tid) {
+            state.enqueue_current_cpu(tid).expect("enqueue");
+        }
+        for _ in 0..32 {
+            if state.current_tid() == Some(tid) {
+                return;
+            }
+            if state.current_tid().is_none() {
+                let _ = state.dispatch_next_task();
+            } else {
+                let _ = state.yield_current();
+            }
+        }
+        assert_eq!(state.current_tid(), Some(tid), "could not schedule {tid}");
+    }
+
+    pub(super) fn waiter(state: &KernelState, idx: usize) -> Option<EndpointWaiterRecord> {
+        state.with_ipc_state(|ipc| ipc.notification_waiters[idx])
+    }
+
+    pub(super) fn wait_generation(state: &KernelState, tid: u64) -> u64 {
+        state.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.blocked_recv_generation)
+                .expect("tcb")
+        })
+    }
+
+    pub(super) fn record_names(
+        record: Option<EndpointWaiterRecord>,
+        tid: u64,
+        generation: u64,
+    ) -> bool {
+        record.is_some_and(|r| {
+            r.receiver.tid == ThreadId(tid)
+                && r.receiver.asid == crate::kernel::vm::Asid(0)
+                && r.wait_generation == generation
+        })
+    }
+
+    pub(super) fn pending(state: &KernelState, idx: usize) -> bool {
+        state.with_ipc_state(|ipc| ipc.notifications[idx].as_ref().is_some_and(|n| n.len != 0))
+    }
+
+    /// N1 — a second receiver on the same notification must not replace the first one's waiter.
+    #[test]
+    fn n1_a_second_receiver_cannot_overwrite_the_first_receivers_waiter() {
+        let mut rig = rig();
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None), "R1 blocks");
+        assert!(rig.state.task_is_blocked(R1));
+        let g1 = wait_generation(&rig.state, R1);
+        assert!(
+            record_names(waiter(&rig.state, rig.idx), R1, g1),
+            "R1 is the waiter"
+        );
+
+        run_as(&mut rig.state, R2);
+        let second = rig.state.ipc_recv(rig.recv[2]);
+        assert_eq!(second, Err(KernelError::EndpointQueueFull), "R2 is refused");
+        assert!(
+            !rig.state.task_is_blocked(R2),
+            "the refused receiver is not left blocked"
+        );
+        assert!(
+            record_names(waiter(&rig.state, rig.idx), R1, g1),
+            "R1 is still the waiter"
+        );
+
+        rig.state.route_external_irq(LINE).expect("signal");
+        assert!(rig.state.task_is_runnable(R1), "the signal wakes R1");
+        assert_eq!(waiter(&rig.state, rig.idx), None);
+    }
+
+    /// N2 — a signal landing after the receiver is Blocked but before its waiter is published
+    /// must not leave the receiver asleep with the event queued.
+    #[test]
+    fn n2_a_signal_before_publication_is_not_lost() {
+        let mut rig = rig();
+        run_as(&mut rig.state, R1);
+        notif_recv_phase_hook::arm(alloc::boxed::Box::new(|s: &mut KernelState| {
+            s.route_external_irq(LINE).expect("signal in the window");
+        }));
+        let got = rig.state.ipc_recv(rig.recv[1]);
+        let asleep_with_event = rig.state.task_is_blocked(R1) && pending(&rig.state, rig.idx);
+        assert!(
+            !asleep_with_event,
+            "R1 asleep while its event is queued: {got:?}"
+        );
+        assert!(
+            matches!(got, Ok(Some(_))),
+            "the receiver consumes the event that raced its publication: {got:?}"
+        );
+    }
+
+    /// N3 — the incarnation the receiver validated is destroyed and its slot reused before the
+    /// waiter is published: the old receiver must not attach to the new incarnation.
+    #[test]
+    fn n3_an_old_receiver_cannot_publish_onto_a_reused_slot() {
+        let mut rig = rig();
+        let idx = rig.idx;
+        let caps = rig.recv;
+        let sig = rig.sig;
+        run_as(&mut rig.state, R1);
+        notif_recv_phase_hook::arm(alloc::boxed::Box::new(move |s: &mut KernelState| {
+            // Every capability of N1 goes, so N1 is destroyed; the slot is then reused.
+            for (tid, cap) in [(0u64, sig), (0, caps[0]), (R1, caps[1]), (R2, caps[2])] {
+                let cnode = s.task_cnode(tid).expect("cnode");
+                let _ = s.revoke_capability_in_cnode(cnode, cap);
+            }
+            assert!(
+                s.with_ipc_state(|ipc| ipc.notifications[idx].is_none()),
+                "N1 destroyed"
+            );
+            // The creator runs (as another CPU would) and creates a new incarnation.
+            if s.current_tid() != Some(0) {
+                let _ = s.idle_re_enqueue_for_test();
+                run_as(s, 0);
+            }
+            let (i2, _sig2, _recv2) = s.create_notification(8).expect("N2");
+            assert_eq!(i2, idx, "the slot is reused");
+        }));
+        let got = rig.state.ipc_recv(rig.recv[1]);
+        assert_ne!(
+            rig.state
+                .with_ipc_state(|ipc| ipc.notification_generations[idx]),
+            rig.generation,
+            "a newer incarnation occupies the slot"
+        );
+        assert_eq!(
+            waiter(&rig.state, idx),
+            None,
+            "no old receiver on the new incarnation: {got:?}"
+        );
+        assert!(
+            !rig.state.task_is_blocked(R1),
+            "the old receiver is restored, not parked"
+        );
+        assert!(got.is_err(), "and told its object is gone: {got:?}");
+    }
+
+    fn status(state: &KernelState, tid: u64) -> Option<TaskStatus> {
+        state.task_status(tid)
+    }
+
+    fn refs(state: &KernelState, idx: usize) -> u32 {
+        state.with_ipc_state(|ipc| ipc.notification_refs[idx])
+    }
+
+    fn accounting(state: &KernelState, idx: usize) {
+        super::irq_generation1::assert_accounting_exact(state, idx);
+    }
+
+    /// A rig whose kernel is shared, so a hook can drive the off-lock (split) paths — the code
+    /// another CPU runs without the global lock — inside the receive's window.
+    fn shared_rig() -> (&'static SharedKernel, usize, [CapId; 3]) {
+        let rig = rig();
+        let (idx, recv) = (rig.idx, rig.recv);
+        let mut state = rig.state;
+        state.set_timer_for_test(Timer::new(1));
+        let k: &'static SharedKernel =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(SharedKernel::new(state)));
+        (k, idx, recv)
+    }
+
+    fn deadline_of(state: &KernelState, tid: u64) -> u64 {
+        state.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.ipc_timeout_deadline)
+                .expect("a deadline rode with the block")
+        })
+    }
+
+    /// §6.2 — the receiver that was already waiting survives the refusal untouched: still
+    /// Blocked, same wait generation, same exact record, no timeout disturbed — for an untimed
+    /// and for a timed first receiver alike.
+    #[test]
+    fn t02_the_first_receiver_survives_the_refusal() {
+        for timed in [false, true] {
+            let mut rig = rig();
+            run_as(&mut rig.state, R1);
+            let first = if timed {
+                rig.state.ipc_recv_with_deadline(rig.recv[1], 50)
+            } else {
+                rig.state.ipc_recv(rig.recv[1])
+            };
+            assert_eq!(first, Ok(None));
+            let g1 = wait_generation(&rig.state, R1);
+            let d1 = rig.state.with_tcbs(|t| {
+                t.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == R1)
+                    .unwrap()
+                    .ipc_timeout_deadline
+            });
+            let before = waiter(&rig.state, rig.idx);
+            for _ in 0..3 {
+                run_as(&mut rig.state, R2);
+                assert_eq!(
+                    rig.state.ipc_recv(rig.recv[2]),
+                    Err(KernelError::EndpointQueueFull)
+                );
+            }
+            assert_eq!(
+                status(&rig.state, R1),
+                Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    rig.recv[1]
+                ))),
+                "timed={timed}"
+            );
+            assert_eq!(
+                wait_generation(&rig.state, R1),
+                g1,
+                "R1's block is not touched"
+            );
+            assert_eq!(
+                waiter(&rig.state, rig.idx),
+                before,
+                "the record is exactly R1's"
+            );
+            assert!(record_names(before, R1, g1));
+            let d_after = rig.state.with_tcbs(|t| {
+                t.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == R1)
+                    .unwrap()
+                    .ipc_timeout_deadline
+            });
+            assert_eq!(d_after, d1, "R1's timeout survives (timed={timed})");
+            assert!(
+                !rig.state.task_present_in_any_runqueue(R1),
+                "R1 stays parked"
+            );
+        }
+    }
+
+    /// §6.3 — after a refusal, the signal reaches the ORIGINAL receiver, exactly once: R1 is
+    /// woken and consumes the one event; R2 is never woken by it, and nothing is duplicated.
+    #[test]
+    fn t03_the_signal_reaches_the_original_receiver_exactly_once() {
+        let mut rig = rig();
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None));
+        run_as(&mut rig.state, R2);
+        assert_eq!(
+            rig.state.ipc_recv(rig.recv[2]),
+            Err(KernelError::EndpointQueueFull)
+        );
+        let r2_gen = wait_generation(&rig.state, R2);
+
+        rig.state.route_external_irq(LINE).expect("signal");
+        assert!(
+            rig.state.task_is_runnable(R1),
+            "the original receiver is woken"
+        );
+        assert_eq!(wait_generation(&rig.state, R2), r2_gen, "R2 is not touched");
+        assert!(!rig.state.task_is_blocked(R2));
+        assert_eq!(waiter(&rig.state, rig.idx), None, "the record is consumed");
+
+        run_as(&mut rig.state, R1);
+        assert!(
+            matches!(rig.state.ipc_recv(rig.recv[1]), Ok(Some(_))),
+            "R1 gets its event"
+        );
+        assert!(
+            !pending(&rig.state, rig.idx),
+            "exactly one event, consumed once"
+        );
+        assert_eq!(
+            rig.state.ipc_recv(rig.recv[1]),
+            Ok(None),
+            "nothing is duplicated: R1 parks"
+        );
+    }
+
+    /// §6.4 — the refused receiver is restored through the receive family's unwind: Runnable or
+    /// Running, in a run queue (or current), its timeout disarmed, no record of it anywhere, and
+    /// it can still use the notification legitimately once the slot is free.
+    #[test]
+    fn t04_the_refused_receiver_is_restored() {
+        let mut rig = rig();
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None));
+        run_as(&mut rig.state, R2);
+        assert_eq!(
+            rig.state.ipc_recv_with_deadline(rig.recv[2], 50),
+            Err(KernelError::EndpointQueueFull),
+            "a timed competitor is refused too"
+        );
+        assert!(matches!(
+            status(&rig.state, R2),
+            Some(TaskStatus::Runnable | TaskStatus::Running)
+        ));
+        assert!(
+            rig.state.task_present_in_any_runqueue(R2),
+            "R2 is schedulable again — never stranded off every queue"
+        );
+        let r2_deadline = rig.state.with_tcbs(|t| {
+            t.iter()
+                .flatten()
+                .find(|t| t.tid.0 == R2)
+                .unwrap()
+                .ipc_timeout_deadline
+        });
+        assert_eq!(
+            r2_deadline, None,
+            "the refused receive's timeout is disarmed"
+        );
+        assert!(
+            !rig.state
+                .with_ipc_state(|ipc| ipc.any_notification_waiter_is(
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(R2),
+                        crate::kernel::vm::Asid(0)
+                    )
+                )),
+            "no record of R2 anywhere"
+        );
+
+        // The slot frees; R2 can now wait legitimately and is the one the next signal wakes.
+        rig.state.route_external_irq(LINE).expect("signal R1");
+        run_as(&mut rig.state, R1);
+        assert!(matches!(rig.state.ipc_recv(rig.recv[1]), Ok(Some(_))));
+        run_as(&mut rig.state, R2);
+        assert_eq!(rig.state.ipc_recv(rig.recv[2]), Ok(None), "R2 parks now");
+        let g2 = wait_generation(&rig.state, R2);
+        assert!(record_names(waiter(&rig.state, rig.idx), R2, g2));
+        rig.state.route_external_irq(LINE).expect("signal R2");
+        assert!(rig.state.task_is_runnable(R2));
+    }
+
+    /// §6.5 — same-identity publication follows the exact wait-generation rule. A receiver
+    /// whose earlier record was left behind re-blocks under a strictly newer generation and
+    /// supersedes its own record; a record of another, no-longer-parked receiver is reclaimed
+    /// as stale; and at the owner, an equal or older generation of the same receiver is refused.
+    #[test]
+    fn t05_same_identity_publication_obeys_the_wait_generation() {
+        use crate::kernel::boot::notification_waiter::{
+            NotificationPublishOutcome as P, publish_notification_waiter_locked,
+        };
+        // (a) the same receiver re-blocks after a wake that left its record behind.
+        let mut rig = rig();
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None));
+        let g1 = wait_generation(&rig.state, R1);
+        // A wake through the receive family's ordinary seam — it does not know about the
+        // notification record, so the record is left naming the old block.
+        rig.state
+            .wake_tid_to_runnable_for_test(ThreadId(R1))
+            .expect("wake");
+        assert!(
+            record_names(waiter(&rig.state, rig.idx), R1, g1),
+            "left behind"
+        );
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None), "R1 re-blocks");
+        let g1b = wait_generation(&rig.state, R1);
+        assert!(g1b > g1);
+        assert!(
+            record_names(waiter(&rig.state, rig.idx), R1, g1b),
+            "the newer block supersedes the same receiver's older record"
+        );
+
+        // (b) a different receiver's record that no longer names a parked receive is stale.
+        rig.state
+            .wake_tid_to_runnable_for_test(ThreadId(R1))
+            .expect("wake");
+        run_as(&mut rig.state, R2);
+        assert_eq!(
+            rig.state.ipc_recv(rig.recv[2]),
+            Ok(None),
+            "R2 reclaims the stale record"
+        );
+        let g2 = wait_generation(&rig.state, R2);
+        assert!(record_names(waiter(&rig.state, rig.idx), R2, g2));
+        rig.state.route_external_irq(LINE).expect("signal");
+        assert!(
+            rig.state.task_is_runnable(R2),
+            "the signal wakes the live waiter"
+        );
+
+        // (c) the owner: equal or older generations of the same receiver are refused.
+        let incarnation = crate::kernel::boot::notification_lifetime::NotificationIncarnation {
+            index: rig.idx,
+            generation: rig.generation,
+        };
+        let id = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            ThreadId(R1),
+            crate::kernel::vm::Asid(0),
+        );
+        let rec = |g| EndpointWaiterRecord::new(id, g);
+        rig.state.with_ipc_state_mut(|ipc| {
+            // drain the pending event so publication is reachable
+            while ipc.notifications[rig.idx]
+                .as_mut()
+                .unwrap()
+                .recv()
+                .is_some()
+            {}
+            ipc.notification_waiters[rig.idx] = Some(rec(7));
+            assert_eq!(
+                publish_notification_waiter_locked(ipc, incarnation, rec(7), None),
+                P::ReceiverAlreadyWaiting(rec(7))
+            );
+            assert_eq!(
+                publish_notification_waiter_locked(ipc, incarnation, rec(6), None),
+                P::ReceiverAlreadyWaiting(rec(7))
+            );
+            assert_eq!(
+                publish_notification_waiter_locked(ipc, incarnation, rec(8), None),
+                P::Published
+            );
+            assert_eq!(ipc.notification_waiters[rig.idx], Some(rec(8)));
+            // a stale proof for a record no longer in the slot replaces nothing
+            let other = EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(R2),
+                    crate::kernel::vm::Asid(0),
+                ),
+                99,
+            );
+            assert_eq!(
+                publish_notification_waiter_locked(ipc, incarnation, other, Some(rec(7))),
+                P::ReceiverAlreadyWaiting(rec(8))
+            );
+        });
+    }
+
+    /// §6.7 — a signal after publication wakes the published waiter, which then consumes it.
+    #[test]
+    fn t07_a_signal_after_publication_wakes_the_waiter() {
+        let mut rig = rig();
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None));
+        rig.state.route_external_irq(LINE).expect("signal");
+        assert!(rig.state.task_is_runnable(R1));
+        assert!(rig.state.task_present_in_any_runqueue(R1));
+        assert_eq!(waiter(&rig.state, rig.idx), None);
+        run_as(&mut rig.state, R1);
+        assert!(matches!(rig.state.ipc_recv(rig.recv[1]), Ok(Some(_))));
+        assert!(!pending(&rig.state, rig.idx));
+    }
+
+    /// §6.6 (split / cross-CPU form) — the off-lock IRQ delivery, entered on CPU 1, lands in the
+    /// receive's window on CPU 0: no waiter is published yet, so it is `Delivered`; the
+    /// publication then finds the event and the receiver consumes it.
+    #[test]
+    fn t06_t14_a_split_signal_before_publication_is_not_lost() {
+        let (k, idx, recv) = shared_rig();
+        let seen = alloc::rc::Rc::new(core::cell::Cell::new(None));
+        let seen2 = seen.clone();
+        let got = k.with(|s| {
+            run_as(s, R1);
+            notif_recv_phase_hook::arm(alloc::boxed::Box::new(move |_s: &mut KernelState| {
+                seen2.set(Some(k.deliver_external_irq_split(CpuId(1), LINE)));
+            }));
+            s.ipc_recv(recv[1])
+        });
+        assert!(
+            matches!(seen.get(), Some(crate::kernel::boot::IrqDeliveryOutcome::Delivered { notification_idx, .. }) if notification_idx == idx),
+            "the window holds no waiter: {:?}",
+            seen.get()
+        );
+        assert!(matches!(got, Ok(Some(_))), "the event is consumed: {got:?}");
+        k.with(|s| {
+            assert!(!s.task_is_blocked(R1), "not asleep");
+            assert!(!pending(s, idx));
+            assert_eq!(waiter(s, idx), None);
+        });
+    }
+
+    /// §6.14 — a split delivery entered on CPU 1 after publication wakes the receiver blocked on
+    /// CPU 0 exactly, consumes the record, and makes the receiver schedulable.
+    #[test]
+    fn t14_a_cross_cpu_signal_wakes_the_published_waiter() {
+        let (k, idx, recv) = shared_rig();
+        let g = k.with(|s| {
+            run_as(s, R1);
+            assert_eq!(s.ipc_recv(recv[1]), Ok(None));
+            wait_generation(s, R1)
+        });
+        let outcome = k.deliver_external_irq_split(CpuId(1), LINE);
+        assert!(
+            matches!(outcome, crate::kernel::boot::IrqDeliveryOutcome::DeliveredAndWoke { waiter_tid, .. } if waiter_tid == R1),
+            "{outcome:?}"
+        );
+        k.with(|s| {
+            assert!(s.task_is_runnable(R1));
+            assert!(s.task_present_in_any_runqueue(R1), "placed on a run queue");
+            assert_eq!(waiter(s, idx), None);
+            assert_eq!(wait_generation(s, R1), g);
+            run_as(s, R1);
+            assert!(matches!(s.ipc_recv(recv[1]), Ok(Some(_))));
+        });
+    }
+
+    /// §6.8 — the production receive-timeout pipeline fires in the window, before publication:
+    /// the receiver is woken with its timeout fact, and the record the publication then makes is
+    /// retracted, so it never stands between the notification and its next receiver.
+    #[test]
+    fn t08_a_timeout_before_publication_leaves_no_record() {
+        let (k, idx, recv) = shared_rig();
+        let got = k.with(|s| {
+            run_as(s, R1);
+            notif_recv_phase_hook::arm(alloc::boxed::Box::new(move |s: &mut KernelState| {
+                let deadline = deadline_of(s, R1);
+                super::drive_production_timeouts(k, CpuId(0), deadline);
+            }));
+            s.ipc_recv_with_deadline(recv[1], 5)
+        });
+        assert_eq!(got, Ok(None));
+        k.with(|s| {
+            assert!(!s.task_is_blocked(R1), "the timeout woke R1");
+            assert!(
+                s.consume_ipc_timeout_fired_for_tid(R1).expect("marker"),
+                "with its timeout fact"
+            );
+            assert_eq!(waiter(s, idx), None, "the late publication was retracted");
+            // the next receiver is not locked out
+            run_as(s, R2);
+            assert_eq!(s.ipc_recv(recv[2]), Ok(None), "R2 parks");
+            let g2 = wait_generation(s, R2);
+            assert!(record_names(waiter(s, idx), R2, g2));
+            s.route_external_irq(LINE).expect("signal");
+            assert!(s.task_is_runnable(R2));
+        });
+    }
+
+    /// §6.9 — timeout and cancellation cleanup after publication: a timed-out receiver's exact
+    /// record is removed by the production pipeline, and a receiver that exits or dies while
+    /// waiting leaves nothing behind. In every case the next receiver parks normally.
+    #[test]
+    fn t09_timeout_exit_and_death_remove_the_exact_record() {
+        // timeout
+        let (k, idx, recv) = shared_rig();
+        let deadline = k.with(|s| {
+            run_as(s, R1);
+            assert_eq!(s.ipc_recv_with_deadline(recv[1], 5), Ok(None));
+            assert!(waiter(s, idx).is_some());
+            deadline_of(s, R1)
+        });
+        super::drive_production_timeouts(k, CpuId(0), deadline);
+        k.with(|s| {
+            assert!(!s.task_is_blocked(R1));
+            assert!(s.consume_ipc_timeout_fired_for_tid(R1).expect("marker"));
+            assert_eq!(waiter(s, idx), None, "the timeout removed R1's record");
+            run_as(s, R2);
+            assert_eq!(s.ipc_recv(recv[2]), Ok(None), "R2 is not locked out");
+        });
+
+        // exit and death while waiting
+        for kill in ["exit", "dead"] {
+            let mut rig = rig();
+            run_as(&mut rig.state, R1);
+            assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None));
+            match kill {
+                "exit" => {
+                    rig.state.exit_task(R1, 0).expect("exit");
+                }
+                _ => rig.state.mark_task_dead(R1).expect("dead"),
+            }
+            assert_eq!(
+                waiter(&rig.state, rig.idx),
+                None,
+                "{kill}: no record survives"
+            );
+            run_as(&mut rig.state, R2);
+            assert_eq!(
+                rig.state.ipc_recv(rig.recv[2]),
+                Ok(None),
+                "{kill}: R2 parks"
+            );
+            let g2 = wait_generation(&rig.state, R2);
+            assert!(record_names(waiter(&rig.state, rig.idx), R2, g2), "{kill}");
+        }
+    }
+
+    /// §6.10 — destruction during a wait: the final capability release destroys the object,
+    /// retires the waiter and wakes it (NOTIF-LIFETIME1, unchanged); destruction inside the
+    /// receive's window refuses the publication and restores the receiver.
+    #[test]
+    fn t10_destruction_during_a_wait() {
+        // after publication
+        let mut rig = rig();
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None));
+        for (tid, cap) in [
+            (0u64, rig.sig),
+            (0, rig.recv[0]),
+            (R1, rig.recv[1]),
+            (R2, rig.recv[2]),
+        ] {
+            let cnode = rig.state.task_cnode(tid).expect("cnode");
+            // revoking task 0's original also revokes the copies derived from it
+            let _ = rig.state.revoke_capability_in_cnode(cnode, cap);
+        }
+        assert!(
+            rig.state
+                .with_ipc_state(|ipc| ipc.notifications[rig.idx].is_none())
+        );
+        assert_eq!(waiter(&rig.state, rig.idx), None);
+        assert!(
+            !rig.state.task_is_blocked(R1),
+            "the destroyed object's waiter is woken"
+        );
+        accounting(&rig.state, rig.idx);
+
+        // inside the window
+        let mut rig = super::notif_waiter1::rig();
+        let (idx, caps, sig) = (rig.idx, rig.recv, rig.sig);
+        run_as(&mut rig.state, R1);
+        notif_recv_phase_hook::arm(alloc::boxed::Box::new(move |s: &mut KernelState| {
+            for (tid, cap) in [(0u64, sig), (0, caps[0]), (R1, caps[1]), (R2, caps[2])] {
+                let cnode = s.task_cnode(tid).expect("cnode");
+                let _ = s.revoke_capability_in_cnode(cnode, cap);
+            }
+        }));
+        assert_eq!(
+            rig.state.ipc_recv(rig.recv[1]),
+            Err(KernelError::StaleCapability)
+        );
+        assert_eq!(waiter(&rig.state, idx), None);
+        assert!(
+            !rig.state.task_is_blocked(R1),
+            "restored, not parked on nothing"
+        );
+        assert!(rig.state.task_present_in_any_runqueue(R1));
+        accounting(&rig.state, idx);
+    }
+
+    /// §6.11 — generation change and slot reuse, after the receiver's validation: (n3 covers
+    /// the window) here the NEW incarnation is fully usable by its own receiver afterwards, and
+    /// the old receiver's restoration did not consume or disturb anything of it.
+    #[test]
+    fn t11_the_new_incarnation_is_untouched_by_the_old_receiver() {
+        let mut rig = rig();
+        let (idx, caps, sig) = (rig.idx, rig.recv, rig.sig);
+        let new_caps = alloc::rc::Rc::new(core::cell::Cell::new(None));
+        let nc = new_caps.clone();
+        run_as(&mut rig.state, R1);
+        notif_recv_phase_hook::arm(alloc::boxed::Box::new(move |s: &mut KernelState| {
+            for (tid, cap) in [(0u64, sig), (0, caps[0]), (R1, caps[1]), (R2, caps[2])] {
+                let cnode = s.task_cnode(tid).expect("cnode");
+                let _ = s.revoke_capability_in_cnode(cnode, cap);
+            }
+            if s.current_tid() != Some(0) {
+                let _ = s.idle_re_enqueue_for_test();
+                run_as(s, 0);
+            }
+            let (i2, sig2, recv2) = s.create_notification(8).expect("N2");
+            assert_eq!(i2, idx);
+            s.bind_irq_notification(LINE, sig2).expect("rebind");
+            // an event already pending on the NEW incarnation when the old receiver decides
+            s.route_external_irq(LINE).expect("signal N2");
+            nc.set(Some(recv2));
+        }));
+        assert_eq!(
+            rig.state.ipc_recv(rig.recv[1]),
+            Err(KernelError::StaleCapability)
+        );
+        assert!(
+            pending(&rig.state, idx),
+            "the old receiver did not consume the new incarnation's event"
+        );
+        assert_eq!(waiter(&rig.state, idx), None);
+        accounting(&rig.state, idx);
+        let recv2 = new_caps.get().expect("N2 caps");
+        run_as(&mut rig.state, 0);
+        assert!(
+            matches!(rig.state.ipc_recv(recv2), Ok(Some(_))),
+            "N2's own receiver gets it"
+        );
+    }
+
+    /// §6.12 — recycled TID / ASID protection: the production waiter-teardown body run for an
+    /// identity that shares the waiter's numeric TID but not its ASID removes nothing, and the
+    /// live waiter is still woken by the next signal.
+    #[test]
+    fn t12_a_recycled_identity_cannot_remove_a_live_waiter() {
+        let mut rig = rig();
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None));
+        let g1 = wait_generation(&rig.state, R1);
+        let old_incarnation = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            ThreadId(R1),
+            crate::kernel::vm::Asid(7),
+        );
+        rig.state.with_ipc_state_mut(|ipc| {
+            let mut orphaned = [None; 4];
+            let _ = crate::kernel::boot::reap_claim::clear_ipc_waiters_for_identity_locked(
+                ipc,
+                old_incarnation,
+                &mut orphaned,
+            );
+            ipc.clear_notification_waiters_for_identity(old_incarnation);
+            assert!(!ipc.any_notification_waiter_is(old_incarnation));
+        });
+        assert!(
+            record_names(waiter(&rig.state, rig.idx), R1, g1),
+            "the live {{tid, asid}} waiter survives a same-TID teardown"
+        );
+        rig.state.route_external_irq(LINE).expect("signal");
+        assert!(rig.state.task_is_runnable(R1));
+    }
+
+    /// §6.13 — repeated signals: one wakes the waiter, the rest queue in order; each is consumed
+    /// exactly once, and the receiver then parks again.
+    #[test]
+    fn t13_repeated_signals_are_each_delivered_once() {
+        let mut rig = rig();
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None));
+        for _ in 0..3 {
+            rig.state.route_external_irq(LINE).expect("signal");
+        }
+        assert!(rig.state.task_is_runnable(R1));
+        run_as(&mut rig.state, R1);
+        for n in 0..3 {
+            assert!(
+                matches!(rig.state.ipc_recv(rig.recv[1]), Ok(Some(_))),
+                "event {n}"
+            );
+        }
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None), "no fourth event");
+        assert!(record_names(
+            waiter(&rig.state, rig.idx),
+            R1,
+            wait_generation(&rig.state, R1)
+        ));
+    }
+
+    /// §6.15 — compatibility with the refcounted lifetime: blocking, refusal, reclaim and
+    /// timeout move no reference; the waiter holds none, so the final capability release still
+    /// destroys immediately and wakes it.
+    #[test]
+    fn t15_the_waiter_holds_no_reference() {
+        let mut rig = rig();
+        let base = refs(&rig.state, rig.idx);
+        accounting(&rig.state, rig.idx);
+        run_as(&mut rig.state, R1);
+        assert_eq!(rig.state.ipc_recv(rig.recv[1]), Ok(None));
+        assert_eq!(
+            refs(&rig.state, rig.idx),
+            base,
+            "blocking takes no reference"
+        );
+        run_as(&mut rig.state, R2);
+        assert_eq!(
+            rig.state.ipc_recv(rig.recv[2]),
+            Err(KernelError::EndpointQueueFull)
+        );
+        assert_eq!(
+            refs(&rig.state, rig.idx),
+            base,
+            "a refusal moves no reference"
+        );
+        rig.state
+            .wake_tid_to_runnable_for_test(ThreadId(R1))
+            .expect("wake");
+        run_as(&mut rig.state, R2);
+        assert_eq!(rig.state.ipc_recv(rig.recv[2]), Ok(None), "reclaim");
+        assert_eq!(
+            refs(&rig.state, rig.idx),
+            base,
+            "a reclaim moves no reference"
+        );
+        accounting(&rig.state, rig.idx);
+        // Every capability goes while R2 waits: destroyed now, not deferred by the waiter.
+        for (tid, cap) in [
+            (0u64, rig.sig),
+            (0, rig.recv[0]),
+            (R1, rig.recv[1]),
+            (R2, rig.recv[2]),
+        ] {
+            let cnode = rig.state.task_cnode(tid).expect("cnode");
+            // revoking task 0's original also revokes the copies derived from it
+            let _ = rig.state.revoke_capability_in_cnode(cnode, cap);
+        }
+        assert!(
+            rig.state
+                .with_ipc_state(|ipc| ipc.notifications[rig.idx].is_none())
+        );
+        assert!(!rig.state.task_is_blocked(R2));
+        accounting(&rig.state, rig.idx);
+    }
+
+    /// §6.11 (owner) — the immediate take is generation-checked in the same acquisition: a
+    /// capability naming a previous incarnation of the slot consumes nothing of the current one.
+    /// (Under NOTIF-LIFETIME1 a live capability keeps its incarnation alive, so no real operation
+    /// presents such a capability; this pins the check at its owner.)
+    #[test]
+    fn the_immediate_take_refuses_a_different_incarnation() {
+        use crate::kernel::boot::notification_lifetime::NotificationIncarnation;
+        use crate::kernel::boot::notification_waiter::take_notification_event_locked;
+        let mut rig = rig();
+        rig.state.route_external_irq(LINE).expect("signal");
+        let (idx, generation) = (rig.idx, rig.generation);
+        rig.state.with_ipc_state_mut(|ipc| {
+            let older = NotificationIncarnation {
+                index: idx,
+                generation: generation.wrapping_sub(1),
+            };
+            let newer = NotificationIncarnation {
+                index: idx,
+                generation: generation + 1,
+            };
+            assert_eq!(take_notification_event_locked(ipc, older), Err(()));
+            assert_eq!(take_notification_event_locked(ipc, newer), Err(()));
+            assert_eq!(
+                ipc.notifications[idx].as_ref().map(|n| n.len),
+                Some(1),
+                "untouched"
+            );
+            let current = NotificationIncarnation {
+                index: idx,
+                generation,
+            };
+            assert!(matches!(
+                take_notification_event_locked(ipc, current),
+                Ok(Some(_))
+            ));
+            assert_eq!(take_notification_event_locked(ipc, current), Ok(None));
+        });
+    }
+
+    /// Structural: the waiter slot is written only by the owners. Outside test code, no file
+    /// publishes into `notification_waiters` except `notification_waiter.rs`, and no removal
+    /// matches a bare numeric TID.
+    #[test]
+    fn notification_waiters_are_written_only_by_their_owners() {
+        let files: &[(&str, &str)] = &[
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            (
+                "notification_lifetime.rs",
+                include_str!("notification_lifetime.rs"),
+            ),
+            (
+                "notification_waiter.rs",
+                include_str!("notification_waiter.rs"),
+            ),
+            ("reap_claim.rs", include_str!("reap_claim.rs")),
+            (
+                "orchestrator_state.rs",
+                include_str!("orchestrator_state.rs"),
+            ),
+            ("bootstrap_state.rs", include_str!("bootstrap_state.rs")),
+            ("runtime.rs", include_str!("../../runtime.rs")),
+            ("exit_txn.rs", include_str!("../syscall/exit_txn.rs")),
+            ("reap_txn.rs", include_str!("../syscall/reap_txn.rs")),
+        ];
+        let mut publishers = alloc::vec::Vec::new();
+        for (file, src) in files {
+            let code = src
+                .find("\n#[cfg(test)]\nmod tests {")
+                .map_or(*src, |cut| &src[..cut]);
+            let code = code
+                .find("\n#[cfg(test)]\npub(crate) mod notif_recv_phase_hook {")
+                .map_or(code, |cut| &code[..cut]);
+            for line in code.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                if t.contains("notification_waiters[") && t.contains("] = Some(") {
+                    publishers.push(*file);
+                }
+                assert!(
+                    !(t.contains("receiver.tid ==") || t.contains("w.receiver.tid")),
+                    "{file}: a waiter matched by bare TID: {t}"
+                );
+            }
+        }
+        assert_eq!(publishers, ["notification_waiter.rs"], "the only publisher");
     }
 }
