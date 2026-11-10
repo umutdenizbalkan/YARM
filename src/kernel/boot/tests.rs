@@ -208212,6 +208212,70 @@ mod irq_auth1 {
         );
     }
 
+    /// (owner) A stale teardown never touches a replacement: retraction and stale replacement
+    /// act only on the exact record they were given. Both run after a lock gap in production
+    /// (revalidation, the post-publication recheck, the reclaim), so the line may have been
+    /// rebound in between.
+    #[test]
+    fn a_stale_teardown_cannot_clear_or_replace_a_newer_route() {
+        use crate::kernel::boot::irq_binding::{
+            IrqBindOutcome, bind_irq_route_locked, retract_irq_route_exact_locked,
+        };
+        let mut state = Bootstrap::init().expect("init");
+        let (n1, _s1, _r1) = state.create_notification(4).expect("n1");
+        let (n2, _s2, _r2) = state.create_notification(4).expect("n2");
+        let older = IrqRoute {
+            notification: incarnation(&state, n1),
+            owner: IrqBindingOwner {
+                cnode: CNodeId(0),
+                cap: CapId::new(3, 1),
+            },
+        };
+        let newer = IrqRoute {
+            notification: incarnation(&state, n2),
+            owner: IrqBindingOwner {
+                cnode: CNodeId(0),
+                cap: CapId::new(4, 1),
+            },
+        };
+        state.with_ipc_state_mut(|ipc| {
+            ipc.irq_routes[usize::from(X)] = Some(newer);
+            assert!(
+                !retract_irq_route_exact_locked(ipc, X, older),
+                "not the record"
+            );
+            assert_eq!(
+                ipc.irq_routes[usize::from(X)],
+                Some(newer),
+                "the newer route stands"
+            );
+            let third = IrqRoute {
+                notification: incarnation_locked(ipc, n1),
+                owner: IrqBindingOwner {
+                    cnode: CNodeId(0),
+                    cap: CapId::new(5, 1),
+                },
+            };
+            assert_eq!(
+                bind_irq_route_locked(ipc, X, third, Some(older)),
+                Ok(IrqBindOutcome::Occupied(newer)),
+                "a stale proof for an older record replaces nothing"
+            );
+            assert!(retract_irq_route_exact_locked(ipc, X, newer));
+            assert_eq!(ipc.irq_routes[usize::from(X)], None);
+        });
+    }
+
+    fn incarnation_locked(
+        ipc: &crate::kernel::boot::IpcSubsystem,
+        idx: usize,
+    ) -> NotificationIncarnation {
+        NotificationIncarnation {
+            index: idx,
+            generation: ipc.notification_generations[idx],
+        }
+    }
+
     /// The live witnesses' provisioning shape: the route is owned by line authority held in the
     /// provisioning context, and init holds only RECEIVE on the Notification.
     #[test]
