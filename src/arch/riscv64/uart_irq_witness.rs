@@ -65,8 +65,14 @@ use super::page_table;
 /// How many data-bearing items the witness exchanges before the source is turned off: the eight
 /// idle/user items, and with `kthread-irq-witness` four KERNEL-THREAD items after them
 /// (KTHREAD1-ACCEPTANCE §2, `kernel::kirq_witness`).
-#[cfg(not(feature = "kthread-irq-witness"))]
+#[cfg(not(any(feature = "kthread-irq-witness", feature = "irq-saturation-witness")))]
 pub const WITNESS_ITEMS: u32 = 8;
+/// IRQ-DELIVERY1: with `irq-saturation-witness`, the saturation window's items follow the eight.
+#[cfg(all(
+    feature = "irq-saturation-witness",
+    not(feature = "kthread-irq-witness")
+))]
+pub const WITNESS_ITEMS: u32 = 8 + crate::kernel::boot::UART_IRQ_SATURATION_ITEMS;
 #[cfg(feature = "kthread-irq-witness")]
 pub const WITNESS_ITEMS: u32 = crate::kernel::kirq_witness::TOTAL_ITEMS;
 
@@ -74,7 +80,9 @@ pub const WITNESS_ITEMS: u32 = crate::kernel::kirq_witness::TOTAL_ITEMS;
 /// eight is an IDLE item when `n` is odd and a USER item when it is even; every later item is a
 /// KERNEL-THREAD item. The gate opens each item only in that window.
 pub const fn item_is_idle(item: u32) -> bool {
-    item <= 8 && item % 2 == 1
+    // IRQ-DELIVERY1: the saturation items are taken in the idle window too — init is parked and
+    // not receiving while they arrive.
+    (item <= 8 && item % 2 == 1) || (cfg!(feature = "irq-saturation-witness") && item > 8)
 }
 
 /// See [`item_is_idle`].

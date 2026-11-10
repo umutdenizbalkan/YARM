@@ -85,6 +85,7 @@ x86_64-uart-irq-witness = []
 # KTHREAD1-ACCEPTANCE §2: four kernel-thread items after the eight idle/user items of the
 # device-interrupt witness (init's receiver); accepted and inert in the other server crates.
 kthread-irq-witness = []
+irq-saturation-witness = []
 context1-witness = []
 context1-clobber = ["context1-witness"]
 recv-queue1-ordinary-grant = []

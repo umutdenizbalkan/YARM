@@ -8716,6 +8716,20 @@ pub const UART_IRQ_WITNESS_SELECTOR: u64 = 30;
 ))]
 pub const UART_IRQ_WITNESS_RING_VA: u64 = 0x2800_0000;
 
+/// IRQ-DELIVERY1 — the saturation window's items (`irq-saturation-witness`): ten device
+/// interrupts on the depth-8 witness Notification while init does not receive, so eight queue and
+/// two coalesce. Must equal init's receiver constant.
+#[cfg(all(
+    feature = "irq-saturation-witness",
+    not(feature = "kthread-irq-witness"),
+    any(
+        feature = "riscv-uart-irq-witness",
+        feature = "aarch64-pl011-irq-witness",
+        feature = "x86_64-uart-irq-witness"
+    )
+))]
+pub const UART_IRQ_SATURATION_ITEMS: u32 = 10;
+
 /// QEMU-IRQ1 §3 — what the witness provisioning handed init.
 #[cfg(any(
     feature = "riscv-uart-irq-witness",

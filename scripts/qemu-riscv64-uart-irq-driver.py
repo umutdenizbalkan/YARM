@@ -71,6 +71,11 @@ DISABLED_RE_X86_64 = re.compile(rb"IRQ3_UART_SOURCE_DISABLED ")
 DONE_RE = re.compile(rb"IRQ1_UART_WITNESS items=")
 DISABLED_RE = re.compile(rb"IRQ1_UART_SOURCE_DISABLED ")
 POST_RE = re.compile(rb"IRQ1_UART_POSTDISABLE_READY")
+# IRQ-DELIVERY1: the saturation window. On SAT_READY inject the first saturation byte; on each
+# later per-claim DRAIN marker inject the next, so every byte is its own device interrupt.
+SAT_RE = re.compile(rb"IRQ1_UART_SAT_READY count=(\d+) bytes=(\d+) claims=(\d+)")
+DRAIN_RE = re.compile(rb"IRQ\d_[A-Z0-9]+_DRAIN claim=(\d+)")
+SAT_BYTE_BASE = 0x60
 BYTE_BASE = 0x40
 POST_BYTE = ord("Z")
 
@@ -156,6 +161,7 @@ def main() -> int:
     injected = {}
     disabled_seen = False
     post_injected = False
+    sat = None  # [count, injected, claims_at_ready]
     done_at = None
     status = 2
     end = t0 + args.timeout
@@ -215,6 +221,16 @@ def main() -> int:
                 pending_idle = None
                 inject(byte, f"seq={seq} mode=idle ack=ready+idle")
                 continue
+            m = SAT_RE.search(line)
+            if m and sat is None and not args.no_inject:
+                sat = [int(m.group(1)), 1, int(m.group(3))]
+                inject(SAT_BYTE_BASE + 1, f"sat=1/{sat[0]} ack=sat_ready")
+                continue
+            m = DRAIN_RE.search(line)
+            if m and sat is not None and sat[1] < sat[0] and int(m.group(1)) > sat[2] + sat[1] - 1:
+                sat[1] += 1
+                inject(SAT_BYTE_BASE + sat[1], f"sat={sat[1]}/{sat[0]} ack=drain claim={int(m.group(1))}")
+                continue
             if disabled_re.search(line):
                 disabled_seen = True
             if POST_RE.search(line) and not post_injected and not args.no_inject:
@@ -225,6 +241,8 @@ def main() -> int:
                     log.write(b"\n#HOST_ERROR postdisable ready before the source was disabled\n")
             if DONE_RE.search(line) and done_at is None:
                 done_at = time.monotonic()
+    if sat is not None:
+        log.write(f"\n#HOST_SATURATION injected={sat[1]} of={sat[0]}\n".encode())
     log.write(f"\n#HOST_SUMMARY injected={len(injected)} post_injected={int(post_injected)} "
               f"status={status}\n".encode())
     log.close()

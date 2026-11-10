@@ -260,6 +260,14 @@ x86_64-uart-irq-witness = []
 # masked, register-patterned section and then unmasks, so the device interrupt is taken on that
 # thread and settled by the production owners. Without a port witness it compiles nothing.
 kthread-irq-witness = []
+# IRQ-DELIVERY1: the Notification saturation window of the device-interrupt witnesses. With one of
+# `riscv-uart-irq-witness`, `aarch64-pl011-irq-witness` or `x86_64-uart-irq-witness` (and without
+# `kthread-irq-witness`), adds ten items after the eight idle/user items: init stops receiving,
+# the host injects ten bytes paced by the kernel's per-claim marker, so ten real device
+# interrupts land on the witness Notification (depth 8) while nobody drains it. Eight queue and
+# two coalesce into the line's pending indication; init then receives eight events plus the
+# pending line, and the boot continues. Without a port witness it compiles nothing.
+irq-saturation-witness = []
 # QEMU-CONTEXT1: the user execution-state witness — init's cell (selector 31) with two real user
 # threads and a fresh thread, the provisioning of its park endpoint, and the kernel's per-trap
 # CTX1_TRAP identity markers. A build without it logs nothing and provisions nothing.

@@ -800,6 +800,80 @@ fn isolation_probes(park: u32) -> (u32, u32, bool) {
     )
 }
 
+/// IRQ-DELIVERY1 — the saturation window's items; must equal the kernel's
+/// `UART_IRQ_SATURATION_ITEMS`.
+#[cfg(feature = "irq-saturation-witness")]
+const SAT_ITEMS: u32 = 10;
+/// The witness Notification's queue depth (the kernel provisions `create_notification(8)`).
+#[cfg(feature = "irq-saturation-witness")]
+const SAT_QUEUE_DEPTH: u32 = 8;
+
+/// IRQ-DELIVERY1 — announce the window, then PARK without receiving while the host's bytes raise
+/// `SAT_ITEMS` real device interrupts on the bound line; once the kernel shows every byte drained
+/// and the source off, receive: the queue's `SAT_QUEUE_DEPTH` events and exactly one more — the
+/// line's coalesced pending indication — all labelled with the bound line, then nothing.
+#[cfg(feature = "irq-saturation-witness")]
+fn saturation_phase(notif: u32, park: u32, bound_line: u16) -> bool {
+    let (bytes_start, claims_start) = (ring_word(W_BYTES), ring_word(W_CLAIMS));
+    yarm_user_rt::user_log!(
+        "IRQ1_UART_SAT_READY count={} bytes={} claims={}",
+        SAT_ITEMS,
+        bytes_start,
+        claims_start
+    );
+    let (mut rounds, mut dup) = (0u32, 0u32);
+    while ring_word(W_BYTES) < bytes_start + SAT_ITEMS || ring_word(W_DISABLED) == 0 {
+        rounds += 1;
+        if rounds > MAX_IDLE_ROUNDS {
+            break;
+        }
+        if let Recv::Message { .. } = recv_timeout(park, IDLE_PARK_TICKS) {
+            dup += 1;
+        }
+    }
+    let bytes = ring_word(W_BYTES) - bytes_start;
+    let claims = ring_word(W_CLAIMS) - claims_start;
+    let (mut received, mut label_ok, mut errors) = (0u32, 0u32, 0u32);
+    loop {
+        match recv_timeout(notif, 0) {
+            Recv::Message { label, .. } => {
+                received += 1;
+                if label == bound_line {
+                    label_ok += 1;
+                }
+                if received > 64 {
+                    break;
+                }
+            }
+            Recv::Error => {
+                errors += 1;
+                break;
+            }
+            Recv::Empty | Recv::TimedOut => break,
+        }
+    }
+    let expected = SAT_QUEUE_DEPTH + 1;
+    let ok = bytes == SAT_ITEMS
+        && claims >= SAT_ITEMS
+        && received == expected
+        && label_ok == expected
+        && errors == 0
+        && dup == 0;
+    yarm_user_rt::user_log!(
+        "IRQ1_UART_SATURATION interrupts={} bytes={} claims={} received={} label_ok={} expected={} errors={} rounds={} result={}",
+        SAT_ITEMS,
+        bytes,
+        claims,
+        received,
+        label_ok,
+        expected,
+        errors,
+        rounds,
+        if ok { "ok" } else { "fail" }
+    );
+    ok
+}
+
 pub(super) fn run_once() {
     let notif = yarm_user_rt::runtime::startup_arg_slot(
         yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_0,
@@ -995,6 +1069,10 @@ pub(super) fn run_once() {
         );
     }
 
+    // ── IRQ-DELIVERY1: the saturation window ───────────────────────────────────────────────────
+    #[cfg(feature = "irq-saturation-witness")]
+    let sat_ok = saturation_phase(notif, park, bound_line);
+
     // ── After the source is off: timer and service progress, and silence ──────────────────────
     let disabled = ring_word(W_DISABLED);
     let (bytes_before, claims_before) = (ring_word(W_BYTES), ring_word(W_CLAIMS));
@@ -1042,6 +1120,8 @@ pub(super) fn run_once() {
         && post_timeouts == POST_ROUNDS
         && post_quiet
         && isolated;
+    #[cfg(feature = "irq-saturation-witness")]
+    let all = all && sat_ok;
     // KTHREAD1-ACCEPTANCE §2: the kernel-thread items, on a line of their own.
     #[cfg(feature = "kthread-irq-witness")]
     let all = all && kthread_items == ITEMS - 8;

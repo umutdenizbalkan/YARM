@@ -46,8 +46,14 @@ use super::irq::GicAck;
 /// How many data-bearing items the witness exchanges before the source is turned off: eight, and
 /// with `kthread-irq-witness` four KERNEL-THREAD items after them (KTHREAD1-ACCEPTANCE §2,
 /// `kernel::kirq_witness`).
-#[cfg(not(feature = "kthread-irq-witness"))]
+#[cfg(not(any(feature = "kthread-irq-witness", feature = "irq-saturation-witness")))]
 pub const WITNESS_ITEMS: u32 = 8;
+/// IRQ-DELIVERY1: with `irq-saturation-witness`, the saturation window's items follow the eight.
+#[cfg(all(
+    feature = "irq-saturation-witness",
+    not(feature = "kthread-irq-witness")
+))]
+pub const WITNESS_ITEMS: u32 = 8 + crate::kernel::boot::UART_IRQ_SATURATION_ITEMS;
 #[cfg(feature = "kthread-irq-witness")]
 pub const WITNESS_ITEMS: u32 = crate::kernel::kirq_witness::TOTAL_ITEMS;
 
