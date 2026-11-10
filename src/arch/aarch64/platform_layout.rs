@@ -18,6 +18,10 @@ pub const NEXT_ANON_PHYS_BASE: u64 = 0x5000_0000;
 pub const KERNEL_PHYS_DIRECT_MAP_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 
 pub const MAX_IRQ_LINES: usize = 64;
+/// IRQ-AUTH1 — the lowest line a device route may bind. Lines are GIC INTIDs: 0..16 are SGIs
+/// (the reschedule SGI among them) and 16..32 are per-CPU PPIs (the architected timer among
+/// them), all kernel-owned. Device interrupts are SPIs, from INTID 32.
+pub const FIRST_DEVICE_IRQ_LINE: u16 = 32;
 pub const MAX_CPUS: usize = 64;
 
 pub const BOOTSTRAP_CPU_ID: u8 = 0;

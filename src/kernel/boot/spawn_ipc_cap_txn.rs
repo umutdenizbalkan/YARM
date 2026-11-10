@@ -306,7 +306,14 @@ pub(crate) fn remove_unpublished_endpoint_locked(
         || ipc.endpoint_sender_waiters[index]
             .iter()
             .any(Option::is_some)
-        || ipc.irq_routes.iter().flatten().any(|route| *route == index)
+        // Pre-existing and preserved by IRQ-AUTH1: this compares Notification route targets with
+        // an ENDPOINT index (recorded in the deferred-defects list). It can only refuse a
+        // removal, never corrupt a route.
+        || ipc
+            .irq_routes
+            .iter()
+            .flatten()
+            .any(|route| route.notification.index == index)
     {
         return EndpointRemoval::Published;
     }

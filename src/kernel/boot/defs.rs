@@ -456,7 +456,9 @@ pub(crate) struct IpcSubsystem {
     /// is `notification_generations[i]`. Changed only by `notification_lifetime`'s reserve and
     /// release bodies; the release that brings it to zero destroys the incarnation.
     pub(crate) notification_refs: [u32; MAX_NOTIFICATIONS],
-    pub(crate) irq_routes: [Option<usize>; MAX_IRQ_LINES],
+    /// IRQ-AUTH1: each line's binding — the exact Notification incarnation and the owner IRQ
+    /// capability (`irq_binding`).
+    pub(crate) irq_routes: [Option<super::irq_binding::IrqRoute>; MAX_IRQ_LINES],
     pub(crate) transfer_envelopes: [Option<TransferEnvelope>; MAX_TRANSFER_ENVELOPES],
     pub(crate) transfer_envelope_generations: [u64; MAX_TRANSFER_ENVELOPES],
     pub(crate) active_transfer_mappings: [Option<ActiveTransferMapping>; MAX_TRANSFER_ENVELOPES],

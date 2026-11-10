@@ -19,6 +19,9 @@ pub const NEXT_ANON_PHYS_BASE: u64 = 0x1000_0000;
 pub const KERNEL_PHYS_DIRECT_MAP_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 
 pub const MAX_IRQ_LINES: usize = 64;
+/// IRQ-AUTH1 — the lowest line a device route may bind. Lines are PLIC sources, and source 0 is
+/// "no interrupt" by specification (the timer and software interrupts are not PLIC sources).
+pub const FIRST_DEVICE_IRQ_LINE: u16 = 1;
 pub const MAX_CPUS: usize = 64;
 
 pub const BOOTSTRAP_CPU_ID: u8 = 0;

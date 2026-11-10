@@ -5,9 +5,10 @@ use super::EndpointWaiterRecord;
 use super::{
     EndpointTakeOutcome, IpcEndpointPeekResult, IpcEndpointRecvResult, IpcEndpointSendResult,
     IpcEndpointSplitRejectReason, IpcFastpathResult, IpcSubsystem, KernelError, KernelState,
-    MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, NotificationObject, ReceiverWaiterIdentity,
-    ReplyCapRecord, ReplyRecordSetOutcome, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
+    MAX_ENDPOINT_SENDER_WAITERS, NotificationObject, ReceiverWaiterIdentity, ReplyCapRecord,
+    ReplyRecordSetOutcome, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
 };
+use crate::kernel::boot::irq_binding::{IrqRoute, routed_notification_locked};
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{EndpointMode, Message, ThreadId};
 use crate::kernel::syscall::complete_blocked_recv_for_waiter;
@@ -7490,7 +7491,7 @@ impl KernelState {
             // route bound to the previous generation.
             ipc.notification_waiters[slot] = None;
             for route in ipc.irq_routes.iter_mut() {
-                if *route == Some(slot) {
+                if route.is_some_and(|r| r.notification.index == slot) {
                     *route = None;
                 }
             }
@@ -7532,41 +7533,12 @@ impl KernelState {
         }
     }
 
-    pub fn bind_irq_notification(
-        &mut self,
-        irq_line: u16,
-        notification_cap: CapId,
-    ) -> Result<(), KernelError> {
-        let capability = self
-            .capability_service()
-            .resolve_current_task_capability(notification_cap)
-            .ok_or(KernelError::InvalidCapability)?;
-        if !capability.has_right(CapRights::SIGNAL) {
-            return Err(KernelError::MissingRight);
-        }
-
-        let notif_idx = self.resolve_notification_index(capability.object)?;
-        let irq_idx = irq_line as usize;
-        if irq_idx >= MAX_IRQ_LINES {
-            return Err(KernelError::WrongObject);
-        }
-        self.with_ipc_state_mut(|ipc| {
-            ipc.irq_routes[irq_idx] = Some(notif_idx);
-        });
-        Ok(())
-    }
-
-    fn signal_notification(
-        &mut self,
-        notification_idx: usize,
-        irq_line: u16,
-    ) -> Result<(), KernelError> {
+    fn signal_notification(&mut self, route: IrqRoute, irq_line: u16) -> Result<(), KernelError> {
         // Phase 1: send signal and snapshot waiter TID under ipc_state_lock.
         // Lock released before Phase 2 (task_state_lock, rank 2) to preserve ordering.
         let opt_waiter_tid = self.with_ipc_state_mut(|ipc| {
-            let notif = ipc.notifications[notification_idx]
-                .as_mut()
-                .ok_or(KernelError::WrongObject)?;
+            let notification_idx = route.notification.index;
+            let notif = routed_notification_locked(ipc, route)?;
             notif.send_irq(irq_line)?;
             Ok::<_, KernelError>(ipc.notification_waiters[notification_idx].take())
         })?;
@@ -7676,9 +7648,8 @@ impl KernelState {
 
     pub fn route_external_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
         let irq_idx = irq_line as usize;
-        let notification_idx =
-            self.with_ipc_state(|ipc| ipc.irq_routes.get(irq_idx).copied().flatten());
-        let Some(notification_idx) = notification_idx else {
+        let route = self.with_ipc_state(|ipc| ipc.irq_routes.get(irq_idx).copied().flatten());
+        let Some(route) = route else {
             return Ok(());
         };
         // Stage 21: a hardware IRQ that lands on a route whose target
@@ -7687,7 +7658,7 @@ impl KernelState {
         // this, a stale route surviving a destroy would turn every spurious
         // interrupt into a kernel error. `destroy_notification` clears matching
         // routes, so this is defence-in-depth for the destroy/deliver race.
-        match self.signal_notification(notification_idx, irq_line) {
+        match self.signal_notification(route, irq_line) {
             Ok(()) => Ok(()),
             Err(KernelError::WrongObject) => Ok(()),
             Err(e) => Err(e),

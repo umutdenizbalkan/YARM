@@ -375,6 +375,8 @@ pub fn enable_source_after_plic_ready(
     let route = super::boot::trap_shared_kernel_riscv().and_then(|shared| {
         shared.with_ipc_split_mut(|ipc| ipc.irq_routes.get(source as usize).copied().flatten())
     });
+    // IRQ-AUTH1: a route names its exact incarnation; the fixture needs only the slot.
+    let route = route.map(|r| r.notification.index);
     let Some(notification_idx) = route else {
         return deferred("witness_route_unbound");
     };

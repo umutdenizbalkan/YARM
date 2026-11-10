@@ -481,6 +481,8 @@ fn enable_source_interrupts_off(
 
     // ── 2. The route must already be bound through the production owner ───────────────────────
     let route = kernel.with_ipc_state(|ipc| ipc.irq_routes.get(gsi as usize).copied().flatten());
+    // IRQ-AUTH1: a route names its exact incarnation; the fixture needs only the slot.
+    let route = route.map(|r| r.notification.index);
     let Some(notification_idx) = route else {
         return deferred("route_unbound");
     };

@@ -66,6 +66,9 @@ pub(crate) struct NotificationRefRelease<const N: usize = 2> {
     /// Distinct incarnations that did not fit. Fail-safe: an unrecorded reference is leaked, never
     /// given back twice, so a full list can keep an object alive but can never destroy one.
     overflowed: u32,
+    /// IRQ-AUTH1: the lines whose IRQ capabilities this removal took out. Each is revalidated
+    /// after rank 4, so a route whose owner capability went is cleared (`irq_binding`).
+    irq_lines: u64,
 }
 
 impl<const N: usize> NotificationRefRelease<N> {
@@ -73,11 +76,17 @@ impl<const N: usize> NotificationRefRelease<N> {
         Self {
             entries: [(0, 0, 0); N],
             overflowed: 0,
+            irq_lines: 0,
         }
     }
 
-    /// Record one removed capability. Anything but a Notification owes nothing.
+    /// Record one removed capability. A Notification owes its reference; an IRQ capability owes
+    /// its line's route a revalidation; anything else owes nothing.
     pub(crate) fn note_object(&mut self, object: CapObject) {
+        if let CapObject::Irq { line } = object {
+            self.irq_lines |= super::irq_binding::irq_line_bit(line);
+            return;
+        }
         let Some(incarnation) = NotificationIncarnation::of(object) else {
             return;
         };
@@ -205,7 +214,7 @@ pub(crate) fn release_notification_refs_locked(
         };
     }
     for route in ipc.irq_routes.iter_mut() {
-        if *route == Some(i) {
+        if route.is_some_and(|r| r.notification == incarnation) {
             *route = None;
         }
     }
@@ -256,6 +265,9 @@ impl KernelState {
                 let _ = self.wake_destroyed_notification_waiter(record);
             }
         }
+        if release.irq_lines != 0 {
+            self.revalidate_irq_routes(release.irq_lines);
+        }
     }
 }
 
@@ -293,6 +305,9 @@ impl crate::runtime::SharedKernel {
             {
                 let _ = self.wake_destroyed_notification_waiter_split(record);
             }
+        }
+        if release.irq_lines != 0 {
+            self.revalidate_irq_routes_split(release.irq_lines);
         }
     }
 }

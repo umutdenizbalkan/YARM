@@ -6,6 +6,7 @@ mod cap_memory_mint_split;
 mod cap_transfer_delegation_split;
 mod cap_transfer_materialize_split;
 mod capability_lifecycle_state;
+pub(crate) mod irq_binding;
 pub(crate) mod notification_lifetime;
 pub(crate) mod notification_waiter;
 /// QEMU-SMP2 — the AArch64 two-CPU witness's bounded transaction record and its pure verifier.
@@ -8736,9 +8737,10 @@ pub struct UartIrqWitnessProvision {
 /// QEMU-IRQ1 §3 — provision init for the witness, through the EXISTING owners only.
 ///
 /// 1. a notification object (`create_notification`), whose SIGNAL root cap is what
-/// 2. `bind_irq_notification` — the existing, and until now uncalled, route owner — binds to the
-///    DTB-derived UART line, so `irq_routes[line]` is set by the same code any future driver
-///    binding will use;
+/// 2. `bind_irq_notification` binds, with line authority the kernel mints for the DTB-derived UART
+///    line through the authorized internal path (`mint_irq_cap`, IRQ-AUTH1). The route is owned
+///    by that IRQ capability, held in the provisioning context, so `irq_routes[line]` is set by
+///    the same code any future driver binding will use. Init receives neither capability;
 /// 3. init receives a RECEIVE cap on that notification (`mint_capability_in_cnode`);
 /// 4. a private park endpoint (`create_endpoint`), SEND|RECEIVE into init;
 /// 5. one anonymous page (`alloc_anonymous_memory_object_with_len`), zeroed through the direct
@@ -8774,7 +8776,14 @@ pub fn provision_init_uart_irq_witness(
             return None;
         }
     };
-    if let Err(e) = kernel.bind_irq_notification(irq_line, signal_root) {
+    let irq_root = match kernel.mint_irq_cap(irq_line) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=mint_irq err={:?}", e);
+            return None;
+        }
+    };
+    if let Err(e) = kernel.bind_irq_notification(irq_root, signal_root) {
         crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=bind_irq err={:?}", e);
         return None;
     }

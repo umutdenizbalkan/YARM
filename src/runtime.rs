@@ -9294,10 +9294,18 @@ impl SharedKernel {
 
         // Phase 1 — rank 3, ONE acquisition: resolve, verify, signal, take the waiter.
         let resolved = self.with_ipc_split_mut(|ipc| {
-            let Some(notification_idx) = ipc.irq_routes.get(irq_line as usize).copied().flatten()
-            else {
+            let Some(route) = ipc.irq_routes.get(irq_line as usize).copied().flatten() else {
                 return Err(O::NoRoute);
             };
+            let notification_idx = route.notification.index;
+            // IRQ-AUTH1: the route names an exact incarnation; any other generation in the slot
+            // is not its object (the destruction owner clears routes in the same section, so
+            // this is defence in depth).
+            if ipc.notification_generations.get(notification_idx).copied()
+                != Some(route.notification.generation)
+            {
+                return Err(O::TargetGone { notification_idx });
+            }
             let Some(notif) = ipc
                 .notifications
                 .get_mut(notification_idx)

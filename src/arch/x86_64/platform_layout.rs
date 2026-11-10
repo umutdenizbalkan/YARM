@@ -27,6 +27,9 @@ pub const NEXT_ANON_PHYS_BASE: u64 = 0x1000_0000;
 pub const KERNEL_LINK_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
 
 pub const MAX_IRQ_LINES: usize = 64;
+/// IRQ-AUTH1 — the lowest line a device route may bind. Line L arrives at vector 0x20 + L, and
+/// vector 0x20 is the LAPIC timer, so line 0 is kernel-owned and never a device interrupt.
+pub const FIRST_DEVICE_IRQ_LINE: u16 = 1;
 pub const MAX_CPUS: usize = 64;
 
 pub const BOOTSTRAP_CPU_ID: u8 = 0;

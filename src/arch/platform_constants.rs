@@ -9,6 +9,8 @@
 
 pub const MAX_CPUS: usize = super::platform_layout::MAX_CPUS;
 pub const MAX_IRQ_LINES: usize = super::platform_layout::MAX_IRQ_LINES;
+/// IRQ-AUTH1 — lines below this are kernel-owned on the selected port and never bindable.
+pub const FIRST_DEVICE_IRQ_LINE: u16 = super::platform_layout::FIRST_DEVICE_IRQ_LINE;
 
 pub const BOOTSTRAP_CPU_ID: u8 = super::platform_layout::BOOTSTRAP_CPU_ID;
 /// The hardware timer deadline, in the selected port's own timer units (see its layout).
