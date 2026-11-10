@@ -80,9 +80,14 @@ pub const WITNESS_ITEMS: u32 = crate::kernel::kirq_witness::TOTAL_ITEMS;
 /// eight is an IDLE item when `n` is odd and a USER item when it is even; every later item is a
 /// KERNEL-THREAD item. The gate opens each item only in that window.
 pub const fn item_is_idle(item: u32) -> bool {
-    // IRQ-DELIVERY1: the saturation items are taken in the idle window too — init is parked and
-    // not receiving while they arrive.
-    (item <= 8 && item % 2 == 1) || (cfg!(feature = "irq-saturation-witness") && item > 8)
+    item <= 8 && item % 2 == 1
+}
+
+/// IRQ-DELIVERY1 — a saturation item (`irq-saturation-witness`): its interrupt must land while
+/// init is NOT receiving, and its origin is not graded, so its gate opens at ANY window point —
+/// an idle point whatever else is runnable, or a return into any task.
+pub const fn item_is_saturation(item: u32) -> bool {
+    cfg!(feature = "irq-saturation-witness") && item > 8
 }
 
 /// See [`item_is_idle`].
@@ -528,7 +533,9 @@ fn close_gate() {
 /// before the wait, so the external interrupt is the one pending when the wait unmasks and it
 /// lands on the `wfi` itself.
 pub fn gate_at_idle(shared: &crate::runtime::SharedKernel, cpu: crate::kernel::scheduler::CpuId) {
-    let armed = shared.runnable_count_on_cpu_split_read(cpu) == 0 && item_is_idle(next_item());
+    let item = next_item();
+    let armed = (shared.runnable_count_on_cpu_split_read(cpu) == 0 && item_is_idle(item))
+        || item_is_saturation(item);
     IDLE_GATE_ARMED.store(armed, Ordering::Release);
 }
 
@@ -548,6 +555,10 @@ pub fn commit_idle_gate() {
 /// is taken before the first U-mode instruction, so `sepc` is the receiver's resume point in the
 /// block.
 pub fn gate_at_user_return(resume_tid: u64) {
+    if item_is_saturation(next_item()) {
+        open_gate(next_item(), WINDOW_USER, resume_tid);
+        return;
+    }
     let receiver = RECEIVER_TID.load(Ordering::Acquire);
     if receiver == 0 || resume_tid != receiver {
         return;
