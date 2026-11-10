@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -u
+S=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad
+OUT=$S/isi1-evidence/nc; F=${F:?}; B=16e5c040f6a54a3a558cbb100de53f292ac173aa
+mkdir -p $OUT; : > $OUT/summary.txt
+T="ipc_sender_id1 u3_ordinary_cap_sender_wake u7_production_timeout_promotion u6_offlock_blocking_send_commit"
+run() { (cd $S/isi1nc-wt && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=$S/isi1nc-target cargo test --lib -- $T --test-threads=1); }
+summ() {
+  local tag=$1 rc=$2
+  res=$(grep -E '^test result' $OUT/$tag.log | tail -1)
+  failed=$(grep -E '^    kernel::' $OUT/$tag.log | sort -u | sed 's/.*tests:://' | paste -sd',' -)
+  echo "$tag rc=$rc $res FAILED=[$failed]" >> $OUT/summary.txt
+}
+# Baseline reproducers: 16e5c04 + only the tests that use production functions (no fix).
+git -C $S/isi1nc-wt checkout -q -f $B && git -C $S/isi1nc-wt clean -qfd
+python3 -I $S/isi1_baseline_tree.py $S/isi1nc-wt $S > /dev/null
+(git -C $S/isi1nc-wt rev-parse HEAD; git -C $S/isi1nc-wt diff --stat) > $OUT/baseline.patch.txt
+(cd $S/isi1nc-wt && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=$S/isi1nc-target cargo test --lib -- ipc_sender_id1 --test-threads=1) > $OUT/baseline.log 2>&1; summ baseline $?
+for nc in nc1 nc2 nc3 nc4 nc5 nc6 nc7 nc8 nc9 nc10 nc11 nc12; do
+  git -C $S/isi1nc-wt checkout -q -f $F && git -C $S/isi1nc-wt clean -qfd
+  python3 -I $S/isi1_nc.py $S/isi1nc-wt $nc > $OUT/$nc.patch.txt 2>&1
+  git -C $S/isi1nc-wt diff >> $OUT/$nc.patch.txt
+  run > $OUT/$nc.log 2>&1; summ $nc $?
+done
+git -C $S/isi1nc-wt checkout -q -f $F && git -C $S/isi1nc-wt clean -qfd
+run > $OUT/F_control.log 2>&1; summ F_control $?
+echo NC_DONE >> $OUT/summary.txt
