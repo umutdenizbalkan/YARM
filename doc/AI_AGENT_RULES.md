@@ -1042,6 +1042,12 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   `sender_waiter::claim_blocked_send_cycle_locked` with the waiter's exact
   `{tid, asid, send_generation}` and wakes only if that claim succeeded. Remove sender waiters only
   through `sender_waiter` (one cycle by its triple; a task by its TID, which names one TCB).
+- The sender waiter is the blocking-send cycle's arbitration token (SEND-TIMEOUT-ARB1,
+  `doc/IPC.md` §8.13). Whoever removes it at rank 3 owns the cycle's ending and its message's
+  envelope. A timeout withdraws the exact waiter BEFORE it claims; finding no waiter, it changes
+  nothing. Any new path that removes a sender waiter must end that cycle itself. Never claim a
+  `TimedOut` ending without holding the withdrawn waiter. Never release the envelope of a send
+  that parked a waiter.
 
 ### 14.4 D3/D6 fences
 

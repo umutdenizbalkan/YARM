@@ -2174,6 +2174,14 @@ refcount, never granted cross-process), so revoking any Notification cap destroy
 the object. Tests must cover the revoke teardown, its idempotence, the lock-rank
 separation outcomes, and stale-cap stability.
 
+> **SEND-TIMEOUT-ARB1 (2026-11-10).** A window that a production function does not return
+> across is entered through a `cfg(test)` phase hook at that exact point
+> (`sender_waiter::send_arb_phase_hook`: the broad block's Phase B→C and the timeout drain's
+> withdraw→claim), never by re-implementing the phase in the test. An arbitration test asserts
+> that the sender's result agrees with what happened to the message: who received it, whether a
+> waiter is left, the envelope's state and the wake count. The return code alone is not enough.
+> See `doc/IPC.md` §8.13.
+
 > **IPC-SENDER-ID1 (2026-11-10).** A test of a blocked sender blocks it for real
 > (`ipc_send_with_deadline` by the current task, or the off-lock publish+commit) and gives it an
 > ASID when it stands for a user task. A two-CPU race is written as the production phases in the

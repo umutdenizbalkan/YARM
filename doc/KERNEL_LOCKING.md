@@ -9329,6 +9329,15 @@ rank 3), preserving the create-two-phase pattern from §38.
 > follows only a successful claim. No acquisition, lock or ordering was added; a refused claim now
 > takes one fewer (no wake). See `doc/IPC.md` §8.12.
 
+> **SEND-TIMEOUT-ARB1 (2026-11-10).** The send-timeout drain's domain claims are now: a read-only
+> rank-2 precheck, the rank-3 withdrawal of the exact waiter, the rank-2 claim, the rank-3 then
+> rank-6 settle, and the rank-1 wake. They are sequential and never nested; before this change the
+> drain claimed at rank 2 first and removed at rank 3 second. Two seams gain a claim and a wake,
+> each after its rank-3 section is released:
+> * `destroy_endpoint` ends each cycle it removes;
+> * a refused Phase C publication ends its own cycle.
+> No lock or rank was added. See `doc/IPC.md` §8.13.
+
 ### 39.3 Bugs fixed (Stage 21)
 
 1. **`signal_notification` resurrected dead waiters** (`ipc_state.rs`,
@@ -9536,6 +9545,15 @@ left parked forever on an object that no longer exists.
 > the completion and makes the sender `Runnable` in that one task acquisition. The rank-1 wake
 > follows only a successful claim. No acquisition, lock or ordering was added; a refused claim now
 > takes one fewer (no wake). See `doc/IPC.md` §8.12.
+
+> **SEND-TIMEOUT-ARB1 (2026-11-10).** The send-timeout drain's domain claims are now: a read-only
+> rank-2 precheck, the rank-3 withdrawal of the exact waiter, the rank-2 claim, the rank-3 then
+> rank-6 settle, and the rank-1 wake. They are sequential and never nested; before this change the
+> drain claimed at rank 2 first and removed at rank 3 second. Two seams gain a claim and a wake,
+> each after its rank-3 section is released:
+> * `destroy_endpoint` ends each cycle it removes;
+> * a refused Phase C publication ends its own cycle.
+> No lock or rank was added. See `doc/IPC.md` §8.13.
 
 ### 40.8 Stale cap / generation behavior
 
