@@ -72,7 +72,9 @@ DONE_RE = re.compile(rb"IRQ1_UART_WITNESS items=")
 DISABLED_RE = re.compile(rb"IRQ1_UART_SOURCE_DISABLED ")
 POST_RE = re.compile(rb"IRQ1_UART_POSTDISABLE_READY")
 # IRQ-DELIVERY1: the saturation window. On SAT_READY inject the first saturation byte; on each
-# later per-claim DRAIN marker inject the next, so every byte is its own device interrupt.
+# later per-claim DRAIN marker inject the next, so every byte is its own device interrupt. Where
+# the port has an idle acknowledgement (AArch64, x86_64) each byte waits for it, so the interrupt
+# lands on the idle hart while init is parked; RISC-V's fixture gate decides the window itself.
 SAT_RE = re.compile(rb"IRQ1_UART_SAT_READY count=(\d+) bytes=(\d+) claims=(\d+)")
 DRAIN_RE = re.compile(rb"IRQ\d_[A-Z0-9]+_DRAIN claim=(\d+)")
 SAT_BYTE_BASE = 0x60
@@ -162,6 +164,7 @@ def main() -> int:
     disabled_seen = False
     post_injected = False
     sat = None  # [count, injected, claims_at_ready]
+    sat_waiting_idle = False
     done_at = None
     status = 2
     end = t0 + args.timeout
@@ -224,12 +227,23 @@ def main() -> int:
             m = SAT_RE.search(line)
             if m and sat is None and not args.no_inject:
                 sat = [int(m.group(1)), 1, int(m.group(3))]
-                inject(SAT_BYTE_BASE + 1, f"sat=1/{sat[0]} ack=sat_ready")
+                if idle_re is None:
+                    inject(SAT_BYTE_BASE + 1, f"sat=1/{sat[0]} ack=sat_ready")
+                else:
+                    sat_waiting_idle = True
                 continue
             m = DRAIN_RE.search(line)
-            if m and sat is not None and sat[1] < sat[0] and int(m.group(1)) > sat[2] + sat[1] - 1:
+            if m and sat is not None and sat[1] < sat[0] and not sat_waiting_idle \
+                    and int(m.group(1)) > sat[2] + sat[1] - 1:
                 sat[1] += 1
-                inject(SAT_BYTE_BASE + sat[1], f"sat={sat[1]}/{sat[0]} ack=drain claim={int(m.group(1))}")
+                if idle_re is None:
+                    inject(SAT_BYTE_BASE + sat[1], f"sat={sat[1]}/{sat[0]} ack=drain claim={int(m.group(1))}")
+                else:
+                    sat_waiting_idle = True
+                continue
+            if sat_waiting_idle and idle_ack(idle_re, line):
+                sat_waiting_idle = False
+                inject(SAT_BYTE_BASE + sat[1], f"sat={sat[1]}/{sat[0]} ack=drain+idle")
                 continue
             if disabled_re.search(line):
                 disabled_seen = True

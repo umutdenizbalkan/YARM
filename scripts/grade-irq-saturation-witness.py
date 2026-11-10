@@ -35,7 +35,7 @@ def main() -> int:
 
     sat = re.findall(r"#HOST_SATURATION injected=(\d+) of=(\d+)", text)
     need(sat == [("10", "10")], f"host saturation injections {sat}")
-    paced = len(re.findall(r"#HOST_INJECT byte=0x6[0-9a-f] .* sat=\d+/10 ack=(sat_ready|drain claim=\d+)", text))
+    paced = len(re.findall(r"#HOST_INJECT byte=0x6[0-9a-f] .* sat=\d+/10 ack=(sat_ready|drain claim=\d+|drain\+idle)", text))
     need(paced == 10, f"paced saturation injections {paced}/10")
 
     ordinary = re.findall(r"IRQ1_UART_WITNESS items=8 received=8 exact_once=8 label_ok=8 data_ok=8 .* result=(\w+)", text)
@@ -65,7 +65,9 @@ def main() -> int:
     need("IRQ1_UART_POSTDISABLE_READY disabled=1" in text, "post-disable phase not reached")
     need(re.search(r"IRQ1_UART_ISOLATION .* result=ok", text) is not None, "isolation phase")
 
-    summary = (f"IRQSAT_GRADE arch={arch} delivered={counts.get('delivered', 0)} "
+    origins = re.findall(r"IRQ1_UART_WITNESS_COUNTS claims=\d+ completions=\d+ empty_drains=\d+ idle_origin=(\d+) user_origin=(\d+)", text)
+    summary = (f"IRQSAT_GRADE arch={arch} origins(idle,user)={origins[0] if origins else 'none'} "
+               f"delivered={counts.get('delivered', 0)} "
                f"coalesced={counts.get('coalesced', 0)} saturation={m[0][2] if m else 'none'} "
                f"claims_completions={c[0] if c else 'none'}")
     if fails:
