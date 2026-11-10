@@ -207567,8 +207567,27 @@ mod notif_waiter1 {
                 index: idx,
                 generation: generation + 1,
             };
-            assert_eq!(take_notification_event_locked(ipc, older), Err(()));
-            assert_eq!(take_notification_event_locked(ipc, newer), Err(()));
+            assert_eq!(
+                take_notification_event_locked(ipc, older),
+                Err(KernelError::StaleCapability)
+            );
+            assert_eq!(
+                take_notification_event_locked(ipc, newer),
+                Err(KernelError::StaleCapability)
+            );
+            let other_slot = (idx + 1) % crate::kernel::boot::MAX_NOTIFICATIONS;
+            assert!(ipc.notifications[other_slot].is_none());
+            assert_eq!(
+                take_notification_event_locked(
+                    ipc,
+                    NotificationIncarnation {
+                        index: other_slot,
+                        generation: 0
+                    }
+                ),
+                Err(KernelError::WrongObject),
+                "an empty slot is WrongObject, as the receive answered before"
+            );
             assert_eq!(
                 ipc.notifications[idx].as_ref().map(|n| n.len),
                 Some(1),

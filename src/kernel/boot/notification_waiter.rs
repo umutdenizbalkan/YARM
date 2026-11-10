@@ -38,7 +38,9 @@
 //! A waiter holds no reference on the notification (NOTIF-LIFETIME1): the final release still
 //! retires and wakes it.
 
-use super::{EndpointWaiterRecord, IpcSubsystem, MAX_NOTIFICATIONS, ReceiverWaiterIdentity};
+use super::{
+    EndpointWaiterRecord, IpcSubsystem, KernelError, MAX_NOTIFICATIONS, ReceiverWaiterIdentity,
+};
 use crate::kernel::boot::notification_lifetime::NotificationIncarnation;
 use crate::kernel::ipc::Message;
 
@@ -56,20 +58,22 @@ pub(crate) enum NotificationPublishOutcome {
     IncarnationGone,
 }
 
-/// Rank 3: the immediate, generation-checked take. `Err(())` when the capability's incarnation
-/// is gone or recycled.
+/// Rank 3: the immediate, generation-checked take, with the receive's existing error precedence:
+/// no object in the slot is `WrongObject`; a different generation is `StaleCapability`.
 pub(crate) fn take_notification_event_locked(
     ipc: &mut IpcSubsystem,
     incarnation: NotificationIncarnation,
-) -> Result<Option<Message>, ()> {
+) -> Result<Option<Message>, KernelError> {
     let i = incarnation.index;
-    if i >= MAX_NOTIFICATIONS || ipc.notification_generations[i] != incarnation.generation {
-        return Err(());
+    if i >= MAX_NOTIFICATIONS || ipc.notifications[i].is_none() {
+        return Err(KernelError::WrongObject);
     }
-    ipc.notifications[i]
+    if ipc.notification_generations[i] != incarnation.generation {
+        return Err(KernelError::StaleCapability);
+    }
+    Ok(ipc.notifications[i]
         .as_mut()
-        .map(|notification| notification.recv())
-        .ok_or(())
+        .and_then(|notification| notification.recv()))
 }
 
 /// Rank 3: the blocking receive's publication — see the module contract for the order.

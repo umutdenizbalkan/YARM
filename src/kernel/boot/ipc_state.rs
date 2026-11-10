@@ -8563,10 +8563,10 @@ impl KernelState {
             generation,
         };
         // 1. The immediate take, against the incarnation the capability names.
-        match self.with_ipc_state_mut(|ipc| take_notification_event_locked(ipc, incarnation)) {
-            Ok(Some(msg)) => return Ok(Some(msg)),
-            Ok(None) => {}
-            Err(()) => return Err(KernelError::StaleCapability),
+        if let Some(msg) =
+            self.with_ipc_state_mut(|ipc| take_notification_event_locked(ipc, incarnation))?
+        {
+            return Ok(Some(msg));
         }
         // 2. Block.
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
