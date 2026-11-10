@@ -1027,6 +1027,11 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   the one rank-3 decision (generation, queue, competing record), and remove only by complete
   `{tid, asid}`. A refused receiver is restored through the receive family's unwind, never by
   a status write.
+- IRQ binding needs line authority (IRQ-AUTH1, `doc/IPC.md` §8.10). Never bind from a raw line
+  number: a route is published only by `irq_binding`, from an IRQ capability and a Notification
+  SIGNAL capability resolved in the caller's cnode, in the one rank-3 decision. An occupied line
+  is never redirected. A route is owned by its exact IRQ capability and released through the
+  removal report, so a new removal path must record what it removes in that report.
 
 ### 14.4 D3/D6 fences
 

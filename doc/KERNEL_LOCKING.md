@@ -9310,6 +9310,14 @@ rank 3), preserving the create-two-phase pattern from §38.
 | `clear_ipc_waiters_for_tid` (exit/death/timeout) | ipc | n/a | clears `notification_waiters` entry for the TID |
 | `destroy_notification` (Stage 21 new) | ipc (route teardown + waiter clear + object remove + gen bump) | n/a | atomic teardown; returns snapshotted waiter for out-of-lock unblock |
 
+
+> **IRQ-AUTH1 (2026-11-10).** `bind_irq_notification` now takes an IRQ capability and a
+> Notification SIGNAL capability. Both are resolved in one rank-4 snapshot (capability), then one
+> rank-3 decision (ipc) checks the exact generation and occupancy and publishes, and a rank-4
+> recheck of the owner follows. A route holds `{incarnation, owner}`. Removals revalidate the IRQ
+> lines they report (rank 3 → rank 4 → rank 3, sequential). Delivery checks the route's generation
+> in its signalling acquisition. See `doc/IPC.md` §8.10.
+
 ### 39.3 Bugs fixed (Stage 21)
 
 1. **`signal_notification` resurrected dead waiters** (`ipc_state.rs`,
@@ -9498,6 +9506,14 @@ left parked forever on an object that no longer exists.
 | Notification cap revoke | `irq_routes[line] = None` (inside `destroy_notification`) | route gone → immediate no-op |
 | forced stale route after revoke (defence-in-depth) | `irq_routes[line] = Some(idx)` but object `None` | `signal_notification` → `WrongObject` swallowed → benign no-op |
 | slot reuse via `create_notification` | stale routes to slot pre-cleared | no cross-generation retarget |
+
+
+> **IRQ-AUTH1 (2026-11-10).** `bind_irq_notification` now takes an IRQ capability and a
+> Notification SIGNAL capability. Both are resolved in one rank-4 snapshot (capability), then one
+> rank-3 decision (ipc) checks the exact generation and occupancy and publishes, and a rank-4
+> recheck of the owner follows. A route holds `{incarnation, owner}`. Removals revalidate the IRQ
+> lines they report (rank 3 → rank 4 → rank 3, sequential). Delivery checks the route's generation
+> in its signalling acquisition. See `doc/IPC.md` §8.10.
 
 ### 40.8 Stale cap / generation behavior
 

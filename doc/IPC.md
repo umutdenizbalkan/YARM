@@ -1934,6 +1934,86 @@ unchanged signal delivery.
 The handshakes run at a test-only hook between the block and the publication. Multi-receiver
 FIFO queues are out of scope.
 
+### 8.10 IRQ binding (IRQ-AUTH1)
+
+**Authorities.** Five things are kept apart:
+
+1. **Signal authority** is a Notification capability with SIGNAL.
+2. **Line authority** is `CapObject::Irq { line }` with SIGNAL. It is the line's only source.
+   Only the kernel mints one (`mint_irq_cap`, `mint_irq_cap_for_task`), no syscall can, fork
+   never inherits one, and delegation (`grant_driver_irq`) cannot widen it.
+3. **Binding ownership** is the route's owner: the cnode and the generation-bearing `CapId` of
+   the IRQ capability the binding was made with.
+4. **The Notification's lifetime** belongs to NOTIF-LIFETIME1 (§8.8). A route holds no
+   reference.
+5. **The IRQ capability's lifetime** follows ordinary capability revocation and reaping.
+
+**Binding.** `bind_irq_notification(irq_cap, notification_cap)` takes both capabilities. It
+resolves them in the caller's own cnode in one rank-4 snapshot, and never takes a raw line
+number. The line must be below `MAX_IRQ_LINES` and must not be kernel-owned
+(`FIRST_DEVICE_IRQ_LINE`):
+
+* x86_64: line 0 is the LAPIC timer vector;
+* AArch64: INTIDs below 32 are SGIs and PPIs;
+* RISC-V: PLIC source 0 means "no interrupt".
+
+One rank-3 decision (`bind_irq_route_locked`) checks the incarnation's presence and exact
+generation, and the line's occupancy, and then publishes. There is no interval between the
+generation check and the route write. An occupied line is never redirected:
+
+* the same incarnation is an idempotent success, which keeps the original owner;
+* any other target is refused (`EndpointQueueFull`), unless the occupying owner was proved dead
+  at rank 4.
+
+A failed bind changes nothing.
+
+**Lease.** `irq_routes[line]` holds `{notification incarnation, owner}`. It lives exactly while
+both are live.
+
+* **When the Notification goes:** its final release clears the routes naming it, inside the
+  destroying critical section.
+* **When the owner goes:** every capability removal already reports what it removed through
+  NOTIF-LIFETIME1's removal report. The report now also records IRQ lines. Both releasers
+  (`release_notification_refs`, `_split`) revalidate those lines after rank 4 and clear each
+  route whose owner no longer resolves. This covers:
+  * revoking the owner;
+  * a subtree revoke containing it;
+  * the split revoke;
+  * the reap that drops the owner's cspace.
+* **Revoking a delegated copy or a sibling** leaves the route, because the owner still
+  resolves.
+* **A concurrent owner removal during a bind:** the bind rechecks its owner after publication
+  (rank 4) and retracts its exact record. Either the recheck sees the removal, or the removal's
+  revalidation sees the route.
+* **Transfer:** a binding is never transferred. Once the old lease ends, a holder of the line's
+  authority binds afresh.
+
+A stale capability cannot change a newer binding: retraction and stale replacement act only on
+the exact record they were given.
+
+**Delivery.** The broad `route_external_irq` and the split `deliver_external_irq_split` check the
+route's generation in the same acquisition that signals. A route can never deliver into a
+replacement incarnation.
+
+**Reachability.** No syscall binds a line. The only production caller is the default-off
+UART/PL011 witness provisioning. It mints line authority through the internal path, binds with
+it, and gives init RECEIVE only.
+
+**Coverage.** `kernel::boot::tests::irq_auth1`:
+
+* B1–B10;
+* stale-owner reclaim;
+* stale-teardown exactness;
+* the provisioning shape;
+* a structural guard that only `irq_binding.rs` publishes a route and that both releasers
+  revalidate.
+
+The UART/PL011 witnesses bind and deliver live on all three interrupt controllers.
+
+**Not changed.** A full notification queue still propagates `EndpointQueueFull` out of the
+interrupt. The port then halts after acknowledging it. This is recorded for IRQ-DELIVERY1
+(`doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md`).
+
 ---
 
 ## 9. Authoring rule

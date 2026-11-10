@@ -2174,6 +2174,12 @@ refcount, never granted cross-process), so revoking any Notification cap destroy
 the object. Tests must cover the revoke teardown, its idempotence, the lock-rank
 separation outcomes, and stale-cap stability.
 
+> **IRQ-AUTH1 (2026-11-10).** A test binds an IRQ line with line authority: mint it through
+> `mint_irq_cap` (or `bind_irq_line_for_test`, which does exactly that) and pass both
+> capabilities to `bind_irq_notification`. A test that forces a defective route uses
+> `forced_route_for_test` and names the incarnation it means. Route assertions compare the whole
+> `IrqRoute` (incarnation and owner) where ownership matters. See `doc/IPC.md` §8.10.
+
 > **NOTIF-WAITER1 (2026-11-10).** A notification waiter test publishes its record through the
 > real blocking receive (`ipc_recv` / `ipc_recv_with_deadline` on a RECEIVE cap), not by writing
 > `notification_waiters`, so the record names the task's true `{tid, asid}`. A window between
