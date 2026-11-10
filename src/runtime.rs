@@ -17699,17 +17699,9 @@ impl SharedKernel {
             );
             let stranded = self.with_ipc_split_mut(|ipc| {
                 ipc.clear_endpoint_waiters_for_identity(identity);
-                for waiter in ipc.notification_waiters.iter_mut() {
-                    if waiter
-                        .is_some_and(|w| w.receiver.tid == crate::kernel::ipc::ThreadId(work.tid))
-                    {
-                        *waiter = None;
-                    }
-                }
-                ipc.any_endpoint_waiter_is(identity)
-                    || ipc.notification_waiters.iter().any(|w| {
-                        w.is_some_and(|w| w.receiver.tid == crate::kernel::ipc::ThreadId(work.tid))
-                    })
+                // NOTIF-WAITER1: the notification waiter by the same complete identity.
+                ipc.clear_notification_waiters_for_identity(identity);
+                ipc.any_endpoint_waiter_is(identity) || ipc.any_notification_waiter_is(identity)
             });
             if stranded {
                 crate::yarm_log!("SCHED_TIMEOUT_STRANDED_WAITER tid={}", work.tid);

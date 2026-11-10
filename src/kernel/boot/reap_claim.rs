@@ -391,11 +391,8 @@ pub(crate) fn clear_ipc_waiters_for_identity_locked(
             }
         }
     }
-    for waiter in ipc.notification_waiters.iter_mut() {
-        if waiter.is_some_and(|w| w.receiver.tid == identity.tid) {
-            *waiter = None;
-        }
-    }
+    // NOTIF-WAITER1: the notification waiter by the complete identity, never the bare TID.
+    ipc.clear_notification_waiters_for_identity(identity);
     orphaned_n
 }
 

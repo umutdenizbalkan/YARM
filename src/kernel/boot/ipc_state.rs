@@ -4347,8 +4347,8 @@ impl KernelState {
         // identity (tid + its captured ASID), so a sweep can never remove a replacement task's
         // waiter (a reused numeric TID always carries a different ASID). Task exit runs synchronously
         // under the global lock while this is still the task at `tid`, so its current ASID IS the one
-        // it published with. Sender/notification waiter structures keep their numeric-TID sweep — they
-        // are not endpoint receive-waiters and are out of this stage's scope.
+        // it published with. NOTIF-WAITER1 clears the notification waiter by the same identity; the
+        // sender waiter structures keep their numeric-TID sweep (not receive-waiters).
         let identity = ReceiverWaiterIdentity::new(tid_id, self.task_asid(tid).unwrap_or(Asid(0)));
         // U6/199C: a removed SENDER waiter may still own a transfer envelope (and, for a
         // shared-region transfer, one transient pin). Collect them under the rank-3 sweep and
@@ -4372,11 +4372,8 @@ impl KernelState {
                     }
                 }
             }
-            for waiter in ipc.notification_waiters.iter_mut() {
-                if waiter.is_some_and(|w| w.receiver.tid == tid_id) {
-                    *waiter = None;
-                }
-            }
+            // NOTIF-WAITER1: the notification waiter too, by complete identity.
+            ipc.clear_notification_waiters_for_identity(identity);
         });
         for slot in orphaned.iter().take(orphaned_n).flatten() {
             let _ = self.settle_blocked_sender_envelope(&slot.0, slot.1);
@@ -5693,11 +5690,8 @@ impl KernelState {
                             }
                         }
                     }
-                    for waiter in ipc.notification_waiters.iter_mut() {
-                        if waiter.is_some_and(|w| w.receiver.tid == tid) {
-                            *waiter = None;
-                        }
-                    }
+                    // NOTIF-WAITER1: the notification waiter by the same complete identity.
+                    ipc.clear_notification_waiters_for_identity(identity);
                 }
                 // Task D re-check (single-lock, cheap): a stranded waiter would be a
                 // batch tid still referenced after the clear — provably impossible
@@ -5710,10 +5704,7 @@ impl KernelState {
                             .endpoint_sender_waiters
                             .iter()
                             .any(|q| q.iter().any(|s| s.as_ref().is_some_and(|w| w.tid == tid)))
-                        || ipc
-                            .notification_waiters
-                            .iter()
-                            .any(|w| w.is_some_and(|w| w.receiver.tid == tid));
+                        || ipc.any_notification_waiter_is(identity);
                     if remains {
                         stranded_in_batch = true;
                     }
@@ -8521,6 +8512,148 @@ impl KernelState {
         self.ipc_recv_with_optional_deadline(recv_cap, Some(deadline_tick))
     }
 
+    /// NOTIF-WAITER1 — rank 2: whether `record` still names a parked receive: its exact
+    /// `{tid, asid}` task is `Blocked(EndpointReceive)` under the record's wait generation.
+    fn notification_record_is_parked(&self, record: EndpointWaiterRecord) -> bool {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter().flatten().any(|tcb| {
+                tcb.tid == record.receiver.tid
+                    && tcb.asid.unwrap_or(crate::kernel::vm::Asid(0)) == record.receiver.asid
+                    && tcb.blocked_recv_generation == record.wait_generation
+                    && matches!(
+                        tcb.status,
+                        TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                    )
+            })
+        })
+    }
+
+    /// NOTIF-WAITER1 — the blocking receive on a notification capability.
+    ///
+    /// No syscall reaches this: NR 2 and NR 5 validate an endpoint capability first, and the
+    /// witness builds' notification door is the non-blocking NR 5 probe. It is the kernel's
+    /// receive primitive for the object, and it obeys `notification_waiter`'s contract:
+    ///
+    /// 1. rank 3 — the generation-checked immediate take;
+    /// 2. ranks 1 and 2 — block the current task, bumping its wait generation (the receive
+    ///    family's own owner), so a signal that later finds the record can wake it;
+    /// 3. rank 3 — ONE publication decision: a gone or recycled incarnation, a queued event, a
+    ///    competing receiver, or publication. A competing record is tested once at rank 2: if
+    ///    it no longer names a parked receive it is stale, and the decision is retaken allowing
+    ///    exactly that record to be replaced;
+    /// 4. every outcome but publication restores the receiver through the receive family's
+    ///    unwind (`wake_tid_to_runnable`, then `dispatch_next_task`), the IPC-DISPLACE1 refusal
+    ///    shape;
+    /// 5. ranks 2 then 3 — a published receiver that a timeout or teardown settled in the window
+    ///    before step 3 is no longer Blocked; its exact record is retracted, so it cannot stand
+    ///    between the incarnation and its next receiver.
+    fn notification_recv_blocking(
+        &mut self,
+        recv_cap: CapId,
+        index: usize,
+        generation: u64,
+        deadline: Option<u64>,
+    ) -> Result<Option<Message>, KernelError> {
+        use crate::kernel::boot::notification_waiter::{
+            NotificationPublishOutcome as P, publish_notification_waiter_locked,
+            retract_notification_waiter_exact_locked, take_notification_event_locked,
+        };
+        let incarnation = crate::kernel::boot::notification_lifetime::NotificationIncarnation {
+            index,
+            generation,
+        };
+        // 1. The immediate take, against the incarnation the capability names.
+        match self.with_ipc_state_mut(|ipc| take_notification_event_locked(ipc, incarnation)) {
+            Ok(Some(msg)) => return Ok(Some(msg)),
+            Ok(None) => {}
+            Err(()) => return Err(KernelError::StaleCapability),
+        }
+        // 2. Block.
+        let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
+        // U9-IRQ-UNKNOWN1 §2 — the waiter's identity is CAPTURED here, where it is true.
+        //
+        // The generation is bumped through the receive family's own owner before the block
+        // is committed, so the record names THIS block and not a previous one by the same
+        // `{tid, asid}`. Reading it afterwards would name whatever a later receive left.
+        let wait_generation = self
+            .bump_blocked_recv_generation(blocked_tid)
+            .ok_or(KernelError::TaskMissing)?;
+        let blocked_asid = self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == blocked_tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            tcb.ipc_timeout_deadline = deadline;
+            tcb.ipc_timeout_fired = false;
+            Ok::<_, KernelError>(tcb.asid.unwrap_or(crate::kernel::vm::Asid(0)))
+        })?;
+        // NOTIF-WAITER1: a test-only phase handshake between "the task is Blocked" and "the
+        // waiter is published" — the window a concurrent signal, timeout or teardown lands in.
+        #[cfg(test)]
+        notif_recv_phase_hook::run_before_publish(self);
+        let record = EndpointWaiterRecord::new(
+            ReceiverWaiterIdentity::new(ThreadId(blocked_tid), blocked_asid),
+            wait_generation,
+        );
+        // 3. The publication decision. A competing record is re-tested at rank 2 once: if it no
+        //    longer names a parked receive, the decision is retaken allowing exactly it to go.
+        let mut outcome = self.with_ipc_state_mut(|ipc| {
+            publish_notification_waiter_locked(ipc, incarnation, record, None)
+        });
+        if let P::ReceiverAlreadyWaiting(current) = outcome
+            && !self.notification_record_is_parked(current)
+        {
+            crate::yarm_log!(
+                "NOTIF_WAITER_STALE_RECLAIMED notification={} stale_tid={} stale_wait_generation={} tid={}",
+                index,
+                current.receiver.tid.0,
+                current.wait_generation,
+                blocked_tid
+            );
+            outcome = self.with_ipc_state_mut(|ipc| {
+                publish_notification_waiter_locked(ipc, incarnation, record, Some(current))
+            });
+        }
+        let answer = match outcome {
+            P::Published => {
+                // 5. Still the exact Blocked incarnation? Otherwise retract the exact record.
+                if !self.notification_record_is_parked(record) {
+                    let retracted = self.with_ipc_state_mut(|ipc| {
+                        retract_notification_waiter_exact_locked(ipc, incarnation, record)
+                    });
+                    crate::yarm_log!(
+                        "NOTIF_WAITER_RETRACTED tid={} notification={} wait_generation={} retracted={}",
+                        blocked_tid,
+                        index,
+                        wait_generation,
+                        u8::from(retracted)
+                    );
+                }
+                let _ = self.dispatch_next_task()?;
+                return Ok(None);
+            }
+            P::EventTaken(msg) => Ok(Some(msg)),
+            P::ReceiverAlreadyWaiting(_) => Err(KernelError::EndpointQueueFull),
+            P::IncarnationGone => Err(KernelError::StaleCapability),
+        };
+        // 4. Not published: restore the receiver.
+        crate::yarm_log!(
+            "NOTIF_WAITER_UNWIND tid={} notification={} reason={}",
+            blocked_tid,
+            index,
+            match &answer {
+                Ok(_) => "event_taken",
+                Err(KernelError::EndpointQueueFull) => "receiver_already_waiting",
+                Err(_) => "incarnation_gone",
+            }
+        );
+        self.wake_tid_to_runnable(ThreadId(blocked_tid))?;
+        let _ = self.dispatch_next_task()?;
+        answer
+    }
+
     fn ipc_recv_with_optional_deadline(
         &mut self,
         recv_cap: CapId,
@@ -8530,46 +8663,8 @@ impl KernelState {
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
-        if let CapObject::Notification { .. } = capability.object {
-            let notif_idx = self.resolve_notification_index(capability.object)?;
-            // Try immediate recv under ipc_state_lock.
-            let immediate = self
-                .with_ipc_state_mut(|ipc| ipc.notifications[notif_idx].as_mut().map(|n| n.recv()));
-            match immediate {
-                None => return Err(KernelError::WrongObject),
-                Some(Some(msg)) => return Ok(Some(msg)),
-                Some(None) => {}
-            }
-            // Nothing available — block.
-            let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
-            // U9-IRQ-UNKNOWN1 §2 — the waiter's identity is CAPTURED here, where it is true.
-            //
-            // The generation is bumped through the receive family's own owner before the block
-            // is committed, so the record names THIS block and not a previous one by the same
-            // `{tid, asid}`. Reading it afterwards would name whatever a later receive left.
-            let wait_generation = self
-                .bump_blocked_recv_generation(blocked_tid)
-                .ok_or(KernelError::TaskMissing)?;
-            let blocked_asid = self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == blocked_tid)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
-                tcb.ipc_timeout_deadline = deadline;
-                tcb.ipc_timeout_fired = false;
-                Ok::<_, KernelError>(tcb.asid.unwrap_or(crate::kernel::vm::Asid(0)))
-            })?;
-            // Publish waiter under ipc_state_lock after TCB is Blocked.
-            self.with_ipc_state_mut(|ipc| {
-                ipc.notification_waiters[notif_idx] = Some(EndpointWaiterRecord::new(
-                    ReceiverWaiterIdentity::new(ThreadId(blocked_tid), blocked_asid),
-                    wait_generation,
-                ));
-            });
-            let _ = self.dispatch_next_task()?;
-            return Ok(None);
+        if let CapObject::Notification { index, generation } = capability.object {
+            return self.notification_recv_blocking(recv_cap, index, generation, deadline);
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
@@ -9138,4 +9233,30 @@ pub(crate) fn ipc_try_recv_queued_with_cap_transfer_locked(
     }
 
     IpcEndpointRecvResult::Received(received)
+}
+
+/// NOTIF-WAITER1 — test-only phase handshake for the blocking notification receive. A test arms
+/// one closure; the receive runs it once, after the receiver is Blocked and before its waiter is
+/// published, so a signal, a teardown or a slot reuse can be placed exactly in that window.
+#[cfg(test)]
+pub(crate) mod notif_recv_phase_hook {
+    extern crate std;
+    use core::cell::RefCell;
+
+    type Hook = alloc::boxed::Box<dyn FnMut(&mut crate::kernel::boot::KernelState)>;
+
+    std::thread_local! {
+        static BEFORE_PUBLISH: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm(hook: Hook) {
+        BEFORE_PUBLISH.with(|h| *h.borrow_mut() = Some(hook));
+    }
+
+    pub(crate) fn run_before_publish(state: &mut crate::kernel::boot::KernelState) {
+        let hook = BEFORE_PUBLISH.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(state);
+        }
+    }
 }
