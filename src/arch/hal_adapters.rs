@@ -127,6 +127,8 @@ impl InterruptCompletion {
 
     /// THE completion write. There is exactly one call site of this in the split phase.
     pub fn complete(self, cpu: CpuId) {
+        #[cfg(test)]
+        completion_count_for_test::note();
         match self {
             Self::ArchSingleStep { line } => acknowledge_interrupt(cpu, line),
             Self::PlicClaim {
@@ -157,4 +159,21 @@ pub fn program_timer_deadline(cpu: CpuId, ticks_from_now: u64) {
 #[inline]
 pub fn decode_trap_event(context: AdapterTrapContext) -> AdapterTrapEvent {
     crate::arch::trap_entry::decode_trap_context(context)
+}
+
+/// IRQ-DELIVERY1: a test-only count of controller completions written through the one owner, so a
+/// hosted test can prove "exactly once" for every delivery outcome (a hosted build has no
+/// controller to read back).
+#[cfg(test)]
+pub(crate) mod completion_count_for_test {
+    extern crate std;
+    use core::cell::Cell;
+    std::thread_local! { static COUNT: Cell<u32> = const { Cell::new(0) }; }
+    pub(crate) fn note() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+    /// The completions since the last call.
+    pub(crate) fn take() -> u32 {
+        COUNT.with(|c| c.replace(0))
+    }
 }

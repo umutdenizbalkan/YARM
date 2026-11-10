@@ -100,12 +100,46 @@ pub(crate) struct MemoryObject {
     pub(crate) kind: MemoryObjectKind,
 }
 
+/// What one IRQ signal did to a Notification (IRQ-DELIVERY1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IrqSignal {
+    /// The event is queued in order.
+    Queued,
+    /// The queue was full (or already coalescing): the line's pending indication is set.
+    /// `newly_pending` is false when this line was already pending, so the signal coalesced.
+    Coalesced { newly_pending: bool },
+}
+
+// IRQ-DELIVERY1: one pending bit per IRQ line.
+const _: () = assert!(crate::arch::platform_constants::MAX_IRQ_LINES <= 64);
+
+/// A Notification's bounded IRQ event state.
+///
+/// # IRQ-DELIVERY1 — saturation without loss
+///
+/// `irq_queue` holds up to `max_depth` events in arrival order. When it is full, an interrupt is
+/// not refused and not forgotten: its line's bit in `overflow_pending` is set, and repeated
+/// interrupts on that line coalesce into that one bit. While any bit is set the object stays in
+/// coalescing mode, so a busy line cannot refill the queue and starve a line that overflowed.
+///
+/// A receive takes the oldest queued event first; with the queue empty, it takes the lowest
+/// pending line and clears exactly that bit. The receiver sees the same event either way — the
+/// line — and a pending line means "at least one interrupt on this line since its last event".
+///
+/// Every operation runs inside the IPC rank-3 critical section that owns the object, so a signal
+/// and a receive are totally ordered. A signal for line X after the receive that cleared X's bit
+/// sets it again (or queues); nothing a later signal publishes can be erased by an earlier
+/// consumption. The state belongs to the incarnation: destruction removes the object, and a
+/// replacement starts empty. Cost: one `u64` per Notification; every operation is O(1).
 #[derive(Debug)]
 pub(crate) struct NotificationObject {
     pub(crate) irq_queue: [u16; crate::kernel::ipc::MAX_ENDPOINT_DEPTH],
     pub(crate) head: usize,
     pub(crate) len: usize,
     pub(crate) max_depth: usize,
+    /// IRQ-DELIVERY1: the lines whose interrupts did not fit in the queue and have not been
+    /// observed since.
+    pub(crate) overflow_pending: u64,
 }
 
 impl NotificationObject {
@@ -118,26 +152,47 @@ impl NotificationObject {
             head: 0,
             len: 0,
             max_depth,
+            overflow_pending: 0,
         })
     }
 
-    pub(crate) fn send_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
-        if self.len >= self.max_depth {
-            return Err(KernelError::EndpointQueueFull);
+    /// Record one interrupt on `irq_line`. Never refuses for want of space. An `Err` is only a
+    /// line no route can carry (an internal invariant), never saturation.
+    pub(crate) fn send_irq(&mut self, irq_line: u16) -> Result<IrqSignal, KernelError> {
+        if usize::from(irq_line) >= crate::arch::platform_constants::MAX_IRQ_LINES {
+            return Err(KernelError::WrongObject);
         }
-        let tail = (self.head + self.len) & (crate::kernel::ipc::MAX_ENDPOINT_DEPTH - 1);
-        self.irq_queue[tail] = irq_line;
-        self.len += 1;
-        Ok(())
+        if self.overflow_pending == 0 && self.len < self.max_depth {
+            let tail = (self.head + self.len) & (crate::kernel::ipc::MAX_ENDPOINT_DEPTH - 1);
+            self.irq_queue[tail] = irq_line;
+            self.len += 1;
+            return Ok(IrqSignal::Queued);
+        }
+        let bit = 1u64 << irq_line;
+        let newly_pending = self.overflow_pending & bit == 0;
+        self.overflow_pending |= bit;
+        Ok(IrqSignal::Coalesced { newly_pending })
+    }
+
+    /// Whether a receive would return an event.
+    #[cfg(test)]
+    pub(crate) fn has_event(&self) -> bool {
+        self.len != 0 || self.overflow_pending != 0
     }
 
     pub(crate) fn recv(&mut self) -> Option<Message> {
-        if self.len == 0 {
+        let irq_line = if self.len != 0 {
+            let irq_line = self.irq_queue[self.head];
+            self.head = (self.head + 1) & (crate::kernel::ipc::MAX_ENDPOINT_DEPTH - 1);
+            self.len -= 1;
+            irq_line
+        } else if self.overflow_pending != 0 {
+            let line = self.overflow_pending.trailing_zeros();
+            self.overflow_pending &= !(1u64 << line);
+            line as u16
+        } else {
             return None;
-        }
-        let irq_line = self.irq_queue[self.head];
-        self.head = (self.head + 1) & (crate::kernel::ipc::MAX_ENDPOINT_DEPTH - 1);
-        self.len -= 1;
+        };
         let payload = irq_line.to_le_bytes();
         Message::with_header(0, irq_line, 0, None, &payload).ok()
     }

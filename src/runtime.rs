@@ -9316,21 +9316,24 @@ impl SharedKernel {
                 // the broad form's `WrongObject` arm is.
                 return Err(O::TargetGone { notification_idx });
             };
-            if let Err(e) = notif.send_irq(irq_line) {
-                return Err(O::Failed {
-                    notification_idx,
-                    error: e,
-                });
-            }
+            let signal = match notif.send_irq(irq_line) {
+                Ok(signal) => signal,
+                Err(e) => {
+                    return Err(O::Failed {
+                        notification_idx,
+                        error: e,
+                    });
+                }
+            };
             let generation = ipc
                 .notification_generations
                 .get(notification_idx)
                 .copied()
                 .unwrap_or(0);
             let waiter = ipc.notification_waiters[notification_idx].take();
-            Ok((notification_idx, generation, waiter))
+            Ok((notification_idx, generation, waiter, signal))
         });
-        let (notification_idx, generation, waiter) = match resolved {
+        let (notification_idx, generation, waiter, signal) = match resolved {
             Ok(v) => v,
             Err(outcome) => return outcome,
         };
@@ -9338,9 +9341,17 @@ impl SharedKernel {
         // Phase 2 — rank 2, in its own acquisition: prove the waiter's identity and transition
         // it. The IPC domain is already released.
         let Some(record) = waiter else {
-            return O::Delivered {
-                notification_idx,
-                generation,
+            // IRQ-DELIVERY1: a full queue is a settled ending, never an error.
+            return match signal {
+                crate::kernel::boot::IrqSignal::Queued => O::Delivered {
+                    notification_idx,
+                    generation,
+                },
+                crate::kernel::boot::IrqSignal::Coalesced { newly_pending } => O::Coalesced {
+                    notification_idx,
+                    generation,
+                    newly_pending,
+                },
             };
         };
         match self.wake_notification_waiter_exact_split(record) {

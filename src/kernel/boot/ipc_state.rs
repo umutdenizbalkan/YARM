@@ -7539,7 +7539,8 @@ impl KernelState {
         let opt_waiter_tid = self.with_ipc_state_mut(|ipc| {
             let notification_idx = route.notification.index;
             let notif = routed_notification_locked(ipc, route)?;
-            notif.send_irq(irq_line)?;
+            // IRQ-DELIVERY1: saturation coalesces (never an error); only an invariant fails.
+            let _signal = notif.send_irq(irq_line)?;
             Ok::<_, KernelError>(ipc.notification_waiters[notification_idx].take())
         })?;
         // Phase 2: wake waiter outside ipc_state_lock.

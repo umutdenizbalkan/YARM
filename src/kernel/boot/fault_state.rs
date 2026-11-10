@@ -120,9 +120,17 @@ pub(crate) enum IrqDeliveryOutcome {
         generation: u64,
         waiter_tid: u64,
     },
-    /// The delivery failed and the error PROPAGATES, exactly as the broad form propagates it:
-    /// a full notification queue is `EndpointQueueFull` and leaves the trap as an error. This
-    /// route does not start dropping interrupts to make itself total.
+    /// IRQ-DELIVERY1: the Notification's queue was full, so the line's pending indication was
+    /// set (`newly_pending`) or was already set and this interrupt coalesced into it. The
+    /// receiver will observe the line. A routine, settled ending — never an error.
+    Coalesced {
+        notification_idx: usize,
+        generation: u64,
+        newly_pending: bool,
+    },
+    /// The delivery failed on a genuine internal error, and the error PROPAGATES, exactly as the
+    /// broad form propagates it. Since IRQ-DELIVERY1 saturation is never this; only an invariant
+    /// failure (a line no route can carry, a failed enqueue of a proven waiter) is.
     Failed {
         notification_idx: usize,
         error: crate::kernel::boot::KernelError,
@@ -138,6 +146,7 @@ impl IrqDeliveryOutcome {
             Self::Delivered { .. } => "delivered",
             Self::DeliveredAndWoke { .. } => "delivered_and_woke",
             Self::DeliveredWaiterStale { .. } => "delivered_waiter_stale",
+            Self::Coalesced { .. } => "coalesced",
             Self::Failed { .. } => "failed",
         }
     }
