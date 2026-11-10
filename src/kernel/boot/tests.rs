@@ -189690,16 +189690,16 @@ mod u9irq1_delivery {
         );
     }
 
-    /// **Delivery errors propagate.** A full notification queue is `EndpointQueueFull`, and the
-    /// route carries it out of the trap exactly as the broad arm's `?` would. This route does
-    /// not start dropping interrupts to make itself total.
+    /// **A full queue is not an error, and is not a silent drop** (IRQ-DELIVERY1; this case
+    /// pinned the old fatal propagation). The overflowing interrupt is `Coalesced` — settled,
+    /// with the line's pending indication retained — and the receiver observes the line.
     #[test]
-    fn a_full_notification_queue_propagates_its_error() {
+    fn a_full_notification_queue_coalesces_rather_than_failing_or_dropping() {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
-        let notif_idx = kernel.with(|state| {
-            let (idx, notif_cap, _recv) = state.create_notification(1).expect("depth-1 queue");
+        let (notif_idx, recv) = kernel.with(|state| {
+            let (idx, notif_cap, recv) = state.create_notification(1).expect("depth-1 queue");
             state.bind_irq_line_for_test(LINE, notif_cap).expect("bind");
-            idx
+            (idx, recv)
         });
 
         let first = kernel.deliver_external_irq_split(CpuId(0), LINE);
@@ -189711,14 +189711,33 @@ mod u9irq1_delivery {
 
         let overflow = kernel.deliver_external_irq_split(CpuId(0), LINE);
         assert!(
-            matches!(overflow, O::Failed { notification_idx, .. } if notification_idx == notif_idx),
-            "the second must fail rather than be silently dropped: {overflow:?}"
+            matches!(overflow, O::Coalesced { notification_idx, newly_pending: true, .. } if notification_idx == notif_idx),
+            "the second is retained as the line's pending indication: {overflow:?}"
         );
-        assert_eq!(overflow.marker(), "failed");
+        assert_eq!(overflow.marker(), "coalesced");
         assert_eq!(
             overflow.propagated_error(),
-            Some(KernelError::EndpointQueueFull),
-            "and the error is the one the broad form propagates"
+            None,
+            "saturation is a settled ending"
+        );
+        let again = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert!(
+            matches!(
+                again,
+                O::Coalesced {
+                    newly_pending: false,
+                    ..
+                }
+            ),
+            "a further interrupt on the pending line coalesces: {again:?}"
+        );
+        let seen: alloc::vec::Vec<u16> = kernel.with(|s| {
+            core::iter::from_fn(|| s.try_ipc_recv(recv).expect("recv").map(|m| m.opcode)).collect()
+        });
+        assert_eq!(
+            seen,
+            [LINE, LINE],
+            "the queued event, then the pending line — not dropped"
         );
     }
 
@@ -189744,6 +189763,11 @@ mod u9irq1_delivery {
                 notification_idx: 0,
                 generation: 1,
                 waiter_tid: RECEIVER,
+            },
+            O::Coalesced {
+                notification_idx: 0,
+                generation: 1,
+                newly_pending: true,
             },
         ];
         for outcome in benign {
@@ -189786,6 +189810,12 @@ mod u9irq1_delivery {
                 waiter_tid: 0,
             }
             .marker(),
+            O::Coalesced {
+                notification_idx: 0,
+                generation: 0,
+                newly_pending: false,
+            }
+            .marker(),
             O::Failed {
                 notification_idx: 0,
                 error: KernelError::EndpointQueueFull,
@@ -189795,7 +189825,7 @@ mod u9irq1_delivery {
         let mut seen: alloc::vec::Vec<&str> = markers.to_vec();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), 6, "every ending must be separately nameable");
+        assert_eq!(seen.len(), 7, "every ending must be separately nameable");
     }
 }
 
@@ -190906,14 +190936,16 @@ mod u9irq1_injected_evidence {
         );
     }
 
-    /// **Injected:** a delivery error reaches the bridge as `Some(Err(..))` rather than being
-    /// swallowed. This is the case the bridge's four-cell join exists for.
+    /// **Injected:** a saturated delivery reaches the bridge as a settled `Some(Ok(()))` —
+    /// never an error into the trap (IRQ-DELIVERY1; this case pinned the old propagation) — and
+    /// the `Ok` is not fabricated: the line's pending event is still there for the receiver.
     #[test]
-    fn an_injected_delivery_error_reaches_the_bridge_as_an_error() {
+    fn an_injected_saturated_delivery_settles_ok_and_keeps_the_event() {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
-        kernel.with(|state| {
-            let (_idx, notif_cap, _recv) = state.create_notification(1).expect("depth-1");
+        let recv = kernel.with(|state| {
+            let (_idx, notif_cap, recv) = state.create_notification(1).expect("depth-1");
             state.bind_irq_line_for_test(LINE, notif_cap).expect("bind");
+            recv
         });
         let _armed = ArmedInjection::arm();
 
@@ -190933,10 +190965,18 @@ mod u9irq1_injected_evidence {
             u32::from(LINE),
             single_step(LINE),
         );
-        assert!(
-            matches!(overflow, Some(Err(_))),
-            "and the second must arrive at the bridge as an error, not a fabricated Ok: \
-             {overflow:?}"
+        assert_eq!(
+            overflow,
+            Some(Ok(())),
+            "saturation settles the trap: {overflow:?}"
+        );
+        let seen: alloc::vec::Vec<u16> = kernel.with(|s| {
+            core::iter::from_fn(|| s.try_ipc_recv(recv).expect("recv").map(|m| m.opcode)).collect()
+        });
+        assert_eq!(
+            seen,
+            [LINE, LINE],
+            "and the overflowing interrupt is still observable"
         );
     }
 
@@ -191087,15 +191127,17 @@ mod u9irqfinal_bridge_completion {
         assert_eq!(model::last_completion(), (unbound, BASE, CTX));
     }
 
-    /// **A delivery ERROR is completed too, and the error still reaches the bridge.** Dropping
-    /// the completion on an error would wedge the controller; swallowing the error would hide a
-    /// full notification queue.
+    /// **A saturated delivery is completed exactly once, and settles without an error**
+    /// (IRQ-DELIVERY1; this case pinned the old propagation). Dropping the completion would
+    /// wedge the controller; an error would halt the kernel; a silent drop would lose the
+    /// device's indication — so the line's pending event must remain.
     #[test]
-    fn a_delivery_error_is_completed_and_still_propagates() {
+    fn a_saturated_delivery_is_completed_once_and_keeps_the_event() {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
-        kernel.with(|state| {
-            let (_idx, notif_cap, _recv) = state.create_notification(1).expect("depth-1");
+        let recv = kernel.with(|state| {
+            let (_idx, notif_cap, recv) = state.create_notification(1).expect("depth-1");
             state.bind_irq_line_for_test(LINE, notif_cap).expect("bind");
+            recv
         });
         let _injected = Injected::arm();
 
@@ -191114,16 +191156,17 @@ mod u9irqfinal_bridge_completion {
             u32::from(LINE),
             claim_token(u32::from(LINE)),
         );
-        assert!(
-            matches!(overflow, Some(Err(_))),
-            "the error reaches the bridge rather than being swallowed: {overflow:?}"
-        );
+        assert_eq!(overflow, Some(Ok(())), "saturation settles: {overflow:?}");
         assert_eq!(
             model::completions(),
             2,
-            "and the failed delivery's claim is completed too — it is still in flight"
+            "and the saturated delivery's claim is completed — exactly once"
         );
         assert_eq!(model::last_completion(), (u32::from(LINE), BASE, CTX));
+        let seen: alloc::vec::Vec<u16> = kernel.with(|s| {
+            core::iter::from_fn(|| s.try_ipc_recv(recv).expect("recv").map(|m| m.opcode)).collect()
+        });
+        assert_eq!(seen, [LINE, LINE], "with its event retained");
     }
 
     /// **A source too wide to be a route line is refused, not truncated — and completed.**
@@ -208344,5 +208387,642 @@ mod irq_auth1 {
             1
         );
         assert!(NL.contains("if let CapObject::Irq { line } = object {"));
+    }
+}
+
+/// IRQ-DELIVERY1 — a saturated Notification IRQ queue. Everything runs through the real owners:
+/// `deliver_external_irq_split`, the bridge `settle_external_interrupt_at_bridge`, the shared
+/// trap dispatch `dispatch_trap_entry_with_shared_kernel`, the broad `route_external_irq`, and
+/// the real receive (`try_ipc_recv`). Completions are counted at the one completion owner.
+mod irq_delivery1 {
+    use super::*;
+    use crate::arch::hal_adapters::{InterruptCompletion, completion_count_for_test};
+    use crate::kernel::syscall_split::settle_external_interrupt_at_bridge;
+    use crate::runtime::SharedKernel;
+
+    const LINE: u16 = 27;
+    const LINE2: u16 = 28;
+
+    struct ArmedInjection;
+    impl ArmedInjection {
+        fn arm() -> Self {
+            crate::kernel::boot::set_irq1_hosted_bridge_injection(true);
+            let _ = completion_count_for_test::take();
+            Self
+        }
+    }
+    impl Drop for ArmedInjection {
+        fn drop(&mut self) {
+            crate::kernel::boot::set_irq1_hosted_bridge_injection(false);
+        }
+    }
+
+    /// A Notification of `depth`, bound to LINE (and LINE2) through line authority.
+    fn fixture(depth: usize) -> (SharedKernel, usize, CapId, CapId) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (idx, sig, recv) = kernel.with(|s| {
+            let (idx, sig, recv) = s.create_notification(depth).expect("notification");
+            s.bind_irq_line_for_test(LINE, sig).expect("bind LINE");
+            s.bind_irq_line_for_test(LINE2, sig).expect("bind LINE2");
+            (idx, sig, recv)
+        });
+        (kernel, idx, sig, recv)
+    }
+
+    fn single_step(line: u16) -> InterruptCompletion {
+        InterruptCompletion::ArchSingleStep { line }
+    }
+
+    /// Fill the queue to its depth through the real split delivery.
+    fn saturate(kernel: &SharedKernel, depth: usize) {
+        for _ in 0..depth {
+            let outcome = kernel.deliver_external_irq_split(CpuId(0), LINE);
+            assert_eq!(outcome.marker(), "delivered", "filling: {outcome:?}");
+        }
+    }
+
+    /// Every line the receiver observes, in order, through the real non-blocking receive.
+    fn drain(kernel: &SharedKernel, recv: CapId) -> alloc::vec::Vec<u16> {
+        let mut seen = alloc::vec::Vec::new();
+        kernel.with(|s| {
+            while let Some(msg) = s.try_ipc_recv(recv).expect("receive") {
+                seen.push(msg.opcode);
+                assert!(seen.len() <= 64, "bounded");
+            }
+        });
+        seen
+    }
+
+    fn x86_external_vector(line: u16) -> u8 {
+        0x20 + line as u8
+    }
+
+    /// Q1 — one IRQ past a full queue: not an error, and the line's pending work survives.
+    #[test]
+    fn q1_one_irq_past_a_full_queue_is_nonfatal_and_not_lost() {
+        let (kernel, _idx, _sig, recv) = fixture(2);
+        saturate(&kernel, 2);
+        let extra = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert_eq!(
+            extra.propagated_error(),
+            None,
+            "saturation is not an error: {extra:?}"
+        );
+        assert_ne!(extra.marker(), "failed");
+        assert_eq!(
+            drain(&kernel, recv),
+            [LINE, LINE, LINE],
+            "the two queued events, then the line's retained pending indication"
+        );
+    }
+
+    /// Q2 — a user-origin interrupt on a saturated route, through the real shared dispatch:
+    /// `Ok`, the interrupted frame untouched, exactly one completion.
+    #[test]
+    fn q2_a_user_origin_interrupt_on_a_full_queue_returns_ok_and_leaves_the_frame() {
+        let (kernel, _idx, _sig, recv) = fixture(1);
+        saturate(&kernel, 1);
+        let _armed = ArmedInjection::arm();
+        let mut frame = TrapFrame::new(0x55, [11, 22, 33, 44, 55, 66]);
+        let before = frame.clone();
+        let ctx = crate::arch::trap_entry::ArchTrapContext {
+            vector: x86_external_vector(LINE),
+            error_code: 0,
+            fault_addr: 0,
+            entered_from_user: true,
+        };
+        let result = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
+            &kernel,
+            CpuId(0),
+            ctx,
+            Some(&mut frame),
+        );
+        assert_eq!(
+            result,
+            Ok(()),
+            "the port's fatal channel must not be entered"
+        );
+        assert_eq!(frame, before, "no error encoded into the interrupted frame");
+        assert_eq!(
+            completion_count_for_test::take(),
+            1,
+            "exactly one completion"
+        );
+        assert_eq!(drain(&kernel, recv), [LINE, LINE]);
+    }
+
+    /// Q3 — the same from idle (no interrupted user frame).
+    #[test]
+    fn q3_an_idle_origin_interrupt_on_a_full_queue_returns_ok() {
+        let (kernel, _idx, _sig, recv) = fixture(1);
+        saturate(&kernel, 1);
+        let _armed = ArmedInjection::arm();
+        let ctx = crate::arch::trap_entry::ArchTrapContext {
+            vector: x86_external_vector(LINE),
+            error_code: 0,
+            fault_addr: 0,
+            entered_from_user: false,
+        };
+        let result = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
+            &kernel,
+            CpuId(0),
+            ctx,
+            None,
+        );
+        assert_eq!(result, Ok(()), "the idle fatal channel must not be entered");
+        assert_eq!(completion_count_for_test::take(), 1);
+        assert_eq!(drain(&kernel, recv), [LINE, LINE]);
+    }
+
+    /// Q4 — the bridge body every kernel-thread port calls: a settled `Ok`, so the kernel-thread
+    /// arm has nothing to report, and one completion.
+    #[test]
+    fn q4_the_bridge_settles_a_saturated_delivery_as_ok() {
+        let (kernel, _idx, _sig, _recv) = fixture(1);
+        saturate(&kernel, 1);
+        let _armed = ArmedInjection::arm();
+        assert_eq!(
+            settle_external_interrupt_at_bridge(
+                &kernel,
+                CpuId(0),
+                u32::from(LINE),
+                single_step(LINE)
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(completion_count_for_test::take(), 1);
+    }
+
+    /// Q5 — ordinary delivery is unchanged: delivered, queued, received, one completion.
+    #[test]
+    fn q5_ordinary_delivery_is_unchanged() {
+        let (kernel, _idx, _sig, recv) = fixture(4);
+        let _armed = ArmedInjection::arm();
+        assert_eq!(
+            settle_external_interrupt_at_bridge(
+                &kernel,
+                CpuId(0),
+                u32::from(LINE),
+                single_step(LINE)
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(completion_count_for_test::take(), 1);
+        assert_eq!(drain(&kernel, recv), [LINE]);
+        assert_eq!(drain(&kernel, recv), [], "nothing duplicated");
+    }
+
+    /// Q6 — two lines on one Notification: after saturation the receiver still observes the
+    /// line whose interrupt did not fit, and the two stay distinct.
+    #[test]
+    fn q6_two_saturated_lines_both_remain_observable() {
+        let (kernel, _idx, _sig, recv) = fixture(1);
+        saturate(&kernel, 1);
+        for line in [LINE2, LINE, LINE2, LINE] {
+            let o = kernel.deliver_external_irq_split(CpuId(0), line);
+            assert_eq!(o.propagated_error(), None, "{o:?}");
+        }
+        let seen = drain(&kernel, recv);
+        assert_eq!(seen.first(), Some(&LINE), "the queued event first");
+        assert!(
+            seen.contains(&LINE2),
+            "the overflowed line is still observable: {seen:?}"
+        );
+        assert_eq!(
+            seen.iter().filter(|&&l| l == LINE2).count(),
+            1,
+            "repeated saturation of one line coalesces: {seen:?}"
+        );
+    }
+
+    /// Q7 — the exact incarnation is destroyed while saturated: its queued and pending events go
+    /// with it, and the replacement in the same slot starts with none.
+    #[test]
+    fn q7_destruction_retires_queued_and_pending_events() {
+        let (kernel, idx, sig, recv) = fixture(1);
+        saturate(&kernel, 1);
+        let _ = kernel.deliver_external_irq_split(CpuId(0), LINE2);
+        kernel.with(|s| {
+            let cnode = s.current_task_cnode().expect("cnode");
+            let _ = s.revoke_capability_in_cnode(cnode, sig);
+            let _ = s.revoke_capability_in_cnode(cnode, recv);
+            assert!(
+                s.with_ipc_state(|ipc| ipc.notifications[idx].is_none()),
+                "destroyed"
+            );
+        });
+        let (idx2, _sig2, recv2) = kernel.with(|s| s.create_notification(1).expect("replacement"));
+        assert_eq!(idx2, idx, "the slot is reused");
+        assert_eq!(
+            drain(&kernel, recv2),
+            [],
+            "the replacement inherits no event"
+        );
+        let o = kernel.deliver_external_irq_split(CpuId(0), LINE2);
+        assert_eq!(o.marker(), "no_route", "and no route: {o:?}");
+    }
+
+    /// Completions for one bridge settlement, through both completion tokens: the single-step
+    /// seam (x86_64 LAPIC EOI / AArch64 inert) and a RISC-V PLIC claim, counted at the one owner
+    /// and in the claim model.
+    fn settle_both(
+        kernel: &SharedKernel,
+        line: u16,
+    ) -> (Option<Result<(), TrapHandleError>>, u32, u32) {
+        use crate::arch::external_irq_claim::model;
+        let _ = completion_count_for_test::take();
+        model::reset();
+        let a = settle_external_interrupt_at_bridge(
+            kernel,
+            CpuId(0),
+            u32::from(line),
+            single_step(line),
+        );
+        let single = completion_count_for_test::take();
+        let b = settle_external_interrupt_at_bridge(
+            kernel,
+            CpuId(0),
+            u32::from(line),
+            InterruptCompletion::PlicClaim {
+                source: u32::from(line),
+                base: 0x0C00_0000,
+                context_index: 1,
+            },
+        );
+        let _ = completion_count_for_test::take();
+        let claims = model::completions() as u32;
+        model::reset();
+        assert_eq!(a, b, "both tokens settle the same way");
+        (a, single, claims)
+    }
+
+    /// §5/§9.12 — exactly one controller completion for every ending: normal, saturated,
+    /// repeated under saturation, unrouted, revoked binding, destroyed Notification, stale route.
+    #[test]
+    fn every_ending_is_completed_exactly_once_on_both_tokens() {
+        let (kernel, idx, sig, recv) = fixture(1);
+        let _armed = ArmedInjection::arm();
+        assert_eq!(
+            settle_both(&kernel, LINE),
+            (Some(Ok(())), 1, 1),
+            "normal, then saturated"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                settle_both(&kernel, LINE),
+                (Some(Ok(())), 1, 1),
+                "repeated under saturation"
+            );
+        }
+        assert_eq!(settle_both(&kernel, 40), (Some(Ok(())), 1, 1), "unrouted");
+        // A stale route naming the incarnation before this one.
+        let current = kernel.with(|s| s.with_ipc_state(|ipc| ipc.notification_generations[idx]));
+        kernel.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                ipc.irq_routes[41] = Some(crate::kernel::boot::irq_binding::forced_route_for_test(
+                    idx,
+                    current.wrapping_sub(1),
+                ))
+            })
+        });
+        assert_eq!(
+            settle_both(&kernel, 41),
+            (Some(Ok(())), 1, 1),
+            "stale route"
+        );
+        // Revoke LINE2's line authority (its owner): the binding ends.
+        kernel.with(|s| {
+            let route = s
+                .with_ipc_state(|ipc| ipc.irq_routes[usize::from(LINE2)])
+                .expect("bound");
+            let _ = s.revoke_capability_in_cnode(route.owner.cnode, route.owner.cap);
+            assert!(s.with_ipc_state(|ipc| ipc.irq_routes[usize::from(LINE2)].is_none()));
+        });
+        assert_eq!(
+            settle_both(&kernel, LINE2),
+            (Some(Ok(())), 1, 1),
+            "revoked binding"
+        );
+        // Destroy the Notification.
+        kernel.with(|s| {
+            let cnode = s.current_task_cnode().expect("cnode");
+            let _ = s.revoke_capability_in_cnode(cnode, sig);
+            let _ = s.revoke_capability_in_cnode(cnode, recv);
+        });
+        assert_eq!(
+            settle_both(&kernel, LINE),
+            (Some(Ok(())), 1, 1),
+            "destroyed Notification"
+        );
+    }
+
+    /// §8 I4 — the receiver consumes a pending line while another interrupt of that line
+    /// arrives. The two are totally ordered at rank 3; in neither order is the new one erased.
+    #[test]
+    fn i4_consuming_a_pending_line_cannot_erase_a_new_interrupt() {
+        // (a) the new interrupt lands after the consumption: it is observable afterwards.
+        let (kernel, _idx, _sig, recv) = fixture(1);
+        saturate(&kernel, 1);
+        let _ = kernel.deliver_external_irq_split(CpuId(0), LINE2);
+        let first: alloc::vec::Vec<u16> = drain(&kernel, recv);
+        assert_eq!(first, [LINE, LINE2]);
+        let after = kernel.deliver_external_irq_split(CpuId(0), LINE2);
+        assert_eq!(
+            after.marker(),
+            "delivered",
+            "the queue has room again: {after:?}"
+        );
+        assert_eq!(
+            drain(&kernel, recv),
+            [LINE2],
+            "the new interrupt was not erased"
+        );
+        // (b) it lands before: it coalesces into the bit the consumption then reports once.
+        let (kernel, idx, _sig, recv) = fixture(1);
+        saturate(&kernel, 1);
+        let _ = kernel.deliver_external_irq_split(CpuId(0), LINE2);
+        let again = kernel.deliver_external_irq_split(CpuId(1), LINE2);
+        assert!(matches!(
+            again,
+            crate::kernel::boot::IrqDeliveryOutcome::Coalesced {
+                newly_pending: false,
+                ..
+            }
+        ));
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                assert_eq!(
+                    ipc.notifications[idx]
+                        .as_ref()
+                        .expect("live")
+                        .overflow_pending,
+                    1u64 << LINE2
+                )
+            })
+        });
+        assert_eq!(drain(&kernel, recv), [LINE, LINE2]);
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                assert_eq!(
+                    ipc.notifications[idx]
+                        .as_ref()
+                        .expect("live")
+                        .overflow_pending,
+                    0
+                )
+            })
+        });
+    }
+
+    /// §8 I2/I3 — two interrupts on one line from two CPUs, and two different lines: one pending
+    /// bit per line, distinct lines stay distinct. (Hosted and serial: the two deliveries are
+    /// ordered by the rank-3 acquisition each takes, which is the production linearization point;
+    /// this does not prove parallel execution.)
+    #[test]
+    fn i2_i3_same_line_coalesces_across_cpus_and_lines_stay_distinct() {
+        let (kernel, idx, _sig, recv) = fixture(1);
+        saturate(&kernel, 1);
+        let a = kernel.deliver_external_irq_split(CpuId(0), LINE2);
+        let b = kernel.deliver_external_irq_split(CpuId(1), LINE2);
+        let c = kernel.deliver_external_irq_split(CpuId(1), LINE);
+        assert!(matches!(
+            a,
+            crate::kernel::boot::IrqDeliveryOutcome::Coalesced {
+                newly_pending: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            b,
+            crate::kernel::boot::IrqDeliveryOutcome::Coalesced {
+                newly_pending: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            c,
+            crate::kernel::boot::IrqDeliveryOutcome::Coalesced {
+                newly_pending: true,
+                ..
+            }
+        ));
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                let n = ipc.notifications[idx].as_ref().expect("live");
+                assert_eq!(n.len, 1, "the queued event is intact");
+                assert_eq!(n.overflow_pending, (1u64 << LINE) | (1u64 << LINE2));
+            })
+        });
+        assert_eq!(
+            drain(&kernel, recv),
+            [LINE, LINE, LINE2],
+            "queued first, then lowest line first"
+        );
+    }
+
+    /// While any line is pending the object stays in coalescing mode, so a busy line cannot
+    /// refill the queue ahead of a line that overflowed.
+    #[test]
+    fn a_busy_line_cannot_starve_a_pending_one() {
+        let (kernel, _idx, _sig, recv) = fixture(2);
+        saturate(&kernel, 2);
+        let _ = kernel.deliver_external_irq_split(CpuId(0), LINE2);
+        // The receiver takes one queued event; the queue has room, but LINE2 is pending.
+        let first = kernel.with(|s| s.try_ipc_recv(recv).expect("recv").expect("event").opcode);
+        assert_eq!(first, LINE);
+        for _ in 0..5 {
+            let o = kernel.deliver_external_irq_split(CpuId(0), LINE);
+            assert_eq!(o.marker(), "coalesced", "{o:?}");
+        }
+        assert_eq!(
+            drain(&kernel, recv),
+            [LINE, LINE, LINE2],
+            "LINE2 is reached, once, after the queue"
+        );
+    }
+
+    /// §8 I8 / §9.14 — a receiver that blocks while only a pending indication remains gets it at
+    /// once (it is not parked); a parked receiver is woken exactly once and its record consumed.
+    #[test]
+    fn i8_pending_work_is_taken_by_a_blocking_receive_and_waiters_are_woken_once() {
+        let (kernel, idx, _sig, recv) = fixture(1);
+        saturate(&kernel, 1);
+        let _ = kernel.deliver_external_irq_split(CpuId(0), LINE2);
+        kernel.with(|s| {
+            assert_eq!(
+                s.try_ipc_recv(recv).expect("recv").map(|m| m.opcode),
+                Some(LINE)
+            );
+            let got = s.ipc_recv(recv).expect("blocking receive");
+            assert_eq!(
+                got.map(|m| m.opcode),
+                Some(LINE2),
+                "the pending line, not a park"
+            );
+            assert!(s.with_ipc_state(|ipc| ipc.notification_waiters[idx].is_none()));
+            // Now empty: a blocking receive parks, and one interrupt wakes it exactly once.
+            s.register_task(9).expect("receiver task");
+        });
+        kernel.with(|s| {
+            let r9 = s
+                .grant_capability_task_to_task_with_rights(
+                    0,
+                    recv,
+                    9,
+                    crate::kernel::capabilities::CapRights::RECEIVE,
+                )
+                .expect("r9");
+            s.enqueue_current_cpu(9).expect("enqueue");
+            let _ = s.yield_current();
+            assert_eq!(s.current_tid(), Some(9));
+            assert_eq!(s.ipc_recv(r9).expect("park"), None);
+            assert!(s.task_is_blocked(9));
+        });
+        let woke = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert!(
+            matches!(
+                woke,
+                crate::kernel::boot::IrqDeliveryOutcome::DeliveredAndWoke { waiter_tid: 9, .. }
+            ),
+            "{woke:?}"
+        );
+        let again = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert!(
+            matches!(
+                again,
+                crate::kernel::boot::IrqDeliveryOutcome::Coalesced { .. }
+            ),
+            "the depth-1 queue is full again and no record is left to wake twice: {again:?}"
+        );
+        kernel.with(|s| assert!(!s.task_is_blocked(9)));
+    }
+
+    /// §8 I5/I6/I7 — saturation interleaved with route revocation and with destruction and
+    /// reuse: a delivery after the route is gone is `NoRoute`; the live Notification keeps its
+    /// pending state; a stale delivery never touches the replacement's state.
+    #[test]
+    fn i5_i6_i7_revocation_destruction_and_reuse_around_saturation() {
+        let (kernel, idx, sig, recv) = fixture(1);
+        saturate(&kernel, 1);
+        let _ = kernel.deliver_external_irq_split(CpuId(0), LINE2);
+        // I6: revoke LINE2's owner; a further LINE2 interrupt has no route, the pending bit stays.
+        kernel.with(|s| {
+            let route = s
+                .with_ipc_state(|ipc| ipc.irq_routes[usize::from(LINE2)])
+                .expect("bound");
+            let _ = s.revoke_capability_in_cnode(route.owner.cnode, route.owner.cap);
+        });
+        assert_eq!(
+            kernel.deliver_external_irq_split(CpuId(0), LINE2).marker(),
+            "no_route"
+        );
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                assert_eq!(
+                    ipc.notifications[idx]
+                        .as_ref()
+                        .expect("live")
+                        .overflow_pending,
+                    1u64 << LINE2
+                )
+            })
+        });
+        // I5/I7: destroy, reuse, and force the old incarnation's route back: the stale delivery
+        // reaches nothing of the replacement.
+        let old = kernel.with(|s| s.with_ipc_state(|ipc| ipc.notification_generations[idx]));
+        kernel.with(|s| {
+            let cnode = s.current_task_cnode().expect("cnode");
+            let _ = s.revoke_capability_in_cnode(cnode, sig);
+            let _ = s.revoke_capability_in_cnode(cnode, recv);
+        });
+        let (idx2, _s2, recv2) = kernel.with(|s| s.create_notification(1).expect("replacement"));
+        assert_eq!(idx2, idx);
+        kernel.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                ipc.irq_routes[usize::from(LINE)] = Some(
+                    crate::kernel::boot::irq_binding::forced_route_for_test(idx, old),
+                )
+            })
+        });
+        assert_eq!(
+            kernel.deliver_external_irq_split(CpuId(0), LINE).marker(),
+            "target_gone"
+        );
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                let n = ipc.notifications[idx2].as_ref().expect("replacement");
+                assert_eq!(
+                    (n.len, n.overflow_pending),
+                    (0, 0),
+                    "the replacement is untouched"
+                );
+            })
+        });
+        assert_eq!(drain(&kernel, recv2), []);
+    }
+
+    /// The broad producer coalesces the same way: `route_external_irq` returns `Ok` on a
+    /// saturated route and the line stays observable.
+    #[test]
+    fn the_broad_route_coalesces_too() {
+        let (kernel, _idx, _sig, recv) = fixture(1);
+        kernel.with(|s| {
+            for _ in 0..3 {
+                s.route_external_irq(LINE).expect("never an error");
+            }
+            s.route_external_irq(LINE2).expect("never an error");
+        });
+        assert_eq!(drain(&kernel, recv), [LINE, LINE, LINE2]);
+    }
+
+    /// Owner level: the receive clears only the bit it reports; a signal never refuses for want
+    /// of space; a line no route can carry is the only refusal (an invariant, never saturation).
+    #[test]
+    fn the_object_owner_coalesces_reports_and_clears_exactly() {
+        use crate::kernel::boot::{IrqSignal, NotificationObject};
+        let mut n = NotificationObject::new(1).expect("depth 1");
+        assert_eq!(n.send_irq(3), Ok(IrqSignal::Queued));
+        assert_eq!(
+            n.send_irq(5),
+            Ok(IrqSignal::Coalesced {
+                newly_pending: true
+            })
+        );
+        assert_eq!(
+            n.send_irq(7),
+            Ok(IrqSignal::Coalesced {
+                newly_pending: true
+            })
+        );
+        assert_eq!(
+            n.send_irq(5),
+            Ok(IrqSignal::Coalesced {
+                newly_pending: false
+            })
+        );
+        assert_eq!(n.recv().map(|m| m.opcode), Some(3));
+        assert_eq!(
+            n.send_irq(3),
+            Ok(IrqSignal::Coalesced {
+                newly_pending: true
+            }),
+            "coalescing mode"
+        );
+        assert_eq!(n.recv().map(|m| m.opcode), Some(3));
+        assert_eq!(
+            n.overflow_pending,
+            (1 << 5) | (1 << 7),
+            "only bit 3 was cleared"
+        );
+        assert_eq!(n.recv().map(|m| m.opcode), Some(5));
+        assert_eq!(n.recv().map(|m| m.opcode), Some(7));
+        assert!(n.recv().is_none() && !n.has_event());
+        assert_eq!(
+            n.send_irq(9),
+            Ok(IrqSignal::Queued),
+            "back to queuing once drained"
+        );
+        let past = crate::arch::platform_constants::MAX_IRQ_LINES as u16;
+        assert_eq!(n.send_irq(past), Err(KernelError::WrongObject));
     }
 }
