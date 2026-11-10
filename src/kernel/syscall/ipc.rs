@@ -716,8 +716,16 @@ pub(super) fn handle_ipc_send(
         );
         return Ok(());
     }
+    // SEND-TIMEOUT-ARB1: a parked sender's waiter owns its transfer envelope; only a send that
+    // parked nothing gives the envelope back here.
+    let (send_result, parked) = match send_result {
+        Ok(crate::kernel::boot::BlockingSendProducerOutcome::BlockedInLock) => {
+            (Err(KernelError::WouldBlock), true)
+        }
+        other => (other, false),
+    };
     if let Err(err) = send_result {
-        if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
+        if let Some(handle) = msg.transferred_cap().map(|c| c.0).filter(|_| !parked) {
             // Use the receiver TID that was bound at stash time. Passing sender_tid
             // would fail the bound-receiver check inside take_transfer_envelope when
             // endpoint_waiter_tid returned Some(waiter_tid) at stash time.

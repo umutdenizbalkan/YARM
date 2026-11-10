@@ -1125,6 +1125,10 @@ pub(crate) enum BlockingSendProducerOutcome {
     /// frame alone and let the post-lock drain decide; the drain's typed disposition is what
     /// finally determines the syscall's result.
     PublicationPending,
+    /// SEND-TIMEOUT-ARB1: the in-lock route PARKED the sender — its waiter is published and owns
+    /// the message and any transfer envelope. The caller reports `WouldBlock` but must not
+    /// release the envelope: the cycle's winner (a receiver or a timeout) owns it.
+    BlockedInLock,
 }
 
 /// U9-RX2 — THE one recv-waiter publication policy: an atomic queue-recheck and
@@ -5158,7 +5162,7 @@ impl KernelState {
         self.with_ipc_state_mut(|ipc| {
             ipc.telemetry.blocked_sends = ipc.telemetry.blocked_sends.saturating_add(1);
         });
-        Err(KernelError::WouldBlock)
+        Ok(BlockingSendProducerOutcome::BlockedInLock)
     }
 
     /// U6 §5 — resolve the publication snapshot for this blocking send, or `None` when the send
@@ -5303,10 +5307,17 @@ impl KernelState {
         if crate::kernel::boot::d2_send_genuine_enabled() {
             crate::yarm_log!("D2_SEND_GENUINE_PHASE_TASK_BLOCK tid={}", blocked_tid);
         }
+        #[cfg(test)]
+        super::sender_waiter::send_arb_phase_hook::run_between_block_and_publish(self);
         // Phase C (ipc rank 3): publish the sender-waiter (its message rides with
         // it, so the receiver-side wake/handoff and the Stage 163P sender-wake
         // oracle are unchanged).
-        self.enqueue_sender_waiter(
+        //
+        // SEND-TIMEOUT-ARB1: between Phase B and here no actor can end this cycle — every ending
+        // needs its waiter — so the waiter is always published for a live cycle. If it cannot be
+        // published, no waiter will ever exist and nothing else can end the cycle: this blocker
+        // owns it, ends it with the refusal's own error, and puts the sender back to run.
+        if let Err(err) = self.enqueue_sender_waiter(
             endpoint_idx,
             SenderWaiter {
                 tid: ThreadId(blocked_tid),
@@ -5314,7 +5325,23 @@ impl KernelState {
                 asid: blocked_asid,
                 send_generation,
             },
-        )?;
+        ) {
+            let target = crate::kernel::ipc::SenderWakeTarget {
+                tid: ThreadId(blocked_tid),
+                asid: blocked_asid,
+                send_generation,
+            };
+            let result = crate::kernel::syscall::SyscallError::from(err).code() as u64;
+            crate::yarm_log!(
+                "SEND_ARB_PUBLICATION_REFUSED_UNWIND tid={} send_generation={} err={:?}",
+                blocked_tid,
+                send_generation,
+                err
+            );
+            self.complete_and_wake_blocked_sender(target, result)?;
+            let _ = self.dispatch_next_task()?;
+            return Err(err);
+        }
         if crate::kernel::boot::d2_send_genuine_enabled() {
             crate::yarm_log!("D2_SEND_GENUINE_PHASE_IPC_LOCK tid={}", blocked_tid);
             crate::yarm_log!("D2_SEND_GENUINE_PHASE_DISPATCH tid={}", blocked_tid);
@@ -7329,12 +7356,13 @@ impl KernelState {
             // U6/199C: capture the parked SENDERS before wiping them. Each may still own a
             // transfer envelope (and a shared-region pin) that nothing can consume once the
             // endpoint is gone; they are settled once, after this rank-3 section releases.
+            // SEND-TIMEOUT-ARB1: EVERY removed waiter is kept — removing it makes this
+            // destruction the owner of its cycle, which it ends below.
             for (i, slot) in ipc.endpoint_sender_waiters[endpoint_idx]
                 .iter_mut()
                 .enumerate()
             {
                 if let Some(removed) = slot.take()
-                    && removed.msg.transferred_cap().is_some()
                     && i < MAX_ENDPOINT_SENDER_WAITERS
                 {
                     orphaned_senders[i] = Some(removed);
@@ -7354,6 +7382,14 @@ impl KernelState {
         // index — not against a live endpoint entry.
         for removed in orphaned_senders.iter().flatten() {
             let _ = self.settle_blocked_sender_envelope(removed, endpoint_idx);
+        }
+        // SEND-TIMEOUT-ARB1: the waiters are gone, so no receiver or timeout can end their cycles;
+        // this destruction does, after the settle, with the error a send to a destroyed endpoint
+        // reports. A stale record (the cycle already over) is refused by the claim.
+        let gone =
+            crate::kernel::syscall::SyscallError::from(KernelError::WrongObject).code() as u64;
+        for removed in orphaned_senders.iter().flatten() {
+            let _ = self.complete_and_wake_blocked_sender(removed.wake_target(), gone);
         }
         // Stage 199D-WA3C1 (F) — the second half of the same defect: the parked receiver used to
         // be discarded silently, leaving it `Blocked(EndpointReceive)` on an endpoint that no
@@ -7716,6 +7752,7 @@ impl KernelState {
         // `Err(WouldBlock)`, exactly as before U6. `PublicationPending` is unreachable here.
         match self.ipc_send_routed(send_cap, msg, deadline, BlockingSendRoute::Legacy)? {
             BlockingSendProducerOutcome::CompletedImmediately => Ok(()),
+            BlockingSendProducerOutcome::BlockedInLock => Err(KernelError::WouldBlock),
             BlockingSendProducerOutcome::PublicationPending => {
                 debug_assert!(false, "the legacy send route never publishes");
                 Err(KernelError::WouldBlock)

@@ -35,6 +35,24 @@
 //!
 //! An ASID-less sender is a cycle with `asid: None`. It is claimed only by a TCB whose ASID is
 //! also `None`, and it is woken without a completion (there is no incarnation to bind one to).
+//!
+//! # SEND-TIMEOUT-ARB1 — the waiter decides
+//!
+//! A cycle's message travels with its waiter, so the waiter is the cycle's arbitration token. The
+//! one irrevocable step is the rank-3 removal of the exact waiter, and whoever performs it owns the
+//! cycle — its ending AND its message's obligations:
+//!
+//! * a receiver's take (consume or refill) owns delivery, then claims `Consumed`;
+//! * the timeout withdraws the waiter first ([`remove_sender_waiter_for_cycle_locked`]), then
+//!   claims `TimedOut` and settles the transfer the message still carried;
+//! * an endpoint's destruction removes its waiters, so it ends each of their cycles;
+//! * a blocker whose waiter could not be published owns its cycle outright (no waiter exists).
+//!
+//! The rank-2 claim that follows a removal therefore has no competitor: no other actor holds that
+//! cycle's waiter, and nothing ends a cycle without one. A timeout that finds no waiter — not yet
+//! published, already taken by a receiver, or the cycle already over — changes nothing and leaves
+//! the deadline armed, so it can neither report a delivered message as timed out nor end a cycle
+//! whose waiter is still to appear. A task's death ends its cycle without a claim.
 
 use super::{IpcSubsystem, KernelState, MAX_ENDPOINT_SENDER_WAITERS, SenderWaiter};
 
@@ -49,9 +67,9 @@ pub(crate) enum SendCycleEnding {
     /// A receiver consumed the message; `result` is the completion it publishes
     /// (`KernelState::SEND_COMPLETION_OK` on every production site).
     Consumed { result: u64 },
-    /// The armed deadline `deadline` expired; `now` is the clock it was compared against. The
-    /// claim also requires the deadline to still be the armed one and still due.
-    TimedOut { deadline: u64, now: u64 },
+    /// The timeout withdrew the cycle's waiter (SEND-TIMEOUT-ARB1): ownership comes from that
+    /// removal, and the drain checked the deadline was due before making it.
+    TimedOut,
 }
 
 /// THE rank-2 claim of one blocking-send cycle. Returns `true` iff this caller ended the cycle.
@@ -79,12 +97,7 @@ pub(crate) fn claim_blocked_send_cycle_locked(
     }
     let (result, timed_out) = match ending {
         SendCycleEnding::Consumed { result } => (result, false),
-        SendCycleEnding::TimedOut { deadline, now } => {
-            if tcb.ipc_timeout_deadline != Some(deadline) || now < deadline {
-                return false;
-            }
-            (KernelState::SEND_COMPLETION_TIMED_OUT, true)
-        }
+        SendCycleEnding::TimedOut => (KernelState::SEND_COMPLETION_TIMED_OUT, true),
     };
     if let Some(asid) = target.asid {
         tcb.pending_syscall_completion = Some(BlockedSyscallCompletion {
@@ -166,6 +179,39 @@ fn compact_sender_queue(queue: &mut [Option<SenderWaiter>]) {
         if queue[read].is_some() {
             queue[write] = queue[read].take();
             write += 1;
+        }
+    }
+}
+
+/// SEND-TIMEOUT-ARB1: test-only phase handshakes at the two windows a concurrent CPU can land in —
+/// between a broad block's task-block (Phase B) and its waiter publication (Phase C), and between
+/// the send-timeout drain's two domain claims.
+#[cfg(test)]
+pub(crate) mod send_arb_phase_hook {
+    extern crate std;
+    use core::cell::RefCell;
+    type BlockHook = alloc::boxed::Box<dyn FnMut(&mut crate::kernel::boot::KernelState)>;
+    type DrainHook = alloc::boxed::Box<dyn FnMut()>;
+    std::thread_local! {
+        static BETWEEN_BLOCK_AND_PUBLISH: RefCell<Option<BlockHook>> = const { RefCell::new(None) };
+        static BETWEEN_DRAIN_PHASES: RefCell<Option<DrainHook>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn arm_between_block_and_publish(hook: BlockHook) {
+        BETWEEN_BLOCK_AND_PUBLISH.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    pub(crate) fn run_between_block_and_publish(state: &mut crate::kernel::boot::KernelState) {
+        let hook = BETWEEN_BLOCK_AND_PUBLISH.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(state);
+        }
+    }
+    pub(crate) fn arm_between_drain_phases(hook: DrainHook) {
+        BETWEEN_DRAIN_PHASES.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    pub(crate) fn run_between_drain_phases() {
+        let hook = BETWEEN_DRAIN_PHASES.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
         }
     }
 }

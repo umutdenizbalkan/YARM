@@ -17439,6 +17439,10 @@ impl SharedKernel {
     /// `SpinLock<KernelState>` already dropped. Four SEQUENTIAL, never-nested domain claims, in
     /// exactly the order the retired in-lock scan used:
     ///
+    /// SEND-TIMEOUT-ARB1 reversed the first two steps: the drain first WITHDRAWS the cycle's
+    /// exact waiter at rank 3 (the arbitration point — no waiter, no action, deadline left armed)
+    /// and only then claims at rank 2, uncontested. The description below is the U7 original.
+    ///
     /// 1. **rank 2 — the exact claim.** The item is settled only if `{tid, asid,
     ///    send_generation}` still names a live incarnation `Blocked(EndpointSend)` whose armed
     ///    deadline is still the collected one and is still due. Everything else is refused with
@@ -17467,28 +17471,39 @@ impl SharedKernel {
         use crate::kernel::capabilities::CapObject;
         let cpu_idx = cpu.0 as usize;
         while let Some(work) = crate::kernel::boot::send_timeout_work_drain_next(cpu_idx) {
-            // ── (1) rank 2: the exact claim + the TimedOut publication ──────────────────────
-            // IPC-SENDER-ID1: THE claim of this exact cycle — the receiver-side publication
-            // makes the same one, so exactly one of them ends the cycle. An ASID-less sender is
-            // claimed without a completion, as before.
             let target = crate::kernel::ipc::SenderWakeTarget {
                 tid: crate::kernel::ipc::ThreadId(work.tid),
                 asid: work.asid,
                 send_generation: work.send_generation,
             };
-            let claimed = self.with_task_tcbs_split_mut(|tcbs| {
-                crate::kernel::boot::sender_waiter::claim_blocked_send_cycle_locked(
-                    tcbs,
-                    target,
-                    crate::kernel::boot::sender_waiter::SendCycleEnding::TimedOut {
-                        deadline: work.deadline,
-                        now,
-                    },
-                )
+            if now < work.deadline {
+                crate::yarm_log!(
+                    "U7_SEND_TIMEOUT_REFUSED_NOT_DUE tid={} send_generation={} deadline={} now={}",
+                    work.tid,
+                    work.send_generation,
+                    work.deadline,
+                    now
+                );
+                continue;
+            }
+            // ── (0) rank 2, read-only: is this cycle still the sender's? ─────────────────────
+            // A cycle the sender already left (completed, re-blocked under a newer generation,
+            // replaced, dead) is refused here with zero mutation, so stale work never touches
+            // any queue.
+            let current = self.with_task_tcbs_split_mut(|tcbs| {
+                tcbs.iter().flatten().any(|t| {
+                    t.tid == target.tid
+                        && t.asid == target.asid
+                        && t.blocked_send_generation == target.send_generation
+                        && matches!(
+                            t.status,
+                            crate::kernel::task::TaskStatus::Blocked(
+                                crate::kernel::task::WaitReason::EndpointSend(_)
+                            )
+                        )
+                })
             });
-            if !claimed {
-                // A receiver won the race, the incarnation was replaced, or the sender
-                // re-blocked with a newer generation. Nothing was mutated.
+            if !current {
                 crate::yarm_log!(
                     "U7_SEND_TIMEOUT_REFUSED_STALE tid={} asid={} send_generation={} deadline={}",
                     work.tid,
@@ -17498,40 +17513,77 @@ impl SharedKernel {
                 );
                 continue;
             }
-            crate::yarm_log!(
-                "U6_SEND_COMPLETION_PUBLISHED tid={} asid={} send_generation={} result={} result=ok",
-                work.tid,
-                work.asid.map(|a| a.0).unwrap_or(0),
-                work.send_generation,
-                KernelState::SEND_COMPLETION_TIMED_OUT
-            );
-            // ── (2) rank 3: remove the waiter and resolve what it still owned ───────────────
-            let envelope = self.with_ipc_split_mut(|ipc| {
-                // IPC-SENDER-ID1: remove exactly this cycle's waiter (compacting its queue).
+            // ── (1) rank 3: withdraw exactly this cycle's waiter — THE arbitration point ─────
+            // SEND-TIMEOUT-ARB1: the waiter carries the message, so removing it is what decides
+            // the cycle. No waiter means a receiver already took the message, the waiter is not
+            // published yet, or the cycle is over: nothing is mutated and the deadline stays
+            // armed, so this can never report a delivered message as timed out.
+            let withdrawn = self.with_ipc_split_mut(|ipc| {
                 let (removed, endpoint_idx) =
                     crate::kernel::boot::sender_waiter::remove_sender_waiter_for_cycle_locked(
                         ipc, target,
                     )?;
-                let handle = removed.msg.transferred_cap()?;
-                let idx = usize::try_from(handle.0 & 0xFFFF).ok()?;
-                // Resolve against the envelope's OWN recorded endpoint, never a live
-                // `ipc.endpoints` entry — the endpoint may legitimately be gone.
-                let env = ipc.transfer_envelopes.get(idx).copied().flatten()?;
-                if ipc.transfer_envelope_generations.get(idx).copied() != Some(handle.0 >> 16) {
-                    return None;
-                }
-                if !matches!(env.endpoint,
-                    CapObject::Endpoint { index, .. } if index == endpoint_idx)
-                {
-                    return None;
-                }
-                Some((
-                    handle.0,
-                    endpoint_idx,
-                    env.receiver_tid.unwrap_or(removed.tid),
-                ))
+                let owed = removed.msg.transferred_cap().and_then(|handle| {
+                    let idx = usize::try_from(handle.0 & 0xFFFF).ok()?;
+                    // Resolve against the envelope's OWN recorded endpoint, never a live
+                    // `ipc.endpoints` entry — the endpoint may legitimately be gone.
+                    let env = ipc.transfer_envelopes.get(idx).copied().flatten()?;
+                    if ipc.transfer_envelope_generations.get(idx).copied() != Some(handle.0 >> 16) {
+                        return None;
+                    }
+                    if !matches!(env.endpoint,
+                        CapObject::Endpoint { index, .. } if index == endpoint_idx)
+                    {
+                        return None;
+                    }
+                    Some((
+                        handle.0,
+                        endpoint_idx,
+                        env.receiver_tid.unwrap_or(removed.tid),
+                    ))
+                });
+                Some(owed)
             });
+            let Some(envelope) = withdrawn else {
+                crate::yarm_log!(
+                    "U7_SEND_TIMEOUT_REFUSED_NO_WAITER tid={} asid={} send_generation={} deadline={}",
+                    work.tid,
+                    work.asid.map(|a| a.0).unwrap_or(0),
+                    work.send_generation,
+                    work.deadline
+                );
+                continue;
+            };
+            #[cfg(test)]
+            crate::kernel::boot::sender_waiter::send_arb_phase_hook::run_between_drain_phases();
+            // ── (2) rank 2: the claim — uncontested, since this drain holds the waiter ──────
+            // It fails only if the sender is no longer blocked in this cycle (it died), so a
+            // failure can strand nobody; the transfer is settled below either way.
+            let claimed = self.with_task_tcbs_split_mut(|tcbs| {
+                crate::kernel::boot::sender_waiter::claim_blocked_send_cycle_locked(
+                    tcbs,
+                    target,
+                    crate::kernel::boot::sender_waiter::SendCycleEnding::TimedOut,
+                )
+            });
+            if claimed {
+                crate::yarm_log!(
+                    "U6_SEND_COMPLETION_PUBLISHED tid={} asid={} send_generation={} result={} result=ok",
+                    work.tid,
+                    work.asid.map(|a| a.0).unwrap_or(0),
+                    work.send_generation,
+                    KernelState::SEND_COMPLETION_TIMED_OUT
+                );
+            } else {
+                crate::yarm_log!(
+                    "U7_SEND_TIMEOUT_CLAIM_AFTER_WITHDRAW_REFUSED tid={} send_generation={}",
+                    work.tid,
+                    work.send_generation
+                );
+            }
             // ── (3) rank 3 released → the canonical settle (rank 3, then rank 6) ────────────
+            // The withdrawn message was never delivered, so its transfer is this drain's to
+            // cancel — exactly once, before any wake.
             if let Some((handle, endpoint_idx, cleanup_tid)) = envelope {
                 let taken =
                     self.settle_blocked_send_envelope_split(handle, endpoint_idx, cleanup_tid);
@@ -17542,6 +17594,9 @@ impl SharedKernel {
                     handle,
                     if taken { "ok" } else { "already_settled" }
                 );
+            }
+            if !claimed {
+                continue;
             }
             // ── (4) rank 1: the wake, last ─────────────────────────────────────────────────
             self.enqueue_reply_timeout_wake_split(work.tid);
