@@ -3369,54 +3369,42 @@ impl KernelState {
     /// already been completed by another site, or one that has since been woken and re-blocked
     /// under a newer generation are all different cycles, and none of them is this waiter's.
     ///
-    /// Returns `true` iff a completion was published.
+    /// IPC-SENDER-ID1: the publication IS the claim of the cycle
+    /// (`sender_waiter::claim_blocked_send_cycle_locked`): on success the sender is also made
+    /// `Runnable` and its deadline disarmed, in the same acquisition. An ASID-less sender is
+    /// claimed without a completion.
+    ///
+    /// Returns `true` iff this caller claimed the cycle. Only then may it wake the sender.
     pub(crate) fn publish_blocking_send_completion(
         &mut self,
         target: crate::kernel::ipc::SenderWakeTarget,
         result: u64,
     ) -> bool {
-        let Some((tid, asid, send_generation)) = target.exact() else {
-            // An ASID-less sender has no incarnation to bind a completion to. It is woken
-            // exactly as it was before U6 — this is the pre-U6 behaviour, preserved.
-            return false;
-        };
+        // IPC-SENDER-ID1: THE claim of this exact cycle (`sender_waiter`), the same one the
+        // timeout drain makes. Claiming also makes the sender `Runnable`, so a timeout that runs
+        // after this can no longer claim the cycle and overwrite the completion.
         let published = self.with_tcbs_mut(|tcbs| {
-            let Some(tcb) = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|t| t.tid.0 == tid && t.asid == Some(asid))
-            else {
-                return false;
-            };
-            if tcb.blocked_send_generation != send_generation {
-                return false;
-            }
-            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {
-                return false;
-            }
-            tcb.pending_syscall_completion = Some(crate::kernel::task::BlockedSyscallCompletion {
-                syscall_class: crate::kernel::task::BlockedSyscallClass::IpcSend,
-                result,
-                tid,
-                asid,
-                blocked_generation: send_generation,
-            });
-            true
+            super::sender_waiter::claim_blocked_send_cycle_locked(
+                tcbs,
+                target,
+                super::sender_waiter::SendCycleEnding::Consumed { result },
+            )
         });
+        let asid_log = target.asid.map_or(0, |a| a.0);
         if published {
             crate::yarm_log!(
                 "U6_SEND_COMPLETION_PUBLISHED tid={} asid={} send_generation={} result={} result=ok",
-                tid,
-                asid.0,
-                send_generation,
+                target.tid.0,
+                asid_log,
+                target.send_generation,
                 result
             );
         } else {
             crate::yarm_log!(
                 "U6_SEND_COMPLETION_REFUSED_STALE tid={} asid={} send_generation={}",
-                tid,
-                asid.0,
-                send_generation
+                target.tid.0,
+                asid_log,
+                target.send_generation
             );
         }
         published
@@ -3529,8 +3517,14 @@ impl KernelState {
         target: crate::kernel::ipc::SenderWakeTarget,
         result: u64,
     ) -> Result<(), KernelError> {
-        self.publish_blocking_send_completion(target, result);
-        self.wake_tid_to_runnable(target.tid)
+        // IPC-SENDER-ID1: wake only the cycle this call claimed. A refused claim means the
+        // cycle already ended (or was replaced by a newer one); waking the bare TID then would
+        // wake whatever the task is doing now.
+        if self.publish_blocking_send_completion(target, result) {
+            self.wake_tid_to_runnable(target.tid)
+        } else {
+            Ok(())
+        }
     }
 
     /// `true` iff a pending blocked-syscall completion is parked for `tid` (assertions).
@@ -4349,7 +4343,8 @@ impl KernelState {
         // waiter (a reused numeric TID always carries a different ASID). Task exit runs synchronously
         // under the global lock while this is still the task at `tid`, so its current ASID IS the one
         // it published with. NOTIF-WAITER1 clears the notification waiter by the same identity; the
-        // sender waiter structures keep their numeric-TID sweep (not receive-waiters).
+        // sender waiters are removed by numeric TID through `sender_waiter`, which states why that
+        // is the task-incarnation predicate (a TID names one TCB for the life of the system).
         let identity = ReceiverWaiterIdentity::new(tid_id, self.task_asid(tid).unwrap_or(Asid(0)));
         // U6/199C: a removed SENDER waiter may still own a transfer envelope (and, for a
         // shared-region transfer, one transient pin). Collect them under the rank-3 sweep and
@@ -4359,20 +4354,13 @@ impl KernelState {
         let mut orphaned_n = 0usize;
         self.with_ipc_state_mut(|ipc| {
             ipc.clear_endpoint_waiters_for_identity(identity);
-            for (endpoint_idx, queue) in ipc.endpoint_sender_waiters.iter_mut().enumerate() {
-                for slot in queue.iter_mut() {
-                    if slot.as_ref().is_some_and(|w| w.tid == tid_id) {
-                        if let Some(removed) = slot.take()
-                            && removed.msg.transferred_cap().is_some()
-                            && orphaned_n < MAX_ENDPOINT_SENDER_WAITERS
-                        {
-                            orphaned[orphaned_n] = Some((removed, endpoint_idx));
-                            orphaned_n += 1;
-                        }
-                        *slot = None;
-                    }
-                }
-            }
+            // IPC-SENDER-ID1: the task-scoped removal owner (numeric TID by proof — see
+            // `sender_waiter`), compacting each queue it touches.
+            orphaned_n = super::sender_waiter::remove_sender_waiters_for_task_locked(
+                ipc,
+                tid_id,
+                &mut orphaned,
+            );
             // NOTIF-WAITER1: the notification waiter too, by complete identity.
             ipc.clear_notification_waiters_for_identity(identity);
         });
@@ -5885,8 +5873,12 @@ impl KernelState {
             target.tid.0,
             target.send_generation
         );
-        self.publish_blocking_send_completion(target, Self::SEND_COMPLETION_OK);
-        self.apply_scheduler_wake_plan(super::SchedulerWakePlan::Wake(target.tid))
+        // IPC-SENDER-ID1: wake only the cycle this call claimed.
+        if self.publish_blocking_send_completion(target, Self::SEND_COMPLETION_OK) {
+            self.apply_scheduler_wake_plan(super::SchedulerWakePlan::Wake(target.tid))
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn ipc_try_send_queued_plain_endpoint_only(

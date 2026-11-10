@@ -122536,6 +122536,11 @@ mod stage199d_wa2a_ownership_boundary {
             // new home rather than at two.
             ("src/kernel/boot/restart_state.rs", 2),
             ("src/kernel/boot/scheduler_state.rs", 1),
+            // IPC-SENDER-ID1: the blocking-send timeout's `Blocked(EndpointSend) -> Runnable`
+            // write moved out of `drain_send_timeout_post_work` into THE claim of a blocking-send
+            // cycle, `sender_waiter::claim_blocked_send_cycle_locked`, which the receiver-side
+            // publication now makes too. It moved; it did not multiply (runtime.rs 13 -> 12).
+            ("src/kernel/boot/sender_waiter.rs", 1),
             // U9-SPAWN1 SP-2: `spawn_user_thread`'s Runnable write moved to the shared
             // thread-incarnation owner, so thread_state.rs falls 4 -> 3 and the owner gains 1.
             ("src/kernel/boot/spawn_thread_core.rs", 1),
@@ -122604,7 +122609,9 @@ mod stage199d_wa2a_ownership_boundary {
             // U9-IRQ-UNKNOWN1 §2: 12 -> 13. `wake_notification_waiter_exact_split` is the
             // off-lock twin of that owner, needed because off-lock code can never obtain a
             // `&mut KernelState`; it applies the identical three-part proof.
-            ("src/runtime.rs", 13),
+            // IPC-SENDER-ID1: 13 -> 12. `drain_send_timeout_post_work`'s write moved into
+            // `sender_waiter::claim_blocked_send_cycle_locked` (counted there).
+            ("src/runtime.rs", 12),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -123348,9 +123355,13 @@ mod stage199d_wa2b_wake_owner_census {
         // `Blocked(EndpointReceive)` task by a precondition no caller can bypass — the rank-2
         // claim refuses anything whose status is not `Blocked(EndpointSend(_))`, and refuses
         // before any mutation.
+        // IPC-SENDER-ID1: the write moved, unchanged in class, into THE claim of a blocking-send
+        // cycle, which both the timeout drain and the receiver-side publication now make. The
+        // same precondition refuses before any mutation, and a target can only be a cycle a
+        // sender waiter recorded.
         (
-            "src/runtime.rs",
-            "drain_send_timeout_post_work",
+            "src/kernel/boot/sender_waiter.rs",
+            "claim_blocked_send_cycle_locked",
             1,
             Verdict::Cannot,
         ),
@@ -123754,6 +123765,18 @@ mod stage199d_wa2b_wake_owner_census {
             "TaskStatus::Blocked(_) => {",
             "Ok(CrossCpuWakeApplyResult::Applied)",
         ),
+        // IPC-SENDER-ID1: THE claim of a blocking-send cycle (timeout drain and receiver-side
+        // publication). The previous line is the close of the `if let Some(asid)` arm that parks
+        // the cycle's completion: it is published in the SAME rank-2 acquisition, immediately
+        // before the status write — the fingerprint U7 pinned on the drain, unchanged.
+        (
+            "src/kernel/boot/sender_waiter.rs",
+            "claim_blocked_send_cycle_locked",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "tcb.ipc_timeout_deadline = None;",
+        ),
         (
             "src/kernel/boot/spawn_thread_core.rs",
             "initialize_thread_incarnation_locked",
@@ -123872,18 +123895,9 @@ mod stage199d_wa2b_wake_owner_census {
             // BL5a-2: the restored wait gets back the reply-deadline registration the commit took.
             "if tcb.reply_timeout_token.is_none() {",
         ),
-        // U7 (199E): the blocking-SEND timeout wake, moved off the broad lock. The previous
-        // line is the close of the `if let Some(asid)` arm that parks the `TimedOut`
-        // completion, which is the whole point of the fingerprint: the completion is published
-        // in the SAME rank-2 acquisition, immediately before the status write.
-        (
-            "src/runtime.rs",
-            "drain_send_timeout_post_work",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            "}",
-            "tcb.ipc_timeout_deadline = None;",
-        ),
+        // U7 (199E): the blocking-SEND timeout wake, moved off the broad lock.
+        // IPC-SENDER-ID1 moved this row to `sender_waiter::claim_blocked_send_cycle_locked` (see
+        // below, in that file's source position).
         // Canonical 199E: the ordinary RECEIVE timeout wake, moved off the broad lock. Its
         // neighbourhood is the close of the exact-claim guards and the deadline clear that
         // publishes the `TimedOut` fact in the same rank-2 acquisition.
@@ -124618,11 +124632,15 @@ mod stage199d_wa2b_wake_owner_census {
             // status that is not `Blocked(EndpointSend(_))`, BEFORE any mutation; the caller
             // closure is the deferred-work drain loop, whose items can only have been published
             // by the collector for a task that was `Blocked(EndpointSend)` at scan time.
+            // IPC-SENDER-ID1: the row moved into THE claim. The guard is unchanged; the closure
+            // fact is that every target names a recorded blocking-send cycle — the timeout drain
+            // builds it from collector work for a task that was `Blocked(EndpointSend)`, and the
+            // receiver side only ever has `SenderWaiter::wake_target()`.
             (
-                "runtime.rs",
-                "drain_send_timeout_post_work",
+                "sender_waiter.rs",
+                "claim_blocked_send_cycle_locked",
                 "if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {",
-                "while let Some(work) = crate::kernel::boot::send_timeout_work_drain_next(cpu_idx)",
+                "target: SenderWakeTarget,",
             ),
             // U9-REAP1 §2: the reap claim. Unlike every other row here the target TID IS supplied
             // from outside (PM names it), so the closure fact is not "no caller selects a victim"
@@ -124694,6 +124712,7 @@ mod stage199d_wa2b_wake_owner_census {
                 "reap_claim.rs" => REAP_CLAIM,
                 "exit_claim.rs" => EXIT_CLAIM,
                 "runtime.rs" => RUNTIME,
+                "sender_waiter.rs" => include_str!("sender_waiter.rs"),
                 other => panic!("unknown census source {other}"),
             };
             let body = src
@@ -131884,17 +131903,17 @@ mod u3_ordinary_cap_sender_wake {
         let cases: [Case; 8] = [
             (
                 "blocked, unpinned",
-                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+                TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1))),
                 None,
             ),
             (
                 "blocked, pinned to cpu 1",
-                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+                TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1))),
                 Some(CpuId(1)),
             ),
             (
                 "blocked, pinned to cpu 0",
-                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+                TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1))),
                 Some(CpuId(0)),
             ),
             ("already runnable", TaskStatus::Runnable, None),
@@ -131945,10 +131964,64 @@ mod u3_ordinary_cap_sender_wake {
         });
         candidate(&new, CpuId(0), ThreadId(SENDER));
         assert_eq!(obs_old, observe(&new));
+        // IPC-SENDER-ID1: a missing sender is a refused claim. It wakes nothing and is not an
+        // error — the receiver already holds the message, and failing its receive here would
+        // drop it. (The retired body returned `TaskMissing` after the message was taken.)
+        let before = observe(&new);
         assert_eq!(
             new.test_apply_split_sender_wake_plan_split(CpuId(0), ThreadId(SENDER)),
-            Err(crate::kernel::boot::types::KernelError::TaskMissing)
+            Ok(())
         );
+        assert_eq!(observe(&new), before, "nothing moved");
+    }
+
+    /// IPC-SENDER-ID1: a sender wake names ONE blocking-send cycle. A task that is not blocked in
+    /// that cycle — blocked in a receive, or blocked in a different send generation — is not
+    /// woken, its deadline is not disarmed, and nothing is enqueued.
+    #[test]
+    fn a_task_not_blocked_in_the_named_send_cycle_is_never_woken() {
+        for (label, status, generation) in [
+            (
+                "blocked in a receive",
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+                0,
+            ),
+            (
+                "blocked in a newer send cycle",
+                TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1))),
+                1,
+            ),
+        ] {
+            let (k, ..) = fixture(status, None);
+            k.with(|s| {
+                s.with_tcbs_mut(|tcbs| {
+                    for tcb in tcbs.iter_mut().flatten() {
+                        if tcb.tid.0 == SENDER {
+                            tcb.blocked_send_generation = generation;
+                        }
+                    }
+                })
+            });
+            let before = observe(&k);
+            assert_eq!(
+                k.test_apply_split_sender_wake_plan_split(CpuId(0), ThreadId(SENDER)),
+                Ok(()),
+                "{label}"
+            );
+            assert_eq!(observe(&k), before, "{label}: nothing may move");
+            let _ = k.with_cpu(CpuId(0), |kernel| {
+                kernel.apply_split_sender_wake_plan(crate::kernel::ipc::SenderWakeTarget {
+                    tid: ThreadId(SENDER),
+                    asid: None,
+                    send_generation: 0,
+                })
+            });
+            assert_eq!(
+                observe(&k),
+                before,
+                "{label}: the in-lock seam refuses identically"
+            );
+        }
     }
 
     // ── 2/3/4/5: the wake itself ─────────────────────────────────────────────────────────
@@ -131956,7 +132029,7 @@ mod u3_ordinary_cap_sender_wake {
     #[test]
     fn a_blocked_sender_becomes_runnable_and_its_timeout_clears_exactly_once() {
         let (k, ..) = fixture(
-            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1))),
             None,
         );
         assert!(
@@ -132008,7 +132081,7 @@ mod u3_ordinary_cap_sender_wake {
     #[test]
     fn a_pinned_sender_lands_on_its_pinned_cpu_not_the_bound_one() {
         let (k, ..) = fixture(
-            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1))),
             Some(CpuId(1)),
         );
         assert!(
@@ -132024,7 +132097,7 @@ mod u3_ordinary_cap_sender_wake {
 
     fn refusal_changes_nothing(cpu: CpuId, label: &str) {
         let (k, ..) = fixture(
-            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1))),
             None,
         );
         let before = observe(&k);
@@ -132061,7 +132134,7 @@ mod u3_ordinary_cap_sender_wake {
     #[test]
     fn wake_tid_none_binds_nothing_and_wakes_nothing() {
         let (k, asid, object) = fixture(
-            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1))),
             None,
         );
         let before = observe(&k);
@@ -132086,7 +132159,7 @@ mod u3_ordinary_cap_sender_wake {
     #[test]
     fn wake_tid_some_wakes_the_exact_sender_and_preserves_the_transferred_cap() {
         let (k, asid, object) = fixture(
-            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1))),
             None,
         );
         let mut f = frame();
@@ -135838,19 +135911,31 @@ mod u7_production_timeout_promotion {
             .split("\n    /// ")
             .next()
             .expect("its body");
-        let publish = body
+        // IPC-SENDER-ID1: the publication and the status transition are THE claim of the
+        // cycle (`sender_waiter`), made in one rank-2 acquisition; the drain calls it first.
+        let claim = include_str!("sender_waiter.rs")
+            .split("pub(crate) fn claim_blocked_send_cycle_locked(")
+            .nth(1)
+            .expect("the claim")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        let publish = claim
             .find("tcb.pending_syscall_completion =")
             .expect("the publication");
-        let runnable = body
+        let runnable = claim
             .find("tcb.status = TaskStatus::Runnable;")
             .expect("the wake");
+        assert!(publish < runnable, "publish precedes the status transition");
+        let runnable = body
+            .find("claim_blocked_send_cycle_locked(")
+            .expect("the drain makes the claim");
         let settle = body
             .find("self.settle_blocked_send_envelope_split(")
             .expect("the envelope settle");
         let enqueue = body
             .find("self.enqueue_reply_timeout_wake_split(work.tid);")
             .expect("the enqueue");
-        assert!(publish < runnable, "publish precedes the status transition");
         assert!(
             runnable < settle && settle < enqueue,
             "the envelope is settled before the sender can be dispatched"

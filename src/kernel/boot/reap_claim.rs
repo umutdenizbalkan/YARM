@@ -365,7 +365,8 @@ pub(crate) fn revoke_reply_caps_for_replier_identity_locked(
 }
 
 /// Detach every waiter the target owns: its endpoint RECEIVE waiter by exact identity, its
-/// endpoint SEND waiters by numeric TID, and its notification waiters.
+/// endpoint SEND waiters through `sender_waiter::remove_sender_waiters_for_task_locked` (numeric
+/// TID, which names exactly this TCB), and its notification waiters.
 ///
 /// Returns how many orphaned sender envelopes were collected into `orphaned` — each still owns a
 /// transferred capability (and, for a shared-region transfer, one transient pin) and must be
@@ -376,21 +377,10 @@ pub(crate) fn clear_ipc_waiters_for_identity_locked(
     orphaned: &mut [Option<(SenderWaiter, usize)>],
 ) -> usize {
     ipc.clear_endpoint_waiters_for_identity(identity);
-    let mut orphaned_n = 0usize;
-    for (endpoint_idx, queue) in ipc.endpoint_sender_waiters.iter_mut().enumerate() {
-        for slot in queue.iter_mut() {
-            if slot.as_ref().is_some_and(|w| w.tid == identity.tid) {
-                if let Some(removed) = slot.take()
-                    && removed.msg.transferred_cap().is_some()
-                    && orphaned_n < orphaned.len()
-                {
-                    orphaned[orphaned_n] = Some((removed, endpoint_idx));
-                    orphaned_n += 1;
-                }
-                *slot = None;
-            }
-        }
-    }
+    // IPC-SENDER-ID1: the task-scoped removal owner. The claim proved this TCB is the target; a
+    // TID names one TCB for the life of the system, so its numeric TID is the incarnation here.
+    let orphaned_n =
+        super::sender_waiter::remove_sender_waiters_for_task_locked(ipc, identity.tid, orphaned);
     // NOTIF-WAITER1: the notification waiter by the complete identity, never the bare TID.
     ipc.clear_notification_waiters_for_identity(identity);
     orphaned_n

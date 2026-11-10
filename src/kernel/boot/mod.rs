@@ -89,6 +89,7 @@ pub(crate) mod reap_claim;
 mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
+pub(crate) mod sender_waiter;
 pub(crate) mod shared_region_txn;
 /// U9-SPAWN-VM1: THE spawn-image provisioner — address space, image, stack, and one rollback.
 pub(crate) mod spawn_image_provision;

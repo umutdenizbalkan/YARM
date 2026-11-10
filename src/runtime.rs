@@ -5820,10 +5820,13 @@ impl SharedKernel {
         // message was already refilled into the endpoint under `ipc_state_lock`, so its send
         // succeeded; the completion is what makes the woken sender return that instead of the
         // `WouldBlock` its saved frame still carries.
-        self.publish_blocking_send_completion_split(
+        // IPC-SENDER-ID1: the publication is the claim; only a claimed cycle is woken.
+        if !self.publish_blocking_send_completion_split(
             target,
             crate::kernel::boot::KernelState::SEND_COMPLETION_OK,
-        );
+        ) {
+            return Ok(());
+        }
         // (3) the shared wake body — `apply_scheduler_wake_plan(Wake(tid))`.
         self.wake_tid_to_runnable_split(cpu, target.tid)
     }
@@ -6174,53 +6177,36 @@ impl SharedKernel {
     ///
     /// Byte-for-byte the same decision as the in-lock body: refused with NO mutation unless the
     /// target's `{tid, asid, send_generation}` still names a live incarnation blocked in
-    /// `EndpointSend`. One acquisition, no other domain touched.
+    /// `EndpointSend`. One acquisition, no other domain touched. IPC-SENDER-ID1: it is the claim
+    /// of the cycle, so it also makes the sender `Runnable`; `true` is the licence to wake.
     fn publish_blocking_send_completion_split(
         &self,
         target: crate::kernel::ipc::SenderWakeTarget,
         result: u64,
     ) -> bool {
-        use crate::kernel::task::{TaskStatus, WaitReason};
-        let Some((tid, asid, send_generation)) = target.exact() else {
-            return false;
-        };
+        // IPC-SENDER-ID1: THE claim of this exact cycle, the in-lock body's own.
         let published = self.with_task_tcbs_split_mut(|tcbs| {
-            let Some(tcb) = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|t| t.tid.0 == tid && t.asid == Some(asid))
-            else {
-                return false;
-            };
-            if tcb.blocked_send_generation != send_generation {
-                return false;
-            }
-            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {
-                return false;
-            }
-            tcb.pending_syscall_completion = Some(crate::kernel::task::BlockedSyscallCompletion {
-                syscall_class: crate::kernel::task::BlockedSyscallClass::IpcSend,
-                result,
-                tid,
-                asid,
-                blocked_generation: send_generation,
-            });
-            true
+            crate::kernel::boot::sender_waiter::claim_blocked_send_cycle_locked(
+                tcbs,
+                target,
+                crate::kernel::boot::sender_waiter::SendCycleEnding::Consumed { result },
+            )
         });
+        let asid_log = target.asid.map_or(0, |a| a.0);
         if published {
             crate::yarm_log!(
                 "U6_SEND_COMPLETION_PUBLISHED tid={} asid={} send_generation={} result={} result=ok",
-                tid,
-                asid.0,
-                send_generation,
+                target.tid.0,
+                asid_log,
+                target.send_generation,
                 result
             );
         } else {
             crate::yarm_log!(
                 "U6_SEND_COMPLETION_REFUSED_STALE tid={} asid={} send_generation={}",
-                tid,
-                asid.0,
-                send_generation
+                target.tid.0,
+                asid_log,
+                target.send_generation
             );
         }
         published
@@ -17477,48 +17463,28 @@ impl SharedKernel {
     ///
     /// No broad lock is taken anywhere, and no lock is held while another is acquired.
     pub(crate) fn drain_send_timeout_post_work(&self, cpu: CpuId, now: u64) {
-        use crate::kernel::boot::{KernelState, MAX_ENDPOINT_SENDER_WAITERS, SenderWaiter};
+        use crate::kernel::boot::KernelState;
         use crate::kernel::capabilities::CapObject;
-        use crate::kernel::task::{TaskStatus, WaitReason};
         let cpu_idx = cpu.0 as usize;
         while let Some(work) = crate::kernel::boot::send_timeout_work_drain_next(cpu_idx) {
             // ── (1) rank 2: the exact claim + the TimedOut publication ──────────────────────
+            // IPC-SENDER-ID1: THE claim of this exact cycle — the receiver-side publication
+            // makes the same one, so exactly one of them ends the cycle. An ASID-less sender is
+            // claimed without a completion, as before.
+            let target = crate::kernel::ipc::SenderWakeTarget {
+                tid: crate::kernel::ipc::ThreadId(work.tid),
+                asid: work.asid,
+                send_generation: work.send_generation,
+            };
             let claimed = self.with_task_tcbs_split_mut(|tcbs| {
-                let Some(tcb) = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|t| t.tid.0 == work.tid && t.asid == work.asid)
-                else {
-                    return false;
-                };
-                if tcb.blocked_send_generation != work.send_generation {
-                    return false;
-                }
-                if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {
-                    return false;
-                }
-                let Some(deadline) = tcb.ipc_timeout_deadline else {
-                    return false;
-                };
-                if deadline != work.deadline || now < deadline {
-                    return false;
-                }
-                // U6 §2: the completion names an INCARNATION. An ASID-less sender has none, so
-                // it is woken with nothing published — the same thing the in-lock scan did.
-                if let Some(asid) = work.asid {
-                    tcb.pending_syscall_completion =
-                        Some(crate::kernel::task::BlockedSyscallCompletion {
-                            syscall_class: crate::kernel::task::BlockedSyscallClass::IpcSend,
-                            result: KernelState::SEND_COMPLETION_TIMED_OUT,
-                            tid: work.tid,
-                            asid,
-                            blocked_generation: work.send_generation,
-                        });
-                }
-                tcb.status = TaskStatus::Runnable;
-                tcb.ipc_timeout_deadline = None;
-                tcb.ipc_timeout_fired = true;
-                true
+                crate::kernel::boot::sender_waiter::claim_blocked_send_cycle_locked(
+                    tcbs,
+                    target,
+                    crate::kernel::boot::sender_waiter::SendCycleEnding::TimedOut {
+                        deadline: work.deadline,
+                        now,
+                    },
+                )
             });
             if !claimed {
                 // A receiver won the race, the incarnation was replaced, or the sender
@@ -17541,44 +17507,29 @@ impl SharedKernel {
             );
             // ── (2) rank 3: remove the waiter and resolve what it still owned ───────────────
             let envelope = self.with_ipc_split_mut(|ipc| {
-                let mut owed: Option<(u64, usize, crate::kernel::ipc::ThreadId)> = None;
-                for (endpoint_idx, queue) in ipc.endpoint_sender_waiters.iter_mut().enumerate() {
-                    for slot in queue[..MAX_ENDPOINT_SENDER_WAITERS].iter_mut() {
-                        if !slot.as_ref().is_some_and(|w: &SenderWaiter| {
-                            w.tid.0 == work.tid && w.send_generation == work.send_generation
-                        }) {
-                            continue;
-                        }
-                        let removed = slot.take().expect("checked Some");
-                        let Some(handle) = removed.msg.transferred_cap() else {
-                            continue;
-                        };
-                        let Ok(idx) = usize::try_from(handle.0 & 0xFFFF) else {
-                            continue;
-                        };
-                        // Resolve against the envelope's OWN recorded endpoint, never a live
-                        // `ipc.endpoints` entry — the endpoint may legitimately be gone.
-                        let Some(Some(env)) = ipc.transfer_envelopes.get(idx).copied() else {
-                            continue;
-                        };
-                        if ipc.transfer_envelope_generations.get(idx).copied()
-                            != Some(handle.0 >> 16)
-                        {
-                            continue;
-                        }
-                        if !matches!(env.endpoint,
-                            CapObject::Endpoint { index, .. } if index == endpoint_idx)
-                        {
-                            continue;
-                        }
-                        owed = Some((
-                            handle.0,
-                            endpoint_idx,
-                            env.receiver_tid.unwrap_or(removed.tid),
-                        ));
-                    }
+                // IPC-SENDER-ID1: remove exactly this cycle's waiter (compacting its queue).
+                let (removed, endpoint_idx) =
+                    crate::kernel::boot::sender_waiter::remove_sender_waiter_for_cycle_locked(
+                        ipc, target,
+                    )?;
+                let handle = removed.msg.transferred_cap()?;
+                let idx = usize::try_from(handle.0 & 0xFFFF).ok()?;
+                // Resolve against the envelope's OWN recorded endpoint, never a live
+                // `ipc.endpoints` entry — the endpoint may legitimately be gone.
+                let env = ipc.transfer_envelopes.get(idx).copied().flatten()?;
+                if ipc.transfer_envelope_generations.get(idx).copied() != Some(handle.0 >> 16) {
+                    return None;
                 }
-                owed
+                if !matches!(env.endpoint,
+                    CapObject::Endpoint { index, .. } if index == endpoint_idx)
+                {
+                    return None;
+                }
+                Some((
+                    handle.0,
+                    endpoint_idx,
+                    env.receiver_tid.unwrap_or(removed.tid),
+                ))
             });
             // ── (3) rank 3 released → the canonical settle (rank 3, then rank 6) ────────────
             if let Some((handle, endpoint_idx, cleanup_tid)) = envelope {
