@@ -4138,6 +4138,11 @@ exactly two: the split route's `run_exit_transaction`, through the claim, and th
 | `wake_tid_to_runnable` | `recv_block_unwind_race`, `wake_waiter_for_endpoint`, `apply_scheduler_wake_plan` | 3 |
 | `apply_scheduler_wake_plan` | `apply_split_receiver_wake_plan`, `apply_split_sender_wake_plan`, `ipc_recv_with_optional_deadline` ×2, `ipc_reply` ×2, `ipc_send_with_optional_deadline`, `try_ipc_recv` | 8 |
 | `wake_tid_to_runnable_split` | `complete_blocked_waiter_delivery_split` | 1 |
+
+> NOTIF-WAITER1: `notification_recv_blocking`, the notification receive's own owner moved out
+> of `ipc_recv_with_optional_deadline`, is a further direct caller of `wake_tid_to_runnable`:
+> the unpublished unwind (gone incarnation, event taken, competing receiver). The live census
+> is `stage199d_wa2b_wake_owner_census`.
 | `apply_split_receiver_wake_plan` | `ctx_finalize_and_wake` ×2, `emit_fault_report_for_fault`, `handle_ipc_send`, `handle_ipc_call` | 5 |
 | `wake_waiter_for_endpoint` | `send_message_to_endpoint_and_wake`, `ipc_send_with_optional_deadline` ×2 | 3 |
 | `apply_cross_cpu_wake_task` | `apply_cross_cpu_work` (the `WorkItem::WakeTask` drain) | 1 |
@@ -4251,7 +4256,7 @@ parity.
 
 | requirement | state | how |
 |---|---|---|
-| 1. generation-bearing `{tid, asid}` waiter identity | **done** | `notification_waiters` is `[Option<EndpointWaiterRecord>; MAX_NOTIFICATIONS]` — the same `{ReceiverWaiterIdentity{tid, asid}, wait_generation}` record `endpoint_waiters` stores. The producer (`ipc_recv_with_optional_deadline`'s notification arm) bumps `blocked_recv_generation` and publishes the record it just minted. |
+| 1. generation-bearing `{tid, asid}` waiter identity | **done** | `notification_waiters` is `[Option<EndpointWaiterRecord>; MAX_NOTIFICATIONS]` — the same `{ReceiverWaiterIdentity{tid, asid}, wait_generation}` record `endpoint_waiters` stores. The producer (`notification_recv_blocking`, formerly `ipc_recv_with_optional_deadline`'s notification arm; NOTIF-WAITER1, `doc/IPC.md` §8.9) bumps `blocked_recv_generation` and publishes the record it just minted. |
 | 2. a notification-specific blocked reason | **substituted, not added** | No new `WaitReason` variant. The notification receive *is* an endpoint receive at the task layer — it blocks as `Blocked(WaitReason::EndpointReceive(_))` and mints the receive wait generation — so the exact token that answers "is this task still in the wait I published?" already existed: `blocked_recv_generation`. The wake requires all three of asid, that generation, and `Blocked(EndpointReceive(_))`. A new reason would be a *fourth* fact restating the first three; the collision E.2 found is closed by the generation, not by the reason tag. If notification waits are ever allowed to block under some other reason, this row must be re-derived — the guard pins the `Blocked(EndpointReceive(_))` arm so that change cannot pass silently. |
 | 3. mismatch or stale record → ignore, never wake | **done** | `wake_notification_waiter_exact` (and its off-lock twin) return `false` on any of the three mismatches. The caller enqueues only on `true`, so a stale record costs a lost signal-wake, never a wrong wake. |
 | 4. never settle an unrelated endpoint waiter | **done, and pinned** | Neither owner reads or writes `endpoint_waiters`; `the_notification_wake_never_consults_the_endpoint_waiter` asserts the absence. |
@@ -4368,7 +4373,7 @@ point of the matrix.
 | ordinary deadline scan | `process_ipc_timeout_deadlines` | `OrdinaryTimeout` | claim → consume on fire, restore on loss; requires the ipc-first reorder |
 | already-terminal, translation undecided | `rt_commit_receiver_runnable` (Timeout **and** PeerDeath) | **none yet** — see E.1; not `OrdinaryTimeout` | E.1 prerequisite |
 | teardown | `exit_task`, `restart_task`, `mark_task_dead`, `reap_faulted_task_noalloc_cleanup` | `Teardown` | claim → cancel; retire paired with `clear_ipc_waiters_for_tid` |
-| rollback, not delivery | `wake_tid_to_runnable` (via `recv_block_unwind_race`), `direct_dispatch_rollback_split` | **none** | assert no slot armed; never claim |
+| rollback, not delivery | `wake_tid_to_runnable` (via `recv_block_unwind_race`, and via `notification_recv_blocking`'s unpublished unwind), `direct_dispatch_rollback_split` | **none** | assert no slot armed; never claim |
 | **must refuse, never claim** | `signal_notification`, `wake_destroyed_notification_waiter` | `Notification` — **retracted**, see E.2 | exact notification identity, then refuse |
 | **production-enforced precondition, not a claim** | the nine group-3 scheduler/lifecycle sites | **none** | E.5 transitions |
 

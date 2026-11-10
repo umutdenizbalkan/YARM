@@ -1863,6 +1863,77 @@ coverage comes from the UART/PL011 IRQ witnesses, the only production creator: c
 cross-process mint into init, the bind and delivery. No default image creates a Notification,
 and no live path revokes or reaps a Notification holder.
 
+### 8.9 Notification waiter (NOTIF-WAITER1)
+
+**Contract.** A notification incarnation has at most one blocking receiver.
+`IpcSubsystem::notification_waiters[i]` names it as `{tid, asid, wait_generation}`. Every
+decision about the slot is taken at IPC rank 3 by `src/kernel/boot/notification_waiter.rs`, in
+one critical section that also sees the incarnation's generation and its event queue:
+
+* **immediate take.** The capability's generation is compared in the same acquisition as the
+  take, so an older capability never consumes a newer incarnation's event.
+* **publication.** It happens after the receiver is `Blocked(EndpointReceive)` and its receive
+  wait generation has been bumped, so a signal that finds the record can always wake it. In
+  order:
+  1. a gone or recycled incarnation refuses (`StaleCapability`);
+  2. a queued event is consumed for the receiver, because the signal raced the block;
+  3. another receiver's record refuses (`EndpointQueueFull`), and so does the same receiver's
+     record unless the new block has a strictly newer wait generation;
+  4. otherwise the record is published.
+* **stale reclaim.** A record is live only while its exact `{tid, asid}` task is
+  `Blocked(EndpointReceive)` under the record's wait generation. A competing record is tested
+  at task rank 2, before rank 3 is re-entered. If it is stale, the decision is retaken and may
+  replace exactly that record. The wait generation only grows, so a record that is once stale
+  stays stale. A record left behind by any wake therefore never locks out the next receiver.
+* **removal.** Each removal matches the complete `{tid, asid}`, never a bare TID. This covers
+  the signal's take, destruction (NOTIF-LIFETIME1, §8.8), task teardown, the broad timeout scan,
+  the reap and exit claim body, and the split receive-timeout settle. A record of a different
+  incarnation that shares the numeric TID is left alone; the signal's exact proof never wakes
+  it, and the next receive reclaims it.
+
+**No lost event.** Either the receiver consumes an available event, or it is the published,
+wakeable waiter. The signal side is unchanged: the broad route and the split IRQ delivery queue
+the event and take the record in one rank-3 acquisition, then wake through the exact-identity
+proof. So:
+
+* a signal before publication is found by step 2;
+* a signal after publication finds the record.
+
+**Restoration.** Every unpublished outcome (gone incarnation, event taken, competing receiver)
+restores the receiver through the receive family's unwind: `wake_tid_to_runnable`, which
+disarms its timeout and enqueues it, then `dispatch_next_task`. This is the IPC-DISPLACE1
+refusal shape. A published receiver that a timeout or teardown settled in the window between
+the block and the publication is no longer parked. Its exact record is retracted, so the
+timeout's wake stands and nothing stale remains.
+
+**Lifetime.** A waiter holds no reference. The final capability release still destroys the
+object, retires the waiter and wakes it (§8.8).
+
+**Reachability.** No syscall reaches the blocking notification receive on any ISA or build:
+
+* NR 2 and NR 5 validate an endpoint capability before any receive (`validate_endpoint_right`
+  answers `WrongObject` for a notification);
+* the witness builds' only notification door is the non-blocking NR 5 probe, which publishes no
+  waiter.
+
+This is a kernel primitive repair, proven hosted. The live UART/PL011 witnesses exercise the
+unchanged signal delivery.
+
+**Coverage.** `kernel::boot::tests::notif_waiter1`:
+
+* N1–N3, the defects, which fail on `dc5c8fd`;
+* first-receiver survival, exactly-once delivery and restoration of the refused receiver;
+* wait-generation supersession and stale reclaim;
+* signals before and after publication, broad and split (the split delivery entered for CPU 1);
+* production timeouts in the window and after publication;
+* exit, death and destruction during a wait, and the new incarnation left untouched;
+* recycled-identity teardown and repeated signals;
+* reference accounting and the generation-checked take;
+* a structural guard that only the owner publishes and no removal matches a bare TID.
+
+The handshakes run at a test-only hook between the block and the publication. Multi-receiver
+FIFO queues are out of scope.
+
 ---
 
 ## 9. Authoring rule

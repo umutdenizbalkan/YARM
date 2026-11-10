@@ -1022,6 +1022,11 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   destroy a Notification by slot index or because one capability went. Reserve its reference
   before a capability becomes visible and release it after the capability is gone, through
   `notification_lifetime`.
+- A notification has one blocking receiver (NOTIF-WAITER1, `doc/IPC.md` §8.9). Never write
+  `notification_waiters` outside `notification_waiter`: publish only after the block, through
+  the one rank-3 decision (generation, queue, competing record), and remove only by complete
+  `{tid, asid}`. A refused receiver is restored through the receive family's unwind, never by
+  a status write.
 
 ### 14.4 D3/D6 fences
 

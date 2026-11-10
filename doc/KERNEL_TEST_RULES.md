@@ -2174,6 +2174,12 @@ refcount, never granted cross-process), so revoking any Notification cap destroy
 the object. Tests must cover the revoke teardown, its idempotence, the lock-rank
 separation outcomes, and stale-cap stability.
 
+> **NOTIF-WAITER1 (2026-11-10).** A notification waiter test publishes its record through the
+> real blocking receive (`ipc_recv` / `ipc_recv_with_deadline` on a RECEIVE cap), not by writing
+> `notification_waiters`, so the record names the task's true `{tid, asid}`. A window between
+> the block and the publication is driven with `notif_recv_phase_hook`, never by reordering
+> production code. See `doc/IPC.md` §8.9.
+
 > **Superseded by NOTIF-LIFETIME1 (2026-11-09).** Notification caps are not single-owner: the UART IRQ witness mints a third cap into init, and delegation, fork inheritance and IPC transfer all copy them. A Notification now lives while any live capability names its exact `{index, generation}`; removing a capability gives back only its own reference, and the last removal destroys the object. See `doc/IPC.md` §8.8.
 > Stage 22/23 tests now give back the partner capability first, so the revoke under test is
 > the incarnation's last reference.
