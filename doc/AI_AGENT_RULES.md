@@ -1032,6 +1032,11 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   SIGNAL capability resolved in the caller's cnode, in the one rank-3 decision. An occupied line
   is never redirected. A route is owned by its exact IRQ capability and released through the
   removal report, so a new removal path must record what it removes in that report.
+- IRQ saturation is a settled ending (IRQ-DELIVERY1, `doc/IPC.md` §8.11). Never make a full
+  Notification queue an error, and never drop an interrupt to fit the queue. `send_irq` coalesces
+  into the line's pending bit, a receive takes the queue, then the lowest pending line, and clears
+  exactly that bit. Every delivery ending is completed exactly once through
+  `InterruptCompletion::complete`. Never widen this into suppressing trap errors.
 
 ### 14.4 D3/D6 fences
 

@@ -9318,6 +9318,11 @@ rank 3), preserving the create-two-phase pattern from §38.
 > lines they report (rank 3 → rank 4 → rank 3, sequential). Delivery checks the route's generation
 > in its signalling acquisition. See `doc/IPC.md` §8.10.
 
+> **IRQ-DELIVERY1 (2026-11-10).** A full queue no longer fails the signalling acquisition.
+> `send_irq` sets the line's pending bit inside the same rank-3 critical section, and a receive
+> clears exactly one bit inside its own. No acquisition, lock or ordering was added. See
+> `doc/IPC.md` §8.11.
+
 ### 39.3 Bugs fixed (Stage 21)
 
 1. **`signal_notification` resurrected dead waiters** (`ipc_state.rs`,
@@ -9514,6 +9519,11 @@ left parked forever on an object that no longer exists.
 > recheck of the owner follows. A route holds `{incarnation, owner}`. Removals revalidate the IRQ
 > lines they report (rank 3 → rank 4 → rank 3, sequential). Delivery checks the route's generation
 > in its signalling acquisition. See `doc/IPC.md` §8.10.
+
+> **IRQ-DELIVERY1 (2026-11-10).** A full queue no longer fails the signalling acquisition.
+> `send_irq` sets the line's pending bit inside the same rank-3 critical section, and a receive
+> clears exactly one bit inside its own. No acquisition, lock or ordering was added. See
+> `doc/IPC.md` §8.11.
 
 ### 40.8 Stale cap / generation behavior
 

@@ -2174,6 +2174,12 @@ refcount, never granted cross-process), so revoking any Notification cap destroy
 the object. Tests must cover the revoke teardown, its idempotence, the lock-rank
 separation outcomes, and stale-cap stability.
 
+> **IRQ-DELIVERY1 (2026-11-10).** A full Notification queue coalesces. A test that needs it
+> saturates with real `send_irq` or real deliveries, then drains with real receives. Assert the
+> received lines, not only the outcome. Completion is counted with
+> `crate::arch::hal_adapters::completion_count_for_test::take()`, which counts the one completion
+> owner (hosted builds have no controller to read back). See `doc/IPC.md` §8.11.
+
 > **IRQ-AUTH1 (2026-11-10).** A test binds an IRQ line with line authority: mint it through
 > `mint_irq_cap` (or `bind_irq_line_for_test`, which does exactly that) and pass both
 > capabilities to `bind_irq_notification`. A test that forces a defective route uses

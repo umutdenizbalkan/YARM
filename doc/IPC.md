@@ -2010,9 +2010,94 @@ it, and gives init RECEIVE only.
 
 The UART/PL011 witnesses bind and deliver live on all three interrupt controllers.
 
-**Not changed.** A full notification queue still propagates `EndpointQueueFull` out of the
-interrupt. The port then halts after acknowledging it. This is recorded for IRQ-DELIVERY1
-(`doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md`).
+**Not changed.** A full notification queue still propagated `EndpointQueueFull` out of the
+interrupt, and the port then halted after acknowledging it. IRQ-DELIVERY1 resolved this (§8.11).
+
+### 8.11 IRQ delivery saturation (IRQ-DELIVERY1)
+
+**Contract.** An authorized interrupt delivered to a live routed Notification always ends in one
+of these:
+
+* a queued event;
+* a retained pending indication for its line;
+* a settled refusal that already existed: the route is gone, or the target incarnation is gone.
+
+None of them is an error, and none reaches the trap as one. There is no ending in which the
+queue is full, the interrupt is acknowledged, and the event is forgotten.
+
+**State.** A Notification keeps its bounded `irq_queue` (`max_depth` events in arrival order).
+It also keeps `overflow_pending`, one bit per IRQ line (`MAX_IRQ_LINES <= 64`, checked at compile
+time).
+
+* `send_irq(line)` queues only while no bit is set and the queue has room.
+* Otherwise it sets the line's bit and reports `IrqSignal::Coalesced { newly_pending }`.
+  `newly_pending` is false when the line was already pending.
+* While any bit is set the object stays in coalescing mode. A busy line cannot refill the queue
+  and starve a line that overflowed.
+* Its only remaining `Err` is a line no route can carry (an internal invariant).
+
+**Receive.** A receive takes the oldest queued event first. With the queue empty, it takes the
+lowest pending line and clears exactly that bit. The message is the same either way: the line,
+in the header and the payload, so the ABI is unchanged.
+
+A pending line means "at least one interrupt on this line since its last event". Coalesced
+interrupts are counted by nobody: a driver that needs a count reads its device.
+
+**Ordering.** Every signal and receive runs inside the IPC rank-3 critical section that owns the
+object, so they are totally ordered. A signal for line X after the receive that cleared X's bit
+sets it again (or queues). An earlier consumption cannot erase what a later signal published.
+
+The state belongs to the incarnation:
+
+* destruction removes the object with its queue and its bits;
+* a replacement starts empty;
+* the route generation check (§8.10) keeps an old route from delivering into it.
+
+**Outcomes.**
+
+* The split delivery (`deliver_external_irq_split`) reports `IrqDeliveryOutcome::Coalesced
+  { notification_idx, generation, newly_pending }`, marker `coalesced`, with no propagated
+  error. The bridge settles it as success.
+* The broad delivery (`signal_notification`) returns `Ok`.
+* `Failed` now means only an invariant failure.
+* No other error class changed meaning: `TrapHandleError` is not suppressed and no other
+  `KernelError` became success.
+* A saturated interrupt does not touch the trapframe, the PC, the return value or the
+  scheduler placement.
+
+**Completion.** The single completion owner (`InterruptCompletion::complete`) runs exactly once for
+every ending, saturated or not:
+
+* x86_64: the LAPIC EOI;
+* AArch64: the claimed INTID's GICC_EOIR, still written by the vector tail;
+* RISC-V: the PLIC completion paired with its claim.
+
+The pending indication is kernel state, not controller state. Nothing is left unacknowledged
+for the device to re-raise.
+
+**Not changed.** These are out of scope:
+
+* no syscall, capability type, rights bit, lock, or unbounded storage;
+* no driver masking or acknowledgement protocol;
+* no binding API.
+
+A level-triggered device that keeps its line asserted re-raises after every completion whether
+or not the queue is full. That is driver work (device acknowledgement or masking), recorded in
+`doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md`.
+
+**Coverage.**
+
+* `kernel::boot::tests::irq_delivery1`:
+  * Q1–Q7: nonfatal for user and idle origin, bridge, ordinary delivery unchanged, two
+    lines, destruction;
+  * exact completion on both tokens;
+  * interleavings I2–I8 at the rank-3 linearization point;
+  * starvation;
+  * both producers;
+  * the object owner.
+* The default-off `irq-saturation-witness` drives real device interrupts past a full queue on
+  all three interrupt controllers, through `scripts/qemu-irq-saturation-witness-smoke.sh` and
+  `scripts/grade-irq-saturation-witness.py`.
 
 ---
 
