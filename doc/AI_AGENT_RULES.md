@@ -1037,6 +1037,11 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   into the line's pending bit, a receive takes the queue, then the lowest pending line, and clears
   exactly that bit. Every delivery ending is completed exactly once through
   `InterruptCompletion::complete`. Never widen this into suppressing trap errors.
+- A blocking-send cycle ends by ONE claim (IPC-SENDER-ID1, `doc/IPC.md` §8.12). Never wake a
+  blocked sender by bare TID: a receiver-side or timeout-side path calls
+  `sender_waiter::claim_blocked_send_cycle_locked` with the waiter's exact
+  `{tid, asid, send_generation}` and wakes only if that claim succeeded. Remove sender waiters only
+  through `sender_waiter` (one cycle by its triple; a task by its TID, which names one TCB).
 
 ### 14.4 D3/D6 fences
 

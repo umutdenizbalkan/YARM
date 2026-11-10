@@ -2174,6 +2174,13 @@ refcount, never granted cross-process), so revoking any Notification cap destroy
 the object. Tests must cover the revoke teardown, its idempotence, the lock-rank
 separation outcomes, and stale-cap stability.
 
+> **IPC-SENDER-ID1 (2026-11-10).** A test of a blocked sender blocks it for real
+> (`ipc_send_with_deadline` by the current task, or the off-lock publish+commit) and gives it an
+> ASID when it stands for a user task. A two-CPU race is written as the production phases in the
+> order two CPUs can run them (the take, the timeout collect+drain, the wake seam), not by
+> injecting the post-race state. A sender-wake fixture's "sender" must be blocked in the send
+> cycle its target names; a receive-blocked task is never a sender. See `doc/IPC.md` §8.12.
+
 > **IRQ-DELIVERY1 (2026-11-10).** A full Notification queue coalesces. A test that needs it
 > saturates with real `send_irq` or real deliveries, then drains with real receives. Assert the
 > received lines, not only the outcome. Completion is counted with

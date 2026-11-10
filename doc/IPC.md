@@ -2099,6 +2099,74 @@ or not the queue is full. That is driver work (device acknowledgement or masking
   all three interrupt controllers, through `scripts/qemu-irq-saturation-witness-smoke.sh` and
   `scripts/grade-irq-saturation-witness.py`.
 
+### 8.12 Endpoint sender-waiter identity (IPC-SENDER-ID1)
+
+A sender parked on a full or synchronous endpoint is a `SenderWaiter` carrying one
+**blocking-send cycle**, `{tid, asid, send_generation}` (`SenderWaiter::wake_target`).
+
+**Ending a cycle.** There is one rank-2 claim, `sender_waiter::claim_blocked_send_cycle_locked`,
+and both ways a cycle can end make it:
+
+* a receiver that consumed the message, through each of the three receiver-side seams
+  (`apply_blocked_sender_wake`, `apply_split_sender_wake_plan`,
+  `apply_split_sender_wake_plan_split`);
+* the send-timeout drain (`drain_send_timeout_post_work`).
+
+The claim succeeds only while that exact incarnation is `Blocked(EndpointSend)` with that
+generation (and, for the timeout, while the collected deadline is still armed and due). In the
+same acquisition it parks the cycle's completion (success or `TimedOut`), makes the sender
+`Runnable` and disarms its deadline. Whoever claims first ends the cycle. Every later claimant is
+refused with no mutation.
+
+Only a successful claim is followed by the wake. A refused claim wakes nothing, publishes nothing
+and is not an error, so a receive that already holds the message never fails because of it. A
+target is therefore never applied to another cycle: neither a newer blocking send of the same
+task nor another task. An ASID-less sender (a kernel sender) is the cycle with `asid: None`. It is
+claimed only by a TCB whose ASID is also `None`, and is woken without a completion.
+
+**Removing waiters.**
+
+* *One cycle* (the timeout): `remove_sender_waiter_for_cycle_locked` matches the whole triple.
+* *A task* (exit, death and reap: `clear_ipc_waiters_for_tid` and
+  `reap_claim::clear_ipc_waiters_for_identity_locked`): `remove_sender_waiters_for_task_locked`
+  matches the numeric TID, by proof rather than by convenience:
+  * a TID names one TCB for the life of the system;
+  * registration of an existing TID is a no-op, and the dynamic allocator never returns a TID
+    a TCB still carries;
+  * no production path removes a TCB that went live from the table (the one slot-clearing
+    owner, `spawn_reservation::clear_reservation_slot`, only clears a reservation or an undone
+    thread spawn that never ran).
+
+  Every waiter carrying the TID therefore belongs to the TCB being torn down, whatever ASID or
+  generation it recorded, and removing all of them is the lifecycle contract. Matching a stored
+  ASID instead would leave such a waiter with nobody to remove it.
+
+Both removals compact the queue, as a receiver's take does, so a later sender never overtakes an
+earlier one. A removed waiter that still owns a transfer envelope is settled once, after rank 3 is
+released, by whoever removed it. A waiter a receiver took is the receiver's, and no later removal
+finds it.
+
+**Not changed.** These stay as they were:
+
+* receiver arbitration, the endpoint queue and the ABI;
+* the timeout's order: claim at rank 2, then remove at rank 3. A timeout that claims after a
+  receiver already took the waiter still ends the cycle with `TimedOut` although the message was
+  delivered (recorded in `doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md`, proposed SEND-TIMEOUT-ARB1).
+
+**Coverage.**
+
+* `kernel::boot::tests::ipc_sender_id1`, which uses real blocking sends, the production take and
+  timeout pipeline, and all three seams, in two-CPU orders. It covers:
+  * S1: a TID is never recycled;
+  * S2: a stale wake against a newer cycle;
+  * S3: timeout against receive;
+  * S4: a dead sender;
+  * S6: repeated cycles;
+  * arrival order;
+  * the ASID-less cycle;
+  * the claim and both removals at the owner.
+* `...::shared_region::ipc_sender_id1_envelope` (S5): envelope and pin ownership.
+
 ---
 
 ## 9. Authoring rule

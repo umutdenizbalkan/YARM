@@ -9323,6 +9323,12 @@ rank 3), preserving the create-two-phase pattern from §38.
 > clears exactly one bit inside its own. No acquisition, lock or ordering was added. See
 > `doc/IPC.md` §8.11.
 
+> **IPC-SENDER-ID1 (2026-11-10).** The receiver-side sender publication is now the same rank-2
+> claim the send-timeout drain makes (`sender_waiter::claim_blocked_send_cycle_locked`): it parks
+> the completion and makes the sender `Runnable` in that one task acquisition. The rank-1 wake
+> follows only a successful claim. No acquisition, lock or ordering was added; a refused claim now
+> takes one fewer (no wake). See `doc/IPC.md` §8.12.
+
 ### 39.3 Bugs fixed (Stage 21)
 
 1. **`signal_notification` resurrected dead waiters** (`ipc_state.rs`,
@@ -9524,6 +9530,12 @@ left parked forever on an object that no longer exists.
 > `send_irq` sets the line's pending bit inside the same rank-3 critical section, and a receive
 > clears exactly one bit inside its own. No acquisition, lock or ordering was added. See
 > `doc/IPC.md` §8.11.
+
+> **IPC-SENDER-ID1 (2026-11-10).** The receiver-side sender publication is now the same rank-2
+> claim the send-timeout drain makes (`sender_waiter::claim_blocked_send_cycle_locked`): it parks
+> the completion and makes the sender `Runnable` in that one task acquisition. The rank-1 wake
+> follows only a successful claim. No acquisition, lock or ordering was added; a refused claim now
+> takes one fewer (no wake). See `doc/IPC.md` §8.12.
 
 ### 40.8 Stale cap / generation behavior
 
