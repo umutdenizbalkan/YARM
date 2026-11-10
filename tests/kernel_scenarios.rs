@@ -32,7 +32,8 @@ struct InitBootSummary {
 fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
     let mut kernel = Bootstrap::init()?;
     let (_notif, notif_send_cap, notif_recv_cap) = kernel.create_notification(8)?;
-    kernel.bind_irq_notification(9, notif_send_cap)?;
+    let irq_cap = kernel.mint_irq_cap(9)?;
+    kernel.bind_irq_notification(irq_cap, notif_send_cap)?;
 
     kernel.route_external_irq(9)?;
     let irq_notification_opcode = kernel
@@ -269,7 +270,8 @@ fn run_deterministic_script(steps: &[SimStep]) -> Result<SimSummary, KernelError
     let mut state = Bootstrap::init()?;
     let (_ep, send_cap, recv_cap) = state.create_endpoint(16)?;
     let (_notif, notif_send_cap, notif_recv_cap) = state.create_notification(8)?;
-    state.bind_irq_notification(9, notif_send_cap)?;
+    let irq_cap = state.mint_irq_cap(9)?;
+    state.bind_irq_notification(irq_cap, notif_send_cap)?;
     let mut last_received_opcode = None;
     let mut last_irq_opcode = None;
     let mut send_count = 0usize;

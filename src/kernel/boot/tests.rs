@@ -6,6 +6,21 @@ use crate::kernel::ipc::ThreadId;
 use crate::kernel::vm::{CachePolicy, PAGE_SIZE};
 use std::{format, string::String, vec::Vec};
 
+impl KernelState {
+    /// IRQ-AUTH1 test helper: bind `line` the authorized way. Line authority is minted into the
+    /// current context through the internal path the witness provisioning uses (`mint_irq_cap`),
+    /// then the line is bound with both capabilities. The returned id is the owner IRQ cap.
+    pub(crate) fn bind_irq_line_for_test(
+        &mut self,
+        line: u16,
+        notification_cap: CapId,
+    ) -> Result<CapId, KernelError> {
+        let irq = self.mint_irq_cap(line)?;
+        self.bind_irq_notification(irq, notification_cap)?;
+        Ok(irq)
+    }
+}
+
 /// Canonical 199E — drive the PRODUCTION timeout entry over a `KernelState` a test owns.
 ///
 /// The entry reads the live clocks, which a hosted test cannot advance, so the injected-clock
@@ -94,7 +109,7 @@ fn selected_arch_trap_entry_routes_timer() {
 fn selected_arch_trap_entry_routes_external_irq_notification() {
     let mut state = Bootstrap::init().expect("init");
     let (_notif_idx, notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(1, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(1, notif_cap).expect("bind");
     let ctx = crate::arch::trap_entry::ArchTrapContext {
         vector: 0x21, // external IRQ line 1
         error_code: 0,
@@ -139,7 +154,7 @@ fn selected_arch_trap_entry_routes_highest_external_irq_notification() {
     let highest_irq = (crate::arch::platform_constants::MAX_IRQ_LINES - 1) as u16;
     let vector = 0x20 + highest_irq as u8;
     state
-        .bind_irq_notification(highest_irq, notif_cap)
+        .bind_irq_line_for_test(highest_irq, notif_cap)
         .expect("bind");
     let ctx = crate::arch::trap_entry::ArchTrapContext {
         vector,
@@ -4994,7 +5009,7 @@ fn task_fault_policy_override_beats_global_policy() {
 fn notification_irq_route_delivers_message_to_bound_endpoint() {
     let mut state = Bootstrap::init().expect("init");
     let (_notif_idx, notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(11, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(11, notif_cap).expect("bind");
 
     state
         .handle_trap_event(TrapEvent::ExternalInterrupt(11), None)
@@ -5010,7 +5025,7 @@ fn create_notification_rejects_non_signal_cap_for_irq_binding() {
     let mut state = Bootstrap::init().expect("init");
     let (_eid, _send_cap, recv_cap) = state.create_endpoint(2).expect("ep");
     let err = state
-        .bind_irq_notification(1, recv_cap)
+        .bind_irq_line_for_test(1, recv_cap)
         .expect_err("must fail");
     assert_eq!(err, KernelError::MissingRight);
 }
@@ -6057,7 +6072,7 @@ fn deterministic_mixed_stress_sequence_is_stable() {
     let mut state = Bootstrap::init().expect("init");
     state.bring_up_cpu(CpuId(1)).expect("cpu1");
     let (_nidx, ncap, nrecv) = state.create_notification(8).expect("notif");
-    state.bind_irq_notification(5, ncap).expect("bind irq");
+    state.bind_irq_line_for_test(5, ncap).expect("bind irq");
 
     // Start from TID 2 to avoid TID 1 (BOOTSTRAP_FIRST_USER_TID), which has a
     // hard invariant that it must be pinned to CPU 0 (BOOTSTRAP_CPU_ID).
@@ -6510,7 +6525,7 @@ fn long_run_multi_core_simulation_is_deterministic() {
     let mut state = Bootstrap::init().expect("init");
     state.bring_up_cpu(CpuId(1)).expect("cpu1");
     let (_nidx, ncap, nrecv) = state.create_notification(64).expect("notif");
-    state.bind_irq_notification(7, ncap).expect("bind");
+    state.bind_irq_line_for_test(7, ncap).expect("bind");
 
     for i in 1..=20u64 {
         state.register_task(i).expect("task");
@@ -21388,7 +21403,7 @@ fn stage21_signal_wakes_waiting_task_exactly_once() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(2101).expect("task");
     let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(9, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(9, notif_cap).expect("bind");
 
     stage21_block_on_notification(&mut state, 2101);
     state.with_ipc_state_mut(|ipc| {
@@ -21428,7 +21443,7 @@ fn stage21_signal_skips_dead_waiter_safely() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(2102).expect("task");
     let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(10, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(10, notif_cap).expect("bind");
 
     state.mark_task_dead(2102).expect("dead");
     assert!(state.task_is_dead(2102), "dead before injection");
@@ -21452,7 +21467,7 @@ fn stage21_signal_skips_exited_waiter_safely() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(2103).expect("task");
     let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(11, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(11, notif_cap).expect("bind");
 
     state.exit_task(2103, 0).expect("exit");
     assert!(state.task_is_exited(2103), "exited before injection");
@@ -21573,7 +21588,7 @@ fn stage21_signal_before_wait_leaves_pending_for_later_recv() {
     // pending entry that a subsequent recv consumes (no waiter woken).
     let mut state = Bootstrap::init().expect("init");
     let (_notif_idx, notif_cap, recv_cap) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(12, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(12, notif_cap).expect("bind");
 
     // No waiter registered yet.
     state.route_external_irq(12).expect("irq");
@@ -21592,7 +21607,7 @@ fn stage21_wait_before_signal_registers_then_wakes() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(2108).expect("task");
     let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(13, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(13, notif_cap).expect("bind");
 
     stage21_block_on_notification(&mut state, 2108);
     state.with_ipc_state_mut(|ipc| {
@@ -21622,7 +21637,7 @@ fn stage21_repeated_signal_accumulates_pending() {
     // each consumable by recv in order (FIFO).
     let mut state = Bootstrap::init().expect("init");
     let (_notif_idx, notif_cap, recv_cap) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(14, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(14, notif_cap).expect("bind");
 
     state.route_external_irq(14).expect("irq1");
     state.route_external_irq(14).expect("irq2");
@@ -21647,17 +21662,17 @@ fn stage21_irq_route_registration_and_teardown() {
     // every route targeting the destroyed notification.
     let mut state = Bootstrap::init().expect("init");
     let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(15, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(15, notif_cap).expect("bind");
 
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[15]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[15].map(|r| r.notification.index)),
         Some(notif_idx),
         "route registered to notification"
     );
 
     notif_destroy_through_owner(&mut state, notif_idx);
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[15]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[15].map(|r| r.notification.index)),
         None,
         "route torn down by destroy_notification"
     );
@@ -21670,7 +21685,7 @@ fn stage21_irq_delivery_to_destroyed_notification_is_safe_noop() {
     // kernel error.
     let mut state = Bootstrap::init().expect("init");
     let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(16, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(16, notif_cap).expect("bind");
 
     notif_destroy_through_owner(&mut state, notif_idx);
     // Normal path: route was cleared, so this is an immediate no-op.
@@ -21679,7 +21694,12 @@ fn stage21_irq_delivery_to_destroyed_notification_is_safe_noop() {
     // Defence-in-depth: force a stale route back at the freed slot and confirm
     // signal_notification reports the dead object as a swallowed no-op.
     state.with_ipc_state_mut(|ipc| {
-        ipc.irq_routes[16] = Some(notif_idx);
+        // IRQ-AUTH1: the forced route names the DESTROYED incarnation (the generation before
+        // the destruction bump), exactly the stale route this defence covers.
+        let stale = ipc.notification_generations[notif_idx].wrapping_sub(1);
+        ipc.irq_routes[16] = Some(crate::kernel::boot::irq_binding::forced_route_for_test(
+            notif_idx, stale,
+        ));
     });
     state
         .route_external_irq(16)
@@ -21736,9 +21756,9 @@ fn stage22_notification_cap_revoke_tears_down_irq_route() {
     let mut state = Bootstrap::init().expect("init");
     let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
     notif_relinquish_partner(&mut state, recv);
-    state.bind_irq_notification(20, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(20, notif_cap).expect("bind");
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[20]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[20].map(|r| r.notification.index)),
         Some(notif_idx),
         "route registered before revoke"
     );
@@ -21749,7 +21769,7 @@ fn stage22_notification_cap_revoke_tears_down_irq_route() {
         .expect("revoke");
 
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[20]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[20].map(|r| r.notification.index)),
         None,
         "IRQ route torn down by cap revoke"
     );
@@ -21819,7 +21839,7 @@ fn stage22_signal_after_revoke_is_stable_noop() {
     // line is a stable no-op (no route -> immediate Ok), repeatable.
     let mut state = Bootstrap::init().expect("init");
     let (_notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(21, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(21, notif_cap).expect("bind");
 
     let cnode = state.current_task_cnode().expect("cnode");
     state
@@ -21866,20 +21886,24 @@ fn stage22_route_after_revoke_is_benign_noop() {
     let mut state = Bootstrap::init().expect("init");
     let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
     notif_relinquish_partner(&mut state, recv);
-    state.bind_irq_notification(22, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(22, notif_cap).expect("bind");
 
     let cnode = state.current_task_cnode().expect("cnode");
     state
         .revoke_capability_in_cnode(cnode, notif_cap)
         .expect("revoke");
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[22]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[22].map(|r| r.notification.index)),
         None,
         "route cleared by revoke"
     );
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.irq_routes[22] = Some(notif_idx);
+        // IRQ-AUTH1: the forced route names the destroyed incarnation.
+        let stale = ipc.notification_generations[notif_idx].wrapping_sub(1);
+        ipc.irq_routes[22] = Some(crate::kernel::boot::irq_binding::forced_route_for_test(
+            notif_idx, stale,
+        ));
     });
     state
         .route_external_irq(22)
@@ -21893,7 +21917,7 @@ fn stage22_create_notification_after_revoke_reuses_slot_cleanly() {
     let mut state = Bootstrap::init().expect("init");
     let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
     notif_relinquish_partner(&mut state, recv);
-    state.bind_irq_notification(23, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(23, notif_cap).expect("bind");
     let gen_first = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
 
     let cnode = state.current_task_cnode().expect("cnode");
@@ -21904,7 +21928,7 @@ fn stage22_create_notification_after_revoke_reuses_slot_cleanly() {
     let (new_idx, new_cap, _new_recv) = state.create_notification(4).expect("recreate");
     assert_eq!(new_idx, notif_idx, "lowest free slot reused");
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[23]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[23].map(|r| r.notification.index)),
         None,
         "no route inherited by reused slot"
     );
@@ -21966,8 +21990,8 @@ fn stage22_notification_cap_revoke_does_not_affect_unrelated_notification() {
     notif_relinquish_partner(&mut state, recv_a);
     let (idx_b, cap_b, recv_b) = state.create_notification(4).expect("notif b");
     assert_ne!(idx_a, idx_b, "distinct slots");
-    state.bind_irq_notification(24, cap_a).expect("bind a");
-    state.bind_irq_notification(25, cap_b).expect("bind b");
+    state.bind_irq_line_for_test(24, cap_a).expect("bind a");
+    state.bind_irq_line_for_test(25, cap_b).expect("bind b");
     let gen_b_before = state.with_ipc_state(|ipc| ipc.notification_generations[idx_b]);
 
     let cnode = state.current_task_cnode().expect("cnode");
@@ -21985,7 +22009,7 @@ fn stage22_notification_cap_revoke_does_not_affect_unrelated_notification() {
         "B still alive"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[25]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[25].map(|r| r.notification.index)),
         Some(idx_b),
         "B route untouched"
     );
@@ -22033,13 +22057,13 @@ fn stage23_revoke_notification_cap_destroys_object_and_routes() {
     let mut state = Bootstrap::init().expect("init");
     let (notif_idx, notif_cap, recv) = state.create_notification(4).expect("notif");
     notif_relinquish_partner(&mut state, recv);
-    state.bind_irq_notification(31, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(31, notif_cap).expect("bind");
     assert!(
         state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some()),
         "object present before revoke"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[31]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[31].map(|r| r.notification.index)),
         Some(notif_idx),
         "route registered before revoke"
     );
@@ -22054,7 +22078,7 @@ fn stage23_revoke_notification_cap_destroys_object_and_routes() {
         "object freed by revoke"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[31]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[31].map(|r| r.notification.index)),
         None,
         "IRQ route torn down by revoke"
     );
@@ -22069,7 +22093,7 @@ fn stage23_cnode_cleanup_on_task_exit_destroys_notification() {
     let mut state = Bootstrap::init().expect("init");
     let pid = state.current_tid().expect("current tid");
     let (notif_idx, _notif_cap, _recv) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(32, _notif_cap).expect("bind");
+    state.bind_irq_line_for_test(32, _notif_cap).expect("bind");
     assert!(
         state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some()),
         "object present before exit"
@@ -22083,7 +22107,7 @@ fn stage23_cnode_cleanup_on_task_exit_destroys_notification() {
         "object freed by task-exit cnode cleanup"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.irq_routes[32]),
+        state.with_ipc_state(|ipc| ipc.irq_routes[32].map(|r| r.notification.index)),
         None,
         "IRQ route torn down by task-exit cnode cleanup"
     );
@@ -22164,7 +22188,7 @@ fn stage23_stale_notification_cap_after_revoke_cannot_signal_or_recv() {
     // last revoke tears the route down.
     let mut state = Bootstrap::init().expect("init");
     let (_notif_idx, notif_cap, recv_cap) = state.create_notification(4).expect("notif");
-    state.bind_irq_notification(33, notif_cap).expect("bind");
+    state.bind_irq_line_for_test(33, notif_cap).expect("bind");
 
     let cnode = state.current_task_cnode().expect("cnode");
     state
@@ -144041,13 +144065,13 @@ mod u9f_split_capability_revocation {
         let (notif_idx, notif_cap, tid) = k.with(|state| {
             let (idx, cap, recv) = state.create_notification(4).expect("notif");
             notif_relinquish_partner(state, recv);
-            state.bind_irq_notification(20, cap).expect("bind");
+            state.bind_irq_line_for_test(20, cap).expect("bind");
             let tid = state.current_tid().expect("current tid");
             (idx, cap, tid)
         });
         k.with(|state| {
             assert_eq!(
-                state.with_ipc_state(|ipc| ipc.irq_routes[20]),
+                state.with_ipc_state(|ipc| ipc.irq_routes[20].map(|r| r.notification.index)),
                 Some(notif_idx),
                 "route registered before revoke"
             );
@@ -144058,7 +144082,7 @@ mod u9f_split_capability_revocation {
 
         k.with(|state| {
             assert_eq!(
-                state.with_ipc_state(|ipc| ipc.irq_routes[20]),
+                state.with_ipc_state(|ipc| ipc.irq_routes[20].map(|r| r.notification.index)),
                 None,
                 "the IRQ route is torn down by the split path"
             );
@@ -165317,7 +165341,10 @@ mod u9spawnic1_endpoint_cap_txn {
         // Publish it the way an IRQ binding would: route a line at this endpoint.
         k.with(|s| {
             s.with_ipc_state_mut(|ipc| {
-                ipc.irq_routes[0] = Some(grant.endpoint_index);
+                ipc.irq_routes[0] = Some(crate::kernel::boot::irq_binding::forced_route_for_test(
+                    grant.endpoint_index,
+                    0,
+                ));
             })
         });
         let removal = k.with(|s| {
@@ -189339,7 +189366,7 @@ mod u9irq1_delivery {
                 .expect("receiver");
             let (idx, notif_cap, recv_cap) = state.create_notification(4).expect("notification");
             state
-                .bind_irq_notification(LINE, notif_cap)
+                .bind_irq_line_for_test(LINE, notif_cap)
                 .expect("bind the line");
             (idx, recv_cap)
         });
@@ -189499,7 +189526,11 @@ mod u9irq1_delivery {
             // `destroy_notification` clears matching routes, so force the stale route back: the
             // arm under test is defence in depth for exactly that window.
             state.with_ipc_state_mut(|ipc| {
-                ipc.irq_routes[LINE as usize] = Some(notif_idx);
+                // IRQ-AUTH1: the forced route names the destroyed incarnation.
+                let stale = ipc.notification_generations[notif_idx].wrapping_sub(1);
+                ipc.irq_routes[LINE as usize] = Some(
+                    crate::kernel::boot::irq_binding::forced_route_for_test(notif_idx, stale),
+                );
             });
         });
 
@@ -189540,7 +189571,7 @@ mod u9irq1_delivery {
             notif_destroy_through_owner(state, notif_idx);
             let (idx, notif_cap, _recv) = state.create_notification(4).expect("recreate");
             state
-                .bind_irq_notification(LINE, notif_cap)
+                .bind_irq_line_for_test(LINE, notif_cap)
                 .expect("rebind the line");
             (
                 idx,
@@ -189667,7 +189698,7 @@ mod u9irq1_delivery {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let notif_idx = kernel.with(|state| {
             let (idx, notif_cap, _recv) = state.create_notification(1).expect("depth-1 queue");
-            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+            state.bind_irq_line_for_test(LINE, notif_cap).expect("bind");
             idx
         });
 
@@ -190765,7 +190796,7 @@ mod u9irq1_injected_evidence {
                 .register_task_with_class(RECEIVER, TaskClass::App)
                 .expect("receiver");
             let (idx, notif_cap, _recv) = state.create_notification(4).expect("notification");
-            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+            state.bind_irq_line_for_test(LINE, notif_cap).expect("bind");
             idx
         });
         (kernel, notif_idx)
@@ -190882,7 +190913,7 @@ mod u9irq1_injected_evidence {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         kernel.with(|state| {
             let (_idx, notif_cap, _recv) = state.create_notification(1).expect("depth-1");
-            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+            state.bind_irq_line_for_test(LINE, notif_cap).expect("bind");
         });
         let _armed = ArmedInjection::arm();
 
@@ -191009,7 +191040,7 @@ mod u9irqfinal_bridge_completion {
                 .register_task_with_class(RECEIVER, TaskClass::App)
                 .expect("receiver");
             let (idx, notif_cap, _recv) = state.create_notification(4).expect("notification");
-            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+            state.bind_irq_line_for_test(LINE, notif_cap).expect("bind");
             idx
         });
         (kernel, idx)
@@ -191064,7 +191095,7 @@ mod u9irqfinal_bridge_completion {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         kernel.with(|state| {
             let (_idx, notif_cap, _recv) = state.create_notification(1).expect("depth-1");
-            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+            state.bind_irq_line_for_test(LINE, notif_cap).expect("bind");
         });
         let _injected = Injected::arm();
 
@@ -205412,7 +205443,7 @@ mod irq_generation1 {
             "{path:?}: no decrement against N2"
         );
         assert_n2_untouched(&k, path, idx, g2, sig2, recv2);
-        k.with(|s| s.bind_irq_notification(21, sig2).expect("bind N2"));
+        k.with(|s| s.bind_irq_line_for_test(21, sig2).expect("bind N2"));
         k.with(|s| s.route_external_irq(21).expect("deliver"));
         let got = k.with(|s| s.try_ipc_recv(recv2).expect("recv N2"));
         assert!(got.is_some(), "{path:?}: N2 still receives its own signal");
@@ -205423,11 +205454,11 @@ mod irq_generation1 {
         let k = kernel();
         let (idx, stale, sig2, recv2) = stale_over_reused_slot(&k, path);
         let g2 = generation(&k, idx);
-        k.with(|s| s.bind_irq_notification(20, sig2).expect("bind N2"));
+        k.with(|s| s.bind_irq_line_for_test(20, sig2).expect("bind N2"));
         revoke(&k, path, stale);
         assert_n2_untouched(&k, path, idx, g2, sig2, recv2);
         assert_eq!(
-            k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[20])),
+            k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[20].map(|r| r.notification.index))),
             Some(idx),
             "{path:?}: N2's route must survive"
         );
@@ -205469,7 +205500,7 @@ mod irq_generation1 {
             "{path:?}: nothing enqueued"
         );
         k.with(|s| {
-            s.bind_irq_notification(22, sig2).expect("bind");
+            s.bind_irq_line_for_test(22, sig2).expect("bind");
             s.route_external_irq(22).expect("deliver");
             assert!(
                 s.task_is_runnable(waiter),
@@ -205488,7 +205519,7 @@ mod irq_generation1 {
         let g = generation(&k, idx);
         let waiter = 3401;
         k.with(|s| {
-            s.bind_irq_notification(23, sig).expect("bind");
+            s.bind_irq_line_for_test(23, sig).expect("bind");
             s.register_task(waiter).expect("task");
             stage21_block_on_notification(s, waiter);
             s.with_ipc_state_mut(|ipc| {
@@ -205505,7 +205536,7 @@ mod irq_generation1 {
         assert_eq!(generation(&k, idx), g, "{path:?}: no generation bump");
         k.with(|s| {
             assert_eq!(
-                s.with_ipc_state(|ipc| ipc.irq_routes[23]),
+                s.with_ipc_state(|ipc| ipc.irq_routes[23].map(|r| r.notification.index)),
                 Some(idx),
                 "{path:?}: route kept"
             );
@@ -205519,7 +205550,7 @@ mod irq_generation1 {
         assert_ne!(generation(&k, idx), g, "{path:?}: generation bumped");
         k.with(|s| {
             assert_eq!(
-                s.with_ipc_state(|ipc| ipc.irq_routes[23]),
+                s.with_ipc_state(|ipc| ipc.irq_routes[23].map(|r| r.notification.index)),
                 None,
                 "{path:?}: route cleared"
             );
@@ -205556,7 +205587,7 @@ mod irq_generation1 {
         for signal_first in [true, false] {
             let k = kernel();
             let (idx, sig, recv) = k.with(|s| s.create_notification(4).expect("N1"));
-            k.with(|s| s.bind_irq_notification(24, sig).expect("bind"));
+            k.with(|s| s.bind_irq_line_for_test(24, sig).expect("bind"));
             assert_eq!(refs(&k, idx), 2, "two capabilities, two references");
             let (first, second) = if signal_first {
                 (sig, recv)
@@ -205569,7 +205600,7 @@ mod irq_generation1 {
                 "{path:?}/{signal_first}: the first removal destroys nothing"
             );
             assert_eq!(
-                k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[24])),
+                k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[24].map(|r| r.notification.index))),
                 Some(idx),
                 "{path:?}/{signal_first}: the route outlives the cap that bound it"
             );
@@ -205584,7 +205615,7 @@ mod irq_generation1 {
             assert_eq!(i2, idx);
             k.with(|s| {
                 assert_eq!(
-                    s.with_ipc_state(|ipc| ipc.irq_routes[24]),
+                    s.with_ipc_state(|ipc| ipc.irq_routes[24].map(|r| r.notification.index)),
                     None,
                     "no inherited route"
                 );
@@ -205609,13 +205640,14 @@ mod irq_generation1 {
             let (idx, sig, recv) = k.with(|s| s.create_notification(4).expect("N"));
             assert_eq!(*slot.get_or_insert(idx), idx, "the same slot every cycle");
             let g = generation(&k, idx);
-            k.with(|s| s.bind_irq_notification(25, sig).expect("bind"));
+            k.with(|s| s.bind_irq_line_for_test(25, sig).expect("bind"));
             for old in older.iter().copied() {
                 let stale = plant_uncounted(&k, old, CapRights::SIGNAL);
                 revoke(&k, path, stale);
                 assert_n2_untouched(&k, path, idx, g, sig, recv);
                 assert_eq!(
-                    k.with(|s| s.with_ipc_state(|ipc| ipc.irq_routes[25])),
+                    k.with(|s| s
+                        .with_ipc_state(|ipc| ipc.irq_routes[25].map(|r| r.notification.index))),
                     Some(idx),
                     "{path:?} cycle {cycle}: route survives"
                 );
@@ -205721,7 +205753,7 @@ mod irq_generation1_lifetime {
         let mut state = Bootstrap::init().expect("init");
         spawn_app(&mut state, 4101);
         let (idx, sig, recv) = state.create_notification(8).expect("notif");
-        state.bind_irq_notification(26, sig).expect("bind");
+        state.bind_irq_line_for_test(26, sig).expect("bind");
         let object = state.current_task_capability(sig).expect("sig").object;
         let other_cnode = state.task_cnode(4101).expect("cnode");
         let copy = state
@@ -205743,7 +205775,7 @@ mod irq_generation1_lifetime {
             "the other holder's revoke leaves the creator's notification alive"
         );
         assert_eq!(
-            state.with_ipc_state(|ipc| ipc.irq_routes[26]),
+            state.with_ipc_state(|ipc| ipc.irq_routes[26].map(|r| r.notification.index)),
             Some(idx),
             "and its route"
         );
@@ -205772,7 +205804,10 @@ mod irq_generation1_lifetime {
             state.with_ipc_state(|ipc| ipc.notifications[idx].is_none()),
             "last one destroys"
         );
-        assert_eq!(state.with_ipc_state(|ipc| ipc.irq_routes[26]), None);
+        assert_eq!(
+            state.with_ipc_state(|ipc| ipc.irq_routes[26].map(|r| r.notification.index)),
+            None
+        );
         assert_accounting_exact(&state, idx);
     }
 
@@ -206735,7 +206770,7 @@ mod notif_waiter1 {
         state.register_task(R1).expect("r1");
         state.register_task(R2).expect("r2");
         let (idx, sig, recv0) = state.create_notification(8).expect("notif");
-        state.bind_irq_notification(LINE, sig).expect("bind");
+        state.bind_irq_line_for_test(LINE, sig).expect("bind");
         let generation = state.with_ipc_state(|ipc| ipc.notification_generations[idx]);
         let recv1 = state
             .grant_capability_task_to_task_with_rights(0, recv0, R1, CapRights::RECEIVE)
@@ -207412,7 +207447,7 @@ mod notif_waiter1 {
             }
             let (i2, sig2, recv2) = s.create_notification(8).expect("N2");
             assert_eq!(i2, idx);
-            s.bind_irq_notification(LINE, sig2).expect("rebind");
+            s.bind_irq_line_for_test(LINE, sig2).expect("rebind");
             // an event already pending on the NEW incarnation when the old receiver decides
             s.route_external_irq(LINE).expect("signal N2");
             nc.set(Some(recv2));
@@ -207653,5 +207688,597 @@ mod notif_waiter1 {
             }
         }
         assert_eq!(publishers, ["notification_waiter.rs"], "the only publisher");
+    }
+}
+
+/// IRQ-AUTH1 — capability-authorized IRQ binding (`irq_binding`). Every test checks the
+/// authoritative IPC state: the exact route (incarnation and owner), not only an error code.
+/// Slot index and generation-bearing identity are kept distinct throughout.
+///
+/// Reachability: no syscall binds an IRQ line. The only production caller is the default-off
+/// UART/PL011 witness provisioning, so these are hosted proofs of the kernel mechanism.
+mod irq_auth1 {
+    use super::*;
+    use crate::kernel::boot::irq_binding::{
+        IrqBindingOwner, IrqRoute, forced_route_for_test, irq_bind_phase_hook,
+    };
+    use crate::kernel::boot::notification_lifetime::NotificationIncarnation;
+    use crate::kernel::capabilities::{CNodeId, CapRights};
+    use crate::runtime::SharedKernel;
+
+    const R1: u64 = 1;
+    const R2: u64 = 2;
+    const X: u16 = 9;
+    const Y: u16 = 10;
+
+    fn run_as(state: &mut KernelState, tid: u64) {
+        if state.current_tid() == Some(tid) {
+            return;
+        }
+        if !state.task_present_in_any_runqueue(tid) {
+            state.enqueue_current_cpu(tid).expect("enqueue");
+        }
+        for _ in 0..32 {
+            if state.current_tid() == Some(tid) {
+                return;
+            }
+            if state.current_tid().is_none() {
+                let _ = state.dispatch_next_task();
+            } else {
+                let _ = state.yield_current();
+            }
+        }
+        assert_eq!(state.current_tid(), Some(tid), "could not schedule {tid}");
+    }
+
+    fn route(state: &KernelState, line: u16) -> Option<IrqRoute> {
+        state.with_ipc_state(|ipc| ipc.irq_routes[usize::from(line)])
+    }
+
+    fn all_routes(state: &KernelState) -> alloc::vec::Vec<Option<IrqRoute>> {
+        state.with_ipc_state(|ipc| ipc.irq_routes.to_vec())
+    }
+
+    fn incarnation(state: &KernelState, idx: usize) -> NotificationIncarnation {
+        NotificationIncarnation {
+            index: idx,
+            generation: state.with_ipc_state(|ipc| ipc.notification_generations[idx]),
+        }
+    }
+
+    fn owner(state: &KernelState, tid: u64, cap: CapId) -> IrqBindingOwner {
+        IrqBindingOwner {
+            cnode: state.task_cnode(tid).expect("cnode"),
+            cap,
+        }
+    }
+
+    fn revoke(state: &mut KernelState, tid: u64, cap: CapId) {
+        let cnode = state.task_cnode(tid).expect("cnode");
+        let _ = state.revoke_capability_in_cnode(cnode, cap);
+    }
+
+    fn accounting(state: &KernelState, idx: usize) {
+        super::irq_generation1::assert_accounting_exact(state, idx);
+    }
+
+    /// Everything a failed bind must leave alone.
+    fn snapshot(
+        state: &KernelState,
+    ) -> (
+        alloc::vec::Vec<Option<IrqRoute>>,
+        alloc::vec::Vec<u64>,
+        alloc::vec::Vec<u32>,
+    ) {
+        state.with_ipc_state(|ipc| {
+            (
+                ipc.irq_routes.to_vec(),
+                ipc.notification_generations.to_vec(),
+                ipc.notification_refs.to_vec(),
+            )
+        })
+    }
+
+    /// B1 — a Notification SIGNAL capability alone cannot bind: there is no IRQ capability to
+    /// present, and nothing else names a line.
+    #[test]
+    fn b1_binding_requires_irq_authority() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_idx, sig, _recv) = state.create_notification(4).expect("n");
+        let before = snapshot(&state);
+        assert_eq!(
+            state.bind_irq_notification(sig, sig),
+            Err(KernelError::WrongObject),
+            "a Notification capability is not line authority"
+        );
+        assert_eq!(
+            state.bind_irq_notification(CapId::new(4000, 1), sig),
+            Err(KernelError::InvalidCapability),
+            "a capability the caller does not hold"
+        );
+        // Another task's IRQ capability cannot be borrowed: it is resolved in the caller's cnode.
+        state.register_task(R1).expect("r1");
+        let foreign_irq = state.mint_irq_cap(X).expect("task 0's line authority");
+        run_as(&mut state, R1);
+        let (_n, r1_sig, _r) = state.create_notification(4).expect("r1 n");
+        let got = state.bind_irq_notification(foreign_irq, r1_sig);
+        assert!(
+            got.is_err(),
+            "another task's IRQ capability bound a line: {got:?}"
+        );
+        assert_eq!(route(&state, X), None);
+        assert_eq!(snapshot(&state).0, before.0, "no route anywhere changed");
+    }
+
+    /// B2 — authority for line X binds X and only X; an IRQ capability without SIGNAL binds
+    /// nothing.
+    #[test]
+    fn b2_authority_for_one_line_binds_only_that_line() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(R1).expect("r1");
+        let (idx, sig, _recv) = state.create_notification(4).expect("n");
+        let irq_x = state.mint_irq_cap(X).expect("irq x");
+        state.bind_irq_notification(irq_x, sig).expect("bind x");
+        assert_eq!(
+            route(&state, X),
+            Some(IrqRoute {
+                notification: incarnation(&state, idx),
+                owner: owner(&state, 0, irq_x),
+            })
+        );
+        for line in 0..crate::arch::platform_constants::MAX_IRQ_LINES as u16 {
+            if line != X {
+                assert_eq!(route(&state, line), None, "line {line} untouched");
+            }
+        }
+        // An IRQ capability without SIGNAL is not binding authority. Grant refuses to widen,
+        // but an IPC transfer attenuates by intersection (SIGNAL ∩ READ|MAP is empty), so such a
+        // capability can exist; it is minted here in that exact shape.
+        let weak = state
+            .mint_capability_for_current_context(crate::kernel::capabilities::Capability::new(
+                crate::kernel::capabilities::CapObject::Irq { line: Y },
+                CapRights::SIGNAL.intersect(CapRights::READ | CapRights::MAP),
+            ))
+            .expect("a rights-less IRQ capability");
+        assert_eq!(
+            state.bind_irq_notification(weak, sig),
+            Err(KernelError::MissingRight)
+        );
+        assert!(
+            state
+                .grant_capability_task_to_task_with_rights(0, irq_x, R1, CapRights::RECEIVE)
+                .is_err(),
+            "and a grant cannot widen or retarget line authority"
+        );
+        assert_eq!(route(&state, Y), None);
+    }
+
+    /// B3 — an occupied line is never redirected, even by another holder of the line's
+    /// authority; the N1 route stays exactly as it was, owner included.
+    #[test]
+    fn b3_an_occupied_line_is_not_redirected() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(R2).expect("r2");
+        let (n1, sig1, _r1) = state.create_notification(4).expect("n1");
+        let irq = state.bind_irq_line_for_test(X, sig1).expect("bind n1");
+        let bound = route(&state, X);
+        let r2_irq = state
+            .grant_capability_task_to_task_with_rights(0, irq, R2, CapRights::SIGNAL)
+            .expect("r2 line authority");
+        run_as(&mut state, R2);
+        let (n2, sig2, _r2) = state.create_notification(4).expect("n2");
+        assert_ne!(n1, n2);
+        let before = snapshot(&state);
+        assert_eq!(
+            state.bind_irq_notification(r2_irq, sig2),
+            Err(KernelError::EndpointQueueFull)
+        );
+        assert_eq!(
+            route(&state, X),
+            bound,
+            "the N1 route, owner included, is unchanged"
+        );
+        assert_eq!(snapshot(&state), before, "nothing at all changed");
+    }
+
+    /// B4 — rebinding the same exact incarnation is idempotent: no duplicate ownership, no
+    /// reference taken, the original owner kept (also when another holder repeats it).
+    #[test]
+    fn b4_rebinding_the_same_incarnation_is_idempotent() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(R2).expect("r2");
+        let (n1, sig1, _r1) = state.create_notification(4).expect("n1");
+        let refs_before = state.with_ipc_state(|ipc| ipc.notification_refs[n1]);
+        let irq = state.mint_irq_cap(X).expect("irq");
+        state.bind_irq_notification(irq, sig1).expect("bind");
+        let bound = route(&state, X);
+        state.bind_irq_notification(irq, sig1).expect("rebind");
+        assert_eq!(route(&state, X), bound);
+        assert_eq!(
+            state.with_ipc_state(|ipc| ipc.notification_refs[n1]),
+            refs_before,
+            "a binding takes no Notification reference"
+        );
+        let r2_irq = state
+            .grant_capability_task_to_task_with_rights(0, irq, R2, CapRights::SIGNAL)
+            .expect("r2 irq");
+        let r2_sig = state
+            .grant_capability_task_to_task_with_rights(0, sig1, R2, CapRights::SIGNAL)
+            .expect("r2 sig");
+        run_as(&mut state, R2);
+        state
+            .bind_irq_notification(r2_irq, r2_sig)
+            .expect("same target, other holder");
+        assert_eq!(route(&state, X), bound, "the owner is not reassigned");
+        accounting(&state, n1);
+    }
+
+    /// B5 — the binder's incarnation is destroyed and its slot reused between the capability
+    /// snapshot and the rank-3 decision: the newer object is not bound.
+    #[test]
+    fn b5_a_stale_notification_does_not_bind_the_newer_object() {
+        let mut state = Bootstrap::init().expect("init");
+        let (n1, sig1, recv1) = state.create_notification(4).expect("n1");
+        let g1 = incarnation(&state, n1);
+        let irq = state.mint_irq_cap(X).expect("irq");
+        irq_bind_phase_hook::arm(alloc::boxed::Box::new(move |s: &mut KernelState| {
+            revoke(s, 0, sig1);
+            revoke(s, 0, recv1);
+            let (n2, _s2, _r2) = s.create_notification(4).expect("n2");
+            assert_eq!(n2, n1, "the slot is reused");
+        }));
+        assert_eq!(
+            state.bind_irq_notification(irq, sig1),
+            Err(KernelError::StaleCapability)
+        );
+        let now = incarnation(&state, n1);
+        assert_eq!(now.index, g1.index);
+        assert_ne!(
+            now.generation, g1.generation,
+            "same slot, newer incarnation"
+        );
+        assert_eq!(
+            route(&state, X),
+            None,
+            "the newer incarnation was not bound"
+        );
+    }
+
+    /// B6 — destruction interleaves with the bind: the result is no route at all.
+    #[test]
+    fn b6_concurrent_teardown_leaves_no_stale_route() {
+        let mut state = Bootstrap::init().expect("init");
+        let (n1, sig1, recv1) = state.create_notification(4).expect("n1");
+        let irq = state.mint_irq_cap(X).expect("irq");
+        irq_bind_phase_hook::arm(alloc::boxed::Box::new(move |s: &mut KernelState| {
+            revoke(s, 0, sig1);
+            revoke(s, 0, recv1);
+        }));
+        assert_eq!(
+            state.bind_irq_notification(irq, sig1),
+            Err(KernelError::WrongObject)
+        );
+        assert!(state.with_ipc_state(|ipc| ipc.notifications[n1].is_none()));
+        assert_eq!(route(&state, X), None);
+        // …and destruction after a bind clears the route in the destroying section.
+        let (n2, sig2, recv2) = state.create_notification(4).expect("n2");
+        state.bind_irq_notification(irq, sig2).expect("bind n2");
+        revoke(&mut state, 0, sig2);
+        assert!(route(&state, X).is_some(), "a reference remains (recv2)");
+        revoke(&mut state, 0, recv2);
+        assert!(state.with_ipc_state(|ipc| ipc.notifications[n2].is_none()));
+        assert_eq!(
+            route(&state, X),
+            None,
+            "the final release cleared the route"
+        );
+    }
+
+    /// B7 — kernel-owned and out-of-range lines are refused, whatever capability names them.
+    #[test]
+    fn b7_kernel_owned_and_out_of_range_lines_are_refused() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_idx, sig, _recv) = state.create_notification(4).expect("n");
+        let first = crate::arch::platform_constants::FIRST_DEVICE_IRQ_LINE;
+        for line in 0..first {
+            let irq = state.mint_irq_cap(line).expect("irq");
+            assert_eq!(
+                state.bind_irq_notification(irq, sig),
+                Err(KernelError::MissingRight),
+                "line {line} is kernel-owned"
+            );
+            assert_eq!(route(&state, line), None);
+        }
+        let past = crate::arch::platform_constants::MAX_IRQ_LINES as u16;
+        let irq = state.mint_irq_cap(past).expect("irq");
+        assert_eq!(
+            state.bind_irq_notification(irq, sig),
+            Err(KernelError::WrongObject)
+        );
+        assert!(all_routes(&state).iter().all(Option::is_none));
+    }
+
+    /// B8 — the lease contract. Revoking the owner, a subtree containing it, or reaping its
+    /// process removes the binding; revoking a delegated copy or a sibling does not; the
+    /// Notification's final release removes it whatever the owner; a holder rebinds afresh.
+    #[test]
+    fn b8_the_binding_lives_exactly_as_long_as_its_owner_and_its_object() {
+        // (a) a delegated copy goes; then the owner itself goes.
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(R1).expect("r1");
+        state.register_task(R2).expect("r2");
+        let (n1, sig, _recv) = state.create_notification(4).expect("n");
+        let irq = state.mint_irq_cap(X).expect("irq");
+        state.bind_irq_notification(irq, sig).expect("bind");
+        let bound = route(&state, X);
+        let copy = state
+            .grant_capability_task_to_task_with_rights(0, irq, R1, CapRights::SIGNAL)
+            .expect("copy");
+        revoke(&mut state, R1, copy);
+        assert_eq!(
+            route(&state, X),
+            bound,
+            "a delegated copy's revoke leaves the binding"
+        );
+        revoke(&mut state, 0, irq);
+        assert_eq!(route(&state, X), None, "the owner's revoke ends it");
+        accounting(&state, n1);
+
+        // (b) the owner is a delegated copy; revoking its parent revokes the subtree; a sibling
+        // copy that survives is not the owner, so the binding still ends — and the sibling can
+        // bind afresh (no transfer).
+        let root = state.mint_irq_cap(Y).expect("manager's root authority");
+        let driver_irq = state
+            .grant_capability_task_to_task_with_rights(0, root, R1, CapRights::SIGNAL)
+            .expect("driver's authority");
+        let r1_sig = state
+            .grant_capability_task_to_task_with_rights(0, sig, R1, CapRights::SIGNAL)
+            .expect("driver's signal");
+        run_as(&mut state, R1);
+        state
+            .bind_irq_notification(driver_irq, r1_sig)
+            .expect("driver binds");
+        assert_eq!(
+            route(&state, Y).map(|r| r.owner),
+            Some(owner(&state, R1, driver_irq))
+        );
+        let sibling = state
+            .mint_irq_cap(Y)
+            .expect("an unrelated holder of the same line");
+        revoke(&mut state, 0, root);
+        assert_eq!(
+            route(&state, Y),
+            None,
+            "the subtree revoke removed the owner"
+        );
+        let sig_r1_again = r1_sig;
+        state
+            .bind_irq_notification(sibling, sig_r1_again)
+            .expect("the surviving holder binds afresh");
+        assert_eq!(
+            route(&state, Y).map(|r| r.owner),
+            Some(owner(&state, R1, sibling))
+        );
+
+        // (c) the Notification's final release ends the binding though the owner lives.
+        let (n2, sig2, recv2) = state.create_notification(4).expect("n2");
+        let irq2 = state.mint_irq_cap(11).expect("irq 11");
+        state.bind_irq_notification(irq2, sig2).expect("bind 11");
+        revoke(&mut state, R1, sig2);
+        revoke(&mut state, R1, recv2);
+        assert!(state.with_ipc_state(|ipc| ipc.notifications[n2].is_none()));
+        assert_eq!(route(&state, 11), None);
+    }
+
+    /// B8 (split + exit) — the split revoke and the split reap of the owner's process release
+    /// the binding through the same report.
+    #[test]
+    fn b8_split_revoke_and_owner_reap_release_the_binding() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(R1).expect("r1");
+        let (_n, sig, _recv) = state.create_notification(4).expect("n");
+        let irq = state.mint_irq_cap(X).expect("irq");
+        state.bind_irq_notification(irq, sig).expect("bind x");
+        let root_y = state.mint_irq_cap(Y).expect("y");
+        let driver_irq = state
+            .grant_capability_task_to_task_with_rights(0, root_y, R1, CapRights::SIGNAL)
+            .expect("driver y");
+        let driver_sig = state
+            .grant_capability_task_to_task_with_rights(0, sig, R1, CapRights::SIGNAL)
+            .expect("driver sig");
+        run_as(&mut state, R1);
+        state
+            .bind_irq_notification(driver_irq, driver_sig)
+            .expect("driver binds y");
+        run_as(&mut state, 0);
+        let k = SharedKernel::new(state);
+        k.revoke_capability_no_vm_split(CpuId(0), 0, irq)
+            .expect("admitted");
+        k.with(|s| assert_eq!(route(s, X), None, "the split revoke released X"));
+        k.with(|s| assert!(route(s, Y).is_some(), "Y is untouched"));
+        k.with(|s| s.mark_task_dead(R1).expect("dead"));
+        assert!(
+            k.reap_process_cnode_split(R1),
+            "the driver's process is reaped"
+        );
+        k.with(|s| assert_eq!(route(s, Y), None, "the reap of the owner released Y"));
+    }
+
+    /// B9 — every failed bind leaves no partial state, and an owner revoked between the
+    /// capability snapshot and the publication leaves no route.
+    #[test]
+    fn b9_a_failed_bind_changes_nothing() {
+        let mut state = Bootstrap::init().expect("init");
+        let (n1, sig1, _r1) = state.create_notification(4).expect("n1");
+        let irq = state.bind_irq_line_for_test(X, sig1).expect("bind n1");
+        let (_e, _send, ep_recv) = state.create_endpoint(2).expect("ep");
+        let (_n2, sig2, recv2) = state.create_notification(4).expect("n2");
+        let before = snapshot(&state);
+        for (irq_cap, n_cap, want) in [
+            (irq, ep_recv, KernelError::MissingRight),
+            (irq, recv2, KernelError::MissingRight),
+            (ep_recv, sig2, KernelError::WrongObject),
+            (irq, sig2, KernelError::EndpointQueueFull),
+        ] {
+            assert_eq!(state.bind_irq_notification(irq_cap, n_cap), Err(want));
+            assert_eq!(snapshot(&state), before, "{want:?} changed state");
+        }
+        accounting(&state, n1);
+
+        // The owner is revoked inside the window: the publication is retracted.
+        let irq_y = state.mint_irq_cap(Y).expect("irq y");
+        irq_bind_phase_hook::arm(alloc::boxed::Box::new(move |s: &mut KernelState| {
+            revoke(s, 0, irq_y);
+        }));
+        assert_eq!(
+            state.bind_irq_notification(irq_y, sig2),
+            Err(KernelError::InvalidCapability)
+        );
+        assert_eq!(route(&state, Y), None, "no route outlives its owner");
+    }
+
+    /// B10 — a replacement incarnation never inherits or receives the previous one's route, on
+    /// the broad and the split delivery paths, even when a stale route is forced back.
+    #[test]
+    fn b10_a_reused_slot_inherits_and_receives_nothing() {
+        let mut state = Bootstrap::init().expect("init");
+        let (n1, sig1, recv1) = state.create_notification(4).expect("n1");
+        let old = incarnation(&state, n1);
+        state.bind_irq_line_for_test(X, sig1).expect("bind");
+        revoke(&mut state, 0, sig1);
+        revoke(&mut state, 0, recv1);
+        assert_eq!(route(&state, X), None);
+        let (n2, _sig2, recv2) = state.create_notification(4).expect("n2");
+        assert_eq!(n2, n1, "the slot is reused");
+        assert_eq!(route(&state, X), None, "nothing inherited");
+        // Force the old incarnation's route back (a defect that does not exist): neither path
+        // delivers into the replacement.
+        state.with_ipc_state_mut(|ipc| {
+            ipc.irq_routes[usize::from(X)] = Some(forced_route_for_test(old.index, old.generation));
+        });
+        state.route_external_irq(X).expect("broad: benign");
+        assert!(
+            state.try_ipc_recv(recv2).expect("probe").is_none(),
+            "broad path delivered"
+        );
+        let k = SharedKernel::new(state);
+        let outcome = k.deliver_external_irq_split(CpuId(0), X);
+        assert!(
+            matches!(
+                outcome,
+                crate::kernel::boot::IrqDeliveryOutcome::TargetGone { .. }
+            ),
+            "{outcome:?}"
+        );
+        k.with(|s| {
+            assert!(
+                s.try_ipc_recv(recv2).expect("probe").is_none(),
+                "split delivered"
+            )
+        });
+    }
+
+    /// A route whose owner is dead (a stale record) is reclaimed by an authorized bind instead
+    /// of locking the line forever; a live owner's is not.
+    #[test]
+    fn a_stale_route_is_reclaimed_only_when_its_owner_is_dead() {
+        let mut state = Bootstrap::init().expect("init");
+        let (n1, sig1, _r1) = state.create_notification(4).expect("n1");
+        let (n2, sig2, _r2) = state.create_notification(4).expect("n2");
+        let dead = IrqRoute {
+            notification: incarnation(&state, n1),
+            owner: IrqBindingOwner {
+                cnode: CNodeId(u64::MAX),
+                cap: CapId::new(1, 1),
+            },
+        };
+        state.with_ipc_state_mut(|ipc| ipc.irq_routes[usize::from(X)] = Some(dead));
+        let irq = state.mint_irq_cap(X).expect("irq");
+        state
+            .bind_irq_notification(irq, sig2)
+            .expect("reclaims the dead owner's line");
+        assert_eq!(
+            route(&state, X),
+            Some(IrqRoute {
+                notification: incarnation(&state, n2),
+                owner: owner(&state, 0, irq),
+            })
+        );
+        let other = state.mint_irq_cap(X).expect("irq again");
+        assert_eq!(
+            state.bind_irq_notification(other, sig1),
+            Err(KernelError::EndpointQueueFull),
+            "a live owner's route is never reclaimed"
+        );
+    }
+
+    /// The live witnesses' provisioning shape: the route is owned by line authority held in the
+    /// provisioning context, and init holds only RECEIVE on the Notification.
+    #[test]
+    fn the_witness_provisioning_binds_with_line_authority_and_gives_init_receive_only() {
+        const MOD: &str = include_str!("mod.rs");
+        let body = MOD
+            .split("pub fn provision_init_uart_irq_witness(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the provisioning body");
+        assert!(body.contains("kernel.mint_irq_cap(irq_line)"));
+        assert!(body.contains("kernel.bind_irq_notification(irq_root, signal_root)"));
+        assert!(body.contains("Capability::new(notification_object, CapRights::RECEIVE)"));
+        assert!(
+            !body.contains("CapRights::SIGNAL"),
+            "init is given no SIGNAL authority"
+        );
+    }
+
+    /// Structural: outside test code, only `irq_binding.rs` writes a route, and the two removal
+    /// releasers revalidate the lines every removal reports.
+    #[test]
+    fn routes_are_written_only_by_their_owner_and_revalidated_on_every_removal() {
+        let files: &[(&str, &str)] = &[
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            ("irq_binding.rs", include_str!("irq_binding.rs")),
+            (
+                "notification_lifetime.rs",
+                include_str!("notification_lifetime.rs"),
+            ),
+            ("spawn_ipc_cap_txn.rs", include_str!("spawn_ipc_cap_txn.rs")),
+            ("bootstrap_state.rs", include_str!("bootstrap_state.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("runtime.rs", include_str!("../../runtime.rs")),
+        ];
+        let mut writers = alloc::vec::Vec::new();
+        for (file, src) in files {
+            let code = src
+                .find("\n#[cfg(test)]\nmod tests {")
+                .map_or(*src, |cut| &src[..cut]);
+            let code = code
+                .find("\n#[cfg(test)]\npub(crate) fn forced_route_for_test(")
+                .map_or(code, |cut| &code[..cut]);
+            for line in code.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                if (t.contains("irq_routes[") && t.contains("] = Some("))
+                    || t.contains("*slot = Some(route)")
+                {
+                    writers.push(*file);
+                }
+            }
+        }
+        assert_eq!(writers, ["irq_binding.rs"], "the only route publisher");
+        const NL: &str = include_str!("notification_lifetime.rs");
+        assert_eq!(
+            NL.matches("self.revalidate_irq_routes(release.irq_lines)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            NL.matches("self.revalidate_irq_routes_split(release.irq_lines)")
+                .count(),
+            1
+        );
+        assert!(NL.contains("if let CapObject::Irq { line } = object {"));
     }
 }
