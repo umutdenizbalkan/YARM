@@ -50,6 +50,15 @@ case "$ARCH" in
 esac
 
 WITNESS_FEATURE=futex-requeue-witness
+# FUTEX-REQUEUE-ATOMIC1: RACE=1 also builds the race witness into the kernel (NR 17 holds its
+# commit-to-placement window open for a competing FutexWake) and the cell (two signallers).
+RACE=${RACE:-0}
+RACE_ARGS=()
+if [[ "$RACE" == 1 ]]; then
+  FEATURE="$FEATURE,futex-requeue-race-witness"
+  WITNESS_FEATURE="$WITNESS_FEATURE,futex-requeue-race-witness"
+  RACE_ARGS=(--race)
+fi
 LOGDIR=${LOGDIR:-/tmp/futex-requeue-witness-$ARCH-smp$SMP}
 TIMEOUT_SECS=${TIMEOUT_SECS:-240}
 ROUNDS=${ROUNDS:-3}
@@ -105,6 +114,6 @@ tr '\r' '\n' <"$BOOT_LOG" >"$NORM"
 sha256sum "$BOOT_LOG" "$DEST" "$INITRAMFS_IMAGE" >"$LOGDIR/sha256.txt" 2>/dev/null || true
 
 python3 -I scripts/grade-futex-requeue-witness.py --self-test >/dev/null || { echo "FUTEX_REQUEUE_WITNESS_SEAL arch=$ARCH smp=$SMP result=fail reason=grader_self_test"; exit 1; }
-python3 -I scripts/grade-futex-requeue-witness.py ${REQUIRE_CROSS_CPU:+--require-cross-cpu} --arch "$ARCH" --smp "$SMP" --rounds "$ROUNDS" \
+python3 -I scripts/grade-futex-requeue-witness.py ${REQUIRE_CROSS_CPU:+--require-cross-cpu} "${RACE_ARGS[@]}" --arch "$ARCH" --smp "$SMP" --rounds "$ROUNDS" \
   --core-rc "$core_rc" --core-log "$LOGDIR/smoke.log" --core-log "$LOGDIR/core-smoke.log" "$NORM" | tee "$LOGDIR/grade.txt"
 exit "${PIPESTATUS[0]}"

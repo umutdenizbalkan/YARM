@@ -13814,6 +13814,13 @@ impl SharedKernel {
             };
             #[cfg(test)]
             fx::futex_phase_hook::run_requeue_window();
+            #[cfg(feature = "futex-requeue-race-witness")]
+            if committed.woken > 0
+                && committed.moved > 0
+                && crate::kernel::boot::futex_requeue_witness_enabled()
+            {
+                fx::race_witness::hold_window(cpu.0, committed.woken, committed.moved);
+            }
             self.futex_requeue_place_split(&committed, &mut preflight.held);
             self.futex_release_placements_split(&mut preflight.held);
             return Ok(fx::FutexRequeueOutcome {

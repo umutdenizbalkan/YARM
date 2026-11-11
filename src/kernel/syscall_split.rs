@@ -6607,7 +6607,11 @@ fn try_split_futex_wake_into_frame(
     crate::yarm_log!("FUTEX_WAKE_SPLIT_BEGIN arch=riscv64");
     #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     crate::yarm_log!("FUTEX_WAKE_SPLIT_BEGIN");
+    #[cfg(feature = "futex-requeue-race-witness")]
+    let race_window = crate::kernel::boot::futex::race_witness::wake_begin();
     let woke = shared.futex_wake_key_split(cpu, key, args.value);
+    #[cfg(feature = "futex-requeue-race-witness")]
+    crate::kernel::boot::futex::race_witness::wake_end(race_window, cpu.0, tid, woke);
     crate::yarm_log!("FUTEX_WAKE_SPLIT_WAKE_OK count={}", woke);
     frame.set_ok(woke as usize, 0, 0);
     #[cfg(target_arch = "aarch64")]

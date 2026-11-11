@@ -233,6 +233,11 @@ timer5-idle-return-witness = []
 ipc-displace1-witness = []
 # FUTEX-REQUEUE1: init's live compare-and-requeue cell (selector 18); inert elsewhere.
 futex-requeue-witness = []
+# FUTEX-REQUEUE-ATOMIC1: the live RACE witness. In the kernel, NR 17 holds its window (after its
+# commit, before its placement) open until a FutexWake from another CPU has run wholly inside it,
+# and NR 10 reports such a wake; in init's cell (with futex-requeue-witness), signaller threads
+# issue those wakes. Default off; no production path changes with it off.
+futex-requeue-race-witness = []
 # QEMU-IRQ1: the first real external-interrupt witness — RISC-V UART0 -> PLIC -> YARM on QEMU
 # virt. Compiles the kernel-only device window install, the idle-origin supervisor-external
 # admission, the UART setup/drain fixture, the provisioning of init's notification + ring page, the

@@ -1102,6 +1102,68 @@ pub fn compare_and_requeue_locked(
     }))
 }
 
+/// FUTEX-REQUEUE-ATOMIC1 — the live RACE witness (feature `futex-requeue-race-witness`, armed by
+/// `yarm.futex_requeue_witness=1`). NR 17 holds the window between its commit and its placement —
+/// the interval that used to separate its transfer from its wake portion — open until a FutexWake
+/// that STARTED inside it has finished, so the competing wake is causally inside the window, not
+/// merely near it in time. Each step is logged in causal order: `..._WINDOW_OPEN` before the window
+/// is published; `..._IN_WINDOW_WAKE` by the waker before it releases the window; `..._CLOSE` after.
+/// Bounded: the window gives up after `SPIN_BOUND` polls and reports `competing_wakes=0`.
+#[cfg(feature = "futex-requeue-race-witness")]
+pub mod race_witness {
+    use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    static OPEN: AtomicU64 = AtomicU64::new(0);
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static WAKES: AtomicU64 = AtomicU64::new(0);
+    const SPIN_BOUND: u64 = 400_000_000;
+
+    /// NR 17, after its commit and before its placement: open the window and hold it.
+    pub fn hold_window(cpu: u8, woken: u32, requeued: u32) {
+        let id = NEXT.fetch_add(1, SeqCst);
+        let before = WAKES.load(SeqCst);
+        crate::yarm_log!(
+            "FUTEX_REQUEUE_RACE_WINDOW_OPEN cpu={} window={} woken={} requeued={}",
+            cpu,
+            id,
+            woken,
+            requeued
+        );
+        OPEN.store(id, SeqCst);
+        let mut spins = 0u64;
+        while WAKES.load(SeqCst) == before && spins < SPIN_BOUND {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        OPEN.store(0, SeqCst);
+        crate::yarm_log!(
+            "FUTEX_REQUEUE_RACE_WINDOW_CLOSE cpu={} window={} competing_wakes={} spins={}",
+            cpu,
+            id,
+            WAKES.load(SeqCst) - before,
+            spins
+        );
+    }
+
+    /// NR 10, before it selects anything: the window open now, if any.
+    pub fn wake_begin() -> u64 {
+        OPEN.load(SeqCst)
+    }
+
+    /// NR 10, after its wake: report it, and release the window, iff it ran wholly inside one.
+    pub fn wake_end(window: u64, cpu: u8, tid: u64, woke: u32) {
+        if window != 0 && OPEN.load(SeqCst) == window {
+            crate::yarm_log!(
+                "FUTEX_REQUEUE_RACE_IN_WINDOW_WAKE cpu={} tid={} window={} woke={}",
+                cpu,
+                tid,
+                window,
+                woke
+            );
+            WAKES.fetch_add(1, SeqCst);
+        }
+    }
+}
+
 /// rank 2 — claim the oldest waiter still on the pending key `key` (`Runnable`, record retired),
 /// exactly as a wake claims. `None` once no live waiter is left on it (the rest exited, or undid
 /// their own registration in their publication window).

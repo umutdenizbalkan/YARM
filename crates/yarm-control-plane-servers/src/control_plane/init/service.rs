@@ -2686,6 +2686,10 @@ pub(super) mod futex_requeue_witness {
     use yarm_user_rt::syscall::{FutexScope, futex_cmp_requeue, futex_wait, yield_now};
 
     pub(super) const WAITERS: usize = 10;
+    /// FUTEX-REQUEUE-ATOMIC1 race mode: threads that issue `FutexWake(seq, 1)` while a broadcast
+    /// is in flight, so one runs inside NR 17's held window on the other CPU.
+    #[cfg(feature = "futex-requeue-race-witness")]
+    pub(super) const SIGNALLERS: usize = 2;
     pub(super) const ROUNDS: u32 = 3;
     pub(super) const STACK_BYTES: usize = 4096;
     /// A bound on every hand-off, so a defective kernel ends the cell with a verdict.
@@ -2714,6 +2718,46 @@ pub(super) mod futex_requeue_witness {
     static RETURNS: AtomicU32 = AtomicU32::new(0);
     static MUTEX_WAKES: AtomicU32 = AtomicU32::new(0);
     static FINISHED: AtomicU32 = AtomicU32::new(0);
+
+    #[cfg(feature = "futex-requeue-race-witness")]
+    #[repr(C, align(16))]
+    pub(super) struct SigStacks(pub(super) [[u8; STACK_BYTES]; SIGNALLERS]);
+    #[cfg(feature = "futex-requeue-race-witness")]
+    #[allow(unused)]
+    pub(super) static mut SIG_STACKS: SigStacks = SigStacks([[0; STACK_BYTES]; SIGNALLERS]);
+    #[cfg(feature = "futex-requeue-race-witness")]
+    #[allow(unused)]
+    pub(super) static mut SIG_TLS: [[u8; 256]; SIGNALLERS] = [[0; 256]; SIGNALLERS];
+    /// Odd while a broadcast is in flight (the signallers wake), even otherwise.
+    #[cfg(feature = "futex-requeue-race-witness")]
+    static ARM: AtomicU32 = AtomicU32::new(0);
+    /// The last ARM generation each signaller saw while not inside a wake.
+    #[cfg(feature = "futex-requeue-race-witness")]
+    static SIG_SEEN: [AtomicU32; SIGNALLERS] = [const { AtomicU32::new(0) }; SIGNALLERS];
+    #[cfg(feature = "futex-requeue-race-witness")]
+    static SIG_WOKE: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "futex-requeue-race-witness")]
+    static SIG_CALLS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "futex-requeue-race-witness")]
+    static SIG_NEXT: AtomicU32 = AtomicU32::new(0);
+
+    /// A signaller: while ARM is odd, `FutexWake(seq, 1)` as fast as it can; otherwise report the
+    /// generation it saw (so the broadcaster knows no wake of its is still in flight) and yield.
+    #[cfg(feature = "futex-requeue-race-witness")]
+    pub(super) extern "C" fn signaller_body() -> ! {
+        let me = (SIG_NEXT.fetch_add(1, SeqCst) as usize).min(SIGNALLERS - 1);
+        loop {
+            let armed_gen = ARM.load(SeqCst);
+            if armed_gen % 2 == 1 {
+                let n = yarm_user_rt::syscall::futex_wake(COND.seq().as_ptr(), 1, P).unwrap_or(0);
+                SIG_WOKE.fetch_add(n, SeqCst);
+                SIG_CALLS.fetch_add(1, SeqCst);
+            } else {
+                SIG_SEEN[me].store(armed_gen, SeqCst);
+                let _ = yield_now();
+            }
+        }
+    }
 
     pub(super) fn armed(slot5: Option<u32>) -> bool {
         matches!(slot5, Some(18))
@@ -2775,7 +2819,11 @@ pub(super) mod futex_requeue_witness {
         pub(super) tls_base: usize,
     }
 
-    pub(super) fn run_once(s_tid: u64, children: &[Child; WAITERS]) {
+    pub(super) fn run_once(
+        s_tid: u64,
+        children: &[Child; WAITERS],
+        #[cfg(feature = "futex-requeue-race-witness")] signallers: &[Child; SIGNALLERS],
+    ) {
         let w = WAITERS as u32;
         yarm_user_rt::user_log!(
             "CRQ_WITNESS_BEGIN s_tid={} waiters={} rounds={}",
@@ -2791,6 +2839,14 @@ pub(super) mod futex_requeue_witness {
                     .unwrap_or(0);
         }
         let mut all = tids.iter().all(|&t| t != 0);
+        #[cfg(feature = "futex-requeue-race-witness")]
+        for c in signallers.iter() {
+            // SAFETY: as for the waiters.
+            let t =
+                unsafe { yarm_user_rt::syscall::spawn_thread(c.tls_base, c.stack_top, c.entry) }
+                    .unwrap_or(0);
+            all &= t != 0;
+        }
         for round in 1..=ROUNDS {
             let arrived = wait_for(&ARRIVED, round * w);
             let (mut census_n, mut census_back, mut census_calls) = (0, 0, 0u32);
@@ -2805,15 +2861,31 @@ pub(super) mod futex_requeue_witness {
             let wakes_before = MUTEX_WAKES.load(SeqCst);
             MUTEX.lock();
             RELEASED.store(round, SeqCst);
+            #[cfg(feature = "futex-requeue-race-witness")]
+            let (sig_before, armed_gen) = (SIG_WOKE.load(SeqCst), ARM.fetch_add(1, SeqCst) + 1);
             let r = COND.broadcast(&MUTEX);
+            #[cfg(feature = "futex-requeue-race-witness")]
+            let sig = {
+                // Disarm, then wait until each signaller has seen it outside a wake: no wake of
+                // theirs is still in flight, so the count below is final for this round.
+                ARM.store(armed_gen + 1, SeqCst);
+                for s in &SIG_SEEN {
+                    let _ = wait_for(s, armed_gen + 1);
+                }
+                SIG_WOKE.load(SeqCst) - sig_before
+            };
+            #[cfg(not(feature = "futex-requeue-race-witness"))]
+            let sig = 0u32;
             MUTEX_WAKES.fetch_add(MUTEX.unlock(), SeqCst);
             let acquired = wait_for(&ACQUIRED, round * w);
             let wakes = MUTEX_WAKES.load(SeqCst) - wakes_before;
+            // Race mode: a signaller wake that ran before the broadcast's commit took a waiter
+            // legitimately, so the round accounts for every waiter exactly once instead.
             let ok = arrived
                 && census_n == w
                 && census_back == w
                 && r.woken == 1
-                && r.requeued == w - 1
+                && r.requeued + 1 + sig == w
                 && r.calls == 1
                 && !r.fell_back_to_wake_all
                 && acquired
@@ -2821,13 +2893,14 @@ pub(super) mod futex_requeue_witness {
                 && OVERLAP.load(SeqCst) == 0;
             all &= ok;
             yarm_user_rt::user_log!(
-                "CRQ_WITNESS_ROUND round={} census={} census_back={} census_calls={} woken={} requeued={} calls={} fallback={} acquired={} mutex_wakes={} overlap={} result={}",
+                "CRQ_WITNESS_ROUND round={} census={} census_back={} census_calls={} woken={} requeued={} sig_woke={} calls={} fallback={} acquired={} mutex_wakes={} overlap={} result={}",
                 round,
                 census_n,
                 census_back,
                 census_calls,
                 r.woken,
                 r.requeued,
+                sig,
                 r.calls,
                 r.fell_back_to_wake_all as u32,
                 ACQUIRED.load(SeqCst),
@@ -2890,6 +2963,15 @@ mod x86_futex_requeue {
             body = sym super::futex_requeue_witness::child_body,
         )
     }
+    #[cfg(feature = "futex-requeue-race-witness")]
+    #[unsafe(naked)]
+    pub(super) extern "C" fn signaller_entry() -> ! {
+        core::arch::naked_asm!(
+            "call {body}",
+            "ud2",
+            body = sym super::futex_requeue_witness::signaller_body,
+        )
+    }
 }
 
 /// FUTEX-REQUEUE1 — resolve this architecture's child entry, the ten stacks, and run the witness.
@@ -2907,7 +2989,26 @@ fn run_futex_requeue_witness(s_tid: u64) {
         stack_top: (stacks + (i + 1) * w::STACK_BYTES) & !0xF,
         tls_base: tls + i * 256,
     });
-    w::run_once(s_tid, &children);
+    #[cfg(feature = "futex-requeue-race-witness")]
+    let signallers: [w::Child; w::SIGNALLERS] = {
+        #[cfg(target_arch = "x86_64")]
+        let entry = x86_futex_requeue::signaller_entry as *const () as usize;
+        #[cfg(not(target_arch = "x86_64"))]
+        let entry = w::signaller_body as *const () as usize;
+        let stacks = core::ptr::addr_of_mut!(w::SIG_STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(w::SIG_TLS) as usize;
+        core::array::from_fn(|i| w::Child {
+            entry,
+            stack_top: (stacks + (i + 1) * w::STACK_BYTES) & !0xF,
+            tls_base: tls + i * 256,
+        })
+    };
+    w::run_once(
+        s_tid,
+        &children,
+        #[cfg(feature = "futex-requeue-race-witness")]
+        &signallers,
+    );
 }
 
 /// U9-TIMER5 §3 — the IDLE-BOUNDARY RETURN witness.
