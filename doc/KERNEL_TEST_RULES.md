@@ -2174,6 +2174,13 @@ refcount, never granted cross-process), so revoking any Notification cap destroy
 the object. Tests must cover the revoke teardown, its idempotence, the lock-rank
 separation outcomes, and stale-cap stability.
 
+> **ENDPOINT-ROLLBACK1 (2026-11-11).** A cross-object collision is arranged, never assumed:
+> line the two namespaces up with real objects (`notification_at_next_endpoint_index`), bind the
+> route through line authority, and assert the exact index coincidence. To fail a transaction
+> after a phase no production input can fail, wrap the real owners
+> (`FailingCommitOwners: SpawnTxnOwners`) and fail exactly one owner call, as an owner may. The
+> production policy and its ledger then run unmodified. See `doc/IPC.md` §8.14.
+
 > **SEND-TIMEOUT-ARB1 (2026-11-10).** A window that a production function does not return
 > across is entered through a `cfg(test)` phase hook at that exact point
 > (`sender_waiter::send_arb_phase_hook`: the broad block's Phase B→C and the timeout drain's

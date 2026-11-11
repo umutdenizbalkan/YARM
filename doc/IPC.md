@@ -2254,6 +2254,53 @@ hooks (`sender_waiter::send_arb_phase_hook`, `cfg(test)`):
 * between the broad block's Phase B and Phase C;
 * between the drain's withdrawal and its claim.
 
+### 8.14 Provisional endpoint rollback (ENDPOINT-ROLLBACK1)
+
+A failed spawn gives back its service endpoints through
+`spawn_ipc_cap_txn::remove_unpublished_endpoint_locked`. The policy
+(`spawn_txn::release_service_endpoint_grant`) first revokes both of the grant's capabilities,
+together with their delegated children, and only then removes the endpoint.
+
+The removal consults only the endpoint's own state:
+
+* **The exact incarnation:** `endpoints[index]` is occupied and `endpoint_generations[index]`
+  equals the token's generation. Otherwise the result is `Stale`: the token owns nothing, and a
+  replacement in the slot is never touched.
+* **No receiver waiter:** `endpoint_waiters[index]` is empty.
+* **No parked sender:** `endpoint_sender_waiters[index]` is empty.
+
+If either waiter check fails, the result is `Published` and nothing is mutated; the endpoint then
+belongs to `destroy_endpoint`. Otherwise the slot is cleared and the generation advances.
+
+**Object namespaces are not compared.** An IRQ route names a Notification incarnation
+`{index, generation}` (§8.10). Endpoints and Notifications have independent slot indexes and
+generations, so a route can never refer to an endpoint, and the removal does not consult
+`irq_routes`.
+
+Until ENDPOINT-ROLLBACK1 the removal refused any endpoint whose slot number equalled a routed
+Notification's index. A failed spawn then kept that endpoint allocated for good, while its
+capabilities were already revoked and nothing could ever name it again.
+
+**Not changed:**
+
+* `IrqRoute`, Notification lifetime and delivery, and binding ownership;
+* the rollback order (capabilities, then the endpoint) and the token semantics;
+* the rank-3 ownership of the removal;
+* `destroy_endpoint`.
+
+**Coverage.** `kernel::boot::tests::endpoint_rollback1` uses real Notifications bound to real lines
+through line authority, real deliveries, a real blocked receiver and a real parked
+capability-bearing sender. It covers:
+
+* E1: a same-index route, through the broad and the split adapters;
+* E2: a route at another index;
+* E3: a blocked receiver;
+* E4: a parked sender with its envelope;
+* E5: a stale token;
+* E6: repeated reuse of one slot;
+* E7: several routes;
+* E8: the real spawn transaction, failing at its commit through a failure-injecting owner set.
+
 ---
 
 ## 9. Authoring rule

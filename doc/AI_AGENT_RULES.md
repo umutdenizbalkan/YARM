@@ -1048,6 +1048,10 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   nothing. Any new path that removes a sender waiter must end that cycle itself. Never claim a
   `TimedOut` ending without holding the withdrawn waiter. Never release the envelope of a send
   that parked a waiter.
+- Never compare slot indexes across object classes (ENDPOINT-ROLLBACK1, `doc/IPC.md` §8.14).
+  Endpoints, Notifications and Replies have independent index spaces and generations. A
+  reference to an object is its own class's `{index, generation}`: an IRQ route names a
+  Notification and can never refer to an Endpoint.
 
 ### 14.4 D3/D6 fences
 

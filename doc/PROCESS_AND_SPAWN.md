@@ -101,8 +101,9 @@ rank 3 was released, and a failing mint returned with the endpoint stranded.
 The token carries the GENERATION, not just the index: endpoint slots are
 recycled, and a rollback naming only an index could destroy a replacement
 endpoint. `remove_unpublished_endpoint_locked` refuses unless the incarnation
-still matches and the endpoint is still unpublished — no waiting receiver, no
-parked sender, no IRQ route. A published endpoint belongs to `destroy_endpoint`,
+still matches and the endpoint is still unpublished — no waiting receiver and no
+parked sender. (IRQ routes name Notifications, never endpoints, so they are not
+consulted: `doc/IPC.md` §8.14.) A published endpoint belongs to `destroy_endpoint`,
 which wakes and settles what it strands and needs ranks the rank-local body does
 not hold.
 

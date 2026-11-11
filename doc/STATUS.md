@@ -53,7 +53,8 @@ incarnation on every failure and drift the census.
 endpoint slots are recycled, so a stale unwind naming a reused index would have destroyed a
 REPLACEMENT endpoint. It now records the whole grant — index, generation, owning cspace and both
 capability ids — and `remove_unpublished_endpoint_locked` refuses unless the incarnation still
-matches AND no receiver waits, no sender is parked and no IRQ routes to it. Destroying a LIVE
+matches AND no receiver waits and no sender is parked (IRQ routes name Notifications, not
+endpoints, and are not consulted since ENDPOINT-ROLLBACK1). Destroying a LIVE
 endpoint wakes a stranded receiver and settles orphaned envelopes; that work is real, stays in
 `destroy_endpoint`, and is owed only by a published endpoint.
 
