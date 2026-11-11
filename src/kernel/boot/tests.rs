@@ -212761,6 +212761,37 @@ mod futex_wake_cap1 {
         });
     }
 
+    /// The claim is token-exact, not TID-exact: a waiter whose status another owner changed after
+    /// it was found — here it faults, and that owner did not retire its futex record — is not
+    /// claimed. Its status is that owner's, the reservation is released, and the next waiter is
+    /// woken instead.
+    #[test]
+    fn c11_a_waiter_moved_by_another_owner_is_not_claimed() {
+        let mut st = Bootstrap::init().expect("init");
+        let (waiters, _, asid) = park_many(&mut st, 2, P);
+        let k: &'static SharedKernel =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(SharedKernel::new(st)));
+        let victim = waiters[0];
+        fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |step, tid| {
+            if step == fx::futex_phase_hook::WAKE_AFTER_RESERVE && tid == victim {
+                k.with(|s| s.set_task_status_for_test(victim, TaskStatus::Faulted));
+                return false;
+            }
+            true
+        }));
+        assert_eq!(k.futex_wake_split_mut(CpuId(0), asid, X, 1, P), Ok(1));
+        k.with(|s| {
+            assert_eq!(
+                s.task_status(victim),
+                Some(TaskStatus::Faulted),
+                "not resurrected"
+            );
+            assert_eq!(placement(s, victim), TaskPlacement::Nowhere);
+            assert_eq!(s.task_status(waiters[1]), Some(TaskStatus::Runnable));
+            assert_eq!(reserved(s), 0);
+        });
+    }
+
     /// Teardown between the claim and the reserved commit: the commit still lands (it cannot be
     /// refused), no reservation leaks, and the dead task's queued entry is the scheduler's to
     /// discard, exactly as for any task that exits while queued.
