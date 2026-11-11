@@ -212886,3 +212886,1666 @@ mod futex_wake_cap1 {
         assert_eq!(rq.reserved_user_slots(TaskPriority::Normal), 0);
     }
 }
+
+/// FUTEX-REQUEUE1 — atomic compare-and-requeue (NR 17). Every case runs through the production
+/// owners (`futex_cmp_requeue_current`, `futex_cmp_requeue_split`) and is checked against the
+/// waiter table itself: per-key FIFO order, exact tokens, the chain invariant, the run queue and
+/// the reservation count.
+mod futex_requeue1 {
+    use super::*;
+    use crate::kernel::boot::futex::{
+        self as fx, FutexKey, FutexKind, FutexRequeueOutcome as Out, FutexRequeueRefusal as R,
+        FutexWaitToken,
+    };
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::{CpuId, TaskPlacement};
+    use crate::kernel::syscall::sched::FutexParkOutcome;
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    const P: FutexKind = FutexKind::Private;
+    const SH: FutexKind = FutexKind::Shared;
+    /// Source word (a condition variable's sequence), value 5.
+    const SQ: usize = 0x6_0000;
+    /// Target word (a mutex), value 0, same page.
+    const MX: usize = 0x6_0004;
+    /// A third key, value 7, same page.
+    const UQ: usize = 0x6_0008;
+    /// A word on a second private page, value 9.
+    const Y: usize = 0x7_0000;
+    const ALL: u32 = u32::MAX;
+
+    fn out(woken: u32, requeued: u32, capacity_limited: bool) -> Out {
+        Out {
+            woken,
+            requeued,
+            capacity_limited,
+        }
+    }
+    fn space(s: &mut KernelState) -> (Asid, CapId) {
+        s.create_user_address_space().expect("address space")
+    }
+    fn task(s: &mut KernelState, tid: u64, asid: Asid) {
+        s.register_task(tid).expect("task");
+        s.bind_task_asid(tid, asid).expect("bind");
+        s.set_task_status_for_test(tid, TaskStatus::Runnable);
+        s.seed_resumable_user_context_for_test(tid);
+        s.set_task_home_cpu(tid, CpuId(0)).expect("home");
+        s.enqueue_task(tid).expect("enqueue");
+    }
+    fn private_page(s: &mut KernelState, asid: Asid, va: usize) {
+        let frame = s.alloc_user_data_frame().expect("frame");
+        s.map_user_page_in_asid_raw(
+            asid,
+            VirtAddr(va as u64),
+            Mapping {
+                phys: PhysAddr(frame),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map private page");
+    }
+    fn object_page(s: &mut KernelState, aspace_cap: CapId, va: usize) -> CapId {
+        let (_id, mem) = s.alloc_anonymous_memory_object().expect("object");
+        s.map_user_page_with_caps(aspace_cap, mem, VirtAddr(va as u64), PageFlags::USER_RW)
+            .expect("map object page");
+        mem
+    }
+    fn word(s: &mut KernelState, tid: u64, va: usize, v: u32) {
+        s.write_user_memory(tid, va, &v.to_ne_bytes())
+            .expect("word");
+    }
+    fn rd(s: &KernelState, tid: u64, va: usize) -> u32 {
+        let b = s.read_user_memory(tid, va, 4).expect("read");
+        u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+    }
+    fn run(s: &mut KernelState, tid: u64) {
+        if s.current_tid() != Some(tid) {
+            s.yield_current_to(ThreadId(tid)).expect("switch");
+        }
+        assert_eq!(s.current_tid(), Some(tid));
+    }
+    fn token_of(s: &KernelState, tid: u64) -> Option<FutexWaitToken> {
+        match s.task_status(tid) {
+            Some(TaskStatus::Blocked(WaitReason::Futex(token))) => Some(token),
+            _ => None,
+        }
+    }
+    fn parked(s: &KernelState, tid: u64) -> bool {
+        token_of(s, tid).is_some()
+    }
+    fn placement(s: &KernelState, tid: u64) -> TaskPlacement {
+        s.with_scheduler_state(|all| all.placement_of(ThreadId(tid)))
+    }
+    fn queue(s: &KernelState) -> Vec<u64> {
+        let mut q = Vec::new();
+        s.for_each_queued_on_for_test(CpuId(0), |_, t| q.push(t.0));
+        q
+    }
+    fn queued_count(s: &KernelState, tid: u64) -> usize {
+        queue(s).iter().filter(|&&t| t == tid).count()
+    }
+    fn reserved(s: &KernelState) -> usize {
+        s.with_scheduler_state(|all| all.reserved_user_slots_on(CpuId(0)))
+    }
+    /// Woken with a continuation: Runnable and queued exactly once.
+    fn placed(s: &KernelState, tid: u64) -> bool {
+        s.task_status(tid) == Some(TaskStatus::Runnable)
+            && placement(s, tid) == TaskPlacement::Queued(CpuId(0))
+            && queued_count(s, tid) == 1
+    }
+    fn key(s: &KernelState, tid: u64, va: usize) -> FutexKey {
+        s.private_futex_key_for_test(tid, va)
+    }
+    fn key_of(s: &mut KernelState, token: FutexWaitToken) -> Option<FutexKey> {
+        s.with_task_futex_mut(|_t, table| table.key_of(token))
+    }
+    fn order(s: &mut KernelState, k: FutexKey) -> Vec<u64> {
+        s.with_task_futex_mut(|tcbs, table| table.waiters_in_order(tcbs.as_slice(), k))
+    }
+    fn occupied(s: &mut KernelState) -> usize {
+        s.with_task_futex_mut(|_t, table| table.occupied())
+    }
+    fn consistent(s: &mut KernelState) {
+        s.with_task_futex_mut(|_t, table| table.assert_chains_consistent());
+    }
+    /// Every listed task is parked and unplaced, or woken with a continuation; nothing reserved.
+    fn contract(s: &KernelState, tids: &[u64]) -> usize {
+        let mut woken = 0;
+        for &t in tids {
+            if parked(s, t) {
+                assert_eq!(
+                    placement(s, t),
+                    TaskPlacement::Nowhere,
+                    "{t}: parked and placed"
+                );
+            } else {
+                assert!(placed(s, t), "{t}: Runnable but not queued exactly once");
+                woken += 1;
+            }
+        }
+        assert_eq!(
+            reserved(s),
+            0,
+            "every reservation was committed or released"
+        );
+        woken
+    }
+    fn rq(
+        s: &mut KernelState,
+        src: usize,
+        dst: usize,
+        exp: u32,
+        wake: u32,
+        n: u32,
+    ) -> Result<Out, R> {
+        s.futex_cmp_requeue_current((src, P), (dst, P), exp, wake, n)
+    }
+    fn leak(s: KernelState) -> &'static SharedKernel {
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(SharedKernel::new(s)))
+    }
+
+    /// One process: its space `a`, a driver task current, words SQ=5, MX=0, UQ=7, Y=9.
+    ///
+    /// Built while the bootstrap task is current (the address-space and object capabilities are
+    /// its): one MemoryObject mapped at 0x8_0000 and 0xB_0000 in A and at 0x9_0000 in a second
+    /// process B, whose own page at SQ is private (SQ=5, MX=0). B's driver `bd` is registered but
+    /// not queued until a test runs it (`ready_b`), so it takes no run-queue slot.
+    struct W {
+        s: KernelState,
+        a: Asid,
+        b: Asid,
+        bd: u64,
+        object_id: u64,
+        driver: u64,
+        next: u64,
+    }
+    fn world(base: u64) -> W {
+        let mut s = Bootstrap::init().expect("init");
+        let (a, acap) = space(&mut s);
+        private_page(&mut s, a, SQ);
+        private_page(&mut s, a, Y);
+        let mem = object_page(&mut s, acap, 0x8_0000);
+        s.map_user_page_with_caps(acap, mem, VirtAddr(0xB_0000), PageFlags::USER_RW)
+            .expect("second mapping in A");
+        let (b, bcap) = space(&mut s);
+        private_page(&mut s, b, SQ);
+        s.map_user_page_with_caps(bcap, mem, VirtAddr(0x9_0000), PageFlags::USER_RW)
+            .expect("map in B");
+        let driver = base + 999;
+        let bd = base + 998;
+        task(&mut s, driver, a);
+        s.register_task(bd).expect("task");
+        s.bind_task_asid(bd, b).expect("bind");
+        for (va, v) in [
+            (SQ, 5),
+            (MX, 0),
+            (UQ, 7),
+            (Y, 9),
+            (0x8_0000, 0),
+            (0xB_0000, 0),
+            (0x8_0008, 0),
+            (0x8_0010, 0),
+        ] {
+            word(&mut s, driver, va, v);
+        }
+        for (va, v) in [(SQ, 5), (MX, 0), (0x9_0008, 0), (0x9_0010, 0)] {
+            word(&mut s, bd, va, v);
+        }
+        let object_id = match s
+            .with_vm_then_memory_mut(|sp, m| fx::resolve_futex_key_locked(sp, m, b, 0x9_0008, SH))
+        {
+            Ok((FutexKey::Shared { object_id, .. }, _)) => object_id,
+            other => panic!("{other:?}"),
+        };
+        run(&mut s, driver);
+        W {
+            s,
+            a,
+            b,
+            bd,
+            object_id,
+            driver,
+            next: base,
+        }
+    }
+    impl W {
+        /// A new task of this process, parked on `va` (whose word must hold `v`).
+        fn park(&mut self, va: usize, v: u32, kind: FutexKind) -> u64 {
+            let t = self.next;
+            self.next += 1;
+            task(&mut self.s, t, self.a);
+            run(&mut self.s, t);
+            assert!(
+                self.s.futex_wait_current(va, v, kind).expect("wait"),
+                "{t} parks"
+            );
+            t
+        }
+        fn park_n(&mut self, n: usize, va: usize, v: u32) -> Vec<u64> {
+            let ws = (0..n).map(|_| self.park(va, v, P)).collect();
+            self.back();
+            ws
+        }
+        fn back(&mut self) {
+            run(&mut self.s, self.driver);
+        }
+        fn k(&self, va: usize) -> FutexKey {
+            key(&self.s, self.driver, va)
+        }
+        fn order(&mut self, va: usize) -> Vec<u64> {
+            let k = self.k(va);
+            order(&mut self.s, k)
+        }
+    }
+
+    type Snapshot = (
+        Vec<(Option<TaskStatus>, TaskPlacement, Option<FutexKey>)>,
+        Vec<u64>,
+        usize,
+        usize,
+    );
+    fn snapshot(s: &mut KernelState, tids: &[u64]) -> Snapshot {
+        let per = tids
+            .iter()
+            .map(|&t| {
+                let k = token_of(s, t).and_then(|tok| key_of(s, tok));
+                (s.task_status(t), placement(s, t), k)
+            })
+            .collect();
+        (per, queue(s), occupied(s), reserved(s))
+    }
+
+    // ── Identity and basic operations ────────────────────────────────────────────────────────
+
+    /// 1 — the comparison holds: one waiter woken, the rest moved, still blocked, in order, each
+    /// keeping its exact token; no run-queue slot is used for the moved ones.
+    #[test]
+    fn r01_match_wakes_one_and_requeues_the_rest() {
+        let mut w = world(45000);
+        let ws = w.park_n(5, SQ, 5);
+        let toks: Vec<_> = ws
+            .iter()
+            .map(|&t| token_of(&w.s, t).expect("token"))
+            .collect();
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 1, ALL), Ok(out(1, 4, false)));
+        assert!(placed(&w.s, ws[0]));
+        assert_eq!(w.order(SQ), Vec::<u64>::new());
+        assert_eq!(w.order(MX), ws[1..].to_vec(), "moved in their source order");
+        let target = w.k(MX);
+        for i in 1..5 {
+            assert_eq!(
+                token_of(&w.s, ws[i]),
+                Some(toks[i]),
+                "the token is unchanged"
+            );
+            assert_eq!(key_of(&mut w.s, toks[i]), Some(target));
+            assert_eq!(
+                placement(&w.s, ws[i]),
+                TaskPlacement::Nowhere,
+                "still blocked"
+            );
+        }
+        assert_eq!(contract(&w.s, &ws), 1);
+        assert_eq!(occupied(&mut w.s), 4);
+        consistent(&mut w.s);
+    }
+
+    /// 1 (split) — the split owner gives the same outcome and the same queues.
+    #[test]
+    fn r01b_split_and_broad_agree() {
+        let mut b = world(45020);
+        let wb = b.park_n(6, SQ, 5);
+        let broad = rq(&mut b.s, SQ, MX, 5, 2, 3);
+        let ob = (b.order(SQ), b.order(MX));
+        let mut w = world(45020);
+        let ws = w.park_n(6, SQ, 5);
+        assert_eq!(wb, ws);
+        let (ks, kt, a) = (w.k(SQ), w.k(MX), w.a);
+        let k = SharedKernel::new(w.s);
+        let split = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 2, 3);
+        assert_eq!(broad, split);
+        assert_eq!(split, Ok(out(2, 3, false)));
+        k.with(|s| {
+            assert_eq!((order(s, ks), order(s, kt)), ob);
+            assert_eq!(contract(s, &ws), 2);
+            consistent(s);
+        });
+    }
+
+    /// 2 — the comparison fails: `ValueChanged`, and nothing at all changes — no status, no
+    /// placement, no key, no queue entry, no reservation. Through the syscall table it is
+    /// `WouldBlock`, never a zero-count success.
+    #[test]
+    fn r02_mismatch_mutates_nothing() {
+        use crate::kernel::syscall::{SYSCALL_FUTEX_CMP_REQUEUE_NR, SyscallError};
+        let mut w = world(45040);
+        let ws = w.park_n(4, SQ, 5);
+        let before = snapshot(&mut w.s, &ws);
+        assert_eq!(rq(&mut w.s, SQ, MX, 4, 1, ALL), Err(R::ValueChanged));
+        assert_eq!(snapshot(&mut w.s, &ws), before);
+        let mut frame = crate::kernel::trapframe::TrapFrame::new(
+            SYSCALL_FUTEX_CMP_REQUEUE_NR,
+            [SQ, MX, 4, 1, ALL as usize, 0],
+        );
+        assert_eq!(
+            crate::kernel::syscall::dispatch(&mut w.s, &mut frame),
+            Err(SyscallError::WouldBlock)
+        );
+        assert_eq!(snapshot(&mut w.s, &ws), before);
+        // And the success encoding, through the same table: ret0 woken, ret1 requeued, ret2 the
+        // status word with DONE set.
+        let mut frame = crate::kernel::trapframe::TrapFrame::new(
+            SYSCALL_FUTEX_CMP_REQUEUE_NR,
+            [SQ, MX, 5, 0, 2, 0],
+        );
+        assert_eq!(
+            crate::kernel::syscall::dispatch(&mut w.s, &mut frame),
+            Ok(())
+        );
+        assert_eq!(
+            (frame.ret0(), frame.ret1(), frame.ret2()),
+            (
+                0,
+                2,
+                crate::kernel::syscall::sched::FUTEX_REQUEUE_STATUS_DONE
+            )
+        );
+    }
+
+    /// 3 — wake zero, requeue several: nobody runs, the moved prefix leaves, the rest stay.
+    #[test]
+    fn r03_wake_zero_requeue_several() {
+        let mut w = world(45060);
+        let ws = w.park_n(6, SQ, 5);
+        let q = queue(&w.s);
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, 4), Ok(out(0, 4, false)));
+        assert_eq!(w.order(MX), ws[..4].to_vec());
+        assert_eq!(w.order(SQ), ws[4..].to_vec());
+        assert_eq!(queue(&w.s), q, "the requeue touched no run queue");
+        assert_eq!(contract(&w.s, &ws), 0);
+    }
+
+    /// 4 — requeue zero, wake several: a plain wake of the oldest.
+    #[test]
+    fn r04_requeue_zero_wake_several() {
+        let mut w = world(45080);
+        let ws = w.park_n(5, SQ, 5);
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 3, 0), Ok(out(3, 0, false)));
+        assert!(ws[..3].iter().all(|&t| placed(&w.s, t)));
+        assert_eq!(w.order(SQ), ws[3..].to_vec());
+        assert_eq!(w.order(MX), Vec::<u64>::new());
+        assert_eq!(contract(&w.s, &ws), 3);
+    }
+
+    /// 5 — no eligible waiter: a successful zero, distinct from a mismatch; other keys untouched.
+    #[test]
+    fn r05_no_eligible_source_waiters() {
+        let mut w = world(45100);
+        let others = w.park_n(2, UQ, 7);
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 1, ALL), Ok(out(0, 0, false)));
+        assert_eq!(rq(&mut w.s, SQ, MX, 4, 1, ALL), Err(R::ValueChanged));
+        assert_eq!(w.order(UQ), others);
+    }
+
+    /// 6 — a target that IS the source key is refused, also when it is reached through another
+    /// mapping of the same object; the private and shared keys of one word are distinct keys.
+    #[test]
+    fn r06_identical_source_and_target_keys() {
+        use crate::kernel::syscall::{SYSCALL_FUTEX_CMP_REQUEUE_NR, SyscallError};
+        let mut w = world(45120);
+        let ws = w.park_n(2, SQ, 5);
+        let before = snapshot(&mut w.s, &ws);
+        assert_eq!(rq(&mut w.s, SQ, SQ, 5, 1, ALL), Err(R::SameKey));
+        assert_eq!(
+            w.s.futex_cmp_requeue_current((0x8_0000, SH), (0xB_0000, SH), 0, 1, ALL),
+            Err(R::SameKey)
+        );
+        assert_eq!(
+            w.s.futex_cmp_requeue_current((0x8_0000, P), (0x8_0000, SH), 0, 1, ALL),
+            Ok(out(0, 0, false))
+        );
+        let mut frame = crate::kernel::trapframe::TrapFrame::new(
+            SYSCALL_FUTEX_CMP_REQUEUE_NR,
+            [SQ, SQ, 5, 1, 1, 0],
+        );
+        assert_eq!(
+            crate::kernel::syscall::dispatch(&mut w.s, &mut frame),
+            Err(SyscallError::InvalidArgs)
+        );
+        assert_eq!(snapshot(&mut w.s, &ws), before);
+    }
+
+    /// Two VAs of the requeuer's page whose private keys share `bucket` with `of` (and not `of`).
+    fn same_bucket(w: &W, of: usize, n: usize) -> Vec<usize> {
+        let b = w.k(of).bucket_for_test();
+        (0..1024)
+            .map(|i| SQ + 4 * i)
+            .filter(|&va| va != of && w.k(va).bucket_for_test() == b)
+            .take(n)
+            .collect()
+    }
+
+    /// 7 — source, target and an unrelated third key all in ONE bucket: the moved records are
+    /// appended behind the target's existing waiters, the walk never revisits them, and the
+    /// third key is untouched; then the same with a kept prefix and an unmoved suffix.
+    #[test]
+    fn r07_different_keys_in_the_same_bucket() {
+        let mut w = world(45140);
+        assert_ne!(
+            w.k(SQ).bucket_for_test(),
+            w.k(MX).bucket_for_test(),
+            "SQ/MX stay a different-bucket pair for the other tests"
+        );
+        let v = same_bucket(&w, SQ, 2);
+        let (b, c) = (v[0], v[1]);
+        for va in [b, c] {
+            let d = w.driver;
+            word(&mut w.s, d, va, 0);
+        }
+        let w0 = w.park(SQ, 5, P);
+        let t0 = w.park(b, 0, P);
+        let w1 = w.park(SQ, 5, P);
+        let x0 = w.park(c, 0, P);
+        let w2 = w.park(SQ, 5, P);
+        let t1 = w.park(b, 0, P);
+        let w3 = w.park(SQ, 5, P);
+        w.back();
+        assert_eq!(rq(&mut w.s, SQ, b, 5, 0, ALL), Ok(out(0, 4, false)));
+        assert_eq!(w.order(b), vec![t0, t1, w0, w1, w2, w3]);
+        assert_eq!(w.order(c), vec![x0]);
+        assert_eq!(w.order(SQ), Vec::<u64>::new());
+        consistent(&mut w.s);
+        for expect in [t0, t1, w0, w1, w2, w3] {
+            assert_eq!(w.s.futex_wake(b, 1, P), Ok(1));
+            assert!(placed(&w.s, expect), "FIFO on the target: {expect}");
+        }
+        assert_eq!(w.s.futex_wake(c, 1, P), Ok(1));
+        assert!(placed(&w.s, x0));
+
+        let mut w = world(45160);
+        let v = same_bucket(&w, SQ, 1);
+        let b = v[0];
+        let d = w.driver;
+        word(&mut w.s, d, b, 0);
+        let t0 = w.park(b, 0, P);
+        let ws: Vec<u64> = (0..4).map(|_| w.park(SQ, 5, P)).collect();
+        w.back();
+        assert_eq!(rq(&mut w.s, SQ, b, 5, 1, 2), Ok(out(1, 2, false)));
+        assert!(placed(&w.s, ws[0]));
+        assert_eq!(w.order(b), vec![t0, ws[1], ws[2]]);
+        assert_eq!(w.order(SQ), vec![ws[3]]);
+        consistent(&mut w.s);
+    }
+
+    /// 8 — FIFO on both keys: the target's existing waiters first, then the moved ones in their
+    /// source order; the source keeps its unmoved suffix in order. Proven by waking one at a time.
+    #[test]
+    fn r08_fifo_preserved_on_source_and_target() {
+        let mut w = world(45180);
+        let t0 = w.park(MX, 0, P);
+        let t1 = w.park(MX, 0, P);
+        let ws = w.park_n(6, SQ, 5);
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 1, 3), Ok(out(1, 3, false)));
+        assert!(placed(&w.s, ws[0]));
+        assert_eq!(w.order(SQ), vec![ws[4], ws[5]]);
+        assert_eq!(w.order(MX), vec![t0, t1, ws[1], ws[2], ws[3]]);
+        for expect in [t0, t1, ws[1], ws[2], ws[3]] {
+            assert_eq!(w.s.futex_wake(MX, 1, P), Ok(1));
+            assert!(placed(&w.s, expect), "target order: {expect}");
+        }
+        for expect in [ws[4], ws[5]] {
+            assert_eq!(w.s.futex_wake(SQ, 1, P), Ok(1));
+            assert!(placed(&w.s, expect), "source order: {expect}");
+        }
+    }
+
+    /// Make B's driver runnable and queued. Returns (B's space, B's driver).
+    fn ready_b(w: &mut W) -> (Asid, u64) {
+        let bd = w.bd;
+        w.s.set_task_status_for_test(bd, TaskStatus::Runnable);
+        w.s.seed_resumable_user_context_for_test(bd);
+        w.s.set_task_home_cpu(bd, CpuId(0)).expect("home");
+        w.s.enqueue_task(bd).expect("enqueue");
+        (w.b, bd)
+    }
+    fn park_in(s: &mut KernelState, tid: u64, asid: Asid, va: usize, v: u32, kind: FutexKind) {
+        task(s, tid, asid);
+        run(s, tid);
+        assert!(
+            s.futex_wait_current(va, v, kind).expect("wait"),
+            "{tid} parks"
+        );
+    }
+
+    /// 9 — private keys of different address spaces never mix, in either direction.
+    #[test]
+    fn r09_private_keys_in_different_address_spaces_never_mix() {
+        let mut w = world(45200);
+        let (b, bd) = ready_b(&mut w);
+        let a0 = w.park(SQ, 5, P);
+        let a1 = w.park(SQ, 5, P);
+        park_in(&mut w.s, 45210, b, SQ, 5, P);
+        park_in(&mut w.s, 45211, b, SQ, 5, P);
+        w.back();
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, ALL), Ok(out(0, 2, false)));
+        let (bs, bm) = (key(&w.s, bd, SQ), key(&w.s, bd, MX));
+        assert_eq!(
+            order(&mut w.s, bs),
+            vec![45210, 45211],
+            "B's waiters are not A's"
+        );
+        assert_eq!(order(&mut w.s, bm), Vec::<u64>::new());
+        assert_eq!(w.order(MX), vec![a0, a1]);
+        run(&mut w.s, bd);
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, ALL), Ok(out(0, 2, false)));
+        assert_eq!(order(&mut w.s, bm), vec![45210, 45211]);
+        assert_eq!(w.s.futex_wake(MX, ALL, P), Ok(2), "only B's");
+        assert!(parked(&w.s, a0) && parked(&w.s, a1));
+        assert_eq!(w.order(MX), vec![a0, a1]);
+    }
+
+    /// 10 — a shared object at different VAs in two processes: A requeues B's waiters between two
+    /// offsets of the object, through A's own mapping, and B's wake through its mapping reaches them.
+    #[test]
+    fn r10_shared_object_at_different_vas_across_processes() {
+        let mut w = world(45220);
+        let (b, bd) = ready_b(&mut w);
+        let object_id = w.object_id;
+        park_in(&mut w.s, 45230, b, 0x9_0008, 0, SH);
+        park_in(&mut w.s, 45231, b, 0x9_0008, 0, SH);
+        w.back();
+        assert_eq!(
+            w.s.futex_cmp_requeue_current((0x8_0008, SH), (0x8_0010, SH), 0, 0, ALL),
+            Ok(out(0, 2, false))
+        );
+        let tok = token_of(&w.s, 45230).expect("parked");
+        assert_eq!(
+            key_of(&mut w.s, tok),
+            Some(FutexKey::Shared {
+                object_id,
+                offset: 0x10
+            })
+        );
+        run(&mut w.s, bd);
+        assert_eq!(w.s.futex_wake(0x9_0008, ALL, SH), Ok(0));
+        assert_eq!(w.s.futex_wake(0x9_0010, ALL, SH), Ok(2));
+    }
+
+    /// 11 — the two flags are independent: shared source to private target, and private source to
+    /// shared target, each resolved in its own namespace. The decode accepts exactly bits 0 and 1.
+    #[test]
+    fn r11_independent_source_and_target_flags() {
+        use crate::kernel::syscall::sched::decode_futex_requeue_args;
+        use crate::kernel::syscall::{SYSCALL_FUTEX_CMP_REQUEUE_NR, SyscallError};
+        let mut w = world(45240);
+        let (b, bd) = ready_b(&mut w);
+        park_in(&mut w.s, 45250, b, 0x9_0008, 0, SH);
+        let a0 = w.park(SQ, 5, P);
+        w.back();
+        assert_eq!(
+            w.s.futex_cmp_requeue_current((0x8_0008, SH), (MX, P), 0, 0, ALL),
+            Ok(out(0, 1, false))
+        );
+        let tok = token_of(&w.s, 45250).expect("parked");
+        let amx = w.k(MX);
+        assert_eq!(key_of(&mut w.s, tok), Some(amx), "now on A's private key");
+        assert_eq!(
+            w.s.futex_cmp_requeue_current((SQ, P), (0x8_0010, SH), 5, 0, ALL),
+            Ok(out(0, 1, false))
+        );
+        assert_eq!(w.s.futex_wake(MX, 1, P), Ok(1));
+        assert!(placed(&w.s, 45250));
+        run(&mut w.s, bd);
+        assert_eq!(
+            w.s.futex_wake(0x9_0010, 1, SH),
+            Ok(1),
+            "B reaches A's moved waiter"
+        );
+        assert!(placed(&w.s, a0));
+
+        let f = |a: [usize; 6]| {
+            decode_futex_requeue_args(&crate::kernel::trapframe::TrapFrame::new(
+                SYSCALL_FUTEX_CMP_REQUEUE_NR,
+                a,
+            ))
+        };
+        for (flags, sk, tk) in [(0, P, P), (1, SH, P), (2, P, SH), (3, SH, SH)] {
+            let d = f([0x1000, 0x2000, 1, 2, 3, flags]).expect("decode");
+            assert_eq!(
+                (
+                    d.source,
+                    d.target,
+                    d.expected,
+                    d.wake,
+                    d.requeue,
+                    d.source_kind,
+                    d.target_kind
+                ),
+                (0x1000, 0x2000, 1, 2, 3, sk, tk)
+            );
+        }
+        for bad in [
+            [0x1000, 0x2000, 1, 2, 3, 4],
+            [0x1000, 0x2000, 1, 2, 3, 1 << 63],
+            [0x1002, 0x2000, 1, 2, 3, 0],
+            [0x1000, 0x2001, 1, 2, 3, 0],
+            [0x1000, 0x2000, 1 << 32, 2, 3, 0],
+            [0x1000, 0x2000, 1, 1 << 32, 3, 0],
+            [0x1000, 0x2000, 1, 2, 1 << 32, 0],
+        ] {
+            assert_eq!(f(bad), Err(SyscallError::InvalidArgs), "{bad:x?}");
+        }
+    }
+
+    /// 12 — stale identity: a waiter of a destroyed object or address space is reachable from
+    /// neither the source nor the target side of a requeue through a replacement at the same VA.
+    #[test]
+    fn r12_stale_identity_cannot_reach_a_replacement() {
+        let mut w = world(45260);
+        const X3: usize = 0xA_0000;
+        let a = w.a;
+        let map = |s: &mut KernelState, phys: PhysAddr| {
+            s.map_user_page_in_asid_raw(
+                a,
+                VirtAddr(X3 as u64),
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map");
+            s.note_mapping_inserted(phys);
+        };
+        let (old_id, old_phys) = w.s.alloc_anonymous_object_without_cap().expect("object");
+        map(&mut w.s, old_phys);
+        let d = w.driver;
+        word(&mut w.s, d, X3, 5);
+        let old = w.park(X3, 5, SH);
+        let moved = w.park(SQ, 5, P);
+        w.back();
+        w.s.unmap_user_page_in_asid(a, VirtAddr(X3 as u64))
+            .expect("unmap");
+        let (mid_id, mid_phys) = w.s.alloc_anonymous_object_without_cap().expect("object");
+        assert_ne!(mid_id, old_id);
+        map(&mut w.s, mid_phys);
+        word(&mut w.s, d, X3, 5);
+        assert_eq!(
+            w.s.futex_cmp_requeue_current((X3, SH), (MX, P), 5, 0, ALL),
+            Ok(out(0, 0, false)),
+            "the old object's waiter is not the new object's"
+        );
+        let tok = token_of(&w.s, old).expect("still parked");
+        assert_eq!(
+            key_of(&mut w.s, tok),
+            Some(FutexKey::Shared {
+                object_id: old_id,
+                offset: 0
+            })
+        );
+        // The target side: moved onto the middle object, which then goes away.
+        assert_eq!(
+            w.s.futex_cmp_requeue_current((SQ, P), (X3, SH), 5, 0, ALL),
+            Ok(out(0, 1, false))
+        );
+        w.s.unmap_user_page_in_asid(a, VirtAddr(X3 as u64))
+            .expect("unmap");
+        let (_new_id, new_phys) = w.s.alloc_anonymous_object_without_cap().expect("object");
+        map(&mut w.s, new_phys);
+        word(&mut w.s, d, X3, 5);
+        assert_eq!(
+            w.s.futex_wake(X3, ALL, SH),
+            Ok(0),
+            "a replacement object wakes nobody"
+        );
+        assert!(parked(&w.s, old) && parked(&w.s, moved));
+        w.s.exit_task(old, 0).expect("exit");
+        w.s.exit_task(moved, 0).expect("exit");
+        assert_eq!(
+            occupied(&mut w.s),
+            0,
+            "each record released exactly once, with its task"
+        );
+
+        // The address-space half: a reused ASID number is a new incarnation.
+        let mut s = Bootstrap::init().expect("init");
+        let (c, _) = space(&mut s);
+        task(&mut s, 45270, c);
+        private_page(&mut s, c, SQ);
+        word(&mut s, 45270, SQ, 5);
+        run(&mut s, 45270);
+        assert!(s.futex_wait_current(SQ, 5, P).expect("wait"));
+        s.with_user_spaces_mut(|m| m.destroy(c, 0))
+            .expect("destroy");
+        let mut reused = None;
+        for _ in 0..70_000 {
+            let n = s
+                .with_user_spaces_mut(|m| m.create_user_space())
+                .expect("create");
+            if n == c {
+                reused = Some(n);
+                break;
+            }
+            s.with_user_spaces_mut(|m| m.destroy(n, 0))
+                .expect("destroy");
+        }
+        let n = reused.expect("the ASID number is reused");
+        task(&mut s, 45271, n);
+        private_page(&mut s, n, SQ);
+        word(&mut s, 45271, SQ, 5);
+        run(&mut s, 45271);
+        assert_eq!(rq(&mut s, SQ, MX, 5, 0, ALL), Ok(out(0, 0, false)));
+        assert!(parked(&s, 45270));
+    }
+
+    // ── Concurrency and ownership ────────────────────────────────────────────────────────────
+
+    /// 13 — a source wake meets a requeue inside its own window. After its reservation, before
+    /// its claim: the requeue moves the reserved candidate, the claim refuses (the record is no
+    /// longer the source key's), the reservation is released and nothing is woken twice. After
+    /// its claim: the claimed waiter is the wake's, the requeue moves only the others.
+    #[test]
+    fn r13_wake_races_requeue_on_the_source() {
+        for (step, woke, moved) in [
+            (fx::futex_phase_hook::WAKE_AFTER_RESERVE, 0, 4),
+            (fx::futex_phase_hook::WAKE_AFTER_CLAIM, 1, 3),
+        ] {
+            let mut w = world(45300);
+            let ws = w.park_n(4, SQ, 5);
+            let (a, kt) = (w.a, w.k(MX));
+            let k = leak(w.s);
+            let first = ws[0];
+            fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
+                if st == step && tid == first {
+                    assert_eq!(
+                        k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 0, ALL),
+                        Ok(out(0, moved, false))
+                    );
+                    return false;
+                }
+                true
+            }));
+            assert_eq!(k.futex_wake_split_mut(CpuId(0), a, SQ, 1, P), Ok(woke));
+            k.with(|s| {
+                assert_eq!(contract(s, &ws), woke as usize);
+                assert_eq!(order(s, kt), ws[(4 - moved as usize)..].to_vec());
+                consistent(s);
+            });
+        }
+    }
+
+    /// 14 — a target wake meets a requeue onto its key: the moved waiters queue behind the
+    /// target's existing waiter, and the wake continues with them in that order.
+    #[test]
+    fn r14_wake_races_requeue_on_the_target() {
+        let mut w = world(45320);
+        let t0 = w.park(MX, 0, P);
+        let ws = w.park_n(2, SQ, 5);
+        let (a, kt) = (w.a, w.k(MX));
+        let k = leak(w.s);
+        fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
+            if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE && tid == t0 {
+                assert_eq!(
+                    k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 0, ALL),
+                    Ok(out(0, 2, false))
+                );
+                return false;
+            }
+            true
+        }));
+        assert_eq!(k.futex_wake_split_mut(CpuId(0), a, MX, 2, P), Ok(2));
+        k.with(|s| {
+            assert!(
+                placed(s, t0) && placed(s, ws[0]),
+                "existing waiter first, then the oldest moved"
+            );
+            assert_eq!(order(s, kt), vec![ws[1]]);
+            contract(s, &[t0, ws[0], ws[1]]);
+            consistent(s);
+        });
+    }
+
+    /// 15 — two requeues compete: the second runs inside the first's wake window and takes the
+    /// kept waiter; every waiter ends on exactly one key, none duplicated, none lost.
+    #[test]
+    fn r15_two_requeues_compete() {
+        let mut w = world(45340);
+        let ws = w.park_n(4, SQ, 5);
+        let (a, kt, ku) = (w.a, w.k(MX), w.k(UQ));
+        let k = leak(w.s);
+        let first = ws[0];
+        fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
+            if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE && tid == first {
+                assert_eq!(
+                    k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (UQ, P), 5, 0, ALL),
+                    Ok(out(0, 1, false))
+                );
+                return false;
+            }
+            true
+        }));
+        assert_eq!(
+            k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, ALL),
+            Ok(out(0, 3, false))
+        );
+        k.with(|s| {
+            assert_eq!(order(s, kt), ws[1..].to_vec());
+            assert_eq!(order(s, ku), vec![ws[0]]);
+            assert_eq!(occupied(s), 4);
+            assert_eq!(contract(s, &ws), 0);
+            consistent(s);
+            // Serialized the other way: the first takes everything, the second finds nothing.
+            run(s, 45340 + 999);
+            assert_eq!(rq(s, UQ, MX, 7, 0, ALL), Ok(out(0, 1, false)));
+            assert_eq!(rq(s, UQ, MX, 7, 0, ALL), Ok(out(0, 0, false)));
+            assert_eq!(order(s, kt).len(), 4);
+        });
+    }
+
+    /// A split-route waiter: `tid` current on CPU 0 in a fresh space whose page at SQ is an
+    /// anonymous object; SQ=5, MX=0.
+    fn split_waiter(k: &SharedKernel, tid: u64) -> Asid {
+        k.with(|s| {
+            s.register_task_with_class(tid, TaskClass::App)
+                .expect("reg");
+            let (asid, cap) = space(s);
+            s.bind_task_asid(tid, asid).expect("bind");
+            object_page(s, cap, SQ);
+            s.enqueue_on_cpu(CpuId(0), tid).expect("enqueue");
+            s.set_current_cpu(CpuId(0)).expect("cpu");
+            s.dispatch_next_task().expect("dispatch");
+            word(s, tid, SQ, 5);
+            word(s, tid, MX, 0);
+            asid
+        })
+    }
+
+    /// 16 — a requeue inside the split wait's window (registered, before its re-read). The moved
+    /// waiter keeps its token, so its re-read, undo and read-back still name it exactly:
+    /// (a) the word is unchanged — it parks, now on the target, and the target's wake resumes it;
+    /// (b) the word changed first (a broadcaster's sequence bump) — its re-read sees it, its undo
+    ///     retires the record FROM THE TARGET, and it returns `ValueChanged` with nothing left;
+    /// (c) the requeue's wake portion takes it — woken during publication, restored, counted.
+    #[test]
+    fn r16_requeue_races_wait_publication_and_its_second_read() {
+        let k = leak(Bootstrap::init().expect("init"));
+        let t = 45360;
+        let asid = split_waiter(k, t);
+        fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+            assert_eq!(
+                k.futex_cmp_requeue_split(CpuId(0), asid, (SQ, P), (MX, P), 5, 0, ALL),
+                Ok(out(0, 1, false))
+            );
+        }));
+        let o = k.futex_wait_park_exact_split(CpuId(0), t, asid, SQ, 5, P);
+        assert!(matches!(o, FutexParkOutcome::Parked { .. }), "{o:?}");
+        let kt = k.with(|s| key(s, t, MX));
+        k.with(|s| {
+            let tok = token_of(s, t).expect("parked");
+            assert_eq!(key_of(s, tok), Some(kt));
+        });
+        assert_eq!(k.futex_wake_split_mut(CpuId(0), asid, MX, 1, P), Ok(1));
+        k.with(|s| assert!(placed(s, t)));
+
+        let k = leak(Bootstrap::init().expect("init"));
+        let asid = split_waiter(k, t);
+        fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+            k.with(|s| word(s, t, SQ, 6));
+            assert_eq!(
+                k.futex_cmp_requeue_split(CpuId(0), asid, (SQ, P), (MX, P), 6, 0, ALL),
+                Ok(out(0, 1, false))
+            );
+        }));
+        let o = k.futex_wait_park_exact_split(CpuId(0), t, asid, SQ, 5, P);
+        assert_eq!(o, FutexParkOutcome::ValueChanged);
+        k.with(|s| {
+            assert_eq!(s.task_status(t), Some(TaskStatus::Running));
+            assert_eq!(occupied(s), 0, "the undo retired the moved record");
+            assert_eq!(order(s, key(s, t, MX)), Vec::<u64>::new());
+            consistent(s);
+        });
+
+        let k = leak(Bootstrap::init().expect("init"));
+        let asid = split_waiter(k, t);
+        fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+            assert_eq!(
+                k.futex_cmp_requeue_split(CpuId(0), asid, (SQ, P), (MX, P), 5, 1, ALL),
+                Ok(out(1, 0, false))
+            );
+        }));
+        let o = k.futex_wait_park_exact_split(CpuId(0), t, asid, SQ, 5, P);
+        assert!(
+            matches!(o, FutexParkOutcome::WokenDuringPublication { .. }),
+            "{o:?}"
+        );
+        k.with(|s| {
+            assert_eq!(s.task_status(t), Some(TaskStatus::Running));
+            assert_eq!(placement(s, t), TaskPlacement::Current(CpuId(0)));
+            assert_eq!(reserved(s), 0);
+        });
+    }
+
+    /// 17 — task death. A stale record (its cycle ended through another owner) is retired, not
+    /// moved; a kept waiter that dies inside the wake portion costs only its reservation; a moved
+    /// waiter that exits leaves the target exactly once.
+    #[test]
+    fn r17_requeue_races_task_death() {
+        let mut w = world(45380);
+        let ws = w.park_n(4, SQ, 5);
+        w.s.set_task_status_for_test(ws[0], TaskStatus::Runnable);
+        w.s.enqueue_task(ws[0]).expect("enqueue");
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, ALL), Ok(out(0, 3, false)));
+        assert_eq!(
+            occupied(&mut w.s),
+            3,
+            "the stale record was reclaimed, uncounted"
+        );
+        assert_eq!(w.order(MX), ws[1..].to_vec());
+        w.s.exit_task(ws[2], 0).expect("exit a moved waiter");
+        assert_eq!(w.order(MX), vec![ws[1], ws[3]]);
+        assert_eq!(occupied(&mut w.s), 2);
+        assert_eq!(w.s.futex_wake(MX, ALL, P), Ok(2));
+        consistent(&mut w.s);
+
+        for (step, woke) in [
+            (fx::futex_phase_hook::WAKE_AFTER_RESERVE, 0),
+            (fx::futex_phase_hook::WAKE_AFTER_CLAIM, 1),
+        ] {
+            let mut w = world(45400);
+            let ws = w.park_n(3, SQ, 5);
+            let (a, kt) = (w.a, w.k(MX));
+            let k = leak(w.s);
+            let victim = ws[0];
+            fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
+                if st == step && tid == victim {
+                    k.with(|s| s.exit_task(victim, 9))
+                        .expect("exit in the window");
+                    return false;
+                }
+                true
+            }));
+            assert_eq!(
+                k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, ALL),
+                Ok(out(woke, 2, false))
+            );
+            k.with(|s| {
+                assert_eq!(reserved(s), 0);
+                assert_eq!(s.task_status(victim), Some(TaskStatus::Exited(9)));
+                assert_eq!(order(s, kt), ws[1..].to_vec());
+                contract(s, &ws[1..]);
+                consistent(s);
+            });
+        }
+    }
+
+    /// 18 — mapping teardown: an unmapped source or target refuses the whole call with the same
+    /// error a wake of that word gives, and moves nothing; waiters already moved to a target whose
+    /// mapping then goes stay parked (no cancellation on teardown) until their tasks end.
+    #[test]
+    fn r18_requeue_races_mapping_teardown() {
+        let mut w = world(45420);
+        let ws = w.park_n(2, SQ, 5);
+        let a = w.a;
+        w.s.unmap_user_page_in_asid(a, VirtAddr(Y as u64))
+            .expect("unmap target");
+        let e = w.s.futex_wake(Y, 1, P).expect_err("unmapped");
+        let before = snapshot(&mut w.s, &ws);
+        assert_eq!(rq(&mut w.s, SQ, Y, 5, 1, ALL), Err(R::Key(e)));
+        assert_eq!(snapshot(&mut w.s, &ws), before);
+        w.s.unmap_user_page_in_asid(a, VirtAddr(SQ as u64))
+            .expect("unmap source");
+        let e = w.s.futex_wake(SQ, 1, P).expect_err("unmapped");
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 1, ALL), Err(R::Key(e)));
+        assert_eq!(snapshot(&mut w.s, &ws), before);
+
+        let mut w = world(45440);
+        let ws = w.park_n(2, SQ, 5);
+        assert_eq!(rq(&mut w.s, SQ, Y, 5, 0, ALL), Ok(out(0, 2, false)));
+        let a = w.a;
+        w.s.unmap_user_page_in_asid(a, VirtAddr(Y as u64))
+            .expect("unmap target");
+        assert!(ws.iter().all(|&t| parked(&w.s, t)));
+        for &t in &ws {
+            w.s.exit_task(t, 0).expect("exit");
+        }
+        assert_eq!(occupied(&mut w.s), 0);
+    }
+
+    /// 19 — exact tokens: a newer wait cycle of a task whose older record is still held is moved
+    /// by its own token; the older cycle's record is reclaimed, never moved, and its delayed undo
+    /// and read-back touch nothing.
+    #[test]
+    fn r19_exact_token_ownership_across_wait_cycles() {
+        let mut w = world(45460);
+        let t = w.park(SQ, 5, P);
+        let t1 = token_of(&w.s, t).expect("cycle 1");
+        w.s.set_task_status_for_test(t, TaskStatus::Runnable);
+        w.s.enqueue_task(t).expect("enqueue");
+        let t2 = {
+            run(&mut w.s, t);
+            assert!(w.s.futex_wait_current(SQ, 5, P).expect("wait"));
+            token_of(&w.s, t).expect("cycle 2")
+        };
+        assert_ne!(t1, t2);
+        w.back();
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, ALL), Ok(out(0, 1, false)));
+        let kt = w.k(MX);
+        assert_eq!(token_of(&w.s, t), Some(t2));
+        assert_eq!(key_of(&mut w.s, t2), Some(kt));
+        assert_eq!(key_of(&mut w.s, t1), None);
+        assert_eq!(occupied(&mut w.s), 1);
+        let undone = w.s.with_task_futex_mut(|tcbs, table| {
+            fx::undo_futex_registration_locked(tcbs.as_mut_slice(), table, t, t1)
+        });
+        assert!(!undone);
+        assert!(
+            !w.s.with_task_futex_mut(|tcbs, _| fx::futex_still_parked_locked(
+                tcbs.as_slice(),
+                t,
+                t1
+            ))
+        );
+        assert_eq!(w.s.futex_wake(MX, 1, P), Ok(1));
+        // A fresh cycle after the move is a source waiter again, and only it moves.
+        run(&mut w.s, t);
+        assert!(w.s.futex_wait_current(SQ, 5, P).expect("wait"));
+        w.back();
+        assert_eq!(rq(&mut w.s, SQ, UQ, 5, 0, ALL), Ok(out(0, 1, false)));
+        assert_eq!(w.order(MX), Vec::<u64>::new());
+        assert_eq!(w.order(UQ), vec![t]);
+    }
+
+    /// 20 — a requeued waiter resumes after a target wake exactly once: one placement, and no
+    /// later wake of either key finds it again.
+    #[test]
+    fn r20_a_requeued_waiter_resumes_exactly_once() {
+        let mut w = world(45480);
+        let ws = w.park_n(3, SQ, 5);
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, ALL), Ok(out(0, 3, false)));
+        assert_eq!(w.s.futex_wake(MX, ALL, P), Ok(3));
+        assert_eq!(contract(&w.s, &ws), 3);
+        assert_eq!(w.s.futex_wake(MX, ALL, P), Ok(0));
+        assert_eq!(w.s.futex_wake(SQ, ALL, P), Ok(0));
+        assert_eq!(occupied(&mut w.s), 0);
+        for &t in &ws {
+            run(&mut w.s, t);
+            assert_eq!(w.s.task_status(t), Some(TaskStatus::Running));
+        }
+    }
+
+    // ── Scheduler and capacity ───────────────────────────────────────────────────────────────
+
+    /// Fill CPU 0's run queue with runnable tasks of `a` until a push is refused.
+    fn fill_queue(s: &mut KernelState, a: Asid, base: u64) -> usize {
+        let mut n = 0;
+        loop {
+            let t = base + n as u64;
+            s.register_task(t).expect("task");
+            s.bind_task_asid(t, a).expect("bind");
+            s.set_task_status_for_test(t, TaskStatus::Runnable);
+            s.seed_resumable_user_context_for_test(t);
+            s.set_task_home_cpu(t, CpuId(0)).expect("home");
+            if s.enqueue_task(t).is_err() {
+                s.exit_task(t, 0).expect("retire the refused filler");
+                return n;
+            }
+            n += 1;
+        }
+    }
+
+    /// 21 — wake 0 / requeue 100 with the destination CPU's queue completely full: all 100 move,
+    /// no scheduler slot is reserved or consumed, the queue is byte-for-byte unchanged.
+    #[test]
+    fn r21_requeue_one_hundred_with_a_full_run_queue() {
+        let mut w = world(46000);
+        let ws = w.park_n(100, SQ, 5);
+        let a = w.a;
+        assert!(fill_queue(&mut w.s, a, 46500) > 0);
+        let q = queue(&w.s);
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, 100), Ok(out(0, 100, false)));
+        assert_eq!(queue(&w.s), q);
+        assert_eq!(reserved(&w.s), 0);
+        assert_eq!(w.order(MX), ws);
+        assert_eq!(contract(&w.s, &ws), 0);
+        // With a wake asked for, the full queue limits only the wake portion — reported.
+        assert_eq!(rq(&mut w.s, MX, UQ, 0, 1, ALL), Ok(out(0, 99, true)));
+        assert_eq!(
+            w.order(MX),
+            vec![ws[0]],
+            "the unplaceable waiter keeps its place"
+        );
+        assert_eq!(w.order(UQ), ws[1..].to_vec());
+        assert_eq!(queue(&w.s), q);
+        assert_eq!(contract(&w.s, &ws), 0);
+        consistent(&mut w.s);
+    }
+
+    /// 22 — a capacity-limited wake portion: the placed waiters are counted, the unplaceable ones
+    /// stay on the source, parked and in order, the moved ones are on the target; nothing is
+    /// discarded or duplicated, and a wake-0 retry moves the remainder without needing room.
+    #[test]
+    fn r22_a_capacity_limited_wake_discards_and_duplicates_nothing() {
+        let mut w = world(46600);
+        let ws = w.park_n(70, SQ, 5);
+        let r = rq(&mut w.s, SQ, MX, 5, 65, 5).expect("requeue");
+        assert_eq!(r, out(63, 5, true), "64 user slots, one the idle task's");
+        assert_eq!(contract(&w.s, &ws), 63);
+        assert!(ws[..63].iter().all(|&t| placed(&w.s, t)));
+        assert_eq!(w.order(SQ), ws[63..65].to_vec());
+        assert_eq!(w.order(MX), ws[65..].to_vec());
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, ALL), Ok(out(0, 2, false)));
+        let mut target = ws[65..].to_vec();
+        target.extend_from_slice(&ws[63..65]);
+        assert_eq!(w.order(MX), target, "behind the waiters already moved");
+        assert_eq!(occupied(&mut w.s), 7);
+        consistent(&mut w.s);
+    }
+
+    /// 23 — mixed wake and requeue counts are exact, including counts larger than the population.
+    #[test]
+    fn r23_mixed_wake_and_requeue_counts_are_exact() {
+        let mut w = world(46700);
+        let ws = w.park_n(10, SQ, 5);
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 3, 4), Ok(out(3, 4, false)));
+        assert_eq!(contract(&w.s, &ws), 3);
+        assert_eq!(w.order(MX), ws[3..7].to_vec());
+        assert_eq!(w.order(SQ), ws[7..].to_vec());
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, 20, 20), Ok(out(3, 0, false)));
+        assert_eq!(rq(&mut w.s, MX, UQ, 0, 2, 100), Ok(out(2, 2, false)));
+        assert_eq!(w.order(UQ), ws[5..7].to_vec());
+        assert_eq!(contract(&w.s, &ws), 8);
+    }
+
+    /// 24 — every reservation the wake portion makes is committed or released: it exists inside
+    /// the window, and is gone after a committed wake, after a death before the claim, and after
+    /// a capacity stop.
+    #[test]
+    fn r24_every_reservation_is_committed_or_released() {
+        let mut w = world(46800);
+        let ws = w.park_n(3, SQ, 5);
+        let a = w.a;
+        let k = leak(w.s);
+        let victim = ws[0];
+        fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
+            assert_eq!(
+                k.with(|s| reserved(s)),
+                usize::from(st == fx::futex_phase_hook::WAKE_AFTER_RESERVE)
+                    | usize::from(st == fx::futex_phase_hook::WAKE_AFTER_CLAIM)
+            );
+            if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE && tid == victim {
+                k.with(|s| s.exit_task(victim, 9)).expect("exit");
+            }
+            true
+        }));
+        assert_eq!(
+            k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 2, 0),
+            Ok(out(2, 0, false))
+        );
+        fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(|_: u8, _: u64| false));
+        fx::futex_phase_hook::run_wake_step(0, 0);
+        k.with(|s| {
+            assert_eq!(reserved(s), 0);
+            assert!(placed(s, ws[1]) && placed(s, ws[2]));
+        });
+        let mut w = world(46820);
+        let ws = w.park_n(66, SQ, 5);
+        assert_eq!(rq(&mut w.s, SQ, MX, 5, ALL, 0), Ok(out(63, 0, true)));
+        assert_eq!(reserved(&w.s), 0);
+        contract(&w.s, &ws);
+    }
+
+    /// A deterministic generator for the property runs.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// 25 — no Runnable-but-unqueued task, ever: 400 random operations (requeue, wake, mismatched
+    /// requeue, re-park) over three keys and twelve waiters, each checked against an exact model
+    /// of the per-key FIFO queues and the woken set.
+    #[test]
+    fn r25_no_runnable_but_unqueued_task_under_mixed_operations() {
+        let mut w = world(46900);
+        let vas = [SQ, MX, UQ];
+        let vals = [5u32, 0, 7];
+        let ws = w.park_n(12, SQ, 5);
+        let mut model: [Vec<u64>; 3] = [ws.clone(), Vec::new(), Vec::new()];
+        let mut g = Lcg(0xF00D);
+        for step in 0..400 {
+            match g.next(4) {
+                0 | 2 => {
+                    let (si, di) = (g.next(3) as usize, g.next(3) as usize);
+                    if si == di {
+                        continue;
+                    }
+                    let (wake, n) = (g.next(3) as u32, g.next(6) as u32);
+                    let mismatch = g.next(4) == 0;
+                    let exp = if mismatch { vals[si] + 1 } else { vals[si] };
+                    let r = rq(&mut w.s, vas[si], vas[di], exp, wake, n);
+                    if mismatch {
+                        assert_eq!(r, Err(R::ValueChanged), "step {step}");
+                        continue;
+                    }
+                    let l = model[si].len();
+                    let keep = (wake as usize).min(l);
+                    let moved = (n as usize).min(l - keep);
+                    assert_eq!(r, Ok(out(keep as u32, moved as u32, false)), "step {step}");
+                    let src = core::mem::take(&mut model[si]);
+                    model[di].extend_from_slice(&src[keep..keep + moved]);
+                    model[si] = src[keep + moved..].to_vec();
+                }
+                1 => {
+                    let ki = g.next(3) as usize;
+                    let c = g.next(4) as u32;
+                    let l = model[ki].len();
+                    let n = (c as usize).min(l);
+                    assert_eq!(w.s.futex_wake(vas[ki], c, P), Ok(n as u32), "step {step}");
+                    model[ki].drain(..n);
+                }
+                _ => {
+                    // Re-park the oldest queued waiter on a random key.
+                    let q = queue(&w.s);
+                    let Some(&t) = q.iter().find(|t| ws.contains(*t)) else {
+                        continue;
+                    };
+                    let ki = g.next(3) as usize;
+                    run(&mut w.s, t);
+                    assert!(w.s.futex_wait_current(vas[ki], vals[ki], P).expect("wait"));
+                    model[ki].push(t);
+                    w.back();
+                }
+            }
+            for (i, &va) in vas.iter().enumerate() {
+                assert_eq!(w.order(va), model[i], "step {step}: key {i}");
+            }
+            let parked_n: usize = model.iter().map(Vec::len).sum();
+            assert_eq!(ws.len() - contract(&w.s, &ws), parked_n, "step {step}");
+            assert_eq!(
+                occupied(&mut w.s),
+                parked_n,
+                "step {step}: no stale or leaked record"
+            );
+            consistent(&mut w.s);
+        }
+    }
+
+    /// 26 — repeated wait / requeue / wake cycles reuse the bounded table: 700 cycles of three
+    /// waiters (2100 registrations against 512 slots) end with every slot free.
+    #[test]
+    fn r26_repeated_cycles_do_not_exhaust_the_waiter_table() {
+        let mut w = world(47000);
+        let ws = w.park_n(3, SQ, 5);
+        for cycle in 0..700 {
+            assert_eq!(
+                rq(&mut w.s, SQ, MX, 5, 0, ALL),
+                Ok(out(0, 3, false)),
+                "cycle {cycle}"
+            );
+            assert_eq!(w.s.futex_wake(MX, ALL, P), Ok(3));
+            assert_eq!(occupied(&mut w.s), 0, "cycle {cycle}");
+            if cycle < 699 {
+                for &t in &ws {
+                    run(&mut w.s, t);
+                    assert!(w.s.futex_wait_current(SQ, 5, P).expect("wait"));
+                }
+                w.back();
+            }
+        }
+        consistent(&mut w.s);
+    }
+
+    // ── Condition-variable behaviour ─────────────────────────────────────────────────────────
+    //
+    // The user protocol of `yarm_user_rt::futex_sync`, step for step, executed by the task that
+    // is current (each step runs on one task, so a read-then-write is that task's atomic swap):
+    // the mutex word at MX is 0 unlocked / 1 locked / 2 contended; the condition variable is the
+    // sequence word at SQ.
+
+    fn m_lock_fast(s: &mut KernelState, t: u64) -> bool {
+        if rd(s, t, MX) == 0 {
+            word(s, t, MX, 1);
+            true
+        } else {
+            false
+        }
+    }
+    /// `lock_contended`: swap(2); acquired if it was 0, else park on 2. Returns acquired.
+    fn m_lock_contended(s: &mut KernelState, t: u64) -> bool {
+        let old = rd(s, t, MX);
+        word(s, t, MX, 2);
+        if old == 0 {
+            return true;
+        }
+        assert!(
+            s.futex_wait_current(MX, 2, P).expect("wait"),
+            "{t} parks on the mutex"
+        );
+        false
+    }
+    fn m_unlock(s: &mut KernelState, t: u64) {
+        let old = rd(s, t, MX);
+        word(s, t, MX, 0);
+        if old == 2 {
+            s.futex_wake(MX, 1, P).expect("wake");
+        }
+    }
+    /// `FutexCondvar::wait` up to the park: read the sequence, unlock, wait on it.
+    fn cv_wait(s: &mut KernelState, t: u64) -> bool {
+        let seen = rd(s, t, SQ);
+        m_unlock(s, t);
+        s.futex_wait_current(SQ, seen, P).expect("wait")
+    }
+    /// `FutexCondvar::broadcast`, by the current holder `b`.
+    fn cv_broadcast(
+        s: &mut KernelState,
+        b: u64,
+        store_contended: bool,
+        wake: u32,
+    ) -> Result<Out, R> {
+        let seq = rd(s, b, SQ).wrapping_add(1);
+        word(s, b, SQ, seq);
+        if store_contended {
+            word(s, b, MX, 2);
+        }
+        rq(s, SQ, MX, seq, wake, ALL)
+    }
+    /// Each waiter: lock (uncontended), then wait on the condition variable.
+    fn ten_waiters(w: &mut W, ws: &[u64]) {
+        for &t in ws {
+            run(&mut w.s, t);
+            assert!(m_lock_fast(&mut w.s, t), "{t} locks");
+            assert!(cv_wait(&mut w.s, t), "{t} waits");
+        }
+        w.back();
+    }
+    fn runnable_waiters(s: &KernelState, ws: &[u64]) -> usize {
+        ws.iter()
+            .filter(|&&t| {
+                matches!(
+                    s.task_status(t),
+                    Some(TaskStatus::Runnable | TaskStatus::Running)
+                )
+            })
+            .count()
+    }
+    /// Run woken waiters (oldest queued first) through `lock_contended` → critical section →
+    /// `unlock` until none is runnable. Returns (acquisition order, most waiters runnable at once).
+    fn drain(w: &mut W, ws: &[u64]) -> (Vec<u64>, usize) {
+        let mut got = Vec::new();
+        let mut most = runnable_waiters(&w.s, ws);
+        for _ in 0..1000 {
+            let q = queue(&w.s);
+            let Some(&t) = q.iter().find(|t| ws.contains(*t) && !got.contains(*t)) else {
+                break;
+            };
+            run(&mut w.s, t);
+            if m_lock_contended(&mut w.s, t) {
+                got.push(t);
+                m_unlock(&mut w.s, t);
+                // The waiter returns from `wait` and leaves: model it parking elsewhere.
+                let d = w.driver;
+                w.s.yield_current_to(ThreadId(d)).expect("switch");
+                w.s.set_task_status_for_test(t, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
+                let _ = w.s.withdraw_queued_tid_on(CpuId(0), t);
+            }
+            most = most.max(runnable_waiters(&w.s, ws));
+        }
+        (got, most)
+    }
+
+    /// 27 — ten waiters; a broadcast makes exactly one runnable and moves nine to the mutex,
+    /// still blocked, in their order. No context switch is needed for the nine.
+    #[test]
+    fn r27_broadcast_to_ten_wakes_one_and_requeues_nine() {
+        let mut w = world(47100);
+        let ws: Vec<u64> = (0..10).map(|i| 47100 + i).collect();
+        for &t in &ws {
+            let a = w.a;
+            task(&mut w.s, t, a);
+        }
+        ten_waiters(&mut w, &ws);
+        let b = w.driver;
+        assert!(m_lock_fast(&mut w.s, b));
+        let q = queue(&w.s);
+        assert_eq!(cv_broadcast(&mut w.s, b, true, 1), Ok(out(1, 9, false)));
+        assert_eq!(runnable_waiters(&w.s, &ws), 1, "no herd");
+        assert!(placed(&w.s, ws[0]));
+        assert_eq!(w.order(MX), ws[1..].to_vec());
+        assert_eq!(w.order(SQ), Vec::<u64>::new());
+        let mut q2 = queue(&w.s);
+        q2.retain(|&t| t != ws[0]);
+        assert_eq!(q2, q, "the nine moved waiters took no queue slot");
+        assert_eq!(
+            rd(&w.s, b, MX),
+            2,
+            "the broadcaster marked the mutex contended"
+        );
+    }
+
+    /// 28 — the mutex releases them progressively: each unlock wakes the next, never more than
+    /// two waiters are runnable at once, and every one of the ten acquires exactly once.
+    #[test]
+    fn r28_mutex_unlocks_release_requeued_waiters_without_a_herd() {
+        let mut w = world(47200);
+        let ws: Vec<u64> = (0..10).map(|i| 47200 + i).collect();
+        for &t in &ws {
+            let a = w.a;
+            task(&mut w.s, t, a);
+        }
+        ten_waiters(&mut w, &ws);
+        let b = w.driver;
+        assert!(m_lock_fast(&mut w.s, b));
+        assert_eq!(cv_broadcast(&mut w.s, b, true, 1), Ok(out(1, 9, false)));
+        m_unlock(&mut w.s, b);
+        let (got, most) = drain(&mut w, &ws);
+        let mut sorted = got.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ws, "every waiter acquired, exactly once");
+        assert!(
+            most <= 2,
+            "at most two waiters runnable at once, saw {most}"
+        );
+        assert_eq!(rd(&w.s, b, MX), 0);
+        assert_eq!(occupied(&mut w.s), 0, "nobody left parked");
+    }
+
+    /// 29 — repeated broadcasts with a moving sequence strand nobody: three rounds; in round two a
+    /// signal lands between a waiter's sequence read and its park (its wait returns at once and it
+    /// re-locks); in round three a signal moves the sequence under the broadcast, which then
+    /// mismatches, moves nothing, and falls back to waking every sequence waiter.
+    #[test]
+    fn r29_repeated_broadcasts_with_changing_sequences_strand_nobody() {
+        let mut w = world(47300);
+        let ws: Vec<u64> = (0..10).map(|i| 47300 + i).collect();
+        for &t in &ws {
+            let a = w.a;
+            task(&mut w.s, t, a);
+        }
+        let b = w.driver;
+        for round in 0..3 {
+            for &t in &ws {
+                w.s.set_task_status_for_test(t, TaskStatus::Runnable);
+                if placement(&w.s, t) == TaskPlacement::Nowhere {
+                    w.s.enqueue_task(t).expect("enqueue");
+                }
+            }
+            let mut late = None;
+            for (i, &t) in ws.iter().enumerate() {
+                run(&mut w.s, t);
+                assert!(m_lock_fast(&mut w.s, t));
+                if round == 1 && i == 5 {
+                    // Read the sequence, then a signal lands before the park.
+                    let seen = rd(&w.s, t, SQ);
+                    m_unlock(&mut w.s, t);
+                    run(&mut w.s, b);
+                    let s1 = rd(&w.s, b, SQ).wrapping_add(1);
+                    word(&mut w.s, b, SQ, s1);
+                    assert_eq!(
+                        w.s.futex_wake(SQ, 1, P),
+                        Ok(1),
+                        "the signal wakes the oldest"
+                    );
+                    run(&mut w.s, t);
+                    assert!(
+                        !w.s.futex_wait_current(SQ, seen, P).expect("wait"),
+                        "returns at once"
+                    );
+                    late = Some(t);
+                    // It re-locks after its wait returns, like any woken waiter (in `drain`).
+                    continue;
+                }
+                assert!(cv_wait(&mut w.s, t));
+            }
+            w.back();
+            assert!(m_lock_fast(&mut w.s, b));
+            let r = if round == 2 {
+                let seq = rd(&w.s, b, SQ).wrapping_add(1);
+                word(&mut w.s, b, SQ, seq);
+                word(&mut w.s, b, MX, 2);
+                word(&mut w.s, b, SQ, seq.wrapping_add(1)); // the racing signal's bump
+                let r = rq(&mut w.s, SQ, MX, seq, 1, ALL);
+                assert_eq!(r, Err(R::ValueChanged));
+                assert_eq!(w.order(MX), Vec::<u64>::new(), "the mismatch moved nothing");
+                // `broadcast`'s fallback: wake every sequence waiter.
+                assert_eq!(w.s.futex_wake(SQ, ALL, P), Ok(10));
+                r
+            } else {
+                cv_broadcast(&mut w.s, b, true, 1)
+            };
+            if round == 0 {
+                assert_eq!(r, Ok(out(1, 9, false)));
+            }
+            if round == 1 {
+                assert_eq!(r, Ok(out(1, 7, false)), "one signalled, one never parked");
+                assert!(late.is_some());
+            }
+            m_unlock(&mut w.s, b);
+            let (got, _) = drain(&mut w, &ws);
+            assert_eq!(got.len(), 10, "round {round}: every waiter acquired");
+            assert_eq!(occupied(&mut w.s), 0, "round {round}: nobody stranded");
+        }
+    }
+
+    /// 30 — the contended-state protocol is what guarantees the target wake. With it, even a
+    /// broadcast that wakes nobody is safe: the broadcaster's own unlock sees 2 and wakes the
+    /// first moved waiter, and the chain continues. Without it (the contrast, kept as a test of
+    /// the hazard), the unlock sees 1, skips the wake, and all ten are stranded on the mutex.
+    #[test]
+    fn r30_the_contended_state_protocol_guarantees_eventual_target_wakeup() {
+        for store_contended in [true, false] {
+            let mut w = world(47400);
+            let ws: Vec<u64> = (0..10).map(|i| 47400 + i).collect();
+            for &t in &ws {
+                let a = w.a;
+                task(&mut w.s, t, a);
+            }
+            ten_waiters(&mut w, &ws);
+            let b = w.driver;
+            assert!(m_lock_fast(&mut w.s, b));
+            assert_eq!(
+                cv_broadcast(&mut w.s, b, store_contended, 0),
+                Ok(out(0, 10, false))
+            );
+            m_unlock(&mut w.s, b);
+            if store_contended {
+                let (got, most) = drain(&mut w, &ws);
+                assert_eq!(got, ws, "released in FIFO order, one unlock at a time");
+                assert!(most <= 1, "{most}");
+            } else {
+                assert_eq!(runnable_waiters(&w.s, &ws), 0);
+                assert_eq!(w.order(MX), ws, "the lost handoff: all ten stranded");
+            }
+        }
+        // The user runtime implements the protected protocol, not the hazard.
+        const USER_RT: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+        let bc = &USER_RT[USER_RT
+            .find("pub fn broadcast(&self, mutex: &FutexMutex)")
+            .expect("broadcast")..];
+        let store = bc
+            .find("mutex.word.store(CONTENDED")
+            .expect("contended store");
+        let call = bc.find("futex_cmp_requeue(").expect("requeue");
+        assert!(store < call, "the contended store precedes the requeue");
+        assert!(USER_RT.contains("let _ = futex_wait(self.seq.as_ptr(), seen, self.scope);\n            // Woken from the sequence, or from the mutex after a requeue: other waiters may be\n            // parked on the mutex, so take it in the contended state.\n            mutex.lock_contended();"));
+    }
+
+    /// ABI v11: NR 17 decodes to `FutexCmpRequeue`, the result mapping is unambiguous on every
+    /// lane, and user-rt encodes what the kernel decodes.
+    #[test]
+    fn r31_the_abi_is_v11_and_unambiguous() {
+        use crate::kernel::syscall::sched::{
+            FUTEX_REQUEUE_STATUS_CAPACITY_LIMITED as CAP, FUTEX_REQUEUE_STATUS_DONE as DONE,
+            apply_futex_requeue_result,
+        };
+        use crate::kernel::syscall::{
+            SYSCALL_ABI_VERSION, SYSCALL_FUTEX_CMP_REQUEUE_NR, Syscall, SyscallError,
+        };
+        assert_eq!(SYSCALL_ABI_VERSION, 11);
+        assert_eq!(
+            Syscall::decode(SYSCALL_FUTEX_CMP_REQUEUE_NR),
+            Ok(Syscall::FutexCmpRequeue)
+        );
+        let mut f = crate::kernel::trapframe::TrapFrame::new(SYSCALL_FUTEX_CMP_REQUEUE_NR, [0; 6]);
+        assert_eq!(
+            apply_futex_requeue_result(&mut f, Ok(out(1, 9, false))),
+            Ok(())
+        );
+        assert_eq!((f.ret0(), f.ret1(), f.ret2()), (1, 9, DONE));
+        assert_eq!(
+            apply_futex_requeue_result(&mut f, Ok(out(0, 4, true))),
+            Ok(())
+        );
+        assert_eq!((f.ret0(), f.ret1(), f.ret2()), (0, 4, DONE | CAP));
+        assert_eq!(
+            apply_futex_requeue_result(&mut f, Ok(out(0, 0, false))),
+            Ok(())
+        );
+        assert_eq!(f.ret2(), DONE, "even a zero-work success carries DONE");
+        assert_eq!(
+            apply_futex_requeue_result(&mut f, Err(R::ValueChanged)),
+            Err(SyscallError::WouldBlock)
+        );
+        assert_eq!(
+            apply_futex_requeue_result(&mut f, Err(R::SameKey)),
+            Err(SyscallError::InvalidArgs)
+        );
+        assert_eq!(
+            apply_futex_requeue_result(&mut f, Err(R::Key(KernelError::UserMemoryFault))),
+            Err(SyscallError::from(KernelError::UserMemoryFault))
+        );
+        assert!(
+            DONE > usize::from(u8::MAX),
+            "no error code (all below 256) carries DONE"
+        );
+        const USER_RT: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+        for needle in [
+            "pub const SYSCALL_FUTEX_CMP_REQUEUE_NR: usize = 17;",
+            "pub const FUTEX_REQUEUE_SOURCE_SHARED: usize = 1 << 0;",
+            "pub const FUTEX_REQUEUE_TARGET_SHARED: usize = 1 << 1;",
+            "pub const FUTEX_REQUEUE_STATUS_DONE: usize = 1 << 8;",
+            "pub const FUTEX_REQUEUE_STATUS_CAPACITY_LIMITED: usize = 1 << 0;",
+            "if ret.ret2 & FUTEX_REQUEUE_STATUS_DONE == 0 {",
+        ] {
+            assert!(USER_RT.contains(needle), "user-rt: {needle}");
+        }
+        assert_eq!(
+            crate::kernel::syscall::sched::FUTEX_REQUEUE_SOURCE_SHARED,
+            1
+        );
+        assert_eq!(
+            crate::kernel::syscall::sched::FUTEX_REQUEUE_TARGET_SHARED,
+            2
+        );
+        assert_eq!((DONE, CAP), (1 << 8, 1));
+    }
+}
