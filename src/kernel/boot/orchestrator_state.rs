@@ -90,6 +90,13 @@ pub(crate) type TaskSpawnGenerationSplitPtrs = (
     *mut u64,
 );
 
+/// FUTEX-FOUND1 — the task lock, the TCB array and the futex waiter table, projected together.
+pub(crate) type TaskFutexSplitPtrs = (
+    *const crate::kernel::lock::SpinLockIrq<()>,
+    *mut KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
+    *mut KernelStorage<super::futex::FutexWaiterTable>,
+);
+
 impl KernelState {
     fn lock_domain_rank(domain: &'static str) -> u8 {
         match domain {
@@ -2321,6 +2328,42 @@ impl KernelState {
         Self::debug_lock_order_note("task");
         let _task_guard = self.task_state_lock.lock();
         f(kernel_mut(&mut self.tcbs))
+    }
+
+    /// FUTEX-FOUND1 — the TCB array and the futex waiter table under ONE task-lock acquisition
+    /// (rank 2). The broad twin of `SharedKernel::with_task_futex_split_mut`.
+    pub(crate) fn with_task_futex_mut<R>(
+        &mut self,
+        f: impl FnOnce(
+            &mut [Option<ThreadControlBlock>; MAX_TASKS],
+            &mut super::futex::FutexWaiterTable,
+        ) -> R,
+    ) -> R {
+        // Lock-order domain: task
+        Self::debug_lock_order_note("task");
+        let _task_guard = self.task_state_lock.lock();
+        let table = core::ptr::addr_of_mut!(self.futex_waiters);
+        // SAFETY: `tcbs` and `futex_waiters` are disjoint fields serialized by the one guard.
+        f(
+            kernel_mut(&mut self.tcbs),
+            kernel_mut(unsafe { &mut *table }),
+        )
+    }
+
+    /// FUTEX-FOUND1 — raw field pointers for the split twin: `(task_state_lock, tcbs, table)`.
+    pub(crate) unsafe fn task_futex_split_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> TaskFutexSplitPtrs {
+        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s private `state_ptr()`
+        // (BLR1); `addr_of!`/`addr_of_mut!` derive raw field pointers without creating references
+        // to the whole KernelState.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).task_state_lock),
+                core::ptr::addr_of_mut!((*state).tcbs),
+                core::ptr::addr_of_mut!((*state).futex_waiters),
+            )
+        }
     }
 
     /// U9-SPAWN1 SP-1 — the BROAD twin of `SharedKernel::with_task_enqueue_policy_split_mut`:

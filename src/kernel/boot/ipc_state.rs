@@ -4489,18 +4489,11 @@ impl KernelState {
         })
     }
 
-    /// Count tasks blocked with WaitReason::Futex on `addr` for test assertions.
+    /// Count LIVE futex waiters that named `addr` (any key), for test assertions.
     #[cfg(test)]
-    pub(crate) fn futex_waiter_count(&self, addr: usize) -> usize {
-        use crate::kernel::task::{TaskStatus, WaitReason};
-        use crate::kernel::vm::VirtAddr;
-        self.with_tcbs(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .filter(|tcb| {
-                    tcb.status == TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))
-                })
-                .count()
+    pub(crate) fn futex_waiter_count(&mut self, addr: usize) -> usize {
+        self.with_task_futex_mut(|tcbs, table| {
+            super::futex::live_futex_waiters_at_va_locked(tcbs.as_slice(), table, addr as u64)
         })
     }
 

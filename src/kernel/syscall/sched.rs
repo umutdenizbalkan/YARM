@@ -12,59 +12,62 @@ use super::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError};
 use crate::kernel::boot::KernelState;
 use crate::kernel::trapframe::TrapFrame;
 
-/// U9-FUTEX-WAIT-FINAL §2 — THE futex-word range policy, in one place.
+/// THE futex-word range policy — one owner, `boot::futex::futex_word_range_check`.
 ///
-/// `KernelState::validate_current_user_futex_word` and the off-lock split read used to carry
-/// byte-identical copies of these two checks, and the copy is what let the split route erase them:
-/// it answered `Option<bool>`, so `addr == 0` and a kernel-range address came back as the same
-/// `None` and both were handed to the broad dispatcher to re-raise. There is one policy now, with
-/// two ACQUISITION adapters around it — the broad validator and the split reader — because only
-/// the reachability of the address space differs between them, never the rule.
-///
-/// The two answers are the canonical ones, unchanged: a null word is `WrongObject`, and an
-/// address whose last byte overflows `usize` or lands at or above `KERNEL_SPACE_BASE` is
-/// `UserMemoryFault`. Nothing about the caller's `expected`/`observed` comparison is decided here
-/// — that is the ABI's, and it happens after the address is known readable.
+/// Both acquisition adapters (the broad owner and the split route) call this; only the
+/// reachability of the address space differs between them, never the rule. A null word is
+/// `WrongObject`; an address whose last byte overflows `usize` or lands at or above
+/// `KERNEL_SPACE_BASE` is `UserMemoryFault`.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 pub(crate) fn futex_word_range_check(addr: usize) -> Result<(), crate::kernel::boot::KernelError> {
-    use crate::kernel::boot::KernelError;
-    if addr == 0 {
-        return Err(KernelError::WrongObject);
-    }
-    let end = addr.checked_add(core::mem::size_of::<u32>() - 1);
-    if end.is_none_or(|end| end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE) {
-        return Err(KernelError::UserMemoryFault);
-    }
-    Ok(())
+    crate::kernel::boot::futex::futex_word_range_check(addr)
 }
 
-/// U9-FUTEX-WAIT-FINAL §2 — what a validated `FutexWait` decided, as a fact rather than a `bool`.
+/// FUTEX-FOUND1 — the decoded futex syscall arguments (NR 9 and NR 10 share the layout).
 ///
-/// `futex_wait_current` answers `Result<bool, KernelError>` and its `bool` means "did this call
-/// park the caller". Naming the two outcomes keeps the split route from having to re-derive which
-/// one it is holding, and keeps the ABI honest at the one place that decides it: YARM's NR 9 takes
-/// the comparison from the CALLER — `expected` and `observed` are both arguments — so the kernel
-/// validates that the futex word is readable and then compares the two values it was given. It
-/// reads no word to make this decision, and there is no bitset, timeout, requeue or PI here.
-/// BL3b — the futex word's value, from the 4 bytes the kernel itself read out of the caller's
-/// address space. Native byte order, because the word is the caller's own `u32` in memory.
-pub(crate) fn futex_word_value(bytes: &[u8]) -> u32 {
-    u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+/// | slot | NR 9 `FutexWait` | NR 10 `FutexWake` |
+/// |---|---|---|
+/// | 0 | word address (4-byte aligned) | word address (4-byte aligned) |
+/// | 1 | `expected` (`u32`) | `count` (`u32`) |
+/// | 2 | flags: `FUTEX_FLAG_SHARED` (bit 0); every other bit reserved, must be 0 | same |
+///
+/// The kernel compares `expected` with the word IT reads (there is no caller-supplied `observed`).
+/// Later operations — an absolute deadline, a requeue target, a wake mask — are each selected by a
+/// flag bit that is reserved today, and that bit is what gives meaning to slots 3 and up; so a
+/// reserved bit set now is `InvalidArgs`, and slots 3.. are not consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FutexArgs {
+    pub(crate) addr: usize,
+    pub(crate) value: u32,
+    pub(crate) kind: crate::kernel::boot::futex::FutexKind,
 }
 
-/// BL3b — THE check of check-and-park: does the caller's `expected` still describe the word?
+/// THE decode, shared by the broad handlers and the split routes: the value as `u32`, the flags,
+/// then the word's alignment. Its errors are all `InvalidArgs` and are answered before the address
+/// range or the caller is consulted.
+pub(crate) fn decode_futex_args(frame: &TrapFrame) -> Result<FutexArgs, SyscallError> {
+    let addr = frame.arg(SYSCALL_ARG_CAP);
+    let value = u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
+    let kind = crate::kernel::boot::futex::FutexKind::from_flags(frame.arg(SYSCALL_ARG_LEN))
+        .ok_or(SyscallError::InvalidArgs)?;
+    if !crate::kernel::boot::futex::futex_word_aligned(addr) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    Ok(FutexArgs { addr, value, kind })
+}
+
+/// THE check of compare-and-park: does the word the KERNEL read still hold `expected`?
 ///
-/// `observed` is the value the caller read; an `expected` that differs from it means the
-/// caller already knows the word moved, and the wait returns at once, exactly as it always has.
-/// But a caller's read is not the word: it can be stale by the time the kernel parks, which is
-/// the lost-wake window. So the decision also requires `expected` to equal the value the
-/// KERNEL read, and the park transaction repeats that read after the waiter is registered.
-pub(crate) fn futex_should_park(expected: u32, observed: u32, word: u32) -> bool {
-    expected == observed && word == expected
+/// The caller's own read is not consulted — it can be stale by the time the kernel parks. The
+/// park transaction applies this to its decision read and again to the read it makes after the
+/// waiter is registered, both from the same mapping the key was resolved from.
+pub(crate) fn futex_should_park(expected: u32, word: u32) -> bool {
+    word == expected
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FutexWaitDecision {
-    /// `expected` matches both the caller's `observed` and the word the kernel read: park.
+    /// The word the kernel read equals `expected`: park.
     Park,
     /// The futex word already moved out from under the caller. Nothing is published and the
     /// syscall answers `0` — the canonical `set_ok(usize::from(false), 0, 0)`.
@@ -78,7 +81,8 @@ pub(crate) enum FutexWaitDecision {
 /// from success, because the clear ran unconditionally afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FutexParkOutcome {
-    /// PARKED. The exact incarnation is `Blocked(Futex(addr))` and current on no CPU, and the
+    /// PARKED. The exact incarnation is `Blocked(Futex(token))` with its keyed record published,
+    /// and current on no CPU, and the
     /// priority it was removed at is carried so a compensation can put it back exactly. The drain
     /// owes the queue advance.
     Parked {
@@ -111,6 +115,9 @@ pub(crate) enum FutexParkOutcome {
     /// The TCB is not the entering incarnation, or is gone, or is not `Running`. **Nothing was
     /// written** — this is the canonical `TaskMissing` population.
     IncarnationMoved,
+    /// FUTEX-FOUND1 — every waiter slot holds a live record. **Nothing was written** and the
+    /// caller is still current. Unreachable in production (one slot per possible task).
+    CapacityExhausted,
 }
 
 pub(super) fn handle_yield(
@@ -126,27 +133,16 @@ pub(super) fn handle_futex_wait(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    // U9-FUTEX-WAIT-FINAL §4 — the LIVE half of the closure claim, measured where arrivals are.
-    //
-    // Same placement and same reasoning as `IPC_SEND_BROAD_ENTRY`: `dispatch`'s
-    // `Syscall::FutexWait` arm is this function's only caller, and it is reached only when the
-    // split route declined. One line here therefore counts exactly what the claim is about — an
-    // NR 9 trap that reached the terminal broad acquisition — where a marker on the split side
-    // could only report doors it chose to walk past.
-    //
-    // The source half is the recognized body's return type: it can no longer answer `NotHandled`,
-    // so a count from that side would be a statement about code that cannot run.
+    // U9-FUTEX-WAIT-FINAL §4 — the LIVE half of the closure claim, measured where arrivals are:
+    // `dispatch`'s `Syscall::FutexWait` arm is this function's only caller, and it is reached only
+    // when the split route declined.
     crate::yarm_log!(
         "FUTEX_WAIT_BROAD_ENTRY nr=9 tid={} result=broad_entry",
         kernel.current_tid().unwrap_or(u64::MAX)
     );
-    let addr = frame.arg(SYSCALL_ARG_CAP);
-    let expected =
-        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let observed =
-        u32::try_from(frame.arg(SYSCALL_ARG_LEN)).map_err(|_| SyscallError::InvalidArgs)?;
+    let args = decode_futex_args(frame)?;
     let blocked = kernel
-        .futex_wait_current(addr, expected, observed)
+        .futex_wait_current(args.addr, args.value, args.kind)
         .map_err(SyscallError::from)?;
     frame.set_ok(usize::from(blocked), 0, 0);
     Ok(())
@@ -156,11 +152,9 @@ pub(super) fn handle_futex_wake(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    let addr = frame.arg(SYSCALL_ARG_CAP);
-    let max_wake =
-        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
+    let args = decode_futex_args(frame)?;
     let woke = kernel
-        .futex_wake(addr, max_wake)
+        .futex_wake(args.addr, args.value, args.kind)
         .map_err(SyscallError::from)?;
     frame.set_ok(woke as usize, 0, 0);
     Ok(())

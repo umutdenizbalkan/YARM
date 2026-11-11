@@ -113,6 +113,11 @@ impl KernelState {
             );
             Ok::<_, KernelError>(())
         })?;
+        // FUTEX-FOUND1: the status write just ended any futex wait this task was in; retire its
+        // record now rather than leaving it to be reclaimed as stale.
+        self.with_task_futex_mut(|_tcbs, table| {
+            super::futex::retire_futex_waiters_for_task_locked(table, tid)
+        });
         // Stage 173 (CAP-CNODE): default-off on-exit cap-revoke markers. Diagnostic
         // only — the reply-cap sweep + waiter cleanup below is UNCHANGED.
         let cap_cnode = crate::kernel::boot::cap_cnode_enabled();
@@ -285,14 +290,14 @@ impl KernelState {
         self.report_task_exit_to_supervisor(tid, code, token)?;
         self.report_task_exit_to_pm(tid, code)?;
         if let Some(robust) = robust {
-            // Use futex_wake_on_exit: the addresses come from the task's own
-            // robust list and are trusted user-space, but current_tid() may be
-            // a different task (e.g. supervisor) when exit is externally driven.
+            // FUTEX-FOUND1: each robust word is woken in the EXITING task's own namespace — its
+            // address space's private key (and the shared key when an object backs the word) —
+            // never the namespace of whichever task drives the exit.
             let stride = core::mem::size_of::<usize>();
             let mut offset = 0usize;
             while offset < robust.len {
                 let addr = robust.head.saturating_add(offset.saturating_mul(stride));
-                let _ = self.futex_wake_on_exit(addr);
+                let _ = self.futex_wake_on_exit(tid, addr);
                 offset += 1;
             }
         }
@@ -386,6 +391,10 @@ impl KernelState {
             tcb.restart.token = None;
             Ok::<_, KernelError>(())
         })?;
+        // FUTEX-FOUND1: a dead task waits on nothing; retire any futex record naming it.
+        self.with_task_futex_mut(|_tcbs, table| {
+            super::futex::retire_futex_waiters_for_task_locked(table, tid)
+        });
         // Stage 199A2B1: authoritative-identity reply-record cleanup at task death.
         let dead_identity = crate::kernel::boot::ReceiverWaiterIdentity::new(
             crate::kernel::ipc::ThreadId(tid),

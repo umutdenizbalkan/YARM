@@ -159,15 +159,18 @@ pub fn futex_wait_hook(
     kernel: &mut KernelState,
     addr: usize,
     expected: u32,
-    observed: u32,
 ) -> Result<bool, PosixErrno> {
     kernel
-        .futex_wait_current(addr, expected, observed)
+        .futex_wait_current(
+            addr,
+            expected,
+            crate::kernel::boot::futex::FutexKind::Private,
+        )
         .map_err(PosixErrno::from)
 }
 
 #[cfg(not(test))]
-pub fn futex_wait_hook(_addr: usize, _expected: u32, _observed: u32) -> Result<bool, PosixErrno> {
+pub fn futex_wait_hook(_addr: usize, _expected: u32) -> Result<bool, PosixErrno> {
     Err(PosixErrno::NoSys)
 }
 
@@ -177,7 +180,13 @@ pub fn futex_wake_hook(
     addr: usize,
     max_wake: u32,
 ) -> Result<u32, PosixErrno> {
-    kernel.futex_wake(addr, max_wake).map_err(PosixErrno::from)
+    kernel
+        .futex_wake(
+            addr,
+            max_wake,
+            crate::kernel::boot::futex::FutexKind::Private,
+        )
+        .map_err(PosixErrno::from)
 }
 
 #[cfg(not(test))]
@@ -222,8 +231,9 @@ mod tests {
             get_tls_hook(&kernel, tid).expect("get tls"),
             Some(0xFEED_CAFE)
         );
-        assert!(!futex_wait_hook(&mut kernel, 0x1000, 3, 4).expect("mismatch"));
-        assert!(futex_wait_hook(&mut kernel, 0x1000, 3, 3).expect("wait"));
+        // The kernel compares `expected` with the word it reads (3).
+        assert!(!futex_wait_hook(&mut kernel, 0x1000, 4).expect("mismatch"));
+        assert!(futex_wait_hook(&mut kernel, 0x1000, 3).expect("wait"));
         assert_eq!(futex_wake_hook(&mut kernel, 0x1000, 1).expect("wake"), 1);
         assert_eq!(
             futex_wake_hook(&mut kernel, 0x1000, 1).expect("wake empty"),

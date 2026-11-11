@@ -70,7 +70,11 @@ pub extern "C" fn yarm_user_entry() -> ! {
     loop {
         let observed = INIT_IDLE_FUTEX.load(core::sync::atomic::Ordering::Relaxed);
         yarm_user_rt::user_log!("INIT_IDLE_PARK_FUTEX_BEGIN");
-        match yarm::user_rt::syscall::futex_wait(INIT_IDLE_FUTEX.as_ptr(), observed, observed) {
+        match yarm::user_rt::syscall::futex_wait(
+            INIT_IDLE_FUTEX.as_ptr(),
+            observed,
+            yarm::user_rt::syscall::FutexScope::Private,
+        ) {
             Ok(blocked) => {
                 yarm_user_rt::user_log!("INIT_IDLE_PARK_FUTEX_RETURN ret={}", usize::from(blocked));
                 if blocked {

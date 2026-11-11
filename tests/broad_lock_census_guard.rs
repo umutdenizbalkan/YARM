@@ -1339,6 +1339,9 @@ const FIELD_AUTHORITY: &[(&str, Authority)] = &[
     ("task_classes", Authority::Lock("task_state_lock")),
     ("tls_restore_pending", Authority::Lock("task_state_lock")),
     ("robust_futex", Authority::Lock("task_state_lock")),
+    // FUTEX-FOUND1: the keyed waiter table is task-domain state — a record is live only while its
+    // TCB holds the same token, so the two are only ever read and written together.
+    ("futex_waiters", Authority::Lock("task_state_lock")),
     ("memory", Authority::Lock("memory_state_lock")),
     ("drivers", Authority::Lock("driver_state_lock")),
     ("telemetry", Authority::Lock("telemetry_state_lock")),

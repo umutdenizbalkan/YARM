@@ -1600,18 +1600,45 @@ pub mod syscall {
         Ok(())
     }
 
+    /// FUTEX-FOUND1 — which namespace a futex word is keyed in (NR 9 / NR 10, argument slot 2).
+    ///
+    /// `Private`: the caller's own address space and the word's VA — for threads of one process.
+    /// `Shared`: the backing MemoryObject and the word's offset in it — for processes that map one
+    /// object (at any VA). A shared wait on memory no allocator-owned object backs is refused
+    /// with `WrongObject`; it is never silently made private.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FutexScope {
+        Private,
+        Shared,
+    }
+
+    impl FutexScope {
+        /// The flag word this scope encodes (`FUTEX_FLAG_SHARED` = bit 0).
+        pub const fn flags(self) -> usize {
+            match self {
+                Self::Private => 0,
+                Self::Shared => 1,
+            }
+        }
+    }
+
+    /// Wait while the 32-bit word at `addr` (4-byte aligned) holds `expected` (NR 9).
+    ///
+    /// The KERNEL reads the word and compares it with `expected`; `Ok(false)` means it already
+    /// differed and nothing parked, `Ok(true)` that the caller parked and was woken. Spurious
+    /// returns are possible only as wakes of the same key, so callers re-check their condition.
     #[inline]
     pub fn futex_wait(
         addr: *const u32,
         expected: u32,
-        observed: u32,
+        scope: FutexScope,
     ) -> core::result::Result<bool, SyscallError> {
         // SAFETY: Uses architecture syscall ABI to enter kernel. The kernel validates
         // that `addr` names a readable current-user futex word before blocking.
         let ret = unsafe {
             crate::arch::raw_syscall(
                 SYSCALL_FUTEX_WAIT_NR,
-                [addr as usize, expected as usize, observed as usize, 0, 0, 0],
+                [addr as usize, expected as usize, scope.flags(), 0, 0, 0],
             )
         };
         #[cfg(target_arch = "x86_64")]
@@ -1625,18 +1652,20 @@ pub mod syscall {
         Ok(ret.ret0 != 0)
     }
 
-    /// Wake up to `max_wake` waiters blocked on the futex word at `addr` (NR 10).
-    /// Returns the number of waiters actually woken. On AArch64 (Stage 195C) this flows
-    /// through the split-dispatch seam (`try_split_futex_wake_into_frame`); the count is
-    /// in x0 (`ret0`), byte-identical to the legacy global-lock return.
+    /// Wake up to `count` waiters of the futex word at `addr` in `scope`, oldest first (NR 10).
+    /// Returns the number actually woken. The count is in `ret0` on every architecture.
     #[inline]
-    pub fn futex_wake(addr: *const u32, max_wake: u32) -> core::result::Result<u32, SyscallError> {
+    pub fn futex_wake(
+        addr: *const u32,
+        count: u32,
+        scope: FutexScope,
+    ) -> core::result::Result<u32, SyscallError> {
         // SAFETY: Uses architecture syscall ABI. The kernel validates that `addr` names a
-        // readable current-user futex word before scanning waiters.
+        // readable current-user futex word before claiming waiters.
         let ret = unsafe {
             crate::arch::raw_syscall(
                 SYSCALL_FUTEX_WAKE_NR,
-                [addr as usize, max_wake as usize, 0, 0, 0, 0],
+                [addr as usize, count as usize, scope.flags(), 0, 0, 0],
             )
         };
         #[cfg(target_arch = "x86_64")]

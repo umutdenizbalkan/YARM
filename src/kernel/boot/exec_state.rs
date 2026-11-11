@@ -6,7 +6,7 @@ use crate::arch::hal::Hal;
 use crate::kernel::capabilities::CapRights;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::scheduler::CpuId;
-use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext, WaitReason};
+use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext};
 use crate::kernel::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -971,23 +971,28 @@ impl KernelState {
         &mut self,
         addr: usize,
         expected: u32,
-        observed: u32,
+        kind: super::futex::FutexKind,
     ) -> Result<bool, KernelError> {
-        // BL3b: compare against the word THIS owner read, not only the caller's copy of it.
-        // The broad acquisition is held from the read to the park, so no waker can interleave.
-        let word = self.validate_current_user_futex_word(addr)?;
-        if !crate::kernel::syscall::sched::futex_should_park(expected, observed, word) {
+        // FUTEX-FOUND1: the key and the word in one vm-then-memory acquisition, compared with
+        // `expected`, then the keyed registration. The broad acquisition is held from the read to
+        // the park, so no waker can interleave.
+        let (tid, asid, key, word) = self.resolve_current_futex_word(addr, kind)?;
+        if !crate::kernel::syscall::sched::futex_should_park(expected, word) {
             return Ok(false);
         }
-        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
-            Ok::<_, KernelError>(())
+        self.with_task_futex_mut(|tcbs, table| {
+            super::futex::register_futex_waiter_locked(
+                tcbs.as_mut_slice(),
+                table,
+                tid,
+                asid,
+                key,
+                addr as u64,
+            )
+        })
+        .map_err(|refusal| match refusal {
+            super::futex::FutexRegisterRefusal::IncarnationMoved => KernelError::TaskMissing,
+            super::futex::FutexRegisterRefusal::Full => KernelError::TaskTableFull,
         })?;
         let _ = self.block_current_cpu();
         // Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): the caller is now
@@ -1151,67 +1156,109 @@ impl KernelState {
         Ok(true)
     }
 
-    pub fn futex_wake(&mut self, addr: usize, max_wake: u32) -> Result<u32, KernelError> {
-        self.validate_current_user_futex_word(addr)?;
-        self.futex_wake_inner(addr, max_wake)
+    pub fn futex_wake(
+        &mut self,
+        addr: usize,
+        count: u32,
+        kind: super::futex::FutexKind,
+    ) -> Result<u32, KernelError> {
+        let (_tid, _asid, key, _word) = self.resolve_current_futex_word(addr, kind)?;
+        Ok(self.futex_wake_key(key, count))
     }
 
-    /// Wake futex waiters without `copy_from_user` address validation.
+    /// The robust-futex cleanup wake, in the EXITING task's own namespace.
     ///
-    /// Used by the robust-futex cleanup path in `exit_task`: the exiting task
-    /// registered the robust list addresses itself, so they are trusted user-space
-    /// addresses.  Using `futex_wake` directly from `exit_task` would use the
-    /// *current* task's ASID for validation (which may be the supervisor, not the
-    /// exiting task), causing the wake to fail silently.
-    pub(crate) fn futex_wake_on_exit(&mut self, addr: usize) -> Result<u32, KernelError> {
-        if addr == 0 {
+    /// `exit_task` may be driven by another task, so the key is resolved in `exiting_tid`'s
+    /// address space — never the current CPU's. The word is woken under its private key and, when
+    /// an allocator-owned object backs it, its shared key too (a robust lock may live in either).
+    /// Every waiter is woken. Returns how many.
+    pub(crate) fn futex_wake_on_exit(
+        &mut self,
+        exiting_tid: u64,
+        addr: usize,
+    ) -> Result<u32, KernelError> {
+        super::futex::futex_word_range_check(addr)?;
+        if !super::futex::futex_word_aligned(addr) {
             return Err(KernelError::WrongObject);
         }
-        let end = addr.checked_add(core::mem::size_of::<u32>() - 1);
-        if end.is_none_or(|end| end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE) {
-            return Err(KernelError::UserMemoryFault);
-        }
-        self.futex_wake_inner(addr, u32::MAX)
-    }
-
-    fn futex_wake_inner(&mut self, addr: usize, max_wake: u32) -> Result<u32, KernelError> {
-        if max_wake == 0 {
-            return Ok(0);
-        }
-        let (wake_tids, wake_count) = self.with_tcbs_mut(|tcbs| {
-            let mut wake_tids = [None; super::MAX_TASKS];
-            let mut wake_count = 0usize;
-            for tcb in tcbs.iter_mut().flatten() {
-                if wake_count >= max_wake as usize {
-                    break;
-                }
-                if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {
-                    continue;
-                }
-                tcb.status = TaskStatus::Runnable;
-                wake_tids[wake_count] = Some(tcb.tid.0);
-                wake_count += 1;
-            }
-            (wake_tids, wake_count)
+        let asid = self
+            .task_asid(exiting_tid)
+            .ok_or(KernelError::UserMemoryFault)?;
+        // The KEY only: cleanup needs the identity, not the word's value.
+        let private = self.with_vm_then_memory_mut(|spaces, memory| {
+            super::futex::resolve_futex_key_locked(
+                spaces,
+                memory,
+                asid,
+                addr,
+                super::futex::FutexKind::Private,
+            )
         });
-        for wake_tid in wake_tids.iter().take(wake_count).flatten() {
-            self.enqueue_task(*wake_tid)?;
+        let shared = self.with_vm_then_memory_mut(|spaces, memory| {
+            super::futex::resolve_futex_key_locked(
+                spaces,
+                memory,
+                asid,
+                addr,
+                super::futex::FutexKind::Shared,
+            )
+        });
+        let (private_key, _) = private?;
+        let mut woke = self.futex_wake_key(private_key, u32::MAX);
+        if let Ok((shared_key, _)) = shared {
+            woke = woke.saturating_add(self.futex_wake_key(shared_key, u32::MAX));
         }
-        Ok(wake_count as u32)
+        Ok(woke)
     }
 
-    /// Validates the futex word and returns its current value (BL3b: the value is the check).
-    fn validate_current_user_futex_word(&self, addr: usize) -> Result<u32, KernelError> {
-        // U9-FUTEX-WAIT-FINAL §2 — the BROAD acquisition adapter over the one range policy. The
-        // two checks it used to spell out inline are `futex_word_range_check`, which the off-lock
-        // reader also calls, so the split route can no longer answer a different error (or no
-        // error at all) for the same address.
-        crate::kernel::syscall::sched::futex_word_range_check(addr)?;
+    /// THE broad wake of one key: claim up to `count` live waiters, oldest first, then give each
+    /// exactly one enqueue. The claim makes each `Runnable` and retires its record in one rank-2
+    /// critical section; the enqueue follows at rank 1.
+    ///
+    /// An enqueue can only be refused for a waiter that is still some CPU's `current` — a split
+    /// park caught between its registration and its compare-and-clear. That waiter's own park
+    /// transaction owns its placement (it reads back, finds itself `Runnable` and recovers), so the
+    /// refusal is reported and not propagated: no later waiter is left `Runnable` and unqueued.
+    fn futex_wake_key(&mut self, key: super::futex::FutexKey, count: u32) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        let mut claimed = [0u64; super::futex::MAX_FUTEX_WAITERS];
+        let n = self.with_task_futex_mut(|tcbs, table| {
+            super::futex::claim_futex_waiters_locked(
+                tcbs.as_mut_slice(),
+                table,
+                key,
+                count as usize,
+                &mut claimed,
+            )
+        });
+        for &tid in &claimed[..n] {
+            if let Err(err) = self.enqueue_task(tid) {
+                crate::yarm_log!(
+                    "FUTEX_WAKE_ENQUEUE_DEFERRED tid={} err={:?} owner=park_transaction",
+                    tid,
+                    err
+                );
+            }
+        }
+        n as u32
+    }
+
+    /// FUTEX-FOUND1 — the BROAD key resolution for the current task: range, caller, address
+    /// space, then the key and the word in one vm-then-memory acquisition.
+    fn resolve_current_futex_word(
+        &mut self,
+        addr: usize,
+        kind: super::futex::FutexKind,
+    ) -> Result<(u64, crate::kernel::vm::Asid, super::futex::FutexKey, u32), KernelError> {
+        super::futex::futex_word_range_check(addr)?;
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-        let bytes =
-            self.copy_from_user(asid, VirtAddr(addr as u64), core::mem::size_of::<u32>())?;
-        Ok(crate::kernel::syscall::sched::futex_word_value(&bytes))
+        let (key, word) = self.with_vm_then_memory_mut(|spaces, memory| {
+            super::futex::resolve_futex_word_locked(spaces, memory, asid, addr, kind)
+        })?;
+        Ok((tid, asid, key, word))
     }
 
     /// Stage 190B (CONTROLLED AP WORKLOAD): build a small, deterministic SEQUENCE of
@@ -2268,7 +2315,10 @@ impl KernelState {
         let (client_tid, client_asid) = client;
         self.copy_to_user(server_asid, VirtAddr(0x2000_0000), &w::k_image())?;
         self.copy_to_user(client_asid, VirtAddr(0x2000_0000), &w::w_image())?;
-        let mbx = self.alloc_user_data_frame()?;
+        // FUTEX-FOUND1: the mailbox is ONE allocator-owned MemoryObject mapped by both processes,
+        // so their futex words resolve to one SHARED key; each mapping takes its reference.
+        let (_mbx_object, mbx_phys) = self.alloc_anonymous_object_without_cap()?;
+        let mbx = mbx_phys.0;
         for asid in [server_asid, client_asid] {
             self.map_user_page_in_asid_raw(
                 asid,
@@ -2278,6 +2328,7 @@ impl KernelState {
                     flags: PageFlags::USER_RW,
                 },
             )?;
+            self.note_mapping_inserted(PhysAddr(mbx));
         }
         self.copy_to_user(client_asid, VirtAddr(ow::MBX_VA), &[0u8; 0x100])?;
         ow::arm(client_tid, client_asid.0, server_tid, server_asid.0);

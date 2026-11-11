@@ -97,6 +97,8 @@ fn build_task(
             flags: PageFlags::USER_RW,
         },
     )?;
+    // FUTEX-FOUND1: the mailbox object's reference for this mapping.
+    kernel.note_mapping_inserted(PhysAddr(mbx));
     kernel.copy_to_user(asid, VirtAddr(CODE_VA), code)?;
     kernel.register_task_with_class(tid, crate::kernel::task::TaskClass::App)?;
     kernel.with_tcbs_mut(|tcbs| {
@@ -117,7 +119,10 @@ fn build_task(
 /// Provision both tasks from the bootstrap window. W is enqueued on CPU 0 here; K is placed by the
 /// AP once it is admitted ([`ap_admitted`]).
 pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
-    let mbx = kernel.alloc_user_data_frame()?;
+    // FUTEX-FOUND1: ONE allocator-owned MemoryObject, so W's and K's words resolve to one
+    // SHARED futex key.
+    let (_mbx_object, mbx_phys) = kernel.alloc_anonymous_object_without_cap()?;
+    let mbx = mbx_phys.0;
     // SAFETY (all `&raw const` below): taking the address of an extern static reads nothing.
     let w_code = image(&raw const yarm_ovt_w_start, &raw const yarm_ovt_w_end);
     let k_code = image(&raw const yarm_ovt_k_start, &raw const yarm_ovt_k_end);

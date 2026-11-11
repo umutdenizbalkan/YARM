@@ -550,6 +550,7 @@ p_b_one:
     LOG m_p_wake
     mov x0, x25
     mov x1, #1
+    mov x2, #0              /* FUTEX-FOUND1: flags = private */
     SVC NR_FUTEX_WAKE
     mov x23, x0
     lsl x24, x20, #3
@@ -1054,7 +1055,7 @@ w_sleep:
     b.eq 3f
     mov x0, x28
     sub x1, x20, #1
-    mov x2, x10
+    mov x2, #0              /* FUTEX-FOUND1: flags = private */
     SVC NR_FUTEX_WAIT
     b 2b
 3:  str x20, [x27, #M_S_ACK]

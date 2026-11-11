@@ -16,7 +16,9 @@ pub struct ThreadGroupId(pub u64);
 pub enum WaitReason {
     EndpointReceive(CapId),
     EndpointSend(CapId),
-    Futex(VirtAddr),
+    /// FUTEX-FOUND1: the exact wait cycle — the waiter table's record slot and its incarnation.
+    /// The record holds the key; the TCB and the record agree iff the tokens are equal.
+    Futex(crate::kernel::boot::futex::FutexWaitToken),
     Join(ThreadId),
     Poll,
 }
@@ -1182,7 +1184,12 @@ mod tests {
         let _ = TaskStatus::Runnable;
         let _ = TaskStatus::Running;
         let _ = TaskStatus::Blocked(WaitReason::Poll);
-        let _ = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x1000)));
+        let _ = TaskStatus::Blocked(WaitReason::Futex(
+            crate::kernel::boot::futex::FutexWaitToken {
+                slot: 0,
+                generation: 0,
+            },
+        ));
         let _ = TaskStatus::Blocked(WaitReason::Join(ThreadId(7)));
         let _ = TaskStatus::Faulted;
         let _ = TaskStatus::Exited(0);

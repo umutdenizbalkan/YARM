@@ -44,15 +44,16 @@
     .endm
 
     /*
-     * FutexWait(addr, expected = observed = x20). BL6e: since BL3b the kernel parks only while the
-     * 32-bit word still holds `expected`, so the program stores it first. Nothing else writes these
-     * words; only K's FutexWake (on WAIT) ends a park.
+     * FutexWait(addr, expected = x20, flags = SHARED). The kernel parks only while the 32-bit word
+     * still holds `expected`, so the program stores it first. W and K are two processes mapping one
+     * mailbox MemoryObject, so the futex is SHARED (FUTEX-FOUND1). Nothing else writes these words;
+     * only K's FutexWake (on WAIT) ends a park.
      */
     .macro OWAIT addr
     OLI32 x0, \addr
     str w20, [x0]
     mov x1, x20
-    mov x2, x20
+    mov x2, #1
     mov x8, #NR_FUTEX_WAIT
     svc #0
     .endm
@@ -161,6 +162,7 @@ yarm_ovt_k_start:
 2:
     OLI32 x0, WAIT_VA
     mov x1, #1
+    mov x2, #1              /* FUTEX-FOUND1: flags = shared (W is another process) */
     mov x8, #NR_FUTEX_WAKE
     svc #0
     cmp x0, #1

@@ -1058,6 +1058,10 @@ impl AddressSpace {
 #[derive(Debug)]
 struct AsEntry {
     asid: Asid,
+    /// FUTEX-FOUND1: this address space's INCARNATION. `asid` is a recycled `u16`; the generation
+    /// is stamped once at creation from a counter that only advances, so no two address spaces —
+    /// live, destroyed or replacing one another under a reused ASID — ever share it.
+    generation: u64,
     aspace: AddressSpace,
 }
 
@@ -1096,6 +1100,8 @@ pub struct RetiredAsid {
 #[derive(Debug)]
 pub struct AddressSpaceManager {
     next_asid: u16,
+    /// FUTEX-FOUND1: the next address-space incarnation. Starts at 1 and only advances.
+    next_generation: u64,
     entries: [Option<AsEntry>; MAX_ADDRESS_SPACES],
     retired: [Option<RetiredAsid>; MAX_ADDRESS_SPACES],
 }
@@ -1104,6 +1110,7 @@ impl Default for AddressSpaceManager {
     fn default() -> Self {
         Self {
             next_asid: 1,
+            next_generation: 1,
             entries: [const { None }; MAX_ADDRESS_SPACES],
             retired: [None; MAX_ADDRESS_SPACES],
         }
@@ -1154,11 +1161,23 @@ impl AddressSpaceManager {
             .ok_or(VmError::Full)?;
         let asid = self.allocate_asid()?;
         arch_register_asid(asid)?;
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
         self.entries[slot_idx] = Some(AsEntry {
             asid,
+            generation,
             aspace: AddressSpace::new_user_with_asid(asid),
         });
         Ok(asid)
+    }
+
+    /// FUTEX-FOUND1: the incarnation of the live address space `asid`, if it is live.
+    pub fn generation(&self, asid: Asid) -> Option<u64> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.asid == asid)
+            .map(|entry| entry.generation)
     }
 
     pub fn get(&self, asid: Asid) -> Option<&AddressSpace> {

@@ -6872,13 +6872,28 @@ fn futex_wait_blocks_current_and_wake_requeues_waiter() {
         .write_user_memory(0, 0x1000, &3u32.to_ne_bytes())
         .expect("init futex word task0");
 
-    assert!(state.futex_wait_current(0x1000, 3, 3).expect("wait"));
-    assert_eq!(
-        state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x1000))))
+    assert!(
+        state
+            .futex_wait_current(0x1000, 3, crate::kernel::boot::futex::FutexKind::Private)
+            .expect("wait")
     );
-    assert_eq!(state.futex_wake(0x1000, 1).expect("wake"), 1);
+    assert!(state.futex_parked_at_va_for_test(1, 0x1000));
+    // FUTEX-FOUND1 re-derivation. This woke task 1 from the idle task — a DIFFERENT address
+    // space that happens to map the same object at the same VA — with a private wake, and
+    // expected it to succeed: an address-only match, which is the cross-process wake defect. A
+    // private key is the address space's own, so that wake finds nobody and task 1 stays parked.
+    assert_eq!(
+        state
+            .futex_wake(0x1000, 1, crate::kernel::boot::futex::FutexKind::Private)
+            .expect("wake"),
+        0,
+        "a private wake from another address space must not reach this waiter"
+    );
+    assert!(state.futex_parked_at_va_for_test(1, 0x1000));
+    // A wake in task 1's OWN namespace reaches it, and requeues it.
+    assert_eq!(state.futex_wake_on_exit(1, 0x1000).expect("wake"), 1);
     assert_eq!(state.task_status(1), Some(TaskStatus::Runnable));
+    assert_eq!(state.futex_waiter_count(0x1000), 0);
 }
 
 #[test]
@@ -6898,13 +6913,21 @@ fn futex_wait_and_wake_reject_kernel_space_address() {
     let kernel_addr = crate::kernel::vm::KERNEL_SPACE_BASE as usize;
     assert_eq!(
         state
-            .futex_wait_current(kernel_addr, 1, 1)
+            .futex_wait_current(
+                kernel_addr,
+                1,
+                crate::kernel::boot::futex::FutexKind::Private
+            )
             .expect_err("kernel va rejected"),
         KernelError::UserMemoryFault
     );
     assert_eq!(
         state
-            .futex_wake(kernel_addr, 1)
+            .futex_wake(
+                kernel_addr,
+                1,
+                crate::kernel::boot::futex::FutexKind::Private
+            )
             .expect_err("kernel va rejected"),
         KernelError::UserMemoryFault
     );
@@ -17921,12 +17944,15 @@ fn robust_futex_wake_works_when_exit_is_externally_driven() {
     let (asid_waiter, _) = state.create_user_address_space().expect("asid_waiter");
     let (asid_victim, _) = state.create_user_address_space().expect("asid_victim");
 
-    // Spawn the waiter task (TID 220) in asid_waiter.
+    // FUTEX-FOUND1 re-derivation: the waiter (TID 220) is a sibling THREAD of the victim, in the
+    // victim's address space. A robust cleanup wakes the exiting task's OWN namespace; a waiter in
+    // another address space at the same VA must not be woken (`futex_found1::f14`).
+    let _ = asid_waiter;
     state
         .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 220,
             entry: 0x4000,
-            asid: Some(asid_waiter),
+            asid: Some(asid_victim),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
             ..Default::default()
@@ -17973,13 +17999,7 @@ fn robust_futex_wake_works_when_exit_is_externally_driven() {
         .expect("robust");
 
     // Block waiter on the futex address by directly setting TCB status.
-    state
-        .with_tcbs_mut(|tcbs| {
-            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 220).unwrap();
-            tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(futex_addr as u64)));
-            Ok::<_, KernelError>(())
-        })
-        .expect("block waiter");
+    state.inject_futex_waiter_for_test(220, futex_addr);
 
     assert_eq!(
         state.futex_waiter_count(futex_addr),
@@ -18125,13 +18145,7 @@ fn repeated_futex_wait_exit_wake_cycles_no_stale_waiters() {
 
         // Directly block the task on the futex without going through the
         // futex_wait syscall path (which would copy_from_user in freestanding).
-        state
-            .with_tcbs_mut(|tcbs| {
-                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
-                tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(futex_addr as u64)));
-                Ok::<_, KernelError>(())
-            })
-            .expect("block");
+        state.inject_futex_waiter_for_test(tid, futex_addr);
         assert_eq!(state.futex_waiter_count(futex_addr), 1, "one waiter i={i}");
 
         // exit_task transitions status to Exited, so futex_waiter_count drops
@@ -18556,7 +18570,12 @@ fn ipc_timeout_does_not_fire_for_futex_blocked_task() {
     state
         .with_tcbs_mut(|tcbs| {
             let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 284).unwrap();
-            tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x5000)));
+            tcb.status = TaskStatus::Blocked(WaitReason::Futex(
+                crate::kernel::boot::futex::FutexWaitToken {
+                    slot: 0,
+                    generation: 0,
+                },
+            ));
             tcb.ipc_timeout_deadline = Some(7);
             Ok::<_, KernelError>(())
         })
@@ -63016,15 +63035,21 @@ mod stage191b_futex_wake_retire {
                 && OWNER_SRC.contains("enqueue_balanced(ThreadId(plan.tid), plan.priority)"),
             "the split wake must use the task + scheduler split-mut seams and the same enqueue"
         );
-        // Same wake predicate + Runnable transition as legacy futex_wake_inner.
+        // FUTEX-FOUND1 re-derivation. This pinned two copies of an address-only predicate
+        // (`Blocked(Futex(VirtAddr(addr)))`) and checked that they resembled each other; that
+        // predicate is the cross-process wake. Both owners now reach THE keyed claim, so the
+        // woken set, count and order are the same by construction, not by resemblance.
         assert!(
-            EXEC_SRC.contains(
-                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"
-            ) && RUNTIME_SRC.contains(
-                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"
-            ),
-            "the split wake scan predicate must match legacy futex_wake_inner"
+            EXEC_SRC.contains("super::futex::claim_futex_waiters_locked(")
+                && RUNTIME_SRC.contains("crate::kernel::boot::futex::claim_futex_waiters_locked("),
+            "the broad and split wakes must both reach the one keyed claim"
         );
+        for (name, src) in [("exec_state.rs", EXEC_SRC), ("runtime.rs", RUNTIME_SRC)] {
+            assert!(
+                !src.contains("WaitReason::Futex(VirtAddr("),
+                "{name}: the address-only futex predicate may not come back"
+            );
+        }
     }
 
     fn total_runnable(k: &crate::kernel::boot::KernelState) -> usize {
@@ -63050,21 +63075,18 @@ mod stage191b_futex_wake_retire {
         state
             .register_task_with_class(10200, TaskClass::App)
             .expect("reg200");
-        state.with_tcbs_mut(|tcbs| {
-            for tcb in tcbs.iter_mut().flatten() {
-                if waiters.contains(&tcb.tid.0) {
-                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
-                } else if tcb.tid.0 == 10200 {
-                    tcb.status = TaskStatus::Blocked(WaitReason::Poll);
-                }
-            }
-        });
+        // FUTEX-FOUND1: waiters are published through the keyed table, in arrival order.
+        for &t in &waiters {
+            state.inject_futex_waiter_for_test(t, addr);
+        }
+        state.set_task_status_for_test(10200, TaskStatus::Blocked(WaitReason::Poll));
+        let key = state.private_futex_key_for_test(waiters[0], addr);
         let before_current = state.current_tid();
         let shared = SharedKernel::new(state);
         let before_runnable = shared.with(|k| total_runnable(k));
 
         // Wake at most 2 → exactly 2 of the 4 waiters.
-        let woke = shared.futex_wake_split_mut(CpuId(0), addr, 2);
+        let woke = shared.futex_wake_key_split(CpuId(0), key, 2);
         assert_eq!(woke, 2, "wake count must be min(waiters, max_wake)");
         shared.with(|k| {
             let runnable = waiters
@@ -63073,12 +63095,7 @@ mod stage191b_futex_wake_retire {
                 .count();
             let still_blocked = waiters
                 .iter()
-                .filter(|&&t| {
-                    k.task_status(t)
-                        == Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
-                            addr as u64,
-                        ))))
-                })
+                .filter(|&&t| k.futex_parked_at_va_for_test(t, addr as u64))
                 .count();
             assert_eq!(runnable, 2, "exactly 2 waiters woken");
             assert_eq!(still_blocked, 2, "the other 2 waiters remain blocked");
@@ -63102,10 +63119,10 @@ mod stage191b_futex_wake_retire {
         });
 
         // Wake the remaining 2.
-        let woke2 = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        let woke2 = shared.futex_wake_key_split(CpuId(0), key, u32::MAX);
         assert_eq!(woke2, 2, "remaining 2 waiters woken");
         // A third wake finds none — no double-wake, no orphaned waiter.
-        let woke3 = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        let woke3 = shared.futex_wake_key_split(CpuId(0), key, u32::MAX);
         assert_eq!(woke3, 0, "no double-wake once all waiters are runnable");
         shared.with(|k| {
             for &t in &waiters {
@@ -63122,22 +63139,12 @@ mod stage191b_futex_wake_retire {
         state
             .register_task_with_class(10301, TaskClass::App)
             .expect("reg");
-        state.with_tcbs_mut(|tcbs| {
-            for tcb in tcbs.iter_mut().flatten() {
-                if tcb.tid.0 == 10301 {
-                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
-                }
-            }
-        });
+        state.inject_futex_waiter_for_test(10301, addr);
+        let key = state.private_futex_key_for_test(10301, addr);
         let shared = SharedKernel::new(state);
-        assert_eq!(shared.futex_wake_split_mut(CpuId(0), addr, 0), 0);
+        assert_eq!(shared.futex_wake_key_split(CpuId(0), key, 0), 0);
         shared.with(|k| {
-            assert_eq!(
-                k.task_status(10301),
-                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
-                    addr as u64
-                ))))
-            );
+            assert!(k.futex_parked_at_va_for_test(10301, addr as u64));
         });
     }
 }
@@ -63421,7 +63428,7 @@ mod stage191c_split_user_copy_seam {
 mod stage191d_futex_wait_block_publish {
     use super::*;
     use crate::kernel::scheduler::{CpuId, MAX_CPUS};
-    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::kernel::task::{TaskClass, TaskStatus};
     use crate::kernel::vm::VirtAddr;
     use crate::runtime::SharedKernel;
 
@@ -63497,10 +63504,14 @@ mod stage191d_futex_wait_block_publish {
         // There is ONE policy now, so what is pinned is that both owners CALL it and that the
         // split adapter answers the canonical error rather than erasing it.
         const SCHED_SRC: &str = include_str!("../syscall/sched.rs");
+        const FUTEX_SRC: &str = include_str!("futex.rs");
+        // FUTEX-FOUND1: the policy lives with the key resolver; the syscall layer delegates.
         assert!(
             SCHED_SRC.contains("pub(crate) fn futex_word_range_check(")
-                && SCHED_SRC.contains("return Err(KernelError::WrongObject);")
-                && SCHED_SRC.contains(">= crate::kernel::vm::KERNEL_SPACE_BASE"),
+                && SCHED_SRC.contains("crate::kernel::boot::futex::futex_word_range_check(addr)")
+                && FUTEX_SRC.contains("pub fn futex_word_range_check(")
+                && FUTEX_SRC.contains("return Err(KernelError::WrongObject);")
+                && FUTEX_SRC.contains(">= crate::kernel::vm::KERNEL_SPACE_BASE"),
             "the one futex-word range policy must exist and keep the canonical answers"
         );
         for (name, src) in [("runtime.rs", RUNTIME_SRC), ("exec_state.rs", EXEC_SRC)] {
@@ -63520,22 +63531,50 @@ mod stage191d_futex_wait_block_publish {
                 && RUNTIME_SRC.contains("FutexWaitDecision::Proceed"),
             "the split adapter must answer typed canonical errors and a typed decision"
         );
-        // BL3b re-derivation. This pinned the decision as the caller's two arguments compared
-        // with each other, which is exactly the lost wake: a waker that stores and wakes between
-        // the caller's read and its `FutexWait` finds no waiter, and the kernel then parks the
-        // caller on a word that has already moved. The decision is now the ONE predicate both
-        // owners call — the word the kernel reads must still hold `expected` — and the caller's
-        // own fast path (`expected != observed` returns at once) is kept inside it.
+        // BL3b re-derivation, and FUTEX-FOUND1 after it. The decision is the ONE predicate both
+        // owners call — the word the kernel reads must still hold `expected` — and the ABI no
+        // longer carries a caller-supplied `observed` at all, so there is no second value for a
+        // caller copy to compare.
         assert!(
-            SCHED_SRC.contains(
-                "pub(crate) fn futex_should_park(expected: u32, observed: u32, word: u32) -> bool {"
-            ) && SCHED_SRC.contains("expected == observed && word == expected"),
+            SCHED_SRC
+                .contains("pub(crate) fn futex_should_park(expected: u32, word: u32) -> bool {")
+                && SCHED_SRC.contains("    word == expected\n"),
             "the one park predicate compares the word the kernel read against `expected`"
         );
         for (name, src) in [("runtime.rs", RUNTIME_SRC), ("exec_state.rs", EXEC_SRC)] {
             assert!(
-                src.contains("futex_should_park(expected, observed, word)"),
+                src.contains("futex_should_park(expected, word)"),
                 "{name}: the decision must be the shared predicate over the word read"
+            );
+        }
+        for (name, src, owner) in [
+            (
+                "runtime.rs",
+                RUNTIME_SRC,
+                "pub fn futex_wait_decide_split_read(",
+            ),
+            (
+                "runtime.rs",
+                RUNTIME_SRC,
+                "pub(crate) fn futex_wait_park_exact_split(",
+            ),
+            ("exec_state.rs", EXEC_SRC, "pub fn futex_wait_current("),
+        ] {
+            let body = src
+                .split(owner)
+                .nth(1)
+                .and_then(|b| {
+                    b.split(
+                        "
+    }
+",
+                    )
+                    .next()
+                })
+                .expect("the futex owner");
+            assert!(
+                !body.contains("observed"),
+                "{name}: no futex owner may consult a caller-supplied `observed`"
             );
             assert!(
                 !src.contains("if expected == observed {"),
@@ -63579,28 +63618,35 @@ mod stage191d_futex_wait_block_publish {
             !RUNTIME_SRC.contains("fn futex_wait_publish_block_split_mut("),
             "the bool-answering publish seam is gone, not renamed"
         );
-        // Same Blocked(Futex(addr)) transition as legacy futex_wait_current. The exact
-        // transaction BINDS it once and uses the same value three times — to register, to
-        // recognize its own registration when undoing it, and to read back whether a waker moved
-        // the TCB off it — so the three can never come to disagree about what "parked" means.
-        assert!(
-            EXEC_SRC.contains(
-                "tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));"
-            ),
-            "legacy futex_wait_current must keep its transition"
-        );
-        assert!(
-            RUNTIME_SRC.contains(
-                "let blocked = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));"
-            ) && park.contains("tcb.status = blocked;"),
-            "the park transaction's transition must match legacy futex_wait_current"
-        );
-        // BL3b: the undo is now ONE closure shared by the clear refusal and the value re-check,
-        // so the count is unchanged — the undo and the read-back.
+        // FUTEX-FOUND1 re-derivation. The transition is no longer written by either route: both
+        // reach THE registration owner, which writes the keyed record and
+        // `Blocked(Futex(token))` in one task-lock critical section. The exact transaction then
+        // uses that one TOKEN twice — to undo its own registration, and to read back whether a
+        // waker claimed it — so the three can never disagree about what "parked" means.
+        const FUTEX_SRC: &str = include_str!("futex.rs");
         assert_eq!(
-            park.matches("status == blocked").count(),
-            2,
-            "and the SAME value must be what the undo and the read-back compare against"
+            FUTEX_SRC
+                .matches("tcb.status = TaskStatus::Blocked(WaitReason::Futex(token));")
+                .count(),
+            1,
+            "one registration owner writes the futex-blocked status"
+        );
+        assert!(
+            EXEC_SRC.contains("super::futex::register_futex_waiter_locked(")
+                && park.contains(
+                    "fx::register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)"
+                ),
+            "both routes must register through the one owner"
+        );
+        assert!(
+            park.contains("fx::undo_futex_registration_locked(tcbs, table, tid, token)")
+                && park.contains("fx::futex_still_parked_locked(tcbs, tid, token)"),
+            "and the SAME token must be what the undo and the read-back compare against"
+        );
+        assert_eq!(
+            park.matches("undo_futex_registration_locked(").count(),
+            1,
+            "BL3b: ONE undo closure, shared by the clear refusal and the value re-check"
         );
         // The transaction must NOT dispatch (the switch is the drain's).
         let start = RUNTIME_SRC
@@ -63650,18 +63696,22 @@ mod stage191d_futex_wait_block_publish {
         // a compare-and-clear rather than an unconditional one.
         let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
         assert_eq!(
-            shared.futex_wait_park_exact_split(CpuId(0), tid, asid, addr, PARK_WORD),
+            shared.futex_wait_park_exact_split(
+                CpuId(0),
+                tid,
+                asid,
+                addr,
+                PARK_WORD,
+                crate::kernel::boot::futex::FutexKind::Private
+            ),
             crate::kernel::syscall::sched::FutexParkOutcome::Parked {
                 priority: crate::kernel::scheduler::TaskPriority::Normal
             },
             "publish must park the exact incarnation"
         );
         shared.with(|k| {
-            assert_eq!(
-                k.task_status(tid),
-                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
-                    addr as u64
-                )))),
+            assert!(
+                k.futex_parked_at_va_for_test(tid, addr as u64),
                 "caller must be published Blocked(Futex)"
             );
             // Removed from the current slot on every CPU (current on no CPU).
@@ -63675,7 +63725,15 @@ mod stage191d_futex_wait_block_publish {
         });
 
         // 191B FutexWake split observes and wakes the split-published waiter exactly once.
-        let woke = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        let woke = shared
+            .futex_wake_split_mut(
+                CpuId(0),
+                asid,
+                addr,
+                u32::MAX,
+                crate::kernel::boot::futex::FutexKind::Private,
+            )
+            .expect("wake");
         assert_eq!(
             woke, 1,
             "FutexWake split must wake the published waiter (no lost wake)"
@@ -63688,7 +63746,15 @@ mod stage191d_futex_wait_block_publish {
             );
         });
         // A second wake finds nothing — no duplicate wake / no orphaned re-enqueue.
-        let woke2 = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        let woke2 = shared
+            .futex_wake_split_mut(
+                CpuId(0),
+                asid,
+                addr,
+                u32::MAX,
+                crate::kernel::boot::futex::FutexKind::Private,
+            )
+            .expect("wake");
         assert_eq!(woke2, 0, "no duplicate wake once the waiter is Runnable");
     }
 
@@ -63706,18 +63772,20 @@ mod stage191d_futex_wait_block_publish {
 
         let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
         assert!(matches!(
-            shared.futex_wait_park_exact_split(CpuId(0), tid, asid, addr, PARK_WORD),
+            shared.futex_wait_park_exact_split(
+                CpuId(0),
+                tid,
+                asid,
+                addr,
+                PARK_WORD,
+                crate::kernel::boot::futex::FutexKind::Private
+            ),
             crate::kernel::syscall::sched::FutexParkOutcome::Parked { .. }
         ));
         shared.with(|k| {
             assert_ne!(k.current_tid_on_cpu(CpuId(0)), Some(tid));
             assert_ne!(k.current_tid_on_cpu(CpuId(1)), Some(tid));
-            assert_eq!(
-                k.task_status(tid),
-                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
-                    addr as u64
-                ))))
-            );
+            assert!(k.futex_parked_at_va_for_test(tid, addr as u64));
         });
     }
 
@@ -63878,11 +63946,19 @@ mod stage191d_futex_wait_block_publish {
             (usize::MAX, Err(KernelError::UserMemoryFault)),
         ] {
             // The BROAD owner's answer, through the real handler path.
-            let broad = kernel.with(|s| s.futex_wait_current(addr, 7, 7).map(|_| ()));
+            let broad = kernel.with(|s| {
+                s.futex_wait_current(addr, 7, crate::kernel::boot::futex::FutexKind::Private)
+                    .map(|_| ())
+            });
             assert_eq!(broad, expected, "canonical answer for addr={addr:#x}");
             // The SPLIT adapter's answer, for the same address.
             let split = kernel
-                .futex_wait_decide_split_read(tid, addr, 7, 7)
+                .futex_wait_decide_split_read(
+                    tid,
+                    addr,
+                    7,
+                    crate::kernel::boot::futex::FutexKind::Private,
+                )
                 .map(|_| ());
             assert_eq!(
                 split, expected,
@@ -63917,18 +63993,27 @@ mod stage191d_futex_wait_block_publish {
             .with(|s| s.write_user_memory(tid, addr, &10u32.to_ne_bytes()))
             .expect("waker store");
         assert_eq!(
-            kernel.with(|s| s.futex_wake_on_exit(addr)),
+            kernel.with(|s| s.futex_wake_on_exit(tid, addr)),
             Ok(0),
             "no waiter to wake yet"
         );
         // (3) The waiter's FutexWait, with the value it read.
         assert_eq!(
-            kernel.futex_wait_decide_split_read(tid, addr, observed, observed),
+            kernel.futex_wait_decide_split_read(
+                tid,
+                addr,
+                observed,
+                crate::kernel::boot::futex::FutexKind::Private
+            ),
             Ok(FutexWaitDecision::Proceed),
             "the split decision must see the word moved, not trust the caller's copy"
         );
         assert_eq!(
-            kernel.with(|s| s.futex_wait_current(addr, observed, observed)),
+            kernel.with(|s| s.futex_wait_current(
+                addr,
+                observed,
+                crate::kernel::boot::futex::FutexKind::Private
+            )),
             Ok(false),
             "the broad owner must not park on a word that no longer holds the expected value"
         );
@@ -63937,14 +64022,15 @@ mod stage191d_futex_wait_block_publish {
             Some(TaskStatus::Running),
             "nothing parked: the caller is still running, so no wake can be owed to it"
         );
-        // And the caller's own fast path is unchanged: an `expected` that differs from what it
-        // observed still returns at once, whatever the word holds.
+        // FUTEX-FOUND1: there is no caller fast path any more — no `observed` argument — so the
+        // only comparison is the kernel's own read of the word.
         assert_eq!(
-            kernel.futex_wait_decide_split_read(tid, addr, 10, 9),
-            Ok(FutexWaitDecision::Proceed)
-        );
-        assert_eq!(
-            kernel.futex_wait_decide_split_read(tid, addr, 10, 10),
+            kernel.futex_wait_decide_split_read(
+                tid,
+                addr,
+                10,
+                crate::kernel::boot::futex::FutexKind::Private
+            ),
             Ok(FutexWaitDecision::Park),
             "a word that still holds `expected` parks"
         );
@@ -63969,15 +64055,27 @@ mod stage191d_futex_wait_block_publish {
 
         // (1) The decision, on a word that still holds `expected`.
         assert_eq!(
-            kernel.futex_wait_decide_split_read(tid, addr, PARK_WORD, PARK_WORD),
+            kernel.futex_wait_decide_split_read(
+                tid,
+                addr,
+                PARK_WORD,
+                crate::kernel::boot::futex::FutexKind::Private
+            ),
             Ok(FutexWaitDecision::Park)
         );
         // (2) The waker, in the window: store, then scan — nobody is registered yet.
         set_futex_word(&kernel, tid, addr, PARK_WORD + 1);
-        assert_eq!(kernel.with(|s| s.futex_wake_on_exit(addr)), Ok(0));
+        assert_eq!(kernel.with(|s| s.futex_wake_on_exit(tid, addr)), Ok(0));
         // (3) The park transaction.
         assert_eq!(
-            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr, PARK_WORD),
+            kernel.futex_wait_park_exact_split(
+                cpu,
+                tid,
+                asid,
+                addr,
+                PARK_WORD,
+                crate::kernel::boot::futex::FutexKind::Private
+            ),
             FutexParkOutcome::ValueChanged,
             "the word moved before the waiter was visible: parking now loses the wake"
         );
@@ -63992,7 +64090,7 @@ mod stage191d_futex_wait_block_publish {
             "and the caller keeps its placement, answering through its own frame"
         );
         assert_eq!(
-            kernel.with(|s| s.futex_wake_on_exit(addr)),
+            kernel.with(|s| s.futex_wake_on_exit(tid, addr)),
             Ok(0),
             "no stale registration is left for a later wake to find"
         );
@@ -64000,7 +64098,14 @@ mod stage191d_futex_wait_block_publish {
         // A word that has become unreadable by the re-read is refused the same exact way, with
         // the canonical error the readability probe answers.
         let unmapped = 0x7000usize;
-        let outcome = kernel.futex_wait_park_exact_split(cpu, tid, asid, unmapped, PARK_WORD);
+        let outcome = kernel.futex_wait_park_exact_split(
+            cpu,
+            tid,
+            asid,
+            unmapped,
+            PARK_WORD,
+            crate::kernel::boot::futex::FutexKind::Private,
+        );
         assert!(
             matches!(outcome, FutexParkOutcome::WordUnreadable(_)),
             "an unreadable word never parks: {outcome:?}"
@@ -64046,59 +64151,60 @@ mod stage191d_futex_wait_block_publish {
     #[test]
     fn u9fw_a_wake_during_publication_never_loses_the_caller() {
         use crate::kernel::syscall::sched::FutexParkOutcome;
-        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let kernel: &'static SharedKernel = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+            SharedKernel::new(Bootstrap::init().expect("init")),
+        ));
         let cpu = CpuId(0);
         let tid = 30003u64;
-        let asid = futex_caller(&kernel, tid, cpu);
+        let asid = futex_caller(kernel, tid, cpu);
         let addr = 0x5100usize;
-        set_futex_word(&kernel, tid, addr, PARK_WORD);
+        set_futex_word(kernel, tid, addr, PARK_WORD);
 
-        // Register, exactly as the park transaction's first step does.
-        kernel.with(|s| {
-            s.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
-                tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
-            });
-        });
-        // THE WAKER, through the production owner, while the caller is still `current`.
-        let woke = kernel.with(|s| s.futex_wake_on_exit(addr));
-        assert!(
-            woke.is_err() || woke == Ok(1),
-            "the production waker either wakes it or reports the enqueue refusal: {woke:?}"
+        // FUTEX-FOUND1: THE WAKER lands between the registration and the compare-and-clear, through
+        // the production owner, exactly where a concurrent CPU lands (the phase hook).
+        let k: &'static SharedKernel = kernel;
+        crate::kernel::boot::futex::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(
+            move || {
+                let woke = k.with(|s| s.futex_wake_on_exit(tid, addr));
+                assert_eq!(woke, Ok(1), "the waker finds the registration");
+            },
+        ));
+        let outcome = kernel.futex_wait_park_exact_split(
+            cpu,
+            tid,
+            asid,
+            addr,
+            PARK_WORD,
+            crate::kernel::boot::futex::FutexKind::Private,
         );
+        let FutexParkOutcome::WokenDuringPublication { recovered, .. } = outcome else {
+            panic!("a wake in the window is detected, never parked through: {outcome:?}");
+        };
+        assert!(recovered.may_resume_entering_frame(), "{recovered:?}");
         assert_eq!(
             kernel.with(|s| s.task_status(tid)),
-            Some(TaskStatus::Runnable),
-            "the waker moved it off the futex-waiter state, which is what the read-back detects"
+            Some(TaskStatus::Running),
+            "the caller is not lost: it runs again"
         );
-
-        // Now the park transaction runs its remaining steps over that state. Re-register first so
-        // the transaction starts where it really starts.
-        kernel.with(|s| {
-            s.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
-                tcb.status = TaskStatus::Running;
-            });
-        });
-        let outcome = kernel.futex_wait_park_exact_split(cpu, tid, asid, addr, PARK_WORD);
-        assert!(
-            matches!(outcome, FutexParkOutcome::Parked { .. }),
-            "with no waker in the window the transaction parks: {outcome:?}"
-        );
+        assert_eq!(kernel.with(|s| s.current_tid_on_cpu(cpu)), Some(tid));
         assert_eq!(
-            kernel.with(|s| s.current_tid_on_cpu(cpu)),
-            None,
-            "and the caller is removed from THIS CPU's current slot"
+            kernel.with(|s| s.futex_waiter_count(addr)),
+            0,
+            "and no record is left behind"
         );
-        assert_eq!(
-            kernel.with(|s| s.task_status(tid)),
-            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
-                addr as u64
-            )))),
-            "and is registered as a futex waiter, so a later wake finds it"
-        );
-        // NEVER lost: a wake after the park reaches it through the production owner.
-        assert_eq!(kernel.with(|s| s.futex_wake_on_exit(addr)), Ok(1));
+        // NEVER lost later either: a park after that, then a wake, reaches it.
+        assert!(matches!(
+            kernel.futex_wait_park_exact_split(
+                cpu,
+                tid,
+                asid,
+                addr,
+                PARK_WORD,
+                crate::kernel::boot::futex::FutexKind::Private
+            ),
+            FutexParkOutcome::Parked { .. }
+        ));
+        assert_eq!(kernel.with(|s| s.futex_wake_on_exit(tid, addr)), Ok(1));
         assert_eq!(
             kernel.with(|s| s.task_status(tid)),
             Some(TaskStatus::Runnable)
@@ -64124,6 +64230,7 @@ mod stage191d_futex_wait_block_publish {
             crate::kernel::vm::Asid(asid.0 + 13),
             addr,
             PARK_WORD,
+            crate::kernel::boot::futex::FutexKind::Private,
         );
         assert_eq!(
             outcome,
@@ -64165,7 +64272,14 @@ mod stage191d_futex_wait_block_publish {
             assert_eq!(s.current_tid_on_cpu(cpu), Some(other));
         });
 
-        let outcome = kernel.futex_wait_park_exact_split(cpu, caller, asid, addr, PARK_WORD);
+        let outcome = kernel.futex_wait_park_exact_split(
+            cpu,
+            caller,
+            asid,
+            addr,
+            PARK_WORD,
+            crate::kernel::boot::futex::FutexKind::Private,
+        );
         assert_eq!(outcome, FutexParkOutcome::VictimChanged);
         assert_eq!(
             kernel.with(|s| s.task_status(caller)),
@@ -64212,11 +64326,18 @@ mod stage191d_futex_wait_block_publish {
         );
 
         assert!(matches!(
-            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr, PARK_WORD),
+            kernel.futex_wait_park_exact_split(
+                cpu,
+                tid,
+                asid,
+                addr,
+                PARK_WORD,
+                crate::kernel::boot::futex::FutexKind::Private
+            ),
             FutexParkOutcome::Parked { .. }
         ));
         // The production wake owner finds it and makes it runnable + queued.
-        assert_eq!(kernel.with(|s| s.futex_wake_on_exit(addr)), Ok(1));
+        assert_eq!(kernel.with(|s| s.futex_wake_on_exit(tid, addr)), Ok(1));
         assert!(kernel.receiver_has_scheduler_membership_split_read(tid));
 
         // A later dispatch resumes it, from exactly what was committed.
@@ -64305,7 +64426,7 @@ mod stage191d_futex_wait_block_publish {
             .expect("the defer-unavailable settlement");
         let park = body
             // BL3b: the park transaction re-checks the word against the caller's `expected`.
-            .find("futex_wait_park_exact_split(cpu, tid, asid, addr, expected)")
+            .find("futex_wait_park_exact_split(cpu, tid, asid, addr, expected, args.kind)")
             .expect("the park transaction");
         assert!(
             already < unavailable && unavailable < park,
@@ -64385,14 +64506,18 @@ mod stage191d_futex_wait_block_publish {
 
         // And the park still happens, on the caller's own decision.
         assert!(matches!(
-            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr, PARK_WORD),
+            kernel.futex_wait_park_exact_split(
+                cpu,
+                tid,
+                asid,
+                addr,
+                PARK_WORD,
+                crate::kernel::boot::futex::FutexKind::Private
+            ),
             FutexParkOutcome::Parked { .. }
         ));
-        assert_eq!(
-            kernel.with(|s| s.task_status(tid)),
-            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
-                addr as u64
-            )))),
+        assert!(
+            kernel.with(|s| s.futex_parked_at_va_for_test(tid, addr as u64)),
             "the caller parked even though nothing could take the CPU"
         );
         assert_eq!(
@@ -64418,11 +64543,8 @@ mod stage191d_futex_wait_block_publish {
             None,
             "the parked caller is NOT put back as current by the idle landing"
         );
-        assert_eq!(
-            kernel.with(|s| s.task_status(tid)),
-            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
-                addr as u64
-            )))),
+        assert!(
+            kernel.with(|s| s.futex_parked_at_va_for_test(tid, addr as u64)),
             "and it is still parked, so a later wake is the only thing that can resume it"
         );
 
@@ -64468,8 +64590,9 @@ mod stage191d_futex_wait_block_publish {
         let census = handler
             .find("FUTEX_WAIT_BROAD_ENTRY")
             .expect("the census is inside the handler");
+        // FUTEX-FOUND1: the first argument read is THE shared decode.
         let first_read = handler
-            .find("frame.arg(SYSCALL_ARG_CAP)")
+            .find("decode_futex_args(frame)")
             .expect("the handler's first argument read");
         assert!(
             census < first_read,
@@ -64516,12 +64639,14 @@ mod stage191d_futex_wait_block_publish {
         const SERVICE: &str = include_str!(
             "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
         );
+        // FUTEX-FOUND1: the calls carry a scope now, so the bare forms are pinned by their prefix
+        // (any scope), and the bodies below are compared with whitespace removed.
         for bare in [
-            "futex_wait(handshake, hv, hv)",
-            "futex_wait(started, sv, sv)",
-            "futex_wake(handshake, 1)",
-            "futex_wake(started, 1)",
-            "let first_wake = yarm_user_rt::syscall::futex_wake(addr, 1)",
+            "futex_wait(handshake,",
+            "futex_wait(started,",
+            "futex_wake(handshake,",
+            "futex_wake(started,",
+            "let first_wake = yarm_user_rt::syscall::futex_wake(addr",
         ] {
             assert!(
                 !SERVICE.contains(bare),
@@ -64529,7 +64654,7 @@ mod stage191d_futex_wait_block_publish {
             );
         }
         // The one remaining single-shot wake is the bounded owner's own ask.
-        let ask = "let woke = yarm_user_rt::syscall::futex_wake(word, 1)";
+        let ask = "yarm_user_rt::syscall::futex_wake(word, 1, yarm_user_rt::syscall::FutexScope::Private)";
         assert_eq!(SERVICE.matches(ask).count(), 1, "only the owner asks bare");
         let owner = SERVICE
             .find("fn oracle_wake_once_parked(")
@@ -64545,17 +64670,23 @@ mod stage191d_futex_wait_block_publish {
             .nth(1)
             .and_then(|b| b.split("\n}\n").next())
             .expect("the publish half");
+        let publish: alloc::string::String = publish.split_whitespace().collect();
         let store = publish.find("word.store(ready").expect("store");
-        let wake = publish.find("futex_wake(word.as_ptr(), 1)").expect("wake");
+        let wake = publish
+            .find("futex_wake(word.as_ptr(),1,yarm_user_rt::syscall::FutexScope::Private")
+            .expect("wake");
         assert!(store < wake, "the word changes BEFORE the wake");
         let await_body = SERVICE
             .split("fn oracle_handshake_await(")
             .nth(1)
             .and_then(|b| b.split("\n}\n").next())
             .expect("the await half");
+        let await_body: alloc::string::String = await_body.split_whitespace().collect();
         assert!(
-            await_body.contains("if v == ready {")
-                && await_body.contains("futex_wait(word.as_ptr(), v, v)"),
+            await_body.contains("ifv==ready{")
+                && await_body.contains(
+                    "futex_wait(word.as_ptr(),v,yarm_user_rt::syscall::FutexScope::Private"
+                ),
             "the waiter parks only on the value it just saw unpublished"
         );
         // Five hand-offs (three FutexWake oracles, shared-region, direct-reply) on each side, and
@@ -64849,8 +64980,7 @@ mod stage191e_dispatch_next_candidate_seam {
 mod stage192a_queue_advancing_dispatch {
     use super::*;
     use crate::kernel::scheduler::{CpuId, MAX_CPUS};
-    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
-    use crate::kernel::vm::VirtAddr;
+    use crate::kernel::task::{TaskClass, TaskStatus};
     use crate::runtime::SharedKernel;
 
     const EXEC_SRC: &str = include_str!("exec_state.rs");
@@ -64959,13 +65089,7 @@ mod stage192a_queue_advancing_dispatch {
         // ordinarily dispatchable fixture must carry an incarnation — as production does.
         super::give_task_an_incarnation(&mut state, next);
         // Publish Blocked(Futex) + clear current (mirrors the in-lock futex block).
-        state.with_tcbs_mut(|tcbs| {
-            for tcb in tcbs.iter_mut().flatten() {
-                if tcb.tid.0 == blocked {
-                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
-                }
-            }
-        });
+        state.inject_futex_waiter_for_test(blocked, addr);
         let _ = state.block_current_cpu();
         let runnable_before = state.runnable_count_on_cpu(CpuId(0));
         let shared = SharedKernel::new(state);
@@ -65006,12 +65130,7 @@ mod stage192a_queue_advancing_dispatch {
                 assert_ne!(k.current_tid_on_cpu(CpuId(c as u8)), Some(next));
             }
             // The blocked task stays Blocked(Futex) (not re-enqueued / orphaned).
-            assert_eq!(
-                k.task_status(blocked),
-                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
-                    addr as u64
-                ))))
-            );
+            assert!(k.futex_parked_at_va_for_test(blocked, addr as u64));
         });
     }
 
@@ -65023,13 +65142,7 @@ mod stage192a_queue_advancing_dispatch {
         let addr = 0x8000usize;
         let mut state = Bootstrap::init().expect("init");
         make_current(&mut state, waiter, CpuId(0));
-        state.with_tcbs_mut(|tcbs| {
-            for tcb in tcbs.iter_mut().flatten() {
-                if tcb.tid.0 == waiter {
-                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
-                }
-            }
-        });
+        state.inject_futex_waiter_for_test(waiter, addr);
         let _ = state.block_current_cpu();
         let shared = SharedKernel::new(state);
         // No other runnable ⇒ dispatch idles (the init-park case).
@@ -65043,7 +65156,8 @@ mod stage192a_queue_advancing_dispatch {
             None
         );
         // FutexWake split wakes the waiter exactly once.
-        assert_eq!(shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX), 1);
+        let key = shared.with(|k| k.private_futex_key_for_test(waiter, addr));
+        assert_eq!(shared.futex_wake_key_split(CpuId(0), key, u32::MAX), 1);
         shared.with(|k| assert_eq!(k.task_status(waiter), Some(TaskStatus::Runnable)));
     }
 
@@ -76138,8 +76252,10 @@ mod stage195c_aarch64_futex_wake_live {
             "the oracle must use the handshake coordination and emit the ok proof marker"
         );
         // The child blocks through the LEGACY global-lock FutexWait (the waiter path under test).
+        // FUTEX-FOUND1: `expected` is the value the child observed, in its own (private) scope.
+        let flat: alloc::string::String = INIT_SRC.split_whitespace().collect();
         assert!(
-            INIT_SRC.contains("futex_wait(addr, observed, observed)"),
+            flat.contains("futex_wait(addr,observed,yarm_user_rt::syscall::FutexScope::Private"),
             "the oracle child must block through the legacy FutexWait path"
         );
     }
@@ -78599,8 +78715,11 @@ mod stage196e_riscv_futex_wait_retirement {
             "the oracle must emit INCOMING_USER_OK + USER_RETURN_OK + LIVE_ORACLE_DONE"
         );
         // The child wakes A through the already-retired SPLIT FutexWake (NR 10).
+        let flat: alloc::string::String = INIT_SRC.split_whitespace().collect();
         assert!(
-            INIT_SRC.contains("yarm_user_rt::syscall::futex_wake(word, 1)"),
+            flat.contains(
+                "yarm_user_rt::syscall::futex_wake(word,1,yarm_user_rt::syscall::FutexScope::Private)"
+            ),
             "the child must wake A through split FutexWake"
         );
         assert!(
@@ -79318,9 +79437,11 @@ mod stage197_first_cohort_seal {
         );
         // FutexWait publishes Blocked; Yield re-enqueues Runnable — now through the one yield
         // policy, whose broad adapter reaches the same preempt seam `yield_current` always used.
+        // FUTEX-FOUND1: through THE registration owner, which writes the keyed token.
         assert!(
-            EXEC_STATE_SRC
-                .contains("TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"),
+            EXEC_STATE_SRC.contains("super::futex::register_futex_waiter_locked(")
+                && include_str!("futex.rs")
+                    .contains("tcb.status = TaskStatus::Blocked(WaitReason::Futex(token));"),
             "FutexWait must publish Blocked(Futex)"
         );
         const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
@@ -122489,7 +122610,13 @@ mod stage199d_wa2a_ownership_boundary {
             // `destroy_notification_split` has already snapshotted AND cleared the waiter
             // slot, so the wake can fire at most once per destruction.
             ("src/kernel/boot/capability_lifecycle_state.rs", 1),
-            ("src/kernel/boot/exec_state.rs", 4),
+            // FUTEX-FOUND1: the five futex status writes — the broad
+            // registration and wake (exec_state.rs), and the split registration, its undo and the
+            // split wake (runtime.rs) — are now THREE, in the one keyed owner module both routes
+            // reach: `register_futex_waiter_locked`, `undo_futex_registration_locked` and
+            // `claim_futex_waiters_locked` (futex.rs). Nothing multiplied: the two copies of the
+            // registration and of the wake became one each. exec_state.rs 4 -> 2.
+            ("src/kernel/boot/exec_state.rs", 2),
             // U9-EXIT1 §2: a NEW file with 3 writes — the self-exit claim, its exact inverse, and
             // the joiner wake the exit owes.
             //
@@ -122505,6 +122632,8 @@ mod stage199d_wa2a_ownership_boundary {
             //   of exactly the same class as `wake_joiners_for` in thread_state.rs, whose rank-2
             //   half this is: one body, two owners, with the rank-1 enqueues left to the caller.
             ("src/kernel/boot/exit_claim.rs", 3),
+            // FUTEX-FOUND1: the keyed futex owners (see exec_state.rs above).
+            ("src/kernel/boot/futex.rs", 3),
             // U9-IRQ-UNKNOWN1 §2: 9 -> 8. `signal_notification` and
             // `wake_destroyed_notification_waiter` had a status writer each, applying the same
             // rule twice; both now reach one owner, `wake_notification_waiter_exact`, so the
@@ -122613,7 +122742,9 @@ mod stage199d_wa2a_ownership_boundary {
             // `&mut KernelState`; it applies the identical three-part proof.
             // IPC-SENDER-ID1: 13 -> 12. `drain_send_timeout_post_work`'s write moved into
             // `sender_waiter::claim_blocked_send_cycle_locked` (counted there).
-            ("src/runtime.rs", 12),
+            // FUTEX-FOUND1: 12 -> 9 — the split registration, its undo and the split wake moved
+            // into the keyed owners in futex.rs.
+            ("src/runtime.rs", 9),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -122645,7 +122776,8 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            41,
+            // FUTEX-FOUND1: 41 -> 39 — five futex writes became the three keyed owners.
+            39,
             "39 raw writes — U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex \
              registration, 38 -> 39, so a park transaction whose rank-1 compare-and-clear \
              refuses takes its own registration back instead of leaving a task parked that the \
@@ -123034,18 +123166,8 @@ mod stage199d_wa2b_wake_owner_census {
     /// barriered and with which typed transitions, so the two views cannot disagree.
     const CENSUS: &[(&str, &str, usize, Verdict)] = &[
         // ── exec_state.rs (7) ───────────────────────────────────────────────────────────────
-        (
-            "src/kernel/boot/exec_state.rs",
-            "futex_wait_current",
-            1,
-            Verdict::IntoBlocked,
-        ),
-        (
-            "src/kernel/boot/exec_state.rs",
-            "futex_wake_inner",
-            1,
-            Verdict::Cannot,
-        ),
+        // FUTEX-FOUND1: `futex_wait_current` and `futex_wake_inner` no longer write the status;
+        // they reach the keyed owners in futex.rs (rows below).
         (
             "src/kernel/boot/exec_state.rs",
             "build_ap_workload",
@@ -123314,7 +123436,6 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Can,
         ),
-        ("src/runtime.rs", "futex_wake_split_mut", 1, Verdict::Cannot),
         // U9-RX3: the BLOCK half of the split receive-block pair. It moves a task INTO
         // `Blocked(EndpointReceive)` in the same rank-2 acquisition that mints the fresh wait
         // generation and stores the blocked-recv writeback state, so it is never a transition
@@ -123377,15 +123498,36 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Can,
         ),
+        // FUTEX-FOUND1: `futex_wait_park_exact_split`'s registration and undo, and
+        // `futex_wake_split_mut`'s wake, moved into the keyed owners in futex.rs (rows below).
+        // ── futex.rs (3) ────────────────────────────────────────────────────────────────────
+        // THE registration: `Running -> Blocked(Futex(token))`, for the exact `{tid, asid}`
+        // incarnation, with its keyed record in the same task-lock critical section. Both routes
+        // reach it. It moves a task INTO a futex wait and can write nothing else.
         (
-            // U9-FUTEX-WAIT-FINAL §3 — two sites, and the second is the exact undo of the first:
-            // a registration this transaction cannot complete is taken back rather than left
-            // standing. Both are `IntoBlocked`'s cohort — they enter and leave the futex-waiter
-            // state and wake nobody.
-            "src/runtime.rs",
-            "futex_wait_park_exact_split",
-            2,
+            "src/kernel/boot/futex.rs",
+            "register_futex_waiter_locked",
+            1,
             Verdict::IntoBlocked,
+        ),
+        // Its exact UNDO (U9-FUTEX-WAIT-FINAL §3's, now keyed): `Blocked(Futex(token)) ->
+        // Running`, only for the TCB still holding this registration's own token. Same class as
+        // the registration it reverses — it enters and leaves the futex-waiter state and wakes
+        // nobody.
+        (
+            "src/kernel/boot/futex.rs",
+            "undo_futex_registration_locked",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        // THE wake claim: `Blocked(Futex(token)) -> Runnable`, for a TCB holding exactly the
+        // token of a record on the woken key. It can never act on a `Blocked(EndpointReceive)`
+        // task (the proof is in `every_cannot_row_pins_its_guard_and_its_caller_closure`).
+        (
+            "src/kernel/boot/futex.rs",
+            "claim_futex_waiters_locked",
+            1,
+            Verdict::Cannot,
         ),
     ];
 
@@ -123589,22 +123731,6 @@ mod stage199d_wa2b_wake_owner_census {
     const FINGERPRINTS: &[(&str, &str, &str, &str, &str, &str)] = &[
         (
             "src/kernel/boot/exec_state.rs",
-            "futex_wait_current",
-            "tcb.status",
-            "TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))",
-            ".ok_or(KernelError::TaskMissing)?;",
-            "Ok::<_, KernelError>(())",
-        ),
-        (
-            "src/kernel/boot/exec_state.rs",
-            "futex_wake_inner",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            "}",
-            "wake_tids[wake_count] = Some(tcb.tid.0);",
-        ),
-        (
-            "src/kernel/boot/exec_state.rs",
             "build_ap_workload",
             "tcb.status",
             "TaskStatus::Runnable",
@@ -123647,6 +123773,34 @@ mod stage199d_wa2b_wake_owner_census {
             "TaskStatus::Runnable",
             "}",
             "if n < out.len() {",
+        ),
+        // FUTEX-FOUND1: the keyed owners. The registration writes the token it just minted,
+        // after resolving the exact incarnation; the undo writes only after finding the TCB on
+        // exactly that token; the claim writes only for a record's own token, and records the
+        // claimed TID next.
+        (
+            "src/kernel/boot/futex.rs",
+            "register_futex_waiter_locked",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::Futex(token))",
+            "if let Some(tcb) = tcbs[tcb_idx].as_mut() {",
+            "}",
+        ),
+        (
+            "src/kernel/boot/futex.rs",
+            "undo_futex_registration_locked",
+            "tcb.status",
+            "TaskStatus::Running",
+            "};",
+            "let slot = usize::from(token.slot);",
+        ),
+        (
+            "src/kernel/boot/futex.rs",
+            "claim_futex_waiters_locked",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "Some(tcb) => {",
+            "out[n] = rec.tid;",
         ),
         (
             "src/kernel/boot/ipc_state.rs",
@@ -123864,14 +124018,6 @@ mod stage199d_wa2b_wake_owner_census {
         ),
         (
             "src/runtime.rs",
-            "futex_wake_split_mut",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            "}",
-            "woken[n] = (tcb.tid.0, tcb.cpu_affinity);",
-        ),
-        (
-            "src/runtime.rs",
             "sr_wake_receiver_split",
             "tcb.status",
             "TaskStatus::Runnable",
@@ -123914,25 +124060,6 @@ mod stage199d_wa2b_wake_owner_census {
             "TaskStatus::Runnable",
             ");",
             "tcb.ipc_timeout_deadline = None;",
-        ),
-        (
-            // The REGISTRATION: exact incarnation, from `Running` only.
-            "src/runtime.rs",
-            "futex_wait_park_exact_split",
-            "tcb.status",
-            "blocked",
-            "{",
-            "true",
-        ),
-        (
-            // Its exact UNDO, taken only when the rank-1 compare-and-clear refuses and only for a
-            // TCB still holding this transaction's own registration.
-            "src/runtime.rs",
-            "futex_wait_park_exact_split",
-            "tcb.status",
-            "TaskStatus::Running",
-            "Some(tcb) if tcb.status == blocked => {",
-            "true",
         ),
     ];
 
@@ -124018,8 +124145,10 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            37,
-            "36 raw writes (U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, \
+            35,
+            "FUTEX-FOUND1: 37 -> 35 — the five futex writes (two broad, three split) became the \
+             three keyed owners in futex.rs, one registration, its undo and one wake claim. \
+             36 raw writes (U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, \
              36 -> 37; U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
              write, 33 -> 32, when the fork moved onto the spawn reservation lifecycle): U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
@@ -124105,8 +124234,9 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            47,
-            "U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex registration, 46 -> 47, \
+            45,
+            "FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
+             U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex registration, 46 -> 47, \
              so a park transaction whose rank-1 compare-and-clear refuses takes its own \
              registration back rather than leaving a task parked that the scheduler believes is \
              elsewhere; U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43; U9-REAP1 §2 moved \
@@ -124132,8 +124262,9 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            47,
-            "U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, 46 -> 47 — the \
+            45,
+            "FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
+             U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, 46 -> 47 — the \
              same shape U9-REAP1 §2 and U9-RESIDUAL1 §3 produced, a transition that gained a \
              named way back rather than multiplying. U9-RESIDUAL1 §3 moved `yield_current`'s \
              transition-barriered write into the ONE yield policy and added its exact inverse, \
@@ -124487,9 +124618,11 @@ mod stage199d_wa2b_wake_owner_census {
         // U9-FUTEX-WAIT-FINAL §3: 46 -> 47. The added site is the futex registration's exact
         // undo, and it lands in the same `IntoBlocked` class as the registration it reverses —
         // it enters and leaves the futex-waiter state and wakes nobody.
+        // FUTEX-FOUND1: 47 -> 45 — CANNOT 19 -> 18 (the two wake copies are one claim) and
+        // INTO_BLOCKED 10 -> 9 (the two registrations are one; the undo stays).
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            47,
+            45,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -124552,7 +124685,11 @@ mod stage199d_wa2b_wake_owner_census {
             // U9-FUTEX-WAIT-FINAL §3: INTO_BLOCKED 9 -> 10. The futex registration's exact UNDO
             // joins the registration it reverses, in the same class and for the same reason —
             // it enters and leaves the futex-waiter state and wakes nobody.
-            (15, 19, 10, 2, 1)
+            //
+            // FUTEX-FOUND1: CANNOT 19 -> 18 and INTO_BLOCKED 10 -> 9. The broad and split wake
+            // copies (both CANNOT) are one keyed claim, and the broad and split registrations
+            // (both INTO_BLOCKED) are one keyed registration; the undo is unchanged in class.
+            (15, 18, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -124593,12 +124730,16 @@ mod stage199d_wa2b_wake_owner_census {
     fn every_cannot_row_pins_its_guard_and_its_caller_closure() {
         // (file source, fn, the guard text, the closure fact that no caller can bypass it)
         const PROOFS: &[(&str, &str, &str, &str)] = &[
+            // FUTEX-FOUND1: the broad and split wake rows are one keyed claim. Its guard is the
+            // exact token match; the closure fact is that the TID it acts on comes only from a
+            // record on the woken key, never from a parameter, and that a token is written only by
+            // the registration of that same record (`table.token(slot)`), so the TCB it moves is
+            // in exactly the futex wait that record describes.
             (
-                "exec_state.rs",
-                "futex_wake_inner",
-                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {",
-                // value-level filter over every TCB: no parameter selects a victim
-                "for tcb in tcbs.iter_mut().flatten() {",
+                "futex.rs",
+                "claim_futex_waiters_locked",
+                "t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))",
+                "let token = table.token(slot);",
             ),
             (
                 "exec_state.rs",
@@ -124624,12 +124765,6 @@ mod stage199d_wa2b_wake_owner_census {
                 ".position(Option::is_none)",
             ),
             // U9-FORK1 §4 RETIRED this row: the write it guarded no longer exists.
-            (
-                "runtime.rs",
-                "futex_wake_split_mut",
-                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {",
-                "for tcb in tcbs.iter_mut().flatten() {",
-            ),
             // U7 (199E): the blocking-send timeout wake. Its local precondition refuses any
             // status that is not `Blocked(EndpointSend(_))`, BEFORE any mutation; the caller
             // closure is the deferred-work drain loop, whose items can only have been published
@@ -124715,6 +124850,7 @@ mod stage199d_wa2b_wake_owner_census {
                 "exit_claim.rs" => EXIT_CLAIM,
                 "runtime.rs" => RUNTIME,
                 "sender_waiter.rs" => include_str!("sender_waiter.rs"),
+                "futex.rs" => include_str!("futex.rs"),
                 other => panic!("unknown census source {other}"),
             };
             let body = src
@@ -148956,11 +149092,12 @@ mod u9qa_split_dispatch_disposition {
         let after = &recognized[reserve..];
         // BL3b: five, not three — the value re-check adds `ValueChanged` and `WordUnreadable`
         // beside `WokenDuringPublication`, `VictimChanged` and `IncarnationMoved`, and each is a
-        // non-parking outcome that must release what it reserved.
+        // non-parking outcome that must release what it reserved. FUTEX-FOUND1: six — the keyed
+        // registration's `CapacityExhausted` refusal is a sixth, decided before any write.
         assert_eq!(
             after.matches("futex_wait_dispatch_clear(cpu_idx)").count(),
-            5,
-            "the five non-parking park outcomes each release the reservation"
+            6,
+            "the six non-parking park outcomes each release the reservation"
         );
     }
 
@@ -148989,7 +149126,7 @@ mod u9qa_split_dispatch_disposition {
             .expect("the deferral reservation");
         let publish = route
             // BL3b: the park transaction re-checks the word against the caller's `expected`.
-            .find("futex_wait_park_exact_split(cpu, tid, asid, addr, expected)")
+            .find("futex_wait_park_exact_split(cpu, tid, asid, addr, expected, args.kind)")
             .expect("the park transaction");
         assert!(
             admit < reserve && reserve < publish,
@@ -172295,7 +172432,6 @@ mod u9residual1_yield_family {
         settle_yield_decline, yield_deferral_arch_gate,
     };
     use crate::kernel::task::{TaskStatus, ThreadControlBlock, WaitReason};
-    use crate::kernel::vm::VirtAddr;
 
     const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
     const SPLIT: &str = include_str!("../syscall_split.rs");
@@ -172563,7 +172699,12 @@ mod u9residual1_yield_family {
             &[
                 tcb(
                     CALLER,
-                    TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x1000))),
+                    TaskStatus::Blocked(WaitReason::Futex(
+                        crate::kernel::boot::futex::FutexWaitToken {
+                            slot: 0,
+                            generation: 0,
+                        },
+                    )),
                 ),
                 tcb(OTHER, TaskStatus::Runnable),
             ],
@@ -172574,7 +172715,12 @@ mod u9residual1_yield_family {
         assert_eq!(h.count("preempt"), 1, "it was attempted");
         assert_eq!(
             h.status_of(CALLER),
-            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x1000)))),
+            Some(TaskStatus::Blocked(WaitReason::Futex(
+                crate::kernel::boot::futex::FutexWaitToken {
+                    slot: 0,
+                    generation: 0
+                }
+            ))),
             "and refused without writing anything"
         );
     }
@@ -175264,7 +175410,10 @@ mod u9dispatchcpu2_recovery {
         state.set_task_status_for_test(
             31001,
             crate::kernel::task::TaskStatus::Blocked(crate::kernel::task::WaitReason::Futex(
-                crate::kernel::vm::VirtAddr(0x1000),
+                crate::kernel::boot::futex::FutexWaitToken {
+                    slot: 0,
+                    generation: 0,
+                },
             )),
         );
         assert!(
@@ -176000,7 +176149,7 @@ mod u9timer1_preempting_timer {
         SharedYieldOwners, YieldDecline, run_yield_transaction,
     };
     use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
-    use crate::kernel::vm::{Asid, VirtAddr};
+    use crate::kernel::vm::Asid;
     use crate::runtime::SharedKernel;
 
     const SPLIT: &str = include_str!("../syscall_split.rs");
@@ -177231,7 +177380,12 @@ mod u9timer1_preempting_timer {
                 // The task was accepted and dequeued; now its status stops being `Runnable`.
                 s.with_task_tcbs_split_mut(|tcbs| {
                     if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 94041) {
-                        tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x9000)));
+                        tcb.status = TaskStatus::Blocked(WaitReason::Futex(
+                            crate::kernel::boot::futex::FutexWaitToken {
+                                slot: 0,
+                                generation: 0,
+                            },
+                        ));
                     }
                 });
                 dispatch

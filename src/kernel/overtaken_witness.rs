@@ -120,12 +120,12 @@ fn armed() -> bool {
 
 /// Where `tid` is parked, if it is `Blocked(Futex)`.
 fn futex_addr_of(shared: &crate::runtime::SharedKernel, tid: u64) -> Option<u64> {
-    shared.with_task_tcbs_split_mut(|tcbs| {
+    shared.with_task_futex_split_mut(|tcbs, table| {
         tcbs.iter()
             .flatten()
             .find(|t| t.tid.0 == tid)
             .and_then(|t| match t.status {
-                TaskStatus::Blocked(WaitReason::Futex(VirtAddr(a))) => Some(a),
+                TaskStatus::Blocked(WaitReason::Futex(token)) => table.va_of(token),
                 _ => None,
             })
     })

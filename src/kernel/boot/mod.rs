@@ -83,6 +83,8 @@ mod orchestrator_state;
 // U9-RECV-BLOCK1 §6 — the one-shot SMP-unlock audit's latch, readable lock-free from the trap
 // path so a split-handled trap can drive the audit the broad path used to carry.
 pub(crate) use orchestrator_state::x86_smp_unlock_audit_claimed;
+/// FUTEX-FOUND1: futex keys, the keyed waiter table and its rank-local owners.
+pub(crate) mod futex;
 pub(crate) mod process_cnode_txn;
 pub(crate) mod provisional_cap;
 pub(crate) mod reap_claim;
@@ -10206,6 +10208,9 @@ pub struct KernelState {
     task_classes: KernelStorage<[Option<TaskClass>; MAX_TASKS]>,
     tls_restore_pending: KernelStorage<[Option<ThreadId>; MAX_TASKS]>,
     robust_futex: KernelStorage<[Option<RobustFutexRecord>; MAX_TASKS]>,
+    /// FUTEX-FOUND1: the bounded keyed futex waiter table. Task domain (rank 2): every record
+    /// is written in the same critical section as its TCB's `Blocked(Futex(token))`.
+    futex_waiters: KernelStorage<futex::FutexWaiterTable>,
     memory: KernelStorage<MemorySubsystem>,
     drivers: KernelStorage<DriverSubsystem>,
     telemetry: KernelStorage<TelemetrySubsystem>,

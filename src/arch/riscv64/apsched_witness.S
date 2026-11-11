@@ -516,6 +516,7 @@ p_b_one:
     LOG m_p_wake
     mv a0, s6
     li a1, 1
+    li a2, 0                /* FUTEX-FOUND1: flags = private */
     li a7, NR_FUTEX_WAKE
     ecall
     mv s4, a0
@@ -923,7 +924,7 @@ w_sleep:
     beq t1, s1, 3f
     mv a0, s9
     addi a1, s1, -1
-    mv a2, t1
+    li a2, 0                /* FUTEX-FOUND1: flags = private */
     li a7, NR_FUTEX_WAIT
     ecall
     j 2b

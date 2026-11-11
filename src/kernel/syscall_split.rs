@@ -5537,20 +5537,21 @@ fn try_split_futex_wait_recognized(
         return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)));
     }
 
-    // (2) ABI, identical to `handle_futex_wait` — and ANSWERED, because `InvalidArgs` is what that
-    // handler's `u32::try_from` produces and no later owner will produce it for us.
+    // (2) ABI — THE decode `handle_futex_wait` uses (FUTEX-FOUND1), and ANSWERED, because
+    // `InvalidArgs` is what it produces and no later owner will produce it for us.
     let addr = frame.arg(SYSCALL_ARG_CAP);
-    let (Ok(expected), Ok(observed)) = (
-        u32::try_from(frame.arg(SYSCALL_ARG_PTR)),
-        u32::try_from(frame.arg(SYSCALL_ARG_LEN)),
-    ) else {
-        crate::yarm_log!(
-            "FUTEX_WAIT_SPLIT_DONE tid=0 addr={} result=invalid_args cpu={}",
-            addr,
-            cpu.0
-        );
-        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    let args = match crate::kernel::syscall::sched::decode_futex_args(frame) {
+        Ok(args) => args,
+        Err(err) => {
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_DONE tid=0 addr={} result=invalid_args cpu={}",
+                addr,
+                cpu.0
+            );
+            return D::Complete(Err(TrapHandleError::Syscall(err)));
+        }
     };
+    let expected = args.value;
 
     // (3) THE ADDRESS RANGE COMES FIRST. `validate_current_user_futex_word` refuses a null or
     // kernel-range word before it ever asks who the caller is, so a trap with no current task
@@ -5579,7 +5580,7 @@ fn try_split_futex_wait_recognized(
 
     // (5) Readability, then the CALLER'S comparison — typed, so each canonical error is answered
     // by the owner that decided it rather than re-derived by the broad dispatcher.
-    let decision = match shared.futex_wait_decide_split_read(tid, addr, expected, observed) {
+    let decision = match shared.futex_wait_decide_split_read(tid, addr, expected, args.kind) {
         Ok(decision) => decision,
         Err(err) => {
             crate::yarm_log!(
@@ -5643,7 +5644,7 @@ fn try_split_futex_wait_recognized(
     // its TCB cannot be reclaimed — so what the transaction authenticates against is the
     // incarnation this trap entered from and not whatever later answers to the number.
     let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
-    match shared.futex_wait_park_exact_split(cpu, tid, asid, addr, expected) {
+    match shared.futex_wait_park_exact_split(cpu, tid, asid, addr, expected, args.kind) {
         FutexParkOutcome::Parked { .. } => {
             crate::yarm_log!(
                 "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid={} cpu={}",
@@ -5712,6 +5713,19 @@ fn try_split_futex_wait_recognized(
                 cpu.0
             );
             D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(err))))
+        }
+        // FUTEX-FOUND1 — pre-mutation by construction: the registration refused before writing.
+        FutexParkOutcome::CapacityExhausted => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=capacity_exhausted cpu={}",
+                tid,
+                addr,
+                cpu.0
+            );
+            D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(
+                crate::kernel::boot::KernelError::TaskTableFull,
+            ))))
         }
         FutexParkOutcome::IncarnationMoved => {
             crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
@@ -6495,14 +6509,18 @@ fn try_split_futex_wake_into_frame(
     // answers `InvalidArgs`, because the conversion is what the canonical handler reaches first —
     // and note that the caller is resolved at step 3, AFTER both argument checks, which is why
     // NR 10 must not share the `Internal` prologue the six `helpers::current_tid` routes use.
-    let Ok(max_wake) = u32::try_from(frame.arg(SYSCALL_ARG_PTR) as u64) else {
-        crate::yarm_log!(
-            "FUTEX_WAKE_SPLIT_REFUSED cpu={} addr=0x{:x} reason=max_wake_not_u32 \
-             settlement=invalid_args broad_lock=0",
-            cpu.0,
-            addr
-        );
-        return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    // FUTEX-FOUND1: THE decode `handle_futex_wake` uses (value, flags, reserved slot, alignment).
+    let args = match crate::kernel::syscall::sched::decode_futex_args(frame) {
+        Ok(args) => args,
+        Err(err) => {
+            crate::yarm_log!(
+                "FUTEX_WAKE_SPLIT_REFUSED cpu={} addr=0x{:x} reason=invalid_args \
+                 settlement=invalid_args broad_lock=0",
+                cpu.0,
+                addr
+            );
+            return Some(Err(TrapHandleError::Syscall(err)));
+        }
     };
     if let Err(err) = crate::kernel::syscall::sched::futex_word_range_check(addr) {
         crate::yarm_log!(
@@ -6543,21 +6561,25 @@ fn try_split_futex_wake_into_frame(
             crate::kernel::boot::KernelError::UserMemoryFault,
         ))));
     }
-    if shared
-        .copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())
-        .is_none()
-    {
-        crate::yarm_log!(
-            "FUTEX_WAKE_SPLIT_REFUSED cpu={} tid={} addr=0x{:x} reason=user_copy \
-             settlement=user_memory_fault broad_lock=0",
-            cpu.0,
-            tid,
-            addr
-        );
-        return Some(Err(TrapHandleError::Syscall(SyscallError::from(
-            crate::kernel::boot::KernelError::UserMemoryFault,
-        ))));
-    }
+    // The waker's KEY, in the waker's address space — the same resolution the broad owner makes.
+    let key = match shared.resolve_futex_word_in_split(
+        crate::kernel::vm::Asid(asid as u16),
+        addr,
+        args.kind,
+    ) {
+        Ok((key, _word)) => key,
+        Err(err) => {
+            crate::yarm_log!(
+                "FUTEX_WAKE_SPLIT_REFUSED cpu={} tid={} addr=0x{:x} reason=key err={:?} \
+                 broad_lock=0",
+                cpu.0,
+                tid,
+                addr,
+                err
+            );
+            return Some(Err(TrapHandleError::Syscall(SyscallError::from(err))));
+        }
+    };
 
     // Validation passed — wake off the global lock.
     // Stage 195C: AArch64 emits arch-tagged split markers (FutexWake is the third live
@@ -6569,7 +6591,7 @@ fn try_split_futex_wake_into_frame(
     crate::yarm_log!("FUTEX_WAKE_SPLIT_BEGIN arch=riscv64");
     #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     crate::yarm_log!("FUTEX_WAKE_SPLIT_BEGIN");
-    let woke = shared.futex_wake_split_mut(cpu, addr, max_wake);
+    let woke = shared.futex_wake_key_split(cpu, key, args.value);
     crate::yarm_log!("FUTEX_WAKE_SPLIT_WAKE_OK count={}", woke);
     frame.set_ok(woke as usize, 0, 0);
     #[cfg(target_arch = "aarch64")]

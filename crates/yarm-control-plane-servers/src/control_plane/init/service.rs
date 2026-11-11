@@ -694,7 +694,11 @@ fn nr9_nonblocking_probe(word: *const u32) {
     // ONE format string and no `Debug` formatting, because every byte of init's image is
     // mapping-ceiling pressure on the feature-built profiles. `blocked` is the syscall's own
     // answer: 0 is the required one, 1 means it parked, 2 means it errored.
-    let blocked: u32 = match yarm_user_rt::syscall::futex_wait(word, observed ^ 1, observed) {
+    let blocked: u32 = match yarm_user_rt::syscall::futex_wait(
+        word,
+        observed ^ 1,
+        yarm_user_rt::syscall::FutexScope::Private,
+    ) {
         Ok(false) => 0,
         Ok(true) => 1,
         Err(_) => 2,
@@ -719,7 +723,11 @@ fn nr9_nonblocking_probe(word: *const u32) {
 #[cfg(not(feature = "hosted-dev"))]
 fn oracle_handshake_publish(word: &core::sync::atomic::AtomicU32, ready: u32) {
     word.store(ready, core::sync::atomic::Ordering::Release);
-    let _ = yarm_user_rt::syscall::futex_wake(word.as_ptr(), 1);
+    let _ = yarm_user_rt::syscall::futex_wake(
+        word.as_ptr(),
+        1,
+        yarm_user_rt::syscall::FutexScope::Private,
+    );
 }
 
 /// BL3a — wait for a hand-off published by `oracle_handshake_publish`. Parks only while the word
@@ -734,7 +742,11 @@ fn oracle_handshake_await(word: &core::sync::atomic::AtomicU32, ready: u32) -> u
             return parked;
         }
         parked += 1;
-        let _ = yarm_user_rt::syscall::futex_wait(word.as_ptr(), v, v);
+        let _ = yarm_user_rt::syscall::futex_wait(
+            word.as_ptr(),
+            v,
+            yarm_user_rt::syscall::FutexScope::Private,
+        );
     }
 }
 
@@ -747,7 +759,9 @@ fn oracle_wake_once_parked(word: *const u32, max: u32) -> (u32, u32) {
     let mut asks = 0u32;
     loop {
         asks += 1;
-        let woke = yarm_user_rt::syscall::futex_wake(word, 1).unwrap_or(0);
+        let woke =
+            yarm_user_rt::syscall::futex_wake(word, 1, yarm_user_rt::syscall::FutexScope::Private)
+                .unwrap_or(0);
         #[cfg(feature = "oracle-handshake-race")]
         if asks == 1 {
             oracle_race_mark_step();
@@ -879,13 +893,18 @@ extern "C" fn futex_oracle_child() -> ! {
     );
     // Legacy global-lock FutexWait (NOT split) — blocks on Futex(addr) and hands the CPU to
     // the now-Runnable parent.
-    let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+    let _ = yarm_user_rt::syscall::futex_wait(
+        addr,
+        observed,
+        yarm_user_rt::syscall::FutexScope::Private,
+    );
     yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_CHILD_WOKE");
     // Park cleanly on an unrelated futex so a second wake on the oracle word finds no waiter.
     let park = FUTEX_ORACLE_PARK.as_ptr();
     loop {
         let pv = FUTEX_ORACLE_PARK.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+        let _ =
+            yarm_user_rt::syscall::futex_wait(park, pv, yarm_user_rt::syscall::FutexScope::Private);
     }
 }
 
@@ -1204,7 +1223,9 @@ fn run_aarch64_futex_wake_oracle(init_tid: u64, futex_wait_mode: bool) {
     );
     // Second wake: the child is now Runnable (no longer Blocked) and does not re-block on the
     // oracle word, so no waiter remains → count must be 0.
-    let second_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0xFFFF);
+    let second_wake =
+        yarm_user_rt::syscall::futex_wake(addr, 1, yarm_user_rt::syscall::FutexScope::Private)
+            .unwrap_or(0xFFFF);
     yarm_user_rt::user_log!(
         "AARCH64_FUTEX_WAKE_ORACLE_COUNTS first_wake={} second_wake={}",
         first_wake,
@@ -1291,7 +1312,11 @@ extern "C" fn x86_futex_wake_oracle_child_body() -> ! {
     let addr = X86_FW_WORD.as_ptr();
     let observed = X86_FW_WORD.load(Relaxed);
     yarm_user_rt::user_log!("X86_FUTEX_ORACLE_CHILD_WAIT_BEGIN observed={}", observed);
-    let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+    let _ = yarm_user_rt::syscall::futex_wait(
+        addr,
+        observed,
+        yarm_user_rt::syscall::FutexScope::Private,
+    );
     // Woken exactly once by the parent's first split FutexWake.
     X86_FW_WAITER_RESUMED.store(1, Relaxed);
     let btid = X86_FW_CHILD_TID.load(Relaxed);
@@ -1299,7 +1324,8 @@ extern "C" fn x86_futex_wake_oracle_child_body() -> ! {
     let park = X86_FW_PARK.as_ptr();
     loop {
         let pv = X86_FW_PARK.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+        let _ =
+            yarm_user_rt::syscall::futex_wait(park, pv, yarm_user_rt::syscall::FutexScope::Private);
     }
 }
 
@@ -1351,7 +1377,9 @@ fn run_x86_futex_wake_oracle(init_tid: u64) {
         asks
     );
     // Second wake: B is no longer Blocked on the target word → count must be 0.
-    let second_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0xFFFF);
+    let second_wake =
+        yarm_user_rt::syscall::futex_wake(addr, 1, yarm_user_rt::syscall::FutexScope::Private)
+            .unwrap_or(0xFFFF);
     yarm_user_rt::user_log!(
         "X86_FUTEX_WAKE_USER_RETURN_OK first_wake={} second_wake={}",
         first_wake,
@@ -2269,7 +2297,11 @@ pub(super) mod ipc_displace1_witness {
     fn park() -> ! {
         loop {
             let v = PARK.load(SeqCst);
-            let _ = yarm_user_rt::syscall::futex_wait(PARK.as_ptr(), v, v);
+            let _ = yarm_user_rt::syscall::futex_wait(
+                PARK.as_ptr(),
+                v,
+                yarm_user_rt::syscall::FutexScope::Private,
+            );
         }
     }
 
@@ -2293,14 +2325,22 @@ pub(super) mod ipc_displace1_witness {
             if v != from {
                 return v;
             }
-            let _ = yarm_user_rt::syscall::futex_wait(cell.as_ptr(), from, from);
+            let _ = yarm_user_rt::syscall::futex_wait(
+                cell.as_ptr(),
+                from,
+                yarm_user_rt::syscall::FutexScope::Private,
+            );
         }
     }
 
     /// S's publication of a new value to a child: store, then wake the child blocked on it.
     fn publish(cell: &AtomicU32, value: u32) {
         cell.store(value, SeqCst);
-        let _ = yarm_user_rt::syscall::futex_wake(cell.as_ptr(), 1);
+        let _ = yarm_user_rt::syscall::futex_wake(
+            cell.as_ptr(),
+            1,
+            yarm_user_rt::syscall::FutexScope::Private,
+        );
     }
 
     fn send(ep: u32, round: u32) -> bool {
@@ -3512,7 +3552,11 @@ mod shared_region_oracle_core {
         let park = PARK.as_ptr();
         loop {
             let pv = PARK.load(Relaxed);
-            let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+            let _ = yarm_user_rt::syscall::futex_wait(
+                park,
+                pv,
+                yarm_user_rt::syscall::FutexScope::Private,
+            );
         }
     }
 
@@ -3901,7 +3945,11 @@ mod ipccall_direct_oracle_core {
         let park = PARK.as_ptr();
         loop {
             let pv = PARK.load(Relaxed);
-            let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+            let _ = yarm_user_rt::syscall::futex_wait(
+                park,
+                pv,
+                yarm_user_rt::syscall::FutexScope::Private,
+            );
         }
     }
 
@@ -4715,7 +4763,11 @@ mod ipc_reply_timeout_oracle {
         let park = PARK.as_ptr();
         loop {
             let pv = PARK.load(Relaxed);
-            let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+            let _ = yarm_user_rt::syscall::futex_wait(
+                park,
+                pv,
+                yarm_user_rt::syscall::FutexScope::Private,
+            );
             let _ = yarm_user_rt::syscall::yield_now();
         }
     }
@@ -6093,13 +6145,18 @@ extern "C" fn riscv_futex_oracle_child() -> ! {
     yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_CHILD_WAIT_BEGIN observed={}", observed);
     // Legacy global-lock FutexWait (NOT split) — blocks on Futex(addr) and hands the CPU to the
     // now-Runnable parent.
-    let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+    let _ = yarm_user_rt::syscall::futex_wait(
+        addr,
+        observed,
+        yarm_user_rt::syscall::FutexScope::Private,
+    );
     yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_CHILD_WOKE");
     // Park on an unrelated futex so a second wake on the oracle word finds no waiter.
     let park = FUTEX_ORACLE_PARK.as_ptr();
     loop {
         let pv = FUTEX_ORACLE_PARK.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+        let _ =
+            yarm_user_rt::syscall::futex_wait(park, pv, yarm_user_rt::syscall::FutexScope::Private);
     }
 }
 
@@ -6147,7 +6204,9 @@ fn run_riscv_futex_wake_oracle(init_tid: u64) {
     );
     // Second wake: the child is now Runnable (no longer Blocked) and parks on an unrelated futex,
     // so no waiter remains on the oracle word → count must be 0.
-    let second_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0xFFFF);
+    let second_wake =
+        yarm_user_rt::syscall::futex_wake(addr, 1, yarm_user_rt::syscall::FutexScope::Private)
+            .unwrap_or(0xFFFF);
     // Userspace return proof: BOTH split FutexWake syscalls returned to userspace (same-task sret)
     // and this subsequent instruction runs with the correct wake counts in hand.
     yarm_user_rt::user_log!(
@@ -6201,7 +6260,8 @@ extern "C" fn riscv_queue_switch_foundation_child() -> ! {
     let park = FUTEX_ORACLE_PARK.as_ptr();
     loop {
         let pv = FUTEX_ORACLE_PARK.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+        let _ =
+            yarm_user_rt::syscall::futex_wait(park, pv, yarm_user_rt::syscall::FutexScope::Private);
     }
 }
 
@@ -6301,7 +6361,8 @@ extern "C" fn riscv_futex_wait_oracle_child() -> ! {
     let park = FUTEX_ORACLE_PARK.as_ptr();
     loop {
         let pv = FUTEX_ORACLE_PARK.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+        let _ =
+            yarm_user_rt::syscall::futex_wait(park, pv, yarm_user_rt::syscall::FutexScope::Private);
     }
 }
 
@@ -6345,7 +6406,7 @@ fn run_riscv_futex_wait_oracle(init_tid: u64) {
     let word = FUTEX_ORACLE_WORD.as_ptr();
     let wv = FUTEX_ORACLE_WORD.load(Relaxed);
     yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_ORACLE_BLOCK_BEGIN word_val={}", wv);
-    let _ = yarm_user_rt::syscall::futex_wait(word, wv, wv);
+    let _ = yarm_user_rt::syscall::futex_wait(word, wv, yarm_user_rt::syscall::FutexScope::Private);
     // Userspace return proof: A's retired FutexWait returned (post-sret continuation) exactly once.
     let wake_count = FUTEX_WAIT_ORACLE_WAKE_COUNT.load(Relaxed);
     yarm_user_rt::user_log!(
@@ -6395,7 +6456,11 @@ fn run_riscv_futex_wait_idle_oracle(init_tid: u64) -> ! {
     // default-on drain to its post-lock Idle outcome. Nothing ever wakes this word, so it does not
     // return; a return would be a defect (the drain must never sret into the blocked caller).
     loop {
-        let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+        let _ = yarm_user_rt::syscall::futex_wait(
+            addr,
+            observed,
+            yarm_user_rt::syscall::FutexScope::Private,
+        );
         yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN");
     }
 }
@@ -6424,7 +6489,8 @@ extern "C" fn riscv_yield_two_task_child() -> ! {
     let word = RISCV_FUTEX_WAIT_IDLE_WORD.as_ptr();
     loop {
         let v = RISCV_FUTEX_WAIT_IDLE_WORD.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(word, v, v);
+        let _ =
+            yarm_user_rt::syscall::futex_wait(word, v, yarm_user_rt::syscall::FutexScope::Private);
     }
 }
 
@@ -6479,7 +6545,8 @@ fn run_riscv_yield_two_task_oracle(init_tid: u64) -> ! {
     let word = RISCV_FUTEX_WAIT_IDLE_WORD.as_ptr();
     loop {
         let v = RISCV_FUTEX_WAIT_IDLE_WORD.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(word, v, v);
+        let _ =
+            yarm_user_rt::syscall::futex_wait(word, v, yarm_user_rt::syscall::FutexScope::Private);
     }
 }
 
@@ -6514,7 +6581,8 @@ fn run_riscv_yield_lone_task_oracle(init_tid: u64) -> ! {
     let word = RISCV_FUTEX_WAIT_IDLE_WORD.as_ptr();
     loop {
         let v = RISCV_FUTEX_WAIT_IDLE_WORD.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(word, v, v);
+        let _ =
+            yarm_user_rt::syscall::futex_wait(word, v, yarm_user_rt::syscall::FutexScope::Private);
     }
 }
 
@@ -6537,7 +6605,11 @@ fn run_aarch64_futex_wait_idle_oracle(init_tid: u64) -> ! {
     // Legacy-shape FutexWait (NR 9) that blocks and — with nothing else runnable — drives the
     // post-lock Idle outcome. Nothing ever wakes this word, so it does not return.
     loop {
-        let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+        let _ = yarm_user_rt::syscall::futex_wait(
+            addr,
+            observed,
+            yarm_user_rt::syscall::FutexScope::Private,
+        );
         yarm_user_rt::user_log!("AARCH64_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN");
     }
 }
@@ -6553,7 +6625,8 @@ extern "C" fn yield_oracle_child() -> ! {
     let park = FUTEX_ORACLE_IDLE_WORD.as_ptr();
     let pv = FUTEX_ORACLE_IDLE_WORD.load(Relaxed);
     loop {
-        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+        let _ =
+            yarm_user_rt::syscall::futex_wait(park, pv, yarm_user_rt::syscall::FutexScope::Private);
     }
 }
 

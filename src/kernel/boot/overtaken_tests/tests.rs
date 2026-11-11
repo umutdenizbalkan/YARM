@@ -141,8 +141,14 @@ fn queued(k: &SharedKernel, cpu: CpuId) -> alloc::vec::Vec<u64> {
 /// The FutexWait commit, through its production owners: W parks (status registered, `current`
 /// compare-and-cleared) and the class's drain cell is armed with W as the outgoing task.
 fn futex_wait_commit(fx: &Fixture) {
-    let parked =
-        fx.k.futex_wait_park_exact_split(CPU0, W, fx.w_asid, FUTEX_ADDR, FUTEX_VALUE);
+    let parked = fx.k.futex_wait_park_exact_split(
+        CPU0,
+        W,
+        fx.w_asid,
+        FUTEX_ADDR,
+        FUTEX_VALUE,
+        crate::kernel::boot::futex::FutexKind::Private,
+    );
     assert!(
         matches!(
             parked,
@@ -160,9 +166,16 @@ fn futex_wait_commit(fx: &Fixture) {
 
 /// The overtaking wake: an ordinary FutexWake issued on CPU 1, through its production owner.
 fn remote_futex_wake(fx: &Fixture) {
+    // FUTEX-FOUND1: the waker is a thread of W's process, so it names W's private key.
     assert_eq!(
-        fx.k.futex_wake_split_mut(CPU1, FUTEX_ADDR, 1),
-        1,
+        fx.k.futex_wake_split_mut(
+            CPU1,
+            fx.w_asid,
+            FUTEX_ADDR,
+            1,
+            crate::kernel::boot::futex::FutexKind::Private
+        ),
+        Ok(1),
         "one waiter woken"
     );
 }

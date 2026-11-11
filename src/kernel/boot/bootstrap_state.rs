@@ -695,6 +695,8 @@ impl Bootstrap {
                 .write(store_kernel_value([None; MAX_TASKS]));
             core::ptr::addr_of_mut!((*state_ptr).robust_futex)
                 .write(store_kernel_value([None; MAX_TASKS]));
+            core::ptr::addr_of_mut!((*state_ptr).futex_waiters)
+                .write(store_kernel_value(super::futex::FutexWaiterTable::new()));
             core::ptr::addr_of_mut!((*state_ptr).memory).write(store_kernel_value(
                 MemorySubsystem {
                     #[cfg(feature = "hosted-dev")]

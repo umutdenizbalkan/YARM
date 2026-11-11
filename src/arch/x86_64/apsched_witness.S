@@ -499,6 +499,7 @@ p_b_one:
     LOG m_p_wake
     lea rdi, [MBX + M_F + r14 * 4]
     mov esi, 1
+    xor edx, edx            /* FUTEX-FOUND1: flags = private */
     SYS NR_FUTEX_WAKE
     mov qword ptr [BUF + V_TMP], rax
     WAIT_BEGIN
@@ -989,7 +990,7 @@ w_sleep:
     je 3f
     lea rdi, [MBX + M_F + r12 * 4]
     lea rsi, [r15 - 1]
-    mov rdx, rax
+    xor edx, edx            /* FUTEX-FOUND1: flags = private */
     SYS NR_FUTEX_WAIT
     jmp 2b
 3:  mov qword ptr [MBX + M_S_ACK + r12 * 8], r15
