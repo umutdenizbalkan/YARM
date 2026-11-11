@@ -236,7 +236,8 @@ reserved holes from implemented privileged paths.
   `FutexCmpRequeue` instead (below), which reports a capacity stop explicitly and moves the
   remaining waiters without needing any run-queue room. `FutexWake`'s ABI is unchanged; the
   ambiguity of its `0` remains, and is recorded with SC-POOL-3.
-- **`FutexCmpRequeue(source, target, expected, wake, requeue, flags)` (NR 17, FUTEX-REQUEUE1).**
+- **`FutexCmpRequeue(source, target, expected, wake, requeue, flags)` (NR 17, FUTEX-REQUEUE1;
+  one operation since FUTEX-REQUEUE-ATOMIC1).**
   Atomically, while the source word still holds `expected`: wake up to `wake` source waiters,
   oldest first, then move up to `requeue` further source waiters, in their order, to the target
   key, where they are queued behind the target's existing waiters and wait exactly as if they had
@@ -245,18 +246,33 @@ reserved holes from implemented privileged paths.
   - *Flags.* bit 0: the source is shared; bit 1: the target is shared — each key is resolved in
     its own namespace. Every other bit is reserved: `InvalidArgs`. Misaligned addresses and counts
     wider than `u32` are `InvalidArgs` as well, answered before anything else is consulted.
-  - *Atomicity.* The key resolution of both words, the read and comparison of the source word, and
-    the transfer happen in ONE critical section (task lock, then VM, then memory). Every wait
-    registers under the task lock, so each waiter is either registered before the operation (and
-    may be moved) or after it (and is not). A waiter still finishing its own `FutexWait` when it is
-    moved re-reads its OWN source word: if that changed (the usual broadcast case: the sequence
-    was bumped first) it returns `0` immediately, and its record leaves the target; otherwise it
-    blocks on the target. So `requeued` counts waiters moved, some of which may then return
-    `0` from their own wait — the usual futex rule, callers re-check their condition.
-  - *Wake portion.* Runs after the transfer, as `FutexWake` of the source with `count = wake`, and
-    has its capacity behaviour: when a waiter cannot be placed, it stops and that waiter stays
-    parked ON THE SOURCE, reported as `CAPACITY_LIMITED`. The transfer is not affected; a retry with
-    `wake = 0` moves the remaining waiters (behind those already moved) with no room needed.
+  - *Atomicity.* The whole outcome — which waiters are woken, which are moved, and the comparison
+    that allows it — is decided in ONE critical section (task lock, then VM, then memory): both
+    keys are resolved, the source word is read and compared, and BOTH portions are selected from
+    one view of the source queue and moved. Every wait, wake, requeue and exit takes the task lock,
+    so each concurrent operation is wholly before this point or wholly after it. The waiters of the
+    wake portion leave the source at that point (to a key private to the operation: no other
+    FutexWait, FutexWake or FutexCmpRequeue can reach them); they are made runnable and placed just
+    after, each into a run-queue slot reserved for it before the decision. So a concurrent wake
+    cannot take them, a waiter that arrives later cannot be woken in their place, and a waiter that
+    exits after the point was still woken by it. (FUTEX-REQUEUE-ATOMIC1. Before it, the wake portion
+    was an ordinary `FutexWake` run after the transfer, and took whichever waiter was oldest by
+    then.)
+  - *A waiter still in its own `FutexWait`.* A waiter registered but still finishing its wait when
+    this operation moves it, or selects it to be woken, keeps that outcome even if its own re-read
+    of its word then sees a change: it does not retract a wait another operation has acted on. A
+    moved one stays parked on the target; a selected one is woken. (Its re-read retracts the wait
+    only while nothing has acted on it.)
+  - *Wake portion and capacity.* The wake portion is the longest prefix of the source queue, up to
+    `wake` waiters, whose placement is secured (a run-queue slot reserved on each one's home CPU). It
+    stops at the first waiter that cannot be placed — its home queue full, its CPU unable to take
+    work — reported as `CAPACITY_LIMITED`. That waiter is never skipped for a later one whose CPU has
+    room: it is the first waiter the requeue portion takes. So the source queue is cut into one
+    woken prefix, one moved block and the rest, in order; a waiter that could not be woken is moved
+    ahead of the younger ones (with `requeue = 0` it stays at the head of the source, parked).
+    Moving needs no room at all. If concurrent operations keep changing the source queue between
+    the reservation and the decision, the operation retries a bounded number of times and then
+    reports the stop as `CAPACITY_LIMITED` in the same way (placement not secured), never a guess.
   - *Results.* Success: `ret0 = woken`, `ret1 = requeued`, `ret2 = status` with bit 8 `DONE`
     always set and bit 0 `CAPACITY_LIMITED` as above (on AArch64 and RISC-V an error has `ret2 = 0`,
     so a success is never read as an error). The source word no longer holding `expected`:
@@ -264,15 +280,19 @@ reserved holes from implemented privileged paths.
     (including another mapping of the same object): `InvalidArgs`, nothing moved. An unmapped or
     otherwise unresolvable word: the error `FutexWake` gives for it, nothing moved. No waiters: a
     successful `(0, 0)`.
-  - *Bounds.* One walk of the source key's bucket (≤ 512 records, O(1) each, no allocation, no
-    stack array); the move is unlink, rekey, append. Scheduler work is proportional to the waiters
-    woken, never to those moved.
+  - *Bounds.* Two walks of the source key's bucket under the one hold (≤ 512 records, O(1) each,
+    no allocation, no per-waiter stack array); the move is unlink, rekey, append. Reservations are
+    counted per CPU and priority (a fixed 384-byte table). Scheduler work is proportional to the
+    waiters woken, never to those moved; at most 4 attempts.
 - **Condition-variable broadcast.** The waiter: lock the mutex, check the predicate, read the
   sequence, unlock, `FutexWait(seq, seen)`, then re-lock in the CONTENDED state (a woken or
   requeued waiter cannot know whether others are parked behind it). The broadcaster, holding the
   mutex: bump the sequence, store CONTENDED (`2`) in the mutex word, then
-  `FutexCmpRequeue(seq, mutex, new_seq, 1, MAX)`; on `CAPACITY_LIMITED` repeat with `wake = 0`; on
-  `WouldBlock` (a signal moved the sequence) fall back to waking every sequence waiter. The
+  `FutexCmpRequeue(seq, mutex, new_seq, 1, MAX)`; on `CAPACITY_LIMITED` repeat with `wake = 0`
+  (since FUTEX-REQUEUE-ATOMIC1 a capacity stop has already moved the unplaceable waiter to the
+  mutex, so the repeat normally moves nothing; anything it does move registered after the bump and
+  sees a spurious wake, which a condition variable allows); on `WouldBlock` (a signal moved the
+  sequence) fall back to waking every sequence waiter. The
   CONTENDED store is what makes the broadcaster's own unlock issue the first mutex wake: without
   it, a broadcast that woke nobody would leave every moved waiter parked on a mutex whose word
   says "uncontended". `yarm_user_rt::futex_sync` implements exactly this; it is not a pthread

@@ -1945,8 +1945,10 @@ pub mod futex_sync {
         ///
         /// Why not "re-issue the wake until it returns 0": a wake that returns 0 may have stopped
         /// at a waiter with no run-queue room, which stays parked. NR 17 reports that case
-        /// (`capacity_limited`), and the retry with `wake = 0` moves the waiter to the mutex
-        /// instead of needing room for it.
+        /// (`capacity_limited`) and, since FUTEX-REQUEUE-ATOMIC1, has already moved that waiter to
+        /// the mutex, first, ahead of the others (moving needs no room). The retry with `wake = 0`
+        /// is kept for older semantics; it normally moves nothing, and anything it does move parked
+        /// after the bump and sees a spurious wake, which a condition variable allows.
         pub fn broadcast(&self, mutex: &FutexMutex) -> BroadcastReport {
             let seq = self.seq.fetch_add(1, Ordering::Release).wrapping_add(1);
             mutex.word.store(CONTENDED, Ordering::Relaxed);
