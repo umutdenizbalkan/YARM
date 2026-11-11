@@ -1,0 +1,14 @@
+nc6 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index fdf1fd46..a2f808a2 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13794,7 +13794,7 @@ impl SharedKernel {
+                     crate::arch::hal::notify_enqueued(t);
+                     woke += 1;
+                 }
+-                Ok(Ok(ReservedCommit::AlreadyPlaced(_))) => woke += 1,
++                Ok(Ok(ReservedCommit::AlreadyPlaced(_))) => {}
+                 other => crate::yarm_log!(
+                     "FUTEX_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} result={:?}",
+                     candidate.tid,

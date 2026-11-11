@@ -1,0 +1,31 @@
+nc8 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index ea08217a..2c0c4117 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -513,6 +513,7 @@ pub fn next_futex_waiter_locked(
+     key: FutexKey,
+ ) -> Option<FutexWakeCandidate> {
+     let b = key.bucket();
++    let mut newest = None;
+     let mut prev = NIL;
+     let mut cur = table.head[b];
+     while cur != NIL {
+@@ -521,7 +522,7 @@ pub fn next_futex_waiter_locked(
+         let next = rec.next;
+         if table.live(tcbs, slot) {
+             if rec.key == key {
+-                return Some(FutexWakeCandidate {
++                newest = Some(FutexWakeCandidate {
+                     tid: rec.tid,
+                     token: table.token(slot),
+                 });
+@@ -533,7 +534,7 @@ pub fn next_futex_waiter_locked(
+         }
+         cur = next;
+     }
+-    None
++    newest
+ }
+ 
+ /// rank 2 — THE wake claim, of exactly one waiter: `candidate` is made `Runnable` and its record

@@ -1,0 +1,3 @@
+F: warning: `yarm` (lib) generated 424 warnings (run `cargo clippy --fix --lib -p yarm -- ` to apply 102 suggestions)
+B: warning: `yarm` (lib) generated 424 warnings (run `cargo clippy --fix --lib -p yarm -- ` to apply 102 suggestions)
+CLASSES_IDENTICAL

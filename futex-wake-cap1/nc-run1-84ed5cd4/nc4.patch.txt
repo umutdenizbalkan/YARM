@@ -1,0 +1,13 @@
+nc4 applied
+diff --git a/src/kernel/scheduler.rs b/src/kernel/scheduler.rs
+index 7d4318f4..0eeee8af 100644
+--- a/src/kernel/scheduler.rs
++++ b/src/kernel/scheduler.rs
+@@ -500,7 +500,6 @@ impl PriorityScheduler {
+         tid: ThreadId,
+         priority: TaskPriority,
+     ) -> Result<(), SchedulerError> {
+-        self.release_user_slot(priority);
+         if self.contains_tid(tid) {
+             return Err(SchedulerError::AlreadyQueued);
+         }

@@ -1,0 +1,23 @@
+nc5 applied
+diff --git a/src/kernel/scheduler.rs b/src/kernel/scheduler.rs
+index 7d4318f4..647c52d2 100644
+--- a/src/kernel/scheduler.rs
++++ b/src/kernel/scheduler.rs
+@@ -452,10 +452,14 @@ impl PriorityScheduler {
+         }
+         // FUTEX-WAKE-CAP1: a reserved slot is occupied for every user push but the one it was
+         // reserved for.
+-        if !crate::kernel::kthread::is_kthread_tid(tid.0) && !self.user_room(priority) {
+-            return Err(SchedulerError::QueueFull);
++        self.queues[Self::priority_index(priority)].push_within(
++            tid,
++            if crate::kernel::kthread::is_kthread_tid(tid.0) { MAX_QUEUED_PER_PRIORITY } else { MAX_RUN_QUEUE },
++        )?;
++        if !self.membership_tracking_exhausted && self.membership_insert(tid).is_err() {
++            self.membership_tracking_exhausted = self.rebuild_membership_table();
+         }
+-        self.push_unchecked_capacity(tid, priority)
++        Ok(())
+     }
+ 
+     /// FUTEX-WAKE-CAP1 — whether one more user entry fits at `priority`, counting reservations.

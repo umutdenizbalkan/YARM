@@ -1,0 +1,60 @@
+      3 warning: associated function `_` is never used
+      1 warning: associated functions `_`, `_`, and `_` are never used
+      4 warning: associated items `_` and `_` are never used
+      2 warning: associated items `_`, `_`, `_`, `_`, `_`, and `_` are never used
+      1 warning: called `_` on a `_` value
+      4 warning: casting to the same type is unnecessary (`_` -> `_`)
+     23 warning: constant `_` is never used
+      3 warning: derefed type is same as origin
+     23 warning: doc list item without indentation
+      4 warning: doc quote line without `_` marker
+      2 warning: empty line after doc comment
+     12 warning: enum `_` is never used
+      2 warning: field `_` is never read
+    136 warning: function `_` is never used
+      4 warning: large size difference between variants
+      3 warning: manual implementation of `_`
+      2 warning: manually filling a slice
+      1 warning: match can be simplified with `_`
+     16 warning: method `_` is never used
+      9 warning: methods `_` and `_` are never used
+      3 warning: methods `_`, `_`, `_`, `_`, and `_` are never used
+      4 warning: methods `_`, `_`, and `_` are never used
+      3 warning: multiple associated items are never used
+      2 warning: multiple methods are never used
+      1 warning: redundant closure
+     16 warning: static `_` is never used
+      9 warning: struct `_` is never constructed
+      3 warning: the following explicit lifetimes could be elided: 'a
+      8 warning: the loop variable `_` is only used to index `_`
+      5 warning: the loop variable `_` is used to index `_`
+      1 warning: this `_` can be collapsed into the outer `_`
+      2 warning: this `_` can be simplified
+      3 warning: this `_` expression can be replaced with `_`
+      3 warning: this `_` may be rewritten with the `_` operator
+     24 warning: this `_` statement can be collapsed
+      2 warning: this block may be rewritten with the `_` operator
+      1 warning: this function has a `_` attribute with no message, but returns a type already considered as `_`
+      1 warning: this function has too many arguments (10/7)
+      7 warning: this function has too many arguments (8/7)
+      1 warning: this function has too many arguments (9/7)
+      1 warning: this loop could be written as a `_` loop
+      2 warning: this operation has no effect
+      1 warning: this returns a `_`
+     15 warning: type `_` is more private than the item `_`
+      3 warning: unneeded `_` statement
+     23 warning: unused import: `_`
+      2 warning: unused imports: `_` and `_`
+      1 warning: unused imports: `_`, `_`, `_`, `_`, `_`, and `_`
+      2 warning: unused imports: `_`, `_`, and `_`
+      5 warning: unused variable: `_`
+      1 warning: use of `_` to construct default value
+      1 warning: use of deprecated method `_`: renamed to `_` for consistency
+      2 warning: using `_` instead of `_` is more efficient
+      1 warning: using `_` over `_`
+      1 warning: using `_` with a constant chunk size
+      1 warning: value assigned to `_` is never read
+      4 warning: variant `_` is never constructed
+      1 warning: variants `_`, `_`, `_`, and `_` are never constructed
+      2 warning: you seem to be trying to use `_` for an equality check. Consider using `_`
+      2 warning: you should consider adding a `_` implementation for `_`

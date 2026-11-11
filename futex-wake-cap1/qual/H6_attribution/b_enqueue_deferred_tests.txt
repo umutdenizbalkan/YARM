@@ -1,0 +1,4 @@
+kernel::boot::tests::futex_found1::f05_wake_before_during_and_after_publication
+kernel::boot::tests::futex_found1::f07_a_wake_during_publication_restores_the_exact_caller
+kernel::boot::tests::robust_futex_wake_works_when_exit_is_externally_driven
+kernel::boot::tests::stage191d_futex_wait_block_publish::u9fw_a_wake_during_publication_never_loses_the_caller

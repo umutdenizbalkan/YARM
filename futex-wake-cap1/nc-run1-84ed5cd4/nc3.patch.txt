@@ -1,0 +1,15 @@
+nc3 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index fdf1fd46..d8aa412c 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13774,9 +13774,6 @@ impl SharedKernel {
+                 fx::claim_futex_waiter_locked(tcbs, table, key, candidate)
+             });
+             if !claimed {
+-                let _ = self.with_cpu_sched_split(target, |c| {
+-                    te::release_enqueue_reservation_on_cpu_locked(c, &plan)
+-                });
+                 continue;
+             }
+             #[cfg(test)]

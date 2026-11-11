@@ -1,0 +1,25 @@
+nc1 applied
+diff --git a/src/kernel/task_enqueue.rs b/src/kernel/task_enqueue.rs
+index 4b4540e0..2e67531f 100644
+--- a/src/kernel/task_enqueue.rs
++++ b/src/kernel/task_enqueue.rs
+@@ -240,9 +240,7 @@ pub(crate) fn reserve_enqueue_on_cpu_locked(
+     plan: &EnqueuePlan,
+ ) -> Result<(), KernelError> {
+     match plan.target {
+-        EnqueueTarget::Pinned(target) if target == view.cpu() => view
+-            .reserve_user_slot(plan.priority)
+-            .map_err(map_scheduler_error),
++        EnqueueTarget::Pinned(target) if target == view.cpu() => Ok(()),
+         _ => Err(map_scheduler_error(
+             crate::kernel::scheduler::SchedulerError::CpuOffline,
+         )),
+@@ -266,7 +264,7 @@ pub(crate) fn commit_reserved_enqueue_on_cpu_locked(
+     plan: &EnqueuePlan,
+ ) -> Result<ReservedCommit, KernelError> {
+     let cpu = view.cpu();
+-    match view.enqueue_reserved_with_priority(ThreadId(plan.tid), plan.priority) {
++    match view.enqueue_with_priority(ThreadId(plan.tid), plan.priority) {
+         Ok(()) => Ok(ReservedCommit::Queued(cpu)),
+         Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued) => {
+             Ok(ReservedCommit::AlreadyPlaced(cpu))
