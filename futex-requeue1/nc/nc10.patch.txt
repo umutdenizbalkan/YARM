@@ -1,0 +1,15 @@
+nc10 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 1b6b718c..ac32221f 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18490,6 +18490,9 @@ impl SharedKernel {
+         // exactly this token — a TCB a waker already moved is the waker's.
+         let undo_registration = || {
+             self.with_task_futex_split_mut(|tcbs, table| {
++                if table.key_of(token) != Some(key) {
++                    return false;
++                }
+                 fx::undo_futex_registration_locked(tcbs, table, tid, token)
+             })
+         };

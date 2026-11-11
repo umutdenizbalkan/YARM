@@ -1,0 +1,9 @@
+[serverdies:x86_64] exact commit sha=15e02f59490504457255267aa847b906b23b17c4 tree=1f0fdc654ee0beb41ca31294916fb364465ebca3 (clean)
+[serverdies:x86_64] RUN_A feature-off binary audit
+[serverdies:x86_64] RUN_A oracle_literals_present=0 production_literals_missing=0
+[serverdies:x86_64] RUN_B feature-on live cell (selector=server-dies)
+ARTIFACT_BINDING arch=x86_64 kernel=build-x86_64/kernel_boot.elf kernel_sha256=18be0f941da515cfdcd3da7cb7bd6532a4070ef6e26fc46e3bbf644524a816fc kernel_features=x86-ipc-reply-timeout-oracle kernel_resolved_features=ipc-reply-timeout-oracle-core,x86-ipc-reply-timeout-oracle kernel_nofp=pass initramfs=build-x86_64/initramfs-core.cpio initramfs_sha256=bb8daa86b2e0bd1b4203e2c3807cd7299eda150554278a45efd0fe18c09a0dfd initramfs_features=none initramfs_compile_env=none source=clean:1f0fdc654ee0beb41ca31294916fb364465ebca3 required=kernel=x86-ipc-reply-timeout-oracle,initramfs=none result=ok
+[serverdies:x86_64] boot cmdline: yarm.x86_64_ipc_reply_timeout_oracle=server-dies
+[serverdies:x86_64] RUN_B witnessed scenario: server={10008,1} caller={1,1} record={0,18}
+[serverdies:x86_64] RUN_B caller_wakes=1 peer_death_winners=1
+STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 sha=15e02f59490504457255267aa847b906b23b17c4 tree=1f0fdc654ee0beb41ca31294916fb364465ebca3 live_cells=1 caller_wakes=1 peer_death_winners=1 exit_returns=0 feature_off_oracle_literals=0 result=ok

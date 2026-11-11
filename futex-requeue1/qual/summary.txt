@@ -1,0 +1,173 @@
+matrix start 2026-11-11T17:48:17Z only=all schedule_sha=3490cb78a6bc118c
+=== P0_provenance [15e02f594905 porcelain=0]: bash -c git rev-parse HEAD; test $(git rev-parse --short=8 HEAD) = 15e02f59 && echo HEAD_IS_F; git status --porcelain | wc -l; rustc -V; cargo -V; qemu-system-x86_64 --version | head -1; qemu-system-aarch64 --version | head -1; qemu-system-riscv64 --version | head -1 (start 17:48:17)
+P0_provenance rc=0 secs=0
+=== P1_source [15e02f594905 porcelain=0]: bash -c git diff --stat 3ff5a628 HEAD; awk '/^pub fn compare_and_requeue_locked/,/^}/' src/kernel/boot/futex.rs | grep -n 'sched\|cpu\|enqueue' || echo NO_SCHEDULER_IN_TRANSFER; true (start 17:48:17)
+P1_source rc=0 secs=1
+=== H1_fmt [15e02f594905 porcelain=0]: cargo fmt --all -- --check (start 17:48:18)
+H1_fmt rc=0 secs=7
+=== H2_clippy [15e02f594905 porcelain=0]: hosted cargo clippy --lib --features hosted-dev (start 17:48:25)
+H2_clippy rc=0 secs=8
+=== H3_hosted_lib [15e02f594905 porcelain=0]: hosted cargo test --lib -- --test-threads=1 (start 17:48:33)
+H3_hosted_lib rc=0 secs=150
+=== H4_integration [15e02f594905 porcelain=0]: hosted cargo test --test * --no-fail-fast -- --test-threads=1 (start 17:51:03)
+H4_integration rc=0 secs=114
+=== H5_futex_requeue1 [15e02f594905 porcelain=0]: hosted cargo test --lib futex_requeue1 -- --test-threads=1 (start 17:52:57)
+H5_futex_requeue1 rc=0 secs=9
+=== H5_futex_wake_cap1 [15e02f594905 porcelain=0]: hosted cargo test --lib futex_wake_cap1 -- --test-threads=1 (start 17:53:06)
+H5_futex_wake_cap1 rc=0 secs=1
+=== H5_futex_found1 [15e02f594905 porcelain=0]: hosted cargo test --lib futex_found1 -- --test-threads=1 (start 17:53:07)
+H5_futex_found1 rc=0 secs=8
+=== H5_futex [15e02f594905 porcelain=0]: hosted cargo test --lib futex -- --test-threads=1 (start 17:53:15)
+H5_futex rc=0 secs=19
+=== H5_robust [15e02f594905 porcelain=0]: hosted cargo test --lib robust -- --test-threads=1 (start 17:53:34)
+H5_robust rc=0 secs=1
+=== H5_scheduler [15e02f594905 porcelain=0]: hosted cargo test --lib scheduler -- --test-threads=1 (start 17:53:35)
+H5_scheduler rc=0 secs=0
+=== H5_sched_ [15e02f594905 porcelain=0]: hosted cargo test --lib sched_ -- --test-threads=1 (start 17:53:35)
+H5_sched_ rc=0 secs=2
+=== H5_enqueue [15e02f594905 porcelain=0]: hosted cargo test --lib enqueue -- --test-threads=1 (start 17:53:37)
+H5_enqueue rc=0 secs=2
+=== H5_ap_sched1 [15e02f594905 porcelain=0]: hosted cargo test --lib ap_sched1 -- --test-threads=1 (start 17:53:39)
+H5_ap_sched1 rc=0 secs=0
+=== H5_stage199d [15e02f594905 porcelain=0]: hosted cargo test --lib stage199d -- --test-threads=1 (start 17:53:39)
+H5_stage199d rc=0 secs=21
+=== H5_stage191b [15e02f594905 porcelain=0]: hosted cargo test --lib stage191b -- --test-threads=1 (start 17:54:00)
+H5_stage191b rc=0 secs=0
+=== H5_stage191d [15e02f594905 porcelain=0]: hosted cargo test --lib stage191d -- --test-threads=1 (start 17:54:01)
+H5_stage191d rc=0 secs=1
+=== H5_stage200d0a [15e02f594905 porcelain=0]: hosted cargo test --lib stage200d0a -- --test-threads=1 (start 17:54:01)
+H5_stage200d0a rc=0 secs=0
+=== H5_stage29 [15e02f594905 porcelain=0]: hosted cargo test --lib stage29 -- --test-threads=1 (start 17:54:01)
+H5_stage29 rc=0 secs=0
+=== H5_syscall [15e02f594905 porcelain=0]: hosted cargo test --lib syscall -- --test-threads=1 (start 17:54:01)
+H5_syscall rc=0 secs=2
+=== H5_u9qa [15e02f594905 porcelain=0]: hosted cargo test --lib u9qa -- --test-threads=1 (start 17:54:03)
+H5_u9qa rc=0 secs=1
+=== H5_kthread [15e02f594905 porcelain=0]: hosted cargo test --lib kthread -- --test-threads=1 (start 17:54:04)
+H5_kthread rc=0 secs=0
+=== H5_exit [15e02f594905 porcelain=0]: hosted cargo test --lib exit -- --test-threads=1 (start 17:54:04)
+H5_exit rc=0 secs=3
+=== H5_reap [15e02f594905 porcelain=0]: hosted cargo test --lib reap -- --test-threads=1 (start 17:54:07)
+H5_reap rc=0 secs=0
+=== H5_spawn [15e02f594905 porcelain=0]: hosted cargo test --lib spawn -- --test-threads=1 (start 17:54:07)
+H5_spawn rc=0 secs=6
+=== H5_thread [15e02f594905 porcelain=0]: hosted cargo test --lib thread -- --test-threads=1 (start 17:54:13)
+H5_thread rc=0 secs=1
+=== H5_fork [15e02f594905 porcelain=0]: hosted cargo test --lib fork -- --test-threads=1 (start 17:54:14)
+H5_fork rc=0 secs=2
+=== H5_ipc_displace1 [15e02f594905 porcelain=0]: hosted cargo test --lib ipc_displace1 -- --test-threads=1 (start 17:54:16)
+H5_ipc_displace1 rc=0 secs=0
+=== H5_sender_wake [15e02f594905 porcelain=0]: hosted cargo test --lib sender_wake -- --test-threads=1 (start 17:54:16)
+H5_sender_wake rc=0 secs=1
+=== H2b_clippy_classes_B [3ff5a6285bc5 porcelain=0]: bash -c /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq_clipcmp.sh (start 17:54:17)
+H2b_clippy_classes_B rc=1 secs=10
+=== H6_lockorder_attr [15e02f594905 porcelain=0]: bash -c /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq_lockattr.sh (start 17:54:27)
+H6_lockorder_attr rc=0 secs=220
+=== D1_build_x86_64 [15e02f594905 porcelain=0]: scripts/build-qemu-x86_64-artifacts.sh (start 17:58:07)
+D1_build_x86_64 rc=0 secs=31
+=== D2_build_aarch64 [15e02f594905 porcelain=0]: scripts/build-qemu-aarch64-artifacts.sh (start 17:58:38)
+D2_build_aarch64 rc=0 secs=31
+=== D3_build_riscv64 [15e02f594905 porcelain=0]: scripts/build-qemu-riscv64-artifacts.sh (start 17:59:09)
+D3_build_riscv64 rc=0 secs=29
+=== O1_oracle_x86_64 [15e02f594905 porcelain=0]: scripts/qemu-ipc-recv-v2-oracle-smoke.sh x86_64 (start 17:59:38)
+O1_oracle_x86_64 rc=0 secs=61
+=== O2_oracle_aarch64 [15e02f594905 porcelain=0]: scripts/qemu-ipc-recv-v2-oracle-smoke.sh aarch64 (start 18:00:39)
+O2_oracle_aarch64 rc=0 secs=11
+=== O3_oracle_riscv64 [15e02f594905 porcelain=0]: scripts/qemu-ipc-recv-v2-oracle-smoke.sh riscv64 (start 18:00:50)
+O3_oracle_riscv64 rc=0 secs=31
+=== S1_build_x86_64_strict [15e02f594905 porcelain=0]: env ARTIFACTS_STRICT=1 BOOTSTRAP_FEATURE_ARGS=--no-default-features --features timer-contract-witness scripts/build-qemu-x86_64-artifacts.sh (start 18:01:21)
+S1_build_x86_64_strict rc=0 secs=34
+=== S2_core_x86_64_strict [15e02f594905 porcelain=0]: env QEMU_SMOKE_STRICT=1 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/S2_qemu-x86_64-core.log scripts/qemu-x86_64-core-smoke.sh (start 18:01:55)
+S2_core_x86_64_strict rc=0 secs=61
+=== S3_build_aarch64_strict [15e02f594905 porcelain=0]: env ARTIFACTS_STRICT=1 scripts/build-qemu-aarch64-artifacts.sh (start 18:02:56)
+S3_build_aarch64_strict rc=0 secs=5
+=== S4_core_aarch64_strict [15e02f594905 porcelain=0]: env QEMU_SMOKE_STRICT=1 scripts/qemu-aarch64-core-smoke.sh (start 18:03:01)
+S4_core_aarch64_strict rc=0 secs=11
+=== S5_build_riscv64_strict [15e02f594905 porcelain=0]: env ARTIFACTS_STRICT=1 scripts/build-qemu-riscv64-artifacts.sh (start 18:03:12)
+S5_build_riscv64_strict rc=0 secs=5
+=== S6_core_riscv64_strict [15e02f594905 porcelain=0]: env QEMU_SMOKE_STRICT=1 scripts/qemu-riscv64-core-smoke.sh (start 18:03:17)
+S6_core_riscv64_strict rc=0 secs=31
+=== FX1_first_cohort_seal [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX1 scripts/qemu-first-cohort-retirement-seal.sh (start 18:03:48)
+FX1_first_cohort_seal rc=1 secs=814
+=== S7_ci_timer_grep [15e02f594905 porcelain=0]: bash -c for m in YARM_TIMER_IRQ_DELIVERED YARM_TIMER_EOI_DONE YARM_SCHED_TICK; do echo "$m $(grep -ac $m /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/S2_qemu-x86_64-core.log)"; done; grep -aq YARM_TIMER_IRQ_DELIVERED /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/S2_qemu-x86_64-core.log && grep -aq YARM_TIMER_EOI_DONE /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/S2_qemu-x86_64-core.log && grep -aq YARM_SCHED_TICK /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/S2_qemu-x86_64-core.log (start 18:17:22)
+S7_ci_timer_grep rc=1 secs=0
+=== W_x86_64_smp1 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/W_x86_64_smp1 timeout 2400 scripts/qemu-ipc-displace1-witness-smoke.sh x86_64 1 (start 18:17:22)
+W_x86_64_smp1 rc=0 secs=219
+=== W_aarch64_smp1 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/W_aarch64_smp1 timeout 2400 scripts/qemu-ipc-displace1-witness-smoke.sh aarch64 1 (start 18:21:01)
+W_aarch64_smp1 rc=0 secs=51
+=== W_riscv64_smp1 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/W_riscv64_smp1 timeout 2400 scripts/qemu-ipc-displace1-witness-smoke.sh riscv64 1 (start 18:21:52)
+W_riscv64_smp1 rc=0 secs=217
+=== FX2_overtaken_x86_64 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX2 scripts/qemu-x86_64-overtaken-witness-smoke.sh (start 18:25:29)
+FX2_overtaken_x86_64 rc=0 secs=42
+=== FX3_overtaken_aarch64 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX3 scripts/qemu-aarch64-overtaken-witness-smoke.sh (start 18:26:11)
+FX3_overtaken_aarch64 rc=0 secs=39
+=== FX4_apsched_x86_64 [15e02f594905 porcelain=0]: env SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX4_x86_64 scripts/qemu-x86_64-apsched-witness-smoke.sh (start 18:26:50)
+FX4_apsched_x86_64 rc=0 secs=49
+=== FX5_kthread1_x86_64 [15e02f594905 porcelain=0]: env ARCH=x86_64 SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX5_x86_64 scripts/qemu-kthread1-witness-smoke.sh (start 18:27:39)
+FX5_kthread1_x86_64 rc=0 secs=62
+=== FX6_schedlock1_x86_64 [15e02f594905 porcelain=0]: env ARCH=x86_64 SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX6_x86_64 scripts/qemu-sched-lock1-witness-smoke.sh (start 18:28:41)
+FX6_schedlock1_x86_64 rc=0 secs=299
+=== FX4_apsched_aarch64 [15e02f594905 porcelain=0]: env SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX4_aarch64 scripts/qemu-aarch64-apsched-witness-smoke.sh (start 18:33:40)
+FX4_apsched_aarch64 rc=0 secs=48
+=== FX5_kthread1_aarch64 [15e02f594905 porcelain=0]: env ARCH=aarch64 SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX5_aarch64 scripts/qemu-kthread1-witness-smoke.sh (start 18:34:28)
+FX5_kthread1_aarch64 rc=0 secs=45
+=== FX6_schedlock1_aarch64 [15e02f594905 porcelain=0]: env ARCH=aarch64 SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX6_aarch64 scripts/qemu-sched-lock1-witness-smoke.sh (start 18:35:13)
+FX6_schedlock1_aarch64 rc=0 secs=46
+=== FX4_apsched_riscv64 [15e02f594905 porcelain=0]: env SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX4_riscv64 scripts/qemu-riscv64-apsched-witness-smoke.sh (start 18:35:59)
+FX4_apsched_riscv64 rc=0 secs=41
+=== FX5_kthread1_riscv64 [15e02f594905 porcelain=0]: env ARCH=riscv64 SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX5_riscv64 scripts/qemu-kthread1-witness-smoke.sh (start 18:36:40)
+FX5_kthread1_riscv64 rc=0 secs=50
+=== FX6_schedlock1_riscv64 [15e02f594905 porcelain=0]: env ARCH=riscv64 SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX6_riscv64 scripts/qemu-sched-lock1-witness-smoke.sh (start 18:37:30)
+FX6_schedlock1_riscv64 rc=0 secs=37
+=== FX7_requeue_x86_64 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX7_x86_64 timeout 3000 scripts/qemu-futex-requeue-witness-smoke.sh x86_64 2 (start 18:38:07)
+FX7_requeue_x86_64 rc=0 secs=252
+=== FX7_requeue_aarch64 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX7_aarch64 timeout 3000 scripts/qemu-futex-requeue-witness-smoke.sh aarch64 2 (start 18:42:19)
+FX7_requeue_aarch64 rc=0 secs=23
+=== FX7_requeue_riscv64 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FX7_riscv64 timeout 3000 scripts/qemu-futex-requeue-witness-smoke.sh riscv64 2 (start 18:42:42)
+FX7_requeue_riscv64 rc=0 secs=250
+=== FB0a_build_x86_64_strict_B [3ff5a6285bc5 porcelain=0]: env ARTIFACTS_STRICT=1 BOOTSTRAP_FEATURE_ARGS=--no-default-features --features timer-contract-witness scripts/build-qemu-x86_64-artifacts.sh (start 18:46:52)
+FB0a_build_x86_64_strict_B rc=0 secs=7
+=== FB0b_build_aarch64_strict_B [3ff5a6285bc5 porcelain=0]: env ARTIFACTS_STRICT=1 scripts/build-qemu-aarch64-artifacts.sh (start 18:46:59)
+FB0b_build_aarch64_strict_B rc=0 secs=8
+=== FB0c_build_riscv64_strict_B [3ff5a6285bc5 porcelain=0]: env ARTIFACTS_STRICT=1 scripts/build-qemu-riscv64-artifacts.sh (start 18:47:07)
+FB0c_build_riscv64_strict_B rc=0 secs=6
+=== FB1_first_cohort_seal_B [3ff5a6285bc5 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FB1 scripts/qemu-first-cohort-retirement-seal.sh (start 18:47:13)
+FB1_first_cohort_seal_B rc=1 secs=815
+=== FB2_overtaken_x86_64_B [3ff5a6285bc5 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FB2 scripts/qemu-x86_64-overtaken-witness-smoke.sh (start 19:00:48)
+FB2_overtaken_x86_64_B rc=0 secs=23
+=== FB3_overtaken_aarch64_B [3ff5a6285bc5 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/FB3 scripts/qemu-aarch64-overtaken-witness-smoke.sh (start 19:01:11)
+FB3_overtaken_aarch64_B rc=0 secs=12
+=== U1_uart_irq_x86_64 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/U1 scripts/qemu-x86_64-uart-irq-witness-smoke.sh (start 19:01:23)
+U1_uart_irq_x86_64 rc=0 secs=166
+=== U2_pl011_irq_aarch64 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/U2 scripts/qemu-aarch64-pl011-irq-witness-smoke.sh (start 19:04:09)
+U2_pl011_irq_aarch64 rc=0 secs=59
+=== U3_uart_irq_riscv64 [15e02f594905 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/U3 scripts/qemu-riscv64-uart-irq-witness-smoke.sh (start 19:05:08)
+U3_uart_irq_riscv64 rc=0 secs=57
+=== M1_direct_matrix [15e02f594905 porcelain=0]: scripts/qemu-ipccall-reply-direct-matrix-seal.sh (start 19:06:05)
+M1_direct_matrix rc=0 secs=395
+=== M2_server_dies_x86_64 [15e02f594905 porcelain=0]: scripts/qemu-x86_64-server-dies-smoke.sh (start 19:12:40)
+M2_server_dies_x86_64 rc=0 secs=208
+=== M3_server_dies_aarch64 [15e02f594905 porcelain=0]: scripts/qemu-aarch64-server-dies-smoke.sh (start 19:16:08)
+M3_server_dies_aarch64 rc=0 secs=210
+=== M4_server_dies_riscv64 [15e02f594905 porcelain=0]: scripts/qemu-riscv64-server-dies-smoke.sh (start 19:19:38)
+M4_server_dies_riscv64 rc=0 secs=207
+=== C1_build_default_x86_64_F [15e02f594905 porcelain=0]: scripts/build-qemu-x86_64-artifacts.sh (start 19:23:05)
+C1_build_default_x86_64_F rc=0 secs=6
+=== C2_ci_profiles_F [15e02f594905 porcelain=0]: scripts/run-ci-profiles.sh sender-wake d2-send smp2-core smp4-core smp2-sender-wake smp4-sender-wake sched-timeout --keep-going --logs-dir /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/C2_ci-profiles (start 19:23:14)
+C2_ci_profiles_F rc=1 secs=850
+=== C3_build_default_x86_64_B [3ff5a6285bc5 porcelain=0]: scripts/build-qemu-x86_64-artifacts.sh (start 19:37:25)
+C3_build_default_x86_64_B rc=0 secs=5
+=== C4_ci_profiles_B [3ff5a6285bc5 porcelain=0]: scripts/run-ci-profiles.sh sender-wake d2-send smp2-core smp4-core smp2-sender-wake smp4-sender-wake sched-timeout --keep-going --logs-dir /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual/C4_ci-profiles (start 19:37:30)
+C4_ci_profiles_B rc=1 secs=851
+=== C5a_reply_timeout_matrix_F [15e02f594905 porcelain=0]: scripts/qemu-ipc-reply-timeout-matrix-smoke.sh (start 19:51:41)
+C5a_reply_timeout_matrix_F rc=1 secs=9
+=== C5b_reply_timeout_matrix_B [3ff5a6285bc5 porcelain=0]: scripts/qemu-ipc-reply-timeout-matrix-smoke.sh (start 19:51:50)
+C5b_reply_timeout_matrix_B rc=1 secs=11
+=== C5c_smp_request_F [15e02f594905 porcelain=0]: scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh (start 19:52:01)
+C5c_smp_request_F rc=2 secs=27
+=== C5d_smp_request_B [3ff5a6285bc5 porcelain=0]: scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh (start 19:52:28)
+C5d_smp_request_B rc=2 secs=9
+=== Z_markers [15e02f594905 porcelain=0]: bash -c for f in $(find /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-evidence/qual -name '*.log' ! -name 'H*' ! -name 'Z_*' ! -name 'P*' ! -path '*/C4_*' ! -path '*/FB*' ! -name 'C3_*' ! -name 'C4_*' ! -name 'C5b_*' ! -name 'C5d_*' ! -name 'FB*'); do n=$(grep -acE 'SCHED_WAKE_FAIL|SCHED_TIMEOUT_STRANDED_WAITER|IPC_RECV_BLOCKED_COMPLETE_FAILED|x86 shared trap dispatch failed|YARM_AARCH64_TRAP_HANDLE halting|RISCV_TRAP_HANDLE_FAILED|U6_SEND_COMPLETION_REFUSED_STALE|U7_SEND_TIMEOUT_CLAIM_AFTER_WITHDRAW_REFUSED|SEND_ARB_PUBLICATION_REFUSED_UNWIND|endpoint=Published|outcome=Published|SPAWN_LEDGER_OVERFLOW|FUTEX_WAKE_RESERVED_COMMIT_REFUSED|FUTEX_WAKE_STOPPED|FUTEX_WAIT_PARK_REFUSED|reason=capacity_exhausted|OVT_.*result=fail|SL1W.*result=fail|FUTEX_REQUEUE_SPLIT_REFUSED|CRQ_WITNESS.*result=fail|FUTEX_REQUEUE_WITNESS_SEAL.*result=fail' $f); [ $n -gt 0 ] && echo "$n $f"; done; true (start 19:52:37)
+Z_markers rc=0 secs=1
+matrix end 2026-11-11T19:52:38Z F_porcelain=0 B_porcelain=0
+MATRIX_DONE

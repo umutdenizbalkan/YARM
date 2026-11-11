@@ -1,0 +1,24 @@
+nc7 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index ea472b41..a29e375e 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -709,7 +709,7 @@ pub struct FutexRequeueTransfer {
+ /// walk stops at, so none is visited twice.
+ #[allow(clippy::too_many_arguments)]
+ pub fn compare_and_requeue_locked(
+-    tcbs: &[Option<ThreadControlBlock>],
++    tcbs: &mut [Option<ThreadControlBlock>],
+     table: &mut FutexWaiterTable,
+     spaces: &AddressSpaceManager,
+     memory: &MemorySubsystem,
+@@ -757,6 +757,9 @@ pub fn compare_and_requeue_locked(
+                 r.va = target.0 as u64;
+             }
+             table.link_tail(slot);
++            if let Some(t) = tcbs.get_mut(usize::from(rec.tcb)).and_then(Option::as_mut) {
++                t.status = TaskStatus::Runnable;
++            }
+             moved += 1;
+         }
+         if at_last {

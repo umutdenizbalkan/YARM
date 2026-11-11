@@ -1,0 +1,29 @@
+nc8 applied
+diff --git a/src/kernel/boot/exec_state.rs b/src/kernel/boot/exec_state.rs
+index cd55ca75..a1df0d79 100644
+--- a/src/kernel/boot/exec_state.rs
++++ b/src/kernel/boot/exec_state.rs
+@@ -1322,6 +1322,9 @@ impl KernelState {
+                     err,
+                     woke
+                 );
++                let _ = self.with_task_futex_mut(|tcbs, table| {
++                    fx::claim_futex_waiter_locked(tcbs.as_mut_slice(), table, key, candidate)
++                });
+                 stopped_unplaceable = true;
+                 break;
+             }
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 1b6b718c..9bb745bd 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13861,6 +13861,9 @@ impl SharedKernel {
+                     err,
+                     woke
+                 );
++                let _ = self.with_task_futex_split_mut(|tcbs, table| {
++                    fx::claim_futex_waiter_locked(tcbs, table, key, candidate)
++                });
+                 stopped_unplaceable = true;
+                 break;
+             }

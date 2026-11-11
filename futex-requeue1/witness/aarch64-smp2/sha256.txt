@@ -1,0 +1,3 @@
+aa4e7db422c4a43b1465d70bf8d71fff7a0607a8698c8727cb6886e256db1e6b  ../frq-wit3/aarch64-smp2/boot.log
+66fea5532da5d00eb0c9d5f1162600ef4b8970e740b73946bcf17d0bc880830a  build-aarch64/yarm-aarch64.bin
+c54f510875e905f4db430ddc1671126b41b8dabaa1e9a32f8631efd582e47c2f  build-aarch64/initramfs-core.cpio

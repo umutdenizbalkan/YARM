@@ -1,0 +1,16 @@
+nc1 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index ea472b41..3611dbb9 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -727,9 +727,7 @@ pub fn compare_and_requeue_locked(
+     if s_key == t_key {
+         return Err(FutexRequeueRefusal::SameKey);
+     }
+-    if word != expected {
+-        return Err(FutexRequeueRefusal::ValueChanged);
+-    }
++    let _ = (word, expected);
+     let b = s_key.bucket();
+     let last = table.tail[b];
+     let mut prev = NIL;

@@ -1,0 +1,19 @@
+nc6 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index ea472b41..14840915 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -750,6 +750,13 @@ pub fn compare_and_requeue_locked(
+         } else if kept < keep {
+             kept += 1;
+             prev = cur;
++        } else if t_key.bucket() == b {
++            if let Some(r) = table.records[slot].as_mut() {
++                r.key = t_key;
++                r.va = target.0 as u64;
++            }
++            moved += 1;
++            prev = cur;
+         } else {
+             table.unlink_after(slot, prev);
+             if let Some(r) = table.records[slot].as_mut() {

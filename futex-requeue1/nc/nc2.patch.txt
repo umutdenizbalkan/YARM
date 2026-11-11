@@ -1,0 +1,36 @@
+nc2 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index ea472b41..90d3bfeb 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -730,11 +730,11 @@ pub fn compare_and_requeue_locked(
+     if word != expected {
+         return Err(FutexRequeueRefusal::ValueChanged);
+     }
+-    let b = s_key.bucket();
++    let (mut kept, mut moved) = (0u32, 0u32);
++    for b in 0..FUTEX_BUCKETS {
+     let last = table.tail[b];
+     let mut prev = NIL;
+     let mut cur = table.head[b];
+-    let (mut kept, mut moved) = (0u32, 0u32);
+     while cur != NIL && moved < max_move {
+         let slot = usize::from(cur);
+         let Some(rec) = table.records[slot] else {
+@@ -745,7 +745,7 @@ pub fn compare_and_requeue_locked(
+         if !table.live(tcbs, slot) {
+             // Stale: reclaimed on the way, exactly as a wake does.
+             table.retire_after(slot, prev);
+-        } else if rec.key != s_key {
++        } else if rec.va != source.0 as u64 {
+             prev = cur;
+         } else if kept < keep {
+             kept += 1;
+@@ -764,6 +764,7 @@ pub fn compare_and_requeue_locked(
+         }
+         cur = next;
+     }
++    }
+     Ok(FutexRequeueTransfer {
+         source: s_key,
+         target: t_key,

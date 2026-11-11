@@ -1,0 +1,14 @@
+nc3 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index ea472b41..549c36aa 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -742,7 +742,7 @@ pub fn compare_and_requeue_locked(
+         };
+         let next = rec.next;
+         let at_last = cur == last;
+-        if !table.live(tcbs, slot) {
++        if false && !table.live(tcbs, slot) {
+             // Stale: reclaimed on the way, exactly as a wake does.
+             table.retire_after(slot, prev);
+         } else if rec.key != s_key {

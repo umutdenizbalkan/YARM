@@ -1,0 +1,4625 @@
+    Checking yarm-ipc-abi v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-wt/crates/yarm-ipc-abi)
+    Checking yarm-kernel v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-wt/crates/yarm-kernel)
+warning: this function has too many arguments (8/7)
+  --> crates/yarm-ipc-abi/src/driver_abi.rs:28:1
+   |
+28 | / pub const fn make_irqmux_grant_descriptor(
+29 | |     grant_id: IrqGrantId,
+30 | |     driver_id: IrqDriverId,
+31 | |     generation: IrqGrantGeneration,
+...  |
+36 | |     polarity: IrqPolarity,
+37 | | ) -> Option<IrqGrantDescriptor> {
+   | |_______________________________^
+   |
+   = help: for further information visit https://clippy.rust-lang.org/main/index.html#too_many_arguments
+   = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: manual implementation of `.is_multiple_of()`
+   --> crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs:467:16
+    |
+467 |             && self.region_len % page_size as u64 == 0
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `self.region_len.is_multiple_of(page_size as u64)`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#manual_is_multiple_of
+    = note: `#[warn(clippy::manual_is_multiple_of)]` on by default
+
+warning: `yarm-ipc-abi` (lib) generated 2 warnings (run `cargo clippy --fix --lib -p yarm-ipc-abi -- ` to apply 1 suggestion)
+    Checking yarm-srv-common v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-wt/crates/yarm-srv-common)
+warning: this loop could be written as a `for` loop
+  --> crates/yarm-srv-common/src/cpio.rs:54:9
+   |
+54 |         while let Some(entry) = iter.next() {
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `for entry in iter`
+   |
+   = help: for further information visit https://clippy.rust-lang.org/main/index.html#while_let_on_iterator
+   = note: `#[warn(clippy::while_let_on_iterator)]` on by default
+
+warning: this returns a `Result<_, ()>`
+  --> crates/yarm-srv-common/src/log.rs:47:5
+   |
+47 |     pub fn decode(bytes: &[u8]) -> Result<Self, ()> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: use a custom `Error` type instead
+   = help: for further information visit https://clippy.rust-lang.org/main/index.html#result_unit_err
+   = note: `#[warn(clippy::result_unit_err)]` on by default
+
+warning: `yarm-srv-common` (lib) generated 2 warnings (run `cargo clippy --fix --lib -p yarm-srv-common -- ` to apply 1 suggestion)
+    Checking yarm v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/frq-wt)
+warning: unused imports: `QueueAdvanceOutcome` and `QueueAdvanceRefusal`
+  --> src/kernel/boot/mod.rs:41:50
+   |
+41 |     IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome, QueueAdvanceRefusal,
+   |                                                  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: empty line after doc comment
+   --> src/kernel/boot/ipc_state.rs:726:5
+    |
+726 | /     /// through these, so numeric TID alone can never authorize a waiter mutation.
+727 | |
+    | |_^
+728 |       /// The present receiver waiter's TID (for waking / telemetry only — never an authority check).
+729 |       pub(crate) fn endpoint_waiter_tid(&self, idx: usize) -> Option<ThreadId> {
+    |       --------------------------------- the comment documents this function
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#empty_line_after_doc_comments
+    = note: `#[warn(clippy::empty_line_after_doc_comments)]` on by default
+    = help: if the empty line is unintentional, remove it
+help: if the documentation should include the empty line include it in the comment
+    |
+727 |     ///
+    |
+
+warning: unused imports: `DetachOutcome` and `enqueue_reply_into_endpoint_locked`
+  --> src/kernel/boot/mod.rs:69:34
+   |
+69 |     BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ParkedDeathHandoff,
+   |                                  ^^^^^^^^^^^^^
+...
+74 |     complete_server_death_over, enqueue_reply_into_endpoint_locked, log_parked_death_handoff,
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `orchestrator_state::x86_smp_unlock_audit_claimed`
+  --> src/kernel/boot/mod.rs:85:16
+   |
+85 | pub(crate) use orchestrator_state::x86_smp_unlock_audit_claimed;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+  --> src/kernel/boot/scheduler_state.rs:10:27
+   |
+10 | use crate::kernel::task::{TaskClass, TaskStatus};
+   |                           ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+ --> src/kernel/boot/task_policy_state.rs:6:5
+  |
+6 | use crate::kernel::ipc::ThreadId;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+ --> src/kernel/boot/thread_state.rs:8:47
+  |
+8 |     KernelExecutionContext, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
+  |                                               ^^^^^^^^^
+
+warning: unused import: `crate::kernel::vm::Asid`
+  --> src/kernel/boot/thread_state.rs:12:5
+   |
+12 | use crate::kernel::vm::Asid;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc_state::rt_detach_server_link`
+    --> src/kernel/boot/mod.rs:5542:16
+     |
+5542 | pub(crate) use ipc_state::rt_detach_server_link;
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapObject`
+  --> src/kernel/recv_waiter_split.rs:94:42
+   |
+94 | use crate::kernel::capabilities::{CapId, CapObject};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+ --> src/kernel/syscall.rs:9:17
+  |
+9 | use super::vm::{PAGE_SIZE, VirtAddr};
+  |                 ^^^^^^^^^
+
+warning: unused imports: `IpcSendPayloadShape`, `classify_ipc_send_payload_shape`, and `frame_ipc_send_message`
+   --> src/kernel/syscall.rs:318:5
+    |
+318 |     IpcSendPayloadShape, classify_ipc_send_payload_shape, frame_ipc_send_message,
+    |     ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::ipc_abi::transfer_cap_arg_present`
+   --> src/kernel/syscall.rs:324:16
+    |
+324 | pub(crate) use self::ipc_abi::transfer_cap_arg_present;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc::REPLY_CAP_QUEUEING_SUPPORTED`
+   --> src/kernel/syscall.rs:327:16
+    |
+327 | pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc::split_inline_payload_from_frame`
+   --> src/kernel/syscall.rs:329:16
+    |
+329 | pub(crate) use ipc::split_inline_payload_from_frame;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SYSCALL_NO_TRANSFER_CAP`
+  --> src/kernel/syscall/recv_shared_v3.rs:12:26
+   |
+12 |     SYSCALL_ABI_VERSION, SYSCALL_NO_TRANSFER_CAP, SyscallError, current_tid,
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapRights`
+  --> src/kernel/syscall/recv_shared_v3.rs:16:42
+   |
+16 | use crate::kernel::capabilities::{CapId, CapRights};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::Message`
+  --> src/kernel/syscall/recv_shared_v3.rs:17:5
+   |
+17 | use crate::kernel::ipc::Message;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CachePolicy`, `Mapping`, `PAGE_SIZE`, `PageFlags`, `PhysAddr`, and `VirtAddr`
+  --> src/kernel/syscall/recv_shared_v3.rs:20:25
+   |
+20 | use crate::kernel::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                         ^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^  ^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+  --> src/kernel/syscall/vm.rs:28:40
+   |
+28 | use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                                        ^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+    --> src/runtime.rs:2683:13
+     |
+2683 |         use crate::kernel::task::TaskClass;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+    --> src/runtime.rs:6306:35
+     |
+6306 |         use crate::kernel::task::{TaskClass, TaskStatus};
+     |                                   ^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+    --> src/runtime.rs:6736:13
+     |
+6736 |         use crate::kernel::task::TaskClass;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_CAP`, `SYSCALL_ARG_LEN`, and `SYSCALL_ARG_PTR`
+    --> src/runtime.rs:9758:55
+     |
+9758 |             OPCODE_SHARED_MEM, RecvQueuedSplitPhaseA, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0,
+     |                                                       ^^^^^^^^^^^^^^^
+9759 |             SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError,
+     |                                          ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: empty line after doc comment
+     --> src/runtime.rs:10277:5
+      |
+10277 | /     /// it fails closed rather than being half-settled.
+...     |
+10282 | |
+      | |_^
+...
+10285 |       pub(crate) fn capability_object_live_split(
+      |       ------------------------------------------ the comment documents this function
+      |
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#empty_line_after_doc_comments
+      = help: if the empty line is unintentional, remove it
+help: if the doc comment should not document function `capability_object_live_split` then comment it out
+      |
+10243 ~     // /// U9-C — the authoritative reply-cap materialization transaction, off the broad lock.
+10244 ~     // ///
+10245 ~     // /// This is the production wiring Stage 188D deliberately left open: 188D built the rank-3
+10246 ~     // /// halves (`try_record_reply_waiter_cap_split` / `clear_reply_waiter_cap_split`) and proved
+10247 ~     // /// them by unit test, but said "wiring a live producer there is out of Stage 188D scope".
+10248 ~     // /// U9-C wires the producer, so the ONE live reply-cap materialization a real boot performs
+10249 ~     // /// (PM receiving a call that carries a reply cap) no longer needs a broad `&mut KernelState`.
+10250 ~     // ///
+10251 ~     // /// # Rank order — sequential, never nested
+10252 ~     // ///
+10253 ~     // /// | phase | rank | effect |
+10254 ~     // /// |---|---|---|
+10255 ~     // /// | A | 3 (IPC) | consume the transfer envelope exactly once; read its `source_object` |
+10256 ~     // /// | B | 3 (IPC) | the named `Reply{index,generation}` is still live |
+10257 ~     // /// | C | 2 then 4 | resolve the receiver's process CNode |
+10258 ~     // /// | D | 4 (+6 no-op) | mint the receiver-local one-shot Reply cap |
+10259 ~     // /// | E | 3 (IPC) | record the exact CapId as the reply record's waiter alias |
+10260 ~     // ///
+10261 ~     // /// Each phase fully RELEASES its domain before the next acquires one, so the capability lock
+10262 ~     // /// is never held while the IPC lock is taken. That is what removes the
+10263 ~     // /// `reply_cap_ipc_rank_inversion` at this site: the inversion was never the order 4-then-3, it
+10264 ~     // /// was holding 4 *while* taking 3.
+10265 ~     // ///
+10266 ~     // /// # Exactness
+10267 ~     // ///
+10268 ~     // /// Nothing here is derived from a bare TID, a bare slot or the ambient current task. The
+10269 ~     // /// envelope consume is generation-guarded and endpoint-matched; the Reply object carries its
+10270 ~     // /// own `{index, generation}`; the record write is generation-guarded again in phase E, which is
+10271 ~     // /// what closes the mint→record window. If phase E finds the reply object revoked or reused, the
+10272 ~     // /// phase-D mint is rolled all the way back (slot + refcount) and the whole transaction fails
+10273 ~     // /// closed — no cap published, no alias set, no envelope resurrected.
+10274 ~     // ///
+10275 ~     // /// A shared-region envelope (`pinned_object.is_some()`) is NOT serviced here: it owes a rank-6
+10276 ~     // /// pin release this transaction deliberately does not perform. Its arrival is a routing bug, so
+10277 ~     // /// it fails closed rather than being half-settled.
+      |
+
+warning: unused import: `TaskClass`
+     --> src/runtime.rs:16173:35
+      |
+16173 |         use crate::kernel::task::{TaskClass, TaskStatus};
+      |                                   ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+     --> src/runtime.rs:16603:13
+      |
+16603 |         use crate::kernel::ipc::ThreadId;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:16605:13
+      |
+16605 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:16639:13
+      |
+16639 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:18004:13
+      |
+18004 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> src/kernel/direct_ack_census.rs:53:29
+   |
+53 |     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |                             ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+53 -     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+53 +     let _ = WAITERS_CURRENT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3386:17
+     |
+3386 |     let pml4e = d6_read_pte(pml4_phys, (va >> 39) & 0x1FF, virt_offset)?;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+    --> src/kernel/boot/exec_state.rs:3385:1
+     |
+3385 | unsafe fn d6_x86_walk_4level(va: u64, pml4_phys: u64, virt_offset: u64) -> Option<u64> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+     = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3388:16
+     |
+3388 |     let pdpe = d6_read_pte(pdp_phys, (va >> 30) & 0x1FF, virt_offset)?;
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3393:15
+     |
+3393 |     let pde = d6_read_pte(pd_phys, (va >> 21) & 0x1FF, virt_offset)?;
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3398:5
+     |
+3398 |     d6_read_pte(pt_phys, (va >> 12) & 0x1FF, virt_offset)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `core::ptr::read_volatile` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3407:17
+     |
+3407 |     let entry = core::ptr::read_volatile(virt as *const u64);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+    --> src/kernel/boot/exec_state.rs:3403:1
+     |
+3403 | unsafe fn d6_read_pte(table_phys: u64, idx: u64, virt_offset: u64) -> Option<u64> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning: unused variable: `deadline`
+    --> src/kernel/boot/ipc_state.rs:5607:30
+     |
+5607 |                     let Some(deadline) = tcb.ipc_timeout_deadline else {
+     |                              ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_deadline`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `tid`
+    --> src/kernel/boot/orchestrator_state.rs:1463:51
+     |
+1463 |     fn run_unlock_graduated_proof_with(&mut self, tid: u64, cnode: CNodeId) {
+     |                                                   ^^^ help: if this is intentional, prefix it with an underscore: `_tid`
+
+warning: unused variable: `cpu`
+    --> src/kernel/boot/thread_state.rs:1087:9
+     |
+1087 |         cpu: crate::kernel::scheduler::CpuId,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: value assigned to `stash_bound_receiver_tid` is never read
+   --> src/kernel/syscall/ipc.rs:464:78
+    |
+464 |     let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
+    |                                                                              ^^^^ this value is reassigned later and never used
+...
+509 |             stash_bound_receiver_tid = bound_tid;
+    |             ------------------------------------ `stash_bound_receiver_tid` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `cpu`
+    --> src/runtime.rs:7901:9
+     |
+7901 |         cpu: CpuId,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: unused variable: `virt`
+     --> src/runtime.rs:16003:9
+      |
+16003 |         virt: crate::kernel::vm::VirtAddr,
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_virt`
+
+warning: type `kernel::ipccall_direct::BlockedServerAck` is more private than the item `kernel::boot::ipccall_direct_ack::snapshot`
+    --> src/kernel/boot/mod.rs:7534:5
+     |
+7534 |     pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedServerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `kernel::boot::ipccall_direct_ack::snapshot` is reachable at visibility `pub`
+     |
+note: but type `kernel::ipccall_direct::BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `kernel::ipccall_direct::BlockedServerAck` is more private than the item `kernel::boot::ipccall_direct_ack::claim`
+    --> src/kernel/boot/mod.rs:7548:5
+     |
+7548 | /     pub fn claim(
+7549 | |         endpoint_index: usize,
+7550 | |         endpoint_generation: u64,
+7551 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `kernel::boot::ipccall_direct_ack::claim` is reachable at visibility `pub`
+     |
+note: but type `kernel::ipccall_direct::BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::boot::defs::ReceiverWaiterIdentity` is more private than the item `kernel::boot::ipccall_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:7557:5
+     |
+7557 | /     pub fn claim_exact(
+7558 | |         endpoint_index: usize,
+7559 | |         endpoint_generation: u64,
+7560 | |         expect_server: Option<ReceiverWaiterIdentity>,
+7561 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `kernel::boot::ipccall_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `kernel::boot::defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::ipccall_direct::BlockedServerAck` is more private than the item `kernel::boot::ipccall_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:7557:5
+     |
+7557 | /     pub fn claim_exact(
+7558 | |         endpoint_index: usize,
+7559 | |         endpoint_generation: u64,
+7560 | |         expect_server: Option<ReceiverWaiterIdentity>,
+7561 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `kernel::boot::ipccall_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `kernel::ipccall_direct::BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::boot::defs::ReceiverWaiterIdentity` is more private than the item `kernel::boot::ipccall_direct_ack::release`
+    --> src/kernel/boot/mod.rs:7574:5
+     |
+7574 | /     pub fn release(
+7575 | |         endpoint_index: usize,
+7576 | |         endpoint_generation: u64,
+7577 | |         server: ReceiverWaiterIdentity,
+7578 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `kernel::boot::ipccall_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `kernel::boot::defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::direct_ack_store::AckRelease` is more private than the item `kernel::boot::ipccall_direct_ack::release`
+    --> src/kernel/boot/mod.rs:7574:5
+     |
+7574 | /     pub fn release(
+7575 | |         endpoint_index: usize,
+7576 | |         endpoint_generation: u64,
+7577 | |         server: ReceiverWaiterIdentity,
+7578 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `kernel::boot::ipccall_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `kernel::direct_ack_store::AckRelease` is only usable at visibility `pub(crate)`
+    --> src/kernel/direct_ack_store.rs:346:1
+     |
+ 346 | pub(crate) enum AckRelease {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::ipccall_direct::BlockedCallerAck` is more private than the item `kernel::boot::ipcreply_direct_ack::snapshot`
+    --> src/kernel/boot/mod.rs:8018:5
+     |
+8018 |     pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedCallerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `kernel::boot::ipcreply_direct_ack::snapshot` is reachable at visibility `pub`
+     |
+note: but type `kernel::ipccall_direct::BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::ipccall_direct::BlockedCallerAck` is more private than the item `kernel::boot::ipcreply_direct_ack::claim`
+    --> src/kernel/boot/mod.rs:8026:5
+     |
+8026 | /     pub fn claim(
+8027 | |         endpoint_index: usize,
+8028 | |         endpoint_generation: u64,
+8029 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `kernel::boot::ipcreply_direct_ack::claim` is reachable at visibility `pub`
+     |
+note: but type `kernel::ipccall_direct::BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::boot::defs::ReceiverWaiterIdentity` is more private than the item `kernel::boot::ipcreply_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:8034:5
+     |
+8034 | /     pub fn claim_exact(
+8035 | |         endpoint_index: usize,
+8036 | |         endpoint_generation: u64,
+8037 | |         expect_caller: Option<ReceiverWaiterIdentity>,
+8038 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `kernel::boot::ipcreply_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `kernel::boot::defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::ipccall_direct::BlockedCallerAck` is more private than the item `kernel::boot::ipcreply_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:8034:5
+     |
+8034 | /     pub fn claim_exact(
+8035 | |         endpoint_index: usize,
+8036 | |         endpoint_generation: u64,
+8037 | |         expect_caller: Option<ReceiverWaiterIdentity>,
+8038 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `kernel::boot::ipcreply_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `kernel::ipccall_direct::BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::boot::defs::ReceiverWaiterIdentity` is more private than the item `kernel::boot::ipcreply_direct_ack::release`
+    --> src/kernel/boot/mod.rs:8050:5
+     |
+8050 | /     pub fn release(
+8051 | |         endpoint_index: usize,
+8052 | |         endpoint_generation: u64,
+8053 | |         caller: ReceiverWaiterIdentity,
+8054 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `kernel::boot::ipcreply_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `kernel::boot::defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::direct_ack_store::AckRelease` is more private than the item `kernel::boot::ipcreply_direct_ack::release`
+    --> src/kernel/boot/mod.rs:8050:5
+     |
+8050 | /     pub fn release(
+8051 | |         endpoint_index: usize,
+8052 | |         endpoint_generation: u64,
+8053 | |         caller: ReceiverWaiterIdentity,
+8054 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `kernel::boot::ipcreply_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `kernel::direct_ack_store::AckRelease` is only usable at visibility `pub(crate)`
+    --> src/kernel/direct_ack_store.rs:346:1
+     |
+ 346 | pub(crate) enum AckRelease {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::syscall::RecvImmediateOutcome` is more private than the item `runtime::SharedKernel::try_split_ipc_recv_timeout_immediate_into_frame`
+     --> src/runtime.rs:11264:5
+      |
+11264 | /     pub fn try_split_ipc_recv_timeout_immediate_into_frame(
+11265 | |         &self,
+11266 | |         cpu: CpuId,
+11267 | |         frame: &mut TrapFrame,
+11268 | |     ) -> crate::kernel::syscall::RecvImmediateOutcome {
+      | |_____________________________________________________^ method `runtime::SharedKernel::try_split_ipc_recv_timeout_immediate_into_frame` is reachable at visibility `pub`
+      |
+note: but type `kernel::syscall::RecvImmediateOutcome` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall.rs:1921:1
+      |
+ 1921 | pub(crate) enum RecvImmediateOutcome {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::syscall::RecvImmediateOutcome` is more private than the item `runtime::SharedKernel::try_split_ipc_recv_queued_plain_into_frame`
+     --> src/runtime.rs:11593:5
+      |
+11593 | /     pub fn try_split_ipc_recv_queued_plain_into_frame(
+11594 | |         &self,
+11595 | |         cpu: CpuId,
+11596 | |         frame: &mut TrapFrame,
+11597 | |     ) -> crate::kernel::syscall::RecvImmediateOutcome {
+      | |_____________________________________________________^ method `runtime::SharedKernel::try_split_ipc_recv_queued_plain_into_frame` is reachable at visibility `pub`
+      |
+note: but type `kernel::syscall::RecvImmediateOutcome` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall.rs:1921:1
+      |
+ 1921 | pub(crate) enum RecvImmediateOutcome {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `kernel::syscall::sched::FutexWaitDecision` is more private than the item `runtime::SharedKernel::futex_wait_decide_split_read`
+     --> src/runtime.rs:18338:5
+      |
+18338 | /     pub fn futex_wait_decide_split_read(
+18339 | |         &self,
+18340 | |         tid: u64,
+18341 | |         addr: usize,
+18342 | |         expected: u32,
+18343 | |         kind: crate::kernel::boot::futex::FutexKind,
+18344 | |     ) -> Result<crate::kernel::syscall::sched::FutexWaitDecision, crate::kernel::boot::KernelError>
+      | |___________________________________________________________________________________________________^ method `runtime::SharedKernel::futex_wait_decide_split_read` is reachable at visibility `pub`
+      |
+note: but type `kernel::syscall::sched::FutexWaitDecision` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall/sched.rs:167:1
+      |
+  167 | pub(crate) enum FutexWaitDecision {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_DISPATCH_STACK_BYTES` is never used
+   --> src/arch/x86_64/descriptor_tables.rs:194:18
+    |
+194 | pub(crate) const AP_DISPATCH_STACK_BYTES: usize = 2 * 1024 * 1024;
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `read_boot_tss_rsp0` is never used
+    --> src/arch/x86_64/descriptor_tables.rs:3521:15
+     |
+3521 | pub(crate) fn read_boot_tss_rsp0() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^
+
+warning: constant `LAPIC_ICR_LOW_OFFSET` is never used
+  --> src/arch/x86_64/smp.rs:25:7
+   |
+25 | const LAPIC_ICR_LOW_OFFSET: usize = 0x300;
+   |       ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `LAPIC_ICR_HIGH_OFFSET` is never used
+  --> src/arch/x86_64/smp.rs:26:7
+   |
+26 | const LAPIC_ICR_HIGH_OFFSET: usize = 0x310;
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ICR_DELIVERY_STATUS_PENDING` is never used
+  --> src/arch/x86_64/smp.rs:30:7
+   |
+30 | const ICR_DELIVERY_STATUS_PENDING: u32 = 1 << 12;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ICR_IDLE_POLL_ITERS` is never used
+  --> src/arch/x86_64/smp.rs:47:7
+   |
+47 | const ICR_IDLE_POLL_ITERS: usize = 1_000_000;
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: static `AP_HANDOFF_OFFS` is never used
+  --> src/arch/x86_64/smp.rs:96:8
+   |
+96 | static AP_HANDOFF_OFFS: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS] =
+   |        ^^^^^^^^^^^^^^^
+
+warning: static `AP_IRQ_READY_FLAGS` is never used
+   --> src/arch/x86_64/smp.rs:101:8
+    |
+101 | static AP_IRQ_READY_FLAGS: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `lapic_mmio_base` is never used
+   --> src/arch/x86_64/smp.rs:116:4
+    |
+116 | fn lapic_mmio_base() -> usize {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `apic_of` is never used
+   --> src/arch/x86_64/smp.rs:122:15
+    |
+122 | pub(crate) fn apic_of(cpu: CpuId) -> Option<u8> {
+    |               ^^^^^^^
+
+warning: function `planned_secondaries_bitmap` is never used
+   --> src/arch/x86_64/smp.rs:701:15
+    |
+701 | pub(crate) fn planned_secondaries_bitmap() -> u64 {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `bound_apic_id` is never used
+   --> src/arch/x86_64/smp.rs:801:4
+    |
+801 | fn bound_apic_id(cpu: CpuId) -> Option<u32> {
+    |    ^^^^^^^^^^^^^
+
+warning: constant `AP_PRODUCTION_ADMISSION_REQUEST` is never used
+    --> src/arch/x86_64/smp.rs:2599:18
+     |
+2599 | pub(crate) const AP_PRODUCTION_ADMISSION_REQUEST: u32 = 2;
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `PRODUCTION_ADMISSION_OWED` is never used
+    --> src/arch/x86_64/smp.rs:2603:8
+     |
+2603 | static PRODUCTION_ADMISSION_OWED: AtomicU64 = AtomicU64::new(0);
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `send_reschedule_ipi_to` is never used
+    --> src/arch/x86_64/smp.rs:2995:15
+     |
+2995 | pub(crate) fn send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `c2c_send_reschedule_ipi_to` is never used
+    --> src/arch/x86_64/smp.rs:3023:15
+     |
+3023 | pub(crate) fn c2c_send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_TRAMPOLINE_SIZE` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:33:18
+   |
+33 | pub(super) const AP_TRAMPOLINE_SIZE: usize = crate::kernel::vm::PAGE_SIZE;
+   |                  ^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_HANDOFF_TPR_OUT_OFFSET` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:75:18
+   |
+75 | pub(super) const AP_HANDOFF_TPR_OUT_OFFSET: usize = 124;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KERNEL_CR3_RELOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:84:15
+   |
+84 |     pub const KERNEL_CR3_RELOADED: u32 = 1 << 0; // mov cr3 + post-reload fetch survived
+   |               ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GDT_LOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:85:15
+   |
+85 |     pub const GDT_LOADED: u32 = 1 << 1; // lgdt + SS/DS/ES + far-return CS=0x08
+   |               ^^^^^^^^^^
+
+warning: constant `TSS_LOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:86:15
+   |
+86 |     pub const TSS_LOADED: u32 = 1 << 2; // ltr 0x28 (per-AP TSS)
+   |               ^^^^^^^^^^
+
+warning: constant `LAPIC_READ` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:87:15
+   |
+87 |     pub const LAPIC_READ: u32 = 1 << 3; // LAPIC ID register MMIO read done
+   |               ^^^^^^^^^^
+
+warning: constant `IDLE_CTX_PUBLISHED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:88:15
+   |
+88 |     pub const IDLE_CTX_PUBLISHED: u32 = 1 << 4; // canary + live rsp stored via gs:
+   |               ^^^^^^^^^^^^^^^^^^
+
+warning: constant `CR4_SYNCED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:90:15
+   |
+90 |     pub const CR4_SYNCED: u32 = 1 << 5; // mov cr4 = handoff.bsp_cr4 survived
+   |               ^^^^^^^^^^
+
+warning: constant `IDT_LOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:91:15
+   |
+91 |     pub const IDT_LOADED: u32 = 1 << 6; // lidt of the AP-safe IDT done
+   |               ^^^^^^^^^^
+
+warning: constant `LAPIC_SW_ENABLED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:95:15
+   |
+95 |     pub const LAPIC_SW_ENABLED: u32 = 1 << 7;
+   |               ^^^^^^^^^^^^^^^^
+
+warning: function `fallback_kernel_stack_bounds` is never used
+   --> src/arch/x86_64/trap.rs:571:15
+    |
+571 | pub(crate) fn fallback_kernel_stack_bounds(rsp: u64) -> (u64, u64, u64) {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `kernel_stack_bounds_if_containing` is never used
+   --> src/arch/x86_64/trap.rs:585:15
+    |
+585 | pub(crate) fn kernel_stack_bounds_if_containing(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `find_kernel_stack_bounds_containing_rsp_split` is never used
+   --> src/arch/x86_64/trap.rs:608:15
+    |
+608 | pub(crate) fn find_kernel_stack_bounds_containing_rsp_split(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `handle_trap_entry_with_fault_bookkeeping_mode` is never used
+  --> src/arch/trap_entry.rs:74:15
+   |
+74 | pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `AlreadyRecordedBySharedSeam` is never constructed
+   --> src/kernel/boot/mod.rs:195:5
+    |
+193 | pub(crate) enum FaultBookkeepingMode {
+    |                 -------------------- variant in this enum
+194 |     RecordInHandleTrapEvent,
+195 |     AlreadyRecordedBySharedSeam,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `FaultBookkeepingMode` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `VmBrkPlan` is never constructed
+   --> src/kernel/boot/mod.rs:438:19
+    |
+438 | pub(crate) struct VmBrkPlan {
+    |                   ^^^^^^^^^
+
+warning: struct `VmAnonMapProgressPlan` is never constructed
+   --> src/kernel/boot/mod.rs:570:19
+    |
+570 | pub(crate) struct VmAnonMapProgressPlan {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_d6_controlled_switch_proof_enabled` is never used
+    --> src/kernel/boot/mod.rs:1082:15
+     |
+1082 | pub(crate) fn set_d6_controlled_switch_proof_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_d6_switch_a_enabled` is never used
+    --> src/kernel/boot/mod.rs:1107:15
+     |
+1107 | pub(crate) fn set_d6_switch_a_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `FUTEX_WAIT_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:1557:8
+     |
+1557 | static FUTEX_WAIT_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_futex_wait_default_on` is never used
+    --> src/kernel/boot/mod.rs:1563:15
+     |
+1563 | pub(crate) fn maybe_log_futex_wait_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_ASYNC_RESUME_PENDING` is never used
+    --> src/kernel/boot/mod.rs:1704:19
+     |
+1704 | pub(crate) static RISCV_ASYNC_RESUME_PENDING: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_publish` is never used
+    --> src/kernel/boot/mod.rs:1710:15
+     |
+1710 | pub(crate) fn riscv_async_resume_publish(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_take` is never used
+    --> src/kernel/boot/mod.rs:1721:15
+     |
+1721 | pub(crate) fn riscv_async_resume_take(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_clear` is never used
+    --> src/kernel/boot/mod.rs:1733:15
+     |
+1733 | pub(crate) fn riscv_async_resume_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_SYSCALL_CONTINUATION_PENDING` is never used
+    --> src/kernel/boot/mod.rs:1757:19
+     |
+1757 | pub(crate) static RISCV_SYSCALL_CONTINUATION_PENDING: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_publish` is never used
+    --> src/kernel/boot/mod.rs:1763:15
+     |
+1763 | pub(crate) fn riscv_syscall_continuation_publish(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_take` is never used
+    --> src/kernel/boot/mod.rs:1771:15
+     |
+1771 | pub(crate) fn riscv_syscall_continuation_take(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_clear` is never used
+    --> src/kernel/boot/mod.rs:1780:15
+     |
+1780 | pub(crate) fn riscv_syscall_continuation_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED` is never used
+    --> src/kernel/boot/mod.rs:1792:19
+     |
+1792 | pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING` is never used
+    --> src/kernel/boot/mod.rs:1795:19
+     |
+1795 | pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING: [core::sync::atomic::AtomicU64;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_DONE` is never used
+    --> src/kernel/boot/mod.rs:1800:8
+     |
+1800 | static RISCV_QUEUE_SWITCH_FOUNDATION_DONE: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_queue_switch_foundation_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:1810:15
+     |
+1810 | pub(crate) fn set_riscv_queue_switch_foundation_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_armed` is never used
+    --> src/kernel/boot/mod.rs:1820:15
+     |
+1820 | pub(crate) fn riscv_queue_switch_foundation_armed() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_try_defer` is never used
+    --> src/kernel/boot/mod.rs:1827:15
+     |
+1827 | pub(crate) fn riscv_queue_switch_foundation_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_is_deferred` is never used
+    --> src/kernel/boot/mod.rs:1859:15
+     |
+1859 | pub(crate) fn riscv_queue_switch_foundation_is_deferred(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_outgoing` is never used
+    --> src/kernel/boot/mod.rs:1865:15
+     |
+1865 | pub(crate) fn riscv_queue_switch_foundation_outgoing(cpu_idx: usize) -> Option<u64> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_clear` is never used
+    --> src/kernel/boot/mod.rs:1876:15
+     |
+1876 | pub(crate) fn riscv_queue_switch_foundation_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_futex_wait_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:1909:15
+     |
+1909 | pub(crate) fn set_riscv_futex_wait_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_futex_wait_idle_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:1917:15
+     |
+1917 | pub(crate) fn set_riscv_futex_wait_idle_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:1928:8
+     |
+1928 | static RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_riscv_futex_wait_retire_default_on` is never used
+    --> src/kernel/boot/mod.rs:1933:15
+     |
+1933 | pub(crate) fn maybe_log_riscv_futex_wait_retire_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `YIELD_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:1980:8
+     |
+1980 | static YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_yield_default_on` is never used
+    --> src/kernel/boot/mod.rs:1986:15
+     |
+1986 | pub(crate) fn maybe_log_yield_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_YIELD_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:2012:8
+     |
+2012 | static RISCV_YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_riscv_yield_retire_default_on` is never used
+    --> src/kernel/boot/mod.rs:2017:15
+     |
+2017 | pub(crate) fn maybe_log_riscv_yield_retire_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_yield_two_task_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:2040:15
+     |
+2040 | pub(crate) fn set_riscv_yield_two_task_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_yield_lone_task_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:2046:15
+     |
+2046 | pub(crate) fn set_riscv_yield_lone_task_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_code` is never used
+    --> src/kernel/boot/mod.rs:2125:8
+     |
+2110 | impl BlockingSyscallClass {
+     | ------------------------- associated function in this implementation
+...
+2125 |     fn from_code(code: u8) -> Option<BlockingSyscallClass> {
+     |        ^^^^^^^^^
+
+warning: function `blocked_syscall_idle_provenance_take` is never used
+    --> src/kernel/boot/mod.rs:2164:15
+     |
+2164 | pub(crate) fn blocked_syscall_idle_provenance_take(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `current_arch_tag` is never used
+    --> src/kernel/boot/mod.rs:2192:21
+     |
+2192 | pub(crate) const fn current_arch_tag() -> &'static str {
+     |                     ^^^^^^^^^^^^^^^^
+
+warning: static `SHARED_REGION_CANCEL_FUSE_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:2251:8
+     |
+2251 | static SHARED_REGION_CANCEL_FUSE_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_shared_region_cancel_fuse_set` is never used
+    --> src/kernel/boot/mod.rs:2258:15
+     |
+2258 | pub(crate) fn maybe_log_shared_region_cancel_fuse_set() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_sched_timeout_enabled` is never used
+    --> src/kernel/boot/mod.rs:2837:15
+     |
+2837 | pub(crate) fn set_sched_timeout_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_vm_cow_enabled` is never used
+    --> src/kernel/boot/mod.rs:2869:15
+     |
+2869 | pub(crate) fn set_vm_cow_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `set_cap_cnode_enabled` is never used
+    --> src/kernel/boot/mod.rs:2893:15
+     |
+2893 | pub(crate) fn set_cap_cnode_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_fault_delivery_enabled` is never used
+    --> src/kernel/boot/mod.rs:2924:15
+     |
+2924 | pub(crate) fn set_fault_delivery_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_spawn_lifecycle_enabled` is never used
+    --> src/kernel/boot/mod.rs:2955:15
+     |
+2955 | pub(crate) fn set_spawn_lifecycle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_global_state_enabled` is never used
+    --> src/kernel/boot/mod.rs:2986:15
+     |
+2986 | pub(crate) fn set_global_state_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_cross_arch_d6_enabled` is never used
+    --> src/kernel/boot/mod.rs:3144:15
+     |
+3144 | pub(crate) fn set_cross_arch_d6_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_d3_full_enabled` is never used
+    --> src/kernel/boot/mod.rs:3176:15
+     |
+3176 | pub(crate) fn set_d3_full_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_recv_oracle_proof_enabled` is never used
+    --> src/kernel/boot/mod.rs:3305:15
+     |
+3305 | pub(crate) fn set_ipc_recv_oracle_proof_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_recv_proof_sender_wake_enabled` is never used
+    --> src/kernel/boot/mod.rs:3342:15
+     |
+3342 | pub(crate) fn set_ipc_recv_proof_sender_wake_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_plain_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3539:15
+     |
+3539 | pub(crate) fn set_ipc_send_plain_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_cap_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3561:15
+     |
+3561 | pub(crate) fn set_ipc_send_cap_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_reply_cap_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3583:15
+     |
+3583 | pub(crate) fn set_ipc_send_reply_cap_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_enqueue_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3604:15
+     |
+3604 | pub(crate) fn set_ipc_send_enqueue_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_cap_enqueue_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3626:15
+     |
+3626 | pub(crate) fn set_ipc_send_cap_enqueue_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_futex_wake_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3641:15
+     |
+3641 | pub(crate) fn set_aarch64_futex_wake_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_futex_wait_retire_enabled` is never used
+    --> src/kernel/boot/mod.rs:3659:15
+     |
+3659 | pub(crate) fn set_aarch64_futex_wait_retire_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_futex_wait_idle_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3674:15
+     |
+3674 | pub(crate) fn set_aarch64_futex_wait_idle_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_yield_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3688:15
+     |
+3688 | pub(crate) fn set_aarch64_yield_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_yield_lone_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3700:15
+     |
+3700 | pub(crate) fn set_aarch64_yield_lone_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_terminal_fault_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3723:15
+     |
+3723 | pub(crate) fn set_aarch64_terminal_fault_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_terminal_fault_fetch_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3763:15
+     |
+3763 | pub(crate) fn set_terminal_fault_fetch_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_terminal_fault_waiter_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3789:15
+     |
+3789 | pub(crate) fn set_terminal_fault_waiter_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_terminal_fault_portio_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3811:15
+     |
+3811 | pub(crate) fn set_terminal_fault_portio_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_terminal_fault_illegal_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3833:15
+     |
+3833 | pub(crate) fn set_terminal_fault_illegal_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_irq1_hosted_bridge_injection` is never used
+    --> src/kernel/boot/mod.rs:3866:15
+     |
+3866 | pub(crate) fn set_irq1_hosted_bridge_injection(armed: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_post_lock_foundation_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3891:15
+     |
+3891 | pub(crate) fn set_riscv_post_lock_foundation_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_futex_wake_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3909:15
+     |
+3909 | pub(crate) fn set_riscv_futex_wake_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_futex_wake_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3925:15
+     |
+3925 | pub(crate) fn set_x86_futex_wake_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_shared_region_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3943:15
+     |
+3943 | pub(crate) fn set_x86_shared_region_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_shared_region_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3964:15
+     |
+3964 | pub(crate) fn set_aarch64_shared_region_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_shared_region_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3985:15
+     |
+3985 | pub(crate) fn set_riscv_shared_region_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipccall_direct_proof_enabled` is never used
+    --> src/kernel/boot/mod.rs:4012:15
+     |
+4012 | pub(crate) fn set_ipccall_direct_proof_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:4233:15
+     |
+4233 | pub(crate) fn set_x86_ipccall_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_smp_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:4271:15
+     |
+4271 | pub(crate) fn set_x86_ipccall_direct_smp_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_smp_recv_v2_server_enabled` is never used
+    --> src/kernel/boot/mod.rs:4310:15
+     |
+4310 | pub(crate) fn set_x86_ipccall_direct_smp_recv_v2_server_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_smp_request_enabled` is never used
+    --> src/kernel/boot/mod.rs:4331:15
+     |
+4331 | pub(crate) fn set_x86_ipccall_direct_smp_request_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipccall_direct_smp_request_note_early_wouldblock` is never used
+    --> src/kernel/boot/mod.rs:4352:15
+     |
+4352 | pub(crate) fn ipccall_direct_smp_request_note_early_wouldblock() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipccall_direct_smp_request_note_delivered` is never used
+    --> src/kernel/boot/mod.rs:4367:15
+     |
+4367 | pub(crate) fn ipccall_direct_smp_request_note_delivered() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_smp_reply_enabled` is never used
+    --> src/kernel/boot/mod.rs:4573:15
+     |
+4573 | pub(crate) fn set_x86_ipccall_direct_smp_reply_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_reply_note_delivered` is never used
+    --> src/kernel/boot/mod.rs:4591:15
+     |
+4591 | pub(crate) fn ipcreply_direct_smp_reply_note_delivered() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_reply_note_early_wouldblock` is never used
+    --> src/kernel/boot/mod.rs:4604:15
+     |
+4604 | pub(crate) fn ipcreply_direct_smp_reply_note_early_wouldblock() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_note_duplicate_refused` is never used
+    --> src/kernel/boot/mod.rs:4621:15
+     |
+4621 | pub(crate) fn ipcreply_direct_smp_note_duplicate_refused() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_echo_smp_oracle_block` is never used
+    --> src/kernel/boot/mod.rs:4726:15
+     |
+4726 | pub(crate) fn maybe_echo_smp_oracle_block(_cpu: u8, _tid: u64, _endpoint: usize, _wait_gen: u64) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_ipccall_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:4760:15
+     |
+4760 | pub(crate) fn set_aarch64_ipccall_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_ipccall_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:4782:15
+     |
+4782 | pub(crate) fn set_riscv_ipccall_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipc_reply_timeout_oracle_mode` is never used
+    --> src/kernel/boot/mod.rs:5206:15
+     |
+5206 | pub(crate) fn set_x86_ipc_reply_timeout_oracle_mode(mode: u8) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_reply_timeout_oracle_reply_endpoint` is never used
+    --> src/kernel/boot/mod.rs:5218:15
+     |
+5218 | pub(crate) fn set_ipc_reply_timeout_oracle_reply_endpoint(eidx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `IPC_REPLY_TIMEOUT_RW_DEADLINE` is never used
+    --> src/kernel/boot/mod.rs:5225:8
+     |
+5225 | static IPC_REPLY_TIMEOUT_RW_DEADLINE: core::sync::atomic::AtomicU64 =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `IPC_REPLY_TIMEOUT_RW_LATE_EMITTED` is never used
+    --> src/kernel/boot/mod.rs:5227:8
+     |
+5227 | static IPC_REPLY_TIMEOUT_RW_LATE_EMITTED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_reply_timeout_rw_deadline` is never used
+    --> src/kernel/boot/mod.rs:5230:15
+     |
+5230 | pub(crate) fn set_ipc_reply_timeout_rw_deadline(tick: u64) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipc_reply_timeout_rw_deadline` is never used
+    --> src/kernel/boot/mod.rs:5233:15
+     |
+5233 | pub(crate) fn ipc_reply_timeout_rw_deadline() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipc_reply_timeout_rw_late_scan_once` is never used
+    --> src/kernel/boot/mod.rs:5237:15
+     |
+5237 | pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_emit_server_dies_link_balance` is never used
+    --> src/kernel/boot/mod.rs:6261:15
+     |
+6261 | pub(crate) fn maybe_emit_server_dies_link_balance(_msg: &str, _live_links: usize) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `slot` is never used
+    --> src/kernel/boot/mod.rs:6402:19
+     |
+6401 | impl ServerDeathWorkReservation {
+     | ------------------------------- method in this implementation
+6402 |     pub(crate) fn slot(&self) -> usize {
+     |                   ^^^^
+
+warning: function `server_death_work_len` is never used
+    --> src/kernel/boot/mod.rs:6506:15
+     |
+6506 | pub(crate) fn server_death_work_len(cpu_idx: usize) -> usize {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_clear` is never used
+    --> src/kernel/boot/mod.rs:6518:15
+     |
+6518 | pub(crate) fn server_death_work_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_published_count` is never used
+    --> src/kernel/boot/mod.rs:6730:15
+     |
+6730 | pub(crate) fn server_death_work_published_count() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_drained_count` is never used
+    --> src/kernel/boot/mod.rs:6733:15
+     |
+6733 | pub(crate) fn server_death_work_drained_count() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `emit_ipccall_direct_request_live_markers` is never used
+    --> src/kernel/boot/mod.rs:7382:15
+     |
+7382 | pub(crate) fn emit_ipccall_direct_request_live_markers() {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `emit_ipcreply_direct_live_markers` is never used
+    --> src/kernel/boot/mod.rs:7393:15
+     |
+7393 | pub(crate) fn emit_ipcreply_direct_live_markers() {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_force_init_zc_load_fail` is never used
+    --> src/kernel/boot/mod.rs:8307:15
+     |
+8307 | pub(crate) fn set_force_init_zc_load_fail(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_typed_outcome_internal_error_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:8322:15
+     |
+8322 | pub(crate) fn set_riscv_typed_outcome_internal_error_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `SHARED_REGION_ORACLE_PAGES` is never used
+    --> src/kernel/boot/mod.rs:8513:18
+     |
+8513 | pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_residual1_queued_cap_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8568:15
+     |
+8568 | pub(crate) fn set_ipc_residual1_queued_cap_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_residual2_park_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8592:15
+     |
+8592 | pub(crate) fn set_ipc_residual2_park_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_final_fault_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8621:15
+     |
+8621 | pub(crate) fn set_ipc_send_final_fault_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_timer5_idle_return_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8663:15
+     |
+8663 | pub(crate) fn set_timer5_idle_return_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_displace1_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8688:15
+     |
+8688 | pub(crate) fn set_ipc_displace1_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_futex_requeue_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8709:15
+     |
+8709 | pub(crate) fn set_futex_requeue_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `note_recv_broad_entry` is never used
+    --> src/kernel/boot/mod.rs:8975:15
+     |
+8975 | pub(crate) fn note_recv_broad_entry() {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_xfer2_grant_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8989:15
+     |
+8989 | pub(crate) fn set_xfer2_grant_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `shared_region_oracle_pattern_byte` is never used
+    --> src/kernel/boot/mod.rs:9344:21
+     |
+9344 | pub(crate) const fn shared_region_oracle_pattern_byte(off: usize) -> u8 {
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `find_current_task_cap_for_memory_object_phys` is never used
+   --> src/kernel/boot/capability_lifecycle_state.rs:808:19
+    |
+  7 | impl KernelState {
+    | ---------------- method in this implementation
+...
+808 |     pub(crate) fn find_current_task_cap_for_memory_object_phys(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `resolved_cap_object_split` is never used
+    --> src/kernel/boot/capability_lifecycle_state.rs:1072:19
+     |
+1063 | impl crate::runtime::SharedKernel {
+     | --------------------------------- method in this implementation
+...
+1072 |     pub(crate) fn resolved_cap_object_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `observe_user_marker` is never used
+   --> src/kernel/boot/smp_request_txn.rs:214:15
+    |
+214 | pub(crate) fn observe_user_marker(msg: &str, tid: u64, cpu: u8) {
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ALL_COW_CLONE_SITES` is never used
+  --> src/kernel/boot/cow_clone.rs:79:18
+   |
+79 | pub(crate) const ALL_COW_CLONE_SITES: [&str; 8] = [
+   |                  ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CowPageRecord` is never constructed
+   --> src/kernel/boot/defs.rs:219:19
+    |
+219 | pub(crate) struct CowPageRecord {
+    |                   ^^^^^^^^^^^^^
+
+warning: associated items `for_bare_tid` and `asid` are never used
+   --> src/kernel/boot/defs.rs:269:19
+    |
+261 | impl EndpointWaiterRecord {
+    | ------------------------- associated items in this implementation
+...
+269 |     pub(crate) fn for_bare_tid(tid: ThreadId) -> Self {
+    |                   ^^^^^^^^^^^^
+...
+284 |     pub(crate) fn asid(&self) -> Asid {
+    |                   ^^^^
+
+warning: function `ap_probe_stub_bytes` is never used
+   --> src/kernel/boot/exec_state.rs:168:15
+    |
+168 | pub(crate) fn ap_probe_stub_bytes() -> &'static [u8] {
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `d2_recv_switch_incoming_asid` and `d6_emit_proof_cleanup_arch_markers` are never used
+    --> src/kernel/boot/exec_state.rs:2643:19
+     |
+ 426 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+2643 |     pub(crate) fn d2_recv_switch_incoming_asid(&mut self, incoming: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3222 |     pub(crate) fn d6_emit_proof_cleanup_arch_markers(&mut self) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `queue_advance_admit_with_authority_split` is never used
+    --> src/kernel/boot/exec_state.rs:4585:19
+     |
+4402 | impl crate::runtime::SharedKernel {
+     | --------------------------------- method in this implementation
+...
+4585 |     pub(crate) fn queue_advance_admit_with_authority_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `fault_current_task_for_test` and `fault_current_task_unsupported_instruction` are never used
+    --> src/kernel/boot/fault_state.rs:1899:19
+     |
+1188 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+1899 |     pub(crate) fn fault_current_task_for_test(&mut self) -> Result<(), KernelError> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2034 |     pub(crate) fn fault_current_task_unsupported_instruction(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `remove_endpoint_waiter_exact` is never used
+   --> src/kernel/boot/ipc_state.rs:990:19
+    |
+723 | impl IpcSubsystem {
+    | ----------------- method in this implementation
+...
+990 |     pub(crate) fn remove_endpoint_waiter_exact(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `reserve_direct_reply_record_locked` is never used
+    --> src/kernel/boot/ipc_state.rs:1507:15
+     |
+1507 | pub(crate) fn reserve_direct_reply_record_locked(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `classify_direct_reply_terminal_locked` is never used
+    --> src/kernel/boot/ipc_state.rs:1544:15
+     |
+1544 | pub(crate) fn classify_direct_reply_terminal_locked(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `DirectReplyTerminalClaim` is never used
+    --> src/kernel/boot/ipc_state.rs:1638:17
+     |
+1638 | pub(crate) enum DirectReplyTerminalClaim {
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `claim_direct_reply_terminal_locked` is never used
+    --> src/kernel/boot/ipc_state.rs:1655:15
+     |
+1655 | pub(crate) fn claim_direct_reply_terminal_locked(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `commit_queued_reply_locked` is never used
+    --> src/kernel/boot/ipc_state.rs:1758:15
+     |
+1758 | pub(crate) fn commit_queued_reply_locked(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: multiple methods are never used
+    --> src/kernel/boot/ipc_state.rs:2253:19
+     |
+2075 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+2253 |     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2364 |     pub(crate) fn complete_server_death_for_link(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2412 |     pub(crate) fn revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2434 |     pub(crate) fn reserve_direct_reply_record(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2449 |     pub(crate) fn commit_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2556 |     pub(crate) fn unregister_server_reply_link(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2643 |     pub(crate) fn live_server_reply_link_count(&self) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2655 |     pub(crate) fn cancel_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2684 |     pub(crate) fn bind_direct_reply_record_server_cap(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2724 |     pub(crate) fn reply_terminal_armed_identity(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2799 |     pub(crate) fn rearm_terminal_for_reply_record(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2849 |     pub(crate) fn try_claim_reply_terminal_slot(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2870 |     pub(crate) fn commit_reply_terminal_slot(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2882 |     pub(crate) fn release_reply_terminal_slot_if_retryable(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2968 |     pub(crate) fn claim_deadline_fire_exact(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2981 |     pub(crate) fn cancel_deadline_exact(
+     |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+2995 |     pub(crate) fn disarm_deadline_after_terminal_completion(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3010 |     pub(crate) fn complete_deadline_fire(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+3024 |     pub(crate) fn disarm_deadline_fire(
+     |                   ^^^^^^^^^^^^^^^^^^^^
+...
+3040 |     pub(crate) fn claim_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3054 |     pub(crate) fn complete_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3069 |     pub(crate) fn restore_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3319 |     pub(crate) fn take_blocked_syscall_completion(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3343 |     pub(crate) fn take_blocked_syscall_completion_of_class(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3548 |     pub(crate) fn reply_record_slot_generation(&self, index: usize) -> Option<u64> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3555 |     pub(crate) fn set_pending_syscall_completion_for_test(&mut self, tid: u64, result: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3565 |     pub(crate) fn set_pending_syscall_completion_of_class_for_test(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3604 |     pub(crate) fn blocked_recv_generation_for_test(&self, tid: u64) -> Option<u64> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3626 |     pub(crate) fn seed_resumable_user_context_for_test(&mut self, tid: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3636 |     pub(crate) fn set_task_status_for_test(&mut self, tid: u64, status: TaskStatus) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3644 |     pub(crate) fn has_pending_syscall_completion(&self, tid: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4214 |     pub(crate) fn run_reply_timeout_completion_locked(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+6865 |     pub(crate) fn try_ipc_send_boundary_split_plain_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+6934 |     pub(crate) fn try_ipc_send_boundary_split_ordinary_cap_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+7043 |     pub(crate) fn try_ipc_send_boundary_split_reply_cap_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `mark_cow_page` and `clone_user_address_space_cow` are never used
+   --> src/kernel/boot/memory_state.rs:46:8
+    |
+ 13 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+ 46 |     fn mark_cow_page(&mut self, asid: Asid, virt: VirtAddr) -> Result<(), KernelError> {
+    |        ^^^^^^^^^^^^^
+...
+429 |     pub(crate) fn clone_user_address_space_cow(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `x86_smp_unlock_audit_claimed` is never used
+  --> src/kernel/boot/orchestrator_state.rs:23:15
+   |
+23 | pub(crate) fn x86_smp_unlock_audit_claimed() -> bool {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `run_cross_arch_live_audit_at_first_dispatch`, `run_unlock_graduated_proof_at_bootstrap`, `resolve_endpoint_send_cap_in_pid_from_raw`, `resolve_reply_cap_in_pid_from_raw`, `process_cnode_for_pid_from_raw`, and `process_cnode_for_identity_from_raw` are never used
+    --> src/kernel/boot/orchestrator_state.rs:885:19
+     |
+ 100 | impl KernelState {
+     | ---------------- associated items in this implementation
+...
+ 885 |     pub(crate) fn run_cross_arch_live_audit_at_first_dispatch(&self, tid: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1413 |     pub(crate) fn run_unlock_graduated_proof_at_bootstrap(&mut self, tid: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2755 |     pub(crate) unsafe fn resolve_endpoint_send_cap_in_pid_from_raw(
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2799 |     pub(crate) unsafe fn resolve_reply_cap_in_pid_from_raw(
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2832 |     pub(crate) unsafe fn process_cnode_for_pid_from_raw(
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2858 |     pub(crate) unsafe fn process_cnode_for_identity_from_raw(
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `nothing_created` is never used
+  --> src/kernel/boot/process_cnode_txn.rs:91:25
+   |
+88 | impl ProcessCNodeGrant {
+   | ---------------------- associated function in this implementation
+...
+91 |     pub(crate) const fn nothing_created(cnode: CNodeId) -> Self {
+   |                         ^^^^^^^^^^^^^^^
+
+warning: methods `withdraw_queued_tid_on`, `on_dispatch_selection_on_cpu`, `on_preempt_prefer_current_cpu`, `task_home_cpu`, and `apply_cross_cpu_wake_task_for_test` are never used
+   --> src/kernel/boot/scheduler_state.rs:63:19
+    |
+ 23 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+ 63 |     pub(crate) fn withdraw_queued_tid_on(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+156 |     pub(crate) fn on_dispatch_selection_on_cpu(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+318 |     pub(crate) fn on_preempt_prefer_current_cpu(&mut self, preferred: u64) -> Option<u64> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+603 |     pub(crate) fn task_home_cpu(&self, tid: u64) -> Option<CpuId> {
+    |                   ^^^^^^^^^^^^^
+...
+780 |     pub(crate) fn apply_cross_cpu_wake_task_for_test(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `shared_region_request_cancel`, `shared_region_execute`, and `rollback_shared_region_direct_txn` are never used
+   --> src/kernel/boot/shared_region_txn.rs:248:19
+    |
+233 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+248 |     pub(crate) fn shared_region_request_cancel(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+437 |     pub(crate) fn shared_region_execute(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+452 |     pub(crate) fn rollback_shared_region_direct_txn(&mut self, txn: &mut SharedRegionDirectTxn) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `thread_control_block_snapshot_for_test` and `set_blocked_recv_generation_for_test` are never used
+   --> src/kernel/boot/task_policy_state.rs:143:19
+    |
+  9 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+143 |     pub(crate) fn thread_control_block_snapshot_for_test(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+153 |     pub(crate) fn set_blocked_recv_generation_for_test(&mut self, tid: u64, generation: u64) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+    --> src/kernel/boot/thread_state.rs:324:8
+     |
+ 323 | impl KernelState {
+     | ---------------- associated items in this implementation
+ 324 |     fn fork_should_inherit_capability(object: CapObject) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 340 |     fn inherit_parent_capabilities_for_fork(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 438 |     pub(crate) fn clear_blocked_recv_return_regs_locked(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1270 |     pub(crate) fn d6_ensure_live_rsp_region_mapped(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2516 |     pub(crate) fn snapshot_async_preempted_current(&mut self, frame: &TrapFrame) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2545 |     pub(crate) fn take_async_preempt_for_incoming(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2558 |     pub(crate) fn cancel_async_preempt_for(&mut self, tid: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2567 |     pub(crate) fn async_preempted_resume_pending(&mut self, tid: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `update_active_transfer_mapping_len_locked` is never used
+   --> src/kernel/boot/transfer_state.rs:426:19
+    |
+  6 | impl KernelState {
+    | ---------------- associated function in this implementation
+...
+426 |     pub(crate) fn update_active_transfer_mapping_len_locked(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variants `DirectRequest`, `DirectReply`, `OrdinaryTimeout`, and `Notification` are never constructed
+   --> src/kernel/boot/waiter_ownership.rs:145:5
+    |
+143 | pub(crate) enum WaiterOwner {
+    |                 ----------- variants in this enum
+144 |     /// The off-lock NR6 direct request transaction.
+145 |     DirectRequest,
+    |     ^^^^^^^^^^^^^
+146 |     /// The off-lock NR7 direct reply transaction.
+147 |     DirectReply,
+    |     ^^^^^^^^^^^
+148 |     /// The ordinary (non-token-bearing) IPC deadline scan.
+149 |     OrdinaryTimeout,
+    |     ^^^^^^^^^^^^^^^
+...
+153 |     Notification,
+    |     ^^^^^^^^^^^^
+    |
+    = note: `WaiterOwner` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `owner`, `endpoint_index`, and `waiter` are never used
+   --> src/kernel/boot/waiter_ownership.rs:314:19
+    |
+312 | impl WaiterClaimToken {
+    | --------------------- methods in this implementation
+313 |     /// Which owner earned this claim — so a future owner can log and assert its own identity.
+314 |     pub(crate) fn owner(&self) -> WaiterOwner {
+    |                   ^^^^^
+...
+320 |     pub(crate) fn endpoint_index(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^
+...
+326 |     pub(crate) fn waiter(&self) -> ReceiverWaiterIdentity {
+    |                   ^^^^^^
+
+warning: methods `claimed_count` and `occupied_count` are never used
+   --> src/kernel/boot/waiter_ownership.rs:720:8
+    |
+494 | impl WaiterOwnershipTable {
+    | ------------------------- methods in this implementation
+...
+720 |     fn claimed_count(&self) -> usize {
+    |        ^^^^^^^^^^^^^
+...
+729 |     fn occupied_count(&self) -> usize {
+    |        ^^^^^^^^^^^^^^
+
+warning: methods `waiter_ownership_claimed_count` and `waiter_ownership_occupied_count` are never used
+   --> src/kernel/boot/waiter_ownership.rs:785:19
+    |
+740 | impl IpcSubsystem {
+    | ----------------- methods in this implementation
+...
+785 |     pub(crate) fn waiter_ownership_claimed_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+789 |     pub(crate) fn waiter_ownership_occupied_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `publish` is never used
+    --> src/kernel/boot/mod.rs:7510:19
+     |
+7510 |     pub(crate) fn publish(ack: BlockedServerAck) -> u64 {
+     |                   ^^^^^^^
+
+warning: function `publish` is never used
+    --> src/kernel/boot/mod.rs:7994:19
+     |
+7994 |     pub(crate) fn publish(ack: BlockedCallerAck) -> u64 {
+     |                   ^^^^^^^
+
+warning: constant `BOOT_COMMAND_LINE_MAX_BYTES` is never used
+  --> src/kernel/boot_command_line.rs:10:11
+   |
+10 | pub const BOOT_COMMAND_LINE_MAX_BYTES: usize = 2048;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `YARM_BOOT_OPTION_MAX_KEY_BYTES` is never used
+  --> src/kernel/boot_command_line.rs:11:11
+   |
+11 | pub const YARM_BOOT_OPTION_MAX_KEY_BYTES: usize = 64;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `YARM_BOOT_OPTION_MAX_VALUE_BYTES` is never used
+  --> src/kernel/boot_command_line.rs:12:11
+   |
+12 | pub const YARM_BOOT_OPTION_MAX_VALUE_BYTES: usize = 1024;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `YARM_MANIFEST_PATH_MAX_BYTES` is never used
+  --> src/kernel/boot_command_line.rs:13:11
+   |
+13 | pub const YARM_MANIFEST_PATH_MAX_BYTES: usize = 255;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `BootCommandLineStatus` is never used
+  --> src/kernel/boot_command_line.rs:16:10
+   |
+16 | pub enum BootCommandLineStatus {
+   |          ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `BootCommandLine` is never constructed
+  --> src/kernel/boot_command_line.rs:23:12
+   |
+23 | pub struct BootCommandLine {
+   |            ^^^^^^^^^^^^^^^
+
+warning: associated items `absent`, `set_raw_cmdline_from_bytes`, `raw_cmdline`, `status`, `cmdline_was_truncated`, and `set_raw_cmdline_from_bytes_monotonic` are never used
+  --> src/kernel/boot_command_line.rs:40:18
+   |
+39 | impl BootCommandLine {
+   | -------------------- associated items in this implementation
+40 |     pub const fn absent() -> Self {
+   |                  ^^^^^^
+...
+53 |     pub fn set_raw_cmdline_from_bytes(&mut self, source: &[u8]) {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+68 |     pub fn raw_cmdline(&self) -> &[u8] {
+   |            ^^^^^^^^^^^
+...
+72 |     pub const fn status(&self) -> BootCommandLineStatus {
+   |                  ^^^^^^
+...
+76 |     pub const fn cmdline_was_truncated(&self) -> bool {
+   |                  ^^^^^^^^^^^^^^^^^^^^^
+...
+90 |     pub fn set_raw_cmdline_from_bytes_monotonic(&mut self, source: &[u8]) -> bool {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `BOOT_COMMAND_LINE` is never used
+   --> src/kernel/boot_command_line.rs:103:8
+    |
+103 | static BOOT_COMMAND_LINE: SpinLock<BootCommandLine> = SpinLock::new(BootCommandLine::absent());
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: function `apply_boot_option_knobs` is never used
+   --> src/kernel/boot_command_line.rs:115:4
+    |
+115 | fn apply_boot_option_knobs(captured: &BootCommandLine) {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_raw_cmdline_from_bytes` is never used
+   --> src/kernel/boot_command_line.rs:680:8
+    |
+680 | pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_raw_cmdline_from_bytes_monotonic` is never used
+   --> src/kernel/boot_command_line.rs:695:8
+    |
+695 | pub fn set_raw_cmdline_from_bytes_monotonic(source: &[u8]) -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `boot_command_line` is never used
+   --> src/kernel/boot_command_line.rs:709:8
+    |
+709 | pub fn boot_command_line() -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: enum `PlatformOption` is never used
+   --> src/kernel/boot_command_line.rs:714:10
+    |
+714 | pub enum PlatformOption {
+    |          ^^^^^^^^^^^^^^
+
+warning: enum `BootPhase` is never used
+   --> src/kernel/boot_command_line.rs:722:10
+    |
+722 | pub enum BootPhase {
+    |          ^^^^^^^^^
+
+warning: struct `YarmBootOptions` is never constructed
+   --> src/kernel/boot_command_line.rs:732:12
+    |
+732 | pub struct YarmBootOptions<'a> {
+    |            ^^^^^^^^^^^^^^^
+
+warning: function `parse_loglevel_value` is never used
+    --> src/kernel/boot_command_line.rs:1102:4
+     |
+1102 | fn parse_loglevel_value(value: &[u8]) -> Option<u8> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_yarm_boot_options` is never used
+    --> src/kernel/boot_command_line.rs:1123:8
+     |
+1123 | pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_bool_knob` is never used
+    --> src/kernel/boot_command_line.rs:1456:4
+     |
+1456 | fn parse_bool_knob(value: &[u8]) -> Option<bool> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `parse_platform_option` is never used
+    --> src/kernel/boot_command_line.rs:1464:4
+     |
+1464 | fn parse_platform_option(value: &[u8]) -> Option<PlatformOption> {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_boot_phase` is never used
+    --> src/kernel/boot_command_line.rs:1473:4
+     |
+1473 | fn parse_boot_phase(value: &[u8]) -> Option<BootPhase> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_positive_usize` is never used
+    --> src/kernel/boot_command_line.rs:1484:4
+     |
+1484 | fn parse_positive_usize(value: &[u8]) -> Option<usize> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `valid_manifest_path` is never used
+    --> src/kernel/boot_command_line.rs:1500:4
+     |
+1500 | fn valid_manifest_path(path: &[u8]) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `NO_ENDPOINT` is never used
+   --> src/kernel/direct_ack_store.rs:180:7
+    |
+180 | const NO_ENDPOINT: usize = usize::MAX;
+    |       ^^^^^^^^^^^
+
+warning: methods `released_seq` and `is_anomaly` are never used
+   --> src/kernel/direct_ack_store.rs:374:19
+    |
+372 | impl AckRelease {
+    | --------------- methods in this implementation
+373 |     /// The retired publication sequence, when this call is the one that ended the lease.
+374 |     pub(crate) fn released_seq(self) -> Option<u64> {
+    |                   ^^^^^^^^^^^^
+...
+389 |     pub(crate) fn is_anomaly(self) -> bool {
+    |                   ^^^^^^^^^^
+
+warning: field `admission` is never read
+   --> src/kernel/direct_ack_store.rs:504:5
+    |
+491 | pub(crate) struct DirectAckStore {
+    |                   -------------- field in this struct
+...
+504 |     admission: AtomicBool,
+    |     ^^^^^^^^^
+    |
+    = note: `DirectAckStore` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: methods `live_lease_at`, `duplicate_live_incarnations`, and `live_pair_count_scan` are never used
+    --> src/kernel/direct_ack_store.rs:1120:19
+     |
+ 541 | impl DirectAckStore {
+     | ------------------- methods in this implementation
+...
+1120 |     pub(crate) fn live_lease_at(&self, endpoint_index: usize) -> Option<(u64, AckWaiter)> {
+     |                   ^^^^^^^^^^^^^
+...
+1137 |     pub(crate) fn duplicate_live_incarnations(&self) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1170 |     pub(crate) fn live_pair_count_scan(&self) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `None` is never constructed
+  --> src/kernel/dispatch_post_work.rs:96:5
+   |
+92 | pub(crate) enum DispatchPostWork {
+   |                 ---------------- variant in this enum
+...
+96 |     None,
+   |     ^^^^
+   |
+   = note: `DispatchPostWork` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: associated items `build` and `payload` are never used
+  --> src/kernel/ipccall_direct.rs:67:19
+   |
+63 | impl IpcCallDirectSnapshot {
+   | -------------------------- associated items in this implementation
+...
+67 |     pub(crate) fn build(
+   |                   ^^^^^
+...
+88 |     pub(crate) fn payload(&self) -> &[u8] {
+   |                   ^^^^^^^
+
+warning: struct `IpcReplyDirectSnapshot` is never constructed
+  --> src/kernel/ipccall_direct.rs:99:19
+   |
+99 | pub(crate) struct IpcReplyDirectSnapshot {
+   |                   ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `build` and `payload` are never used
+   --> src/kernel/ipccall_direct.rs:113:19
+    |
+110 | impl IpcReplyDirectSnapshot {
+    | --------------------------- associated items in this implementation
+...
+113 |     pub(crate) fn build(
+    |                   ^^^^^
+...
+132 |     pub(crate) fn payload(&self) -> &[u8] {
+    |                   ^^^^^^^
+
+warning: enum `ReplyReservationError` is never used
+   --> src/kernel/ipccall_direct.rs:140:17
+    |
+140 | pub(crate) enum ReplyReservationError {
+    |                 ^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ReplyReservation` is never used
+   --> src/kernel/ipccall_direct.rs:167:17
+    |
+167 | pub(crate) enum ReplyReservation {
+    |                 ^^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src/kernel/ipccall_direct.rs:180:25
+    |
+179 | impl ReplyReservation {
+    | --------------------- associated items in this implementation
+180 |     pub(crate) const fn new() -> Self {
+    |                         ^^^
+...
+184 |     pub(crate) const fn is_available(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+...
+188 |     pub(crate) const fn is_reserved(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+192 |     pub(crate) const fn is_consumed(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+198 |     pub(crate) fn reserve(
+    |                   ^^^^^^^
+...
+218 |     pub(crate) fn release(
+    |                   ^^^^^^^
+...
+239 |     pub(crate) fn consume(
+    |                   ^^^^^^^
+
+warning: methods `is_committed` and `waiter_claim_key` are never used
+   --> src/kernel/ipccall_direct.rs:304:25
+    |
+299 | impl BlockedServerAck {
+    | --------------------- methods in this implementation
+...
+304 |     pub(crate) const fn is_committed(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+...
+310 |     pub(crate) const fn waiter_claim_key(&self) -> (usize, u64, ReceiverWaiterIdentity) {
+    |                         ^^^^^^^^^^^^^^^^
+
+warning: method `is_committed` is never used
+   --> src/kernel/ipccall_direct.rs:343:25
+    |
+341 | impl BlockedCallerAck {
+    | --------------------- method in this implementation
+342 |     /// Well-formed for a direct reply: committed RecvV2 with a payload destination.
+343 |     pub(crate) const fn is_committed(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+
+warning: enum `AckLeaseError` is never used
+   --> src/kernel/ipccall_direct.rs:350:17
+    |
+350 | pub(crate) enum AckLeaseError {
+    |                 ^^^^^^^^^^^^^
+
+warning: enum `AckLease` is never used
+   --> src/kernel/ipccall_direct.rs:373:17
+    |
+373 | pub(crate) enum AckLease {
+    |                 ^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src/kernel/ipccall_direct.rs:380:25
+    |
+379 | impl AckLease {
+    | ------------- associated items in this implementation
+380 |     pub(crate) const fn new_available() -> Self {
+    |                         ^^^^^^^^^^^^^
+...
+384 |     pub(crate) const fn is_available(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+...
+387 |     pub(crate) const fn is_claimed(&self) -> bool {
+    |                         ^^^^^^^^^^
+...
+390 |     pub(crate) const fn is_consumed(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+396 |     pub(crate) fn claim(&mut self, commit_seq: u64) -> Result<(), AckLeaseError> {
+    |                   ^^^^^
+...
+408 |     pub(crate) fn consume(&mut self, commit_seq: u64) -> Result<(), AckLeaseError> {
+    |                   ^^^^^^^
+...
+421 |     pub(crate) fn restore(&mut self, commit_seq: u64) -> Result<(), AckLeaseError> {
+    |                   ^^^^^^^
+...
+433 |     pub(crate) fn discard(&mut self) {
+    |                   ^^^^^^^
+
+warning: methods `drain_direct_request_post_work`, `direct_server_exact_still_blocked`, `rollback_direct_request_after_commit`, `settle_lease_pre_claim`, and `ipc_call_direct_request_txn` are never used
+   --> src/kernel/ipccall_direct_txn.rs:123:19
+    |
+113 | impl SharedKernel {
+    | ----------------- methods in this implementation
+...
+123 |     pub(crate) fn drain_direct_request_post_work(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+236 |     fn direct_server_exact_still_blocked(&self, ack: &BlockedServerAck) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+281 |     fn rollback_direct_request_after_commit(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+331 |     fn settle_lease_pre_claim(&self, ack: &BlockedServerAck, lease: &mut AckLease, seq: u64) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+...
+344 |     pub(crate) fn ipc_call_direct_request_txn(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `DirectReplyPostWork` is never constructed
+   --> src/kernel/ipccall_direct_txn.rs:850:19
+    |
+850 | pub(crate) struct DirectReplyPostWork {
+    |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `direct_caller_exact_still_blocked`, `ipc_reply_direct_txn`, `settle_reply_pre_reserve`, `settle_reply_after_reserve`, and `drain_direct_reply_post_work` are never used
+    --> src/kernel/ipccall_direct_txn.rs:860:8
+     |
+ 856 | impl SharedKernel {
+     | ----------------- methods in this implementation
+...
+ 860 |     fn direct_caller_exact_still_blocked(&self, ack: &BlockedCallerAck) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 878 |     pub(crate) fn ipc_reply_direct_txn(
+     |                   ^^^^^^^^^^^^^^^^^^^^
+...
+1221 |     fn settle_reply_pre_reserve(&self, ack: &BlockedCallerAck, lease: &mut AckLease, seq: u64) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1233 |     fn settle_reply_after_reserve(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1256 |     pub(crate) fn drain_direct_reply_post_work(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated functions `from_recv_v2`, `from_legacy_mapped_recv`, and `from_v3_abi_request` are never used
+   --> src/kernel/recv_core.rs:256:19
+    |
+166 | impl RecvRequest {
+    | ---------------- associated functions in this implementation
+...
+256 |     pub(crate) fn from_recv_v2(
+    |                   ^^^^^^^^^^^^
+...
+299 |     pub(crate) fn from_legacy_mapped_recv(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+333 |     pub(crate) fn from_v3_abi_request(
+    |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: function `peek_recv_core_user_plain` is never used
+   --> src/kernel/recv_core.rs:766:15
+    |
+766 | pub(crate) fn peek_recv_core_user_plain(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_user_asid_plain_writeback` is never used
+   --> src/kernel/recv_core.rs:803:15
+    |
+803 | pub(crate) fn execute_user_asid_plain_writeback(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_queued_shared_region_delivery` is never used
+    --> src/kernel/syscall.rs:1387:15
+     |
+1387 | pub(crate) fn produce_queued_shared_region_delivery(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `into_legacy_option` is never used
+    --> src/kernel/syscall.rs:1949:19
+     |
+1940 | impl RecvImmediateOutcome {
+     | ------------------------- method in this implementation
+...
+1949 |     pub(crate) fn into_legacy_option(self) -> Option<Result<(), TrapHandleError>> {
+     |                   ^^^^^^^^^^^^^^^^^^
+
+warning: function `transfer_cap_arg_value` is never used
+  --> src/kernel/syscall/ipc_abi.rs:58:15
+   |
+58 | pub(crate) fn transfer_cap_arg_value(frame: &TrapFrame) -> Option<CapId> {
+   |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `frame_reply_message_with_cap` is never used
+  --> src/kernel/syscall/ipc_abi.rs:68:15
+   |
+68 | pub(crate) fn frame_reply_message_with_cap(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `frame_call_request_message` is never used
+  --> src/kernel/syscall/ipc_abi.rs:91:15
+   |
+91 | pub(crate) fn frame_call_request_message(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new` and `try_take` are never used
+   --> src/kernel/syscall/process.rs:272:25
+    |
+271 | impl<const N: usize> TakeOnceStagingBuffer<N> {
+    | --------------------------------------------- associated items in this implementation
+272 |     pub(super) const fn new() -> Self {
+    |                         ^^^
+...
+281 |     pub(super) fn try_take(&'static self) -> Option<StagingBufferClaim<'static, N>> {
+    |                   ^^^^^^^^
+
+warning: struct `StagingBufferClaim` is never constructed
+   --> src/kernel/syscall/process.rs:292:19
+    |
+292 | pub(super) struct StagingBufferClaim<'a, const N: usize> {
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: method `as_mut_slice` is never used
+   --> src/kernel/syscall/process.rs:297:19
+    |
+296 | impl<'a, const N: usize> StagingBufferClaim<'a, N> {
+    | -------------------------------------------------- method in this implementation
+297 |     pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
+    |                   ^^^^^^^^^^^^
+
+warning: function `write_v3_output_to_user` is never used
+   --> src/kernel/syscall/recv_shared_v3.rs:144:4
+    |
+144 | fn write_v3_output_to_user(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `read_user` is never used
+  --> src/kernel/syscall/recv_v3_txn.rs:82:8
+   |
+77 | pub(crate) trait RecvV3Owners {
+   |                  ------------ method in this trait
+...
+82 |     fn read_user(&mut self, asid: Asid, ptr: usize, len: usize) -> Option<[u8; 80]>;
+   |        ^^^^^^^^^
+
+warning: method `len` is never used
+   --> src/kernel/syscall/spawn_image_txn.rs:195:25
+    |
+168 | impl SpawnLedger {
+    | ---------------- method in this implementation
+...
+195 |     pub(crate) const fn len(&self) -> usize {
+    |                         ^^^
+
+warning: field `asid` is never read
+   --> src/kernel/syscall/spawn_image_txn.rs:369:16
+    |
+364 | pub(crate) struct SpawnImageCommitted {
+    |                   ------------------- field in this struct
+...
+369 |     pub(crate) asid: Asid,
+    |                ^^^^
+
+warning: variant `NoAsid` is never constructed
+   --> src/kernel/syscall/xfer_txn.rs:140:5
+    |
+122 | pub(crate) enum XferRefusal {
+    |                 ----------- variant in this enum
+...
+140 |     NoAsid,
+    |     ^^^^^^
+    |
+    = note: `XferRefusal` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variant `TimerIdleQueueAdvance` is never constructed
+    --> src/kernel/syscall_split.rs:2285:5
+     |
+2206 | pub(crate) enum SplitDispatchDisposition {
+     |                 ------------------------ variant in this enum
+...
+2285 |     TimerIdleQueueAdvance,
+     |     ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `SplitDispatchDisposition` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `try_split_blocking_ipc_recv_into_frame` is never used
+    --> src/kernel/syscall_split.rs:4888:4
+     |
+4888 | fn try_split_blocking_ipc_recv_into_frame(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `AsyncResumeClass` is never used
+   --> src/kernel/task.rs:640:17
+    |
+640 | pub(crate) enum AsyncResumeClass {
+    |                 ^^^^^^^^^^^^^^^^
+
+warning: method `restores_verbatim` is never used
+   --> src/kernel/task.rs:656:19
+    |
+653 | impl AsyncResumeClass {
+    | --------------------- method in this implementation
+...
+656 |     pub(crate) fn restores_verbatim(self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: function `classify_and_take_async_resume` is never used
+   --> src/kernel/task.rs:712:15
+    |
+712 | pub(crate) fn classify_and_take_async_resume(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resume_boundary_consumes` is never used
+   --> src/kernel/task.rs:766:21
+    |
+766 | pub(crate) const fn resume_boundary_consumes(class: BlockedSyscallClass) -> bool {
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `cancel_async_resume` is never used
+   --> src/kernel/task.rs:788:15
+    |
+788 | pub(crate) fn cancel_async_resume(tcbs: &mut [Option<ThreadControlBlock>], tid: u64) -> bool {
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: function `publish_async_preempt_snapshot` is never used
+   --> src/kernel/task.rs:821:15
+    |
+821 | pub(crate) fn publish_async_preempt_snapshot(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `OwnerRevalidation` is never used
+   --> src/runtime.rs:336:17
+    |
+336 | pub(crate) enum OwnerRevalidation {
+    |                 ^^^^^^^^^^^^^^^^^
+
+warning: enum `OwnerCommit` is never used
+   --> src/runtime.rs:439:17
+    |
+439 | pub(crate) enum OwnerCommit {
+    |                 ^^^^^^^^^^^
+
+warning: method `disposition` is never used
+   --> src/runtime.rs:455:19
+    |
+451 | impl OwnerRevalidation {
+    | ---------------------- method in this implementation
+...
+455 |     pub(crate) fn disposition(self) -> OwnerCommit {
+    |                   ^^^^^^^^^^^
+
+warning: method `marker` is never used
+   --> src/runtime.rs:840:19
+    |
+830 | impl CpuDispatch {
+    | ---------------- method in this implementation
+...
+840 |     pub(crate) fn marker(self) -> &'static str {
+    |                   ^^^^^^
+
+warning: method `provenance` is never used
+   --> src/runtime.rs:993:19
+    |
+946 | impl DispatchMarkToken {
+    | ---------------------- method in this implementation
+...
+993 |     pub(crate) fn provenance(&self) -> crate::kernel::scheduler::DispatchSelection {
+    |                   ^^^^^^^^^^
+
+warning: struct `PostLockExitValidation` is never constructed
+    --> src/runtime.rs:1020:19
+     |
+1020 | pub(crate) struct PostLockExitValidation {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `DispatchDisposition` is never used
+    --> src/runtime.rs:1303:17
+     |
+1303 | pub(crate) enum DispatchDisposition {
+     |                 ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `token` and `disposition` are never used
+    --> src/runtime.rs:1432:19
+     |
+1427 | impl DispatchMarkOutcome {
+     | ------------------------ methods in this implementation
+...
+1432 |     pub(crate) fn token(self) -> Option<DispatchMarkToken> {
+     |                   ^^^^^
+...
+1440 |     pub(crate) fn disposition(self) -> DispatchDisposition {
+     |                   ^^^^^^^^^^^
+
+warning: multiple methods are never used
+     --> src/runtime.rs:2431:19
+      |
+ 1576 | impl SharedKernel {
+      | ----------------- methods in this implementation
+...
+ 2431 |     pub(crate) fn revalidate_idle_owner_after_drains(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2502 |     pub(crate) fn owner_revalidation_select_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2557 |     pub(crate) fn owner_revalidation_claim_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2676 |     fn owner_revalidation_rollback_split(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2951 |     pub(crate) fn stale_dispatch_mark_token_for_test(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2970 |     pub(crate) fn continued_dispatch_mark_token_for_test(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3219 |     pub(crate) fn server_reply_link_for_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3414 |     pub(crate) fn timer_would_preempt_split_read(&self, cpu: CpuId) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3488 |     pub(crate) fn scheduler_tick_if_no_switch_split_mut(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 4979 |     pub(crate) fn split_return_take_tls_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5047 |     pub(crate) fn direct_dispatch_observe_outgoing_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5190 |     pub(crate) fn direct_dispatch_current_agrees_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5360 |     pub(crate) fn direct_dispatch_take_completion_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5404 |     pub(crate) fn take_async_preempt_for_incoming_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5431 |     pub(crate) fn snapshot_async_preempted_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5447 |     pub(crate) fn cancel_async_preempt_for_split(&self, tid: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5511 |     pub(crate) fn post_lock_exit_validation_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 6664 |     pub(crate) fn terminal_idle_on_cpu_split(&self, cpu: CpuId) -> Result<bool, KernelError> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 6915 |     pub(crate) fn commit_user_fpu_current_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 6937 |     pub(crate) fn settle_user_fpu_return_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 6963 |     pub(crate) fn ap_saved_resume_current_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 7212 |     pub(crate) fn recv_block_phase_b_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 7356 |     pub(crate) fn cancel_deadline_exact_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 7377 |     pub(crate) fn publish_reply_timeout_token_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 8522 |     pub(crate) fn cow_recover_private_copy_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 8747 |     fn copy_cow_frame_contents_split(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9168 |     pub(crate) fn resolve_memory_object_phys_for_task_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9488 |     pub(crate) fn ipc_try_recv_queued_plain_endpoint_only_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9516 |     pub(crate) fn recv_would_block_split_read(&self, endpoint_idx: usize, generation: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9545 |     pub(crate) fn ipc_try_recv_queued_with_cap_transfer_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9581 |     pub(crate) fn peek_transfer_envelope_source_object_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+10548 |     pub(crate) fn memory_object_phys_by_id_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+13454 |     pub(crate) fn fault_or_supervisor_endpoint_split_read(&self, endpoint_idx: usize) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+13951 |     pub(crate) fn sr_update_mapped_prefix_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15003 |     pub(crate) fn reserve_direct_reply_record_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15023 |     pub(crate) fn bind_direct_reply_record_server_cap_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15047 |     pub(crate) fn commit_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15263 |     pub(crate) fn register_server_reply_link_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15305 |     pub(crate) fn can_reserve_server_reply_link_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15393 |     pub(crate) fn cancel_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15428 |     pub(crate) fn reserve_existing_reply_record_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15543 |     pub(crate) fn restore_consumed_reply_record_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15625 |     pub(crate) fn discard_reply_record_split(&self, index: usize, generation: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15647 |     pub(crate) fn create_initramfs_file_slice_mo_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15710 |     pub(crate) fn reply_record_externally_invokable_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15737 |     pub(crate) fn reply_terminal_committed_winner_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15759 |     pub(crate) fn reply_record_caller_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15775 |     pub(crate) fn reply_record_endpoint_ref_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16368 |     pub(crate) fn endpoint_mode_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16383 |     pub(crate) fn endpoint_waiter_is_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16571 |     pub(crate) fn runnable_count_on_cpu_split_read(&self, cpu: CpuId) -> usize {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16628 |     pub(crate) fn sr_enqueue_committed_receiver_reconciled_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16789 |     pub(crate) fn take_preread_recv_timeout_deadline_split(&self, cpu: CpuId) -> Option<u64> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16923 |     pub(crate) fn current_entering_incarnation_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+17028 |     pub(crate) fn smp_blocked_server_task_facts_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+17130 |     pub(crate) fn smp_request_wake_target_split_read(&self, tid: u64) -> Option<CpuId> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18045 |     pub(crate) fn disarm_reply_deadline_on_reply_win(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18087 |     pub(crate) fn smp_assign_task_home_cpu(&self, tid: u64, cpu: CpuId) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18733 |     pub(crate) fn classify_direct_reply_terminal_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18758 |     pub(crate) fn claim_direct_reply_terminal_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18863 |     pub(crate) fn commit_queued_reply_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18902 |     pub(crate) fn reply_authority_slots_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18983 |     pub(crate) fn direct_ack_lease_bijection(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19020 |     pub(crate) fn blocked_recv_v2_commit_is_complete_split_read(&self, tid: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19034 |     pub(crate) fn live_server_reply_link_count_split_read(&self) -> usize {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19241 |     pub(crate) fn resolve_endpoint_send_cap_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19263 |     pub(crate) fn resolve_reply_cap_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19282 |     pub(crate) fn process_cnode_for_identity_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `enqueued_cpu`, `rejection_is_runtime_recoverable`, and `receiver_is_unplaced` are never used
+     --> src/runtime.rs:19552:19
+      |
+19549 | impl ReceiverEnqueue {
+      | -------------------- methods in this implementation
+...
+19552 |     pub(crate) fn enqueued_cpu(self) -> Option<CpuId> {
+      |                   ^^^^^^^^^^^^
+...
+19582 |     pub(crate) fn rejection_is_runtime_recoverable(self) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19594 |     pub(crate) fn receiver_is_unplaced(self) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: the following explicit lifetimes could be elided: 'a
+   --> src/arch/boot_entry.rs:331:38
+    |
+331 | pub fn take_staged_ram_for_bootstrap<'a>(
+    |                                      ^^
+332 |     scratch: &'a mut [crate::kernel::frame_allocator::MemoryRegion],
+    |               ^^
+333 | ) -> Option<&'a [crate::kernel::frame_allocator::MemoryRegion]> {
+    |              ^^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_lifetimes
+    = note: `#[warn(clippy::needless_lifetimes)]` on by default
+help: elide the lifetimes
+    |
+331 ~ pub fn take_staged_ram_for_bootstrap(
+332 ~     scratch: &mut [crate::kernel::frame_allocator::MemoryRegion],
+333 ~ ) -> Option<&[crate::kernel::frame_allocator::MemoryRegion]> {
+    |
+
+warning: the following explicit lifetimes could be elided: 'a
+   --> src/arch/boot_entry.rs:376:32
+    |
+376 | fn take_staged_irq_description<'a>(
+    |                                ^^
+377 |     scratch: &'a mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
+    |               ^^
+378 | ) -> Option<&'a [u8]> {
+    |              ^^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_lifetimes
+help: elide the lifetimes
+    |
+376 ~ fn take_staged_irq_description(
+377 ~     scratch: &mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
+378 ~ ) -> Option<&[u8]> {
+    |
+
+warning: the following explicit lifetimes could be elided: 'a
+   --> src/arch/boot_entry.rs:398:41
+    |
+398 | fn take_irq_firmware_blob_from_provider<'a>(
+    |                                         ^^
+399 |     scratch: &'a mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
+    |               ^^
+400 | ) -> Option<&'a [u8]> {
+    |              ^^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_lifetimes
+help: elide the lifetimes
+    |
+398 ~ fn take_irq_firmware_blob_from_provider(
+399 ~     scratch: &mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
+400 ~ ) -> Option<&[u8]> {
+    |
+
+warning: unneeded `return` statement
+   --> src/arch/boot_entry.rs:472:9
+    |
+472 |         return run_kernel_boot_with_firmware_blob(run, Some(firmware_blob.as_bytes()));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_return
+    = note: `#[warn(clippy::needless_return)]` on by default
+help: remove `return`
+    |
+472 -         return run_kernel_boot_with_firmware_blob(run, Some(firmware_blob.as_bytes()));
+472 +         run_kernel_boot_with_firmware_blob(run, Some(firmware_blob.as_bytes()))
+    |
+
+warning: large size difference between variants
+   --> src/arch/x86_64/ap_sched.rs:181:1
+    |
+181 | / pub(crate) enum ApDispatchDecision {
+182 | |     Dispatch(ApUserDispatchPlan),
+    | |     ---------------------------- the largest variant contains at least 232 bytes
+183 | |     Idle,
+    | |     ---- the second-largest variant carries no data at all
+184 | | }
+    | |_^ the entire enum is at least 232 bytes
+    |
+note: boxing a variant would require the type no longer be `Copy`
+   --> src/arch/x86_64/ap_sched.rs:181:17
+    |
+181 | pub(crate) enum ApDispatchDecision {
+    |                 ^^^^^^^^^^^^^^^^^^
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+   --> src/arch/x86_64/ap_sched.rs:182:5
+    |
+182 |     Dispatch(ApUserDispatchPlan),
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#large_enum_variant
+    = note: `#[warn(clippy::large_enum_variant)]` on by default
+
+warning: you should consider adding a `Default` implementation for `X86TaskStateSegment`
+   --> src/arch/x86_64/descriptor_tables.rs:105:5
+    |
+105 | /     pub const fn new() -> Self {
+106 | |         Self {
+107 | |             _reserved0: 0,
+108 | |             rsp0: 0,
+...   |
+123 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#new_without_default
+    = note: `#[warn(clippy::new_without_default)]` on by default
+help: try adding this
+    |
+124 ~ }
+125 + 
+126 + impl Default for X86TaskStateSegment {
+127 +     fn default() -> Self {
+128 +         Self::new()
+129 +     }
+130 + }
+    |
+
+warning: this function has too many arguments (8/7)
+    --> src/arch/x86_64/descriptor_tables.rs:3701:1
+     |
+3701 | / pub fn enter_user_mode_iret(
+3702 | |     _entry: u64,
+3703 | |     _stack_top: u64,
+3704 | |     _arg0: u64,
+...    |
+3709 | |     _arg5: u64,
+3710 | | ) -> ! {
+     | |______^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#too_many_arguments
+     = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: manually filling a slice
+   --> src/arch/x86_64/page_table.rs:361:5
+    |
+361 | /     for page in &mut state.pages {
+362 | |         *page = None;
+363 | |     }
+    | |_____^ help: try: `&mut state.pages.fill(None);`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#manual_slice_fill
+    = note: `#[warn(clippy::manual_slice_fill)]` on by default
+
+warning: manually filling a slice
+   --> src/arch/x86_64/page_table.rs:364:5
+    |
+364 | /     for asid in &mut state.asids {
+365 | |         *asid = None;
+366 | |     }
+    | |_____^ help: try: `&mut state.asids.fill(None);`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#manual_slice_fill
+
+warning: unneeded `return` statement
+    --> src/arch/x86_64/page_table.rs:1360:9
+     |
+1360 |         return Some(PageTableEntry(entry));
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_return
+help: remove `return`
+     |
+1360 -         return Some(PageTableEntry(entry));
+1360 +         Some(PageTableEntry(entry))
+     |
+
+warning: unneeded `return` statement
+    --> src/arch/x86_64/page_table.rs:1389:9
+     |
+1389 |         return Err(PageTableError::InvalidAddress);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_return
+help: remove `return`
+     |
+1389 -         return Err(PageTableError::InvalidAddress);
+1389 +         Err(PageTableError::InvalidAddress)
+     |
+
+warning: this `if` statement can be collapsed
+  --> src/arch/x86_64/trap.rs:75:5
+   |
+75 | /     if let Some(tid) = kernel.current_tid() {
+76 | |         if tid != 0 {
+77 | |             if let Some(task_asid) = kernel.task_asid(tid) {
+78 | |                 ensure_user_return_cr3(kernel, tid, task_asid);
+...  |
+81 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+   = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+   |
+75 ~     if let Some(tid) = kernel.current_tid()
+76 ~         && tid != 0 {
+77 |             if let Some(task_asid) = kernel.task_asid(tid) {
+78 |                 ensure_user_return_cr3(kernel, tid, task_asid);
+79 |             }
+80 ~         }
+   |
+
+warning: this `if` statement can be collapsed
+  --> src/arch/x86_64/trap.rs:76:9
+   |
+76 | /         if tid != 0 {
+77 | |             if let Some(task_asid) = kernel.task_asid(tid) {
+78 | |                 ensure_user_return_cr3(kernel, tid, task_asid);
+79 | |             }
+80 | |         }
+   | |_________^
+   |
+   = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+   |
+76 ~         if tid != 0
+77 ~             && let Some(task_asid) = kernel.task_asid(tid) {
+78 |                 ensure_user_return_cr3(kernel, tid, task_asid);
+79 ~             }
+   |
+
+warning: this operation has no effect
+   --> src/arch/x86_64/trap.rs:776:13
+    |
+776 |             (error >> 0) & 1,
+    |             ^^^^^^^^^^^^ help: consider reducing it to: `error`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#identity_op
+    = note: `#[warn(clippy::identity_op)]` on by default
+
+warning: this `if` statement can be collapsed
+   --> src/arch/x86_64/trap.rs:826:5
+    |
+826 | /     if let (Some(f), Some(tid)) = (frame.as_deref(), kernel.current_tid()) {
+827 | |         if tid != 0 {
+828 | |             let _ = kernel.sync_current_thread_from_frame(f);
+829 | |         }
+830 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+    |
+826 ~     if let (Some(f), Some(tid)) = (frame.as_deref(), kernel.current_tid())
+827 ~         && tid != 0 {
+828 |             let _ = kernel.sync_current_thread_from_frame(f);
+829 ~         }
+    |
+
+warning: derefed type is same as origin
+   --> src/arch/trap_entry.rs:720:74
+    |
+720 |                 post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut());
+    |                                                                          ^^^^^^^^^^^^^^^^^^^^ help: try: `frame`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_option_as_deref
+    = note: `#[warn(clippy::needless_option_as_deref)]` on by default
+
+warning: this `if` statement can be collapsed
+    --> src/arch/trap_entry.rs:1374:5
+     |
+1374 | /     if !post_work_committed
+1375 | |         && let Some((syscall_nr, timeout_ticks, arch_name)) =
+1376 | |             shared_recv_timeout_staging_info(context, frame.as_deref())
+...    |
+1391 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+     |
+1376 ~             shared_recv_timeout_staging_info(context, frame.as_deref())
+1377 ~         && syscall_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR && timeout_ticks != 0 {
+1378 |             crate::yarm_log!(
+ ...
+1388 |             }
+1389 ~         }
+     |
+
+warning: this `if` statement can be collapsed
+    --> src/arch/trap_entry.rs:1413:5
+     |
+1413 | /     if !post_work_committed && matches!(decode_trap_context(context), TrapEvent::Syscall) {
+1414 | |         if let Some(frame) = frame.as_deref_mut() {
+...    |
+1770 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+     |
+1413 ~     if !post_work_committed && matches!(decode_trap_context(context), TrapEvent::Syscall)
+1414 ~         && let Some(frame) = frame.as_deref_mut() {
+1415 |             // Stage 160C: import the decoded syscall ABI into the frame BEFORE the
+ ...
+1768 |             }
+1769 ~         }
+     |
+
+warning: derefed type is same as origin
+    --> src/arch/trap_entry.rs:2234:52
+     |
+2234 |                     x86_recv_park_self_resume(cpu, frame.as_deref_mut(), Some(outgoing), inc);
+     |                                                    ^^^^^^^^^^^^^^^^^^^^ help: try: `frame`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_option_as_deref
+
+warning: derefed type is same as origin
+    --> src/arch/trap_entry.rs:3717:45
+     |
+3717 |                         let resumed = match frame.as_deref_mut() {
+     |                                             ^^^^^^^^^^^^^^^^^^^^ help: try: `frame`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_option_as_deref
+
+warning: the loop variable `i` is only used to index `sorted`
+   --> src/kernel/boot/bootstrap_state.rs:329:18
+    |
+329 |         for i in 0..nsorted {
+    |                  ^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/boot/bootstrap_state.rs:330:32
+    |
+330 |             let (start, len) = sorted[i];
+    |                                ^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+    = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator
+    |
+329 -         for i in 0..nsorted {
+329 +         for <item> in sorted.iter().take(nsorted) {
+    |
+
+warning: this function has too many arguments (8/7)
+   --> src/kernel/boot/capacity_state.rs:127:5
+    |
+127 | /     fn runtime_capacity_config_with_cnodes(
+128 | |         max_endpoints: usize,
+129 | |         max_notifications: usize,
+130 | |         max_tasks: usize,
+...   |
+135 | |         driver_cnode_slot_capacity: usize,
+136 | |     ) -> RuntimeCapacityConfig {
+    | |______________________________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#too_many_arguments
+
+warning: use of `or_insert_with` to construct default value
+   --> src/kernel/boot/cow_clone.rs:517:10
+    |
+517 |         .or_insert_with(alloc::collections::BTreeSet::new)
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `or_default()`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#unwrap_or_default
+    = note: `#[warn(clippy::unwrap_or_default)]` on by default
+
+warning: this `if` can be collapsed into the outer `match`
+   --> src/kernel/boot/delegation_state.rs:145:17
+    |
+145 | /                 if index >= MAX_REPLY_CAPS
+146 | |                     || self.with_ipc_state(|ipc| ipc.reply_cap_generations[index]) != generation
+147 | |                 {
+148 | |                     return None;
+149 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_match
+    = note: `#[warn(clippy::collapsible_match)]` on by default
+help: collapse nested if block
+    |
+144 ~             CapObject::Reply { index, generation }
+145 ~                 if (index >= MAX_REPLY_CAPS
+146 ~                     || self.with_ipc_state(|ipc| ipc.reply_cap_generations[index]) != generation)
+147 ~                 => {
+148 |                     return None;
+149 ~                 }
+    |
+
+warning: this `if` statement can be collapsed
+    --> src/kernel/boot/exec_state.rs:2698:13
+     |
+2698 | /             if trap_path && queue_neutral && single_cpu && !already_deferred {
+2699 | |                 if crate::kernel::boot::d6_genuine_dispatch_try_defer(cpu_idx, outgoing_tid) {
+2700 | |                     if smp_live {
+...    |
+2715 | |             }
+     | |_____________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+     |
+2698 ~             if trap_path && queue_neutral && single_cpu && !already_deferred
+2699 ~                 && crate::kernel::boot::d6_genuine_dispatch_try_defer(cpu_idx, outgoing_tid) {
+2700 |                     if smp_live {
+ ...
+2713 |                     return Ok(cur);
+2714 ~                 }
+     |
+
+warning: this `if` statement can be collapsed
+    --> src/kernel/boot/exec_state.rs:3116:17
+     |
+3116 | /                 if redispatched == Some(tid) {
+3117 | |                     if cfg!(not(feature = "hosted-dev")) && DEBUG_YIELD_LOG {
+3118 | |                         crate::yarm_log!("YARM_YIELD_RETURN_SAME_TASK tid={}", tid);
+3119 | |                         crate::yarm_log!("YARM_YIELD_END status=same-task tid={}", tid);
+3120 | |                     }
+3121 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+     |
+3116 ~                 if redispatched == Some(tid)
+3117 ~                     && cfg!(not(feature = "hosted-dev")) && DEBUG_YIELD_LOG {
+3118 |                         crate::yarm_log!("YARM_YIELD_RETURN_SAME_TASK tid={}", tid);
+3119 |                         crate::yarm_log!("YARM_YIELD_END status=same-task tid={}", tid);
+3120 ~                     }
+     |
+
+warning: this `if` statement can be collapsed
+    --> src/kernel/boot/exec_state.rs:4894:9
+     |
+4894 | /         if let Some(asid) = to_load {
+4895 | |             if crate::arch::hal_adapters::switch_address_space(asid) {
+4896 | |                 crate::arch::hal::note_address_space_activated(cpu, asid);
+4897 | |             }
+4898 | |         }
+     | |_________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+     |
+4894 ~         if let Some(asid) = to_load
+4895 ~             && crate::arch::hal_adapters::switch_address_space(asid) {
+4896 |                 crate::arch::hal::note_address_space_activated(cpu, asid);
+4897 ~             }
+     |
+
+warning: this `if` statement can be collapsed
+    --> src/kernel/boot/fault_state.rs:2496:9
+     |
+2496 | /         if matches!(
+2497 | |             fault_bookkeeping_mode,
+2498 | |             FaultBookkeepingMode::RecordInHandleTrapEvent
+2499 | |         ) {
+...    |
+2506 | |         }
+     | |_________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+     |
+2499 ~         )
+2500 ~             && let Some(fault) = event.fault() {
+2501 |                 self.record_fault(fault);
+ ...
+2504 |                 }
+2505 ~             }
+     |
+
+warning: this `if` statement can be collapsed
+    --> src/kernel/boot/fault_state.rs:2582:17
+     |
+2582 | /                 if matches!(fault.access, FaultAccess::Write) {
+2583 | |                     if let Some(tid) = self.current_tid()
+2584 | |                         && let Some(asid) = self.task_asid(tid)
+2585 | |                         && self
+...    |
+2597 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+     |
+2582 ~                 if matches!(fault.access, FaultAccess::Write)
+2583 ~                     && let Some(tid) = self.current_tid()
+2584 |                         && let Some(asid) = self.task_asid(tid)
+ ...
+2595 |                         return Ok(());
+2596 ~                     }
+     |
+
+warning: this `if` statement can be collapsed
+    --> src/kernel/boot/ipc_state.rs:4196:17
+     |
+4196 | /                 if let CapObject::Endpoint { index, .. } = record.reply_endpoint {
+4197 | |                     if index == reply_eidx {
+4198 | |                         return Some((idx, ipc.reply_cap_generations[idx]));
+4199 | |                     }
+4200 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+     |
+4196 ~                 if let CapObject::Endpoint { index, .. } = record.reply_endpoint
+4197 ~                     && index == reply_eidx {
+4198 |                         return Some((idx, ipc.reply_cap_generations[idx]));
+4199 ~                     }
+     |
+
+warning: using `map_err` over `inspect_err`
+    --> src/kernel/boot/ipc_state.rs:6590:14
+     |
+6590 |             .map_err(|err| {
+     |              ^^^^^^^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#manual_inspect
+     = note: `#[warn(clippy::manual_inspect)]` on by default
+help: try
+     |
+6590 ~             .inspect_err(|&err| {
+6591 |                 crate::yarm_log!(
+ ...
+6594 |                     err
+6595 ~                 );
+     |
+
+warning: doc list item without indentation
+    --> src/kernel/boot/ipc_state.rs:6958:9
+     |
+6958 |     /// `Ok(false)` — not the reply-cap slice / no drainer; caller uses the legacy path (the
+     |         ^
+     |
+     = help: if this is supposed to be its own paragraph, add a blank line
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+     = note: `#[warn(clippy::doc_lazy_continuation)]` on by default
+help: indent this line
+     |
+6958 |     ///     `Ok(false)` — not the reply-cap slice / no drainer; caller uses the legacy path (the
+     |         ++++
+
+warning: doc list item without indentation
+    --> src/kernel/boot/ipc_state.rs:6959:9
+     |
+6959 |     ///   producer consumed NOTHING before returning false).
+     |         ^^
+     |
+     = help: if this is supposed to be its own paragraph, add a blank line
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+     |
+6959 |     ///     producer consumed NOTHING before returning false).
+     |           ++
+
+warning: doc list item without indentation
+    --> src/kernel/boot/ipc_state.rs:6960:9
+     |
+6960 |     /// `Err(_)` — a real Phase-A error (undersized/unmapped waiter buffer, missing/dead
+     |         ^
+     |
+     = help: if this is supposed to be its own paragraph, add a blank line
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+     |
+6960 |     ///     `Err(_)` — a real Phase-A error (undersized/unmapped waiter buffer, missing/dead
+     |         ++++
+
+warning: doc list item without indentation
+    --> src/kernel/boot/ipc_state.rs:6961:9
+     |
+6961 |     ///   envelope, non-`Reply` object) → `UserMemoryFault`, exactly as the legacy delivery
+     |         ^^
+     |
+     = help: if this is supposed to be its own paragraph, add a blank line
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+     |
+6961 |     ///     envelope, non-`Reply` object) → `UserMemoryFault`, exactly as the legacy delivery
+     |           ++
+
+warning: doc list item without indentation
+    --> src/kernel/boot/ipc_state.rs:6962:9
+     |
+6962 |     ///   failure (the envelope disposition matches the legacy arm).
+     |         ^^
+     |
+     = help: if this is supposed to be its own paragraph, add a blank line
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+     |
+6962 |     ///     failure (the envelope disposition matches the legacy arm).
+     |           ++
+
+warning: you seem to be trying to use `match` for an equality check. Consider using `if`
+    --> src/kernel/boot/ipc_state.rs:7067:9
+     |
+7067 | /         match self.try_ipc_send_boundary_split_plain(waiter_tid, endpoint_idx, msg)? {
+7068 | |             true => return Ok(true),
+7069 | |             false => {}
+7070 | |         }
+     | |_________^ help: try: `if self.try_ipc_send_boundary_split_plain(waiter_tid, endpoint_idx, msg)? == true { return Ok(true) }`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#single_match
+     = note: `#[warn(clippy::single_match)]` on by default
+
+warning: you seem to be trying to use `match` for an equality check. Consider using `if`
+    --> src/kernel/boot/ipc_state.rs:7071:9
+     |
+7071 | /         match self.try_ipc_send_boundary_split_reply_cap(waiter_tid, endpoint_idx, msg)? {
+7072 | |             true => return Ok(true),
+7073 | |             false => {}
+7074 | |         }
+     | |_________^ help: try: `if self.try_ipc_send_boundary_split_reply_cap(waiter_tid, endpoint_idx, msg)? == true { return Ok(true) }`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#single_match
+
+warning: this `match` expression can be replaced with `?`
+    --> src/kernel/boot/ipc_state.rs:7085:20
+     |
+7085 |           let slot = match self.resolve_reply_index(capability.object) {
+     |  ____________________^
+7086 | |             Ok(slot) => slot,
+7087 | |             Err(err) => return Err(err),
+7088 | |         };
+     | |_________^ help: try instead: `self.resolve_reply_index(capability.object)?`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#question_mark
+     = note: `#[warn(clippy::question_mark)]` on by default
+
+warning: this `match` expression can be replaced with `?`
+    --> src/kernel/boot/ipc_state.rs:7235:28
+     |
+7235 |           let endpoint_idx = match self.resolve_endpoint_index(record.reply_endpoint) {
+     |  ____________________________^
+7236 | |             Ok(idx) => idx,
+7237 | |             Err(err) => return Err(err),
+7238 | |         };
+     | |_________^ help: try instead: `self.resolve_endpoint_index(record.reply_endpoint)?`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#question_mark
+
+warning: this `map_or` can be simplified
+  --> src/kernel/boot/memory_state.rs:92:13
+   |
+92 | /             memory
+93 | |                 .cow_pages
+94 | |                 .get(&asid.0)
+95 | |                 .map_or(false, |set| set.contains(&virt.0))
+   | |___________________________________________________________^
+   |
+   = help: for further information visit https://clippy.rust-lang.org/main/index.html#unnecessary_map_or
+   = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_some_and` instead
+   |
+95 -                 .map_or(false, |set| set.contains(&virt.0))
+95 +                 .is_some_and(|set| set.contains(&virt.0))
+   |
+
+warning: doc list item without indentation
+   --> src/kernel/boot/orchestrator_state.rs:693:9
+    |
+693 |     /// explicit DEFERRED for the live lock-dropped restore. It performs NO user-memory
+    |         ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+    |
+693 |     ///   explicit DEFERRED for the live lock-dropped restore. It performs NO user-memory
+    |         ++
+
+warning: doc list item without indentation
+   --> src/kernel/boot/orchestrator_state.rs:694:9
+    |
+694 |     /// copy / IPC writeback / dispatch and live-wires NOTHING — every anomaly becomes a
+    |         ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+    |
+694 |     ///   copy / IPC writeback / dispatch and live-wires NOTHING — every anomaly becomes a
+    |         ++
+
+warning: doc list item without indentation
+   --> src/kernel/boot/orchestrator_state.rs:695:9
+    |
+695 |     /// `CROSS_ARCH_D6_*` failure marker. Diagnostic only.
+    |         ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+    |
+695 |     ///   `CROSS_ARCH_D6_*` failure marker. Diagnostic only.
+    |         ++
+
+warning: doc quote line without `>` marker
+   --> src/kernel/boot/orchestrator_state.rs:879:9
+    |
+879 |     /// running, so `bootstrap_first_user_task` is too early — init exists there but nothing
+    |         ^
+    |
+    = help: if this not intended to be a quote at all, escape it with `\>`
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: add markers to start of line
+    |
+879 |     /// > running, so `bootstrap_first_user_task` is too early — init exists there but nothing
+    |         +
+
+warning: doc quote line without `>` marker
+   --> src/kernel/boot/orchestrator_state.rs:880:9
+    |
+880 |     /// dispatches it, and the audit would refuse with `accounting_bad`. The first-dispatch entry
+    |         ^
+    |
+    = help: if this not intended to be a quote at all, escape it with `\>`
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: add markers to start of line
+    |
+880 |     /// > dispatches it, and the audit would refuse with `accounting_bad`. The first-dispatch entry
+    |         +
+
+warning: doc quote line without `>` marker
+   --> src/kernel/boot/orchestrator_state.rs:881:9
+    |
+881 |     /// holds `&KernelState` at exactly the moment the claim becomes true, and holds it already,
+    |         ^
+    |
+    = help: if this not intended to be a quote at all, escape it with `\>`
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: add markers to start of line
+    |
+881 |     /// > holds `&KernelState` at exactly the moment the claim becomes true, and holds it already,
+    |         +
+
+warning: doc quote line without `>` marker
+   --> src/kernel/boot/orchestrator_state.rs:882:9
+    |
+882 |     /// so this adds no acquisition either.
+    |         ^
+    |
+    = help: if this not intended to be a quote at all, escape it with `\>`
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: add markers to start of line
+    |
+882 |     /// > so this adds no acquisition either.
+    |         +
+
+warning: doc list item without indentation
+    --> src/kernel/boot/orchestrator_state.rs:1250:9
+     |
+1250 |     /// failure markers on a real anomaly. Self-contained; consumes no net resources.
+     |         ^
+     |
+     = help: if this is supposed to be its own paragraph, add a blank line
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+     |
+1250 |     ///   failure markers on a real anomaly. Self-contained; consumes no net resources.
+     |         ++
+
+warning: this `if` statement can be collapsed
+   --> src/kernel/boot/scheduler_state.rs:704:9
+    |
+704 | /         if tid == BOOTSTRAP_FIRST_USER_TID {
+705 | |             if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+706 | |                 if cfg!(not(feature = "hosted-dev")) {
+707 | |                     crate::yarm_log!(
+...   |
+720 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+    |
+704 ~         if tid == BOOTSTRAP_FIRST_USER_TID
+705 ~             && cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+706 |                 if cfg!(not(feature = "hosted-dev")) {
+...
+718 |                 }
+719 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/kernel/boot/scheduler_state.rs:705:13
+    |
+705 | /             if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+706 | |                 if cfg!(not(feature = "hosted-dev")) {
+707 | |                     crate::yarm_log!(
+708 | |                         "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
+...   |
+719 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+    |
+705 ~             if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+706 ~                 && cfg!(not(feature = "hosted-dev")) {
+707 |                     crate::yarm_log!(
+...
+717 |                     );
+718 ~                 }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/kernel/boot/shared_region_txn.rs:318:17
+    |
+318 | /                 if let Some(req) = *slot {
+319 | |                     if req.tid == receiver_tid && req.asid == receiver_asid {
+320 | |                         *slot = None;
+321 | |                         return true;
+322 | |                     }
+323 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+    |
+318 ~                 if let Some(req) = *slot
+319 ~                     && req.tid == receiver_tid && req.asid == receiver_asid {
+320 |                         *slot = None;
+321 |                         return true;
+322 ~                     }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/kernel/boot/shared_region_txn.rs:342:13
+    |
+342 | /             if let Some(req) = *slot {
+343 | |                 if req.tid == receiver_tid && req.asid == receiver_asid {
+344 | |                     *slot = None;
+345 | |                     return true;
+346 | |                 }
+347 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+    |
+342 ~             if let Some(req) = *slot
+343 ~                 && req.tid == receiver_tid && req.asid == receiver_asid {
+344 |                     *slot = None;
+345 |                     return true;
+346 ~                 }
+    |
+
+warning: this function has too many arguments (10/7)
+   --> src/kernel/boot/shared_region_txn.rs:362:5
+    |
+362 | /     pub(crate) fn shared_region_phase_a(
+363 | |         &mut self,
+364 | |         handle: u64,
+365 | |         endpoint: CapObject,
+...   |
+372 | |         recv_abi: crate::kernel::task::RecvAbiVariant,
+373 | |     ) -> Result<RecvBoundarySharedRegionSnapshot, KernelError> {
+    | |______________________________________________________________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#too_many_arguments
+
+warning: redundant closure
+  --> src/kernel/boot/task_core_state.rs:47:22
+   |
+47 |                 .map(|tcb| f(tcb))
+   |                      ^^^^^^^^^^^^ help: replace the closure with the function itself: `f`
+   |
+   = help: for further information visit https://clippy.rust-lang.org/main/index.html#redundant_closure
+   = note: `#[warn(clippy::redundant_closure)]` on by default
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+   --> src/kernel/boot/thread_state.rs:691:20
+    |
+691 |                 if roots[..len].iter().any(|entry| *entry == Some(asid)) {
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `roots[..len].contains(&Some(asid))`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#manual_contains
+    = note: `#[warn(clippy::manual_contains)]` on by default
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+    --> src/kernel/boot/thread_state.rs:1137:20
+     |
+1137 |                 if roots[..len].iter().any(|e| *e == Some(asid)) {
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `roots[..len].contains(&Some(asid))`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#manual_contains
+
+warning: this block may be rewritten with the `?` operator
+    --> src/kernel/boot/thread_state.rs:2724:9
+     |
+2724 | /         if let Err(err) = initialized {
+2725 | |             return Err(err);
+2726 | |         }
+     | |_________^ help: replace it with: `initialized?;`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#question_mark
+
+warning: this `if` statement can be collapsed
+  --> src/kernel/boot/transfer_state.rs:86:9
+   |
+86 | /         if let Some(bound_receiver) = envelope.receiver_tid {
+87 | |             if bound_receiver != receiver_tid {
+88 | |                 return None;
+89 | |             }
+90 | |         }
+   | |_________^
+   |
+   = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+   |
+86 ~         if let Some(bound_receiver) = envelope.receiver_tid
+87 ~             && bound_receiver != receiver_tid {
+88 |                 return None;
+89 ~             }
+   |
+
+warning: this `if` statement can be collapsed
+   --> src/kernel/boot/transfer_state.rs:134:9
+    |
+134 | /         if let Some(bound_receiver) = envelope.receiver_tid {
+135 | |             if bound_receiver != receiver_tid {
+136 | |                 return None;
+137 | |             }
+138 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+    |
+134 ~         if let Some(bound_receiver) = envelope.receiver_tid
+135 ~             && bound_receiver != receiver_tid {
+136 |                 return None;
+137 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/kernel/boot/transfer_state.rs:433:13
+    |
+433 | /             if let Some(mapping) = slot.as_mut() {
+434 | |                 if mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap {
+435 | |                     mapping.len = new_len;
+436 | |                     return true;
+437 | |                 }
+438 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+    |
+433 ~             if let Some(mapping) = slot.as_mut()
+434 ~                 && mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap {
+435 |                     mapping.len = new_len;
+436 |                     return true;
+437 ~                 }
+    |
+
+warning: this `let...else` may be rewritten with the `?` operator
+    --> src/kernel/boot/mod.rs:7736:5
+     |
+7736 | /     let Some(asid) = receiver_asid else {
+7737 | |         return None;
+7738 | |     };
+     | |______^ help: replace it with: `let asid = receiver_asid?;`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#question_mark
+
+warning: this `let...else` may be rewritten with the `?` operator
+    --> src/kernel/boot/mod.rs:8193:5
+     |
+8193 | /     let Some(asid) = receiver_asid else {
+8194 | |         return None;
+8195 | |     };
+     | |______^ help: replace it with: `let asid = receiver_asid?;`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#question_mark
+
+warning: match can be simplified with `.unwrap_or_default()`
+   --> src/kernel/direct_ipc_counters.rs:489:30
+    |
+489 |       let (nr6_bij, nr7_bij) = match census {
+    |  ______________________________^
+490 | |         Some(pair) => pair,
+491 | |         None => Default::default(),
+492 | |     };
+    | |_____^ help: replace it with: `census.unwrap_or_default()`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#manual_unwrap_or_default
+    = note: `#[warn(clippy::manual_unwrap_or_default)]` on by default
+
+warning: the loop variable `idx` is used to index `self.extents`
+   --> src/kernel/frame_allocator.rs:261:20
+    |
+261 |         for idx in 0..self.extents.len() {
+    |                    ^^^^^^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/frame_allocator.rs:262:35
+    |
+262 |             if let Some(extent) = self.extents[idx] {
+    |                                   ^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator and `.enumerate()`
+    |
+261 -         for idx in 0..self.extents.len() {
+261 +         for (idx, <item>) in self.extents.iter().enumerate().take(self.extents.len()) {
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/kernel/frame_allocator.rs:262:13
+    |
+262 | /             if let Some(extent) = self.extents[idx] {
+263 | |                 if extent.pages > 0 {
+264 | |                     chosen = Some((idx, extent));
+265 | |                     break;
+266 | |                 }
+267 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+    |
+262 ~             if let Some(extent) = self.extents[idx]
+263 ~                 && extent.pages > 0 {
+264 |                     chosen = Some((idx, extent));
+265 |                     break;
+266 ~                 }
+    |
+
+warning: the loop variable `i` is used to index `self.slots`
+   --> src/kernel/kthread.rs:409:18
+    |
+409 |         for i in 0..KTHREAD_CAPACITY {
+    |                  ^^^^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/kthread.rs:410:13
+    |
+410 |             self.slots[i] = (KTHREAD_CAPACITY - 1 - i) as u8;
+    |             ^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator and `.enumerate()`
+    |
+409 -         for i in 0..KTHREAD_CAPACITY {
+409 +         for (i, <item>) in self.slots.iter_mut().enumerate().take(KTHREAD_CAPACITY) {
+    |
+
+warning: manual implementation of `.is_multiple_of()`
+   --> src/kernel/kthread.rs:505:23
+    |
+505 | const _: () = assert!(KTHREAD_STACK_BYTES % KTHREAD_STACK_ALIGN == 0);
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `KTHREAD_STACK_BYTES.is_multiple_of(KTHREAD_STACK_ALIGN)`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#manual_is_multiple_of
+    = note: `#[warn(clippy::manual_is_multiple_of)]` on by default
+
+warning: large size difference between variants
+   --> src/kernel/recv_core.rs:540:1
+    |
+540 | / pub enum RecvOutcome {
+541 | |     /// A plain message was dequeued; caller applies `delivery.writeback` and
+542 | |     /// `delivery.scheduler` to the frame and scheduler respectively.
+543 | |     Delivered(RecvDelivery),
+    | |     ----------------------- the largest variant contains at least 240 bytes
+...   |
+552 | |     FallbackRequired(FallbackReason),
+    | |     -------------------------------- the second-largest variant contains at least 1 bytes
+553 | |     /// Domain error identical to what the global-lock path would return.
+554 | |     Error(KernelError),
+555 | | }
+    | |_^ the entire enum is at least 240 bytes
+    |
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+   --> src/kernel/recv_core.rs:543:5
+    |
+543 |     Delivered(RecvDelivery),
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#large_enum_variant
+
+warning: you should consider adding a `Default` implementation for `RecvV3CleanupRegistry`
+    --> src/kernel/recv_core.rs:1668:9
+     |
+1668 | /         pub const fn new() -> Self {
+1669 | |             Self {
+1670 | |                 slots: [RecvV3CleanupSlot::EMPTY; RECV_V3_CLEANUP_REGISTRY_CAPACITY],
+1671 | |             }
+1672 | |         }
+     | |_________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#new_without_default
+help: try adding this
+     |
+1736 ~     }
+1737 + 
+1738 +     impl Default for RecvV3CleanupRegistry {
+1739 +         fn default() -> Self {
+1740 +             Self::new()
+1741 +         }
+1742 +     }
+     |
+
+warning: this `if` statement can be collapsed
+   --> src/kernel/scheduler.rs:437:9
+    |
+437 | /         if let Some(current) = self.current {
+438 | |             if current.tid == tid {
+439 | |                 return true;
+440 | |             }
+441 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+    |
+437 ~         if let Some(current) = self.current
+438 ~             && current.tid == tid {
+439 |                 return true;
+440 ~             }
+    |
+
+warning: this `map_or` can be simplified
+    --> src/kernel/scheduler.rs:1043:16
+     |
+1043 |             if best.map_or(true, |(best_load, _)| l < best_load) {
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#unnecessary_map_or
+help: use `is_none_or` instead
+     |
+1043 -             if best.map_or(true, |(best_load, _)| l < best_load) {
+1043 +             if best.is_none_or(|(best_load, _)| l < best_load) {
+     |
+
+warning: the loop variable `idx` is used to index `self.cpus`
+    --> src/kernel/scheduler.rs:1999:20
+     |
+1999 |         for idx in 0..MAX_CPUS {
+     |                    ^^^^^^^^^^^
+     |
+note: for this index operation
+    --> src/kernel/scheduler.rs:2000:37
+     |
+2000 |             let (current, queued) = self.cpus[idx].placement_here(tid);
+     |                                     ^^^^^^^^^^^^^^
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator and `.enumerate()`
+     |
+1999 -         for idx in 0..MAX_CPUS {
+1999 +         for (idx, <item>) in self.cpus.iter().enumerate().take(MAX_CPUS) {
+     |
+
+warning: this `match` expression can be replaced with `?`
+   --> src/kernel/syscall/ipc.rs:543:15
+    |
+543 |       let msg = match msg_result {
+    |  _______________^
+544 | |         Ok(msg) => msg,
+545 | |         Err(err) => return Err(err),
+546 | |     };
+    | |_____^ help: try instead: `msg_result?`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#question_mark
+
+warning: casting to the same type is unnecessary (`u64` -> `u64`)
+   --> src/kernel/syscall/ipc.rs:780:9
+    |
+780 |         recv_tid as u64,
+    |         ^^^^^^^^^^^^^^^ help: try: `recv_tid`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#unnecessary_cast
+    = note: `#[warn(clippy::unnecessary_cast)]` on by default
+
+warning: casting to the same type is unnecessary (`u64` -> `u64`)
+   --> src/kernel/syscall/ipc.rs:993:9
+    |
+993 |         recv_tid as u64,
+    |         ^^^^^^^^^^^^^^^ help: try: `recv_tid`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#unnecessary_cast
+
+warning: this `if` statement can be collapsed
+    --> src/kernel/syscall/ipc.rs:1538:9
+     |
+1538 | /         if let Some(handle) = transfer_handle {
+1539 | |             if let Some(reply_endpoint) = reply_endpoint_for_cleanup {
+1540 | |                 let cleanup_tid =
+1541 | |                     stash_bound_reply_tid.unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+...    |
+1544 | |         }
+     | |_________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+     |
+1538 ~         if let Some(handle) = transfer_handle
+1539 ~             && let Some(reply_endpoint) = reply_endpoint_for_cleanup {
+1540 |                 let cleanup_tid =
+1541 |                     stash_bound_reply_tid.unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+1542 |                 let _ = kernel.take_transfer_envelope(handle, reply_endpoint, cleanup_tid);
+1543 ~             }
+     |
+
+warning: this function has too many arguments (8/7)
+    --> src/kernel/syscall/ipc.rs:1578:1
+     |
+1578 | / fn handle_ipc_recv_result(
+1579 | |     kernel: &mut KernelState,
+1580 | |     frame: &mut TrapFrame,
+1581 | |     endpoint: CapObject,
+...    |
+1586 | |     received: Option<Message>,
+1587 | | ) -> Result<(), SyscallError> {
+     | |_____________________________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#too_many_arguments
+
+warning: this function has too many arguments (9/7)
+    --> src/kernel/syscall/ipc.rs:1601:1
+     |
+1601 | / fn handle_ipc_recv_result_with_empty_error(
+1602 | |     kernel: &mut KernelState,
+1603 | |     frame: &mut TrapFrame,
+1604 | |     endpoint: CapObject,
+...    |
+1610 | |     empty_error: SyscallError,
+1611 | | ) -> Result<(), SyscallError> {
+     | |_____________________________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#too_many_arguments
+
+warning: doc list item without indentation
+   --> src/kernel/syscall/ipc_recv_core.rs:658:5
+    |
+658 | /// VALIDATION: FALLBACK_GLOBAL_LOCK — `FLAG_REPLY_CAP` (D5 deferred),
+    |     ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+    |
+658 | ///      VALIDATION: FALLBACK_GLOBAL_LOCK — `FLAG_REPLY_CAP` (D5 deferred),
+    |     +++++
+
+warning: doc list item without indentation
+   --> src/kernel/syscall/ipc_recv_core.rs:659:5
+    |
+659 | ///   shared-region transfers (`OPCODE_SHARED_MEM`), and every
+    |     ^^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+    |
+659 | ///      shared-region transfers (`OPCODE_SHARED_MEM`), and every
+    |       +++
+
+warning: doc list item without indentation
+   --> src/kernel/syscall/ipc_recv_core.rs:660:5
+    |
+660 | ///   `FallbackRequired` outcome continue through
+    |     ^^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+    |
+660 | ///      `FallbackRequired` outcome continue through
+    |       +++
+
+warning: doc list item without indentation
+   --> src/kernel/syscall/ipc_recv_core.rs:661:5
+    |
+661 | ///   `materialize_received_message_cap` unchanged. The legacy full recv path
+    |     ^^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+    |
+661 | ///      `materialize_received_message_cap` unchanged. The legacy full recv path
+    |       +++
+
+warning: doc list item without indentation
+   --> src/kernel/syscall/ipc_recv_core.rs:662:5
+    |
+662 | ///   (`handle_ipc_recv_result_with_empty_error`) and the NR 30 RecvSharedV3
+    |     ^^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+    |
+662 | ///      (`handle_ipc_recv_result_with_empty_error`) and the NR 30 RecvSharedV3
+    |       +++
+
+warning: doc list item without indentation
+   --> src/kernel/syscall/ipc_recv_core.rs:663:5
+    |
+663 | ///   handler intentionally keep calling the canonical helper directly.
+    |     ^^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+    |
+663 | ///      handler intentionally keep calling the canonical helper directly.
+    |       +++
+
+warning: this function has too many arguments (8/7)
+   --> src/kernel/syscall/fork_txn.rs:495:1
+    |
+495 | / fn unwind<O: SpawnTxnOwners>(
+496 | |     owners: &mut O,
+497 | |     child_tid: u64,
+498 | |     reservation: SpawnReservationToken,
+...   |
+503 | |     err: KernelError,
+504 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#too_many_arguments
+
+warning: using `chunks_exact` with a constant chunk size
+   --> src/kernel/syscall/process.rs:417:24
+    |
+417 |     for chunk in bytes.chunks_exact(core::mem::size_of::<u64>()) {
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<{ core::mem::size_of::<u64>() }>().0`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#chunks_exact_to_as_chunks
+    = note: `#[warn(clippy::chunks_exact_to_as_chunks)]` on by default
+
+warning: the loop variable `idx` is used to index `ipc.transfer_envelopes`
+   --> src/kernel/syscall/reap_txn.rs:836:16
+    |
+836 |     for idx in 0..MAX_TRANSFER_ENVELOPES {
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/syscall/reap_txn.rs:837:30
+    |
+837 |         let Some(envelope) = ipc.transfer_envelopes[idx] else {
+    |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator and `.enumerate()`
+    |
+836 -     for idx in 0..MAX_TRANSFER_ENVELOPES {
+836 +     for (idx, <item>) in ipc.transfer_envelopes.iter().enumerate().take(MAX_TRANSFER_ENVELOPES) {
+    |
+
+warning: the loop variable `idx` is used to index `ipc.active_transfer_mappings`
+   --> src/kernel/syscall/reap_txn.rs:853:16
+    |
+853 |     for idx in 0..MAX_TRANSFER_ENVELOPES {
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/syscall/reap_txn.rs:854:29
+    |
+854 |         let Some(mapping) = ipc.active_transfer_mappings[idx] else {
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator and `.enumerate()`
+    |
+853 -     for idx in 0..MAX_TRANSFER_ENVELOPES {
+853 +     for (idx, <item>) in ipc.active_transfer_mappings.iter().enumerate().take(MAX_TRANSFER_ENVELOPES) {
+    |
+
+warning: casting to the same type is unnecessary (`u32` -> `u32`)
+   --> src/kernel/syscall/recv_shared_v3.rs:124:32
+    |
+124 |     out[4..8].copy_from_slice(&(V3_MIN_OUTPUT_LEN as u32).to_le_bytes());
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `V3_MIN_OUTPUT_LEN`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#unnecessary_cast
+
+warning: casting to the same type is unnecessary (`u64` -> `u64`)
+   --> src/kernel/syscall/spawn_image_txn.rs:675:14
+    |
+675 |             ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `service_send_cap`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#unnecessary_cast
+
+warning: the loop variable `index` is only used to index `records`
+   --> src/kernel/syscall/vm_txn.rs:672:34
+    |
+672 |                     for index in 0..records.len() {
+    |                                  ^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/syscall/vm_txn.rs:677:56
+    |
+677 |                         owners.release_unminted_object(records[index].object_id);
+    |                                                        ^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator
+    |
+672 -                     for index in 0..records.len() {
+672 +                     for <item> in &mut records {
+    |
+
+warning: the loop variable `index` is only used to index `records`
+   --> src/kernel/syscall/vm_txn.rs:692:30
+    |
+692 |                 for index in 0..records.len() {
+    |                              ^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/syscall/vm_txn.rs:697:52
+    |
+697 |                     owners.release_unminted_object(records[index].object_id);
+    |                                                    ^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator
+    |
+692 -                 for index in 0..records.len() {
+692 +                 for <item> in &mut records {
+    |
+
+warning: the loop variable `index` is only used to index `records`
+   --> src/kernel/syscall/vm_txn.rs:734:30
+    |
+734 |                 for index in 0..records.len() {
+    |                              ^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/syscall/vm_txn.rs:737:25
+    |
+737 |                         records[index].pinned = false;
+    |                         ^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator
+    |
+734 -                 for index in 0..records.len() {
+734 +                 for <item> in &mut records {
+    |
+
+warning: the loop variable `index` is only used to index `records`
+   --> src/kernel/syscall/vm_txn.rs:740:30
+    |
+740 |                 for index in i..records.len() {
+    |                              ^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/syscall/vm_txn.rs:741:52
+    |
+741 |                     owners.release_unminted_object(records[index].object_id);
+    |                                                    ^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator
+    |
+740 -                 for index in i..records.len() {
+740 +                 for <item> in records.iter().skip(i) {
+    |
+
+warning: the loop variable `index` is only used to index `records`
+   --> src/kernel/syscall/vm_txn.rs:778:22
+    |
+778 |         for index in 0..records.len() {
+    |                      ^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/syscall/vm_txn.rs:780:48
+    |
+780 |                 owners.release_unminted_object(records[index].object_id);
+    |                                                ^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator
+    |
+778 -         for index in 0..records.len() {
+778 +         for <item> in &records {
+    |
+
+warning: the loop variable `index` is only used to index `records`
+   --> src/kernel/syscall/vm_txn.rs:800:18
+    |
+800 |     for index in 0..records.len() {
+    |                  ^^^^^^^^^^^^^^^^
+    |
+note: for this index operation
+   --> src/kernel/syscall/vm_txn.rs:923:38
+    |
+923 |             if let Some(object_id) = records[index].displaced_pinned.take() {
+    |                                      ^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator
+    |
+800 -     for index in 0..records.len() {
+800 +     for <item> in &mut records {
+    |
+
+warning: the loop variable `index` is only used to index `records`
+    --> src/kernel/syscall/vm_txn.rs:1027:18
+     |
+1027 |     for index in 0..records.len() {
+     |                  ^^^^^^^^^^^^^^^^
+     |
+note: for this index operation
+    --> src/kernel/syscall/vm_txn.rs:1032:13
+     |
+1032 |             records[index].pinned = false;
+     |             ^^^^^^^^^^^^^^
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#needless_range_loop
+help: consider using an iterator
+     |
+1027 -     for index in 0..records.len() {
+1027 +     for <item> in &mut records {
+     |
+
+warning: this function has too many arguments (8/7)
+    --> src/kernel/syscall.rs:1387:1
+     |
+1387 | / pub(crate) fn produce_queued_shared_region_delivery(
+1388 | |     kernel: &mut KernelState,
+1389 | |     receiver_tid: u64,
+1390 | |     endpoint_idx: usize,
+...    |
+1395 | |     msg: &Message,
+1396 | | ) -> Result<bool, SyscallError> {
+     | |_______________________________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#too_many_arguments
+
+warning: this operation has no effect
+  --> src/kernel/vm.rs:31:26
+   |
+31 |             None => Self(u64::MAX & !mask),
+   |                          ^^^^^^^^^^^^^^^^ help: consider reducing it to: `!mask`
+   |
+   = help: for further information visit https://clippy.rust-lang.org/main/index.html#identity_op
+
+warning: called `.err().expect()` on a `Result` value
+   --> src/kernel/vm.rs:516:45
+    |
+516 |         let i = self.find_entry_index(virt).err().expect("insert idx");
+    |                                             ^^^^^^^^^^^^ help: try: `expect_err`
+    |
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#err_expect
+    = note: `#[warn(clippy::err_expect)]` on by default
+
+warning: this block may be rewritten with the `?` operator
+    --> src/kernel/vm.rs:1218:9
+     |
+1218 | /         if self.get(asid).is_none() {
+1219 | |             return None;
+1220 | |         }
+     | |_________^ help: replace it with: `self.get(asid)?;`
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#question_mark
+
+warning: large size difference between variants
+   --> src/runtime.rs:419:1
+    |
+419 | / pub(crate) enum OwnerRevalidationClaim {
+420 | |     /// Marked `Running`, convention consumed, context/TLS read and the parked send completion
+421 | |     /// taken — all from the exact selected incarnation.
+422 | |     Claimed(OwnerRevalidationSnapshot),
+    | |     ---------------------------------- the largest variant contains at least 384 bytes
+...   |
+426 | |     Missing,
+    | |     ------- the second-largest variant carries no data at all
+...   |
+430 | |     Refused,
+431 | | }
+    | |_^ the entire enum is at least 384 bytes
+    |
+note: boxing a variant would require the type no longer be `Copy`
+   --> src/runtime.rs:419:17
+    |
+419 | pub(crate) enum OwnerRevalidationClaim {
+    |                 ^^^^^^^^^^^^^^^^^^^^^^
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+   --> src/runtime.rs:422:5
+    |
+422 |     Claimed(OwnerRevalidationSnapshot),
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://clippy.rust-lang.org/main/index.html#large_enum_variant
+
+warning: large size difference between variants
+    --> src/runtime.rs:1223:1
+     |
+1223 | /  pub(crate) enum UserFpuReturn {
+1224 | |      /// Restore `state`, the home of `owner`, which is the exact incarnation the prepared
+1225 | |      /// continuation belongs to AND the one the scheduler names current on this CPU.
+1226 | |/     Install {
+1227 | ||         owner: FpuHomeOwner,
+1228 | ||         state: crate::kernel::user_fpu::UserFpuState,
+1229 | ||     },
+     | ||_____- the largest variant contains at least 528 bytes
+...    |
+1232 | |      Refuse(FpuHomeRefusal),
+     | |      ---------------------- the second-largest variant contains at least 24 bytes
+1233 | |  }
+     | |__^ the entire enum is at least 544 bytes
+     |
+note: boxing a variant would require the type no longer be `Copy`
+    --> src/runtime.rs:1223:17
+     |
+1223 | pub(crate) enum UserFpuReturn {
+     |                 ^^^^^^^^^^^^^
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    --> src/runtime.rs:1226:5
+     |
+1226 | /     Install {
+1227 | |         owner: FpuHomeOwner,
+1228 | |         state: crate::kernel::user_fpu::UserFpuState,
+1229 | |     },
+     | |_____^
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#large_enum_variant
+
+warning: this function has a `#[must_use]` attribute with no message, but returns a type already considered as `#[must_use]`
+    --> src/runtime.rs:2853:5
+     |
+2853 | /     pub(crate) fn d6_genuine_mark_running_via_task_seam(
+2854 | |         &self,
+2855 | |         dispatch: CpuDispatch,
+2856 | |     ) -> DispatchMarkOutcome {
+     | |____________________________^
+     |
+help: remove `must_use`
+    --> src/runtime.rs:2852:5
+     |
+2852 |     #[must_use]
+     |     ^^^^^^^^^^^
+     = note: alternatively, you may add an explicit reason to the `must_use` attribute
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#double_must_use
+     = note: `#[warn(clippy::double_must_use)]` on by default
+
+warning: doc list item without indentation
+    --> src/runtime.rs:7006:9
+     |
+7006 |     /// U9-FT3 §3 — the split terminal task transition.
+     |         ^
+     |
+     = help: if this is supposed to be its own paragraph, add a blank line
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+     |
+7006 |     ///   U9-FT3 §3 — the split terminal task transition.
+     |         ++
+
+warning: this function has too many arguments (8/7)
+    --> src/runtime.rs:9670:5
+     |
+9670 | /     fn kernel_register_v2_meta_write_split(
+9671 | |         &self,
+9672 | |         cpu: CpuId,
+9673 | |         frame: &mut TrapFrame,
+...    |
+9678 | |         is_reply_cap: bool,
+9679 | |     ) -> Option<crate::kernel::syscall::SyscallError> {
+     | |_____________________________________________________^
+     |
+     = help: for further information visit https://clippy.rust-lang.org/main/index.html#too_many_arguments
+
+warning: doc list item without indentation
+     --> src/runtime.rs:11762:9
+      |
+11762 |     ///   `ipc_state_lock`, NO capability lock, NO broad `&mut KernelState` is
+      |         ^^
+      |
+      = help: if this is supposed to be its own paragraph, add a blank line
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+      |
+11762 |     ///     `ipc_state_lock`, NO capability lock, NO broad `&mut KernelState` is
+      |           ++
+
+warning: doc list item without indentation
+     --> src/runtime.rs:11763:9
+      |
+11763 |     ///   held during the copy.
+      |         ^^
+      |
+      = help: if this is supposed to be its own paragraph, add a blank line
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+      |
+11763 |     ///     held during the copy.
+      |           ++
+
+warning: doc list item without indentation
+     --> src/runtime.rs:11776:9
+      |
+11776 |     /// the message is consumed in every case (one-shot preserved).
+      |         ^
+      |
+      = help: if this is supposed to be its own paragraph, add a blank line
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+      |
+11776 |     ///   the message is consumed in every case (one-shot preserved).
+      |         ++
+
+warning: this `let...else` may be rewritten with the `?` operator
+     --> src/runtime.rs:13311:9
+      |
+13311 | /         let Some((base, current_end)) =
+13312 | |             self.with_memory_split_mut(|memory| KernelState::task_brk_bounds_locked(memory, tid))
+13313 | |         else {
+13314 | |             return None;
+13315 | |         };
+      | |__________^ help: replace it with: `let (base, current_end) = self.with_memory_split_mut(|memory| KernelState::task_brk_bounds_locked(memory, tid))?;`
+      |
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#question_mark
+
+warning: this `if` statement can be collapsed
+     --> src/runtime.rs:15150:17
+      |
+15150 | /                 if record_live && identity.reply_record_generation != work.reply_record_generation {
+15151 | |                     if let Some(slot) = ipc.reply_death_unclaimed.get_mut(work.reply_record_index) {
+...     |
+15160 | |                 }
+      | |_________________^
+      |
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+      |
+15150 ~                 if record_live && identity.reply_record_generation != work.reply_record_generation
+15151 ~                     && let Some(slot) = ipc.reply_death_unclaimed.get_mut(work.reply_record_index) {
+15152 |                         // A slot already holding an item for another generation holds a stale
+  ...
+15158 |                         parked = true;
+15159 ~                     }
+      |
+
+warning: this `if` statement can be collapsed
+     --> src/runtime.rs:15611:17
+      |
+15611 | /                 if let Some(Some(record)) = ipc.reply_caps.get_mut(index) {
+15612 | |                     if ipc.reply_cap_generations[index] == generation {
+15613 | |                         record.reservation = ReplyRecordReservation::Consumed;
+15614 | |                     }
+15615 | |                 }
+      | |_________________^
+      |
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+      |
+15611 ~                 if let Some(Some(record)) = ipc.reply_caps.get_mut(index)
+15612 ~                     && ipc.reply_cap_generations[index] == generation {
+15613 |                         record.reservation = ReplyRecordReservation::Consumed;
+15614 ~                     }
+      |
+
+warning: manual implementation of `.is_multiple_of()`
+     --> src/runtime.rs:15804:12
+      |
+15804 |         if virt.0 % (PAGE_SIZE as u64) != 0 {
+      |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `!virt.0.is_multiple_of(PAGE_SIZE as u64)`
+      |
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#manual_is_multiple_of
+
+warning: doc list item without indentation
+     --> src/runtime.rs:16167:9
+      |
+16167 |     /// enqueues. NO IPC/capability/VM/memory lock is held. Mirrors `apply_split_receiver_wake_plan`
+      |         ^
+      |
+      = help: if this is supposed to be its own paragraph, add a blank line
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+      |
+16167 |     ///   enqueues. NO IPC/capability/VM/memory lock is held. Mirrors `apply_split_receiver_wake_plan`
+      |         ++
+
+warning: doc list item without indentation
+     --> src/runtime.rs:16168:9
+      |
+16168 |     /// (`wake_tid_to_runnable` → `enqueue_woken_task`) for a blocked recv-v2 receiver (whose plain
+      |         ^
+      |
+      = help: if this is supposed to be its own paragraph, add a blank line
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+      |
+16168 |     ///   (`wake_tid_to_runnable` → `enqueue_woken_task`) for a blocked recv-v2 receiver (whose plain
+      |         ++
+
+warning: doc list item without indentation
+     --> src/runtime.rs:16169:9
+      |
+16169 |     /// recv carries no IPC deadline, so the broad path's timeout-clear is a no-op here).
+      |         ^
+      |
+      = help: if this is supposed to be its own paragraph, add a blank line
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+      |
+16169 |     ///   recv carries no IPC deadline, so the broad path's timeout-clear is a no-op here).
+      |         ++
+
+warning: this `if` statement can be collapsed
+     --> src/runtime.rs:17545:29
+      |
+17545 | / ...                   if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+17546 | | ...                       if tcb.reply_timeout_token == Some(this) {
+17547 | | ...                           tcb.ipc_timeout_deadline = None;
+17548 | | ...                           tcb.reply_timeout_token = None;
+17549 | | ...                       }
+17550 | | ...                   }
+      | |_______________________^
+      |
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#collapsible_if
+help: collapse nested if block
+      |
+17545 ~                             if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)
+17546 ~                                 && tcb.reply_timeout_token == Some(this) {
+17547 |                                     tcb.ipc_timeout_deadline = None;
+17548 |                                     tcb.reply_timeout_token = None;
+17549 ~                                 }
+      |
+
+warning: doc list item without indentation
+     --> src/runtime.rs:18727:9
+      |
+18727 |     /// 199D-TRC — classify the reply-record's terminal cell relative to ONE exact direct reply.
+      |         ^
+      |
+      = help: if this is supposed to be its own paragraph, add a blank line
+      = help: for further information visit https://clippy.rust-lang.org/main/index.html#doc_lazy_continuation
+help: indent this line
+      |
+18727 |     ///    199D-TRC — classify the reply-record's terminal cell relative to ONE exact direct reply.
+      |         +++
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `yarm` (lib) generated 425 warnings (run `cargo clippy --fix --lib -p yarm -- ` to apply 102 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.22s

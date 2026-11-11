@@ -1,0 +1,13 @@
+nc4 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index ea472b41..b4c250dd 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -757,6 +757,7 @@ pub fn compare_and_requeue_locked(
+                 r.va = target.0 as u64;
+             }
+             table.link_tail(slot);
++            table.generations[slot] = table.generations[slot].wrapping_add(1);
+             moved += 1;
+         }
+         if at_last {

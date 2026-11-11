@@ -1,0 +1,4 @@
+[ipccall-direct-smp-request] building base x86_64 artifacts (servers + initramfs)
+[ipccall-direct-smp-request] rebuilding kernel_boot with --features x86-ipccall-direct-smp-oracle
+scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh: line 67: syntax error near unexpected token `fi'
+scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh: line 67: `fi'
