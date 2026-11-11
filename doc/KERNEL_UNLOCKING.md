@@ -4952,6 +4952,195 @@ Verdict: **FUTEX_WAKE_CAP1_ACCEPTED_WITH_BASELINE_DEBT**. Refs: `claude/yarm-ker
 and `wip/futex-wake-cap1` at the commit that adds this record; `main` `b81e0317` and every other
 ref unchanged.
 
+#### FUTEX-REQUEUE1 (from delivered `3ff5a628`)
+
+**What was missing.** A condition-variable broadcast had two tools, and both were wrong.
+Re-issuing `FutexWake` until it returned `0` (what `SYSCALL_ABI.md` told callers to do) made every
+waiter runnable at once, only for all but one to block again on the mutex. Since FUTEX-WAKE-CAP1 it
+could also stop early: a `0` can mean the oldest waiter's home queue is full, not that no waiter is
+left. There was no way to move a blocked waiter from one futex to another without first making it
+runnable.
+
+**The ABI: NR 17, v10 → v11.** `FutexCmpRequeue(source, target, expected, wake, requeue, flags)`
+takes the lowest number of the reserved gap `17..=22`. Assigning a reserved public number is what
+the ABI policy reserves a version bump for, so `SYSCALL_ABI_VERSION` is `11`; the `abi_version`
+field NR 30 writes reports it (`RECV_V3_ABI_VERSION = 11`). Nothing else changes. The bump also
+formally covers FUTEX-FOUND1's NR 9 / NR 10 argument redesign, made while the version still read
+`10`. Arguments: two 4-byte-aligned words; `expected`, `wake` and `requeue` each `u32`; flags bit 0
+source shared, bit 1 target shared, every other bit reserved. Every argument refusal is
+`InvalidArgs` and is answered before any lock is taken. Results:
+
+| outcome | `ret0` | `ret1` | `ret2` / error | mutated |
+|---|---|---|---|---|
+| success | woken | requeued | `DONE` (bit 8) always set, `CAPACITY_LIMITED` (bit 0) if the wake portion stopped for queue room | exactly those |
+| source word ≠ `expected` | — | — | `WouldBlock` | nothing |
+| source and target are the same key (also via another mapping of the same object) | — | — | `InvalidArgs` | nothing |
+| unresolvable word | — | — | the error `FutexWake` gives for it | nothing |
+| no waiters | 0 | 0 | `DONE` | nothing |
+
+On AArch64 and RISC-V an error leaves `ret2 = 0`, so `DONE` is what tells a success from an error
+on every port. `FutexWake`'s ABI is unchanged.
+
+**The linearization point, and why no lock redesign was needed.** One critical section, task lock
+then VM then memory (ranks 2 → 5 → 6, the order `FutexWait`'s compare-and-park already takes):
+resolve both keys, read the source word, compare, and transfer. Every wait registers under the
+task lock, so each waiter is either registered before the operation (it may be moved) or after it
+(it is not). The comparison and the move therefore see one state of the world. The HARD STOP
+condition was not met: the existing three locks cover every input of the decision, and nothing
+in the transfer touches the scheduler. The wake portion runs afterwards, as `FutexWake` of the
+source with `count = wake` (`futex_wake_key_outcome(_split)`), and keeps FUTEX-WAKE-CAP1's
+reserve → claim → commit protocol unchanged.
+
+**The transfer** (`compare_and_requeue_locked`, `src/kernel/boot/futex.rs`). One walk of the source
+key's bucket, from its head to the tail it had at entry. It skips the first `wake` live source
+waiters, which the wake portion will claim, then moves up to `requeue` further ones: unlink
+(`unlink_after`), rekey (key and VA), append at the target bucket's tail (`link_tail`). Stale
+records are retired on the way, exactly as a wake does. Moved records are appended past the
+remembered tail and never revisited, so a same-bucket move is an ordinary relink, not a special
+case. Existing target waiters stay ahead of the moved ones, and the moved ones keep their relative
+order: FIFO on both keys. Bound: ≤ 512 O(1) record visits; no allocation, no stack array, no
+scheduler lock.
+
+**Ownership.** A waiter's token is `{slot, generation}` and does not name its key, so a moved
+waiter keeps its identity: the later wake of the target claims it token-exact (FUTEX-WAKE-CAP1's
+claim also checks that the record is still on the woken key, so a waiter moved away cannot be
+claimed through the source). Exit and death retire by slot (`table.retire`), which walks the
+bucket of the record's CURRENT key, so a waiter that dies after being moved leaves nothing behind.
+A waiter still in its split-wait publication window when it is moved re-reads its OWN source word
+(a broadcast bumped it first, so it returns `0` at once) and undoes its registration through the
+same slot-exact retire, which finds the record on the target. So `requeued` counts waiters moved,
+some of which may then return `0` from their own wait: the usual futex rule.
+
+**Capacity.** The move needs no queue room at all: a moved waiter stays `Blocked(Futex)` and is
+placed only when a later wake of the target reaches it, through the same reservation every wake
+uses. Only the wake portion can meet a full queue. When it does, it stops, the waiter it could not
+place stays parked ON THE SOURCE, and the result says `CAPACITY_LIMITED`; a retry with `wake = 0`
+moves the remaining waiters, behind those already moved, with no room needed. `wake 0 / requeue
+100` with a full queue moves all 100 (r21).
+
+**The broadcast protocol** (`yarm_user_rt::futex_sync`, documented in `SYSCALL_ABI.md`). The
+waiter: lock, check, read the sequence, unlock, `FutexWait(seq, seen)`, then re-lock in the
+CONTENDED state (`2`), because a woken or moved waiter cannot know whether others are parked
+behind it. The broadcaster, holding the mutex: bump the sequence, store CONTENDED in the mutex
+word, `FutexCmpRequeue(seq, mutex, new_seq, 1, MAX)`; on `CAPACITY_LIMITED` repeat with `wake = 0`;
+on `WouldBlock` (a signal moved the sequence) fall back to waking every sequence waiter. The
+CONTENDED store is what makes the broadcaster's own unlock issue the first mutex wake: without it,
+a broadcast that woke nobody would leave every moved waiter parked on a mutex whose word says
+"uncontended" (r30). This is a demonstration of the protocol, not a pthread implementation: no
+timeouts, attributes, robustness or priority protocol.
+
+**Split from birth.** NR 17 never takes the broad lock on any port: the `syscall_split` route
+(`try_split_futex_cmp_requeue_into_frame`, `FUTEX_REQUEUE_SPLIT_DONE ... broad_lock=0`), the AArch64
+pre-split import and finalize lists, and the RISC-V split-eligible list (x86 needs no list). On the
+ports the route answers every NR 17 call itself — refusals included — and never returns to the
+broad dispatcher. The broad-path implementation (`futex_cmp_requeue_current`) is reached only by
+the hosted build, as NR 10's is, and is the same transfer under the same locks (r01b checks parity).
+
+**Footprint.** No new allocation, no new static table, no stack array; `FutexRequeueTransfer` and
+`FutexRequeueOutcome` are a few words each. Contention: the transfer holds task, VM and memory once
+for one bucket walk; the wake portion costs what `FutexWake(wake)` costs; scheduler work is
+proportional to the waiters woken, never to those moved.
+
+**Re-derived guards.** Syscall-count pins 22 → 23 (36 sites); the d03 free-number list without 17;
+the 199D whitelist (21 entries plus `SYSCALL_FUTEX_CMP_REQUEUE_NR`); stage29 split eligibility now
+lists NR 17; `RECV_V3_ABI_VERSION` and its fixtures at 11; the frozen ABI test asserts v11 and NR 17.
+
+**Tests** (`futex_requeue1`, 32): r01–r31 and r01b (split and broad agree). Matching and
+mismatched words (a mismatch mutates nothing); wake 0 / requeue n and wake n / requeue 0; no
+eligible waiters; the same key, including through two mappings (refused); two keys in one bucket;
+FIFO on both keys; private keys in different address spaces never mix; a shared object at
+different VAs across processes; independent source and target flags; a stale identity cannot reach
+a replacement; a wake racing the requeue on the source and on the target; two requeues competing; a
+requeue racing a wait's publication and its second read; a requeue racing task death and mapping
+teardown; exact token ownership across wait cycles; a moved waiter resumes exactly once; requeue 100
+with a full run queue; a capacity-limited wake discards and duplicates nothing; mixed counts are
+exact; every reservation is committed or released; no `Runnable` but unqueued task under a
+randomized mix; repeated cycles do not exhaust the waiter table; the condvar model: broadcast to
+ten wakes one and requeues nine, mutex unlocks release the moved waiters without a herd, repeated
+broadcasts with changing sequences strand nobody, the CONTENDED protocol guarantees an eventual
+target wake-up; the ABI is v11 and its status bits unambiguous.
+
+**Hosted negative controls** (`frq_nc.py`, disposable worktree, at `08a639ac`, filter `futex`). Each
+reintroduces one defect class; all ten are detected by behavioural tests, and the unmodified tree
+passes all 177 tests in the subset.
+
+| Control | Defect reintroduced | Detected by |
+|---|---|---|
+| NC1 | the comparison is skipped: a stale `expected` still moves and wakes | r02, r05, r25, r29 |
+| NC2 | identity by VA alone, every bucket walked | r09–r12 |
+| NC3 | stale records are moved and counted | r17, r19 |
+| NC4 | the move gives the record a new generation (the waiter's token dies) | 23 tests |
+| NC5 | moved records are linked at the HEAD of the target chain | 15 tests |
+| NC6 | same-bucket shortcut: retag in place without relinking | r07 |
+| NC7 | a moved waiter is made `Runnable` (and placed nowhere) | 26 tests |
+| NC8 | a waiter whose reservation was refused is claimed anyway | 12 tests, FUTEX-WAKE-CAP1's included |
+| NC9 | the claim does not check the record is still on the woken key | r13, r15 |
+| NC10 | the publication-window undo assumes the waiter is on its own key | r16 |
+
+**The live witness** (default off; `yarm.futex_requeue_witness=1`, init selector 18,
+`scripts/qemu-futex-requeue-witness-smoke.sh`, graded by `scripts/grade-futex-requeue-witness.py`
+against the kernel's own markers). In ring 3, init starts ten threads that each run three condvar
+rounds against one mutex. Before every broadcast, a census proves all ten are parked: two NR 17
+calls with `wake = 0` move all ten to an auxiliary word and back (`requeued=10` each, from the
+kernel's line). Then one broadcast: the grader requires exactly one kernel
+`FUTEX_REQUEUE_SPLIT_DONE woken=1 requeued=9 capacity_limited=0 broad_lock=0` per round, the cell's
+`calls=1 fallback=0`, and `acquired = 10k` with `overlap = 0`, so every moved waiter was released
+through mutex wakes, one at a time. The waiters' parks are attributed to CPUs from the kernel's
+`FUTEX_REQUEUE_WITNESS_PARK` lines (emitted only with the knob on). The standard core smoke must
+accept the same boot. Frozen `15e02f59`, SMP 2, all three ports:
+
+| arch | broadcasts | census calls | parks | park CPUs | woken / requeued per round | result |
+|---|---|---|---|---|---|---|
+| x86_64 | 3 | 6 | 40 | 0, 1 | 1 / 9 ×3 | `witness=ok core_smoke=ok cross_cpu=yes` |
+| AArch64 | 3 | 6 | 40 | 0, 1 | 1 / 9 ×3 | `witness=ok core_smoke=ok cross_cpu=yes` |
+| RISC-V | 3 | 6 | 40 | 0, 1 | 1 / 9 ×3 | `witness=ok core_smoke=ok cross_cpu=yes` |
+
+The same three passed again inside the qualification matrix (FX7). `mutex_wakes` is reported, not
+graded: a mutex wake can come from the unlock inside another thread's next wait, so its count per
+round varies (9,7,9 in one x86 run); `acquired = 10k` is the proof.
+
+**Qualification of `15e02f59`** against `3ff5a628`, on a predeclared schedule (`frq_schedule.md`,
+hashed with the runner); steps sequential; nothing retried.
+
+| Step | Result |
+|---|---|
+| fmt; clippy `--features hosted-dev` | clean; 425 warnings against 424. The one extra is `set_futex_requeue_witness_enabled` never used in the hosted build, the class every witness setter already has (`set_ipc_displace1_witness_enabled` among them: they are called only from boot command-line parsing, which the hosted build does not compile). No other class or count changed |
+| hosted lib (serial) | 6474 passed, 0 failed, 3 ignored |
+| integration: broad-lock census, doc-fragmentation guard, SCHED-LOCK1 grader | 41 binaries, 396 passed |
+| subsets: futex_requeue1 (32), futex_wake_cap1, futex_found1, futex (177), robust, scheduler, sched_, enqueue, ap_sched1, stage199d, stage191b, stage191d, stage200d0a, stage29, syscall, u9qa, kthread, exit, reap, spawn, thread, fork, ipc_displace1, sender_wake | all pass |
+| lock order, common test set (F excluding `futex_requeue1`) | 20478 (test, pair) entries on each side; 2 differ, both in `c09_reply_vs_timeout_terminal_cas_race` (scheduler/task 78 vs 74, task/ipc 1350 vs 1330). Three reruns of `c09` on B alone give 83–89 and 1370–1400: race-test variance, no new pair, nothing nested |
+| `compare_and_requeue_locked` source check | no scheduler, CPU or enqueue reference in the transfer |
+| default builds ×3; recv-v2 oracles ×3; CI-exact strict builds + strict core smokes ×3 | pass |
+| first-cohort futex seal on the CI-exact artifacts | F and B identical: 12/12 live cells, the same two idle cross-checks (AArch64, RISC-V) missing. The known idle-oracle variance; the wait path is unchanged here |
+| IPC-DISPLACE1 SMP1 ×3 | `witness=ok core_smoke=ok` |
+| overtaken witness x86_64, AArch64 | `result=ok` on F and B |
+| AP-scheduling SMP2 ×3; KTHREAD1 SMP2 ×3; SCHED-LOCK1 SMP2 ×3 | `APSW_WITNESS_SEAL` ×3; `KT1W_SEAL result=pass` ×3; `SL1W_SEAL result=pass` ×3 |
+| FUTEX-REQUEUE1 witness SMP2 ×3 (FX7) | `result=ok` ×3, `cross_cpu=yes` |
+| UART / PL011 IRQ witnesses ×3 | `result=ok` ×3 |
+| IpcCall/IpcReply direct matrix; server-dies ×3 | `total_live_cells=6 ... result=ok`; `result=ok` ×3 |
+| CI profiles, F and B | identical status and identical failure output: sender-wake, smp2-core, smp4-core pass; inherited #2 (smp2-sender-wake), #3 (smp4-sender-wake), #4 (sched-timeout, the same 2 error lines) and d2-send (the same 8) |
+| reply-timeout matrix; SMP-request script; CI strict timer grep | inherited #1 (`class=IpcReplyTimeout`), #5 (line 67), #6 (0/0/0), identical on F and B |
+| every QEMU log of F for the marker list (incl. `FUTEX_REQUEUE_SPLIT_REFUSED`, `FUTEX_WAKE_STOPPED`, `FUTEX_WAKE_RESERVED_COMMIT_REFUSED`, `CRQ_WITNESS ... result=fail`) | no hits |
+
+**Limits.**
+
+* *Not a capacity change.* A queue still holds 64 user entries per priority (SC-POOL-3, RT-SCHED1).
+  The requeue moves waiters without needing room; it cannot create room for the wake portion.
+* *`FutexWake`'s `0` stays ambiguous* (no waiter left, or the oldest one unplaceable): its ABI is
+  unchanged by scope. A mutex unlock whose `FutexWake(1)` meets a full queue leaves that waiter
+  parked until the next contended unlock. Recorded as an open observation with SC-POOL-3.
+* *Not implemented, by scope:* timed waits, bitset wake masks, priority inheritance or protection,
+  RT-SCHED1, queue resizing, a general synchronization framework, pthread.
+* *The witness measures one shape:* ten waiters, one broadcaster, two CPUs. The interleavings the
+  hosted tests force (death, teardown, competing requeues, the publication window) are not forced
+  live.
+* *Still open:* the six baseline debts, the inherited `d2-send` failure and the idle-oracle
+  variance, unchanged; exited tasks still linger in run queues until dispatched; the FUTEX-FOUND1,
+  FUTEX-WAKE-CAP1 and ENDPOINT-ROLLBACK1 observations, unchanged.
+
+Verdict: **FUTEX_REQUEUE1_ACCEPTED_WITH_BASELINE_DEBT**. Refs: `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/futex-requeue1`
+at the commit that adds this record; `main` `b81e0317` and every other ref unchanged.
+
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 
