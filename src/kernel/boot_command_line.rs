@@ -399,6 +399,11 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_ipc_displace1_witness_enabled(enabled);
         crate::yarm_log!("YARM_IPC_DISPLACE1_WITNESS_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.futex_requeue_witness {
+        // FUTEX-REQUEUE1: arm the live compare-and-requeue witness. Default off.
+        crate::kernel::boot::set_futex_requeue_witness_enabled(enabled);
+        crate::yarm_log!("YARM_FUTEX_REQUEUE_WITNESS_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ipc_residual2_park_witness {
         // U9-IPC-RESIDUAL2 §4: arm the full-endpoint park witness. Default off.
         crate::kernel::boot::set_ipc_residual2_park_witness_enabled(enabled);
@@ -937,6 +942,10 @@ pub struct YarmBootOptions<'a> {
     /// second receiver must be refused `QueueFull` and restored while the first stays the waiter.
     /// No ordinary boot has two receivers on one endpoint. Architecture-neutral.
     pub ipc_displace1_witness: Option<bool>,
+    /// FUTEX-REQUEUE1: `yarm.futex_requeue_witness=1` DEFAULT-OFF knob. Arms init startup slot 5
+    /// (=18): ten of init's threads wait on a condition variable and a broadcast requeues all but
+    /// one of them onto the mutex. Architecture-neutral.
+    pub futex_requeue_witness: Option<bool>,
     /// U9-IPC-RESIDUAL2 §4: `yarm.ipc_residual2_park_witness=1` DEFAULT-OFF knob. Arms init
     /// startup slot 5 (=14) so init exercises the one newly-served shape no production workload
     /// reaches: an `IpcCall` onto an endpoint whose queue is FULL, which parks the sender.
@@ -1281,6 +1290,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.ipc_displace1_witness" {
             options.ipc_displace1_witness = parse_bool_knob(value);
+        }
+        if key == b"yarm.futex_requeue_witness" {
+            options.futex_requeue_witness = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_residual2_park_witness" {
             options.ipc_residual2_park_witness = parse_bool_knob(value);

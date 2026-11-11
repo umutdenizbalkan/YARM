@@ -1881,9 +1881,12 @@ pub mod futex_sync {
             }
         }
 
-        pub fn unlock(&self) {
+        /// Unlock; when the word was contended, wake one waiter. Returns how many were woken.
+        pub fn unlock(&self) -> u32 {
             if self.word.swap(UNLOCKED, Ordering::Release) == CONTENDED {
-                let _ = futex_wake(self.word.as_ptr(), 1, self.scope);
+                futex_wake(self.word.as_ptr(), 1, self.scope).unwrap_or(0)
+            } else {
+                0
             }
         }
     }

@@ -2657,6 +2657,259 @@ fn run_ipc_displace1_witness(s_tid: u64) {
     );
 }
 
+/// FUTEX-REQUEUE1 — the LIVE compare-and-requeue witness (selector 18).
+///
+/// Ten of init's own threads use `yarm_user_rt::futex_sync` exactly as a program would: each
+/// locks the mutex, announces itself, and waits on the condition variable until the round is
+/// released. Init then, per round:
+///
+/// 1. waits until all ten have announced, then takes a CENSUS of the condition variable's
+///    waiters without waking any — every waiter moved to an auxiliary word and straight back, two
+///    NR 17 calls with wake 0 — until all ten are counted as parked (so the broadcast's counts
+///    are exact, not a scheduling accident);
+/// 2. holding the mutex, releases the round and BROADCASTS (`FutexCondvar::broadcast`: the mutex
+///    marked contended, then one NR 17 waking at most one and requeueing the rest), and unlocks;
+/// 3. waits until all ten have passed the critical section, each exactly once, never two at once.
+///    A requeued waiter is blocked on the MUTEX key, so it can reach the critical section only
+///    through a mutex wake: all ten acquiring is the proof that every moved waiter was resumed.
+///    `mutex_wakes` (the wakes the explicit unlocks issued in the round) is reported, not graded:
+///    a moved waiter may equally be woken by the unlock inside another thread's next `wait`.
+///
+/// The verdict lines are `CRQ_WITNESS_ROUND` and `CRQ_WITNESS_DONE`; the kernel's
+/// `FUTEX_REQUEUE_SPLIT_DONE` and `FUTEX_REQUEUE_WITNESS_PARK` lines attest the counts and where
+/// each waiter parked. Everything is a real syscall through the production owners. The threads
+/// park on a private word at the end, so the boot still reaches its idle boundary.
+#[cfg(all(not(feature = "hosted-dev"), feature = "futex-requeue-witness"))]
+pub(super) mod futex_requeue_witness {
+    use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use yarm_user_rt::futex_sync::{FutexCondvar, FutexMutex};
+    use yarm_user_rt::syscall::{FutexScope, futex_cmp_requeue, futex_wait, yield_now};
+
+    pub(super) const WAITERS: usize = 10;
+    pub(super) const ROUNDS: u32 = 3;
+    pub(super) const STACK_BYTES: usize = 4096;
+    /// A bound on every hand-off, so a defective kernel ends the cell with a verdict.
+    const WAIT_YIELDS: u32 = 20_000;
+    const P: FutexScope = FutexScope::Private;
+
+    /// One contiguous region for all ten stacks (one mapping run, for init's mapping headroom).
+    #[repr(C, align(16))]
+    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; WAITERS]);
+    #[allow(unused)]
+    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; WAITERS]);
+    #[allow(unused)]
+    pub(super) static mut TLS: [[u8; 256]; WAITERS] = [[0; 256]; WAITERS];
+
+    static MUTEX: FutexMutex = FutexMutex::new(P);
+    static COND: FutexCondvar = FutexCondvar::new(P);
+    /// The census's auxiliary word (value 0).
+    static AUX: AtomicU32 = AtomicU32::new(0);
+    static PARK: AtomicU32 = AtomicU32::new(0);
+    /// The predicate: the last round init released.
+    static RELEASED: AtomicU32 = AtomicU32::new(0);
+    static ARRIVED: AtomicU32 = AtomicU32::new(0);
+    static ACQUIRED: AtomicU32 = AtomicU32::new(0);
+    static INSIDE: AtomicU32 = AtomicU32::new(0);
+    static OVERLAP: AtomicU32 = AtomicU32::new(0);
+    static RETURNS: AtomicU32 = AtomicU32::new(0);
+    static MUTEX_WAKES: AtomicU32 = AtomicU32::new(0);
+    static FINISHED: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn armed(slot5: Option<u32>) -> bool {
+        matches!(slot5, Some(18))
+    }
+
+    fn park() -> ! {
+        loop {
+            let v = PARK.load(SeqCst);
+            let _ = futex_wait(PARK.as_ptr(), v, P);
+        }
+    }
+
+    /// A waiter thread: three rounds of lock, announce, wait for the release, critical section,
+    /// unlock. Never returns.
+    pub(super) extern "C" fn child_body() -> ! {
+        for round in 1..=ROUNDS {
+            MUTEX.lock();
+            ARRIVED.fetch_add(1, SeqCst);
+            while RELEASED.load(SeqCst) < round {
+                COND.wait(&MUTEX);
+                RETURNS.fetch_add(1, SeqCst);
+            }
+            if INSIDE.fetch_add(1, SeqCst) != 0 {
+                OVERLAP.fetch_add(1, SeqCst);
+            }
+            ACQUIRED.fetch_add(1, SeqCst);
+            INSIDE.fetch_sub(1, SeqCst);
+            MUTEX_WAKES.fetch_add(MUTEX.unlock(), SeqCst);
+        }
+        FINISHED.fetch_add(1, SeqCst);
+        park()
+    }
+
+    fn wait_for(cell: &AtomicU32, value: u32) -> bool {
+        for _ in 0..WAIT_YIELDS {
+            if cell.load(SeqCst) >= value {
+                return true;
+            }
+            let _ = yield_now();
+        }
+        cell.load(SeqCst) >= value
+    }
+
+    /// The waiters parked on the condition variable, counted without waking any: all moved to
+    /// `AUX` and straight back, in order. Returns (moved there, moved back); `u32::MAX` = refused.
+    fn census() -> (u32, u32) {
+        let seq = COND.seq().load(SeqCst);
+        let there = futex_cmp_requeue(COND.seq().as_ptr(), P, AUX.as_ptr(), P, seq, 0, u32::MAX);
+        let back = futex_cmp_requeue(AUX.as_ptr(), P, COND.seq().as_ptr(), P, 0, 0, u32::MAX);
+        (
+            there.map_or(u32::MAX, |o| o.requeued),
+            back.map_or(u32::MAX, |o| o.requeued),
+        )
+    }
+
+    pub(super) struct Child {
+        pub(super) entry: usize,
+        pub(super) stack_top: usize,
+        pub(super) tls_base: usize,
+    }
+
+    pub(super) fn run_once(s_tid: u64, children: &[Child; WAITERS]) {
+        let w = WAITERS as u32;
+        yarm_user_rt::user_log!(
+            "CRQ_WITNESS_BEGIN s_tid={} waiters={} rounds={}",
+            s_tid,
+            w,
+            ROUNDS
+        );
+        let mut tids = [0u64; WAITERS];
+        for (i, c) in children.iter().enumerate() {
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+            tids[i] =
+                unsafe { yarm_user_rt::syscall::spawn_thread(c.tls_base, c.stack_top, c.entry) }
+                    .unwrap_or(0);
+        }
+        let mut all = tids.iter().all(|&t| t != 0);
+        for round in 1..=ROUNDS {
+            let arrived = wait_for(&ARRIVED, round * w);
+            let (mut census_n, mut census_back, mut census_calls) = (0, 0, 0u32);
+            for _ in 0..WAIT_YIELDS {
+                (census_n, census_back) = census();
+                census_calls += 1;
+                if census_n != census_back || census_n == w {
+                    break;
+                }
+                let _ = yield_now();
+            }
+            let wakes_before = MUTEX_WAKES.load(SeqCst);
+            MUTEX.lock();
+            RELEASED.store(round, SeqCst);
+            let r = COND.broadcast(&MUTEX);
+            MUTEX_WAKES.fetch_add(MUTEX.unlock(), SeqCst);
+            let acquired = wait_for(&ACQUIRED, round * w);
+            let wakes = MUTEX_WAKES.load(SeqCst) - wakes_before;
+            let ok = arrived
+                && census_n == w
+                && census_back == w
+                && r.woken == 1
+                && r.requeued == w - 1
+                && r.calls == 1
+                && !r.fell_back_to_wake_all
+                && acquired
+                && ACQUIRED.load(SeqCst) == round * w
+                && OVERLAP.load(SeqCst) == 0;
+            all &= ok;
+            yarm_user_rt::user_log!(
+                "CRQ_WITNESS_ROUND round={} census={} census_back={} census_calls={} woken={} requeued={} calls={} fallback={} acquired={} mutex_wakes={} overlap={} result={}",
+                round,
+                census_n,
+                census_back,
+                census_calls,
+                r.woken,
+                r.requeued,
+                r.calls,
+                r.fell_back_to_wake_all as u32,
+                ACQUIRED.load(SeqCst),
+                wakes,
+                OVERLAP.load(SeqCst),
+                if ok { "ok" } else { "fail" }
+            );
+        }
+        let finished = wait_for(&FINISHED, w);
+        all &= finished;
+        let mut list = [0u8; 160];
+        let mut n = 0;
+        for (i, t) in tids.iter().enumerate() {
+            if i > 0 && n < list.len() {
+                list[n] = b',';
+                n += 1;
+            }
+            let mut digits = [0u8; 20];
+            let mut d = 0;
+            let mut v = *t;
+            loop {
+                digits[d] = b'0' + (v % 10) as u8;
+                d += 1;
+                v /= 10;
+                if v == 0 {
+                    break;
+                }
+            }
+            while d > 0 && n < list.len() {
+                d -= 1;
+                list[n] = digits[d];
+                n += 1;
+            }
+        }
+        yarm_user_rt::user_log!(
+            "CRQ_WITNESS_DONE waiters={} rounds={} finished={} returns={} tids={} result={}",
+            w,
+            ROUNDS,
+            FINISHED.load(SeqCst),
+            RETURNS.load(SeqCst),
+            core::str::from_utf8(&list[..n]).unwrap_or("?"),
+            if all { "ok" } else { "fail" }
+        );
+    }
+}
+
+/// x86_64 entry trampoline: `spawn_user_thread` installs a 16-byte-aligned RSP verbatim, so the
+/// child is entered through a naked shim whose `call` restores the SysV entry alignment.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    target_arch = "x86_64"
+))]
+mod x86_futex_requeue {
+    #[unsafe(naked)]
+    pub(super) extern "C" fn child_entry() -> ! {
+        core::arch::naked_asm!(
+            "call {body}",
+            "ud2",
+            body = sym super::futex_requeue_witness::child_body,
+        )
+    }
+}
+
+/// FUTEX-REQUEUE1 — resolve this architecture's child entry, the ten stacks, and run the witness.
+#[cfg(all(not(feature = "hosted-dev"), feature = "futex-requeue-witness"))]
+fn run_futex_requeue_witness(s_tid: u64) {
+    use futex_requeue_witness as w;
+    #[cfg(target_arch = "x86_64")]
+    let entry = x86_futex_requeue::child_entry as *const () as usize;
+    #[cfg(not(target_arch = "x86_64"))]
+    let entry = w::child_body as *const () as usize;
+    let stacks = core::ptr::addr_of_mut!(w::STACKS) as usize;
+    let tls = core::ptr::addr_of_mut!(w::TLS) as usize;
+    let children: [w::Child; w::WAITERS] = core::array::from_fn(|i| w::Child {
+        entry,
+        stack_top: (stacks + (i + 1) * w::STACK_BYTES) & !0xF,
+        tls_base: tls + i * 256,
+    });
+    w::run_once(s_tid, &children);
+}
+
 /// U9-TIMER5 §3 — the IDLE-BOUNDARY RETURN witness.
 ///
 /// # The shape, and why no ordinary boot has it
@@ -7499,6 +7752,12 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), feature = "ipc-displace1-witness"))]
     if ipc_displace1_witness::armed(ctx.supervisor_control_recv_ep) {
         run_ipc_displace1_witness(ctx.task_id);
+    }
+    // FUTEX-REQUEUE1: the live compare-and-requeue witness, selector 18. Mutually exclusive with
+    // every other slot-5 cell; compiled only with `futex-requeue-witness`.
+    #[cfg(all(not(feature = "hosted-dev"), feature = "futex-requeue-witness"))]
+    if futex_requeue_witness::armed(ctx.supervisor_control_recv_ep) {
+        run_futex_requeue_witness(ctx.task_id);
     }
     // Stage 200D-0C1: default-off + feature-gated AArch64 LIVE ExitCurrentTask oracle. The slot-5
     // value is DECODED through the shared `yarm_ipc_abi::exit_current_task_abi` helper rather than

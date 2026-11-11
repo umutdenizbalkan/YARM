@@ -8338,6 +8338,8 @@ pub fn bootstrap_first_user_task(
                 crate::kernel::boot::TIMER5_IDLE_RETURN_WITNESS_SELECTOR
             } else if crate::kernel::boot::ipc_displace1_witness_enabled() {
                 crate::kernel::boot::IPC_DISPLACE1_WITNESS_SELECTOR
+            } else if crate::kernel::boot::futex_requeue_witness_enabled() {
+                crate::kernel::boot::FUTEX_REQUEUE_WITNESS_SELECTOR
             } else {
                 crate::kernel::boot::AARCH64_SHARED_REGION_ORACLE_SELECTOR
             };

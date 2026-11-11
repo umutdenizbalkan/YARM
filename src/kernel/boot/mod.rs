@@ -8694,6 +8694,28 @@ pub fn ipc_displace1_witness_enabled() -> bool {
     IPC_DISPLACE1_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// FUTEX-REQUEUE1 — the LIVE compare-and-requeue witness selector, the next free value after
+/// IPC-DISPLACE1's 17. Init's cell (`futex-requeue-witness`) runs ten of its own threads through
+/// `yarm_user_rt::futex_sync`'s condition-variable broadcast: NR 17 wakes one and moves nine to
+/// the mutex, whose unlocks then release them. It needs no capability, but it rides the SAME
+/// provisioning branch as selectors 12–17 (the branch that writes slot 5), so it adds no second
+/// provisioning path.
+pub const FUTEX_REQUEUE_WITNESS_SELECTOR: u64 = 18;
+
+static FUTEX_REQUEUE_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the FUTEX-REQUEUE1 live witness (`yarm.futex_requeue_witness=1`). Default OFF.
+pub(crate) fn set_futex_requeue_witness_enabled(enabled: bool) {
+    FUTEX_REQUEUE_WITNESS_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the FUTEX-REQUEUE1 live witness is armed. Besides selecting init's cell it makes the
+/// split FutexWait route report each committed park's CPU (`FUTEX_REQUEUE_WITNESS_PARK`).
+pub fn futex_requeue_witness_enabled() -> bool {
+    FUTEX_REQUEUE_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// QEMU-IRQ1 §3 — init's slot-5 selector for the RISC-V UART external-interrupt witness.
 ///
 /// 30 is claimed by no other slot-5 constant, encoder run or arm on any port (in use: 1–16 and
@@ -8994,6 +9016,7 @@ pub fn shared_region_oracle_provisioning_armed() -> bool {
         || ipc_send_final_fault_witness_enabled()
         || timer5_idle_return_witness_enabled()
         || ipc_displace1_witness_enabled()
+        || futex_requeue_witness_enabled()
 }
 
 /// Stage 198E3C2B: the AArch64 init startup-slot-5 selector for the DIRECT shared-region oracle. On

@@ -5651,6 +5651,16 @@ fn try_split_futex_wait_recognized(
                 tid,
                 cpu_idx
             );
+            // FUTEX-REQUEUE1: the live witness grades each waiter's CPU from this line. Off on
+            // every boot that does not arm it.
+            if crate::kernel::boot::futex_requeue_witness_enabled() {
+                crate::yarm_log!(
+                    "FUTEX_REQUEUE_WITNESS_PARK cpu={} tid={} addr=0x{:x}",
+                    cpu_idx,
+                    tid,
+                    addr
+                );
+            }
             // The syscall's own result, into the outgoing frame, before the switch: the caller
             // observes it when it is later resumed.
             frame.set_ok(1, 0, 0);
