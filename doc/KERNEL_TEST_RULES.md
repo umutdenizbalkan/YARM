@@ -91,7 +91,7 @@ state.write_user_memory(tid0, 0x1000, &val.to_ne_bytes())?;
 
 // WRONG — task0's futex_wake validate call finds no entry for asid0
 state.write_user_memory(tid1, 0x1000, &val.to_ne_bytes())?;
-// ... then state.futex_wake(0x1000, 1) fails with TaskMissing
+// ... then state.futex_wake(0x1000, 1, FutexKind::Private) fails with UserMemoryFault
 ```
 
 ---
@@ -1705,11 +1705,14 @@ results in `task_is_dead` returning true AND that process cnode cleanup
 was called).  Inline `tcb.status = Dead` without calling `mark_task_dead` is
 forbidden.
 
-### N+22.3 — Robust futex wake must not depend on current_tid ASID
+### N+22.3 — Robust futex wake uses the EXITING task's namespace
 
-Tests that call `exit_task` on a non-current task (supervisor-driven exit)
-must not fail due to ASID mismatch in the futex wake path.  Use
-`futex_wake_on_exit` (no ASID validation) for the robust list wake loop.
+Tests that call `exit_task` on a non-current task (supervisor-driven exit) must
+see the robust words woken in the exiting task's own address space, never the
+driver's. `futex_wake_on_exit(exiting_tid, addr)` resolves the private key (and
+the shared key, when an object backs the word) in `exiting_tid`'s address space;
+it needs the key only, so an unwritten hosted word is not an error there
+(FUTEX-FOUND1).
 
 ### N+22.4 — Repeated lifecycle stress tests must not exhaust the frame pool
 
@@ -1719,11 +1722,19 @@ call `destroy_user_address_space_by_asid` to free user stack frames between
 iterations.  Prefer `register_task` (no user stack) when the test does not
 need a user address space.
 
-### N+22.5 — futex_waiter_count relies on TCB status, not a separate list
+### N+22.5 — futex waiters are keyed records; the TCB token is the authority
 
-`futex_waiter_count` counts tasks in `Blocked(WaitReason::Futex(addr))` status.
-Tests must not assume a separate futex waiter list is maintained.  A task that
-transitions from `Blocked(Futex)` to any other status is no longer counted.
+FUTEX-FOUND1: a futex waiter is a record in the keyed waiter table, and the TCB
+holds `Blocked(WaitReason::Futex(token))`. A record is live only while its TCB
+holds the same token, so a task that leaves `Blocked(Futex)` by any route is no
+longer counted, whatever record it left behind. `futex_waiter_count(va)` counts
+LIVE records that named `va`, under any key. To assert "parked at this VA" use
+`futex_parked_at_va_for_test(tid, va)`; to publish a waiter without running the
+syscall use `inject_futex_waiter_for_test(tid, va)`, which registers through the
+production owner. Never write `Blocked(Futex(_))` into a TCB directly and expect a
+wake to find it: no record names it. To force the publication window (a wake
+between registration and the compare-and-clear) arm
+`futex::futex_phase_hook::arm_after_register`.
 
 ### N+22.6 — MemoryObject refcounts must drop to zero for reclaim
 

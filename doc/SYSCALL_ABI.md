@@ -25,8 +25,8 @@ kernel-extension slots.
 | `6` | `IpcCall` | public, send with kernel-minted ephemeral reply-cap transfer |
 | `7` | `IpcReply` | public, consumes a reply-cap and sends reply to the bound caller endpoint |
 | `8` | `ControlPlaneSetCnodeSlots` | public control-plane ABI; policy-gated by `control_plane_set_process_cnode_slots`, non-authorized callers receive `MissingRight` |
-| `9` | `FutexWait` | public (`arg0=addr`, `arg1=expected`, `arg2=observed`) |
-| `10` | `FutexWake` | public (`arg0=addr`, `arg1=max_wake`) |
+| `9` | `FutexWait` | public (`arg0=addr`, 4-byte aligned; `arg1=expected`, `u32`; `arg2=flags`) — FUTEX-FOUND1 |
+| `10` | `FutexWake` | public (`arg0=addr`, 4-byte aligned; `arg1=count`, `u32`; `arg2=flags`) — FUTEX-FOUND1 |
 | `11` | `SpawnThread` | public (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`) |
 | `12` | `Fork` | public, forks current process with CoW and returns child tid in parent |
 | `13` | `VmAnonMap` | public, wired anonymous page mapping syscall |
@@ -193,7 +193,30 @@ reserved holes from implemented privileged paths.
 
 - `FutexWait`/`FutexWake` validate the futex address as a userspace `u32` word (4 bytes) before acting.
 - Kernel/high-half, non-user, and unmapped addresses are rejected with user-memory fault/error mapping rather than being treated as trusted kernel pointers.
-- `FutexWait(addr, expected, observed)` returns `0` without blocking when `expected != observed`, and otherwise blocks only while the word at `addr` still holds `expected`: the kernel reads the word itself, and checks it again after the waiter is registered, so a `FutexWake` issued after a store to the word can never be lost. A word that no longer holds `expected` returns `0` (not blocked); `1` means the caller blocked and was woken.
+- **ABI (FUTEX-FOUND1).** `FutexWait(addr, expected, flags)` and `FutexWake(addr, count, flags)`.
+  `addr` must be 4-byte aligned and `expected` / `count` must fit in `u32`. `flags` bit 0 is
+  `FUTEX_FLAG_SHARED`; every other bit is reserved and a set reserved bit is `InvalidArgs`. All
+  three argument errors are `InvalidArgs` and are answered before the address range or the caller
+  is consulted. Slots 3 and up are not read: a later operation (an absolute deadline, a
+  compare-and-requeue target, a wake mask) is selected by a flag bit that is reserved today, and
+  that bit is what gives meaning to the further slots. There is no caller-supplied `observed`.
+- **Keys.** A *private* futex (`flags = 0`) is `{address space, its generation, va}`: threads of one
+  address space share it, and nothing in another address space — including a later address space
+  that reuses the same ASID number — can reach it. A *shared* futex (`flags = FUTEX_FLAG_SHARED`)
+  is `{MemoryObject id, offset}`: every process that maps the object, at any VA, reaches the same
+  waiters. Object ids are never reused. A shared wait or wake on memory that no allocator-owned
+  MemoryObject backs is refused with `WrongObject`; it is never silently treated as private.
+- `FutexWait` blocks only while the word at `addr` still holds `expected`: the kernel reads the
+  word itself, in the same acquisition that resolves the key, and reads it again after the waiter
+  is registered, so a `FutexWake` issued after a store to the word can never be lost. A word that
+  no longer holds `expected` returns `0` (not blocked); `1` means the caller blocked and was woken.
+  A return of `1` is a wake of the same key, so callers re-check their condition.
+- `FutexWake` wakes up to `count` waiters of the key `addr` resolves to in the caller's address
+  space, oldest first, and returns how many it woke. `count = 0` wakes nobody.
+- A waiter table slot exists for every possible task, so a wait cannot run out of waiter storage.
+  The capacity refusal is still implemented (`TaskTableFull`, decided before anything is written).
+- Robust-futex cleanup at task exit wakes each robust word in the EXITING task's own address space,
+  under its private key and, when an object backs the word, its shared key.
 
 ## Fork contract (current behavior)
 

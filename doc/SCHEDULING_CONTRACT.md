@@ -290,7 +290,7 @@ bounded and potentially unbounded parts).
 | IPC timeouts | `run_due_ipc_timeout_work` (collect + reply/send/recv drains) | the trapping CPU | 2, 3, 1 | masked | timed-out caller's parked completion | TCB scan ≤ 512 per collection; deadline store 4 slots |
 | Server death / reap / exit | `drain_server_death_post_work`, exit/terminal drains | authority | 2, 3, 4, 1 | masked | exiting task has none; replacement via token | per-object teardown; bounded by fixed tables |
 | FutexWait | `try_split_futex_wait_recognized` → `futex_wait_park_exact_split` → drain | authority + per-CPU deferral cell | 2 → 1; drain 1(→2) | masked | caller parked; incoming via token | O(1) + selection |
-| FutexWake | `futex_wake_split_mut` | trapping CPU | 2 (scan), then 1 per woken | masked | caller continues | ≤ 512 TCB scan; ≤ `max_wake` enqueues |
+| FutexWake | `futex_wake_split_mut` → `futex_wake_key_split` | trapping CPU | 5 → 6 (key), then 2 (keyed claim), then 1 per woken | masked | caller continues | ≤ 512 record visits in one bucket, O(1) each; ≤ `count` enqueues (FUTEX-FOUND1) |
 | Page fault (COW/demand recovered) | COW / demand routes | authority | 2, 5, 6 | masked | faulting task resumes | one frame allocation; page-table walk |
 | Page fault (terminal) | terminal route + queue advance | authority + reserved deferral | 2, 8, 1 | masked | faulting task terminated | as selection |
 | Overtaken deferral | `settle_overtaken_deferral_split` | authority | 1, 2 | masked | as recorded in the deferral | O(1) |
@@ -756,7 +756,7 @@ not representative of silicon, and no target hardware is in the loop.
 | W7 | Synchronous logging | `yarm_log!` → `printk_flush` | **A** | Up to 128 × 192 bytes per flush, at UART rate, polled per byte, plus cross-CPU `PRINTK_DRAIN_LOCK` contention. It runs on every tick and on many refusal and settlement markers. This is the largest **known** variable term. |
 | W8 | Membership table | `PriorityScheduler::membership_*` | **S** | ≤ 256 probes; the linear fallback is ≤ 192 + 1. |
 | W9 | `RingQueue::remove_tid` | scheduler | **S** | ≤ 64 shifts. |
-| W10 | FutexWake | `futex_wake_split_mut` | **S** | ≤ 512 TCB scan + ≤ `max_wake` (≤ 512) enqueues. |
+| W10 | FutexWake | `futex_wake_split_mut` | **S** | one key resolution, then ≤ 512 record visits in one hash bucket (each an O(1) TCB-slot check) + ≤ `count` (≤ 512 live waiters) enqueues. FUTEX-FOUND1. |
 | W11 | IPC timeout collection | `collect_due_ipc_timeout_work` | **S** | TCB scan ≤ 512; deadline store 4 slots. |
 | W12 | Retry loops in selection | queue-advance owner | **S** | None. The acceptance-filtered selection is single-pass. Contended marks are reported, not retried. |
 | W13 | Timer period | per-port re-arm | **N** | Relative re-arm; drift and jitter (SC-TIME-3). |

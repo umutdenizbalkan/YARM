@@ -1052,6 +1052,13 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   Endpoints, Notifications and Replies have independent index spaces and generations. A
   reference to an object is its own class's `{index, generation}`: an IRQ route names a
   Notification and can never refer to an Endpoint.
+- A futex is its KEY, never its VA or its physical frame (FUTEX-FOUND1, `doc/SYSCALL_ABI.md`
+  "Futex safety contract"). Private: `{asid, address-space generation, va}`; shared:
+  `{MemoryObject id, offset}`. Resolve keys only through `boot::futex::resolve_futex_key_locked`
+  / `resolve_futex_word_locked`, and read a word only in the acquisition that resolved it. Waiter
+  status is written by exactly three owners — `register_futex_waiter_locked`,
+  `undo_futex_registration_locked`, `claim_futex_waiters_locked` — and every check of a waiter
+  compares the exact token. Never wake a futex waiter by TID or by VA.
 
 ### 14.4 D3/D6 fences
 

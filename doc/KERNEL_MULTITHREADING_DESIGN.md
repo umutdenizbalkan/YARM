@@ -44,21 +44,25 @@ The kernel now exposes mechanism-oriented helpers:
 - `thread_tls_base(tid)`
 - `set_thread_tls_base(tid, tls_base)`
 - `spawn_user_thread(parent_tid, tls_base, user_stack_top, user_entry)`
-- `futex_wait_current(addr, expected, observed)`
-- `futex_wake(addr, max_wake)`
+- `futex_wait_current(addr, expected, kind)` (`kind`: `FutexKind::Private` or `Shared`)
+- `futex_wake(addr, count, kind)`
 
 ### Scheduler / blocking semantics
 
 A futex wait blocks the current thread by:
 
-1. validating the futex word/address contract,
-2. marking the current TCB as `Blocked(WaitReason::Futex(addr))`,
-3. removing it from the running slot,
-4. dispatching the next runnable thread.
+1. resolving the word's futex KEY (private: address space, its generation and VA; shared:
+   MemoryObject and offset) and reading the word, in one vm-then-memory acquisition,
+2. registering a keyed waiter record and marking the current TCB `Blocked(WaitReason::Futex(token))`
+   in one task-lock critical section — the token names the record slot and its incarnation,
+3. re-reading the word (a changed word undoes the registration and returns without blocking),
+4. removing it from the running slot, and dispatching the next runnable thread.
 
-A futex wake scans blocked TCBs for matching futex addresses, marks them runnable, and re-enqueues them.
-
-This is intentionally simple (`O(n)` wake scan over the fixed TCB table) but it is **real scheduler-integrated blocking**, unlike the previous compatibility-only bookkeeping shim.
+A futex wake resolves the same key in the waker's address space and claims up to `count` waiters
+of that key, oldest first: each is made `Runnable` and its record retired in one task-lock
+critical section, then each is enqueued once. Waiters live in a bounded, allocation-free table
+(`boot/futex.rs`, FUTEX-FOUND1) with one slot per possible task; a record is live only while its
+TCB holds the same token.
 
 ## libc / musl mapping
 
@@ -67,8 +71,8 @@ The linux-compat sysdeps thread/TLS/futex hooks now route into kernel mechanisms
 - `clone_thread_hook` -> `spawn_user_thread`
 - `set_tls_hook` -> `set_thread_tls_base`
 - `get_tls_hook` -> `thread_tls_base`
-- `futex_wait_hook` -> `futex_wait_current`
-- `futex_wake_hook` -> `futex_wake`
+- `futex_wait_hook` -> `futex_wait_current` (private key)
+- `futex_wake_hook` -> `futex_wake` (private key)
 
 This does **not** yet provide full POSIX pthread semantics. It provides the kernel substrate required for them.
 
