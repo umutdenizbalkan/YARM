@@ -1057,8 +1057,13 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   `{MemoryObject id, offset}`. Resolve keys only through `boot::futex::resolve_futex_key_locked`
   / `resolve_futex_word_locked`, and read a word only in the acquisition that resolved it. Waiter
   status is written by exactly three owners — `register_futex_waiter_locked`,
-  `undo_futex_registration_locked`, `claim_futex_waiters_locked` — and every check of a waiter
+  `undo_futex_registration_locked`, `claim_futex_waiter_locked` — and every check of a waiter
   compares the exact token. Never wake a futex waiter by TID or by VA.
+- Never make a task `Runnable` before its placement is guaranteed (FUTEX-WAKE-CAP1). A wake that
+  must mutate the task before it enqueues it reserves the slot first
+  (`task_enqueue::reserve_enqueue_on_cpu_locked`), then mutates, then fills the reservation
+  (`commit_reserved_enqueue_on_cpu_locked`), and releases it if the task was taken by another
+  owner. Logging a refused enqueue is not recovery.
 
 ### 14.4 D3/D6 fences
 

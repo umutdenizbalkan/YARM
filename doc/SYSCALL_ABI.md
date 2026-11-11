@@ -213,6 +213,13 @@ reserved holes from implemented privileged paths.
   A return of `1` is a wake of the same key, so callers re-check their condition.
 - `FutexWake` wakes up to `count` waiters of the key `addr` resolves to in the caller's address
   space, oldest first, and returns how many it woke. `count = 0` wakes nobody.
+- **Every waiter counted is placed (FUTEX-WAKE-CAP1).** A waiter is claimed only after a run-queue
+  slot on its home CPU is reserved for it, so a woken waiter is always queued exactly once (or is
+  still current, finishing its own wait). When no slot can be reserved — the home CPU's queue for
+  that priority is full (64 user entries), or the CPU cannot take work — the wake stops: that
+  waiter and every later one stay parked with their records, are not counted, and are reached by a
+  later wake. So the return value can be less than `count` while waiters remain; a caller that
+  must wake everyone (a broadcast) re-issues the wake until it returns 0.
 - A waiter table slot exists for every possible task, so a wait cannot run out of waiter storage.
   The capacity refusal is still implemented (`TaskTableFull`, decided before anything is written).
 - Robust-futex cleanup at task exit wakes each robust word in the EXITING task's own address space,

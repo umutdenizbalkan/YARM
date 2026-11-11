@@ -58,9 +58,11 @@ A futex wait blocks the current thread by:
 3. re-reading the word (a changed word undoes the registration and returns without blocking),
 4. removing it from the running slot, and dispatching the next runnable thread.
 
-A futex wake resolves the same key in the waker's address space and claims up to `count` waiters
-of that key, oldest first: each is made `Runnable` and its record retired in one task-lock
-critical section, then each is enqueued once. Waiters live in a bounded, allocation-free table
+A futex wake resolves the same key in the waker's address space and wakes up to `count` waiters
+of that key, oldest first. For each it first reserves a run-queue slot on the waiter's home CPU,
+then claims exactly that waiter (made `Runnable` and its record retired in one task-lock critical
+section), then fills the reserved slot (FUTEX-WAKE-CAP1). A waiter that cannot be placed is not
+claimed and stays parked. Waiters live in a bounded, allocation-free table
 (`boot/futex.rs`, FUTEX-FOUND1) with one slot per possible task; a record is live only while its
 TCB holds the same token.
 

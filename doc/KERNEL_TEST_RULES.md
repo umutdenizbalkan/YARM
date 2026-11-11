@@ -1734,7 +1734,9 @@ syscall use `inject_futex_waiter_for_test(tid, va)`, which registers through the
 production owner. Never write `Blocked(Futex(_))` into a TCB directly and expect a
 wake to find it: no record names it. To force the publication window (a wake
 between registration and the compare-and-clear) arm
-`futex::futex_phase_hook::arm_after_register`.
+`futex::futex_phase_hook::arm_after_register`. To force a wake's own windows (after a waiter's
+slot is reserved, after it is claimed) arm `futex_phase_hook::arm_wake_step`; the hook gets the
+step and the TID and returns whether to stay armed (FUTEX-WAKE-CAP1).
 
 ### N+22.6 — MemoryObject refcounts must drop to zero for reclaim
 
