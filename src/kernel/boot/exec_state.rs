@@ -1166,6 +1166,51 @@ impl KernelState {
         Ok(self.futex_wake_key(key, count))
     }
 
+    /// FUTEX-REQUEUE1 — THE broad compare-and-requeue (NR 17) of the current task.
+    ///
+    /// 1. rank 2 → 5 → 6, ONE hold — `compare_and_requeue_locked`: the source key and word, the
+    ///    target key, the comparison, and the transfer of up to `requeue` live source waiters
+    ///    beyond the first `wake` to the target key. The linearization point; a refusal writes
+    ///    nothing.
+    /// 2. The wake portion — the FUTEX-WAKE-CAP1 wake of the source key, at most `wake` waiters,
+    ///    oldest first (the waiters the transfer left at the head). Its capacity stop is reported,
+    ///    never hidden: those waiters stay parked on the source key.
+    ///
+    /// The transfer takes no scheduler lock and needs no run-queue slot: a requeued waiter stays
+    /// `Blocked(Futex(token))`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn futex_cmp_requeue_current(
+        &mut self,
+        source: (usize, super::futex::FutexKind),
+        target: (usize, super::futex::FutexKind),
+        expected: u32,
+        wake: u32,
+        requeue: u32,
+    ) -> Result<super::futex::FutexRequeueOutcome, super::futex::FutexRequeueRefusal> {
+        use super::futex::{self as fx, FutexRequeueRefusal as R};
+        fx::futex_word_range_check(source.0).map_err(R::Key)?;
+        fx::futex_word_range_check(target.0).map_err(R::Key)?;
+        let tid = self.current_tid().ok_or(R::Key(KernelError::TaskMissing))?;
+        let asid = self
+            .task_asid(tid)
+            .ok_or(R::Key(KernelError::UserMemoryFault))?;
+        let transfer = self.with_task_futex_then_vm_memory_mut(|tcbs, table, spaces, memory| {
+            fx::compare_and_requeue_locked(
+                tcbs, table, spaces, memory, asid, source, target, expected, wake, requeue,
+            )
+        })?;
+        let woke = if wake == 0 {
+            fx::FutexWakeOutcome::default()
+        } else {
+            self.futex_wake_key_outcome(transfer.source, wake)
+        };
+        Ok(fx::FutexRequeueOutcome {
+            woken: woke.woke,
+            requeued: transfer.moved,
+            capacity_limited: woke.stopped_unplaceable,
+        })
+    }
+
     /// The robust-futex cleanup wake, in the EXITING task's own namespace.
     ///
     /// `exit_task` may be driven by another task, so the key is resolved in `exiting_tid`'s
@@ -1218,11 +1263,22 @@ impl KernelState {
     /// `Runnable` until its placement is guaranteed; a refused reservation ends the wake with
     /// that waiter and every later one still parked and uncounted. Returns how many were placed.
     fn futex_wake_key(&mut self, key: super::futex::FutexKey, count: u32) -> u32 {
+        self.futex_wake_key_outcome(key, count).woke
+    }
+
+    /// FUTEX-REQUEUE1 — [`Self::futex_wake_key`], also reporting whether it stopped at a waiter it
+    /// could not place.
+    fn futex_wake_key_outcome(
+        &mut self,
+        key: super::futex::FutexKey,
+        count: u32,
+    ) -> super::futex::FutexWakeOutcome {
         use super::futex as fx;
         use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
         let want = (count as usize).min(fx::MAX_FUTEX_WAITERS);
         let current_cpu = self.current_cpu();
         let mut woke = 0usize;
+        let mut stopped_unplaceable = false;
         let mut attempts = 0usize;
         while woke < want && attempts < want + fx::MAX_FUTEX_WAITERS {
             attempts += 1;
@@ -1242,6 +1298,7 @@ impl KernelState {
                         err,
                         woke
                     );
+                    stopped_unplaceable = true;
                     break;
                 }
             };
@@ -1265,6 +1322,7 @@ impl KernelState {
                     err,
                     woke
                 );
+                stopped_unplaceable = true;
                 break;
             }
             #[cfg(test)]
@@ -1301,7 +1359,10 @@ impl KernelState {
                 ),
             }
         }
-        woke as u32
+        fx::FutexWakeOutcome {
+            woke: woke as u32,
+            stopped_unplaceable,
+        }
     }
 
     /// FUTEX-FOUND1 — the BROAD key resolution for the current task: range, caller, address

@@ -2086,7 +2086,7 @@ mod tests {
         RecvSharedV3Output {
             version: V3_VERSION,
             record_len: V3_MIN_OUTPUT_LEN,
-            abi_version: 10,
+            abi_version: 11,
             result_status: 0,
             sender_tid: 0,
             message_len: 0,

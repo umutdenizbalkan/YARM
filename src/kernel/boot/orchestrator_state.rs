@@ -2332,6 +2332,38 @@ impl KernelState {
 
     /// FUTEX-FOUND1 — the TCB array and the futex waiter table under ONE task-lock acquisition
     /// (rank 2). The broad twin of `SharedKernel::with_task_futex_split_mut`.
+    /// FUTEX-REQUEUE1 — the task domain (rank 2), then the vm (rank 5) and memory (rank 6)
+    /// domains, ALL held for the whole closure: the one composition a compare-and-requeue needs,
+    /// so that its word comparison and its waiter transfer are a single critical section ordered
+    /// against every waiter registration (task lock) and every mapping change (vm lock). The
+    /// ranks ascend and the order is fixed here. Nothing inside may call back into `KernelState`.
+    pub(crate) fn with_task_futex_then_vm_memory_mut<R>(
+        &mut self,
+        f: impl FnOnce(
+            &mut [Option<ThreadControlBlock>; MAX_TASKS],
+            &mut super::futex::FutexWaiterTable,
+            &mut AddressSpaceManager,
+            &mut MemorySubsystem,
+        ) -> R,
+    ) -> R {
+        // Multi-lock helper order (must match doc/KERNEL_LOCKING.md): task -> vm -> memory
+        Self::debug_lock_order_note("task");
+        let _task_guard = self.task_state_lock.lock();
+        Self::debug_lock_order_note("vm");
+        let _vm_guard = self.vm_state_lock.lock();
+        Self::debug_lock_order_note("memory");
+        let _mem_guard = self.memory_state_lock.lock();
+        let table = core::ptr::addr_of_mut!(self.futex_waiters);
+        let memory = core::ptr::addr_of_mut!(self.memory);
+        // SAFETY: four disjoint fields, each serialized by its own guard, all held for the call.
+        f(
+            kernel_mut(&mut self.tcbs),
+            kernel_mut(unsafe { &mut *table }),
+            kernel_mut(&mut self.user_spaces),
+            kernel_mut(unsafe { &mut *memory }),
+        )
+    }
+
     pub(crate) fn with_task_futex_mut<R>(
         &mut self,
         f: impl FnOnce(

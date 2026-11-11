@@ -4885,6 +4885,46 @@ impl SharedKernel {
         f(kernel_mut(tcbs).as_mut_slice())
     }
 
+    /// FUTEX-REQUEUE1 — the split twin of `KernelState::with_task_futex_then_vm_memory_mut`: the
+    /// task lock (rank 2), then the vm lock (rank 5), then the memory lock (rank 6), all held for
+    /// the whole closure, in ascending rank order. Nothing inside may call back into
+    /// `SharedKernel`.
+    pub(crate) fn with_task_futex_then_vm_memory_split_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut [Option<crate::kernel::task::ThreadControlBlock>],
+            &mut crate::kernel::boot::futex::FutexWaiterTable,
+            &mut crate::kernel::vm::AddressSpaceManager,
+            &mut crate::kernel::boot::MemorySubsystem,
+        ) -> R,
+    ) -> R {
+        // SAFETY: the three projectors derive raw field pointers without forming a reference to
+        // the whole `KernelState`; each lock serializes its own fields and all three guards are
+        // held for the whole closure. The fields are disjoint, so no two `&mut` alias.
+        let (task_lock, tcbs, table) =
+            unsafe { KernelState::task_futex_split_ptrs_from_raw(self.state_ptr()) };
+        let (vm_lock, user_spaces) =
+            unsafe { KernelState::vm_split_mut_ptrs_from_raw(self.state_ptr()) };
+        let (memory_lock, memory) =
+            unsafe { KernelState::memory_split_mut_ptrs_from_raw(self.state_ptr()) };
+        let task_lock = unsafe { &*task_lock };
+        let _task_guard = task_lock.lock();
+        let vm_lock = unsafe { &*vm_lock };
+        let _vm_guard = vm_lock.lock();
+        let memory_lock = unsafe { &*memory_lock };
+        let _memory_guard = memory_lock.lock();
+        let tcbs = unsafe { &mut *tcbs };
+        let table = unsafe { &mut *table };
+        let user_spaces = unsafe { &mut *user_spaces };
+        let memory = unsafe { &mut *memory };
+        f(
+            kernel_mut(tcbs).as_mut_slice(),
+            kernel_mut(table),
+            kernel_mut(user_spaces),
+            kernel_mut(memory),
+        )
+    }
+
     /// FUTEX-FOUND1 — task (rank 2) split-mut seam: the TCB array and the futex waiter table
     /// under ONE acquisition of the task lock. Callers must not already hold a lock of rank ≥ 2.
     pub(crate) fn with_task_futex_split_mut<R>(
@@ -13694,6 +13734,52 @@ impl SharedKernel {
         Ok(self.futex_wake_key_split(cpu, key, count))
     }
 
+    /// FUTEX-REQUEUE1 — THE split compare-and-requeue (NR 17), in the caller's address space
+    /// `asid`; the twin of `KernelState::futex_cmp_requeue_current`.
+    ///
+    /// 1. rank 2 → 5 → 6, ONE hold (`with_task_futex_then_vm_memory_split_mut`) —
+    ///    `compare_and_requeue_locked`: keys, word, comparison and transfer. The linearization
+    ///    point; a refusal writes nothing. No scheduler lock is taken and no run-queue slot is
+    ///    needed: a requeued waiter stays blocked.
+    /// 2. The wake portion: [`Self::futex_wake_key_outcome_split`] on the source key, at most
+    ///    `wake` waiters (task and scheduler locks alternately, never nested, never under step 1).
+    ///
+    /// The caller does NOT task-switch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn futex_cmp_requeue_split(
+        &self,
+        cpu: CpuId,
+        asid: crate::kernel::vm::Asid,
+        source: (usize, crate::kernel::boot::futex::FutexKind),
+        target: (usize, crate::kernel::boot::futex::FutexKind),
+        expected: u32,
+        wake: u32,
+        requeue: u32,
+    ) -> Result<
+        crate::kernel::boot::futex::FutexRequeueOutcome,
+        crate::kernel::boot::futex::FutexRequeueRefusal,
+    > {
+        use crate::kernel::boot::futex::{self as fx, FutexRequeueRefusal as R};
+        fx::futex_word_range_check(source.0).map_err(R::Key)?;
+        fx::futex_word_range_check(target.0).map_err(R::Key)?;
+        let transfer =
+            self.with_task_futex_then_vm_memory_split_mut(|tcbs, table, spaces, memory| {
+                fx::compare_and_requeue_locked(
+                    tcbs, table, spaces, memory, asid, source, target, expected, wake, requeue,
+                )
+            })?;
+        let woke = if wake == 0 {
+            fx::FutexWakeOutcome::default()
+        } else {
+            self.futex_wake_key_outcome_split(cpu, transfer.source, wake)
+        };
+        Ok(fx::FutexRequeueOutcome {
+            woken: woke.woke,
+            requeued: transfer.moved,
+            capacity_limited: woke.stopped_unplaceable,
+        })
+    }
+
     /// FUTEX-FOUND1 — THE split wake of one key. FUTEX-WAKE-CAP1: no waiter is claimed before
     /// its placement is guaranteed.
     ///
@@ -13718,10 +13804,22 @@ impl SharedKernel {
         key: crate::kernel::boot::futex::FutexKey,
         count: u32,
     ) -> u32 {
+        self.futex_wake_key_outcome_split(cpu, key, count).woke
+    }
+
+    /// FUTEX-REQUEUE1 — [`Self::futex_wake_key_split`], also reporting whether the wake stopped
+    /// at a waiter it could not place (the compare-and-requeue's `capacity_limited`).
+    pub(crate) fn futex_wake_key_outcome_split(
+        &self,
+        cpu: CpuId,
+        key: crate::kernel::boot::futex::FutexKey,
+        count: u32,
+    ) -> crate::kernel::boot::futex::FutexWakeOutcome {
         use crate::kernel::boot::futex as fx;
         use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
         let want = (count as usize).min(fx::MAX_FUTEX_WAITERS);
         let mut woke = 0usize;
+        let mut stopped_unplaceable = false;
         let mut attempts = 0usize;
         while woke < want && attempts < want + fx::MAX_FUTEX_WAITERS {
             attempts += 1;
@@ -13742,6 +13840,7 @@ impl SharedKernel {
                         err,
                         woke
                     );
+                    stopped_unplaceable = true;
                     break;
                 }
             };
@@ -13762,6 +13861,7 @@ impl SharedKernel {
                     err,
                     woke
                 );
+                stopped_unplaceable = true;
                 break;
             }
             #[cfg(test)]
@@ -13803,7 +13903,10 @@ impl SharedKernel {
                 ),
             }
         }
-        woke as u32
+        fx::FutexWakeOutcome {
+            woke: woke as u32,
+            stopped_unplaceable,
+        }
     }
 
     // ── Stage 198E3B2A part 2: shared-region OFF-LOCK seams ─────────────────────────────────────

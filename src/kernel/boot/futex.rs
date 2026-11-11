@@ -351,6 +351,19 @@ impl FutexWaiterTable {
     /// its incarnation. O(1).
     fn retire_after(&mut self, slot: usize, prev: u16) -> Option<FutexWaiterRecord> {
         let rec = self.records[slot]?;
+        self.unlink_after(slot, prev);
+        self.records[slot] = None;
+        self.generations[slot] = self.generations[slot].wrapping_add(1);
+        Some(rec)
+    }
+
+    /// FUTEX-REQUEUE1 — take `slot` out of its bucket chain (predecessor `prev`, `NIL` at the
+    /// head) WITHOUT freeing it: the record and its incarnation, and so its waiter's token, are
+    /// unchanged. O(1). The caller relinks it ([`Self::link_tail`]) under the same task lock.
+    fn unlink_after(&mut self, slot: usize, prev: u16) {
+        let Some(rec) = self.records[slot] else {
+            return;
+        };
         let b = rec.key.bucket();
         if prev == NIL {
             if self.head[b] as usize == slot {
@@ -362,9 +375,6 @@ impl FutexWaiterTable {
         if self.tail[b] as usize == slot {
             self.tail[b] = prev;
         }
-        self.records[slot] = None;
-        self.generations[slot] = self.generations[slot].wrapping_add(1);
-        Some(rec)
     }
 
     /// Whether `slot`'s record is LIVE: its TCB waits on exactly this token.
@@ -406,6 +416,63 @@ impl FutexWaiterTable {
     #[cfg(test)]
     pub fn occupied(&self) -> usize {
         self.records.iter().flatten().count()
+    }
+
+    /// FUTEX-REQUEUE1 — the LIVE waiters of `key`, in FIFO order (bucket-chain order), as TIDs.
+    #[cfg(test)]
+    pub fn waiters_in_order(
+        &self,
+        tcbs: &[Option<ThreadControlBlock>],
+        key: FutexKey,
+    ) -> alloc::vec::Vec<u64> {
+        let mut out = alloc::vec::Vec::new();
+        let mut cur = self.head[key.bucket()];
+        while cur != NIL {
+            let slot = usize::from(cur);
+            let Some(rec) = self.records[slot] else {
+                break;
+            };
+            if rec.key == key && self.live(tcbs, slot) {
+                out.push(rec.tid);
+            }
+            cur = rec.next;
+        }
+        out
+    }
+
+    /// FUTEX-REQUEUE1 — the chains are exact: every held record is on exactly one chain, the one
+    /// its key hashes to, each chain ends at its `tail`, and no free slot is linked.
+    #[cfg(test)]
+    pub fn assert_chains_consistent(&self) {
+        let mut seen = [false; MAX_FUTEX_WAITERS];
+        let mut linked = 0;
+        for b in 0..FUTEX_BUCKETS {
+            let (mut prev, mut cur) = (NIL, self.head[b]);
+            while cur != NIL {
+                let slot = usize::from(cur);
+                assert!(!seen[slot], "slot {slot} linked twice");
+                seen[slot] = true;
+                let rec = self.records[slot].expect("a free slot is linked");
+                assert_eq!(rec.key.bucket(), b, "slot {slot} on the wrong chain");
+                linked += 1;
+                prev = cur;
+                cur = rec.next;
+                assert!(linked <= MAX_FUTEX_WAITERS, "a cycle in bucket {b}");
+            }
+            assert_eq!(
+                self.tail[b], prev,
+                "bucket {b}: tail is not the last record"
+            );
+        }
+        assert_eq!(linked, self.occupied(), "a held record is on no chain");
+    }
+}
+
+impl FutexKey {
+    /// The bucket a key hashes to. Test use (collisions, same-bucket moves).
+    #[cfg(test)]
+    pub fn bucket_for_test(&self) -> usize {
+        self.bucket()
     }
 }
 
@@ -572,6 +639,137 @@ pub fn claim_futex_waiter_locked(
     tcb.status = TaskStatus::Runnable;
     table.retire(slot);
     true
+}
+
+/// FUTEX-REQUEUE1 — what a wake loop achieved: how many waiters it placed, and whether it stopped
+/// because a waiter it found could not be placed (its home queue full, its CPU unable to take
+/// work, or no plan) rather than because none was left. A stopped wake leaves that waiter and every
+/// later one parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FutexWakeOutcome {
+    pub woke: u32,
+    pub stopped_unplaceable: bool,
+}
+
+/// FUTEX-REQUEUE1 — what a successful compare-and-requeue did, as NR 17 reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FutexRequeueOutcome {
+    /// Waiters woken (placed exactly once) by the wake portion.
+    pub woken: u32,
+    /// Waiters moved, still blocked, from the source key to the target key.
+    pub requeued: u32,
+    /// The wake portion stopped at a waiter it could not place; see
+    /// `sched::FUTEX_REQUEUE_STATUS_CAPACITY_LIMITED`.
+    pub capacity_limited: bool,
+}
+
+/// FUTEX-REQUEUE1 — why a compare-and-requeue transferred nothing. Nothing was mutated for any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutexRequeueRefusal {
+    /// The source word did not hold `expected` at the linearization point.
+    ValueChanged,
+    /// The source and target addresses resolve to the same key: refused, not reordered.
+    SameKey,
+    /// A key could not be resolved (range, mapping, or a shared key with no backing object).
+    Key(KernelError),
+}
+
+/// FUTEX-REQUEUE1 — what the atomic transfer step did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FutexRequeueTransfer {
+    pub source: FutexKey,
+    pub target: FutexKey,
+    /// The live source waiters left at the head of the source queue for the wake portion.
+    pub kept: u32,
+    /// The live source waiters moved to the target, in their source order.
+    pub moved: u32,
+}
+
+/// rank 2 → 5 → 6 — THE compare-and-requeue transfer: the caller holds the task lock, then the vm
+/// lock, then the memory lock, for the whole call. This is the operation's linearization point.
+///
+/// 1. Resolve the source key and read its word, and resolve the target key, from the caller's
+///    address space `asid` — under the vm and memory locks, so no mapping can change in between.
+/// 2. Refuse a target that is the same key (`SameKey`), then compare the word with `expected`
+///    (`ValueChanged`). Either refusal writes nothing.
+/// 3. In one walk of the source bucket: leave the first `keep` live source waiters in place (the
+///    wake portion's), then move up to `max_move` further live source waiters, in source order, to
+///    the tail of the target key's queue. A moved record keeps its slot and incarnation, so its
+///    waiter's token is unchanged; only its key (and its diagnostic VA, now the caller's target
+///    address) changes. No TCB is written: a moved waiter stays `Blocked(Futex(token))`.
+///
+/// Why this is atomic: every waiter registration takes the task lock, which is held here, so a
+/// waiter is either registered before this step (and is a candidate) or after it (and is not).
+/// The comparison is made under the same hold. A registered waiter still inside its own wait's
+/// publication window is moved like any other: its re-read, undo and read-back are by token,
+/// which the move does not touch (see `doc/SYSCALL_ABI.md`).
+///
+/// Bounded: one walk of one bucket (≤ `MAX_FUTEX_WAITERS` records, O(1) each). When source and
+/// target share a bucket, moved records are appended after the walk's original tail, which the
+/// walk stops at, so none is visited twice.
+#[allow(clippy::too_many_arguments)]
+pub fn compare_and_requeue_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    spaces: &AddressSpaceManager,
+    memory: &MemorySubsystem,
+    asid: Asid,
+    source: (usize, FutexKind),
+    target: (usize, FutexKind),
+    expected: u32,
+    keep: u32,
+    max_move: u32,
+) -> Result<FutexRequeueTransfer, FutexRequeueRefusal> {
+    let (s_key, word) = resolve_futex_word_locked(spaces, memory, asid, source.0, source.1)
+        .map_err(FutexRequeueRefusal::Key)?;
+    let (t_key, _) = resolve_futex_key_locked(spaces, memory, asid, target.0, target.1)
+        .map_err(FutexRequeueRefusal::Key)?;
+    if s_key == t_key {
+        return Err(FutexRequeueRefusal::SameKey);
+    }
+    if word != expected {
+        return Err(FutexRequeueRefusal::ValueChanged);
+    }
+    let b = s_key.bucket();
+    let last = table.tail[b];
+    let mut prev = NIL;
+    let mut cur = table.head[b];
+    let (mut kept, mut moved) = (0u32, 0u32);
+    while cur != NIL && moved < max_move {
+        let slot = usize::from(cur);
+        let Some(rec) = table.records[slot] else {
+            break;
+        };
+        let next = rec.next;
+        let at_last = cur == last;
+        if !table.live(tcbs, slot) {
+            // Stale: reclaimed on the way, exactly as a wake does.
+            table.retire_after(slot, prev);
+        } else if rec.key != s_key {
+            prev = cur;
+        } else if kept < keep {
+            kept += 1;
+            prev = cur;
+        } else {
+            table.unlink_after(slot, prev);
+            if let Some(r) = table.records[slot].as_mut() {
+                r.key = t_key;
+                r.va = target.0 as u64;
+            }
+            table.link_tail(slot);
+            moved += 1;
+        }
+        if at_last {
+            break;
+        }
+        cur = next;
+    }
+    Ok(FutexRequeueTransfer {
+        source: s_key,
+        target: t_key,
+        kept,
+        moved,
+    })
 }
 
 /// rank 2 — retire every record naming `tid` (its TCB is being torn down). Eager reclamation; a

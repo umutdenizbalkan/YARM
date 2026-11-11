@@ -1623,6 +1623,9 @@ pub fn handle_riscv_trap_entry_shared(
     let split_eligible = is_syscall
         && (nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+            // FUTEX-REQUEUE1: FutexCmpRequeue (NR 17), split from birth (non-switching, NR 10's
+            // shape). Absent here it would take the terminal broad edge on this port.
+            || nr == crate::kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
             || nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
             // U9-RECV-FINAL §1: IpcRecv (NR 2). It was the ONE recognized IPC syscall this

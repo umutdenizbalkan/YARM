@@ -75,6 +75,16 @@ pub mod syscall {
     pub const SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR: usize = 8;
     const SYSCALL_FUTEX_WAIT_NR: usize = 9;
     const SYSCALL_FUTEX_WAKE_NR: usize = 10;
+    /// FUTEX-REQUEUE1 (ABI v11): compare-and-requeue (NR 17). Must match
+    /// `kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR`.
+    pub const SYSCALL_FUTEX_CMP_REQUEUE_NR: usize = 17;
+    /// NR 17 flag bits (argument slot 5). Must match `kernel::syscall::sched`.
+    pub const FUTEX_REQUEUE_SOURCE_SHARED: usize = 1 << 0;
+    pub const FUTEX_REQUEUE_TARGET_SHARED: usize = 1 << 1;
+    /// NR 17 success status word (`ret2`): `DONE` is always set on success, so on AArch64 and
+    /// RISC-V (error in `ret0`, `ret2` zero) a success is never read as an error.
+    pub const FUTEX_REQUEUE_STATUS_DONE: usize = 1 << 8;
+    pub const FUTEX_REQUEUE_STATUS_CAPACITY_LIMITED: usize = 1 << 0;
     const SYSCALL_SPAWN_THREAD_NR: usize = 11;
     const SYSCALL_YIELD_NR: usize = 0;
     /// Stage 163 proof-only: `Fork` (NR 12). Already part of the frozen syscall
@@ -1677,6 +1687,75 @@ pub mod syscall {
         Ok(ret.ret0 as u32)
     }
 
+    /// FUTEX-REQUEUE1 — what a successful compare-and-requeue did (NR 17).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct FutexRequeueOutcome {
+        /// Waiters of the source word woken (each placed exactly once).
+        pub woken: u32,
+        /// Waiters moved, still blocked, from the source word to the target word.
+        pub requeued: u32,
+        /// The wake portion stopped at a waiter it could not place (its run queue full). That
+        /// waiter, and any later one the wake would have reached, is still parked on the SOURCE
+        /// word: issue the call again (for instance with `wake = 0`) to move it.
+        pub capacity_limited: bool,
+    }
+
+    /// Atomically, while the 32-bit word at `source` still holds `expected`: wake up to `wake`
+    /// of its waiters, oldest first, then move up to `requeue` further waiters, in their order,
+    /// to the word at `target`, where they wait exactly as if they had called `futex_wait` on it
+    /// (behind its existing waiters). A moved waiter is not made runnable.
+    ///
+    /// `Err(WouldBlock)`: the source word no longer held `expected`; nothing was woken or moved.
+    /// `Err(InvalidArgs)`: a misaligned address, or `target` names the same futex as `source`.
+    /// A waiter that was still registering when it was moved may return from its own
+    /// `futex_wait` without being woken; as always, callers re-check their condition.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn futex_cmp_requeue(
+        source: *const u32,
+        source_scope: FutexScope,
+        target: *const u32,
+        target_scope: FutexScope,
+        expected: u32,
+        wake: u32,
+        requeue: u32,
+    ) -> core::result::Result<FutexRequeueOutcome, SyscallError> {
+        let mut flags = 0;
+        if source_scope == FutexScope::Shared {
+            flags |= FUTEX_REQUEUE_SOURCE_SHARED;
+        }
+        if target_scope == FutexScope::Shared {
+            flags |= FUTEX_REQUEUE_TARGET_SHARED;
+        }
+        // SAFETY: Uses architecture syscall ABI. The kernel validates both futex words.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_FUTEX_CMP_REQUEUE_NR,
+                [
+                    source as usize,
+                    target as usize,
+                    expected as usize,
+                    wake as usize,
+                    requeue as usize,
+                    flags,
+                ],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        if ret.ret2 & FUTEX_REQUEUE_STATUS_DONE == 0 {
+            // AArch64 / RISC-V: an error is the code in `ret0` with `ret2` zero.
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(FutexRequeueOutcome {
+            woken: ret.ret0 as u32,
+            requeued: ret.ret1 as u32,
+            capacity_limited: ret.ret2 & FUTEX_REQUEUE_STATUS_CAPACITY_LIMITED != 0,
+        })
+    }
+
     /// Spawn a new user thread in the caller's address space (NR 11). `entry` is the
     /// thread entry VA, `stack_top` the top of a caller-owned stack region, `tls_base`
     /// the thread TLS base (0 = none). Returns the new thread's TID.
@@ -1750,6 +1829,160 @@ pub mod syscall {
         // ret0 == resized slot capacity on success (the kernel writes
         // set_ok(slot_capacity, target_pid, 0)).
         Ok(ret.ret0)
+    }
+}
+
+/// FUTEX-REQUEUE1 — a minimal futex mutex and condition variable, enough to show the
+/// compare-and-requeue broadcast. Not a pthread implementation: no timeouts, no attributes, no
+/// robustness, no priority protocol.
+pub mod futex_sync {
+    use crate::syscall::{FutexScope, SyscallError, futex_cmp_requeue, futex_wait, futex_wake};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const UNLOCKED: u32 = 0;
+    const LOCKED: u32 = 1;
+    /// Locked, and waiters may be parked on the word: the unlock must wake one.
+    pub const CONTENDED: u32 = 2;
+
+    /// A three-state futex mutex: `0` unlocked, `1` locked, `2` locked with possible waiters.
+    pub struct FutexMutex {
+        word: AtomicU32,
+        scope: FutexScope,
+    }
+
+    impl FutexMutex {
+        pub const fn new(scope: FutexScope) -> Self {
+            Self {
+                word: AtomicU32::new(UNLOCKED),
+                scope,
+            }
+        }
+
+        pub fn word(&self) -> &AtomicU32 {
+            &self.word
+        }
+
+        pub fn lock(&self) {
+            if self
+                .word
+                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+            self.lock_contended();
+        }
+
+        /// The slow path, and the path a woken or requeued condition waiter takes: it marks the
+        /// word contended, because other waiters may be parked behind it.
+        pub fn lock_contended(&self) {
+            while self.word.swap(CONTENDED, Ordering::Acquire) != UNLOCKED {
+                let _ = futex_wait(self.word.as_ptr(), CONTENDED, self.scope);
+            }
+        }
+
+        pub fn unlock(&self) {
+            if self.word.swap(UNLOCKED, Ordering::Release) == CONTENDED {
+                let _ = futex_wake(self.word.as_ptr(), 1, self.scope);
+            }
+        }
+    }
+
+    /// A condition variable over a sequence word. Waiters park on the sequence; a broadcast
+    /// wakes at most one and requeues the rest onto the mutex.
+    pub struct FutexCondvar {
+        seq: AtomicU32,
+        scope: FutexScope,
+    }
+
+    /// What a broadcast did, summed over its calls.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct BroadcastReport {
+        pub woken: u32,
+        pub requeued: u32,
+        /// NR 17 calls made (more than one only after a capacity-limited wake).
+        pub calls: u32,
+        /// The sequence moved under the broadcast (`WouldBlock`), so it fell back to waking
+        /// every waiter of the sequence.
+        pub fell_back_to_wake_all: bool,
+    }
+
+    impl FutexCondvar {
+        pub const fn new(scope: FutexScope) -> Self {
+            Self {
+                seq: AtomicU32::new(0),
+                scope,
+            }
+        }
+
+        pub fn seq(&self) -> &AtomicU32 {
+            &self.seq
+        }
+
+        /// Wait. The caller holds `mutex`; it holds it again on return. Spurious returns are
+        /// possible: re-check the predicate.
+        pub fn wait(&self, mutex: &FutexMutex) {
+            let seen = self.seq.load(Ordering::Relaxed);
+            mutex.unlock();
+            let _ = futex_wait(self.seq.as_ptr(), seen, self.scope);
+            // Woken from the sequence, or from the mutex after a requeue: other waiters may be
+            // parked on the mutex, so take it in the contended state.
+            mutex.lock_contended();
+        }
+
+        pub fn signal(&self) {
+            self.seq.fetch_add(1, Ordering::Release);
+            let _ = futex_wake(self.seq.as_ptr(), 1, self.scope);
+        }
+
+        /// Broadcast. The caller MUST hold `mutex`. At most one waiter is made runnable; every
+        /// other waiter is moved, still blocked, to the mutex word, and each later unlock wakes
+        /// the next. The word is set to `CONTENDED` first, so the unlock that follows cannot skip
+        /// that wake.
+        ///
+        /// Why not "re-issue the wake until it returns 0": a wake that returns 0 may have stopped
+        /// at a waiter with no run-queue room, which stays parked. NR 17 reports that case
+        /// (`capacity_limited`), and the retry with `wake = 0` moves the waiter to the mutex
+        /// instead of needing room for it.
+        pub fn broadcast(&self, mutex: &FutexMutex) -> BroadcastReport {
+            let seq = self.seq.fetch_add(1, Ordering::Release).wrapping_add(1);
+            mutex.word.store(CONTENDED, Ordering::Relaxed);
+            let mut report = BroadcastReport::default();
+            let mut wake = 1;
+            // Bounded: each capacity-limited round is followed by a wake-0 round, which needs no
+            // run-queue room and so cannot be capacity-limited.
+            for _ in 0..2 {
+                report.calls += 1;
+                match futex_cmp_requeue(
+                    self.seq.as_ptr(),
+                    self.scope,
+                    mutex.word.as_ptr(),
+                    mutex.scope,
+                    seq,
+                    wake,
+                    u32::MAX,
+                ) {
+                    Ok(out) => {
+                        report.woken += out.woken;
+                        report.requeued += out.requeued;
+                        if !out.capacity_limited {
+                            break;
+                        }
+                        wake = 0;
+                    }
+                    Err(SyscallError::WouldBlock) => {
+                        // A signal moved the sequence: every waiter that parked before it is
+                        // still on the sequence. Correct, if not efficient: wake them all.
+                        report.fell_back_to_wake_all = true;
+                        report.woken +=
+                            futex_wake(self.seq.as_ptr(), u32::MAX, self.scope).unwrap_or(0);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            report
+        }
     }
 }
 

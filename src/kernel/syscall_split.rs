@@ -6078,6 +6078,12 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_futex_wake_into_frame(shared, cpu, frame);
     }
 
+    // FUTEX-REQUEUE1: FutexCmpRequeue (NR 17) — born split. Like NR 10 the caller never
+    // task-switches; its route settles every refusal itself, in the canonical order.
+    if matches!(syscall, Syscall::FutexCmpRequeue) {
+        return try_split_futex_cmp_requeue_into_frame(shared, cpu, frame);
+    }
+
     // U9-IPC-RESIDUAL2 §2: IpcCall (NR 6) is no longer serviced from here. It became a SWITCHING
     // class the moment its full-endpoint arm started parking the caller, so it is tried in
     // `try_split_dispatch_into_frame` alongside the other four, whose contract admits a caller
@@ -6651,6 +6657,106 @@ fn maybe_log_futex_wake_retired() {
 /// itself (`futex_wake_split_mut`) is arch-neutral and unit-tested directly.
 #[cfg(feature = "hosted-dev")]
 fn try_split_futex_wake_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
+/// FUTEX-REQUEUE1 — service `FutexCmpRequeue` (NR 17) off the global lock.
+///
+/// The canonical chain is `sched::handle_futex_cmp_requeue` ->
+/// `KernelState::futex_cmp_requeue_current`, and this route settles every refusal in its order:
+///
+///   1. `decode_futex_requeue_args` -> `InvalidArgs` (non-`u32` counts, reserved flag bits,
+///      misaligned address)
+///   2. `futex_word_range_check(source)`, then `(target)` -> `WrongObject` | `UserMemoryFault`
+///   3. the caller -> `TaskMissing`; its address space -> `UserMemoryFault`
+///   4. `SharedKernel::futex_cmp_requeue_split` -> the key error, `InvalidArgs` (same key) or
+///      `WouldBlock` (the source word no longer holds `expected`; nothing was written)
+///
+/// A success is `set_ok(woken, requeued, status)` (see `sched::apply_futex_requeue_result`).
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_futex_cmp_requeue_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR as NR;
+    use crate::kernel::syscall::sched as sc;
+    let refuse = |reason: &str, err: SyscallError| {
+        crate::yarm_log!(
+            "FUTEX_REQUEUE_SPLIT_REFUSED cpu={} reason={} err={:?} broad_lock=0",
+            cpu.0,
+            reason,
+            err
+        );
+        Some(Err(TrapHandleError::Syscall(err)))
+    };
+    let args = match sc::decode_futex_requeue_args(frame) {
+        Ok(args) => args,
+        Err(err) => return refuse("invalid_args", err),
+    };
+    for addr in [args.source, args.target] {
+        if let Err(err) = sc::futex_word_range_check(addr) {
+            return refuse("range_check", SyscallError::from(err));
+        }
+    }
+    let tid = match split_caller(shared, cpu) {
+        SplitCaller::Running(tid) => tid,
+        SplitCaller::NoCurrentTask => {
+            crate::yarm_log!(
+                "SYSCALL_SPLIT_NO_CURRENT nr={} cpu={} settlement=task_missing broad_lock=0",
+                NR,
+                cpu.0
+            );
+            return Some(Err(TrapHandleError::Syscall(SyscallError::from(
+                crate::kernel::boot::KernelError::TaskMissing,
+            ))));
+        }
+    };
+    let asid = shared.task_asid_for_tid_split_read(tid);
+    if asid == 0 {
+        return refuse(
+            "no_user_asid",
+            SyscallError::from(crate::kernel::boot::KernelError::UserMemoryFault),
+        );
+    }
+    let result = shared.futex_cmp_requeue_split(
+        cpu,
+        crate::kernel::vm::Asid(asid as u16),
+        (args.source, args.source_kind),
+        (args.target, args.target_kind),
+        args.expected,
+        args.wake,
+        args.requeue,
+    );
+    if let Ok(outcome) = &result {
+        #[cfg(target_arch = "aarch64")]
+        let arch = "aarch64";
+        #[cfg(target_arch = "riscv64")]
+        let arch = "riscv64";
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+        let arch = "x86_64";
+        crate::yarm_log!(
+            "FUTEX_REQUEUE_SPLIT_DONE arch={} cpu={} tid={} woken={} requeued={} \
+             capacity_limited={} broad_lock=0",
+            arch,
+            cpu.0,
+            tid,
+            outcome.woken,
+            outcome.requeued,
+            outcome.capacity_limited as u8
+        );
+    }
+    Some(sc::apply_futex_requeue_result(frame, result).map_err(TrapHandleError::Syscall))
+}
+
+/// Hosted-dev: NR 17 takes the broad path (as NR 10 does); the split owner
+/// (`futex_cmp_requeue_split`) is arch-neutral and tested directly.
+#[cfg(feature = "hosted-dev")]
+fn try_split_futex_cmp_requeue_into_frame(
     _shared: &SharedKernel,
     _cpu: CpuId,
     _frame: &mut TrapFrame,
@@ -10465,6 +10571,9 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // addr) return `None` → unchanged global-lock fallback, which produces the exact
         // error. (NR 11 is SpawnThread, NOT FutexWake — do not confuse the two.)
         Syscall::FutexWake => Some(syscall),
+        // FUTEX-REQUEUE1: FutexCmpRequeue (NR 17) — split from birth; the caller never
+        // task-switches. `try_split_futex_cmp_requeue_into_frame` settles every refusal.
+        Syscall::FutexCmpRequeue => Some(syscall),
         // U9-MO2 §4: CreateInitramfsFileSliceMo (NR 28) — the smallest live production class
         // still reaching a terminal broad acquisition. Its object is BORROWED initrd backing, so
         // its compensation never touches the frame allocator; every owner it needs already exists
@@ -11644,6 +11753,8 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
                 || nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
                 || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+                // FUTEX-REQUEUE1: NR 17 `FutexCmpRequeue`, split from birth.
+                || nr == crate::kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR
                 || nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
                 || nr == SYSCALL_SPAWN_PROCESS_NR

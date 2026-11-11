@@ -4136,6 +4136,9 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
     let raw_nr = frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8);
     if raw_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+        // FUTEX-REQUEUE1: FutexCmpRequeue (NR 17) — non-switching, like NR 10, and split from
+        // birth; without its ABI in the frame it would reach the terminal broad dispatcher here.
+        || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR
         // U9-QA §2: FutexWait (NR 9) — the one SWITCHING pre-lock class. Without its ABI in the
         // frame the split dispatcher sees `nr = 0` and declines, which is why AArch64 kept taking
         // the in-lock deferral while x86_64 and RISC-V had moved to the pre-lock route. This is
@@ -4411,6 +4414,7 @@ fn finalize_split_handled_syscall(
     // it would re-execute the `svc` and re-block when the wake eventually resumes it.
     if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+        || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         || ((frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR

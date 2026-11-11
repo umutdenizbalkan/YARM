@@ -10,7 +10,7 @@ use super::vm::{PAGE_SIZE, VirtAddr};
 use crate::arch::syscall_abi;
 use crate::kernel::boot::TrapHandleError;
 
-pub const SYSCALL_ABI_VERSION: u16 = 10;
+pub const SYSCALL_ABI_VERSION: u16 = 11;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
@@ -35,6 +35,9 @@ pub const SYSCALL_DEBUG_LOG_NR: usize = 15;
 /// The syscall takes NO target identity: it terminates the current task and nothing else,
 /// so there is no capability to check and no way to name another task.
 pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;
+/// FUTEX-REQUEUE1 (ABI v11) — atomic compare-and-requeue: `17`, the lowest number of the reserved
+/// public gap `17..=22`, contiguous with `0..=16`. Assigning it is what makes this ABI v11.
+pub const SYSCALL_FUTEX_CMP_REQUEUE_NR: usize = 17;
 
 /// Stage 200D-0A — the exit status recorded for a task that ended itself via NR 16.
 ///
@@ -417,6 +420,8 @@ pub enum Syscall {
     ReapFaultedTask = SYSCALL_REAP_FAULTED_TASK_NR,
     /// Stage 200D-0: terminate the calling task. Never returns on success.
     ExitCurrentTask = SYSCALL_EXIT_CURRENT_TASK_NR,
+    /// FUTEX-REQUEUE1 (ABI v11): atomic compare, wake and requeue between two futex keys.
+    FutexCmpRequeue = SYSCALL_FUTEX_CMP_REQUEUE_NR,
 }
 
 /// Stage 200D-0A — the CANONICAL list of every `Syscall` variant.
@@ -446,6 +451,7 @@ pub const ALL_SYSCALL_VARIANTS: &[Syscall] = &[
     Syscall::VmBrk,
     Syscall::DebugLog,
     Syscall::ExitCurrentTask,
+    Syscall::FutexCmpRequeue,
     Syscall::SpawnProcess,
     Syscall::CreateInitramfsFileSliceMo,
     Syscall::SpawnFromMemoryObject,
@@ -486,6 +492,7 @@ impl Syscall {
             SYSCALL_RECV_SHARED_V3_NR => Ok(Self::RecvSharedV3),
             SYSCALL_REAP_FAULTED_TASK_NR => Ok(Self::ReapFaultedTask),
             SYSCALL_EXIT_CURRENT_TASK_NR => Ok(Self::ExitCurrentTask),
+            SYSCALL_FUTEX_CMP_REQUEUE_NR => Ok(Self::FutexCmpRequeue),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -2328,6 +2335,13 @@ fn handle_futex_wake(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<
     self::sched::handle_futex_wake(kernel, frame)
 }
 
+fn handle_futex_cmp_requeue(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    self::sched::handle_futex_cmp_requeue(kernel, frame)
+}
+
 fn handle_spawn_thread(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
@@ -2515,6 +2529,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::TransferRelease => handle_transfer_release(kernel, frame),
         Syscall::FutexWait => handle_futex_wait(kernel, frame),
         Syscall::FutexWake => handle_futex_wake(kernel, frame),
+        Syscall::FutexCmpRequeue => handle_futex_cmp_requeue(kernel, frame),
         Syscall::SpawnThread => handle_spawn_thread(kernel, frame),
         Syscall::Fork => handle_fork(kernel, frame),
         Syscall::VmAnonMap => handle_vm_anon_map(kernel, frame),
@@ -2705,7 +2720,9 @@ mod tests {
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
-        assert_eq!(SYSCALL_ABI_VERSION, 10);
+        // FUTEX-REQUEUE1: v11 — NR 17 assigned from the reserved gap (doc/SYSCALL_ABI.md).
+        assert_eq!(SYSCALL_ABI_VERSION, 11);
+        assert_eq!(SYSCALL_FUTEX_CMP_REQUEUE_NR, 17);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4);
@@ -5840,7 +5857,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 2 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "D4 step 2 must not change syscall variant count"
         );
         assert!(
@@ -5906,7 +5923,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 3 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "D4 step 3 must not change syscall variant count"
         );
         assert!(
@@ -5975,7 +5992,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 4 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "D4 step 4 must not change syscall variant count"
         );
         assert!(
