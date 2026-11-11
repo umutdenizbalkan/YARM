@@ -211948,33 +211948,43 @@ mod futex_found1 {
         assert_eq!(k.with(|s| s.futex_waiter_count(X)), 0);
     }
 
-    /// F8 — exit removes exactly the exiting waiter; the others keep their records.
+    /// F8 — exit removes exactly the exiting waiter, from the MIDDLE of its queue; the others keep
+    /// their records and their order.
     #[test]
     fn f08_exit_removes_only_the_exiting_waiter() {
         let mut s = Bootstrap::init().expect("init");
         let (a, _) = space(&mut s);
-        for t in [41071, 41072, 41073] {
+        for t in [41071, 41072, 41073, 41074] {
             task(&mut s, t, a);
         }
         private_page(&mut s, a, X);
         word(&mut s, 41071, X, 5);
-        wait(&mut s, 41071, X, 5, P);
-        let t2 = wait(&mut s, 41072, X, 5, P);
-        assert_eq!(occupied(&mut s), 2);
+        let t1 = wait(&mut s, 41071, X, 5, P);
+        wait(&mut s, 41072, X, 5, P);
+        let t4 = wait(&mut s, 41074, X, 5, P);
+        assert_eq!(occupied(&mut s), 3);
         run(&mut s, 41073);
-        s.exit_task(41071, 0).expect("exit the first waiter");
+        s.exit_task(41072, 0).expect("exit the middle waiter");
         assert_eq!(
             occupied(&mut s),
-            1,
+            2,
             "exactly the exiting waiter's record went"
         );
+        assert_eq!(token_of(&s, 41071), Some(t1), "the others are untouched");
+        assert_eq!(token_of(&s, 41074), Some(t4));
+        assert_eq!(s.futex_wake(X, 1, P), Ok(1));
         assert_eq!(
-            token_of(&s, 41072),
-            Some(t2),
-            "the other waiter is untouched"
+            s.task_status(41071),
+            Some(TaskStatus::Runnable),
+            "still oldest first"
         );
-        assert_eq!(s.futex_wake(X, u32::MAX, P), Ok(1));
-        assert_eq!(s.task_status(41072), Some(TaskStatus::Runnable));
+        assert_eq!(
+            s.futex_wake(X, 1, P),
+            Ok(1),
+            "the queue is intact past the removal"
+        );
+        assert_eq!(s.task_status(41074), Some(TaskStatus::Runnable));
+        assert_eq!(occupied(&mut s), 0);
     }
 
     /// F9 — repeated wait cycles: an earlier cycle's delayed cleanup cannot wake or remove the
