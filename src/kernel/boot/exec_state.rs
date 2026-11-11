@@ -1166,18 +1166,18 @@ impl KernelState {
         Ok(self.futex_wake_key(key, count))
     }
 
-    /// FUTEX-REQUEUE1 — THE broad compare-and-requeue (NR 17) of the current task.
+    /// FUTEX-REQUEUE-ATOMIC1 — THE broad compare-and-requeue (NR 17) of the current task: the
+    /// twin of `SharedKernel::futex_cmp_requeue_split`, through the broad seams, with the same
+    /// three phases and the same one linearization point:
     ///
-    /// 1. rank 2 → 5 → 6, ONE hold — `compare_and_requeue_locked`: the source key and word, the
-    ///    target key, the comparison, and the transfer of up to `requeue` live source waiters
-    ///    beyond the first `wake` to the target key. The linearization point; a refusal writes
-    ///    nothing.
-    /// 2. The wake portion — the FUTEX-WAKE-CAP1 wake of the source key, at most `wake` waiters,
-    ///    oldest first (the waiters the transfer left at the head). Its capacity stop is reported,
-    ///    never hidden: those waiters stay parked on the source key.
-    ///
-    /// The transfer takes no scheduler lock and needs no run-queue slot: a requeued waiter stays
-    /// `Blocked(Futex(token))`.
+    /// 1. PREFLIGHT — a run-queue slot reserved for each of the oldest source waiters, up to
+    ///    `wake` (task and scheduler domains alternately, never nested).
+    /// 2. COMMIT — rank 2 → 5 → 6, ONE hold: `compare_and_requeue_locked` compares the word and
+    ///    selects and moves both portions (the wake portion to private pending keys, the requeue
+    ///    portion to the target). A refusal, or a stale preflight, writes nothing; a stale one is
+    ///    retried, at most `FUTEX_REQUEUE_ATTEMPTS` times.
+    /// 3. PLACEMENT — each pending waiter claimed, its reserved slot filled; every unused
+    ///    reservation released.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn futex_cmp_requeue_current(
         &mut self,
@@ -1187,28 +1187,209 @@ impl KernelState {
         wake: u32,
         requeue: u32,
     ) -> Result<super::futex::FutexRequeueOutcome, super::futex::FutexRequeueRefusal> {
-        use super::futex::{self as fx, FutexRequeueRefusal as R};
+        use super::futex::{self as fx, FutexRequeueCommit, FutexRequeueRefusal as R};
         fx::futex_word_range_check(source.0).map_err(R::Key)?;
         fx::futex_word_range_check(target.0).map_err(R::Key)?;
         let tid = self.current_tid().ok_or(R::Key(KernelError::TaskMissing))?;
         let asid = self
             .task_asid(tid)
             .ok_or(R::Key(KernelError::UserMemoryFault))?;
-        let transfer = self.with_task_futex_then_vm_memory_mut(|tcbs, table, spaces, memory| {
-            fx::compare_and_requeue_locked(
-                tcbs, table, spaces, memory, asid, source, target, expected, wake, requeue,
-            )
-        })?;
-        let woke = if wake == 0 {
-            fx::FutexWakeOutcome::default()
-        } else {
-            self.futex_wake_key_outcome(transfer.source, wake)
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let last_attempt = attempt >= fx::FUTEX_REQUEUE_ATTEMPTS;
+            let mut preflight = if wake == 0 {
+                fx::FutexWakePreflight::none(last_attempt)
+            } else {
+                self.futex_requeue_preflight(asid, source, expected, wake, last_attempt)
+            };
+            let decided =
+                self.with_task_futex_then_vm_memory_mut(|tcbs, classes, table, spaces, memory| {
+                    fx::compare_and_requeue_locked(
+                        tcbs.as_slice(),
+                        classes.as_slice(),
+                        table,
+                        spaces,
+                        memory,
+                        asid,
+                        source,
+                        target,
+                        expected,
+                        wake,
+                        requeue,
+                        &preflight,
+                    )
+                });
+            let committed = match decided {
+                Ok(FutexRequeueCommit::Committed(c)) => c,
+                Ok(FutexRequeueCommit::Stale) => {
+                    crate::yarm_log!(
+                        "FUTEX_REQUEUE_PREFLIGHT_STALE attempt={} reserved={}",
+                        attempt,
+                        preflight.held.total()
+                    );
+                    self.futex_release_placements(&mut preflight.held);
+                    continue;
+                }
+                Err(refusal) => {
+                    self.futex_release_placements(&mut preflight.held);
+                    return Err(refusal);
+                }
+            };
+            #[cfg(test)]
+            fx::futex_phase_hook::run_requeue_window();
+            self.futex_requeue_place(&committed, &mut preflight.held);
+            self.futex_release_placements(&mut preflight.held);
+            return Ok(fx::FutexRequeueOutcome {
+                woken: committed.woken,
+                requeued: committed.moved,
+                capacity_limited: committed.capacity_limited,
+            });
+        }
+    }
+
+    /// FUTEX-REQUEUE-ATOMIC1 — the broad preflight; see `SharedKernel::futex_requeue_preflight_split`.
+    fn futex_requeue_preflight(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        source: (usize, super::futex::FutexKind),
+        expected: u32,
+        wake: u32,
+        last_attempt: bool,
+    ) -> super::futex::FutexWakePreflight {
+        use super::futex::{self as fx, FutexPlacementRefusal};
+        use crate::kernel::task_enqueue::{self as te, EnqueueTarget};
+        let mut out = fx::FutexWakePreflight::none(last_attempt);
+        let Ok((key, word)) = self.with_vm_then_memory_mut(|spaces, memory| {
+            fx::resolve_futex_word_locked(spaces, memory, asid, source.0, source.1)
+        }) else {
+            return out;
         };
-        Ok(fx::FutexRequeueOutcome {
-            woken: woke.woke,
-            requeued: transfer.moved,
-            capacity_limited: woke.stopped_unplaceable,
-        })
+        if word != expected {
+            return out;
+        }
+        let current_cpu = self.current_cpu();
+        let want = (wake as usize).min(fx::MAX_FUTEX_WAITERS);
+        let mut cursor = None;
+        for _ in 0..want {
+            let Ok(Some(candidate)) = self.with_task_futex_mut(|tcbs, table| {
+                fx::next_futex_waiter_after_locked(tcbs.as_slice(), table, key, cursor)
+            }) else {
+                break;
+            };
+            let mut plan = match self.with_task_enqueue_policy_mut(|tcbs, classes| {
+                te::plan_balanced_enqueue_locked(tcbs, classes, candidate.tid, current_cpu)
+            }) {
+                Ok(plan) => plan,
+                Err(_) => {
+                    out.refused = Some(FutexPlacementRefusal::Plan {
+                        token: candidate.token,
+                    });
+                    break;
+                }
+            };
+            self.fix_plan_home(&mut plan, current_cpu);
+            let EnqueueTarget::Pinned(home) = plan.target else {
+                break;
+            };
+            let reserved = {
+                let mut guard = self.scheduler_state();
+                let mut all = guard.view();
+                match all.cpu(home) {
+                    Ok(mut view) => te::reserve_enqueue_on_cpu_locked(&mut view, &plan),
+                    Err(err) => Err(super::map_scheduler_error(err)),
+                }
+            };
+            if let Err(err) = reserved {
+                crate::yarm_log!(
+                    "FUTEX_REQUEUE_PLACEMENT_REFUSED tid={} cpu={} err={:?} reserved={}",
+                    candidate.tid,
+                    home.0,
+                    err,
+                    out.held.total()
+                );
+                out.refused = Some(FutexPlacementRefusal::Slot {
+                    cpu: home,
+                    priority: plan.priority,
+                });
+                break;
+            }
+            out.held.add(home, plan.priority);
+            #[cfg(test)]
+            fx::futex_phase_hook::run_wake_step(
+                fx::futex_phase_hook::WAKE_AFTER_RESERVE,
+                candidate.tid,
+            );
+            cursor = Some(candidate);
+        }
+        out
+    }
+
+    /// FUTEX-REQUEUE-ATOMIC1 — the broad placement; see `SharedKernel::futex_requeue_place_split`.
+    fn futex_requeue_place(
+        &mut self,
+        committed: &super::futex::FutexRequeueCommitted,
+        held: &mut super::futex::FutexPlacementCounts,
+    ) {
+        use super::futex::{self as fx, FutexKey};
+        use crate::kernel::task_enqueue::{self as te, EnqueuePlan, EnqueueTarget};
+        for (home, priority, count) in committed.assigned.nonzero() {
+            let key = FutexKey::Pending {
+                op: committed.op,
+                cpu: home.0,
+                priority: priority as u8,
+            };
+            for _ in 0..count {
+                let Some(tid) = self.with_task_futex_mut(|tcbs, table| {
+                    fx::claim_pending_futex_waiter_locked(tcbs.as_mut_slice(), table, key)
+                }) else {
+                    break;
+                };
+                #[cfg(test)]
+                fx::futex_phase_hook::run_wake_step(fx::futex_phase_hook::WAKE_AFTER_CLAIM, tid);
+                let covered = held.take(home, priority);
+                debug_assert!(covered, "a pending waiter without a reserved slot");
+                let plan = EnqueuePlan {
+                    tid,
+                    priority,
+                    target: EnqueueTarget::Pinned(home),
+                };
+                let mut guard = self.scheduler_state();
+                let mut all = guard.view();
+                let committed = match all.cpu(home) {
+                    Ok(mut view) => te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan),
+                    Err(err) => Err(super::map_scheduler_error(err)),
+                };
+                if let Err(err) = committed {
+                    crate::yarm_log!(
+                        "FUTEX_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} err={:?}",
+                        tid,
+                        home.0,
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    /// FUTEX-REQUEUE-ATOMIC1 — give back every reserved slot in `held`, leaving it empty.
+    fn futex_release_placements(&mut self, held: &mut super::futex::FutexPlacementCounts) {
+        use crate::kernel::task_enqueue::{self as te, EnqueuePlan, EnqueueTarget};
+        for (home, priority, count) in held.nonzero() {
+            let plan = EnqueuePlan {
+                tid: 0,
+                priority,
+                target: EnqueueTarget::Pinned(home),
+            };
+            let mut guard = self.scheduler_state();
+            let mut all = guard.view();
+            if let Ok(mut view) = all.cpu(home) {
+                for _ in 0..count {
+                    te::release_enqueue_reservation_on_cpu_locked(&mut view, &plan);
+                }
+            }
+        }
+        *held = super::futex::FutexPlacementCounts::new();
     }
 
     /// The robust-futex cleanup wake, in the EXITING task's own namespace.

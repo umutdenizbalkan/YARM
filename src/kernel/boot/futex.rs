@@ -56,7 +56,8 @@
 //! (the future requeue) is an unlink and an append, with the TCB untouched.
 
 use super::{KernelError, MAX_TASKS, MemorySubsystem};
-use crate::kernel::task::{TaskStatus, ThreadControlBlock, WaitReason};
+use crate::kernel::scheduler::{CpuId, MAX_CPUS, TaskPriority};
+use crate::kernel::task::{TaskClass, TaskStatus, ThreadControlBlock, WaitReason};
 use crate::kernel::vm::{AddressSpaceManager, Asid, PAGE_SIZE, VirtAddr};
 
 /// NR 9 / NR 10 flag: resolve a SHARED key (backing object + offset) instead of a private one.
@@ -97,6 +98,17 @@ pub enum FutexKey {
         object_id: u64,
         offset: u64,
     },
+    /// FUTEX-REQUEUE-ATOMIC1 — the wake set of ONE compare-and-requeue, between the commit that
+    /// selected it and the placement of each member. No key resolution produces it, so no
+    /// FutexWait, FutexWake or compare-and-requeue of a user word can reach these waiters; only
+    /// the operation that made the key, and task exit, touch them. `op` is unique per operation
+    /// ([`next_requeue_op`]); `cpu` and `priority` are the placement whose reserved run-queue slot
+    /// the commit counted for each waiter on this key.
+    Pending {
+        op: u64,
+        cpu: u8,
+        priority: u8,
+    },
 }
 
 impl FutexKey {
@@ -109,6 +121,12 @@ impl FutexKey {
             } => (va >> 2) ^ aspace_generation.rotate_left(17) ^ u64::from(asid.0).rotate_left(41),
             Self::Shared { object_id, offset } => {
                 (offset >> 2) ^ object_id.rotate_left(29) ^ 0x9E37_79B9_7F4A_7C15
+            }
+            Self::Pending { op, cpu, priority } => {
+                op.rotate_left(7)
+                    ^ (u64::from(cpu) << 2)
+                    ^ u64::from(priority)
+                    ^ 0x5851_F42D_4C95_7F2D
             }
         };
         (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % FUTEX_BUCKETS
@@ -206,9 +224,20 @@ pub fn resolve_futex_key_locked(
 fn read_word_locked(_memory: &MemorySubsystem, _asid: Asid, phys: u64) -> Result<u32, KernelError> {
     let ptr =
         super::KernelState::phys_to_direct_map_ptr(phys).ok_or(KernelError::UserMemoryFault)?;
+    // FUTEX-REQUEUE-ATOMIC1: the word is a synchronization variable that other CPUs' user code
+    // stores to with atomics while the kernel reads it, so the kernel's read is an ATOMIC load
+    // (a volatile read is not one in Rust's memory model: racing it with a store is a data race).
+    // Acquire, so the kernel's later decisions are ordered after the value it compared; the futex
+    // protocol's ordering against registrations and wakes comes from the task lock.
+    // Every syscall refuses a misaligned word before it gets here (`InvalidArgs`); the reader
+    // refuses one too, because the atomic load below requires alignment.
+    if ptr as usize % core::mem::align_of::<core::sync::atomic::AtomicU32>() != 0 {
+        return Err(KernelError::UserMemoryFault);
+    }
     // SAFETY: `phys` is inside a validated user-readable mapping held stable by the vm lock, the
-    // direct-map pointer is bounds-checked, and the word is 4-byte aligned.
-    Ok(unsafe { core::ptr::read_volatile(ptr as *const u32) })
+    // direct-map pointer is bounds-checked, and it is aligned for `AtomicU32` (checked above).
+    let word = unsafe { &*(ptr as *const core::sync::atomic::AtomicU32) };
+    Ok(word.load(core::sync::atomic::Ordering::Acquire))
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -551,6 +580,32 @@ pub fn undo_futex_registration_locked(
     true
 }
 
+/// FUTEX-REQUEUE-ATOMIC1 — rank 2: the undo of the split wait's SECOND READ, when that read saw
+/// the word (or key) change. Like [`undo_futex_registration_locked`], and also refused (changing
+/// nothing) when the record is no longer on `key`, the key this wait registered on: another
+/// operation has then ACTED on this waiter as registered — a compare-and-requeue moved it to its
+/// target, or selected it for its wake portion — so the wait is no longer this caller's to
+/// retract. The caller then continues to park, and the other operation's outcome stands (moved:
+/// parked on the target; selected: placed by that operation). Retracting it instead would leave
+/// that operation having moved or woken a waiter that, by its own report, never waited — a
+/// history no sequential order produces.
+pub fn undo_futex_registration_unless_acted_on_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    tid: u64,
+    token: FutexWaitToken,
+    key: FutexKey,
+) -> bool {
+    let slot = usize::from(token.slot);
+    let rekeyed = slot < MAX_FUTEX_WAITERS
+        && table.generations[slot] == token.generation
+        && table.records[slot].is_some_and(|r| r.key != key);
+    if rekeyed {
+        return false;
+    }
+    undo_futex_registration_locked(tcbs, table, tid, token)
+}
+
 /// rank 2 — whether `tid` still waits on exactly `token`.
 pub fn futex_still_parked_locked(
     tcbs: &[Option<ThreadControlBlock>],
@@ -674,42 +729,264 @@ pub enum FutexRequeueRefusal {
     Key(KernelError),
 }
 
-/// FUTEX-REQUEUE1 — what the atomic transfer step did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FutexRequeueTransfer {
-    pub source: FutexKey,
-    pub target: FutexKey,
-    /// The live source waiters left at the head of the source queue for the wake portion.
-    pub kept: u32,
-    /// The live source waiters moved to the target, in their source order.
-    pub moved: u32,
+// ── FUTEX-REQUEUE-ATOMIC1: compare-and-requeue as ONE operation ─────────────────────────────
+//
+// NR 17 runs in three phases, and only the middle one decides anything:
+//
+// 1. PREFLIGHT (task lock and one CPU's scheduler lock, alternately, never nested): for the
+//    oldest source waiters, up to `wake`, the placement a wake would use and a run-queue slot
+//    RESERVED there — FUTEX-WAKE-CAP1's reservation, made before anything is decided. Its
+//    observations may go stale; a reservation grants no ownership of any waiter.
+// 2. COMMIT ([`compare_and_requeue_locked`], task → vm → memory held together): the keys, the
+//    word, the comparison, and the selection of BOTH portions from one view of the source queue.
+//    The wake portion is the longest FIFO prefix of live source waiters whose placement has a
+//    reserved slot, up to `wake`; it is moved to a [`FutexKey::Pending`] key private to this
+//    operation (still `Blocked(Futex(token))`, token unchanged). The requeue portion is the next
+//    up to `requeue` live source waiters, moved to the target. This is the linearization point.
+// 3. PLACEMENT: each pending waiter is claimed and its reserved slot filled (the WAKE-CAP1
+//    claim → reserved commit), then every unused reservation is released. Nothing but this
+//    operation and task exit can reach a pending waiter, so the placement cannot change the
+//    outcome the commit fixed.
+
+/// How many times NR 17 re-runs its preflight when the commit finds it stale.
+pub const FUTEX_REQUEUE_ATTEMPTS: u32 = 4;
+
+static NEXT_REQUEUE_OP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// A fresh operation id for [`FutexKey::Pending`]: unique for the life of the kernel.
+pub fn next_requeue_op() -> u64 {
+    NEXT_REQUEUE_OP.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
-/// rank 2 → 5 → 6 — THE compare-and-requeue transfer: the caller holds the task lock, then the vm
+const PRIORITIES: usize = 3;
+
+fn priority_from_index(i: usize) -> TaskPriority {
+    match i {
+        0 => TaskPriority::High,
+        1 => TaskPriority::Normal,
+        _ => TaskPriority::Low,
+    }
+}
+
+/// FUTEX-REQUEUE-ATOMIC1 — run-queue slots counted by `(CPU, priority)`: the slots a preflight
+/// RESERVED, or those a commit ASSIGNED to its wake portion. Fixed size (`MAX_CPUS × 3 × u16`,
+/// 384 bytes with 64 CPUs); a run-queue reservation is a count per CPU and priority, so this is
+/// all an operation needs to remember about the slots it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FutexPlacementCounts {
+    n: [[u16; PRIORITIES]; MAX_CPUS],
+}
+
+impl Default for FutexPlacementCounts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FutexPlacementCounts {
+    pub const fn new() -> Self {
+        Self {
+            n: [[0; PRIORITIES]; MAX_CPUS],
+        }
+    }
+    pub fn add(&mut self, cpu: CpuId, priority: TaskPriority) {
+        if let Some(c) = self.n.get_mut(usize::from(cpu.0)) {
+            c[priority as usize] = c[priority as usize].saturating_add(1);
+        }
+    }
+    /// Take one slot of `(cpu, priority)`; `false` if none is left.
+    pub fn take(&mut self, cpu: CpuId, priority: TaskPriority) -> bool {
+        match self.n.get_mut(usize::from(cpu.0)) {
+            Some(c) if c[priority as usize] > 0 => {
+                c[priority as usize] -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+    pub fn total(&self) -> u32 {
+        self.n.iter().flatten().map(|&c| u32::from(c)).sum()
+    }
+    /// Every non-zero count, as `(cpu, priority, count)`.
+    pub fn nonzero(&self) -> impl Iterator<Item = (CpuId, TaskPriority, u16)> + '_ {
+        self.n.iter().enumerate().flat_map(|(cpu, per)| {
+            per.iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0)
+                .map(move |(p, &c)| (CpuId(cpu as u8), priority_from_index(p), c))
+        })
+    }
+}
+
+/// FUTEX-REQUEUE-ATOMIC1 — why a preflight secured fewer placements than it was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutexPlacementRefusal {
+    /// A slot on `cpu` at `priority` was refused (full queue, offline or wake-only CPU).
+    Slot { cpu: CpuId, priority: TaskPriority },
+    /// The waiter of this exact wait cycle has no enqueue plan (no class, or not a live task).
+    Plan { token: FutexWaitToken },
+}
+
+/// FUTEX-REQUEUE-ATOMIC1 — what a preflight secured for the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FutexWakePreflight {
+    /// The run-queue slots it reserved. The operation owns them until it fills or releases each.
+    pub held: FutexPlacementCounts,
+    /// Where it stopped, if it was refused a placement.
+    pub refused: Option<FutexPlacementRefusal>,
+    /// The operation's last attempt: the commit may not ask for another preflight.
+    pub last_attempt: bool,
+}
+
+impl FutexWakePreflight {
+    /// Nothing reserved (a `wake = 0` operation, or a word that already differs).
+    pub const fn none(last_attempt: bool) -> Self {
+        Self {
+            held: FutexPlacementCounts::new(),
+            refused: None,
+            last_attempt,
+        }
+    }
+}
+
+/// FUTEX-REQUEUE-ATOMIC1 — what the commit decided. `Committed` carries the placement counts
+/// (~400 bytes); the value is returned once per attempt and lives on the caller's stack, which a
+/// kernel path with no allocation prefers to boxing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum FutexRequeueCommit {
+    /// Committed: the operation's whole outcome is fixed.
+    Committed(FutexRequeueCommitted),
+    /// The preflight's reservations do not cover the waiters the wake portion must take now
+    /// (another owner changed the source queue in between), and this is not the last attempt.
+    /// NOTHING was mutated: release the reservations and preflight again.
+    Stale,
+}
+
+/// FUTEX-REQUEUE-ATOMIC1 — a committed compare-and-requeue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FutexRequeueCommitted {
+    pub source: FutexKey,
+    pub target: FutexKey,
+    /// The operation id of its pending keys.
+    pub op: u64,
+    /// Waiters selected for the wake portion — moved to `Pending { op, cpu, priority }`, one
+    /// assigned slot each. This is the `woken` NR 17 reports: they are woken at the commit.
+    pub woken: u32,
+    /// Their placements, by `(cpu, priority)`; each is covered by a reserved slot.
+    pub assigned: FutexPlacementCounts,
+    /// Waiters moved, still blocked, to the target, in their source order.
+    pub moved: u32,
+    /// The wake portion stopped short of `wake` at a live waiter whose placement was not secured.
+    pub capacity_limited: bool,
+}
+
+/// rank 2 — the oldest live waiter on `key` AFTER `after` (the preflight's cursor), or the oldest
+/// of all for `None`. `Err(())` if `after` is no longer a live waiter on `key`: another owner
+/// changed the queue, so the preflight stops (the commit then sees what it reserved is short).
+/// Stale records met on the way are retired, as [`next_futex_waiter_locked`] does.
+pub fn next_futex_waiter_after_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    key: FutexKey,
+    after: Option<FutexWakeCandidate>,
+) -> Result<Option<FutexWakeCandidate>, ()> {
+    let Some(after) = after else {
+        return Ok(next_futex_waiter_locked(tcbs, table, key));
+    };
+    let slot = usize::from(after.token.slot);
+    let still = slot < MAX_FUTEX_WAITERS
+        && table.token(slot) == after.token
+        && table.records[slot].is_some_and(|r| r.key == key && r.tid == after.tid)
+        && table.live(tcbs, slot);
+    if !still {
+        return Err(());
+    }
+    let mut prev = after.token.slot;
+    let mut cur = table.records[slot].map_or(NIL, |r| r.next);
+    while cur != NIL {
+        let s = usize::from(cur);
+        let Some(rec) = table.records[s] else {
+            break;
+        };
+        let next = rec.next;
+        if table.live(tcbs, s) {
+            if rec.key == key {
+                return Ok(Some(FutexWakeCandidate {
+                    tid: rec.tid,
+                    token: table.token(s),
+                }));
+            }
+            prev = cur;
+        } else {
+            table.retire_after(s, prev);
+        }
+        cur = next;
+    }
+    Ok(None)
+}
+
+/// rank 2 — where a wake of `slot`'s waiter would place it (see `homed_wake_placement_locked`).
+fn record_placement(
+    tcbs: &[Option<ThreadControlBlock>],
+    classes: &[Option<TaskClass>],
+    table: &FutexWaiterTable,
+    slot: usize,
+) -> Option<(CpuId, TaskPriority)> {
+    let rec = table.records[slot]?;
+    crate::kernel::task_enqueue::homed_wake_placement_locked(tcbs, classes, rec.tid)
+}
+
+/// Move `slot` (bucket predecessor `prev`) to `key`, appended at that key's tail: unlink, rekey,
+/// append. Its slot and incarnation, and so its waiter's token, are unchanged.
+fn rekey(table: &mut FutexWaiterTable, slot: usize, prev: u16, key: FutexKey, va: Option<u64>) {
+    table.unlink_after(slot, prev);
+    if let Some(r) = table.records[slot].as_mut() {
+        r.key = key;
+        if let Some(va) = va {
+            r.va = va;
+        }
+    }
+    table.link_tail(slot);
+}
+
+/// rank 2 → 5 → 6 — THE compare-and-requeue commit: the caller holds the task lock, then the vm
 /// lock, then the memory lock, for the whole call. This is the operation's linearization point.
 ///
 /// 1. Resolve the source key and read its word, and resolve the target key, from the caller's
-///    address space `asid` — under the vm and memory locks, so no mapping can change in between.
+///    address space `asid`, under the vm and memory locks.
 /// 2. Refuse a target that is the same key (`SameKey`), then compare the word with `expected`
 ///    (`ValueChanged`). Either refusal writes nothing.
-/// 3. In one walk of the source bucket: leave the first `keep` live source waiters in place (the
-///    wake portion's), then move up to `max_move` further live source waiters, in source order, to
-///    the tail of the target key's queue. A moved record keeps its slot and incarnation, so its
-///    waiter's token is unchanged; only its key (and its diagnostic VA, now the caller's target
-///    address) changes. No TCB is written: a moved waiter stays `Blocked(Futex(token))`.
+/// 3. Select, read-only, the WAKE PORTION: the live source waiters in FIFO order, each taking one
+///    of the preflight's reserved slots for its placement (`homed_wake_placement_locked`: its
+///    fixed home CPU and its class's priority — what a wake's plan resolves to), up to `wake`. It
+///    ends at the first live waiter whose placement has no reserved slot left:
+///    * if the preflight was refused exactly that placement (that CPU and priority, or that
+///      waiter's plan), or this is the last attempt, the wake portion is CAPACITY-LIMITED there;
+///    * otherwise the preflight is stale: return [`FutexRequeueCommit::Stale`] with nothing
+///      written.
 ///
-/// Why this is atomic: every waiter registration takes the task lock, which is held here, so a
-/// waiter is either registered before this step (and is a candidate) or after it (and is not).
-/// The comparison is made under the same hold. A registered waiter still inside its own wait's
-/// publication window is moved like any other: its re-read, undo and read-back are by token,
-/// which the move does not touch (see `doc/SYSCALL_ABI.md`).
+///    No waiter is ever skipped: the waiter the wake portion stops at is the first one the
+///    requeue portion takes.
+/// 4. Commit both portions in one walk of the source bucket: the selected waiters are moved, in
+///    order, to `Pending { op, cpu, priority }` (still `Blocked(Futex(token))`); the next up to
+///    `max_move` live source waiters are moved, in order, to the tail of the target key's queue.
+///    Stale records met are retired. No TCB is written. Nothing can register, wake, requeue or
+///    exit in between: every one of those takes the task lock, which is held.
 ///
-/// Bounded: one walk of one bucket (≤ `MAX_FUTEX_WAITERS` records, O(1) each). When source and
-/// target share a bucket, moved records are appended after the walk's original tail, which the
-/// walk stops at, so none is visited twice.
+/// Why one point: registrations, wake claims, other requeues, undo and exit all take the task
+/// lock, and the comparison, both selections and both moves happen under one hold of it. After
+/// it, the wake set is reachable only through its private key, so no concurrent operation can
+/// change which waiters this operation woke or moved; placing them later changes nothing that is
+/// observable as a futex outcome.
+///
+/// Bounded: two walks of one bucket (≤ `MAX_FUTEX_WAITERS` records, O(1) each), no allocation.
+/// Records moved into the same bucket are appended after the walk's original tail, which the walk
+/// stops at, so none is visited twice.
 #[allow(clippy::too_many_arguments)]
 pub fn compare_and_requeue_locked(
     tcbs: &[Option<ThreadControlBlock>],
+    classes: &[Option<TaskClass>],
     table: &mut FutexWaiterTable,
     spaces: &AddressSpaceManager,
     memory: &MemorySubsystem,
@@ -717,9 +994,10 @@ pub fn compare_and_requeue_locked(
     source: (usize, FutexKind),
     target: (usize, FutexKind),
     expected: u32,
-    keep: u32,
+    wake: u32,
     max_move: u32,
-) -> Result<FutexRequeueTransfer, FutexRequeueRefusal> {
+    preflight: &FutexWakePreflight,
+) -> Result<FutexRequeueCommit, FutexRequeueRefusal> {
     let (s_key, word) = resolve_futex_word_locked(spaces, memory, asid, source.0, source.1)
         .map_err(FutexRequeueRefusal::Key)?;
     let (t_key, _) = resolve_futex_key_locked(spaces, memory, asid, target.0, target.1)
@@ -731,11 +1009,48 @@ pub fn compare_and_requeue_locked(
         return Err(FutexRequeueRefusal::ValueChanged);
     }
     let b = s_key.bucket();
+
+    // (3) The wake portion, read-only: how many, and whether it stops short.
+    let mut avail = preflight.held;
+    let (mut woken, mut capacity_limited) = (0u32, false);
+    let mut cur = table.head[b];
+    while cur != NIL && woken < wake {
+        let slot = usize::from(cur);
+        let Some(rec) = table.records[slot] else {
+            break;
+        };
+        if rec.key == s_key && table.live(tcbs, slot) {
+            let at = record_placement(tcbs, classes, table, slot);
+            match at {
+                Some((cpu, priority)) if avail.take(cpu, priority) => woken += 1,
+                _ => {
+                    let explained = match preflight.refused {
+                        Some(FutexPlacementRefusal::Slot { cpu, priority }) => {
+                            at == Some((cpu, priority))
+                        }
+                        Some(FutexPlacementRefusal::Plan { token }) => token == table.token(slot),
+                        None => false,
+                    };
+                    if !explained && !preflight.last_attempt {
+                        return Ok(FutexRequeueCommit::Stale);
+                    }
+                    capacity_limited = true;
+                    break;
+                }
+            }
+        }
+        cur = rec.next;
+    }
+
+    // (4) Both portions, in one walk. `assigned` is built from what is actually moved, so every
+    // pending key's waiters are exactly covered by the slots counted for that key.
+    let op = next_requeue_op();
+    let mut assigned = FutexPlacementCounts::new();
     let last = table.tail[b];
     let mut prev = NIL;
     let mut cur = table.head[b];
-    let (mut kept, mut moved) = (0u32, 0u32);
-    while cur != NIL && moved < max_move {
+    let (mut selected, mut moved) = (0u32, 0u32);
+    while cur != NIL && (selected < woken || moved < max_move) {
         let slot = usize::from(cur);
         let Some(rec) = table.records[slot] else {
             break;
@@ -743,33 +1058,60 @@ pub fn compare_and_requeue_locked(
         let next = rec.next;
         let at_last = cur == last;
         if !table.live(tcbs, slot) {
-            // Stale: reclaimed on the way, exactly as a wake does.
             table.retire_after(slot, prev);
         } else if rec.key != s_key {
             prev = cur;
-        } else if kept < keep {
-            kept += 1;
-            prev = cur;
-        } else {
-            table.unlink_after(slot, prev);
-            if let Some(r) = table.records[slot].as_mut() {
-                r.key = t_key;
-                r.va = target.0 as u64;
+        } else if selected < woken
+            && let Some((cpu, priority)) = record_placement(tcbs, classes, table, slot)
+        {
+            // Step 3 proved this waiter's placement has a slot: the walk meets the same waiters in
+            // the same order, because nothing can change under the held locks. (Were a placement
+            // ever missing here, the waiter would simply begin the requeue portion below, and
+            // `woken` would count only the waiters actually selected.)
+            let pending = FutexKey::Pending {
+                op,
+                cpu: cpu.0,
+                priority: priority as u8,
+            };
+            rekey(table, slot, prev, pending, None);
+            assigned.add(cpu, priority);
+            selected += 1;
+        } else if moved < max_move {
+            if selected < woken {
+                woken = selected;
             }
-            table.link_tail(slot);
+            rekey(table, slot, prev, t_key, Some(target.0 as u64));
             moved += 1;
+        } else {
+            break;
         }
         if at_last {
             break;
         }
         cur = next;
     }
-    Ok(FutexRequeueTransfer {
+    let woken = selected;
+    Ok(FutexRequeueCommit::Committed(FutexRequeueCommitted {
         source: s_key,
         target: t_key,
-        kept,
+        op,
+        woken,
+        assigned,
         moved,
-    })
+        capacity_limited,
+    }))
+}
+
+/// rank 2 — claim the oldest waiter still on the pending key `key` (`Runnable`, record retired),
+/// exactly as a wake claims. `None` once no live waiter is left on it (the rest exited, or undid
+/// their own registration in their publication window).
+pub fn claim_pending_futex_waiter_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    key: FutexKey,
+) -> Option<u64> {
+    let candidate = next_futex_waiter_locked(tcbs, table, key)?;
+    claim_futex_waiter_locked(tcbs, table, key, candidate).then_some(candidate.tid)
 }
 
 /// rank 2 — retire every record naming `tid` (its TCB is being torn down). Eager reclamation; a
@@ -848,6 +1190,22 @@ pub(crate) mod futex_phase_hook {
             && hook(step, tid)
         {
             WAKE_STEP.with(|h| *h.borrow_mut() = Some(hook));
+        }
+    }
+
+    /// FUTEX-REQUEUE-ATOMIC1 — the compare-and-requeue's own window, for tests: after the
+    /// transaction that compares and moves has released its locks, before the woken waiters are
+    /// placed. One-shot.
+    std::thread_local! {
+        static REQUEUE_WINDOW: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn arm_requeue_window(hook: Hook) {
+        REQUEUE_WINDOW.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    pub(crate) fn run_requeue_window() {
+        let hook = REQUEUE_WINDOW.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
         }
     }
 }

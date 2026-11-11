@@ -2337,10 +2337,13 @@ impl KernelState {
     /// so that its word comparison and its waiter transfer are a single critical section ordered
     /// against every waiter registration (task lock) and every mapping change (vm lock). The
     /// ranks ascend and the order is fixed here. Nothing inside may call back into `KernelState`.
+    /// FUTEX-REQUEUE-ATOMIC1: the task-class table too (task domain, the same lock), so the commit
+    /// can read each waiter's wake placement.
     pub(crate) fn with_task_futex_then_vm_memory_mut<R>(
         &mut self,
         f: impl FnOnce(
             &mut [Option<ThreadControlBlock>; MAX_TASKS],
+            &[Option<TaskClass>; MAX_TASKS],
             &mut super::futex::FutexWaiterTable,
             &mut AddressSpaceManager,
             &mut MemorySubsystem,
@@ -2355,9 +2358,12 @@ impl KernelState {
         let _mem_guard = self.memory_state_lock.lock();
         let table = core::ptr::addr_of_mut!(self.futex_waiters);
         let memory = core::ptr::addr_of_mut!(self.memory);
-        // SAFETY: four disjoint fields, each serialized by its own guard, all held for the call.
+        let classes = core::ptr::addr_of!(self.task_classes);
+        // SAFETY: five disjoint fields, each serialized by its own guard (the class table by the
+        // task guard), all held for the call.
         f(
             kernel_mut(&mut self.tcbs),
+            kernel_ref(unsafe { &*classes }),
             kernel_mut(unsafe { &mut *table }),
             kernel_mut(&mut self.user_spaces),
             kernel_mut(unsafe { &mut *memory }),

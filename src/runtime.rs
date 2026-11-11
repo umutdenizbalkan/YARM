@@ -4888,21 +4888,26 @@ impl SharedKernel {
     /// FUTEX-REQUEUE1 — the split twin of `KernelState::with_task_futex_then_vm_memory_mut`: the
     /// task lock (rank 2), then the vm lock (rank 5), then the memory lock (rank 6), all held for
     /// the whole closure, in ascending rank order. Nothing inside may call back into
-    /// `SharedKernel`.
+    /// `SharedKernel`. FUTEX-REQUEUE-ATOMIC1: the task-class table too (task domain, the same
+    /// lock), so the commit can read each waiter's wake placement.
     pub(crate) fn with_task_futex_then_vm_memory_split_mut<R>(
         &self,
         f: impl FnOnce(
             &mut [Option<crate::kernel::task::ThreadControlBlock>],
+            &[Option<crate::kernel::task::TaskClass>],
             &mut crate::kernel::boot::futex::FutexWaiterTable,
             &mut crate::kernel::vm::AddressSpaceManager,
             &mut crate::kernel::boot::MemorySubsystem,
         ) -> R,
     ) -> R {
-        // SAFETY: the three projectors derive raw field pointers without forming a reference to
-        // the whole `KernelState`; each lock serializes its own fields and all three guards are
-        // held for the whole closure. The fields are disjoint, so no two `&mut` alias.
+        // SAFETY: the projectors derive raw field pointers without forming a reference to the
+        // whole `KernelState`; each lock serializes its own fields and all three guards are held
+        // for the whole closure. The fields are disjoint, so no two references alias; the class
+        // table is in the task domain, serialized by the task lock taken here.
         let (task_lock, tcbs, table) =
             unsafe { KernelState::task_futex_split_ptrs_from_raw(self.state_ptr()) };
+        let (_, _, classes) =
+            unsafe { KernelState::task_enqueue_policy_split_mut_ptrs_from_raw(self.state_ptr()) };
         let (vm_lock, user_spaces) =
             unsafe { KernelState::vm_split_mut_ptrs_from_raw(self.state_ptr()) };
         let (memory_lock, memory) =
@@ -4914,11 +4919,13 @@ impl SharedKernel {
         let memory_lock = unsafe { &*memory_lock };
         let _memory_guard = memory_lock.lock();
         let tcbs = unsafe { &mut *tcbs };
+        let classes = unsafe { &*classes };
         let table = unsafe { &mut *table };
         let user_spaces = unsafe { &mut *user_spaces };
         let memory = unsafe { &mut *memory };
         f(
             kernel_mut(tcbs).as_mut_slice(),
+            crate::kernel::boot::kernel_ref(classes).as_slice(),
             kernel_mut(table),
             kernel_mut(user_spaces),
             kernel_mut(memory),
@@ -13734,17 +13741,24 @@ impl SharedKernel {
         Ok(self.futex_wake_key_split(cpu, key, count))
     }
 
-    /// FUTEX-REQUEUE1 — THE split compare-and-requeue (NR 17), in the caller's address space
-    /// `asid`; the twin of `KernelState::futex_cmp_requeue_current`.
+    /// FUTEX-REQUEUE-ATOMIC1 — THE split compare-and-requeue (NR 17), in the caller's address
+    /// space `asid`; the twin of `KernelState::futex_cmp_requeue_current`. One operation, with one
+    /// linearization point (see the phase overview in `kernel::boot::futex`):
     ///
-    /// 1. rank 2 → 5 → 6, ONE hold (`with_task_futex_then_vm_memory_split_mut`) —
-    ///    `compare_and_requeue_locked`: keys, word, comparison and transfer. The linearization
-    ///    point; a refusal writes nothing. No scheduler lock is taken and no run-queue slot is
-    ///    needed: a requeued waiter stays blocked.
-    /// 2. The wake portion: [`Self::futex_wake_key_outcome_split`] on the source key, at most
-    ///    `wake` waiters (task and scheduler locks alternately, never nested, never under step 1).
+    /// 1. PREFLIGHT ([`Self::futex_requeue_preflight_split`]) — a run-queue slot reserved for each
+    ///    of the oldest source waiters, up to `wake`: task lock (rank 2) and the home CPU's
+    ///    scheduler lock (rank 1) alternately, never nested.
+    /// 2. COMMIT — rank 2 → 5 → 6, ONE hold (`with_task_futex_then_vm_memory_split_mut`):
+    ///    `compare_and_requeue_locked` compares the word and selects and moves BOTH portions —
+    ///    the wake portion to this operation's private pending keys, the requeue portion to the
+    ///    target. The linearization point; a refusal writes nothing. A stale preflight (another
+    ///    owner changed the source queue) writes nothing either: the reservations are released
+    ///    and the preflight runs again, at most `FUTEX_REQUEUE_ATTEMPTS` times.
+    /// 3. PLACEMENT ([`Self::futex_requeue_place_split`]) — each pending waiter claimed (rank 2)
+    ///    and its reserved slot filled (rank 1); then every unused reservation released.
     ///
-    /// The caller does NOT task-switch.
+    /// No scheduler lock is ever held with the task lock, and the VM and memory locks are held
+    /// only in step 2, as before. The caller does NOT task-switch.
     #[allow(clippy::too_many_arguments)]
     pub fn futex_cmp_requeue_split(
         &self,
@@ -13759,25 +13773,209 @@ impl SharedKernel {
         crate::kernel::boot::futex::FutexRequeueOutcome,
         crate::kernel::boot::futex::FutexRequeueRefusal,
     > {
-        use crate::kernel::boot::futex::{self as fx, FutexRequeueRefusal as R};
+        use crate::kernel::boot::futex::{
+            self as fx, FutexRequeueCommit, FutexRequeueRefusal as R,
+        };
         fx::futex_word_range_check(source.0).map_err(R::Key)?;
         fx::futex_word_range_check(target.0).map_err(R::Key)?;
-        let transfer =
-            self.with_task_futex_then_vm_memory_split_mut(|tcbs, table, spaces, memory| {
-                fx::compare_and_requeue_locked(
-                    tcbs, table, spaces, memory, asid, source, target, expected, wake, requeue,
-                )
-            })?;
-        let woke = if wake == 0 {
-            fx::FutexWakeOutcome::default()
-        } else {
-            self.futex_wake_key_outcome_split(cpu, transfer.source, wake)
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let last_attempt = attempt >= fx::FUTEX_REQUEUE_ATTEMPTS;
+            let mut preflight = if wake == 0 {
+                fx::FutexWakePreflight::none(last_attempt)
+            } else {
+                self.futex_requeue_preflight_split(cpu, asid, source, expected, wake, last_attempt)
+            };
+            let decided = self.with_task_futex_then_vm_memory_split_mut(
+                |tcbs, classes, table, spaces, memory| {
+                    fx::compare_and_requeue_locked(
+                        tcbs, classes, table, spaces, memory, asid, source, target, expected, wake,
+                        requeue, &preflight,
+                    )
+                },
+            );
+            let committed = match decided {
+                Ok(FutexRequeueCommit::Committed(c)) => c,
+                Ok(FutexRequeueCommit::Stale) => {
+                    crate::yarm_log!(
+                        "FUTEX_REQUEUE_PREFLIGHT_STALE cpu={} attempt={} reserved={}",
+                        cpu.0,
+                        attempt,
+                        preflight.held.total()
+                    );
+                    self.futex_release_placements_split(&mut preflight.held);
+                    continue;
+                }
+                Err(refusal) => {
+                    self.futex_release_placements_split(&mut preflight.held);
+                    return Err(refusal);
+                }
+            };
+            #[cfg(test)]
+            fx::futex_phase_hook::run_requeue_window();
+            self.futex_requeue_place_split(&committed, &mut preflight.held);
+            self.futex_release_placements_split(&mut preflight.held);
+            return Ok(fx::FutexRequeueOutcome {
+                woken: committed.woken,
+                requeued: committed.moved,
+                capacity_limited: committed.capacity_limited,
+            });
+        }
+    }
+
+    /// FUTEX-REQUEUE-ATOMIC1 — the split preflight: for the oldest live source waiters, up to
+    /// `wake`, the placement a wake would use (THE planner and the home rule, as the FutexWake
+    /// protocol resolves it) and a user slot RESERVED there. It stops at the first refusal and
+    /// records it. Nothing is decided here: the commit validates what it finds against these
+    /// reservations, and a word that already differs reserves nothing (the commit refuses).
+    fn futex_requeue_preflight_split(
+        &self,
+        cpu: CpuId,
+        asid: crate::kernel::vm::Asid,
+        source: (usize, crate::kernel::boot::futex::FutexKind),
+        expected: u32,
+        wake: u32,
+        last_attempt: bool,
+    ) -> crate::kernel::boot::futex::FutexWakePreflight {
+        use crate::kernel::boot::futex::{self as fx, FutexPlacementRefusal};
+        use crate::kernel::task_enqueue::{self as te, EnqueueTarget};
+        let mut out = fx::FutexWakePreflight::none(last_attempt);
+        let Ok((key, word)) = self.resolve_futex_word_in_split(asid, source.0, source.1) else {
+            return out;
         };
-        Ok(fx::FutexRequeueOutcome {
-            woken: woke.woke,
-            requeued: transfer.moved,
-            capacity_limited: woke.stopped_unplaceable,
-        })
+        if word != expected {
+            return out;
+        }
+        let want = (wake as usize).min(fx::MAX_FUTEX_WAITERS);
+        let mut cursor = None;
+        for _ in 0..want {
+            // rank 2: the next source waiter in FIFO order, then its plan.
+            let Ok(Some(candidate)) = self.with_task_futex_split_mut(|tcbs, table| {
+                fx::next_futex_waiter_after_locked(tcbs, table, key, cursor)
+            }) else {
+                break;
+            };
+            let mut plan = match self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                te::plan_balanced_enqueue_locked(tcbs, classes, candidate.tid, cpu)
+            }) {
+                Ok(plan) => plan,
+                Err(_) => {
+                    out.refused = Some(FutexPlacementRefusal::Plan {
+                        token: candidate.token,
+                    });
+                    break;
+                }
+            };
+            self.resolve_plan_home_split(&mut plan, cpu);
+            let EnqueueTarget::Pinned(home) = plan.target else {
+                break;
+            };
+            // rank 1: the slot, promised before anything is decided about the waiter.
+            let reserved = self
+                .with_cpu_sched_split(home, |c| te::reserve_enqueue_on_cpu_locked(c, &plan))
+                .map_err(crate::kernel::boot::map_scheduler_error)
+                .and_then(|r| r);
+            if let Err(err) = reserved {
+                crate::yarm_log!(
+                    "FUTEX_REQUEUE_PLACEMENT_REFUSED tid={} cpu={} err={:?} reserved={}",
+                    candidate.tid,
+                    home.0,
+                    err,
+                    out.held.total()
+                );
+                out.refused = Some(FutexPlacementRefusal::Slot {
+                    cpu: home,
+                    priority: plan.priority,
+                });
+                break;
+            }
+            out.held.add(home, plan.priority);
+            #[cfg(test)]
+            fx::futex_phase_hook::run_wake_step(
+                fx::futex_phase_hook::WAKE_AFTER_RESERVE,
+                candidate.tid,
+            );
+            cursor = Some(candidate);
+        }
+        out
+    }
+
+    /// FUTEX-REQUEUE-ATOMIC1 — place a committed wake portion: per pending key, its waiters in
+    /// order, each claimed (rank 2: `Runnable`, record retired) and then its reserved slot filled
+    /// (rank 1, the FUTEX-WAKE-CAP1 reserved commit, which cannot be refused for capacity). Each
+    /// fill consumes one of `held`. A waiter that left its pending key first (it exited, or undid
+    /// its own registration in its publication window) leaves its slot in `held`, for the caller
+    /// to release. Bounded by the committed `woken`.
+    fn futex_requeue_place_split(
+        &self,
+        committed: &crate::kernel::boot::futex::FutexRequeueCommitted,
+        held: &mut crate::kernel::boot::futex::FutexPlacementCounts,
+    ) {
+        use crate::kernel::boot::futex::{self as fx, FutexKey};
+        use crate::kernel::task_enqueue::{self as te, EnqueuePlan, EnqueueTarget, ReservedCommit};
+        for (home, priority, count) in committed.assigned.nonzero() {
+            let key = FutexKey::Pending {
+                op: committed.op,
+                cpu: home.0,
+                priority: priority as u8,
+            };
+            for _ in 0..count {
+                let Some(tid) = self.with_task_futex_split_mut(|tcbs, table| {
+                    fx::claim_pending_futex_waiter_locked(tcbs, table, key)
+                }) else {
+                    break;
+                };
+                #[cfg(test)]
+                fx::futex_phase_hook::run_wake_step(fx::futex_phase_hook::WAKE_AFTER_CLAIM, tid);
+                // The commit assigned this waiter a slot it holds: `take` cannot fail.
+                let covered = held.take(home, priority);
+                debug_assert!(covered, "a pending waiter without a reserved slot");
+                let plan = EnqueuePlan {
+                    tid,
+                    priority,
+                    target: EnqueueTarget::Pinned(home),
+                };
+                match self.with_cpu_sched_split(home, |c| {
+                    te::commit_reserved_enqueue_on_cpu_locked(c, &plan)
+                }) {
+                    Ok(Ok(ReservedCommit::Queued(t))) => {
+                        #[cfg(feature = "sched-lock1-witness")]
+                        crate::kernel::schedlock1_witness::claim(self, t, plan.tid);
+                        crate::arch::hal::notify_enqueued(t);
+                    }
+                    Ok(Ok(ReservedCommit::AlreadyPlaced(_))) => {}
+                    other => crate::yarm_log!(
+                        "FUTEX_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} result={:?}",
+                        tid,
+                        home.0,
+                        other
+                    ),
+                }
+            }
+        }
+    }
+
+    /// FUTEX-REQUEUE-ATOMIC1 — give back every reserved slot in `held` (rank 1, one acquisition
+    /// per CPU and priority held), leaving it empty.
+    fn futex_release_placements_split(
+        &self,
+        held: &mut crate::kernel::boot::futex::FutexPlacementCounts,
+    ) {
+        use crate::kernel::task_enqueue::{self as te, EnqueuePlan, EnqueueTarget};
+        for (home, priority, count) in held.nonzero() {
+            let plan = EnqueuePlan {
+                tid: 0,
+                priority,
+                target: EnqueueTarget::Pinned(home),
+            };
+            let _ = self.with_cpu_sched_split(home, |c| {
+                for _ in 0..count {
+                    te::release_enqueue_reservation_on_cpu_locked(c, &plan);
+                }
+            });
+        }
+        *held = crate::kernel::boot::futex::FutexPlacementCounts::new();
     }
 
     /// FUTEX-FOUND1 — THE split wake of one key. FUTEX-WAKE-CAP1: no waiter is claimed before
@@ -18505,7 +18703,16 @@ impl SharedKernel {
         // one. A changed key (the mapping moved) is a changed word for the same reason.
         let reread = self.resolve_futex_word_in_split(asid, addr, kind);
         let unchanged = matches!(reread, Ok((k, w)) if k == key && w == expected);
-        if !unchanged && undo_registration() {
+        // FUTEX-REQUEUE-ATOMIC1: a changed word retracts the registration only while no other
+        // operation has acted on it. Once a compare-and-requeue has moved this waiter (or selected
+        // it to be woken), the undo refuses, and the wait continues to park: the requeue's
+        // outcome — this waiter moved, or woken — stands, as in the one order that explains it.
+        let undo_unless_acted_on = || {
+            self.with_task_futex_split_mut(|tcbs, table| {
+                fx::undo_futex_registration_unless_acted_on_locked(tcbs, table, tid, token, key)
+            })
+        };
+        if !unchanged && undo_unless_acted_on() {
             crate::yarm_log!(
                 "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason={} expected={}",
                 tid,

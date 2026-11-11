@@ -196,6 +196,29 @@ pub(crate) fn fix_home_locked(
     }
 }
 
+/// FUTEX-REQUEUE-ATOMIC1 — rank 2, read-only: where a wake would place `tid` IF it already has a
+/// home — `(home, priority_for_class(class))`, exactly what [`plan_balanced_enqueue_locked`]
+/// followed by the home rule resolves to for such a task. `None` for a task with no home yet (its
+/// first placement needs the scheduler's balanced choice, at rank 1), no class, no TCB, or a
+/// spawn reservation. Mutates nothing, so a compare-and-requeue commit can ask it under the task
+/// lock and still write nothing when it refuses.
+pub(crate) fn homed_wake_placement_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    classes: &[Option<TaskClass>],
+    tid: u64,
+) -> Option<(CpuId, TaskPriority)> {
+    if tid == 0 {
+        return None;
+    }
+    let idx = tcbs.iter().position(|slot| {
+        slot.as_ref()
+            .is_some_and(|tcb| tcb.tid.0 == tid && !tcb.is_spawn_reservation())
+    })?;
+    let class = classes.get(idx).copied().flatten()?;
+    let home = tcbs[idx].as_ref()?.cpu_affinity?;
+    Some((home, priority_for_class(class)))
+}
+
 /// rank 1L — **THE** commit, on the one CPU whose lock the caller holds. The only place a
 /// task-lifecycle transition touches a run queue.
 ///

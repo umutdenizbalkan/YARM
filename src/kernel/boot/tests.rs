@@ -63041,7 +63041,23 @@ mod stage191b_futex_wake_retire {
         // predicate is the cross-process wake. Both owners now reach THE keyed claim, so the
         // woken set, count and order are the same by construction, not by resemblance.
         // FUTEX-WAKE-CAP1: both wakes reach THE exact claim, and only after a reserved placement.
-        for (name, src) in [("exec_state.rs", EXEC_SRC), ("runtime.rs", RUNTIME_SRC)] {
+        // FUTEX-REQUEUE-ATOMIC1 re-derivation: this read the FIRST occurrence of each step in the
+        // whole file, which is now the compare-and-requeue's own preflight and placement (they
+        // come first in both files). The FutexWake order is checked inside the wake function;
+        // the requeue owners' order (reserve, then the pending claim, then the reserved commit)
+        // is checked inside theirs.
+        for (name, src, wake_fn) in [
+            ("exec_state.rs", EXEC_SRC, "fn futex_wake_key_outcome("),
+            (
+                "runtime.rs",
+                RUNTIME_SRC,
+                "fn futex_wake_key_outcome_split(",
+            ),
+        ] {
+            let src = src
+                .split(wake_fn)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}: the wake function"));
             let reserve = src
                 .find("te::reserve_enqueue_on_cpu_locked(")
                 .unwrap_or_else(|| panic!("{name}: the wake reserves a placement"));
@@ -63058,6 +63074,28 @@ mod stage191b_futex_wake_retire {
             assert!(
                 !src.contains("claim_futex_waiters_locked("),
                 "{name}: the claim-everything-then-enqueue batch may not come back"
+            );
+        }
+        for (name, src, owner) in [
+            ("exec_state.rs", EXEC_SRC, "fn futex_cmp_requeue_current("),
+            ("runtime.rs", RUNTIME_SRC, "pub fn futex_cmp_requeue_split("),
+        ] {
+            let src = src
+                .split(owner)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}: the requeue owner"));
+            let reserve = src
+                .find("te::reserve_enqueue_on_cpu_locked(")
+                .expect("preflight");
+            let claim = src
+                .find("fx::claim_pending_futex_waiter_locked(")
+                .expect("pending claim");
+            let commit = src
+                .find("te::commit_reserved_enqueue_on_cpu_locked(")
+                .expect("reserved commit");
+            assert!(
+                reserve < claim && claim < commit,
+                "{name}: the requeue reserves, then claims, then fills"
             );
         }
         for (name, src) in [("exec_state.rs", EXEC_SRC), ("runtime.rs", RUNTIME_SRC)] {
@@ -213709,8 +213747,13 @@ mod futex_requeue1 {
         });
     }
 
-    /// 15 — two requeues compete: the second runs inside the first's wake window and takes the
-    /// kept waiter; every waiter ends on exactly one key, none duplicated, none lost.
+    /// 15 — two requeues compete; every waiter ends on exactly one key, none duplicated, none
+    /// lost, and the two results are one sequential order. FUTEX-REQUEUE-ATOMIC1 re-derivation:
+    /// this ran the second requeue after the first had TRANSFERRED but before its wake portion,
+    /// and pinned the second taking the kept waiter (`(0, 1)`, the first then `(0, 3)`) — an
+    /// outcome no order of the two produces. Now (a) inside the first's preflight, before it has
+    /// decided anything: the second takes all four, the first then finds none; (b) inside the
+    /// first's window after its commit: the first's outcome is fixed, the second finds none.
     #[test]
     fn r15_two_requeues_compete() {
         let mut w = world(45340);
@@ -213722,7 +213765,7 @@ mod futex_requeue1 {
             if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE && tid == first {
                 assert_eq!(
                     k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (UQ, P), 5, 0, ALL),
-                    Ok(out(0, 1, false))
+                    Ok(out(0, 4, false))
                 );
                 return false;
             }
@@ -213730,19 +213773,37 @@ mod futex_requeue1 {
         }));
         assert_eq!(
             k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, ALL),
-            Ok(out(0, 3, false))
+            Ok(out(0, 0, false))
         );
         k.with(|s| {
-            assert_eq!(order(s, kt), ws[1..].to_vec());
-            assert_eq!(order(s, ku), vec![ws[0]]);
+            assert_eq!(order(s, kt), Vec::<u64>::new());
+            assert_eq!(order(s, ku), ws.clone());
             assert_eq!(occupied(s), 4);
             assert_eq!(contract(s, &ws), 0);
             consistent(s);
-            // Serialized the other way: the first takes everything, the second finds nothing.
-            run(s, 45340 + 999);
-            assert_eq!(rq(s, UQ, MX, 7, 0, ALL), Ok(out(0, 1, false)));
-            assert_eq!(rq(s, UQ, MX, 7, 0, ALL), Ok(out(0, 0, false)));
-            assert_eq!(order(s, kt).len(), 4);
+        });
+
+        let mut w = world(45350);
+        let ws = w.park_n(4, SQ, 5);
+        let (a, kt, ku) = (w.a, w.k(MX), w.k(UQ));
+        let k = leak(w.s);
+        fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+            assert_eq!(
+                k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (UQ, P), 5, 0, ALL),
+                Ok(out(0, 0, false))
+            );
+        }));
+        assert_eq!(
+            k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, ALL),
+            Ok(out(1, 3, false))
+        );
+        k.with(|s| {
+            assert_eq!(order(s, kt), ws[1..].to_vec());
+            assert_eq!(order(s, ku), Vec::<u64>::new());
+            assert!(placed(s, ws[0]));
+            assert_eq!(occupied(s), 3);
+            assert_eq!(contract(s, &ws), 1);
+            consistent(s);
         });
     }
 
@@ -213767,8 +213828,12 @@ mod futex_requeue1 {
     /// 16 — a requeue inside the split wait's window (registered, before its re-read). The moved
     /// waiter keeps its token, so its re-read, undo and read-back still name it exactly:
     /// (a) the word is unchanged — it parks, now on the target, and the target's wake resumes it;
-    /// (b) the word changed first (a broadcaster's sequence bump) — its re-read sees it, its undo
-    ///     retires the record FROM THE TARGET, and it returns `ValueChanged` with nothing left;
+    /// (b) the word changes after it registered (a broadcaster's sequence bump), and the requeue
+    ///     moves it — its re-read sees the bump, but its registration has been ACTED ON, so the
+    ///     undo refuses and it parks on the target, where the requeue put it. FUTEX-REQUEUE-ATOMIC1
+    ///     re-derivation: this pinned the undo retiring the record from the target and the wait
+    ///     returning `ValueChanged` — the requeue then reported moving a waiter that, by its own
+    ///     report, never waited, which no order of the three operations gives (`x10`);
     /// (c) the requeue's wake portion takes it — woken during publication, restored, counted.
     #[test]
     fn r16_requeue_races_wait_publication_and_its_second_read() {
@@ -213801,13 +213866,19 @@ mod futex_requeue1 {
             );
         }));
         let o = k.futex_wait_park_exact_split(CpuId(0), t, asid, SQ, 5, P);
-        assert_eq!(o, FutexParkOutcome::ValueChanged);
+        assert!(matches!(o, FutexParkOutcome::Parked { .. }), "{o:?}");
         k.with(|s| {
-            assert_eq!(s.task_status(t), Some(TaskStatus::Running));
-            assert_eq!(occupied(s), 0, "the undo retired the moved record");
-            assert_eq!(order(s, key(s, t, MX)), Vec::<u64>::new());
+            assert!(parked(s, t), "the moved waiter stays parked");
+            assert_eq!(placement(s, t), TaskPlacement::Nowhere);
+            assert_eq!(
+                order(s, key(s, t, MX)),
+                vec![t],
+                "on the target, where it was moved"
+            );
             consistent(s);
         });
+        assert_eq!(k.futex_wake_split_mut(CpuId(0), asid, MX, 1, P), Ok(1));
+        k.with(|s| assert!(placed(s, t)));
 
         let k = leak(Bootstrap::init().expect("init"));
         let asid = split_waiter(k, t);
@@ -213830,8 +213901,15 @@ mod futex_requeue1 {
     }
 
     /// 17 — task death. A stale record (its cycle ended through another owner) is retired, not
-    /// moved; a kept waiter that dies inside the wake portion costs only its reservation; a moved
-    /// waiter that exits leaves the target exactly once.
+    /// moved; a waiter that dies while the operation is placing it costs only its reservation; a
+    /// moved waiter that exits leaves the target exactly once.
+    ///
+    /// FUTEX-REQUEUE-ATOMIC1 re-derivation of the window cases. The death after the reservation is
+    /// now inside the PREFLIGHT, before anything is decided: the commit sees B and C, and B takes
+    /// the slot reserved on the same CPU and priority — `(1, 1)`, exactly "A exits, then the
+    /// operation". (This pinned `(0, 2)`: a wake portion that took no one although three waiters
+    /// were there at the transfer — no sequential order gives that.) The death after the claim is
+    /// in the placement: A was woken at the commit, and its reserved commit still lands.
     #[test]
     fn r17_requeue_races_task_death() {
         let mut w = world(45380);
@@ -213851,9 +213929,9 @@ mod futex_requeue1 {
         assert_eq!(w.s.futex_wake(MX, ALL, P), Ok(2));
         consistent(&mut w.s);
 
-        for (step, woke) in [
-            (fx::futex_phase_hook::WAKE_AFTER_RESERVE, 0),
-            (fx::futex_phase_hook::WAKE_AFTER_CLAIM, 1),
+        for (step, result, on_target) in [
+            (fx::futex_phase_hook::WAKE_AFTER_RESERVE, (1, 1), 2..3),
+            (fx::futex_phase_hook::WAKE_AFTER_CLAIM, (1, 2), 1..3),
         ] {
             let mut w = world(45400);
             let ws = w.park_n(3, SQ, 5);
@@ -213870,12 +213948,12 @@ mod futex_requeue1 {
             }));
             assert_eq!(
                 k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, ALL),
-                Ok(out(woke, 2, false))
+                Ok(out(result.0, result.1, false))
             );
             k.with(|s| {
                 assert_eq!(reserved(s), 0);
                 assert_eq!(s.task_status(victim), Some(TaskStatus::Exited(9)));
-                assert_eq!(order(s, kt), ws[1..].to_vec());
+                assert_eq!(order(s, kt), ws[on_target.clone()].to_vec());
                 contract(s, &ws[1..]);
                 consistent(s);
             });
@@ -214011,22 +214089,27 @@ mod futex_requeue1 {
         assert_eq!(reserved(&w.s), 0);
         assert_eq!(w.order(MX), ws);
         assert_eq!(contract(&w.s, &ws), 0);
-        // With a wake asked for, the full queue limits only the wake portion — reported.
-        assert_eq!(rq(&mut w.s, MX, UQ, 0, 1, ALL), Ok(out(0, 99, true)));
+        // With a wake asked for, the full queue limits only the wake portion — reported. The
+        // FIFO head it could not place is not skipped: it is the first waiter the requeue
+        // portion takes (FUTEX-REQUEUE-ATOMIC1; it used to stay behind on MX while the 99
+        // younger waiters moved past it).
+        assert_eq!(rq(&mut w.s, MX, UQ, 0, 1, ALL), Ok(out(0, 100, true)));
+        assert_eq!(w.order(MX), Vec::<u64>::new());
         assert_eq!(
-            w.order(MX),
-            vec![ws[0]],
-            "the unplaceable waiter keeps its place"
+            w.order(UQ),
+            ws,
+            "the unplaceable head first, all in source order"
         );
-        assert_eq!(w.order(UQ), ws[1..].to_vec());
         assert_eq!(queue(&w.s), q);
         assert_eq!(contract(&w.s, &ws), 0);
         consistent(&mut w.s);
     }
 
-    /// 22 — a capacity-limited wake portion: the placed waiters are counted, the unplaceable ones
-    /// stay on the source, parked and in order, the moved ones are on the target; nothing is
-    /// discarded or duplicated, and a wake-0 retry moves the remainder without needing room.
+    /// 22 — a capacity-limited wake portion: the placed waiters are counted; the requeue portion
+    /// starts at the first waiter that could not be placed (FUTEX-REQUEUE-ATOMIC1: the source
+    /// queue is cut into one woken prefix, one moved block and the rest, never reordered);
+    /// nothing is discarded or duplicated, and a wake-0 call moves the remainder, behind the
+    /// block, without needing room.
     #[test]
     fn r22_a_capacity_limited_wake_discards_and_duplicates_nothing() {
         let mut w = world(46600);
@@ -214035,12 +214118,18 @@ mod futex_requeue1 {
         assert_eq!(r, out(63, 5, true), "64 user slots, one the idle task's");
         assert_eq!(contract(&w.s, &ws), 63);
         assert!(ws[..63].iter().all(|&t| placed(&w.s, t)));
-        assert_eq!(w.order(SQ), ws[63..65].to_vec());
-        assert_eq!(w.order(MX), ws[65..].to_vec());
+        assert_eq!(
+            w.order(MX),
+            ws[63..68].to_vec(),
+            "starting at the unplaceable head"
+        );
+        assert_eq!(w.order(SQ), ws[68..].to_vec());
         assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, ALL), Ok(out(0, 2, false)));
-        let mut target = ws[65..].to_vec();
-        target.extend_from_slice(&ws[63..65]);
-        assert_eq!(w.order(MX), target, "behind the waiters already moved");
+        assert_eq!(
+            w.order(MX),
+            ws[63..].to_vec(),
+            "behind the waiters already moved"
+        );
         assert_eq!(occupied(&mut w.s), 7);
         consistent(&mut w.s);
     }
@@ -214060,9 +214149,11 @@ mod futex_requeue1 {
         assert_eq!(contract(&w.s, &ws), 8);
     }
 
-    /// 24 — every reservation the wake portion makes is committed or released: it exists inside
-    /// the window, and is gone after a committed wake, after a death before the claim, and after
-    /// a capacity stop.
+    /// 24 — every reservation the operation makes is committed or released: they exist inside
+    /// its windows (never more than `wake`), and are gone after a committed wake, after a death
+    /// in the preflight (which makes that preflight stale: released, preflighted again), and
+    /// after a capacity stop. FUTEX-REQUEUE-ATOMIC1 re-derivation: the preflight holds up to
+    /// `wake` slots at once, where the old wake portion held one at a time.
     #[test]
     fn r24_every_reservation_is_committed_or_released() {
         let mut w = world(46800);
@@ -214071,11 +214162,8 @@ mod futex_requeue1 {
         let k = leak(w.s);
         let victim = ws[0];
         fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
-            assert_eq!(
-                k.with(|s| reserved(s)),
-                usize::from(st == fx::futex_phase_hook::WAKE_AFTER_RESERVE)
-                    | usize::from(st == fx::futex_phase_hook::WAKE_AFTER_CLAIM)
-            );
+            let held = k.with(|s| reserved(s));
+            assert!((1..=2).contains(&held), "{held} slots held at step {st}");
             if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE && tid == victim {
                 k.with(|s| s.exit_task(victim, 9)).expect("exit");
             }
@@ -214547,5 +214635,941 @@ mod futex_requeue1 {
             2
         );
         assert_eq!((DONE, CAP), (1 << 8, 1));
+    }
+
+    /// FUTEX-REQUEUE-ATOMIC1 — is NR 17 ONE operation?
+    ///
+    /// Every test here runs a real race through the split owners: CPU 0's compare-and-requeue is
+    /// stopped by a test-only hook in the window between the transaction that compares and moves
+    /// and the placement of the waiters it woke; inside that window other CPUs' operations run to
+    /// completion through the same production owners (FutexWake, FutexWait's split publication,
+    /// another NR 17, task exit, user stores to the word). The observable history — every
+    /// operation's result, which waiters ended woken, and the FIFO contents of every key — is then
+    /// checked against a sequential futex specification (`Model`) over EVERY order of the
+    /// operations that respects their real-time order (the requeue overlaps all of them, so it may
+    /// be placed anywhere; the others ran one after another). A history no order produces is not
+    /// linearizable.
+    mod atomic1 {
+        use super::*;
+
+        /// Which word an operation names: the source S, the target T (a mutex), a third key U.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(super) enum Q {
+            S,
+            T,
+            U,
+        }
+
+        /// A sequential futex operation.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(super) enum Op {
+            /// FutexCmpRequeue(S, dst, exp, wake, req).
+            Rq {
+                dst: Q,
+                exp: u32,
+                wake: usize,
+                req: usize,
+            },
+            /// FutexWake(S, n).
+            Wake(usize),
+            /// FutexWait(S, exp) by `tid`.
+            Wait { tid: u64, exp: u32 },
+            /// A user store of the source word.
+            Store(u32),
+            /// Task `tid` exits.
+            Exit(u64),
+        }
+
+        /// What an operation returned.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub(super) enum Res {
+            /// `Some((woken, requeued))`, or `None` for `WouldBlock`.
+            Rq(Option<(u32, u32)>),
+            Wake(u32),
+            /// Parked, or refused because the word differed.
+            Wait(bool),
+            Done,
+        }
+
+        /// The sequential state: the source word, the FIFO of each key, the live woken waiters.
+        #[derive(Debug, Clone, PartialEq, Eq, Default)]
+        pub(super) struct Model {
+            pub(super) word: u32,
+            pub(super) s: Vec<u64>,
+            pub(super) t: Vec<u64>,
+            pub(super) u: Vec<u64>,
+            pub(super) woken: Vec<u64>,
+        }
+
+        impl Model {
+            fn q(&mut self, q: Q) -> &mut Vec<u64> {
+                match q {
+                    Q::S => &mut self.s,
+                    Q::T => &mut self.t,
+                    Q::U => &mut self.u,
+                }
+            }
+            /// THE specification of each operation, applied atomically.
+            fn step(&mut self, op: Op) -> Res {
+                match op {
+                    Op::Rq {
+                        dst,
+                        exp,
+                        wake,
+                        req,
+                    } => {
+                        if self.word != exp {
+                            return Res::Rq(None);
+                        }
+                        let w = wake.min(self.s.len());
+                        let woke: Vec<u64> = self.s.drain(..w).collect();
+                        self.woken.extend(woke);
+                        let m = req.min(self.s.len());
+                        let moved: Vec<u64> = self.s.drain(..m).collect();
+                        self.q(dst).extend(moved);
+                        Res::Rq(Some((w as u32, m as u32)))
+                    }
+                    Op::Wake(n) => {
+                        let w = n.min(self.s.len());
+                        let woke: Vec<u64> = self.s.drain(..w).collect();
+                        self.woken.extend(woke);
+                        Res::Wake(w as u32)
+                    }
+                    Op::Wait { tid, exp } => {
+                        if self.word == exp {
+                            self.s.push(tid);
+                            Res::Wait(true)
+                        } else {
+                            Res::Wait(false)
+                        }
+                    }
+                    Op::Store(v) => {
+                        self.word = v;
+                        Res::Done
+                    }
+                    Op::Exit(tid) => {
+                        for q in [Q::S, Q::T, Q::U] {
+                            self.q(q).retain(|&t| t != tid);
+                        }
+                        self.woken.retain(|&t| t != tid);
+                        Res::Done
+                    }
+                }
+            }
+        }
+
+        /// Every history a linearizable execution can show: `r` (index 0 of the results) placed
+        /// at each position of `chain`, which keeps its own order (indices 1..).
+        pub(super) fn legal(init: &Model, r: Op, chain: &[Op]) -> Vec<(Vec<Res>, Model)> {
+            (0..=chain.len())
+                .map(|at| {
+                    let mut m = init.clone();
+                    let mut res = vec![Res::Done; chain.len() + 1];
+                    for (i, &op) in chain.iter().enumerate() {
+                        if i == at {
+                            res[0] = m.step(r);
+                        }
+                        res[i + 1] = m.step(op);
+                    }
+                    if at == chain.len() {
+                        res[0] = m.step(r);
+                    }
+                    m.woken.sort_unstable();
+                    (res, m)
+                })
+                .collect()
+        }
+
+        /// Panics unless `observed` is one of the histories [`legal`] admits.
+        pub(super) fn assert_linearizable(
+            observed: &(Vec<Res>, Model),
+            init: &Model,
+            r: Op,
+            chain: &[Op],
+        ) {
+            let admitted = legal(init, r, chain);
+            assert!(
+                admitted.contains(observed),
+                "NOT LINEARIZABLE\n observed: {observed:?}\n admitted:\n{}",
+                admitted
+                    .iter()
+                    .map(|h| alloc::format!("   {h:?}\n"))
+                    .collect::<alloc::string::String>()
+            );
+        }
+
+        /// The observed final state of the real kernel, in the model's terms: the source word, the
+        /// live FIFO of each key, and which of `subjects` are woken with a continuation (Runnable
+        /// and queued exactly once). No subject may be Runnable but unqueued.
+        pub(super) fn observe(
+            s: &mut KernelState,
+            driver: u64,
+            subjects: &[u64],
+            word_now: u32,
+        ) -> Model {
+            let (ks, kt, ku) = (key(s, driver, SQ), key(s, driver, MX), key(s, driver, UQ));
+            let mut woken: Vec<u64> = subjects.iter().copied().filter(|&t| placed(s, t)).collect();
+            woken.sort_unstable();
+            for &t in subjects {
+                if s.task_status(t) == Some(TaskStatus::Runnable) {
+                    assert!(placed(s, t), "{t}: Runnable but not queued exactly once");
+                }
+            }
+            assert_eq!(reserved(s), 0, "a reservation outlived the operation");
+            consistent(s);
+            Model {
+                word: word_now,
+                s: order(s, ks),
+                t: order(s, kt),
+                u: order(s, ku),
+                woken,
+            }
+        }
+
+        pub(super) fn res(r: &Result<Out, R>) -> Res {
+            match r {
+                Ok(o) => {
+                    assert!(!o.capacity_limited, "no queue is full in these races");
+                    Res::Rq(Some((o.woken, o.requeued)))
+                }
+                Err(R::ValueChanged) => Res::Rq(None),
+                Err(other) => panic!("unexpected refusal {other:?}"),
+            }
+        }
+
+        /// A, B, C parked on S (= 5) through the production wait; the requeuer is the driver.
+        pub(super) fn three(base: u64) -> (W, Vec<u64>, Model) {
+            let mut w = world(base);
+            let ws = w.park_n(3, SQ, 5);
+            let init = Model {
+                word: 5,
+                s: ws.clone(),
+                ..Model::default()
+            };
+            (w, ws, init)
+        }
+
+        /// A new task of process A made current on CPU 0, then `FutexWait(SQ, exp)` through the
+        /// production SPLIT publication — registration, second read, compare-and-clear, read-back.
+        pub(super) fn split_wait(k: &SharedKernel, a: Asid, t: u64, exp: u32) -> bool {
+            k.with(|s| {
+                task(s, t, a);
+                run(s, t);
+            });
+            match k.futex_wait_park_exact_split(CpuId(0), t, a, SQ, exp, P) {
+                FutexParkOutcome::Parked { .. } => true,
+                FutexParkOutcome::ValueChanged => false,
+                other => panic!("{t}: unexpected park outcome {other:?}"),
+            }
+        }
+
+        /// The model itself, on its own: a sanity check of the specification the races are
+        /// judged by (so a broken model cannot make a race "pass").
+        #[test]
+        fn x00_the_sequential_model() {
+            let init = Model {
+                word: 5,
+                s: vec![1, 2, 3],
+                ..Model::default()
+            };
+            let r = Op::Rq {
+                dst: Q::T,
+                exp: 5,
+                wake: 1,
+                req: 2,
+            };
+            let h = legal(&init, r, &[Op::Wake(1)]);
+            assert_eq!(h.len(), 2);
+            assert_eq!(h[0].0, vec![Res::Rq(Some((1, 2))), Res::Wake(0)]);
+            assert_eq!(
+                (h[0].1.woken.clone(), h[0].1.t.clone()),
+                (vec![1], vec![2, 3])
+            );
+            assert_eq!(h[1].0, vec![Res::Rq(Some((1, 1))), Res::Wake(1)]);
+            assert_eq!(
+                (h[1].1.woken.clone(), h[1].1.t.clone()),
+                (vec![1, 2], vec![3])
+            );
+            let h = legal(&init, r, &[Op::Store(6)]);
+            assert_eq!(
+                h[1].0[0],
+                Res::Rq(None),
+                "after the store the comparison fails"
+            );
+        }
+
+        /// X1 — THE suspected counterexample (the brief's): A, B, C on S; CPU 0 runs
+        /// `FutexCmpRequeue(S, T, 5, wake 1, requeue 2)`. In its window CPU 1's `FutexWake(S, 1)`
+        /// completes, then a new waiter D registers on S through the production split wait (the
+        /// word still holds 5, so D's own comparison admits it). CPU 0 resumes.
+        #[test]
+        fn x01_a_delayed_wake_takes_a_waiter_that_arrived_after_the_transfer() {
+            let (w, ws, init) = three(47000);
+            let (a, driver) = (w.a, w.driver);
+            let d = 47100;
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                let woke = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                sink.borrow_mut().push(Res::Wake(woke));
+                sink.borrow_mut().push(Res::Wait(split_wait(k, a, d, 5)));
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            let mut results = vec![res(&r)];
+            results.extend(seen.borrow().iter().cloned());
+            let mut subjects = ws.clone();
+            subjects.push(d);
+            let observed = (results, k.with(|s| observe(s, driver, &subjects, 5)));
+            assert_linearizable(
+                &observed,
+                &init,
+                Op::Rq {
+                    dst: Q::T,
+                    exp: 5,
+                    wake: 1,
+                    req: 2,
+                },
+                &[Op::Wake(1), Op::Wait { tid: d, exp: 5 }],
+            );
+        }
+
+        /// X2 — the same window, no new waiter: CPU 1's `FutexWake(S, 1)` takes the waiter the
+        /// transfer had left for the wake portion. Sequentially, `requeued = 2` with `wake = 1`
+        /// needs three source waiters at the operation's point, so it must also have woken one
+        /// (or reported a capacity stop).
+        #[test]
+        fn x02_a_competing_source_wake_inside_the_window() {
+            let (w, ws, init) = three(47200);
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                let woke = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                sink.borrow_mut().push(Res::Wake(woke));
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            let mut results = vec![res(&r)];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe(s, driver, &ws, 5)));
+            assert_linearizable(
+                &observed,
+                &init,
+                Op::Rq {
+                    dst: Q::T,
+                    exp: 5,
+                    wake: 1,
+                    req: 2,
+                },
+                &[Op::Wake(1)],
+            );
+        }
+
+        /// X3 — a competing compare-and-requeue (S → U, wake 0) runs to completion in the window.
+        #[test]
+        fn x03_a_competing_requeue_inside_the_window() {
+            let (w, ws, init) = three(47300);
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                let r2 = k.futex_cmp_requeue_split(CpuId(1), a, (SQ, P), (UQ, P), 5, 0, ALL);
+                sink.borrow_mut().push(res(&r2));
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            let mut results = vec![res(&r)];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe(s, driver, &ws, 5)));
+            assert_linearizable(
+                &observed,
+                &init,
+                Op::Rq {
+                    dst: Q::T,
+                    exp: 5,
+                    wake: 1,
+                    req: 2,
+                },
+                &[Op::Rq {
+                    dst: Q::U,
+                    exp: 5,
+                    wake: 0,
+                    req: usize::MAX,
+                }],
+            );
+        }
+
+        /// X4 — legal futex sequencing, not an injected waiter: in the window CPU 1 signals
+        /// (`FutexWake(S, 1)`), then a broadcaster bumps the word to 6. A waiter D that read 5
+        /// is REFUSED by its own production wait (the word is 6), and a waiter E that read 6
+        /// registers legitimately — for the NEXT generation. The operation compared 5, so it is
+        /// ordered before the store, and E (who registered after the store) cannot be among the
+        /// waiters it woke.
+        #[test]
+        fn x04_a_waiter_of_the_next_generation_is_not_the_old_operations() {
+            let (w, ws, init) = three(47400);
+            let (a, driver) = (w.a, w.driver);
+            let (d, e) = (47500, 47501);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                let woke = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                sink.borrow_mut().push(Res::Wake(woke));
+                k.with(|s| word(s, driver, SQ, 6));
+                sink.borrow_mut().push(Res::Done);
+                sink.borrow_mut().push(Res::Wait(split_wait(k, a, d, 5)));
+                sink.borrow_mut().push(Res::Wait(split_wait(k, a, e, 6)));
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            let mut results = vec![res(&r)];
+            results.extend(seen.borrow().iter().cloned());
+            // D never parked (its own wait refused it), so it is not a futex subject: its
+            // placement afterwards is only the switch to E.
+            let mut subjects = ws.clone();
+            subjects.push(e);
+            let observed = (results, k.with(|s| observe(s, driver, &subjects, 6)));
+            assert_linearizable(
+                &observed,
+                &init,
+                Op::Rq {
+                    dst: Q::T,
+                    exp: 5,
+                    wake: 1,
+                    req: 2,
+                },
+                &[
+                    Op::Wake(1),
+                    Op::Store(6),
+                    Op::Wait { tid: d, exp: 5 },
+                    Op::Wait { tid: e, exp: 6 },
+                ],
+            );
+        }
+
+        /// Every history a linearizable execution of `ops` can show, where each operation has a
+        /// real-time interval `(start, end)`: every order of the operations in which one that
+        /// ended before another began comes first. Results are indexed as `ops`.
+        pub(super) fn legal_iv(init: &Model, ops: &[(Op, (u32, u32))]) -> Vec<(Vec<Res>, Model)> {
+            fn perms(n: usize) -> Vec<Vec<usize>> {
+                if n == 0 {
+                    return vec![Vec::new()];
+                }
+                let mut out = Vec::new();
+                for p in perms(n - 1) {
+                    for at in 0..=p.len() {
+                        let mut q = p.clone();
+                        q.insert(at, n - 1);
+                        out.push(q);
+                    }
+                }
+                out
+            }
+            perms(ops.len())
+                .into_iter()
+                .filter(|order| {
+                    order
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &a)| order[i + 1..].iter().all(|&b| ops[b].1.1 >= ops[a].1.0))
+                })
+                .map(|order| {
+                    let mut m = init.clone();
+                    let mut res = vec![Res::Done; ops.len()];
+                    for &i in &order {
+                        res[i] = m.step(ops[i].0);
+                    }
+                    m.woken.sort_unstable();
+                    (res, m)
+                })
+                .collect()
+        }
+
+        fn assert_linearizable_iv(
+            observed: &(Vec<Res>, Model),
+            init: &Model,
+            ops: &[(Op, (u32, u32))],
+        ) {
+            let admitted = legal_iv(init, ops);
+            assert!(
+                admitted.contains(observed),
+                "NOT LINEARIZABLE\n observed: {observed:?}\n admitted:\n{}",
+                admitted
+                    .iter()
+                    .map(|h| alloc::format!("   {h:?}\n"))
+                    .collect::<alloc::string::String>()
+            );
+        }
+
+        const RQ12: Op = Op::Rq {
+            dst: Q::T,
+            exp: 5,
+            wake: 1,
+            req: 2,
+        };
+
+        /// A waiter of class `class` (SystemServer is High priority; App is Normal) parked on S.
+        fn park_classed(w: &mut W, class: TaskClass) -> u64 {
+            let t = w.next;
+            w.next += 1;
+            w.s.register_task_with_class(t, class).expect("task");
+            w.s.bind_task_asid(t, w.a).expect("bind");
+            w.s.set_task_status_for_test(t, TaskStatus::Runnable);
+            w.s.seed_resumable_user_context_for_test(t);
+            w.s.set_task_home_cpu(t, CpuId(0)).expect("home");
+            w.s.enqueue_task(t).expect("enqueue");
+            run(&mut w.s, t);
+            assert!(w.s.futex_wait_current(SQ, 5, P).expect("wait"), "{t} parks");
+            t
+        }
+
+        /// X6 — a TARGET wake runs to completion in the window: it reaches the moved waiters,
+        /// behind any the target already had, oldest first.
+        #[test]
+        fn x06_a_target_wake_inside_the_window() {
+            let (w, ws, _) = three(47700);
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                let woke = k.futex_wake_split_mut(CpuId(1), a, MX, 1, P).expect("wake");
+                sink.borrow_mut().push(Res::Wake(woke));
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            let mut results = vec![res(&r)];
+            results.extend(seen.borrow().iter().cloned());
+            // R, then the target wake: A woken by R; B, the oldest moved waiter, by the wake.
+            let observed = (results, k.with(|s| observe(s, driver, &ws, 5)));
+            assert_eq!(observed.0, vec![Res::Rq(Some((1, 2))), Res::Wake(1)]);
+            assert_eq!(
+                observed.1.woken,
+                vec![ws[0], ws[1]],
+                "A by the requeue, then B"
+            );
+            assert_eq!(observed.1.t, vec![ws[2]]);
+            assert!(observed.1.s.is_empty());
+        }
+
+        /// X7 — a NEW waiter registers on S (production split wait) while the operation is in
+        /// its preflight, before it has decided anything: it is behind A, B, C, so a wake-1
+        /// requeue-2 operation that sees it leaves it on S.
+        #[test]
+        fn x07_a_new_waiter_during_the_preflight() {
+            let (w, ws, init) = three(47800);
+            let (a, driver) = (w.a, w.driver);
+            let d = 47900;
+            let k = leak(w.s);
+            let first = ws[0];
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
+                if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE && tid == first {
+                    sink.borrow_mut().push(Res::Wait(split_wait(k, a, d, 5)));
+                    return false;
+                }
+                true
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            let mut results = vec![res(&r)];
+            results.extend(seen.borrow().iter().cloned());
+            let mut subjects = ws.clone();
+            subjects.push(d);
+            let observed = (results, k.with(|s| observe(s, driver, &subjects, 5)));
+            assert_linearizable(&observed, &init, RQ12, &[Op::Wait { tid: d, exp: 5 }]);
+            assert_eq!(observed.1.s, vec![d]);
+        }
+
+        /// X8 — the word changes between the preflight and the commit: the comparison refuses,
+        /// and NOTHING changed — no status, placement, key, queue entry or reservation (the
+        /// preflight's slot was released).
+        #[test]
+        fn x08_a_store_between_preflight_and_commit_mutates_nothing() {
+            let (mut w, ws, init) = three(48000);
+            let (a, driver) = (w.a, w.driver);
+            let before = snapshot(&mut w.s, &ws);
+            let k = leak(w.s);
+            let first = ws[0];
+            fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
+                if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE && tid == first {
+                    assert_eq!(k.with(|s| reserved(s)), 1, "the preflight holds a slot");
+                    k.with(|s| word(s, driver, SQ, 6));
+                    return false;
+                }
+                true
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            assert_eq!(r, Err(R::ValueChanged));
+            k.with(|s| {
+                assert_eq!(
+                    snapshot(s, &ws),
+                    before,
+                    "zero mutation, reservation released"
+                );
+                let observed = (vec![res(&r), Res::Done], observe(s, driver, &ws, 6));
+                assert_linearizable(&observed, &init, RQ12, &[Op::Store(6)]);
+            });
+        }
+
+        /// X9 — the waiter the preflight reserved for is woken by another CPU before the commit,
+        /// and the next waiter needs a slot of another priority, so the preflight is STALE: the
+        /// commit writes nothing, the slot is released, the operation preflights again and
+        /// commits. (A next waiter of the SAME placement simply takes the slot: r17.)
+        #[test]
+        fn x09_a_stale_preflight_is_retried_not_guessed() {
+            let mut w = world(48100);
+            let high = park_classed(&mut w, TaskClass::SystemServer);
+            let normal: Vec<u64> = (0..2)
+                .map(|_| park_classed(&mut w, TaskClass::App))
+                .collect();
+            w.back();
+            let (a, driver) = (w.a, w.driver);
+            let mut ws = vec![high];
+            ws.extend(&normal);
+            let init = Model {
+                word: 5,
+                s: ws.clone(),
+                ..Model::default()
+            };
+            let k = leak(w.s);
+            let fired = alloc::rc::Rc::new(core::cell::Cell::new(0u32));
+            let count = fired.clone();
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
+                if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE {
+                    count.set(count.get() + 1);
+                    if tid == high {
+                        let woke = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                        sink.borrow_mut().push(Res::Wake(woke));
+                    }
+                }
+                true
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(|_: u8, _: u64| false));
+            assert_eq!(
+                fired.get(),
+                2,
+                "one preflight per attempt: the stale one and the retry"
+            );
+            let mut results = vec![res(&r)];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe(s, driver, &ws, 5)));
+            assert_linearizable(&observed, &init, RQ12, &[Op::Wake(1)]);
+            assert_eq!(observed.0[0], Res::Rq(Some((1, 1))));
+        }
+
+        /// X10 — the split wait's publication window meets a requeue that MOVES it: the waiter
+        /// registered (word 5), the word was bumped to 6, a requeue expecting 6 moved it. Its own
+        /// re-read then sees 6, but its registration was acted on: it parks on the target. This
+        /// is r16(b), judged by the model — the history FUTEX-REQUEUE1 pinned (the wait returning
+        /// `ValueChanged` while the requeue counted it moved) is not admitted.
+        #[test]
+        fn x10_a_moved_waiter_does_not_retract_its_wait() {
+            let k = leak(Bootstrap::init().expect("init"));
+            let t = 48200;
+            let asid = split_waiter(k, t);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                k.with(|s| word(s, t, SQ, 6));
+                let r = k.futex_cmp_requeue_split(CpuId(1), asid, (SQ, P), (MX, P), 6, 0, ALL);
+                sink.borrow_mut().push(res(&r));
+            }));
+            let o = k.futex_wait_park_exact_split(CpuId(0), t, asid, SQ, 5, P);
+            let w = Res::Wait(matches!(o, FutexParkOutcome::Parked { .. }));
+            let mut results = vec![w, Res::Done];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe(s, t, &[t], 6)));
+            assert_linearizable_iv(
+                &observed,
+                &Model {
+                    word: 5,
+                    ..Model::default()
+                },
+                &[
+                    (Op::Wait { tid: t, exp: 5 }, (0, 10)),
+                    (Op::Store(6), (2, 3)),
+                    (
+                        Op::Rq {
+                            dst: Q::T,
+                            exp: 6,
+                            wake: 0,
+                            req: usize::MAX,
+                        },
+                        (4, 5),
+                    ),
+                ],
+            );
+        }
+
+        /// X11 — the split wait's publication window meets a requeue that SELECTS it for its wake
+        /// portion. Two threads, stepped deterministically: the waiter registers and stops; the
+        /// requeue commits (the waiter is its wake portion) and stops in its window; there the word
+        /// is bumped and the waiter runs its re-read, sees the bump, and — its registration acted
+        /// on — parks; then the requeue places it. The requeue woke it, and it was woken.
+        #[test]
+        fn x11_a_selected_waiter_does_not_retract_its_wait() {
+            use std::sync::mpsc::channel;
+            let k = leak(Bootstrap::init().expect("init"));
+            let t = 48300;
+            let asid = split_waiter(k, t);
+            let (registered_tx, registered_rx) = channel::<()>();
+            let (go_tx, go_rx) = channel::<()>();
+            let (done_tx, done_rx) = channel::<bool>();
+            let waiter = std::thread::spawn(move || {
+                fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                    registered_tx.send(()).expect("registered");
+                    go_rx.recv().expect("go");
+                }));
+                let o = k.futex_wait_park_exact_split(CpuId(0), t, asid, SQ, 5, P);
+                done_tx
+                    .send(matches!(o, FutexParkOutcome::Parked { .. }))
+                    .expect("done");
+            });
+            registered_rx.recv().expect("the waiter registered");
+            let parked = alloc::rc::Rc::new(core::cell::Cell::new(None));
+            let sink = parked.clone();
+            fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                k.with(|s| word(s, t, SQ, 6));
+                go_tx.send(()).expect("go");
+                sink.set(Some(done_rx.recv().expect("the waiter finished")));
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(1), asid, (SQ, P), (MX, P), 5, 1, 0);
+            waiter.join().expect("waiter thread");
+            let w = Res::Wait(parked.get().expect("the window ran"));
+            let observed = (
+                vec![w, res(&r), Res::Done],
+                k.with(|s| observe(s, t, &[t], 6)),
+            );
+            assert_linearizable_iv(
+                &observed,
+                &Model {
+                    word: 5,
+                    ..Model::default()
+                },
+                &[
+                    (Op::Wait { tid: t, exp: 5 }, (0, 10)),
+                    (
+                        Op::Rq {
+                            dst: Q::T,
+                            exp: 5,
+                            wake: 1,
+                            req: 0,
+                        },
+                        (2, 9),
+                    ),
+                    (Op::Store(6), (4, 5)),
+                ],
+            );
+            k.with(|s| assert!(placed(s, t), "woken by the requeue, queued exactly once"));
+        }
+
+        /// X12 — the run queue becomes full DURING the operation (ordinary enqueues fill it after
+        /// the first waiter's slot is reserved): the wake portion is that one waiter; the next one
+        /// is unplaceable, reported, and is the first the requeue portion takes.
+        #[test]
+        fn x12_the_queue_fills_during_the_preflight() {
+            let (w, ws, _init) = three(48400);
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            let first = ws[0];
+            fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, tid| {
+                if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE && tid == first {
+                    assert!(k.with(|s| fill_queue(s, a, 48500)) > 0);
+                    return false;
+                }
+                true
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 2, ALL);
+            assert_eq!(r, Ok(out(1, 2, true)));
+            k.with(|s| {
+                let m = observe(s, driver, &ws, 5);
+                assert_eq!(m.woken, vec![ws[0]]);
+                assert_eq!(m.t, ws[1..].to_vec(), "B, the unplaceable head, first");
+                assert!(m.s.is_empty());
+            });
+        }
+
+        /// X13 — a reservation held across ordinary enqueues: after the commit, before the
+        /// placement, other tasks fill the queue. They cannot take the reserved slot, so the
+        /// placement still lands — the guarantee the claim relied on.
+        #[test]
+        fn x13_a_held_reservation_survives_a_filling_queue() {
+            let (w, ws, _init) = three(48600);
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                assert_eq!(k.with(|s| reserved(s)), 1);
+                assert!(
+                    k.with(|s| fill_queue(s, a, 48700)) > 0,
+                    "fills up to the reservation"
+                );
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            assert_eq!(r, Ok(out(1, 2, false)));
+            k.with(|s| {
+                let m = observe(s, driver, &ws, 5);
+                assert_eq!(m.woken, vec![ws[0]], "placed into the slot it reserved");
+                assert_eq!(m.t, ws[1..].to_vec());
+            });
+        }
+
+        /// X14 — bounded retries. Every preflight is made stale (another CPU wakes the waiter it
+        /// reserved for, and the next waiter needs the other priority). After
+        /// `FUTEX_REQUEUE_ATTEMPTS` preflights the commit may not ask for another: the wake
+        /// portion stops at the waiter whose placement is not secured, reported as
+        /// `capacity_limited`, and that waiter is the first the requeue portion takes. Nothing is
+        /// stranded or leaked.
+        #[test]
+        fn x14_contention_ends_in_a_reported_stop_not_a_livelock() {
+            let mut w = world(48800);
+            let mut ws = Vec::new();
+            for i in 0..5 {
+                let class = if i % 2 == 0 {
+                    TaskClass::SystemServer
+                } else {
+                    TaskClass::App
+                };
+                ws.push(park_classed(&mut w, class));
+            }
+            w.back();
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            let fired = alloc::rc::Rc::new(core::cell::Cell::new(0u32));
+            let count = fired.clone();
+            fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(move |st, _tid| {
+                if st == fx::futex_phase_hook::WAKE_AFTER_RESERVE {
+                    count.set(count.get() + 1);
+                    assert_eq!(
+                        k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P),
+                        Ok(1),
+                        "another CPU takes the reserved waiter"
+                    );
+                }
+                true
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, ALL);
+            fx::futex_phase_hook::arm_wake_step(alloc::boxed::Box::new(|_: u8, _: u64| false));
+            assert_eq!(fired.get(), fx::FUTEX_REQUEUE_ATTEMPTS);
+            assert_eq!(r, Ok(out(0, 1, true)));
+            k.with(|s| {
+                let m = observe(s, driver, &ws, 5);
+                assert_eq!(m.woken, ws[..4].to_vec(), "the four the other CPU woke");
+                assert_eq!(m.t, vec![ws[4]]);
+            });
+        }
+
+        /// X15 — repeated operations racing in their windows leak nothing: no record, no pending
+        /// key, no reservation, and every waiter ends exactly once. One kernel for all rounds, so
+        /// record slots, generations and pending keys are reused.
+        #[test]
+        fn x15_repeated_window_races_leak_nothing() {
+            let w = world(49000);
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            for round in 0..12u64 {
+                let ws: Vec<u64> = (0..3).map(|i| 49100 + round * 3 + i).collect();
+                for &t in &ws {
+                    assert!(split_wait(k, a, t, 5), "{t} parks");
+                }
+                k.with(|s| run(s, driver));
+                let victim = ws[((round / 3) % 3) as usize];
+                fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(
+                    move || match round % 3 {
+                        0 => {
+                            let _ = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P);
+                        }
+                        1 => {
+                            let _ = k.futex_wake_split_mut(CpuId(1), a, MX, 1, P);
+                        }
+                        _ => {
+                            k.with(|s| s.exit_task(victim, 0)).expect("exit");
+                        }
+                    },
+                ));
+                let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+                assert_eq!(r, Ok(out(1, 2, false)), "round {round}");
+                let _ = k.futex_wake_split_mut(CpuId(0), a, MX, ALL, P);
+                let _ = k.futex_wake_split_mut(CpuId(0), a, SQ, ALL, P);
+                k.with(|s| {
+                    assert_eq!(occupied(s), 0, "round {round}: a record was left");
+                    let _ = observe(s, driver, &ws, 5);
+                    for &t in &ws {
+                        if s.task_status(t) != Some(TaskStatus::Exited(0)) {
+                            assert!(placed(s, t), "round {round}: {t} not placed exactly once");
+                            s.exit_task(t, 0).expect("retire");
+                        }
+                    }
+                });
+            }
+        }
+
+        /// X16 — the wake portion never skips an unplaceable FIFO head. The High queue is full,
+        /// the Normal queue has room; the oldest waiter is High, the next Normal. `wake 1,
+        /// requeue 0` stops at the head — reported — and does NOT wake the Normal waiter behind
+        /// it merely because its queue has room; with a requeue asked for, the head is the first
+        /// waiter moved.
+        #[test]
+        fn x16_an_unplaceable_head_is_never_skipped() {
+            let mut w = world(49400);
+            let head = park_classed(&mut w, TaskClass::SystemServer);
+            let next = park_classed(&mut w, TaskClass::App);
+            w.back();
+            let mut n = 0;
+            loop {
+                let f = 49500 + n;
+                w.s.register_task_with_class(f, TaskClass::SystemServer)
+                    .expect("filler");
+                w.s.bind_task_asid(f, w.a).expect("bind");
+                w.s.set_task_status_for_test(f, TaskStatus::Runnable);
+                w.s.seed_resumable_user_context_for_test(f);
+                w.s.set_task_home_cpu(f, CpuId(0)).expect("home");
+                if w.s.enqueue_task(f).is_err() {
+                    w.s.exit_task(f, 0).expect("retire the refused filler");
+                    break;
+                }
+                n += 1;
+            }
+            assert!(n > 0, "the High queue is full");
+            let driver = w.driver;
+            assert_eq!(rq(&mut w.s, SQ, MX, 5, 1, 0), Ok(out(0, 0, true)));
+            assert!(parked(&w.s, head) && parked(&w.s, next), "neither is woken");
+            assert_eq!(w.order(SQ), vec![head, next], "and neither moved");
+            assert_eq!(reserved(&w.s), 0);
+            assert_eq!(rq(&mut w.s, SQ, MX, 5, 1, ALL), Ok(out(0, 2, true)));
+            assert_eq!(w.order(MX), vec![head, next], "the head first");
+            let _ = observe(&mut w.s, driver, &[head, next], 5);
+        }
+
+        /// X5 — the waiter the transfer left for the wake portion exits in the window.
+        #[test]
+        fn x05_the_kept_waiter_exits_inside_the_window() {
+            let (w, ws, init) = three(47600);
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            let victim = ws[0];
+            fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                k.with(|s| s.exit_task(victim, 0).expect("exit"));
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            let observed = (
+                vec![res(&r), Res::Done],
+                k.with(|s| observe(s, driver, &ws, 5)),
+            );
+            assert_linearizable(
+                &observed,
+                &init,
+                Op::Rq {
+                    dst: Q::T,
+                    exp: 5,
+                    wake: 1,
+                    req: 2,
+                },
+                &[Op::Exit(victim)],
+            );
+        }
     }
 }
