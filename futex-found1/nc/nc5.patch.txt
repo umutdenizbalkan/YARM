@@ -1,0 +1,22 @@
+nc5 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 2caebd55..68d6b612 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -525,14 +525,12 @@ pub fn claim_futex_waiters_locked(
+             match tcbs
+                 .get_mut(usize::from(rec.tcb))
+                 .and_then(Option::as_mut)
+-                .filter(|t| {
+-                    t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))
+-                }) {
++                .filter(|t| { let _ = token; t.tid.0 == rec.tid }) {
+                 Some(tcb) => {
+                     tcb.status = TaskStatus::Runnable;
+                     out[n] = rec.tid;
+                     n += 1;
+-                    true
++                    false
+                 }
+                 // Stale: the TCB moved on through some other owner. Reclaim, do not count.
+                 None => true,

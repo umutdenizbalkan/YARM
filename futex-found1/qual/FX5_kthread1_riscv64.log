@@ -1,0 +1,7 @@
+KT1_GRADER_SELF_TEST result=pass
+ARTIFACT_BINDING arch=riscv64 kernel=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX5_riscv64/build/yarm-riscv64-apsw.bin kernel_sha256=9eef2365ce8e0ac00a812bba4192809066a48ae39ecc385c77ef2a544ed57d7f kernel_features=riscv64-kthread1-witness kernel_resolved_features=apsched-witness,kthread1-witness,riscv64-apsched-witness,riscv64-kthread1-witness kernel_nofp=pass initramfs=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX5_riscv64/build/initramfs-core.cpio initramfs_sha256=445a7cbb5d595cd7148a853c9bfae74e3c96f7139c4f0831bcf545193a688b70 initramfs_features=none initramfs_compile_env=none source=clean:d5621d8eeb76208f55d9cf717f40bed75eaba5b9 required=kernel=riscv64-kthread1-witness,initramfs=none result=ok
+[apsched-witness] booting -smp 2 with no diagnostic knob
+[apsched-witness] boot dumped after 30.7s
+APSW_WITNESS_SEAL arch=riscv64 cpus=2 admission=production per_cpu_work=threads,forks preempt_recorded=5,8 preempt_counted=5,10,0,0,0,0,0,0 registers=intact deadlines=timed_out dtick=dirq0/own:1:64=64/71 idle_wakes=3_ipi ipc=4 churn=4_reaped_quarantined=0 records=121 result=ok
+KT1_VERDICT records=478 failures=0 result=pass
+KT1W_SEAL arch=riscv64 smp=2 host=idle result=pass apsched_rc=0

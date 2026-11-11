@@ -1,0 +1,4 @@
+tree=d727771879fb50e28778f608243916e50c7d721f head=a7a27fb45165c72f9e5b005ecab17d41c4cca369 dirty=0 features=x86-overtaken-witness cmdline=console=ttyS0 rdinit=/init yarm.x86_64_ipccall_direct_smp_oracle=1 yarm.x86_64_ipccall_direct_smp_recv_v2_server=1 yarm.x86_64_ipccall_direct_smp_request=1 yarm.x86_64_ipccall_direct_smp_reply=1 yarm.ap_user_dispatch=1 yarm.x86_64_overtaken_witness=1
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=q35 cpu=qemu64 smp=2
+6ad0bb8766952184d8aa4f26ec5bbce924f82afa4c82bd554a7853720151f96f  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FB2/build/kernel_boot.elf
+74771cd02dd807c645b7d0c47b8377ce1e84b6740b1501832241f3db169058c2  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FB2/build/initramfs-core.cpio

@@ -1,0 +1,23 @@
+nc6 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 2caebd55..0eacc14b 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -472,7 +472,7 @@ pub fn undo_futex_registration_locked(
+     let Some(tcb) = tcbs
+         .iter_mut()
+         .flatten()
+-        .find(|t| t.tid.0 == tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token)))
++        .find(|t| { let _ = token; t.tid.0 == tid && matches!(t.status, TaskStatus::Blocked(WaitReason::Futex(_))) })
+     else {
+         return false;
+     };
+@@ -492,7 +492,7 @@ pub fn futex_still_parked_locked(
+ ) -> bool {
+     tcbs.iter()
+         .flatten()
+-        .any(|t| t.tid.0 == tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token)))
++        .any(|t| { let _ = token; t.tid.0 == tid && matches!(t.status, TaskStatus::Blocked(WaitReason::Futex(_))) })
+ }
+ 
+ /// rank 2 — THE wake claim: up to `max` LIVE waiters on `key`, oldest first.

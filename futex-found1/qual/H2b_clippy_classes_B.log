@@ -1,0 +1,6 @@
+F: warning: `yarm` (lib) generated 424 warnings (run `cargo clippy --fix --lib -p yarm -- ` to apply 102 suggestions)
+B: warning: `yarm` (lib) generated 427 warnings (run `cargo clippy --fix --lib -p yarm -- ` to apply 105 suggestions)
+46c46
+<      23 warning: unused import: `_`
+---
+>      26 warning: unused import: `_`

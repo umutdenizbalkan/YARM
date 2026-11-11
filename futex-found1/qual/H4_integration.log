@@ -1,0 +1,3330 @@
+   Compiling yarm-ipc-abi v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-wt/crates/yarm-ipc-abi)
+   Compiling yarm-kernel v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-wt/crates/yarm-kernel)
+   Compiling yarm v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-wt)
+   Compiling yarm-srv-common v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-wt/crates/yarm-srv-common)
+warning: unused imports: `QueueAdvanceOutcome` and `QueueAdvanceRefusal`
+  --> src/kernel/boot/mod.rs:41:50
+   |
+41 |     IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome, QueueAdvanceRefusal,
+   |                                                  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `DetachOutcome` and `enqueue_reply_into_endpoint_locked`
+  --> src/kernel/boot/mod.rs:69:34
+   |
+69 |     BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ParkedDeathHandoff,
+   |                                  ^^^^^^^^^^^^^
+...
+74 |     complete_server_death_over, enqueue_reply_into_endpoint_locked, log_parked_death_handoff,
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `orchestrator_state::x86_smp_unlock_audit_claimed`
+  --> src/kernel/boot/mod.rs:85:16
+   |
+85 | pub(crate) use orchestrator_state::x86_smp_unlock_audit_claimed;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+  --> src/kernel/boot/scheduler_state.rs:10:27
+   |
+10 | use crate::kernel::task::{TaskClass, TaskStatus};
+   |                           ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+ --> src/kernel/boot/task_policy_state.rs:6:5
+  |
+6 | use crate::kernel::ipc::ThreadId;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+ --> src/kernel/boot/thread_state.rs:8:47
+  |
+8 |     KernelExecutionContext, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
+  |                                               ^^^^^^^^^
+
+warning: unused import: `crate::kernel::vm::Asid`
+  --> src/kernel/boot/thread_state.rs:12:5
+   |
+12 | use crate::kernel::vm::Asid;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc_state::rt_detach_server_link`
+    --> src/kernel/boot/mod.rs:5542:16
+     |
+5542 | pub(crate) use ipc_state::rt_detach_server_link;
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapObject`
+  --> src/kernel/recv_waiter_split.rs:94:42
+   |
+94 | use crate::kernel::capabilities::{CapId, CapObject};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+ --> src/kernel/syscall.rs:9:17
+  |
+9 | use super::vm::{PAGE_SIZE, VirtAddr};
+  |                 ^^^^^^^^^
+
+warning: unused imports: `IpcSendPayloadShape`, `classify_ipc_send_payload_shape`, and `frame_ipc_send_message`
+   --> src/kernel/syscall.rs:315:5
+    |
+315 |     IpcSendPayloadShape, classify_ipc_send_payload_shape, frame_ipc_send_message,
+    |     ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::ipc_abi::transfer_cap_arg_present`
+   --> src/kernel/syscall.rs:321:16
+    |
+321 | pub(crate) use self::ipc_abi::transfer_cap_arg_present;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc::REPLY_CAP_QUEUEING_SUPPORTED`
+   --> src/kernel/syscall.rs:324:16
+    |
+324 | pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc::split_inline_payload_from_frame`
+   --> src/kernel/syscall.rs:326:16
+    |
+326 | pub(crate) use ipc::split_inline_payload_from_frame;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SYSCALL_NO_TRANSFER_CAP`
+  --> src/kernel/syscall/recv_shared_v3.rs:12:26
+   |
+12 |     SYSCALL_ABI_VERSION, SYSCALL_NO_TRANSFER_CAP, SyscallError, current_tid,
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapRights`
+  --> src/kernel/syscall/recv_shared_v3.rs:16:42
+   |
+16 | use crate::kernel::capabilities::{CapId, CapRights};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::Message`
+  --> src/kernel/syscall/recv_shared_v3.rs:17:5
+   |
+17 | use crate::kernel::ipc::Message;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CachePolicy`, `Mapping`, `PAGE_SIZE`, `PageFlags`, `PhysAddr`, and `VirtAddr`
+  --> src/kernel/syscall/recv_shared_v3.rs:20:25
+   |
+20 | use crate::kernel::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                         ^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^  ^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+  --> src/kernel/syscall/vm.rs:28:40
+   |
+28 | use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                                        ^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+    --> src/runtime.rs:2683:13
+     |
+2683 |         use crate::kernel::task::TaskClass;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+    --> src/runtime.rs:6266:35
+     |
+6266 |         use crate::kernel::task::{TaskClass, TaskStatus};
+     |                                   ^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+    --> src/runtime.rs:6696:13
+     |
+6696 |         use crate::kernel::task::TaskClass;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_CAP`, `SYSCALL_ARG_LEN`, and `SYSCALL_ARG_PTR`
+    --> src/runtime.rs:9718:55
+     |
+9718 |             OPCODE_SHARED_MEM, RecvQueuedSplitPhaseA, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0,
+     |                                                       ^^^^^^^^^^^^^^^
+9719 |             SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError,
+     |                                          ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+     --> src/runtime.rs:16019:35
+      |
+16019 |         use crate::kernel::task::{TaskClass, TaskStatus};
+      |                                   ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+     --> src/runtime.rs:16449:13
+      |
+16449 |         use crate::kernel::ipc::ThreadId;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:16451:13
+      |
+16451 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:16485:13
+      |
+16485 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:17850:13
+      |
+17850 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> src/kernel/direct_ack_census.rs:53:29
+   |
+53 |     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |                             ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+53 -     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+53 +     let _ = WAITERS_CURRENT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3266:17
+     |
+3266 |     let pml4e = d6_read_pte(pml4_phys, (va >> 39) & 0x1FF, virt_offset)?;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+    --> src/kernel/boot/exec_state.rs:3265:1
+     |
+3265 | unsafe fn d6_x86_walk_4level(va: u64, pml4_phys: u64, virt_offset: u64) -> Option<u64> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+     = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3268:16
+     |
+3268 |     let pdpe = d6_read_pte(pdp_phys, (va >> 30) & 0x1FF, virt_offset)?;
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3273:15
+     |
+3273 |     let pde = d6_read_pte(pd_phys, (va >> 21) & 0x1FF, virt_offset)?;
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3278:5
+     |
+3278 |     d6_read_pte(pt_phys, (va >> 12) & 0x1FF, virt_offset)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `core::ptr::read_volatile` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3287:17
+     |
+3287 |     let entry = core::ptr::read_volatile(virt as *const u64);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+    --> src/kernel/boot/exec_state.rs:3283:1
+     |
+3283 | unsafe fn d6_read_pte(table_phys: u64, idx: u64, virt_offset: u64) -> Option<u64> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning: unused variable: `deadline`
+    --> src/kernel/boot/ipc_state.rs:5607:30
+     |
+5607 |                     let Some(deadline) = tcb.ipc_timeout_deadline else {
+     |                              ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_deadline`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `tid`
+    --> src/kernel/boot/orchestrator_state.rs:1463:51
+     |
+1463 |     fn run_unlock_graduated_proof_with(&mut self, tid: u64, cnode: CNodeId) {
+     |                                                   ^^^ help: if this is intentional, prefix it with an underscore: `_tid`
+
+warning: unused variable: `cpu`
+    --> src/kernel/boot/thread_state.rs:1087:9
+     |
+1087 |         cpu: crate::kernel::scheduler::CpuId,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: value assigned to `stash_bound_receiver_tid` is never read
+   --> src/kernel/syscall/ipc.rs:464:78
+    |
+464 |     let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
+    |                                                                              ^^^^ this value is reassigned later and never used
+...
+509 |             stash_bound_receiver_tid = bound_tid;
+    |             ------------------------------------ `stash_bound_receiver_tid` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `cpu`
+    --> src/runtime.rs:7861:9
+     |
+7861 |         cpu: CpuId,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: unused variable: `virt`
+     --> src/runtime.rs:15849:9
+      |
+15849 |         virt: crate::kernel::vm::VirtAddr,
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_virt`
+
+warning: type `BlockedServerAck` is more private than the item `ipccall_direct_ack::snapshot`
+    --> src/kernel/boot/mod.rs:7534:5
+     |
+7534 |     pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedServerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `ipccall_direct_ack::snapshot` is reachable at visibility `pub`
+     |
+note: but type `BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `BlockedServerAck` is more private than the item `ipccall_direct_ack::claim`
+    --> src/kernel/boot/mod.rs:7548:5
+     |
+7548 | /     pub fn claim(
+7549 | |         endpoint_index: usize,
+7550 | |         endpoint_generation: u64,
+7551 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `ipccall_direct_ack::claim` is reachable at visibility `pub`
+     |
+note: but type `BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipccall_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:7557:5
+     |
+7557 | /     pub fn claim_exact(
+7558 | |         endpoint_index: usize,
+7559 | |         endpoint_generation: u64,
+7560 | |         expect_server: Option<ReceiverWaiterIdentity>,
+7561 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `ipccall_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedServerAck` is more private than the item `ipccall_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:7557:5
+     |
+7557 | /     pub fn claim_exact(
+7558 | |         endpoint_index: usize,
+7559 | |         endpoint_generation: u64,
+7560 | |         expect_server: Option<ReceiverWaiterIdentity>,
+7561 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `ipccall_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipccall_direct_ack::release`
+    --> src/kernel/boot/mod.rs:7574:5
+     |
+7574 | /     pub fn release(
+7575 | |         endpoint_index: usize,
+7576 | |         endpoint_generation: u64,
+7577 | |         server: ReceiverWaiterIdentity,
+7578 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipccall_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `AckRelease` is more private than the item `ipccall_direct_ack::release`
+    --> src/kernel/boot/mod.rs:7574:5
+     |
+7574 | /     pub fn release(
+7575 | |         endpoint_index: usize,
+7576 | |         endpoint_generation: u64,
+7577 | |         server: ReceiverWaiterIdentity,
+7578 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipccall_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `AckRelease` is only usable at visibility `pub(crate)`
+    --> src/kernel/direct_ack_store.rs:346:1
+     |
+ 346 | pub(crate) enum AckRelease {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::snapshot`
+    --> src/kernel/boot/mod.rs:8018:5
+     |
+8018 |     pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedCallerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `ipcreply_direct_ack::snapshot` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::claim`
+    --> src/kernel/boot/mod.rs:8026:5
+     |
+8026 | /     pub fn claim(
+8027 | |         endpoint_index: usize,
+8028 | |         endpoint_generation: u64,
+8029 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `ipcreply_direct_ack::claim` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipcreply_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:8034:5
+     |
+8034 | /     pub fn claim_exact(
+8035 | |         endpoint_index: usize,
+8036 | |         endpoint_generation: u64,
+8037 | |         expect_caller: Option<ReceiverWaiterIdentity>,
+8038 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `ipcreply_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:8034:5
+     |
+8034 | /     pub fn claim_exact(
+8035 | |         endpoint_index: usize,
+8036 | |         endpoint_generation: u64,
+8037 | |         expect_caller: Option<ReceiverWaiterIdentity>,
+8038 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `ipcreply_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipcreply_direct_ack::release`
+    --> src/kernel/boot/mod.rs:8050:5
+     |
+8050 | /     pub fn release(
+8051 | |         endpoint_index: usize,
+8052 | |         endpoint_generation: u64,
+8053 | |         caller: ReceiverWaiterIdentity,
+8054 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipcreply_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `AckRelease` is more private than the item `ipcreply_direct_ack::release`
+    --> src/kernel/boot/mod.rs:8050:5
+     |
+8050 | /     pub fn release(
+8051 | |         endpoint_index: usize,
+8052 | |         endpoint_generation: u64,
+8053 | |         caller: ReceiverWaiterIdentity,
+8054 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipcreply_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `AckRelease` is only usable at visibility `pub(crate)`
+    --> src/kernel/direct_ack_store.rs:346:1
+     |
+ 346 | pub(crate) enum AckRelease {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `RecvImmediateOutcome` is more private than the item `SharedKernel::try_split_ipc_recv_timeout_immediate_into_frame`
+     --> src/runtime.rs:11224:5
+      |
+11224 | /     pub fn try_split_ipc_recv_timeout_immediate_into_frame(
+11225 | |         &self,
+11226 | |         cpu: CpuId,
+11227 | |         frame: &mut TrapFrame,
+11228 | |     ) -> crate::kernel::syscall::RecvImmediateOutcome {
+      | |_____________________________________________________^ method `SharedKernel::try_split_ipc_recv_timeout_immediate_into_frame` is reachable at visibility `pub`
+      |
+note: but type `RecvImmediateOutcome` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall.rs:1914:1
+      |
+ 1914 | pub(crate) enum RecvImmediateOutcome {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `RecvImmediateOutcome` is more private than the item `SharedKernel::try_split_ipc_recv_queued_plain_into_frame`
+     --> src/runtime.rs:11553:5
+      |
+11553 | /     pub fn try_split_ipc_recv_queued_plain_into_frame(
+11554 | |         &self,
+11555 | |         cpu: CpuId,
+11556 | |         frame: &mut TrapFrame,
+11557 | |     ) -> crate::kernel::syscall::RecvImmediateOutcome {
+      | |_____________________________________________________^ method `SharedKernel::try_split_ipc_recv_queued_plain_into_frame` is reachable at visibility `pub`
+      |
+note: but type `RecvImmediateOutcome` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall.rs:1914:1
+      |
+ 1914 | pub(crate) enum RecvImmediateOutcome {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `FutexWaitDecision` is more private than the item `SharedKernel::futex_wait_decide_split_read`
+     --> src/runtime.rs:18184:5
+      |
+18184 | /     pub fn futex_wait_decide_split_read(
+18185 | |         &self,
+18186 | |         tid: u64,
+18187 | |         addr: usize,
+18188 | |         expected: u32,
+18189 | |         kind: crate::kernel::boot::futex::FutexKind,
+18190 | |     ) -> Result<crate::kernel::syscall::sched::FutexWaitDecision, crate::kernel::boot::KernelError>
+      | |___________________________________________________________________________________________________^ method `SharedKernel::futex_wait_decide_split_read` is reachable at visibility `pub`
+      |
+note: but type `FutexWaitDecision` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall/sched.rs:69:1
+      |
+   69 | pub(crate) enum FutexWaitDecision {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_DISPATCH_STACK_BYTES` is never used
+   --> src/arch/x86_64/descriptor_tables.rs:194:18
+    |
+194 | pub(crate) const AP_DISPATCH_STACK_BYTES: usize = 2 * 1024 * 1024;
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `read_boot_tss_rsp0` is never used
+    --> src/arch/x86_64/descriptor_tables.rs:3521:15
+     |
+3521 | pub(crate) fn read_boot_tss_rsp0() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^
+
+warning: constant `LAPIC_ICR_LOW_OFFSET` is never used
+  --> src/arch/x86_64/smp.rs:25:7
+   |
+25 | const LAPIC_ICR_LOW_OFFSET: usize = 0x300;
+   |       ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `LAPIC_ICR_HIGH_OFFSET` is never used
+  --> src/arch/x86_64/smp.rs:26:7
+   |
+26 | const LAPIC_ICR_HIGH_OFFSET: usize = 0x310;
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ICR_DELIVERY_STATUS_PENDING` is never used
+  --> src/arch/x86_64/smp.rs:30:7
+   |
+30 | const ICR_DELIVERY_STATUS_PENDING: u32 = 1 << 12;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ICR_IDLE_POLL_ITERS` is never used
+  --> src/arch/x86_64/smp.rs:47:7
+   |
+47 | const ICR_IDLE_POLL_ITERS: usize = 1_000_000;
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: static `AP_HANDOFF_OFFS` is never used
+  --> src/arch/x86_64/smp.rs:96:8
+   |
+96 | static AP_HANDOFF_OFFS: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS] =
+   |        ^^^^^^^^^^^^^^^
+
+warning: static `AP_IRQ_READY_FLAGS` is never used
+   --> src/arch/x86_64/smp.rs:101:8
+    |
+101 | static AP_IRQ_READY_FLAGS: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `lapic_mmio_base` is never used
+   --> src/arch/x86_64/smp.rs:116:4
+    |
+116 | fn lapic_mmio_base() -> usize {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `apic_of` is never used
+   --> src/arch/x86_64/smp.rs:122:15
+    |
+122 | pub(crate) fn apic_of(cpu: CpuId) -> Option<u8> {
+    |               ^^^^^^^
+
+warning: function `planned_secondaries_bitmap` is never used
+   --> src/arch/x86_64/smp.rs:701:15
+    |
+701 | pub(crate) fn planned_secondaries_bitmap() -> u64 {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `bound_apic_id` is never used
+   --> src/arch/x86_64/smp.rs:801:4
+    |
+801 | fn bound_apic_id(cpu: CpuId) -> Option<u32> {
+    |    ^^^^^^^^^^^^^
+
+warning: constant `AP_PRODUCTION_ADMISSION_REQUEST` is never used
+    --> src/arch/x86_64/smp.rs:2599:18
+     |
+2599 | pub(crate) const AP_PRODUCTION_ADMISSION_REQUEST: u32 = 2;
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `PRODUCTION_ADMISSION_OWED` is never used
+    --> src/arch/x86_64/smp.rs:2603:8
+     |
+2603 | static PRODUCTION_ADMISSION_OWED: AtomicU64 = AtomicU64::new(0);
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `send_reschedule_ipi_to` is never used
+    --> src/arch/x86_64/smp.rs:2995:15
+     |
+2995 | pub(crate) fn send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `c2c_send_reschedule_ipi_to` is never used
+    --> src/arch/x86_64/smp.rs:3023:15
+     |
+3023 | pub(crate) fn c2c_send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_TRAMPOLINE_SIZE` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:33:18
+   |
+33 | pub(super) const AP_TRAMPOLINE_SIZE: usize = crate::kernel::vm::PAGE_SIZE;
+   |                  ^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_HANDOFF_TPR_OUT_OFFSET` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:75:18
+   |
+75 | pub(super) const AP_HANDOFF_TPR_OUT_OFFSET: usize = 124;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KERNEL_CR3_RELOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:84:15
+   |
+84 |     pub const KERNEL_CR3_RELOADED: u32 = 1 << 0; // mov cr3 + post-reload fetch survived
+   |               ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GDT_LOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:85:15
+   |
+85 |     pub const GDT_LOADED: u32 = 1 << 1; // lgdt + SS/DS/ES + far-return CS=0x08
+   |               ^^^^^^^^^^
+
+warning: constant `TSS_LOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:86:15
+   |
+86 |     pub const TSS_LOADED: u32 = 1 << 2; // ltr 0x28 (per-AP TSS)
+   |               ^^^^^^^^^^
+
+warning: constant `LAPIC_READ` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:87:15
+   |
+87 |     pub const LAPIC_READ: u32 = 1 << 3; // LAPIC ID register MMIO read done
+   |               ^^^^^^^^^^
+
+warning: constant `IDLE_CTX_PUBLISHED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:88:15
+   |
+88 |     pub const IDLE_CTX_PUBLISHED: u32 = 1 << 4; // canary + live rsp stored via gs:
+   |               ^^^^^^^^^^^^^^^^^^
+
+warning: constant `CR4_SYNCED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:90:15
+   |
+90 |     pub const CR4_SYNCED: u32 = 1 << 5; // mov cr4 = handoff.bsp_cr4 survived
+   |               ^^^^^^^^^^
+
+warning: constant `IDT_LOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:91:15
+   |
+91 |     pub const IDT_LOADED: u32 = 1 << 6; // lidt of the AP-safe IDT done
+   |               ^^^^^^^^^^
+
+warning: constant `LAPIC_SW_ENABLED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:95:15
+   |
+95 |     pub const LAPIC_SW_ENABLED: u32 = 1 << 7;
+   |               ^^^^^^^^^^^^^^^^
+
+warning: function `fallback_kernel_stack_bounds` is never used
+   --> src/arch/x86_64/trap.rs:571:15
+    |
+571 | pub(crate) fn fallback_kernel_stack_bounds(rsp: u64) -> (u64, u64, u64) {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `kernel_stack_bounds_if_containing` is never used
+   --> src/arch/x86_64/trap.rs:585:15
+    |
+585 | pub(crate) fn kernel_stack_bounds_if_containing(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `find_kernel_stack_bounds_containing_rsp_split` is never used
+   --> src/arch/x86_64/trap.rs:608:15
+    |
+608 | pub(crate) fn find_kernel_stack_bounds_containing_rsp_split(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `handle_trap_entry_with_fault_bookkeeping_mode` is never used
+  --> src/arch/trap_entry.rs:74:15
+   |
+74 | pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `AlreadyRecordedBySharedSeam` is never constructed
+   --> src/kernel/boot/mod.rs:195:5
+    |
+193 | pub(crate) enum FaultBookkeepingMode {
+    |                 -------------------- variant in this enum
+194 |     RecordInHandleTrapEvent,
+195 |     AlreadyRecordedBySharedSeam,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `FaultBookkeepingMode` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `VmBrkPlan` is never constructed
+   --> src/kernel/boot/mod.rs:438:19
+    |
+438 | pub(crate) struct VmBrkPlan {
+    |                   ^^^^^^^^^
+
+warning: struct `VmAnonMapProgressPlan` is never constructed
+   --> src/kernel/boot/mod.rs:570:19
+    |
+570 | pub(crate) struct VmAnonMapProgressPlan {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_d6_controlled_switch_proof_enabled` is never used
+    --> src/kernel/boot/mod.rs:1082:15
+     |
+1082 | pub(crate) fn set_d6_controlled_switch_proof_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_d6_switch_a_enabled` is never used
+    --> src/kernel/boot/mod.rs:1107:15
+     |
+1107 | pub(crate) fn set_d6_switch_a_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `FUTEX_WAIT_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:1557:8
+     |
+1557 | static FUTEX_WAIT_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_futex_wait_default_on` is never used
+    --> src/kernel/boot/mod.rs:1563:15
+     |
+1563 | pub(crate) fn maybe_log_futex_wait_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_ASYNC_RESUME_PENDING` is never used
+    --> src/kernel/boot/mod.rs:1704:19
+     |
+1704 | pub(crate) static RISCV_ASYNC_RESUME_PENDING: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_publish` is never used
+    --> src/kernel/boot/mod.rs:1710:15
+     |
+1710 | pub(crate) fn riscv_async_resume_publish(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_take` is never used
+    --> src/kernel/boot/mod.rs:1721:15
+     |
+1721 | pub(crate) fn riscv_async_resume_take(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_clear` is never used
+    --> src/kernel/boot/mod.rs:1733:15
+     |
+1733 | pub(crate) fn riscv_async_resume_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_SYSCALL_CONTINUATION_PENDING` is never used
+    --> src/kernel/boot/mod.rs:1757:19
+     |
+1757 | pub(crate) static RISCV_SYSCALL_CONTINUATION_PENDING: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_publish` is never used
+    --> src/kernel/boot/mod.rs:1763:15
+     |
+1763 | pub(crate) fn riscv_syscall_continuation_publish(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_take` is never used
+    --> src/kernel/boot/mod.rs:1771:15
+     |
+1771 | pub(crate) fn riscv_syscall_continuation_take(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_clear` is never used
+    --> src/kernel/boot/mod.rs:1780:15
+     |
+1780 | pub(crate) fn riscv_syscall_continuation_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED` is never used
+    --> src/kernel/boot/mod.rs:1792:19
+     |
+1792 | pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING` is never used
+    --> src/kernel/boot/mod.rs:1795:19
+     |
+1795 | pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING: [core::sync::atomic::AtomicU64;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_DONE` is never used
+    --> src/kernel/boot/mod.rs:1800:8
+     |
+1800 | static RISCV_QUEUE_SWITCH_FOUNDATION_DONE: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_queue_switch_foundation_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:1810:15
+     |
+1810 | pub(crate) fn set_riscv_queue_switch_foundation_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_armed` is never used
+    --> src/kernel/boot/mod.rs:1820:15
+     |
+1820 | pub(crate) fn riscv_queue_switch_foundation_armed() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_try_defer` is never used
+    --> src/kernel/boot/mod.rs:1827:15
+     |
+1827 | pub(crate) fn riscv_queue_switch_foundation_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_is_deferred` is never used
+    --> src/kernel/boot/mod.rs:1859:15
+     |
+1859 | pub(crate) fn riscv_queue_switch_foundation_is_deferred(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_outgoing` is never used
+    --> src/kernel/boot/mod.rs:1865:15
+     |
+1865 | pub(crate) fn riscv_queue_switch_foundation_outgoing(cpu_idx: usize) -> Option<u64> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_clear` is never used
+    --> src/kernel/boot/mod.rs:1876:15
+     |
+1876 | pub(crate) fn riscv_queue_switch_foundation_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_futex_wait_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:1909:15
+     |
+1909 | pub(crate) fn set_riscv_futex_wait_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_futex_wait_idle_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:1917:15
+     |
+1917 | pub(crate) fn set_riscv_futex_wait_idle_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:1928:8
+     |
+1928 | static RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_riscv_futex_wait_retire_default_on` is never used
+    --> src/kernel/boot/mod.rs:1933:15
+     |
+1933 | pub(crate) fn maybe_log_riscv_futex_wait_retire_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `YIELD_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:1980:8
+     |
+1980 | static YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_yield_default_on` is never used
+    --> src/kernel/boot/mod.rs:1986:15
+     |
+1986 | pub(crate) fn maybe_log_yield_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_YIELD_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:2012:8
+     |
+2012 | static RISCV_YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_riscv_yield_retire_default_on` is never used
+    --> src/kernel/boot/mod.rs:2017:15
+     |
+2017 | pub(crate) fn maybe_log_riscv_yield_retire_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_yield_two_task_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:2040:15
+     |
+2040 | pub(crate) fn set_riscv_yield_two_task_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_yield_lone_task_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:2046:15
+     |
+2046 | pub(crate) fn set_riscv_yield_lone_task_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_code` is never used
+    --> src/kernel/boot/mod.rs:2125:8
+     |
+2110 | impl BlockingSyscallClass {
+     | ------------------------- associated function in this implementation
+...
+2125 |     fn from_code(code: u8) -> Option<BlockingSyscallClass> {
+     |        ^^^^^^^^^
+
+warning: function `blocked_syscall_idle_provenance_take` is never used
+    --> src/kernel/boot/mod.rs:2164:15
+     |
+2164 | pub(crate) fn blocked_syscall_idle_provenance_take(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `current_arch_tag` is never used
+    --> src/kernel/boot/mod.rs:2192:21
+     |
+2192 | pub(crate) const fn current_arch_tag() -> &'static str {
+     |                     ^^^^^^^^^^^^^^^^
+
+warning: static `SHARED_REGION_CANCEL_FUSE_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:2251:8
+     |
+2251 | static SHARED_REGION_CANCEL_FUSE_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_shared_region_cancel_fuse_set` is never used
+    --> src/kernel/boot/mod.rs:2258:15
+     |
+2258 | pub(crate) fn maybe_log_shared_region_cancel_fuse_set() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_sched_timeout_enabled` is never used
+    --> src/kernel/boot/mod.rs:2837:15
+     |
+2837 | pub(crate) fn set_sched_timeout_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_vm_cow_enabled` is never used
+    --> src/kernel/boot/mod.rs:2869:15
+     |
+2869 | pub(crate) fn set_vm_cow_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `set_cap_cnode_enabled` is never used
+    --> src/kernel/boot/mod.rs:2893:15
+     |
+2893 | pub(crate) fn set_cap_cnode_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_fault_delivery_enabled` is never used
+    --> src/kernel/boot/mod.rs:2924:15
+     |
+2924 | pub(crate) fn set_fault_delivery_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_spawn_lifecycle_enabled` is never used
+    --> src/kernel/boot/mod.rs:2955:15
+     |
+2955 | pub(crate) fn set_spawn_lifecycle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_global_state_enabled` is never used
+    --> src/kernel/boot/mod.rs:2986:15
+     |
+2986 | pub(crate) fn set_global_state_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_cross_arch_d6_enabled` is never used
+    --> src/kernel/boot/mod.rs:3144:15
+     |
+3144 | pub(crate) fn set_cross_arch_d6_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_d3_full_enabled` is never used
+    --> src/kernel/boot/mod.rs:3176:15
+     |
+3176 | pub(crate) fn set_d3_full_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_recv_oracle_proof_enabled` is never used
+    --> src/kernel/boot/mod.rs:3305:15
+     |
+3305 | pub(crate) fn set_ipc_recv_oracle_proof_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_recv_proof_sender_wake_enabled` is never used
+    --> src/kernel/boot/mod.rs:3342:15
+     |
+3342 | pub(crate) fn set_ipc_recv_proof_sender_wake_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_plain_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3539:15
+     |
+3539 | pub(crate) fn set_ipc_send_plain_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_cap_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3561:15
+     |
+3561 | pub(crate) fn set_ipc_send_cap_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_reply_cap_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3583:15
+     |
+3583 | pub(crate) fn set_ipc_send_reply_cap_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_enqueue_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3604:15
+     |
+3604 | pub(crate) fn set_ipc_send_enqueue_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_cap_enqueue_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3626:15
+     |
+3626 | pub(crate) fn set_ipc_send_cap_enqueue_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_futex_wake_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3641:15
+     |
+3641 | pub(crate) fn set_aarch64_futex_wake_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_futex_wait_retire_enabled` is never used
+    --> src/kernel/boot/mod.rs:3659:15
+     |
+3659 | pub(crate) fn set_aarch64_futex_wait_retire_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_futex_wait_idle_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3674:15
+     |
+3674 | pub(crate) fn set_aarch64_futex_wait_idle_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_yield_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3688:15
+     |
+3688 | pub(crate) fn set_aarch64_yield_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_yield_lone_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3700:15
+     |
+3700 | pub(crate) fn set_aarch64_yield_lone_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_terminal_fault_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3723:15
+     |
+3723 | pub(crate) fn set_aarch64_terminal_fault_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_terminal_fault_fetch_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3763:15
+     |
+3763 | pub(crate) fn set_terminal_fault_fetch_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_terminal_fault_waiter_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3789:15
+     |
+3789 | pub(crate) fn set_terminal_fault_waiter_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_terminal_fault_portio_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3811:15
+     |
+3811 | pub(crate) fn set_terminal_fault_portio_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_terminal_fault_illegal_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3833:15
+     |
+3833 | pub(crate) fn set_terminal_fault_illegal_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_irq1_hosted_bridge_injection` is never used
+    --> src/kernel/boot/mod.rs:3866:15
+     |
+3866 | pub(crate) fn set_irq1_hosted_bridge_injection(armed: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_post_lock_foundation_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3891:15
+     |
+3891 | pub(crate) fn set_riscv_post_lock_foundation_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_futex_wake_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3909:15
+     |
+3909 | pub(crate) fn set_riscv_futex_wake_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_futex_wake_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3925:15
+     |
+3925 | pub(crate) fn set_x86_futex_wake_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_shared_region_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3943:15
+     |
+3943 | pub(crate) fn set_x86_shared_region_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_shared_region_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3964:15
+     |
+3964 | pub(crate) fn set_aarch64_shared_region_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_shared_region_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:3985:15
+     |
+3985 | pub(crate) fn set_riscv_shared_region_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipccall_direct_proof_enabled` is never used
+    --> src/kernel/boot/mod.rs:4012:15
+     |
+4012 | pub(crate) fn set_ipccall_direct_proof_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:4233:15
+     |
+4233 | pub(crate) fn set_x86_ipccall_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_smp_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:4271:15
+     |
+4271 | pub(crate) fn set_x86_ipccall_direct_smp_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_smp_recv_v2_server_enabled` is never used
+    --> src/kernel/boot/mod.rs:4310:15
+     |
+4310 | pub(crate) fn set_x86_ipccall_direct_smp_recv_v2_server_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_smp_request_enabled` is never used
+    --> src/kernel/boot/mod.rs:4331:15
+     |
+4331 | pub(crate) fn set_x86_ipccall_direct_smp_request_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipccall_direct_smp_request_note_early_wouldblock` is never used
+    --> src/kernel/boot/mod.rs:4352:15
+     |
+4352 | pub(crate) fn ipccall_direct_smp_request_note_early_wouldblock() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipccall_direct_smp_request_note_delivered` is never used
+    --> src/kernel/boot/mod.rs:4367:15
+     |
+4367 | pub(crate) fn ipccall_direct_smp_request_note_delivered() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipccall_direct_smp_reply_enabled` is never used
+    --> src/kernel/boot/mod.rs:4573:15
+     |
+4573 | pub(crate) fn set_x86_ipccall_direct_smp_reply_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_reply_note_delivered` is never used
+    --> src/kernel/boot/mod.rs:4591:15
+     |
+4591 | pub(crate) fn ipcreply_direct_smp_reply_note_delivered() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_reply_note_early_wouldblock` is never used
+    --> src/kernel/boot/mod.rs:4604:15
+     |
+4604 | pub(crate) fn ipcreply_direct_smp_reply_note_early_wouldblock() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_note_duplicate_refused` is never used
+    --> src/kernel/boot/mod.rs:4621:15
+     |
+4621 | pub(crate) fn ipcreply_direct_smp_note_duplicate_refused() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_echo_smp_oracle_block` is never used
+    --> src/kernel/boot/mod.rs:4726:15
+     |
+4726 | pub(crate) fn maybe_echo_smp_oracle_block(_cpu: u8, _tid: u64, _endpoint: usize, _wait_gen: u64) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_aarch64_ipccall_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:4760:15
+     |
+4760 | pub(crate) fn set_aarch64_ipccall_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_ipccall_direct_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:4782:15
+     |
+4782 | pub(crate) fn set_riscv_ipccall_direct_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_ipc_reply_timeout_oracle_mode` is never used
+    --> src/kernel/boot/mod.rs:5206:15
+     |
+5206 | pub(crate) fn set_x86_ipc_reply_timeout_oracle_mode(mode: u8) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_reply_timeout_oracle_reply_endpoint` is never used
+    --> src/kernel/boot/mod.rs:5218:15
+     |
+5218 | pub(crate) fn set_ipc_reply_timeout_oracle_reply_endpoint(eidx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `IPC_REPLY_TIMEOUT_RW_DEADLINE` is never used
+    --> src/kernel/boot/mod.rs:5225:8
+     |
+5225 | static IPC_REPLY_TIMEOUT_RW_DEADLINE: core::sync::atomic::AtomicU64 =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `IPC_REPLY_TIMEOUT_RW_LATE_EMITTED` is never used
+    --> src/kernel/boot/mod.rs:5227:8
+     |
+5227 | static IPC_REPLY_TIMEOUT_RW_LATE_EMITTED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_reply_timeout_rw_deadline` is never used
+    --> src/kernel/boot/mod.rs:5230:15
+     |
+5230 | pub(crate) fn set_ipc_reply_timeout_rw_deadline(tick: u64) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipc_reply_timeout_rw_deadline` is never used
+    --> src/kernel/boot/mod.rs:5233:15
+     |
+5233 | pub(crate) fn ipc_reply_timeout_rw_deadline() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipc_reply_timeout_rw_late_scan_once` is never used
+    --> src/kernel/boot/mod.rs:5237:15
+     |
+5237 | pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_emit_server_dies_link_balance` is never used
+    --> src/kernel/boot/mod.rs:6261:15
+     |
+6261 | pub(crate) fn maybe_emit_server_dies_link_balance(_msg: &str, _live_links: usize) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `slot` is never used
+    --> src/kernel/boot/mod.rs:6402:19
+     |
+6401 | impl ServerDeathWorkReservation {
+     | ------------------------------- method in this implementation
+6402 |     pub(crate) fn slot(&self) -> usize {
+     |                   ^^^^
+
+warning: function `server_death_work_len` is never used
+    --> src/kernel/boot/mod.rs:6506:15
+     |
+6506 | pub(crate) fn server_death_work_len(cpu_idx: usize) -> usize {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_clear` is never used
+    --> src/kernel/boot/mod.rs:6518:15
+     |
+6518 | pub(crate) fn server_death_work_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_published_count` is never used
+    --> src/kernel/boot/mod.rs:6730:15
+     |
+6730 | pub(crate) fn server_death_work_published_count() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_drained_count` is never used
+    --> src/kernel/boot/mod.rs:6733:15
+     |
+6733 | pub(crate) fn server_death_work_drained_count() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `emit_ipccall_direct_request_live_markers` is never used
+    --> src/kernel/boot/mod.rs:7382:15
+     |
+7382 | pub(crate) fn emit_ipccall_direct_request_live_markers() {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `emit_ipcreply_direct_live_markers` is never used
+    --> src/kernel/boot/mod.rs:7393:15
+     |
+7393 | pub(crate) fn emit_ipcreply_direct_live_markers() {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_force_init_zc_load_fail` is never used
+    --> src/kernel/boot/mod.rs:8307:15
+     |
+8307 | pub(crate) fn set_force_init_zc_load_fail(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_riscv_typed_outcome_internal_error_oracle_enabled` is never used
+    --> src/kernel/boot/mod.rs:8322:15
+     |
+8322 | pub(crate) fn set_riscv_typed_outcome_internal_error_oracle_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `SHARED_REGION_ORACLE_PAGES` is never used
+    --> src/kernel/boot/mod.rs:8513:18
+     |
+8513 | pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_residual1_queued_cap_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8568:15
+     |
+8568 | pub(crate) fn set_ipc_residual1_queued_cap_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_residual2_park_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8592:15
+     |
+8592 | pub(crate) fn set_ipc_residual2_park_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_send_final_fault_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8621:15
+     |
+8621 | pub(crate) fn set_ipc_send_final_fault_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_timer5_idle_return_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8663:15
+     |
+8663 | pub(crate) fn set_timer5_idle_return_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_displace1_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8688:15
+     |
+8688 | pub(crate) fn set_ipc_displace1_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `note_recv_broad_entry` is never used
+    --> src/kernel/boot/mod.rs:8953:15
+     |
+8953 | pub(crate) fn note_recv_broad_entry() {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_xfer2_grant_witness_enabled` is never used
+    --> src/kernel/boot/mod.rs:8967:15
+     |
+8967 | pub(crate) fn set_xfer2_grant_witness_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `shared_region_oracle_pattern_byte` is never used
+    --> src/kernel/boot/mod.rs:9321:21
+     |
+9321 | pub(crate) const fn shared_region_oracle_pattern_byte(off: usize) -> u8 {
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `find_current_task_cap_for_memory_object_phys` is never used
+   --> src/kernel/boot/capability_lifecycle_state.rs:808:19
+    |
+  7 | impl KernelState {
+    | ---------------- method in this implementation
+...
+808 |     pub(crate) fn find_current_task_cap_for_memory_object_phys(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `resolved_cap_object_split` is never used
+    --> src/kernel/boot/capability_lifecycle_state.rs:1072:19
+     |
+1063 | impl crate::runtime::SharedKernel {
+     | --------------------------------- method in this implementation
+...
+1072 |     pub(crate) fn resolved_cap_object_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `observe_user_marker` is never used
+   --> src/kernel/boot/smp_request_txn.rs:214:15
+    |
+214 | pub(crate) fn observe_user_marker(msg: &str, tid: u64, cpu: u8) {
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ALL_COW_CLONE_SITES` is never used
+  --> src/kernel/boot/cow_clone.rs:79:18
+   |
+79 | pub(crate) const ALL_COW_CLONE_SITES: [&str; 8] = [
+   |                  ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CowPageRecord` is never constructed
+   --> src/kernel/boot/defs.rs:219:19
+    |
+219 | pub(crate) struct CowPageRecord {
+    |                   ^^^^^^^^^^^^^
+
+warning: associated items `for_bare_tid` and `asid` are never used
+   --> src/kernel/boot/defs.rs:269:19
+    |
+261 | impl EndpointWaiterRecord {
+    | ------------------------- associated items in this implementation
+...
+269 |     pub(crate) fn for_bare_tid(tid: ThreadId) -> Self {
+    |                   ^^^^^^^^^^^^
+...
+284 |     pub(crate) fn asid(&self) -> Asid {
+    |                   ^^^^
+
+warning: function `ap_probe_stub_bytes` is never used
+   --> src/kernel/boot/exec_state.rs:168:15
+    |
+168 | pub(crate) fn ap_probe_stub_bytes() -> &'static [u8] {
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `d2_recv_switch_incoming_asid` and `d6_emit_proof_cleanup_arch_markers` are never used
+    --> src/kernel/boot/exec_state.rs:2523:19
+     |
+ 426 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+2523 |     pub(crate) fn d2_recv_switch_incoming_asid(&mut self, incoming: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3102 |     pub(crate) fn d6_emit_proof_cleanup_arch_markers(&mut self) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `queue_advance_admit_with_authority_split` is never used
+    --> src/kernel/boot/exec_state.rs:4465:19
+     |
+4282 | impl crate::runtime::SharedKernel {
+     | --------------------------------- method in this implementation
+...
+4465 |     pub(crate) fn queue_advance_admit_with_authority_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `fault_current_task_for_test` and `fault_current_task_unsupported_instruction` are never used
+    --> src/kernel/boot/fault_state.rs:1899:19
+     |
+1188 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+1899 |     pub(crate) fn fault_current_task_for_test(&mut self) -> Result<(), KernelError> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2034 |     pub(crate) fn fault_current_task_unsupported_instruction(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `remove_endpoint_waiter_exact` is never used
+   --> src/kernel/boot/ipc_state.rs:990:19
+    |
+723 | impl IpcSubsystem {
+    | ----------------- method in this implementation
+...
+990 |     pub(crate) fn remove_endpoint_waiter_exact(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `reserve_direct_reply_record_locked` is never used
+    --> src/kernel/boot/ipc_state.rs:1507:15
+     |
+1507 | pub(crate) fn reserve_direct_reply_record_locked(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `classify_direct_reply_terminal_locked` is never used
+    --> src/kernel/boot/ipc_state.rs:1544:15
+     |
+1544 | pub(crate) fn classify_direct_reply_terminal_locked(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `DirectReplyTerminalClaim` is never used
+    --> src/kernel/boot/ipc_state.rs:1638:17
+     |
+1638 | pub(crate) enum DirectReplyTerminalClaim {
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `claim_direct_reply_terminal_locked` is never used
+    --> src/kernel/boot/ipc_state.rs:1655:15
+     |
+1655 | pub(crate) fn claim_direct_reply_terminal_locked(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `commit_queued_reply_locked` is never used
+    --> src/kernel/boot/ipc_state.rs:1758:15
+     |
+1758 | pub(crate) fn commit_queued_reply_locked(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: multiple methods are never used
+    --> src/kernel/boot/ipc_state.rs:2253:19
+     |
+2075 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+2253 |     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2364 |     pub(crate) fn complete_server_death_for_link(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2412 |     pub(crate) fn revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2434 |     pub(crate) fn reserve_direct_reply_record(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2449 |     pub(crate) fn commit_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2556 |     pub(crate) fn unregister_server_reply_link(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2643 |     pub(crate) fn live_server_reply_link_count(&self) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2655 |     pub(crate) fn cancel_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2684 |     pub(crate) fn bind_direct_reply_record_server_cap(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2724 |     pub(crate) fn reply_terminal_armed_identity(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2799 |     pub(crate) fn rearm_terminal_for_reply_record(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2849 |     pub(crate) fn try_claim_reply_terminal_slot(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2870 |     pub(crate) fn commit_reply_terminal_slot(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2882 |     pub(crate) fn release_reply_terminal_slot_if_retryable(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2968 |     pub(crate) fn claim_deadline_fire_exact(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2981 |     pub(crate) fn cancel_deadline_exact(
+     |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+2995 |     pub(crate) fn disarm_deadline_after_terminal_completion(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3010 |     pub(crate) fn complete_deadline_fire(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+3024 |     pub(crate) fn disarm_deadline_fire(
+     |                   ^^^^^^^^^^^^^^^^^^^^
+...
+3040 |     pub(crate) fn claim_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3054 |     pub(crate) fn complete_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3069 |     pub(crate) fn restore_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3319 |     pub(crate) fn take_blocked_syscall_completion(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3343 |     pub(crate) fn take_blocked_syscall_completion_of_class(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3548 |     pub(crate) fn reply_record_slot_generation(&self, index: usize) -> Option<u64> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3555 |     pub(crate) fn set_pending_syscall_completion_for_test(&mut self, tid: u64, result: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3565 |     pub(crate) fn set_pending_syscall_completion_of_class_for_test(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3604 |     pub(crate) fn blocked_recv_generation_for_test(&self, tid: u64) -> Option<u64> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3626 |     pub(crate) fn seed_resumable_user_context_for_test(&mut self, tid: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3636 |     pub(crate) fn set_task_status_for_test(&mut self, tid: u64, status: TaskStatus) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3644 |     pub(crate) fn has_pending_syscall_completion(&self, tid: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4214 |     pub(crate) fn run_reply_timeout_completion_locked(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+6865 |     pub(crate) fn try_ipc_send_boundary_split_plain_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+6934 |     pub(crate) fn try_ipc_send_boundary_split_ordinary_cap_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+7043 |     pub(crate) fn try_ipc_send_boundary_split_reply_cap_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `mark_cow_page` and `clone_user_address_space_cow` are never used
+   --> src/kernel/boot/memory_state.rs:46:8
+    |
+ 13 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+ 46 |     fn mark_cow_page(&mut self, asid: Asid, virt: VirtAddr) -> Result<(), KernelError> {
+    |        ^^^^^^^^^^^^^
+...
+429 |     pub(crate) fn clone_user_address_space_cow(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `x86_smp_unlock_audit_claimed` is never used
+  --> src/kernel/boot/orchestrator_state.rs:23:15
+   |
+23 | pub(crate) fn x86_smp_unlock_audit_claimed() -> bool {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `run_cross_arch_live_audit_at_first_dispatch`, `run_unlock_graduated_proof_at_bootstrap`, `resolve_endpoint_send_cap_in_pid_from_raw`, `resolve_reply_cap_in_pid_from_raw`, `process_cnode_for_pid_from_raw`, and `process_cnode_for_identity_from_raw` are never used
+    --> src/kernel/boot/orchestrator_state.rs:885:19
+     |
+ 100 | impl KernelState {
+     | ---------------- associated items in this implementation
+...
+ 885 |     pub(crate) fn run_cross_arch_live_audit_at_first_dispatch(&self, tid: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1413 |     pub(crate) fn run_unlock_graduated_proof_at_bootstrap(&mut self, tid: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2723 |     pub(crate) unsafe fn resolve_endpoint_send_cap_in_pid_from_raw(
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2767 |     pub(crate) unsafe fn resolve_reply_cap_in_pid_from_raw(
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2800 |     pub(crate) unsafe fn process_cnode_for_pid_from_raw(
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2826 |     pub(crate) unsafe fn process_cnode_for_identity_from_raw(
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `nothing_created` is never used
+  --> src/kernel/boot/process_cnode_txn.rs:91:25
+   |
+88 | impl ProcessCNodeGrant {
+   | ---------------------- associated function in this implementation
+...
+91 |     pub(crate) const fn nothing_created(cnode: CNodeId) -> Self {
+   |                         ^^^^^^^^^^^^^^^
+
+warning: methods `withdraw_queued_tid_on`, `on_dispatch_selection_on_cpu`, `on_preempt_prefer_current_cpu`, `task_home_cpu`, and `apply_cross_cpu_wake_task_for_test` are never used
+   --> src/kernel/boot/scheduler_state.rs:63:19
+    |
+ 23 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+ 63 |     pub(crate) fn withdraw_queued_tid_on(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+156 |     pub(crate) fn on_dispatch_selection_on_cpu(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+318 |     pub(crate) fn on_preempt_prefer_current_cpu(&mut self, preferred: u64) -> Option<u64> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+603 |     pub(crate) fn task_home_cpu(&self, tid: u64) -> Option<CpuId> {
+    |                   ^^^^^^^^^^^^^
+...
+780 |     pub(crate) fn apply_cross_cpu_wake_task_for_test(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `shared_region_request_cancel`, `shared_region_execute`, and `rollback_shared_region_direct_txn` are never used
+   --> src/kernel/boot/shared_region_txn.rs:248:19
+    |
+233 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+248 |     pub(crate) fn shared_region_request_cancel(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+437 |     pub(crate) fn shared_region_execute(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+452 |     pub(crate) fn rollback_shared_region_direct_txn(&mut self, txn: &mut SharedRegionDirectTxn) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `thread_control_block_snapshot_for_test` and `set_blocked_recv_generation_for_test` are never used
+   --> src/kernel/boot/task_policy_state.rs:143:19
+    |
+  9 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+143 |     pub(crate) fn thread_control_block_snapshot_for_test(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+153 |     pub(crate) fn set_blocked_recv_generation_for_test(&mut self, tid: u64, generation: u64) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+    --> src/kernel/boot/thread_state.rs:324:8
+     |
+ 323 | impl KernelState {
+     | ---------------- associated items in this implementation
+ 324 |     fn fork_should_inherit_capability(object: CapObject) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 340 |     fn inherit_parent_capabilities_for_fork(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 438 |     pub(crate) fn clear_blocked_recv_return_regs_locked(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1270 |     pub(crate) fn d6_ensure_live_rsp_region_mapped(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2516 |     pub(crate) fn snapshot_async_preempted_current(&mut self, frame: &TrapFrame) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2545 |     pub(crate) fn take_async_preempt_for_incoming(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2558 |     pub(crate) fn cancel_async_preempt_for(&mut self, tid: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2567 |     pub(crate) fn async_preempted_resume_pending(&mut self, tid: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `update_active_transfer_mapping_len_locked` is never used
+   --> src/kernel/boot/transfer_state.rs:426:19
+    |
+  6 | impl KernelState {
+    | ---------------- associated function in this implementation
+...
+426 |     pub(crate) fn update_active_transfer_mapping_len_locked(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variants `DirectRequest`, `DirectReply`, `OrdinaryTimeout`, and `Notification` are never constructed
+   --> src/kernel/boot/waiter_ownership.rs:145:5
+    |
+143 | pub(crate) enum WaiterOwner {
+    |                 ----------- variants in this enum
+144 |     /// The off-lock NR6 direct request transaction.
+145 |     DirectRequest,
+    |     ^^^^^^^^^^^^^
+146 |     /// The off-lock NR7 direct reply transaction.
+147 |     DirectReply,
+    |     ^^^^^^^^^^^
+148 |     /// The ordinary (non-token-bearing) IPC deadline scan.
+149 |     OrdinaryTimeout,
+    |     ^^^^^^^^^^^^^^^
+...
+153 |     Notification,
+    |     ^^^^^^^^^^^^
+    |
+    = note: `WaiterOwner` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `owner`, `endpoint_index`, and `waiter` are never used
+   --> src/kernel/boot/waiter_ownership.rs:314:19
+    |
+312 | impl WaiterClaimToken {
+    | --------------------- methods in this implementation
+313 |     /// Which owner earned this claim — so a future owner can log and assert its own identity.
+314 |     pub(crate) fn owner(&self) -> WaiterOwner {
+    |                   ^^^^^
+...
+320 |     pub(crate) fn endpoint_index(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^
+...
+326 |     pub(crate) fn waiter(&self) -> ReceiverWaiterIdentity {
+    |                   ^^^^^^
+
+warning: methods `claimed_count` and `occupied_count` are never used
+   --> src/kernel/boot/waiter_ownership.rs:720:8
+    |
+494 | impl WaiterOwnershipTable {
+    | ------------------------- methods in this implementation
+...
+720 |     fn claimed_count(&self) -> usize {
+    |        ^^^^^^^^^^^^^
+...
+729 |     fn occupied_count(&self) -> usize {
+    |        ^^^^^^^^^^^^^^
+
+warning: methods `waiter_ownership_claimed_count` and `waiter_ownership_occupied_count` are never used
+   --> src/kernel/boot/waiter_ownership.rs:785:19
+    |
+740 | impl IpcSubsystem {
+    | ----------------- methods in this implementation
+...
+785 |     pub(crate) fn waiter_ownership_claimed_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+789 |     pub(crate) fn waiter_ownership_occupied_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `publish` is never used
+    --> src/kernel/boot/mod.rs:7510:19
+     |
+7510 |     pub(crate) fn publish(ack: BlockedServerAck) -> u64 {
+     |                   ^^^^^^^
+
+warning: function `publish` is never used
+    --> src/kernel/boot/mod.rs:7994:19
+     |
+7994 |     pub(crate) fn publish(ack: BlockedCallerAck) -> u64 {
+     |                   ^^^^^^^
+
+warning: constant `BOOT_COMMAND_LINE_MAX_BYTES` is never used
+  --> src/kernel/boot_command_line.rs:10:11
+   |
+10 | pub const BOOT_COMMAND_LINE_MAX_BYTES: usize = 2048;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `YARM_BOOT_OPTION_MAX_KEY_BYTES` is never used
+  --> src/kernel/boot_command_line.rs:11:11
+   |
+11 | pub const YARM_BOOT_OPTION_MAX_KEY_BYTES: usize = 64;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `YARM_BOOT_OPTION_MAX_VALUE_BYTES` is never used
+  --> src/kernel/boot_command_line.rs:12:11
+   |
+12 | pub const YARM_BOOT_OPTION_MAX_VALUE_BYTES: usize = 1024;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `YARM_MANIFEST_PATH_MAX_BYTES` is never used
+  --> src/kernel/boot_command_line.rs:13:11
+   |
+13 | pub const YARM_MANIFEST_PATH_MAX_BYTES: usize = 255;
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `BootCommandLineStatus` is never used
+  --> src/kernel/boot_command_line.rs:16:10
+   |
+16 | pub enum BootCommandLineStatus {
+   |          ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `BootCommandLine` is never constructed
+  --> src/kernel/boot_command_line.rs:23:12
+   |
+23 | pub struct BootCommandLine {
+   |            ^^^^^^^^^^^^^^^
+
+warning: associated items `absent`, `set_raw_cmdline_from_bytes`, `raw_cmdline`, `status`, `cmdline_was_truncated`, and `set_raw_cmdline_from_bytes_monotonic` are never used
+  --> src/kernel/boot_command_line.rs:40:18
+   |
+39 | impl BootCommandLine {
+   | -------------------- associated items in this implementation
+40 |     pub const fn absent() -> Self {
+   |                  ^^^^^^
+...
+53 |     pub fn set_raw_cmdline_from_bytes(&mut self, source: &[u8]) {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+68 |     pub fn raw_cmdline(&self) -> &[u8] {
+   |            ^^^^^^^^^^^
+...
+72 |     pub const fn status(&self) -> BootCommandLineStatus {
+   |                  ^^^^^^
+...
+76 |     pub const fn cmdline_was_truncated(&self) -> bool {
+   |                  ^^^^^^^^^^^^^^^^^^^^^
+...
+90 |     pub fn set_raw_cmdline_from_bytes_monotonic(&mut self, source: &[u8]) -> bool {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `BOOT_COMMAND_LINE` is never used
+   --> src/kernel/boot_command_line.rs:103:8
+    |
+103 | static BOOT_COMMAND_LINE: SpinLock<BootCommandLine> = SpinLock::new(BootCommandLine::absent());
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: function `apply_boot_option_knobs` is never used
+   --> src/kernel/boot_command_line.rs:115:4
+    |
+115 | fn apply_boot_option_knobs(captured: &BootCommandLine) {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_raw_cmdline_from_bytes` is never used
+   --> src/kernel/boot_command_line.rs:675:8
+    |
+675 | pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_raw_cmdline_from_bytes_monotonic` is never used
+   --> src/kernel/boot_command_line.rs:690:8
+    |
+690 | pub fn set_raw_cmdline_from_bytes_monotonic(source: &[u8]) -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `boot_command_line` is never used
+   --> src/kernel/boot_command_line.rs:704:8
+    |
+704 | pub fn boot_command_line() -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: enum `PlatformOption` is never used
+   --> src/kernel/boot_command_line.rs:709:10
+    |
+709 | pub enum PlatformOption {
+    |          ^^^^^^^^^^^^^^
+
+warning: enum `BootPhase` is never used
+   --> src/kernel/boot_command_line.rs:717:10
+    |
+717 | pub enum BootPhase {
+    |          ^^^^^^^^^
+
+warning: struct `YarmBootOptions` is never constructed
+   --> src/kernel/boot_command_line.rs:727:12
+    |
+727 | pub struct YarmBootOptions<'a> {
+    |            ^^^^^^^^^^^^^^^
+
+warning: function `parse_loglevel_value` is never used
+    --> src/kernel/boot_command_line.rs:1093:4
+     |
+1093 | fn parse_loglevel_value(value: &[u8]) -> Option<u8> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_yarm_boot_options` is never used
+    --> src/kernel/boot_command_line.rs:1114:8
+     |
+1114 | pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_bool_knob` is never used
+    --> src/kernel/boot_command_line.rs:1444:4
+     |
+1444 | fn parse_bool_knob(value: &[u8]) -> Option<bool> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `parse_platform_option` is never used
+    --> src/kernel/boot_command_line.rs:1452:4
+     |
+1452 | fn parse_platform_option(value: &[u8]) -> Option<PlatformOption> {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_boot_phase` is never used
+    --> src/kernel/boot_command_line.rs:1461:4
+     |
+1461 | fn parse_boot_phase(value: &[u8]) -> Option<BootPhase> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_positive_usize` is never used
+    --> src/kernel/boot_command_line.rs:1472:4
+     |
+1472 | fn parse_positive_usize(value: &[u8]) -> Option<usize> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `valid_manifest_path` is never used
+    --> src/kernel/boot_command_line.rs:1488:4
+     |
+1488 | fn valid_manifest_path(path: &[u8]) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `NO_ENDPOINT` is never used
+   --> src/kernel/direct_ack_store.rs:180:7
+    |
+180 | const NO_ENDPOINT: usize = usize::MAX;
+    |       ^^^^^^^^^^^
+
+warning: methods `released_seq` and `is_anomaly` are never used
+   --> src/kernel/direct_ack_store.rs:374:19
+    |
+372 | impl AckRelease {
+    | --------------- methods in this implementation
+373 |     /// The retired publication sequence, when this call is the one that ended the lease.
+374 |     pub(crate) fn released_seq(self) -> Option<u64> {
+    |                   ^^^^^^^^^^^^
+...
+389 |     pub(crate) fn is_anomaly(self) -> bool {
+    |                   ^^^^^^^^^^
+
+warning: field `admission` is never read
+   --> src/kernel/direct_ack_store.rs:504:5
+    |
+491 | pub(crate) struct DirectAckStore {
+    |                   -------------- field in this struct
+...
+504 |     admission: AtomicBool,
+    |     ^^^^^^^^^
+    |
+    = note: `DirectAckStore` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: methods `live_lease_at`, `duplicate_live_incarnations`, and `live_pair_count_scan` are never used
+    --> src/kernel/direct_ack_store.rs:1120:19
+     |
+ 541 | impl DirectAckStore {
+     | ------------------- methods in this implementation
+...
+1120 |     pub(crate) fn live_lease_at(&self, endpoint_index: usize) -> Option<(u64, AckWaiter)> {
+     |                   ^^^^^^^^^^^^^
+...
+1137 |     pub(crate) fn duplicate_live_incarnations(&self) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1170 |     pub(crate) fn live_pair_count_scan(&self) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `None` is never constructed
+  --> src/kernel/dispatch_post_work.rs:96:5
+   |
+92 | pub(crate) enum DispatchPostWork {
+   |                 ---------------- variant in this enum
+...
+96 |     None,
+   |     ^^^^
+   |
+   = note: `DispatchPostWork` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: associated items `build` and `payload` are never used
+  --> src/kernel/ipccall_direct.rs:67:19
+   |
+63 | impl IpcCallDirectSnapshot {
+   | -------------------------- associated items in this implementation
+...
+67 |     pub(crate) fn build(
+   |                   ^^^^^
+...
+88 |     pub(crate) fn payload(&self) -> &[u8] {
+   |                   ^^^^^^^
+
+warning: struct `IpcReplyDirectSnapshot` is never constructed
+  --> src/kernel/ipccall_direct.rs:99:19
+   |
+99 | pub(crate) struct IpcReplyDirectSnapshot {
+   |                   ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `build` and `payload` are never used
+   --> src/kernel/ipccall_direct.rs:113:19
+    |
+110 | impl IpcReplyDirectSnapshot {
+    | --------------------------- associated items in this implementation
+...
+113 |     pub(crate) fn build(
+    |                   ^^^^^
+...
+132 |     pub(crate) fn payload(&self) -> &[u8] {
+    |                   ^^^^^^^
+
+warning: enum `ReplyReservationError` is never used
+   --> src/kernel/ipccall_direct.rs:140:17
+    |
+140 | pub(crate) enum ReplyReservationError {
+    |                 ^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ReplyReservation` is never used
+   --> src/kernel/ipccall_direct.rs:167:17
+    |
+167 | pub(crate) enum ReplyReservation {
+    |                 ^^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src/kernel/ipccall_direct.rs:180:25
+    |
+179 | impl ReplyReservation {
+    | --------------------- associated items in this implementation
+180 |     pub(crate) const fn new() -> Self {
+    |                         ^^^
+...
+184 |     pub(crate) const fn is_available(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+...
+188 |     pub(crate) const fn is_reserved(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+192 |     pub(crate) const fn is_consumed(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+198 |     pub(crate) fn reserve(
+    |                   ^^^^^^^
+...
+218 |     pub(crate) fn release(
+    |                   ^^^^^^^
+...
+239 |     pub(crate) fn consume(
+    |                   ^^^^^^^
+
+warning: methods `is_committed` and `waiter_claim_key` are never used
+   --> src/kernel/ipccall_direct.rs:304:25
+    |
+299 | impl BlockedServerAck {
+    | --------------------- methods in this implementation
+...
+304 |     pub(crate) const fn is_committed(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+...
+310 |     pub(crate) const fn waiter_claim_key(&self) -> (usize, u64, ReceiverWaiterIdentity) {
+    |                         ^^^^^^^^^^^^^^^^
+
+warning: method `is_committed` is never used
+   --> src/kernel/ipccall_direct.rs:343:25
+    |
+341 | impl BlockedCallerAck {
+    | --------------------- method in this implementation
+342 |     /// Well-formed for a direct reply: committed RecvV2 with a payload destination.
+343 |     pub(crate) const fn is_committed(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+
+warning: enum `AckLeaseError` is never used
+   --> src/kernel/ipccall_direct.rs:350:17
+    |
+350 | pub(crate) enum AckLeaseError {
+    |                 ^^^^^^^^^^^^^
+
+warning: enum `AckLease` is never used
+   --> src/kernel/ipccall_direct.rs:373:17
+    |
+373 | pub(crate) enum AckLease {
+    |                 ^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src/kernel/ipccall_direct.rs:380:25
+    |
+379 | impl AckLease {
+    | ------------- associated items in this implementation
+380 |     pub(crate) const fn new_available() -> Self {
+    |                         ^^^^^^^^^^^^^
+...
+384 |     pub(crate) const fn is_available(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+...
+387 |     pub(crate) const fn is_claimed(&self) -> bool {
+    |                         ^^^^^^^^^^
+...
+390 |     pub(crate) const fn is_consumed(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+396 |     pub(crate) fn claim(&mut self, commit_seq: u64) -> Result<(), AckLeaseError> {
+    |                   ^^^^^
+...
+408 |     pub(crate) fn consume(&mut self, commit_seq: u64) -> Result<(), AckLeaseError> {
+    |                   ^^^^^^^
+...
+421 |     pub(crate) fn restore(&mut self, commit_seq: u64) -> Result<(), AckLeaseError> {
+    |                   ^^^^^^^
+...
+433 |     pub(crate) fn discard(&mut self) {
+    |                   ^^^^^^^
+
+warning: methods `drain_direct_request_post_work`, `direct_server_exact_still_blocked`, `rollback_direct_request_after_commit`, `settle_lease_pre_claim`, and `ipc_call_direct_request_txn` are never used
+   --> src/kernel/ipccall_direct_txn.rs:123:19
+    |
+113 | impl SharedKernel {
+    | ----------------- methods in this implementation
+...
+123 |     pub(crate) fn drain_direct_request_post_work(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+236 |     fn direct_server_exact_still_blocked(&self, ack: &BlockedServerAck) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+281 |     fn rollback_direct_request_after_commit(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+331 |     fn settle_lease_pre_claim(&self, ack: &BlockedServerAck, lease: &mut AckLease, seq: u64) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+...
+344 |     pub(crate) fn ipc_call_direct_request_txn(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `DirectReplyPostWork` is never constructed
+   --> src/kernel/ipccall_direct_txn.rs:850:19
+    |
+850 | pub(crate) struct DirectReplyPostWork {
+    |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `direct_caller_exact_still_blocked`, `ipc_reply_direct_txn`, `settle_reply_pre_reserve`, `settle_reply_after_reserve`, and `drain_direct_reply_post_work` are never used
+    --> src/kernel/ipccall_direct_txn.rs:860:8
+     |
+ 856 | impl SharedKernel {
+     | ----------------- methods in this implementation
+...
+ 860 |     fn direct_caller_exact_still_blocked(&self, ack: &BlockedCallerAck) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 878 |     pub(crate) fn ipc_reply_direct_txn(
+     |                   ^^^^^^^^^^^^^^^^^^^^
+...
+1221 |     fn settle_reply_pre_reserve(&self, ack: &BlockedCallerAck, lease: &mut AckLease, seq: u64) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1233 |     fn settle_reply_after_reserve(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1256 |     pub(crate) fn drain_direct_reply_post_work(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated functions `from_recv_v2`, `from_legacy_mapped_recv`, and `from_v3_abi_request` are never used
+   --> src/kernel/recv_core.rs:256:19
+    |
+166 | impl RecvRequest {
+    | ---------------- associated functions in this implementation
+...
+256 |     pub(crate) fn from_recv_v2(
+    |                   ^^^^^^^^^^^^
+...
+299 |     pub(crate) fn from_legacy_mapped_recv(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+333 |     pub(crate) fn from_v3_abi_request(
+    |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: function `peek_recv_core_user_plain` is never used
+   --> src/kernel/recv_core.rs:766:15
+    |
+766 | pub(crate) fn peek_recv_core_user_plain(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_user_asid_plain_writeback` is never used
+   --> src/kernel/recv_core.rs:803:15
+    |
+803 | pub(crate) fn execute_user_asid_plain_writeback(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `produce_queued_shared_region_delivery` is never used
+    --> src/kernel/syscall.rs:1380:15
+     |
+1380 | pub(crate) fn produce_queued_shared_region_delivery(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `into_legacy_option` is never used
+    --> src/kernel/syscall.rs:1942:19
+     |
+1933 | impl RecvImmediateOutcome {
+     | ------------------------- method in this implementation
+...
+1942 |     pub(crate) fn into_legacy_option(self) -> Option<Result<(), TrapHandleError>> {
+     |                   ^^^^^^^^^^^^^^^^^^
+
+warning: function `transfer_cap_arg_value` is never used
+  --> src/kernel/syscall/ipc_abi.rs:58:15
+   |
+58 | pub(crate) fn transfer_cap_arg_value(frame: &TrapFrame) -> Option<CapId> {
+   |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `frame_reply_message_with_cap` is never used
+  --> src/kernel/syscall/ipc_abi.rs:68:15
+   |
+68 | pub(crate) fn frame_reply_message_with_cap(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `frame_call_request_message` is never used
+  --> src/kernel/syscall/ipc_abi.rs:91:15
+   |
+91 | pub(crate) fn frame_call_request_message(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new` and `try_take` are never used
+   --> src/kernel/syscall/process.rs:272:25
+    |
+271 | impl<const N: usize> TakeOnceStagingBuffer<N> {
+    | --------------------------------------------- associated items in this implementation
+272 |     pub(super) const fn new() -> Self {
+    |                         ^^^
+...
+281 |     pub(super) fn try_take(&'static self) -> Option<StagingBufferClaim<'static, N>> {
+    |                   ^^^^^^^^
+
+warning: struct `StagingBufferClaim` is never constructed
+   --> src/kernel/syscall/process.rs:292:19
+    |
+292 | pub(super) struct StagingBufferClaim<'a, const N: usize> {
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: method `as_mut_slice` is never used
+   --> src/kernel/syscall/process.rs:297:19
+    |
+296 | impl<'a, const N: usize> StagingBufferClaim<'a, N> {
+    | -------------------------------------------------- method in this implementation
+297 |     pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
+    |                   ^^^^^^^^^^^^
+
+warning: function `write_v3_output_to_user` is never used
+   --> src/kernel/syscall/recv_shared_v3.rs:144:4
+    |
+144 | fn write_v3_output_to_user(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `read_user` is never used
+  --> src/kernel/syscall/recv_v3_txn.rs:82:8
+   |
+77 | pub(crate) trait RecvV3Owners {
+   |                  ------------ method in this trait
+...
+82 |     fn read_user(&mut self, asid: Asid, ptr: usize, len: usize) -> Option<[u8; 80]>;
+   |        ^^^^^^^^^
+
+warning: method `len` is never used
+   --> src/kernel/syscall/spawn_image_txn.rs:195:25
+    |
+168 | impl SpawnLedger {
+    | ---------------- method in this implementation
+...
+195 |     pub(crate) const fn len(&self) -> usize {
+    |                         ^^^
+
+warning: field `asid` is never read
+   --> src/kernel/syscall/spawn_image_txn.rs:369:16
+    |
+364 | pub(crate) struct SpawnImageCommitted {
+    |                   ------------------- field in this struct
+...
+369 |     pub(crate) asid: Asid,
+    |                ^^^^
+
+warning: variant `NoAsid` is never constructed
+   --> src/kernel/syscall/xfer_txn.rs:140:5
+    |
+122 | pub(crate) enum XferRefusal {
+    |                 ----------- variant in this enum
+...
+140 |     NoAsid,
+    |     ^^^^^^
+    |
+    = note: `XferRefusal` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variant `TimerIdleQueueAdvance` is never constructed
+    --> src/kernel/syscall_split.rs:2285:5
+     |
+2206 | pub(crate) enum SplitDispatchDisposition {
+     |                 ------------------------ variant in this enum
+...
+2285 |     TimerIdleQueueAdvance,
+     |     ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `SplitDispatchDisposition` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `try_split_blocking_ipc_recv_into_frame` is never used
+    --> src/kernel/syscall_split.rs:4888:4
+     |
+4888 | fn try_split_blocking_ipc_recv_into_frame(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `AsyncResumeClass` is never used
+   --> src/kernel/task.rs:640:17
+    |
+640 | pub(crate) enum AsyncResumeClass {
+    |                 ^^^^^^^^^^^^^^^^
+
+warning: method `restores_verbatim` is never used
+   --> src/kernel/task.rs:656:19
+    |
+653 | impl AsyncResumeClass {
+    | --------------------- method in this implementation
+...
+656 |     pub(crate) fn restores_verbatim(self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: function `classify_and_take_async_resume` is never used
+   --> src/kernel/task.rs:712:15
+    |
+712 | pub(crate) fn classify_and_take_async_resume(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resume_boundary_consumes` is never used
+   --> src/kernel/task.rs:766:21
+    |
+766 | pub(crate) const fn resume_boundary_consumes(class: BlockedSyscallClass) -> bool {
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `cancel_async_resume` is never used
+   --> src/kernel/task.rs:788:15
+    |
+788 | pub(crate) fn cancel_async_resume(tcbs: &mut [Option<ThreadControlBlock>], tid: u64) -> bool {
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: function `publish_async_preempt_snapshot` is never used
+   --> src/kernel/task.rs:821:15
+    |
+821 | pub(crate) fn publish_async_preempt_snapshot(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `OwnerRevalidation` is never used
+   --> src/runtime.rs:336:17
+    |
+336 | pub(crate) enum OwnerRevalidation {
+    |                 ^^^^^^^^^^^^^^^^^
+
+warning: enum `OwnerCommit` is never used
+   --> src/runtime.rs:439:17
+    |
+439 | pub(crate) enum OwnerCommit {
+    |                 ^^^^^^^^^^^
+
+warning: method `disposition` is never used
+   --> src/runtime.rs:455:19
+    |
+451 | impl OwnerRevalidation {
+    | ---------------------- method in this implementation
+...
+455 |     pub(crate) fn disposition(self) -> OwnerCommit {
+    |                   ^^^^^^^^^^^
+
+warning: method `marker` is never used
+   --> src/runtime.rs:840:19
+    |
+830 | impl CpuDispatch {
+    | ---------------- method in this implementation
+...
+840 |     pub(crate) fn marker(self) -> &'static str {
+    |                   ^^^^^^
+
+warning: method `provenance` is never used
+   --> src/runtime.rs:993:19
+    |
+946 | impl DispatchMarkToken {
+    | ---------------------- method in this implementation
+...
+993 |     pub(crate) fn provenance(&self) -> crate::kernel::scheduler::DispatchSelection {
+    |                   ^^^^^^^^^^
+
+warning: struct `PostLockExitValidation` is never constructed
+    --> src/runtime.rs:1020:19
+     |
+1020 | pub(crate) struct PostLockExitValidation {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `DispatchDisposition` is never used
+    --> src/runtime.rs:1303:17
+     |
+1303 | pub(crate) enum DispatchDisposition {
+     |                 ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `token` and `disposition` are never used
+    --> src/runtime.rs:1432:19
+     |
+1427 | impl DispatchMarkOutcome {
+     | ------------------------ methods in this implementation
+...
+1432 |     pub(crate) fn token(self) -> Option<DispatchMarkToken> {
+     |                   ^^^^^
+...
+1440 |     pub(crate) fn disposition(self) -> DispatchDisposition {
+     |                   ^^^^^^^^^^^
+
+warning: multiple methods are never used
+     --> src/runtime.rs:2431:19
+      |
+ 1576 | impl SharedKernel {
+      | ----------------- methods in this implementation
+...
+ 2431 |     pub(crate) fn revalidate_idle_owner_after_drains(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2502 |     pub(crate) fn owner_revalidation_select_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2557 |     pub(crate) fn owner_revalidation_claim_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2676 |     fn owner_revalidation_rollback_split(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2951 |     pub(crate) fn stale_dispatch_mark_token_for_test(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 2970 |     pub(crate) fn continued_dispatch_mark_token_for_test(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3219 |     pub(crate) fn server_reply_link_for_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3414 |     pub(crate) fn timer_would_preempt_split_read(&self, cpu: CpuId) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3488 |     pub(crate) fn scheduler_tick_if_no_switch_split_mut(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 4939 |     pub(crate) fn split_return_take_tls_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5007 |     pub(crate) fn direct_dispatch_observe_outgoing_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5150 |     pub(crate) fn direct_dispatch_current_agrees_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5320 |     pub(crate) fn direct_dispatch_take_completion_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5364 |     pub(crate) fn take_async_preempt_for_incoming_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5391 |     pub(crate) fn snapshot_async_preempted_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5407 |     pub(crate) fn cancel_async_preempt_for_split(&self, tid: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5471 |     pub(crate) fn post_lock_exit_validation_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 6624 |     pub(crate) fn terminal_idle_on_cpu_split(&self, cpu: CpuId) -> Result<bool, KernelError> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 6875 |     pub(crate) fn commit_user_fpu_current_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 6897 |     pub(crate) fn settle_user_fpu_return_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 6923 |     pub(crate) fn ap_saved_resume_current_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 7172 |     pub(crate) fn recv_block_phase_b_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 7316 |     pub(crate) fn cancel_deadline_exact_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 7337 |     pub(crate) fn publish_reply_timeout_token_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 8482 |     pub(crate) fn cow_recover_private_copy_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 8707 |     fn copy_cow_frame_contents_split(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9128 |     pub(crate) fn resolve_memory_object_phys_for_task_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9448 |     pub(crate) fn ipc_try_recv_queued_plain_endpoint_only_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9476 |     pub(crate) fn recv_would_block_split_read(&self, endpoint_idx: usize, generation: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9505 |     pub(crate) fn ipc_try_recv_queued_with_cap_transfer_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9541 |     pub(crate) fn peek_transfer_envelope_source_object_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+10508 |     pub(crate) fn memory_object_phys_by_id_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+13414 |     pub(crate) fn fault_or_supervisor_endpoint_split_read(&self, endpoint_idx: usize) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+13797 |     pub(crate) fn sr_update_mapped_prefix_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+14849 |     pub(crate) fn reserve_direct_reply_record_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+14869 |     pub(crate) fn bind_direct_reply_record_server_cap_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+14893 |     pub(crate) fn commit_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15109 |     pub(crate) fn register_server_reply_link_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15151 |     pub(crate) fn can_reserve_server_reply_link_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15239 |     pub(crate) fn cancel_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15274 |     pub(crate) fn reserve_existing_reply_record_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15389 |     pub(crate) fn restore_consumed_reply_record_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15471 |     pub(crate) fn discard_reply_record_split(&self, index: usize, generation: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15493 |     pub(crate) fn create_initramfs_file_slice_mo_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15556 |     pub(crate) fn reply_record_externally_invokable_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15583 |     pub(crate) fn reply_terminal_committed_winner_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15605 |     pub(crate) fn reply_record_caller_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15621 |     pub(crate) fn reply_record_endpoint_ref_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16214 |     pub(crate) fn endpoint_mode_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16229 |     pub(crate) fn endpoint_waiter_is_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16417 |     pub(crate) fn runnable_count_on_cpu_split_read(&self, cpu: CpuId) -> usize {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16474 |     pub(crate) fn sr_enqueue_committed_receiver_reconciled_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16635 |     pub(crate) fn take_preread_recv_timeout_deadline_split(&self, cpu: CpuId) -> Option<u64> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16769 |     pub(crate) fn current_entering_incarnation_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16874 |     pub(crate) fn smp_blocked_server_task_facts_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16976 |     pub(crate) fn smp_request_wake_target_split_read(&self, tid: u64) -> Option<CpuId> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+17891 |     pub(crate) fn disarm_reply_deadline_on_reply_win(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+17933 |     pub(crate) fn smp_assign_task_home_cpu(&self, tid: u64, cpu: CpuId) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18579 |     pub(crate) fn classify_direct_reply_terminal_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18604 |     pub(crate) fn claim_direct_reply_terminal_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18709 |     pub(crate) fn commit_queued_reply_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18748 |     pub(crate) fn reply_authority_slots_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18829 |     pub(crate) fn direct_ack_lease_bijection(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18866 |     pub(crate) fn blocked_recv_v2_commit_is_complete_split_read(&self, tid: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18880 |     pub(crate) fn live_server_reply_link_count_split_read(&self) -> usize {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19087 |     pub(crate) fn resolve_endpoint_send_cap_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19109 |     pub(crate) fn resolve_reply_cap_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19128 |     pub(crate) fn process_cnode_for_identity_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `enqueued_cpu`, `rejection_is_runtime_recoverable`, and `receiver_is_unplaced` are never used
+     --> src/runtime.rs:19398:19
+      |
+19395 | impl ReceiverEnqueue {
+      | -------------------- methods in this implementation
+...
+19398 |     pub(crate) fn enqueued_cpu(self) -> Option<CpuId> {
+      |                   ^^^^^^^^^^^^
+...
+19428 |     pub(crate) fn rejection_is_runtime_recoverable(self) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19440 |     pub(crate) fn receiver_is_unplaced(self) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `yarm` (lib) generated 303 warnings (run `cargo fix --lib -p yarm` to apply 36 suggestions)
+warning: `yarm` (lib) generated 303 warnings (303 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.98s
+     Running tests/aarch64_pl011_irq_witness_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/dff6a7fdb42e6d3e/out/aarch64_pl011_irq_witness_scope-dff6a7fdb42e6d3e)
+
+running 12 tests
+test drain_before_completion_and_device_first_disable ... ok
+test every_witness_entry_point_is_feature_gated ... ok
+test kernel_and_receiver_agree_on_selector_ring_and_words ... ok
+test the_driver_uses_a_dedicated_backend_and_acknowledgements ... ok
+test the_enable_order_is_readiness_route_controller_uart_source_admission ... ok
+test the_fixture_owns_no_part_of_the_interrupt_path ... ok
+test the_idle_halt_is_a_masked_wait_then_a_one_instruction_take ... ok
+test the_receiver_does_not_depend_on_simd_across_a_blocking_receive ... ok
+test the_reused_device_leaves_are_kernel_only_and_execute_never ... ok
+test the_route_uses_the_intid_not_the_spi_number ... ok
+test the_vector_entry_claims_once_and_completes_the_token_once ... ok
+test the_witness_feature_is_declared_and_not_default ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/aarch64_reply_grader.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/14b77d73a99df647/out/aarch64_reply_grader-14b77d73a99df647)
+
+running 4 tests
+test the_aarch64_core_smoke_grades_with_the_shared_library ... ok
+test the_corpus_catches_the_defects_the_repair_removed ... ok
+test the_grader_judges_every_fixture_case_for_its_reason ... ok
+test the_reuse_witness_is_labeled_default_off_and_separately_graded ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.79s
+
+     Running tests/artifact_binding_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/e6932027b24d4191/out/artifact_binding_scope-e6932027b24d4191)
+
+running 5 tests
+test every_core_smoke_binds_its_artifacts_before_it_boots_them ... ok
+test every_qemu_launcher_is_guarded ... ok
+test real_launchers_refuse_cached_and_skip_build_artifacts_before_qemu_starts ... ok
+test the_guard_accepts_checked_builds_and_refuses_every_unbound_set ... ok
+test the_recorded_compile_environment_is_every_option_env_in_the_tree ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.45s
+
+     Running tests/broad_lock_census_guard.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/3e1d3bc5b51bbe02/out/broad_lock_census_guard-3e1d3bc5b51bbe02)
+
+running 17 tests
+test blr1_hosted_non_test_library_has_no_whole_state_accessor ... ok
+test blr1_kernel_state_field_authority_is_total_and_projections_respect_it ... ok
+test blr1_kind1_no_production_broad_acquisition_by_any_spelling ... ok
+test blr1_kind2_no_production_broad_wrapper_definition ... ok
+test blr1_kind3_no_production_broad_lock_storage ... ok
+test blr1_kind4_test_only_support_is_exactly_cfg_test ... ok
+test blr1_send_sync_impls_are_the_audited_ones ... ok
+test blr1_trap_installation_is_the_only_pre_publication_handle ... ok
+test broad_with_callsites_match_the_census ... ok
+test census_totals_are_internally_consistent ... ok
+test documents_publish_the_same_census_totals ... ok
+test neither_bridge_regrew_a_replacement_for_the_deleted_acquisition ... ok
+test no_production_broad_acquisition_exists_anywhere ... ok
+test raw_state_lock_sites_match_the_census ... ok
+test stage199d_blocker3_added_no_broad_lock_acquisition_site ... ok
+test stage_204a_classification_covers_every_runtime_required_site ... ok
+test with_cpu_callsites_match_the_census ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.42s
+
+     Running tests/doc_fragmentation_guard.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/afd94fb7f9d19872/out/doc_fragmentation_guard-afd94fb7f9d19872)
+
+running 7 tests
+test approved_fragments_are_registered_in_the_documentation_map ... ok
+test approved_fragments_that_no_longer_exist_are_pruned ... ok
+test canonical_owner_documents_exist ... ok
+test documentation_map_records_the_consolidation_and_the_guard ... ok
+test kernel_unlock_audit_states_its_audited_commit ... ok
+test no_duplicate_status_audit_or_plan_documents ... ok
+test no_unapproved_per_stage_report_files ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/extraction_bridge_tests.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/0ddf8b2c28e62b83/out/extraction_bridge_tests-0ddf8b2c28e62b83)
+
+running 2 tests
+test extracted_kernel_type_families_match_yarm_kernel_layouts ... ok
+test extraction_bridge_sources_keep_yarm_kernel_reexports ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/kernel_nofp_cli.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/5b264ab820f06de5/out/kernel_nofp_cli-5b264ab820f06de5)
+
+running 2 tests
+test checker_cli_fixture_regressions ... ok
+test checker_cli_missing_image_fails ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.81s
+
+     Running tests/kernel_nofp_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/d4b86ef3d60102de/out/kernel_nofp_scope-d4b86ef3d60102de)
+
+running 8 tests
+test aarch64_fp_simd_assembly_is_bracketed ... ok
+test every_artifact_build_runs_the_final_image_check ... ok
+test every_ci_job_that_runs_the_checker_provisions_its_tools ... ok
+test final_image_checker_self_test_passes ... ok
+test kernel_targets_are_soft_float ... ok
+test recorded_exception_kinds_match_the_checker_policy ... ok
+test recorded_regions_match_the_reviewed_exclusion_inventory ... ok
+test user_targets_keep_their_fp_simd ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/kernel_scenarios.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/9d5fa6ff5c7de99c/out/kernel_scenarios-9d5fa6ff5c7de99c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/kstack_adjust_cli.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/9cac160907412c2c/out/kstack_adjust_cli-9cac160907412c2c)
+
+running 3 tests
+test a_decrement_past_the_bound_fails_on_every_isa ... ok
+test an_unresolvable_decrement_fails_instead_of_being_skipped ... ok
+test decrements_within_the_bound_pass_on_every_isa ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/kthread1_witness_grader.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/895fe2a26b308c3e/out/kthread1_witness_grader-895fe2a26b308c3e)
+
+running 25 tests
+test a_changed_role_does_not_make_obligations_disappear ... ok
+test a_lost_wakeup_is_detected ... ok
+test a_missing_kernel_origin_interrupt_population_is_detected ... ok
+test a_record_needs_one_intact_copy ... ok
+test a_single_cpu_record_set_is_graded_by_the_single_cpu_rules ... ok
+test a_stale_incarnation_accepted_is_detected ... ok
+test a_suppressed_remote_wake_is_detected ... ok
+test a_switch_under_a_plain_lock_is_detected ... ok
+test a_switch_under_a_prohibited_guard_is_detected ... ok
+test another_threads_plain_lock_is_attributed_to_that_thread_only ... ok
+test corrupted_continuations_are_detected ... ok
+test every_user_timeout_sequence_is_validated ... ok
+test impossible_lifecycle_events_are_refused ... ok
+test integrity_failures_award_nothing ... ok
+test legitimate_reuse_and_concurrent_orders_pass ... ok
+test overlapping_owners_on_one_cpu_are_refused ... ok
+test population_must_be_the_expected_cpus ... ok
+test premature_stack_reuse_is_detected ... ok
+test single_cpu_coexistence_and_timeout_delivery_are_required ... ok
+test the_holder_s_honoured_point_is_its_turn ... ok
+test the_real_record_set_passes ... ok
+test the_reproduced_false_passes_are_refused ... ok
+test user_execution_inside_a_kernel_thread_interval_is_refused ... ok
+test user_progress_and_pool_recovery_are_required ... ok
+test valid_unfinished_rounds_at_the_census_boundaries_pass ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.37s
+
+     Running tests/kthread_plain_lock_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/17967c5cd89c43c8/out/kthread_plain_lock_scope-17967c5cd89c43c8)
+
+running 6 tests
+test every_hand_rolled_lock_is_in_the_audited_set ... ok
+test every_plain_guard_is_counted_against_its_stack_and_released_there ... ok
+test every_scheduling_point_refuses_a_live_or_poisoned_plain_count ... ok
+test logging_takes_no_plain_lock ... ok
+test no_guard_escapes_through_a_forget_primitive_outside_the_audited_sites ... ok
+test the_lock_path_takes_no_lock_and_does_not_log ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running tests/phase1_payload_bench.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/c45a06a6140930a4/out/phase1_payload_bench-c45a06a6140930a4)
+
+running 1 test
+test phase1_payload_policy_benchmark_snapshot ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/printk_loss_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/bc5aae61ce42abf9/out/printk_loss_scope-bc5aae61ce42abf9)
+
+running 2 tests
+test every_one_shot_grader_reports_an_announced_loss_before_counting ... ok
+test the_drain_announces_exactly_the_marker_the_graders_read ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/qemu_context1_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/149240591fff4059/out/qemu_context1_scope-149240591fff4059)
+
+running 11 tests
+test aarch64_commit_precedes_and_load_follows_the_dispatch ... ok
+test aarch64_el0_returns_install_the_resuming_tasks_nzcv ... ok
+test aarch64_post_lock_argument_mirror_is_gated ... ok
+test aarch64_vector_dispatch_captures_first_and_restores_last ... ok
+test every_home_writer_follows_the_ownership_rules ... ok
+test the_witness_features_are_declared_and_not_default ... ok
+test the_witness_uses_existing_syscalls_and_the_grader_checks_identities ... ok
+test x86_commit_precedes_and_load_follows_the_dispatch ... ok
+test x86_entry_stubs_capture_first_and_restore_last ... ok
+test x86_first_entry_and_saved_frame_resumes_install_a_home ... ok
+test x86_ring3_returns_install_the_resuming_tasks_flags ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/qemu_lock1_owner_closure.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/ec42e12e6ae4c54c/out/qemu_lock1_owner_closure-ec42e12e6ae4c54c)
+
+running 3 tests
+test every_sender_identity_traces_to_the_executing_cpu ... ok
+test publication_generations_are_written_only_by_the_enumerated_owners ... ok
+test the_mailbox_is_consumed_only_by_the_enumerated_consumer ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+
+     Running tests/qemu_lock1_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/32cd0da533ee23e6/out/qemu_lock1_scope-32cd0da533ee23e6)
+
+running 11 tests
+test acquire_holds_and_releases_in_causal_order ... ok
+test contention_is_observed_from_the_held_flag_once ... ok
+test exactly_one_lock_is_witnessed ... ok
+test the_dump_is_sealed_and_the_grader_is_independent ... ok
+test the_hold_hook_is_bounded_and_releases_regardless ... ok
+test the_identity_field_is_feature_gated_and_defaults_to_zero ... ok
+test the_ipi_work_is_attributed_at_the_production_mailbox ... ok
+test the_lock_path_is_bounded_lock_free_and_console_free ... ok
+test the_round_count_is_gated_consistently ... ok
+test the_waiter_uses_the_production_acquisition_path ... ok
+test the_witness_is_gated_and_off_by_default ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/qemu_lock2_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/2140b14108a3ec58/out/qemu_lock2_scope-2140b14108a3ec58)
+
+running 9 tests
+test claims_and_completions_are_observed_at_the_one_reader_and_writer ... ok
+test the_gate_orders_arrival_ownership_and_publication ... ok
+test the_hold_observes_the_controller_before_and_after ... ok
+test the_lock_and_interrupt_paths_are_bounded_and_console_free ... ok
+test the_mailbox_stride_holds_every_round ... ok
+test the_smoke_and_grader_are_wired ... ok
+test the_smp2_hooks_and_round_count_are_gated ... ok
+test the_witness_is_gated_and_off_by_default ... ok
+test the_witness_never_claims_completes_or_synthesizes ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/qemu_lock3_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/56d2a02754311248/out/qemu_lock3_scope-56d2a02754311248)
+
+running 9 tests
+test the_gate_orders_arrival_ownership_and_publication ... ok
+test the_handler_records_entry_and_eoi_without_calls_or_acquisitions ... ok
+test the_held_lock_is_masked_and_every_sti_is_enumerated ... ok
+test the_hold_observes_the_lapic_before_and_after ... ok
+test the_lock_and_interrupt_paths_are_bounded_and_console_free ... ok
+test the_smoke_and_grader_are_wired ... ok
+test the_smp1_hooks_and_round_count_are_gated ... ok
+test the_witness_is_gated_and_off_by_default ... ok
+test the_witness_never_writes_eoi_or_icr_or_runs_the_handler ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/qemu_smp1_acceptance_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/af64eda4b9be7ccc/out/qemu_smp1_acceptance_scope-af64eda4b9be7ccc)
+
+running 5 tests
+test both_bridges_settle_through_the_continuations_owner ... ok
+test every_context_apply_binds_the_incarnation_it_restored ... ok
+test the_generation_is_published_inside_as_patterned_window ... ok
+test the_reply_grader_reads_the_record_and_every_selection_route ... ok
+test the_request_transaction_is_recorded_at_its_owners ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/qemu_smp1_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/58ff8a1ac3d66bf4/out/qemu_smp1_scope-58ff8a1ac3d66bf4)
+
+running 6 tests
+test fp_homes_are_authenticated_against_the_current_incarnation ... ok
+test the_ack_wait_answers_its_own_mailbox_in_the_stub_order ... ok
+test the_bsp_takes_0xf1_through_the_asm_stub ... ok
+test the_reply_profile_has_one_selection_owner_and_no_probe_park ... ok
+test the_stub_counts_arrivals_by_origin_and_acks_last ... ok
+test the_witness_is_gated_and_observes ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/qemu_smp2_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/45af77865e08bed1/out/qemu_smp2_scope-45af77865e08bed1)
+
+running 8 tests
+test break_before_make_and_the_invalidation_barriers_are_in_order ... ok
+test one_claim_one_completion_and_the_shared_idle_drain ... ok
+test production_admission_needs_no_knob ... ok
+test the_ap_is_admitted_only_after_its_interface_is_published ... ok
+test the_sgi_is_sent_only_for_a_committed_remote_wake ... ok
+test the_vector_elr_slot_is_per_cpu ... ok
+test the_vm_operation_is_recorded_by_its_owner_at_every_exit ... ok
+test the_witness_is_gated_and_observes ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/qemu_smp3_acceptance_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/9f4f873106cb451e/out/qemu_smp3_acceptance_scope-9f4f873106cb451e)
+
+running 6 tests
+test every_failed_reverify_is_settled_not_fallen_through ... ok
+test no_text_claims_a_woken_task_resumes_through_the_entering_frame ... ok
+test the_bridge_applies_every_settlement_and_fails_closed_on_contradiction ... ok
+test the_live_witness_is_default_off_and_gated ... ok
+test the_policy_authenticates_before_it_returns_and_owes_the_advance_otherwise ... ok
+test the_smp3_runner_boots_only_the_pinned_firmware ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/qemu_smp3_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/33ad7373437d63e7/out/qemu_smp3_scope-33ad7373437d63e7)
+
+running 13 tests
+test a_reply_racing_its_callers_block_is_retried_not_spent ... ok
+test an_ipi_never_reaches_the_external_claim ... ok
+test an_overtaken_deferral_is_settled_not_returned_through ... ok
+test each_operation_has_one_production_owner ... ok
+test every_trap_context_initializer_names_the_software_interrupt ... ok
+test secondary_dispatch_is_behind_the_knob ... ok
+test the_arrival_clears_before_it_consumes ... ok
+test the_coexistence_refusal_counts_only_consumed_classes ... ok
+test the_image_ordering_check_covers_the_three_owners ... ok
+test the_remote_fence_is_ordered_and_fails_closed ... ok
+test the_wake_follows_a_committed_remote_enqueue ... ok
+test the_wake_publishes_before_it_notifies ... ok
+test the_witness_is_gated_and_observes ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/riscv64_live_irq_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/cde1cda926421ee5/out/riscv64_live_irq_scope-cde1cda926421ee5)
+
+running 13 tests
+test captured_dtb_state_is_present_in_boot ... ok
+test fdt_module_exposes_find_node_reg_by_name_prefix ... ok
+test multi_hart_topology_emits_irq_deferred_marker ... ok
+test plic_base_marker_records_source_origin ... ok
+test plic_context_marker_carries_hart_and_mode ... ok
+test plic_does_not_enable_any_source_in_this_pass ... ok
+test plic_enumerates_qemu_virt_known_sources ... ok
+test plic_resolve_base_prefers_dtb_over_fallback ... ok
+test plic_threshold_write_targets_correct_context_register ... ok
+test primary_entry_emits_boot_hart_id_stored_marker ... ok
+test smoke_script_requires_new_live_irq_markers ... ok
+test timer_keeps_stie_and_sie_off_by_default ... ok
+test timer_module_emits_mechanism_breadcrumb ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/riscv64_regular_smoke_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/b46576997b4f49e7/out/riscv64_regular_smoke_scope-b46576997b4f49e7)
+
+running 12 tests
+test build_script_fails_clearly_when_artifacts_missing ... ok
+test build_script_produces_canonical_artifacts ... ok
+test matrix_script_runs_full_smp_matrix ... ok
+test matrix_script_summary_columns_cover_required_axes ... ok
+test smoke_script_accepts_timer_plic_extirq_deferred_or_live ... ok
+test smoke_script_no_live_timer_or_plic_irq_required_in_this_pass ... ok
+test smoke_script_rejects_boot_hart_in_secondary_park_list ... ok
+test smoke_script_rejects_destabilizing_patterns ... ok
+test smoke_script_rejects_present_cpus_one_under_smp_gt_one ... ok
+test smoke_script_requires_boot_entry_and_boot_hart_id_markers ... ok
+test smoke_script_requires_full_service_chain_markers ... ok
+test smoke_script_supports_smp_matrix_1_to_4 ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/riscv64_smp_topology_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/17fdf1cbda67d70c/out/riscv64_smp_topology_scope-17fdf1cbda67d70c)
+
+running 17 tests
+test boot_hart_id_is_read_from_opensbi_a0 ... ok
+test dtb_cpu_scan_emits_diagnostic_markers ... ok
+test dtb_topology_is_staged_for_bootstrap ... ok
+test early_marker_takes_uart_line_lock_to_serialize_smp_output ... ok
+test fdt_module_exposes_cpus_hart_id_bitmap ... ok
+test online_cpus_remains_one_until_riscv_smp_scheduler_lands ... ok
+test park_secondaries_no_longer_uses_bootstrap_cpu_id_constant ... ok
+test real_qemu_virt_dtb_fixtures_exist_for_fdt_unit_test ... ok
+test secondary_park_marker_format_is_stable_for_smoke_match ... ok
+test smoke_script_enforces_per_n_topology ... ok
+test smoke_script_keeps_default_smp_one ... ok
+test smoke_script_rejects_silent_dtb_cpu_scan_fallback ... ok
+test start_does_not_hardcode_hart_zero_as_boot_hart ... ok
+test start_does_not_use_atomic_cas_for_boot_hart_arrival ... ok
+test start_has_no_cold_boot_secondary_park_branch ... ok
+test topology_marker_emits_present_cpus_bitmap_boot_hart ... ok
+test topology_module_prefers_binary_fdt_over_text_scan ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/riscv64_timer_admission_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/cd16244e7c1c7b9c/out/riscv64_timer_admission_scope-cd16244e7c1c7b9c)
+
+running 11 tests
+test csr_set_helpers_stay_confined_to_two_call_sites ... ok
+test enable_block_writes_correct_csr_bits ... ok
+test live_enable_sequence_orders_deadline_stie_then_sie ... ok
+test only_platform_and_ownership_deferrals_remain ... ok
+test plic_external_irq_remains_deferred ... ok
+test rearm_schedules_from_a_fresh_sample ... ok
+test the_boot_arm_never_unmasks_supervisor_interrupts ... ok
+test the_timer_admission_gate_is_fully_retired ... ok
+test the_timer_is_armed_before_the_first_user_task ... ok
+test timer_ownership_is_boot_hart_only ... ok
+test timer_uses_sbi_time_and_rdtime ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/riscv64_timer_plic_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/3b40cbdbc50cdc7b/out/riscv64_timer_plic_scope-3b40cbdbc50cdc7b)
+
+running 18 tests
+test no_code_enables_all_plic_sources_blindly ... ok
+test plic_module_emits_discovery_markers ... ok
+test plic_threshold_write_is_gated_by_mapping_coverage_check ... ok
+test secondary_harts_still_park ... ok
+test smoke_script_accepts_extirq_live_or_deferred ... ok
+test smoke_script_accepts_plic_init_or_deferred ... ok
+test smoke_script_accepts_timer_live_or_deferred ... ok
+test smoke_script_pins_canonical_timer_deferred_reasons ... ok
+test smoke_script_references_official_artifact_paths ... ok
+test smoke_script_reject_patterns_present ... ok
+test smoke_script_required_markers_present ... ok
+test smoke_script_requires_audit_markers ... ok
+test smoke_script_supports_smp2_secondary_park_assertion ... ok
+test timer_audit_completes_before_any_csr_write ... ok
+test timer_boot_hart_only_guard_is_present ... ok
+test timer_is_armed_at_the_boot_safe_point_not_at_idle ... ok
+test timer_module_emits_required_markers ... ok
+test timer_stie_audit_flag_requires_the_s_mode_fast_path ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/riscv64_uart_irq_witness_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/fe6c8b804dc64b1d/out/riscv64_uart_irq_witness_scope-fe6c8b804dc64b1d)
+
+running 13 tests
+test drain_precedes_delivery_and_the_fixture_never_completes ... ok
+test every_witness_entry_point_is_feature_gated ... ok
+test kernel_and_receiver_agree_on_selector_ring_and_words ... ok
+test readiness_is_the_walk_not_a_flag ... ok
+test selector_30_is_free ... ok
+test the_device_window_is_kernel_only ... ok
+test the_driver_uses_a_dedicated_backend_and_acknowledgements ... ok
+test the_enable_order_is_mappings_readiness_route_controller_source_cpu ... ok
+test the_feature_off_bring_up_still_defers ... ok
+test the_idle_boundary_window_is_closed ... ok
+test the_nr5_notification_arm_is_narrow ... ok
+test the_riscv_window_gate_ties_each_arrival_to_its_window ... ok
+test the_witness_feature_is_declared_and_not_default ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/riscv_core_smoke_capacity_rejection.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/a10a68473966b877/out/riscv_core_smoke_capacity_rejection-a10a68473966b877)
+
+running 11 tests
+test ack_capacity_256_is_accepted ... ok
+test capability_full_and_task_table_full_are_rejected ... ok
+test capacity_256_is_accepted ... ok
+test capacity_refused_one_is_rejected ... ok
+test capacity_refused_zero_is_accepted ... ok
+test every_named_exhaustion_form_is_rejected ... ok
+test existing_full_oom_and_fatal_rejections_remain_active ... ok
+test multi_digit_capacity_refusals_are_rejected ... ok
+test no_broad_generic_capacity_rejection_survives ... ok
+test the_benign_deferred_capacity_ok_form_is_accepted ... ok
+test the_reject_pattern_list_parses_and_is_non_trivial ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
+
+     Running tests/riscv_split_census.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/08a5c4fe9bda58da/out/riscv_split_census-08a5c4fe9bda58da)
+
+running 5 tests
+test a_record_cut_by_the_timeout_is_not_counted ... ok
+test an_unexpected_nr_still_fails ... ok
+test legitimate_nr0_traffic_passes ... ok
+test missing_or_inconsistent_nr0_accounting_still_fails ... ok
+test the_sum_is_widened_by_exactly_nr0 ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.47s
+
+     Running tests/rpi5_stage1_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/ad7206b5fc6937ac/out/rpi5_stage1_scope-ad7206b5fc6937ac)
+
+running 19 tests
+test existing_architecture_defaults_remain_explicit ... ok
+test raw_entry_breadcrumb_ladder_has_all_expected_markers ... ok
+test raw_entry_marker_is_confined_to_the_rpi5_stage1_feature ... ok
+test rpi5_boot4_builds_high_half_heap_and_vm_then_defers_precisely ... ok
+test rpi5_boot4_global_allocator_pt_init_is_markered_and_bss_is_zeroed ... ok
+test rpi5_boot4_physmap_bridge_is_gated_and_preserves_default_identity ... ok
+test rpi5_console_transition_is_bounded_and_uses_the_proven_uart ... ok
+test rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0 ... ok
+test rpi5_hh3_build_and_generator_paths_are_explicit ... ok
+test rpi5_hh3_bypass_is_temporary_and_hh4_proves_dtb_handoff ... ok
+test rpi5_hh3_success_markers_are_retained_in_the_high_image ... ok
+test rpi5_hh4_retires_low_ttbr0_and_hh5_defers_without_eret ... ok
+test rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret ... ok
+test rpi5_hh5_fdt_walker_is_bounded_with_precise_phase_markers ... ok
+test rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely ... ok
+test rpi5_high_half_scaffold_is_explicit_and_non_default ... ok
+test rpi5_stage1_does_not_start_rp1_pcie_or_userspace_policy ... ok
+test rpi5_stage1b_diagnostics_are_bounded_lock_free_and_halt ... ok
+test rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/sched_lock1_grader_cli.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/82c207c342d06b35/out/sched_lock1_grader_cli-82c207c342d06b35)
+
+running 4 tests
+test every_corpus_case_gets_its_verdict_and_obligation ... 76 cases
+ok
+test producer_facts_the_grader_relies_on ... ok
+test the_grader_self_test_passes ... ok
+test undoing_each_repair_lets_its_own_defect_through ... 76 cases
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 37.85s
+
+     Running tests/scheduling_contract.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/6d511a92eb873d7b/out/scheduling_contract-6d511a92eb873d7b)
+
+running 31 tests
+test model::every_mutation_is_killed_by_its_targeted_check ... ok
+test model::model_cross_partition_ipc_does_not_extend_either_window ... ok
+test model::model_debt_beyond_one_replenishment_is_conserved ... ok
+test model::model_debt_consumed_replenishment_grants_no_position ... ok
+test model::model_debt_overflow_saturates_and_is_reported ... ok
+test model::model_debt_repayment_cases_and_no_budget_accumulation ... ok
+test model::model_equal_priority_order_is_deterministic_fifo ... ok
+test model::model_essential_kernel_work_is_charged_and_overrun_reported ... ok
+test model::model_exhausted_context_is_ineligible_despite_priority ... ok
+test model::model_exhausted_thread_rejoins_the_tail_only_at_replenishment ... ok
+test model::model_highest_priority_cannot_run_outside_its_partition_window ... ok
+test model::model_invalid_overlapping_and_overflowing_schedules_are_rejected ... ok
+test model::model_ipc_handoff_cannot_bypass_eligibility_or_donate_budget ... ok
+test model::model_overflow_latch_holds_across_scheduling_events ... ok
+test model::model_overflow_latch_refuses_restored_budget_constructed ... ok
+test model::model_overflow_latch_survives_replenishment_constructed ... ok
+test model::model_overrun_debt_is_repaid_at_replenishment ... ok
+test model::model_preemption_yield_block_and_wake_queue_positions ... ok
+test model::model_queue_membership_has_no_duplicates_or_stale_positions ... ok
+test model::model_remote_wake_keeps_cpu_and_manufactures_no_budget ... ok
+test model::model_simultaneous_replenishments_rejoin_in_context_order ... ok
+test model::model_wake_while_exhausted_takes_no_position ... ok
+test model::model_window_boundaries_advance_while_the_cpu_is_idle ... ok
+test production::sc_cpu_1_enqueue_is_confined_to_the_named_cpu ... ok
+test production::sc_elig_1_acceptance_filter_skips_ineligible_highest_in_place ... ok
+test production::sc_pool_1_run_queue_exhaustion_is_explicit_and_atomic ... ok
+test production::sc_pri_1_strict_priority_order_high_normal_low ... ok
+test production::sc_pri_2_equal_priority_is_fifo_and_deterministic ... ok
+test production::sc_pri_3_quantum_preemption_requeues_at_tail_of_own_priority ... ok
+test production::sc_pri_4_wake_appends_at_tail_and_never_displaces_running_task ... ok
+test sc_gp_1_general_purpose_model_agrees_with_production_priority_scheduler ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/server_dies_runner_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/d87385282eb3e356/out/server_dies_runner_scope-d87385282eb3e356)
+
+running 10 tests
+test every_arch_runner_builds_its_own_feature_and_target ... ok
+test every_arch_runner_exists_and_uses_the_shared_body ... ok
+test every_arch_runner_selects_server_dies_on_its_own_knob ... ok
+test every_runner_records_its_live_stage_and_boots_the_staged_initramfs ... ok
+test feature_off_audit_is_two_sided ... ok
+test forbidden_markers_cover_every_hard_fail ... ok
+test required_chain_is_scoped_to_the_witnessed_transaction ... ok
+test required_marker_chain_is_ordered_and_complete ... ok
+test run_b_is_a_single_fresh_boot ... ok
+test runner_freezes_and_rechecks_the_exact_commit ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/service_fault_injection.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/169ec4043e586b47/out/service_fault_injection-169ec4043e586b47)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/smp3_evidence_differential.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/36091e6bd7a1ac47/out/smp3_evidence_differential-36091e6bd7a1ac47)
+
+running 5 tests
+test groups_and_consumptions_are_numbered_by_their_own_operations ... ok
+test the_base_record_passes_both_verifiers ... ok
+test the_shootdown_inputs_are_the_owners_own_values ... ok
+test the_step_tables_agree ... ok
+test the_two_verifiers_agree_on_every_case_and_each_gets_its_expected_verdict ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.73s
+
+     Running tests/x86_64_ap_env_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/a1c4fb2bed41fea9/out/x86_64_ap_env_scope-a1c4fb2bed41fea9)
+
+running 25 tests
+test ap_dispatch_region_is_unchanged_and_shootdown_moved_to_the_sole_producer ... ok
+test ap_env_begin_marker_is_emitted_per_cpu ... ok
+test ap_env_failure_path_parks_safely ... ok
+test ap_env_reaches_accepted_live_online_grades ... ok
+test ap_env_ready_marker_closes_scaffold ... ok
+test ap_env_scaffold_helper_lives_in_smp_module ... ok
+test ap_fpu_is_explicitly_deferred ... ok
+test ap_gdt_is_marked_ready_with_explicit_reason ... ok
+test ap_gs_is_really_initialized_and_graded ... ok
+test ap_gs_ready_is_never_faked ... ok
+test ap_idt_is_explicitly_deferred ... ok
+test ap_legacy_markers_preserved_for_existing_smoke_grep ... ok
+test ap_park_marker_carries_no_scheduler_reason ... ok
+test ap_path_does_not_dispatch_scheduler ... ok
+test ap_path_does_not_enable_lapic_timer ... ok
+test ap_path_does_not_enter_userspace ... ok
+test ap_path_does_not_join_runqueue ... ok
+test ap_stack_marker_records_real_stack_top ... ok
+test ap_tss_is_really_loaded_and_graded ... ok
+test early_ap_breadcrumb_ladder_still_uses_com1 ... ok
+test late_ap_breadcrumb_state_publications_are_unchanged ... ok
+test late_ap_breadcrumbs_go_to_debugcon_and_restore_com1 ... ok
+test smoke_gate_uses_strict_literal_matching_only ... ok
+test smp1_path_is_unchanged_no_ap_path_runs_when_present_bitmap_is_one ... ok
+test smp_startup_summary_keeps_online_cpus_at_one ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/x86_64_ap_percpu_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/c2048180b32f2a2f/out/x86_64_ap_percpu_scope-c2048180b32f2a2f)
+
+running 16 tests
+test ap_env_scaffold_markers_still_present ... ok
+test ap_installs_local_gdt_and_real_tss ... ok
+test ap_path_does_not_dispatch_scheduler ... ok
+test ap_path_does_not_enable_lapic_timer ... ok
+test ap_path_does_not_enter_userspace ... ok
+test ap_path_does_not_join_runqueue ... ok
+test ap_percpu_scaffold_emits_required_marker_set ... ok
+test gs_base_write_is_not_faked ... ok
+test online_cpus_summary_is_unchanged ... ok
+test percpu_module_defines_record_type_and_slot_table ... ok
+test percpu_module_is_listed_in_arch_mod ... ok
+test percpu_record_layout_is_repr_c_with_pinned_offsets ... ok
+test percpu_scaffold_initializes_record_with_real_values ... ok
+test record_base_accessor_is_bounded_by_cpu_id ... ok
+test smp1_path_is_unchanged_no_ap_path_runs_when_present_bitmap_is_one ... ok
+test smp_module_emits_percpu_scaffold_before_env_scaffold ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/x86_64_uart_irq_witness_scope.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1q-target/debug/build/yarm/a1392202d94864d5/out/x86_64_uart_irq_witness_scope-a1392202d94864d5)
+
+running 11 tests
+test drain_before_output_and_device_first_disable ... ok
+test every_witness_entry_point_is_feature_gated ... ok
+test kernel_and_receiver_agree_on_selector_ring_and_words ... ok
+test no_new_access_path_reaches_userspace ... ok
+test return_contracts_are_ring3_only_revalidation_and_preserved_flags ... ok
+test the_driver_uses_a_dedicated_backend_and_acknowledgements ... ok
+test the_enable_order_is_readiness_route_controller_device_source_admission ... ok
+test the_fixture_owns_no_part_of_the_interrupt_path ... ok
+test the_receiver_grades_gprs_and_flags_and_only_observes_xmm ... ok
+test the_route_is_derived_from_the_madt_and_the_decoder ... ok
+test the_witness_feature_is_declared_and_not_default ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

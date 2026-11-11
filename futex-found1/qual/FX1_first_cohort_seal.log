@@ -1,0 +1,43 @@
+[seal] artifact hashes / mtimes:
+  6c630fde849ab89d72274dce4e7f5c07af93ba751f01a92d87cc3bf1910a7690  2026-11-11 10:57:34  build-x86_64/kernel_boot.elf
+  84c5f5ea37651758b09dc1b6772acb78c3a10082c7476bf88ebd498c999a3f50  2026-11-11 11:01:33  build-aarch64/yarm-aarch64.bin
+  25faedf76d4bce969350d5d8eede658980836892d88e485d1d6f32ce277fd716  2026-11-11 11:02:38  build-riscv64/yarm-riscv64.bin
+[seal] run: scripts/qemu-riscv64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/rv_core.log)
+[seal] run: FUTEX_WAKE_ORACLE=1 scripts/qemu-riscv64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/rv_fw.log)
+[seal] run: FUTEX_WAIT_ORACLE=1 scripts/qemu-riscv64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/rv_fwait.log)
+[seal] run: FUTEX_WAIT_IDLE_ORACLE=1 scripts/qemu-riscv64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/rv_idle.log)
+[seal] run: YIELD_TWO_TASK_ORACLE=1 scripts/qemu-riscv64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/rv_ytwo.log)
+[seal] run: YIELD_LONE_TASK_ORACLE=1 scripts/qemu-riscv64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/rv_ylone.log)
+[seal] run: QEMU_SMP=2 scripts/qemu-aarch64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/arm_core.log)
+[seal] run: FUTEX_WAKE_ORACLE=1 scripts/qemu-aarch64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/arm_fw.log)
+[seal] run: FUTEX_WAIT_ORACLE=1 scripts/qemu-aarch64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/arm_fwait.log)
+[seal] run: FUTEX_WAIT_IDLE_ORACLE=1 scripts/qemu-aarch64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/arm_idle.log)
+[seal] run: YIELD_ORACLE=1 scripts/qemu-aarch64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/arm_ytwo.log)
+[seal] run: YIELD_LONE_ORACLE=1 scripts/qemu-aarch64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/arm_ylone.log)
+[seal] run: scripts/qemu-x86_64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/x86_core.log)
+[seal] run: IPC_SEND_CAP_ENQUEUE_ORACLE=1 scripts/qemu-x86_64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/x86_ipc.log)
+[seal] run: X86_FUTEX_WAKE_ORACLE=1 scripts/qemu-x86_64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/x86_fw.log)
+[seal] run: QEMU_SMP=2 scripts/qemu-x86_64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/x86_smp2.log)
+[seal] run: QEMU_SMP=4 scripts/qemu-x86_64-core-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/x86_smp4.log)
+[seal] run: scripts/qemu-supervisor-crash-restart-smoke.sh (log=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX1/x86_crash.log)
+── first-cohort seal matrix ──
+FIRST_COHORT_SEAL arch=x86_64 class=DebugLog result=ok proof=live
+FIRST_COHORT_SEAL arch=x86_64 class=FutexWake result=MISSING
+[seal][fail] no live proof for arch=x86_64 class=FutexWake
+FIRST_COHORT_SEAL arch=x86_64 class=FutexWait result=ok proof=live
+FIRST_COHORT_SEAL arch=x86_64 class=Yield result=ok proof=live
+FIRST_COHORT_SEAL arch=x86_64 classes=3 result=fail
+FIRST_COHORT_SEAL arch=aarch64 class=DebugLog result=ok proof=live
+FIRST_COHORT_SEAL arch=aarch64 class=FutexWake result=ok proof=live
+FIRST_COHORT_SEAL arch=aarch64 class=FutexWait result=ok proof=live
+FIRST_COHORT_SEAL arch=aarch64 class=Yield result=ok proof=live
+FIRST_COHORT_SEAL arch=aarch64 classes=4 result=ok
+FIRST_COHORT_SEAL arch=riscv64 class=DebugLog result=ok proof=live
+FIRST_COHORT_SEAL arch=riscv64 class=FutexWake result=ok proof=live
+FIRST_COHORT_SEAL arch=riscv64 class=FutexWait result=ok proof=live
+FIRST_COHORT_SEAL arch=riscv64 class=Yield result=ok proof=live
+FIRST_COHORT_SEAL arch=riscv64 classes=4 result=ok
+[seal][fail] aarch64 FutexWait idle oracle proof missing
+FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=11 result=fail
+[seal][fail] expected 12 live cells, found 11
+FIRST_COHORT_CROSS_ARCH_SEAL arches=2 classes=4 result=fail

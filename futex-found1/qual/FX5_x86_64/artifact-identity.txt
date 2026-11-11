@@ -1,0 +1,5 @@
+tree=d5621d8eeb76208f55d9cf717f40bed75eaba5b9 head=e684de30cad0b0c900f7a86194d04b994628dbda dirty=0 kernel_features=--no-default-features --features x86-kthread1-witness
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=q35 cpu=qemu64 m=512M
+bf186b6822a8ebc8431564295f35b4cacb65c787a0e700921871f5cc6a3b2968  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX5_x86_64/build/kernel_boot.elf
+6762d3e9f569494c1ceea125859847903225fd3e21dfc074ee54516f4d2d436c  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX5_x86_64/build/initramfs-core.cpio
+boot smp=2 append=console=ttyS0 rdinit=/init

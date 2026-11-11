@@ -1,0 +1,14 @@
+nc9 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 2caebd55..b8bebb2a 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -529,7 +529,7 @@ pub fn claim_futex_waiters_locked(
+                     t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))
+                 }) {
+                 Some(tcb) => {
+-                    tcb.status = TaskStatus::Runnable;
++                    let _ = &tcb;
+                     out[n] = rec.tid;
+                     n += 1;
+                     true

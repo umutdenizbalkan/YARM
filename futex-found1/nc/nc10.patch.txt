@@ -1,0 +1,17 @@
+nc10 applied
+diff --git a/src/kernel/boot/exec_state.rs b/src/kernel/boot/exec_state.rs
+index 1f14a976..3bd408e0 100644
+--- a/src/kernel/boot/exec_state.rs
++++ b/src/kernel/boot/exec_state.rs
+@@ -1181,8 +1181,10 @@ impl KernelState {
+         if !super::futex::futex_word_aligned(addr) {
+             return Err(KernelError::WrongObject);
+         }
++        let _ = exiting_tid;
+         let asid = self
+-            .task_asid(exiting_tid)
++            .current_tid()
++            .and_then(|t| self.task_asid(t))
+             .ok_or(KernelError::UserMemoryFault)?;
+         // The KEY only: cleanup needs the identity, not the word's value.
+         let private = self.with_vm_then_memory_mut(|spaces, memory| {

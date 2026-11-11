@@ -1,0 +1,6 @@
+[pl011-irq-witness] building aarch64 artifacts with aarch64-pl011-irq-witness
+ARTIFACT_BINDING arch=aarch64 kernel=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/U2/build/yarm-aarch64.bin kernel_sha256=d7a2f12720dd328ccb1145bbde178bddb9a522a62e902198ad88b4849b1a7893 kernel_features=aarch64-pl011-irq-witness kernel_resolved_features=aarch64-pl011-irq-witness kernel_nofp=pass initramfs=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/U2/build/initramfs-core.cpio initramfs_sha256=6c69d2ffecf6f7706fc27668f5f82d6a8315274aad01e2b232f64059881c2fea initramfs_features=aarch64-pl011-irq-witness initramfs_compile_env=none source=clean:d5621d8eeb76208f55d9cf717f40bed75eaba5b9 required=kernel=aarch64-pl011-irq-witness,initramfs=aarch64-pl011-irq-witness result=ok
+[pl011-irq-witness] booting (dedicated socket serial, host injection on READY)
+[pl011-irq-witness] idle-resume SIMD sentinel loss in 0/4 idle items (pre-existing: no per-task FP/SIMD state)
+[pl011-irq-witness] special INTID claims: 0 (never completed)
+PL011_IRQ_WITNESS_SEAL items=8 intid=33 claims=8 completions=8 deliveries=8 probes=8 idle=4 user=4 idle_in_window=4 user_in_spin=4 post_ticks=358 post_parks=16 specials=0 result=ok

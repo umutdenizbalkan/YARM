@@ -1,0 +1,2 @@
+kernel::boot::tests::robust_futex_wake_works_when_exit_is_externally_driven
+kernel::boot::tests::stage191d_futex_wait_block_publish::u9fw_a_wake_during_publication_never_loses_the_caller

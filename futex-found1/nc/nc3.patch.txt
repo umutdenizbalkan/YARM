@@ -1,0 +1,14 @@
+nc3 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 2caebd55..2028cc9f 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -192,7 +192,7 @@ pub fn resolve_futex_key_locked(
+             let object = memory.memory_objects[slot].ok_or(KernelError::WrongObject)?;
+             FutexKey::Shared {
+                 object_id: object.id,
+-                offset: phys - object.phys.0,
++                offset: { let _ = object.phys; 0 },
+             }
+         }
+     };

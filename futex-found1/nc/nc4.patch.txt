@@ -1,0 +1,14 @@
+nc4 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 6e062774..a07be902 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18343,7 +18343,7 @@ impl SharedKernel {
+         // transaction's acquisition of it, which precedes this read: the value below is the new
+         // one. A changed key (the mapping moved) is a changed word for the same reason.
+         let reread = self.resolve_futex_word_in_split(asid, addr, kind);
+-        let unchanged = matches!(reread, Ok((k, w)) if k == key && w == expected);
++        let unchanged = { let _ = &reread; true };
+         if !unchanged && undo_registration() {
+             crate::yarm_log!(
+                 "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason={} expected={}",

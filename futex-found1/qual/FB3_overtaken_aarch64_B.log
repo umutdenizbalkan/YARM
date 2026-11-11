@@ -1,0 +1,9 @@
+[overtaken-witness] building aarch64 artifacts with aarch64-overtaken-witness into /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FB3/build
+ARTIFACT_BINDING arch=aarch64 kernel=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FB3/build/yarm-aarch64.bin kernel_sha256=398b7a449ac88a996bc3c477d83dbaf2afe32454de5b8b503f6628851360b070 kernel_features=aarch64-overtaken-witness kernel_resolved_features=aarch64-overtaken-witness kernel_nofp=pass initramfs=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FB3/build/initramfs-core.cpio initramfs_sha256=a2545f371b0de6d40632b17809e0ff187d54dd300e970520e5276fc0b05923ec initramfs_features=aarch64-overtaken-witness initramfs_compile_env=none source=clean:d727771879fb50e28778f608243916e50c7d721f required=kernel=aarch64-overtaken-witness,initramfs=aarch64-overtaken-witness result=ok
+[overtaken-witness] booting -smp 2 yarm.ap_user_dispatch=1
+[overtaken-witness] boot sealed after 4.5s
+[overtaken-witness] summary (2 intact pass(es)): arch=aarch64 hold_cpu=0 w_tid=9400 w_asid=4 k_tid=9401 k_asid=5 rounds=4 held=4 r1=3322/overtaken/switch/9400/4/1 r2=1283/overtaken/switch/2/2/2 r3=999/overtaken/switch/9400/4/3 r4=810/overtaken/switch/9400/4/4 overtaken=4 synchronized=4 natural=0 timeouts=0 settled=4 switched_to_w=3 go=4 reason=none result=ok
+[overtaken-witness] rounds=4 synchronized=4 natural=0 switch_to_w=3 records=r1=3322/overtaken/switch/9400/4/1 r2=1283/overtaken/switch/2/2/2 r3=999/overtaken/switch/9400/4/3 r4=810/overtaken/switch/9400/4/4
+[overtaken-witness] live: settled_lines=4 k_woke=4 w_round_ok=4
+[overtaken-witness] naturally occurring settlements outside the witness: 0
+OVT_WITNESS_SEAL arch=aarch64 result=ok

@@ -1,0 +1,14 @@
+nc7 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 2caebd55..a4c193de 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -356,8 +356,6 @@ impl FutexWaiterTable {
+             if self.head[b] as usize == slot {
+                 self.head[b] = rec.next;
+             }
+-        } else if let Some(p) = self.records[prev as usize].as_mut() {
+-            p.next = rec.next;
+         }
+         if self.tail[b] as usize == slot {
+             self.tail[b] = prev;

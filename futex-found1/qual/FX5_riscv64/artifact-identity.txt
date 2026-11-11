@@ -1,0 +1,8 @@
+tree=d5621d8eeb76208f55d9cf717f40bed75eaba5b9 head=e684de30cad0b0c900f7a86194d04b994628dbda dirty=0 kernel_features=--no-default-features --features riscv64-kthread1-witness userspace_features=--no-default-features
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=virt cpu=rv64 cmdline=console=ttyS0 rdinit=/init
+firmware_path=/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin firmware_banner=OpenSBI v1.3
+9eef2365ce8e0ac00a812bba4192809066a48ae39ecc385c77ef2a544ed57d7f  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX5_riscv64/build/yarm-riscv64-apsw.bin
+db429510c8982f6e444245eb3833dc88d161070893cee72fd91b1434bed7d8cd  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX5_riscv64/build/yarm-riscv64-apsw.elf
+445a7cbb5d595cd7148a853c9bfae74e3c96f7139c4f0831bcf545193a688b70  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX5_riscv64/build/initramfs-core.cpio
+171a91cceeb419d5cf238008c77641a13c4783d2540fec9294b1ba969bfa095d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ff1-evidence/qual/FX5_riscv64/build/opensbi-fw_dynamic.bin
+boot smp=2

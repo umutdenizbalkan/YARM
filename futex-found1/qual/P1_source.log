@@ -1,0 +1,54 @@
+ .../src/posix_compat/sysdeps/kernel_hooks.rs       |   22 +-
+ .../src/bin/init_server.rs                         |    6 +-
+ .../src/control_plane/init/service.rs              |  129 +-
+ crates/yarm-user-rt/src/lib.rs                     |   47 +-
+ doc/KERNEL_UNLOCKING.md                            |    2 +-
+ src/arch/aarch64/apsched_witness.S                 |    3 +-
+ src/arch/aarch64/overtaken_witness.S               |   10 +-
+ src/arch/aarch64/overtaken_witness.rs              |    7 +-
+ src/arch/riscv64/apsched_witness.S                 |    3 +-
+ src/arch/x86_64/apsched_witness.S                  |    3 +-
+ src/arch/x86_64/overtaken_witness.S                |   10 +-
+ src/kernel/boot/bootstrap_state.rs                 |    2 +
+ src/kernel/boot/exec_state.rs                      |  175 ++-
+ src/kernel/boot/futex.rs                           |  654 +++++++++
+ src/kernel/boot/ipc_state.rs                       |   15 +-
+ src/kernel/boot/mod.rs                             |    5 +
+ src/kernel/boot/orchestrator_state.rs              |   43 +
+ src/kernel/boot/overtaken_tests/tests.rs           |   23 +-
+ src/kernel/boot/restart_state.rs                   |   17 +-
+ src/kernel/boot/tests.rs                           | 1477 +++++++++++++++-----
+ src/kernel/overtaken_witness.rs                    |    4 +-
+ src/kernel/syscall/sched.rs                        |  118 +-
+ src/kernel/syscall_split.rs                        |   98 +-
+ src/kernel/task.rs                                 |   11 +-
+ src/kernel/vm.rs                                   |   19 +
+ src/runtime.rs                                     |  390 +++---
+ tests/broad_lock_census_guard.rs                   |    3 +
+ 27 files changed, 2571 insertions(+), 725 deletions(-)
+src/kernel/boot/exec_state.rs:3215:    /// the 4-level page table for the exact page that contained the observed
+src/kernel/syscall/sched.rs:34:/// The kernel compares `expected` with the word IT reads (there is no caller-supplied `observed`).
+src/kernel/syscall_split.rs:5263:                "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=0 rearm=1 broad_lock=0",
+src/kernel/syscall_split.rs:5335:                "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=1 rearm=1 broad_lock=0",
+src/kernel/syscall_split.rs:5495:/// `expected` and `observed` are both the CALLER'S arguments and the kernel compares them; it
+src/kernel/syscall_split.rs:7573:        QueuedRequestOutcome::EndpointIncarnationChanged { expected, observed } => {
+src/kernel/syscall_split.rs:7576:                "IPCCALL_QUEUED_SPLIT_INCARNATION tid={} endpoint={} expected={} observed={} enqueues=0 result=ok",
+src/kernel/syscall_split.rs:7580:                observed.unwrap_or(u64::MAX)
+crates/yarm-user-rt/src/lib.rs:1631:    pub fn futex_wait(
+crates/yarm-user-rt/src/lib.rs:1658:    pub fn futex_wake(
+crates/yarm-compat-servers/src/posix_compat/sysdeps/kernel_hooks.rs:184:        .futex_wake(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:697:    let blocked: u32 = match yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:726:    let _ = yarm_user_rt::syscall::futex_wake(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:745:        let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:896:    let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:1315:    let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:2300:            let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:2328:            let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:2339:        let _ = yarm_user_rt::syscall::futex_wake(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3555:            let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3948:            let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:4766:            let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:6148:    let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:6459:        let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/control_plane/init/service.rs:6608:        let _ = yarm_user_rt::syscall::futex_wait(
+crates/yarm-control-plane-servers/src/bin/init_server.rs:73:        match yarm::user_rt::syscall::futex_wait(

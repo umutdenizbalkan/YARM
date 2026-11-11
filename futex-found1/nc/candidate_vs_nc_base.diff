@@ -1,0 +1,33 @@
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 6e062774..ee99dc7e 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13725,14 +13725,21 @@ impl SharedKernel {
+             )
+         });
+         for &tid in &claimed[..n] {
+-            let Ok(mut plan) = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
++            // The planner refuses only a TID with no live TCB (the task was torn down after the
++            // claim) or a spawn reservation (never `Running`, so never registered): there is no
++            // live waiter left to place.
++            let mut plan = match self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                 crate::kernel::task_enqueue::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)
+-            }) else {
+-                crate::yarm_log!(
+-                    "FUTEX_WAKE_ENQUEUE_DEFERRED tid={} reason=plan owner=park_transaction",
+-                    tid
+-                );
+-                continue;
++            }) {
++                Ok(plan) => plan,
++                Err(err) => {
++                    crate::yarm_log!(
++                        "FUTEX_WAKE_ENQUEUE_SKIPPED tid={} reason=plan_refused err={:?}",
++                        tid,
++                        err
++                    );
++                    continue;
++                }
+             };
+             // AP-SCHED1: the woken task's home, then the remote half of the commit.
+             self.resolve_plan_home_split(&mut plan, cpu);
