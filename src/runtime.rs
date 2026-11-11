@@ -13929,7 +13929,12 @@ impl SharedKernel {
             };
             for _ in 0..count {
                 let Some(tid) = self.with_task_futex_split_mut(|tcbs, table| {
-                    fx::claim_pending_futex_waiter_locked(tcbs, table, key)
+                    let tid = fx::claim_pending_futex_waiter_locked(tcbs, table, key)?;
+                    // SCHED-LOCK1 witness only: the incarnation this owner places — exactly the
+                    // waiter it claimed, which may differ from the one its preflight planned for.
+                    #[cfg(feature = "sched-lock1-witness")]
+                    crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid);
+                    Some(tid)
                 }) else {
                     break;
                 };

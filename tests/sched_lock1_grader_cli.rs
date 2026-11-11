@@ -371,6 +371,9 @@ fn producer_facts_the_grader_relies_on() {
     // FUTEX-WAKE-CAP1: 5 -> 6. The futex wake no longer commits through
     // `commit_enqueue_split`; its reserved commit is a commit site of its own and claims for
     // itself, so the witness still sees every futex wake's placement.
-    assert_eq!(claims, 6, "claim sites");
+    // FUTEX-REQUEUE-ATOMIC1: 6 -> 7. NR 17's wake portion is no longer a FutexWake run afterwards;
+    // its placement fills the slots its preflight reserved, a reserved commit of its own, which
+    // claims (and stages the exact waiter it claimed) for itself.
+    assert_eq!(claims, 7, "claim sites");
     assert!(staged >= 6, "stage sites: {staged}");
 }
