@@ -13694,65 +13694,116 @@ impl SharedKernel {
         Ok(self.futex_wake_key_split(cpu, key, count))
     }
 
-    /// FUTEX-FOUND1 — THE split wake of one key.
+    /// FUTEX-FOUND1 — THE split wake of one key. FUTEX-WAKE-CAP1: no waiter is claimed before
+    /// its placement is guaranteed.
     ///
-    /// 1. rank 2 — the claim: up to `count` live waiters, oldest first; each is made `Runnable`
-    ///    and its record retired in this one critical section, so none is claimed twice.
-    /// 2. rank 1 — one enqueue per claimed waiter, through THE shared enqueue owner (its home
-    ///    CPU, then the remote half of the commit). A refusal can only be for a waiter that is
-    ///    still some CPU's `current` — a park caught between its registration and its
-    ///    compare-and-clear, whose own read-back owns its placement — so it is reported, not
-    ///    propagated, and no later waiter is skipped.
+    /// Per waiter, oldest first, until `count` are placed:
     ///
-    /// Lock order: task (rank 2) then scheduler (rank 1), never nested.
+    /// 1. rank 2 — the oldest live waiter (`next_futex_waiter_locked`), and its enqueue plan
+    ///    through THE planner and the home rule (a waiter has run, so its home is fixed).
+    /// 2. rank 1 — a user slot RESERVED on its home CPU. A refusal (full queue, offline or
+    ///    wake-only CPU) ends the wake: that waiter and every later one stay parked, exactly as
+    ///    they were, and are not counted.
+    /// 3. rank 2 — the claim of exactly that waiter (`Runnable`, record retired). If another
+    ///    owner took it first, the reservation is released and the next waiter is tried.
+    /// 4. rank 1 — the reserved commit, which cannot be refused for capacity. A waiter that is
+    ///    already placed (still current mid-publication: its own read-back owns it) is counted.
+    ///
+    /// Lock order: task (rank 2) and scheduler (rank 1) alternately, never nested. Every
+    /// iteration places a waiter, ends the wake, or meets a waiter another owner took, so the
+    /// loop is bounded by `count` plus the waiters taken concurrently.
     pub(crate) fn futex_wake_key_split(
         &self,
         cpu: CpuId,
         key: crate::kernel::boot::futex::FutexKey,
         count: u32,
     ) -> u32 {
-        if count == 0 {
-            return 0;
-        }
-        let mut claimed = [0u64; crate::kernel::boot::futex::MAX_FUTEX_WAITERS];
-        let n = self.with_task_futex_split_mut(|tcbs, table| {
-            crate::kernel::boot::futex::claim_futex_waiters_locked(
-                tcbs,
-                table,
-                key,
-                count as usize,
-                &mut claimed,
-            )
-        });
-        for &tid in &claimed[..n] {
-            // The planner refuses only a TID with no live TCB (the task was torn down after the
-            // claim) or a spawn reservation (never `Running`, so never registered): there is no
-            // live waiter left to place.
+        use crate::kernel::boot::futex as fx;
+        use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
+        let want = (count as usize).min(fx::MAX_FUTEX_WAITERS);
+        let mut woke = 0usize;
+        let mut attempts = 0usize;
+        while woke < want && attempts < want + fx::MAX_FUTEX_WAITERS {
+            attempts += 1;
+            // (1) rank 2: the oldest live waiter, then its plan.
+            let Some(candidate) = self.with_task_futex_split_mut(|tcbs, table| {
+                fx::next_futex_waiter_locked(tcbs, table, key)
+            }) else {
+                break;
+            };
             let mut plan = match self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
-                crate::kernel::task_enqueue::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)
+                te::plan_balanced_enqueue_locked(tcbs, classes, candidate.tid, cpu)
             }) {
                 Ok(plan) => plan,
                 Err(err) => {
                     crate::yarm_log!(
-                        "FUTEX_WAKE_ENQUEUE_SKIPPED tid={} reason=plan_refused err={:?}",
-                        tid,
-                        err
+                        "FUTEX_WAKE_STOPPED tid={} reason=plan_refused err={:?} woke={}",
+                        candidate.tid,
+                        err,
+                        woke
                     );
-                    continue;
+                    break;
                 }
             };
-            // AP-SCHED1: the woken task's home, then the remote half of the commit.
             self.resolve_plan_home_split(&mut plan, cpu);
-            match self.commit_enqueue_split(&plan) {
-                Ok(target) => crate::arch::hal::notify_enqueued(target),
-                Err(err) => crate::yarm_log!(
-                    "FUTEX_WAKE_ENQUEUE_DEFERRED tid={} err={:?} owner=park_transaction",
-                    tid,
-                    err
+            let EnqueueTarget::Pinned(target) = plan.target else {
+                break;
+            };
+            // (2) rank 1: the placement, promised before the waiter is touched.
+            let reserved = self
+                .with_cpu_sched_split(target, |c| te::reserve_enqueue_on_cpu_locked(c, &plan))
+                .map_err(crate::kernel::boot::map_scheduler_error)
+                .and_then(|r| r);
+            if let Err(err) = reserved {
+                crate::yarm_log!(
+                    "FUTEX_WAKE_STOPPED tid={} cpu={} reason=no_placement err={:?} woke={}",
+                    candidate.tid,
+                    target.0,
+                    err,
+                    woke
+                );
+                break;
+            }
+            #[cfg(test)]
+            fx::futex_phase_hook::run_wake_step(
+                fx::futex_phase_hook::WAKE_AFTER_RESERVE,
+                candidate.tid,
+            );
+            // (3) rank 2: the claim of exactly this waiter.
+            let claimed = self.with_task_futex_split_mut(|tcbs, table| {
+                fx::claim_futex_waiter_locked(tcbs, table, key, candidate)
+            });
+            if !claimed {
+                let _ = self.with_cpu_sched_split(target, |c| {
+                    te::release_enqueue_reservation_on_cpu_locked(c, &plan)
+                });
+                continue;
+            }
+            #[cfg(test)]
+            fx::futex_phase_hook::run_wake_step(
+                fx::futex_phase_hook::WAKE_AFTER_CLAIM,
+                candidate.tid,
+            );
+            // (4) rank 1: the reserved commit.
+            match self.with_cpu_sched_split(target, |c| {
+                te::commit_reserved_enqueue_on_cpu_locked(c, &plan)
+            }) {
+                Ok(Ok(ReservedCommit::Queued(t))) => {
+                    #[cfg(feature = "sched-lock1-witness")]
+                    crate::kernel::schedlock1_witness::claim(self, t, plan.tid);
+                    crate::arch::hal::notify_enqueued(t);
+                    woke += 1;
+                }
+                Ok(Ok(ReservedCommit::AlreadyPlaced(_))) => woke += 1,
+                other => crate::yarm_log!(
+                    "FUTEX_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} result={:?}",
+                    candidate.tid,
+                    target.0,
+                    other
                 ),
             }
         }
-        n as u32
+        woke as u32
     }
 
     // ── Stage 198E3B2A part 2: shared-region OFF-LOCK seams ─────────────────────────────────────

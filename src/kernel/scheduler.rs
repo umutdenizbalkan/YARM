@@ -160,14 +160,23 @@ impl RingQueue {
         false
     }
 
+    /// Push within the ring's physical bound. The user limit ([`MAX_RUN_QUEUE`], counting
+    /// reservations) is the caller's: `PriorityScheduler::enqueue_with_priority` applies it to
+    /// every user push, and a reserved fill was admitted by it when it reserved. KTHREAD1-ACCEPTANCE
+    /// §1: kernel threads keep their reserved room.
+    /// The ring's own per-kind limit, unchanged (unit tests of the ring).
+    #[cfg(test)]
     fn push(&mut self, tid: ThreadId) -> Result<(), SchedulerError> {
-        // KTHREAD1-ACCEPTANCE §1: the user limit is unchanged; kernel threads have reserved room.
         let limit = if crate::kernel::kthread::is_kthread_tid(tid.0) {
             MAX_QUEUED_PER_PRIORITY
         } else {
             MAX_RUN_QUEUE
         };
-        if self.len >= limit {
+        self.push_within(tid, limit)
+    }
+
+    fn push_within(&mut self, tid: ThreadId, limit: usize) -> Result<(), SchedulerError> {
+        if self.len >= limit.min(MAX_QUEUED_PER_PRIORITY) {
             return Err(SchedulerError::QueueFull);
         }
         let tail = Self::index(self.head + self.len);
@@ -294,6 +303,12 @@ pub struct PriorityScheduler {
     membership_keys: [ThreadId; MEMBERSHIP_SLOTS],
     membership_state: [u8; MEMBERSHIP_SLOTS],
     membership_tracking_exhausted: bool,
+    /// FUTEX-WAKE-CAP1 — user slots promised per priority queue and not yet filled. A wake that
+    /// must not mutate its waiter until a placement is guaranteed reserves first; every user push
+    /// counts these as occupied, so the promise cannot be spent by anyone else. Bounded by
+    /// [`MAX_RUN_QUEUE`] per queue, because a reservation is refused once
+    /// `len + reserved` reaches it.
+    reserved: [usize; 3],
 }
 
 impl Default for PriorityScheduler {
@@ -304,6 +319,7 @@ impl Default for PriorityScheduler {
             membership_keys: [ThreadId(0); MEMBERSHIP_SLOTS],
             membership_state: [MEMBERSHIP_EMPTY; MEMBERSHIP_SLOTS],
             membership_tracking_exhausted: false,
+            reserved: [0; 3],
         }
     }
 }
@@ -434,7 +450,71 @@ impl PriorityScheduler {
         if self.contains_tid(tid) {
             return Err(SchedulerError::AlreadyQueued);
         }
-        self.queues[Self::priority_index(priority)].push(tid)?;
+        // FUTEX-WAKE-CAP1: a reserved slot is occupied for every user push but the one it was
+        // reserved for.
+        if !crate::kernel::kthread::is_kthread_tid(tid.0) && !self.user_room(priority) {
+            return Err(SchedulerError::QueueFull);
+        }
+        self.push_unchecked_capacity(tid, priority)
+    }
+
+    /// FUTEX-WAKE-CAP1 — whether one more user entry fits at `priority`, counting reservations.
+    fn user_room(&self, priority: TaskPriority) -> bool {
+        let p = Self::priority_index(priority);
+        self.queues[p].len + self.reserved[p] < MAX_RUN_QUEUE
+    }
+
+    /// FUTEX-WAKE-CAP1 — promise one user slot at `priority`. Refused (`QueueFull`) exactly when
+    /// an ordinary user push would be; nothing is mutated on a refusal.
+    pub(crate) fn reserve_user_slot(
+        &mut self,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        if !self.user_room(priority) {
+            return Err(SchedulerError::QueueFull);
+        }
+        self.reserved[Self::priority_index(priority)] += 1;
+        Ok(())
+    }
+
+    /// FUTEX-WAKE-CAP1 — give back a promise that will not be used.
+    pub(crate) fn release_user_slot(&mut self, priority: TaskPriority) {
+        let p = Self::priority_index(priority);
+        debug_assert!(self.reserved[p] > 0, "released a user slot nobody reserved");
+        self.reserved[p] = self.reserved[p].saturating_sub(1);
+    }
+
+    /// FUTEX-WAKE-CAP1 — the user slots currently promised at `priority`.
+    #[cfg(test)]
+    pub(crate) fn reserved_user_slots(&self, priority: TaskPriority) -> usize {
+        self.reserved[Self::priority_index(priority)]
+    }
+
+    /// FUTEX-WAKE-CAP1 — fill a promised slot. The reservation is consumed whatever the outcome;
+    /// the only refusal is `AlreadyQueued` (the task is already placed here). Capacity cannot
+    /// refuse: at the reservation `len + reserved < MAX_RUN_QUEUE`, every later user push keeps
+    /// `len + reserved <= MAX_RUN_QUEUE`, and kernel threads add at most
+    /// `KTHREAD_CAPACITY` entries, so `len < MAX_QUEUED_PER_PRIORITY` holds here.
+    pub(crate) fn enqueue_reserved_with_priority(
+        &mut self,
+        tid: ThreadId,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        self.release_user_slot(priority);
+        if self.contains_tid(tid) {
+            return Err(SchedulerError::AlreadyQueued);
+        }
+        self.push_unchecked_capacity(tid, priority)
+    }
+
+    /// The push itself, after the caller's capacity rule. The ring's physical bound is still
+    /// checked; for a user TID it is the kernel-thread headroom that a reserved fill may use.
+    fn push_unchecked_capacity(
+        &mut self,
+        tid: ThreadId,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        self.queues[Self::priority_index(priority)].push_within(tid, MAX_QUEUED_PER_PRIORITY)?;
         if !self.membership_tracking_exhausted && self.membership_insert(tid).is_err() {
             self.membership_tracking_exhausted = self.rebuild_membership_table();
         }
@@ -1326,6 +1406,41 @@ impl CpuView<'_> {
         self.enqueue_with_priority(tid, TaskPriority::Normal)
     }
 
+    /// FUTEX-WAKE-CAP1 — promise one user slot on this CPU at `priority`, under its 1L. Refused
+    /// for exactly the CPU states an enqueue is refused for (offline, wake-only) and for a full
+    /// queue; nothing is mutated on a refusal.
+    pub(crate) fn reserve_user_slot(
+        &mut self,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        self.validate_online()?;
+        if self.wake_only() {
+            return Err(SchedulerError::WakeOnly);
+        }
+        self.sched.rq.reserve_user_slot(priority)
+    }
+
+    /// FUTEX-WAKE-CAP1 — give back an unused promise on this CPU.
+    pub(crate) fn release_user_slot(&mut self, priority: TaskPriority) {
+        self.sched.rq.release_user_slot(priority);
+    }
+
+    /// FUTEX-WAKE-CAP1 — the promised slots on this CPU at `priority` (tests).
+    #[cfg(test)]
+    pub(crate) fn reserved_user_slots(&self, priority: TaskPriority) -> usize {
+        self.sched.rq.reserved_user_slots(priority)
+    }
+
+    /// FUTEX-WAKE-CAP1 — fill a slot promised by [`Self::reserve_user_slot`] on this CPU. The CPU
+    /// was online and not wake-only when the promise was made, and neither changes back.
+    pub(crate) fn enqueue_reserved_with_priority(
+        &mut self,
+        tid: ThreadId,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        self.sched.rq.enqueue_reserved_with_priority(tid, priority)
+    }
+
     /// Provenance-preserving form of [`Self::dispatch_next`].
     pub fn dispatch_next_selection(&mut self) -> DispatchSelection {
         if !self.online() {
@@ -1609,6 +1724,17 @@ impl SchedAll<'_> {
     #[cfg(feature = "sched-lock1-witness")]
     pub(crate) fn witness_cell(&self, cpu: CpuId) -> &CpuSched {
         &*self.cpus[cpu.0 as usize]
+    }
+
+    /// FUTEX-WAKE-CAP1 — the user slots promised on `cpu`, all priorities (tests).
+    #[cfg(test)]
+    pub(crate) fn reserved_user_slots_on(&self, cpu: CpuId) -> usize {
+        self.cpu_ref(cpu).map_or(0, |(_, s)| {
+            [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low]
+                .into_iter()
+                .map(|p| s.rq.reserved_user_slots(p))
+                .sum()
+        })
     }
 
     fn cpu_ref(&self, cpu: CpuId) -> Option<(usize, &CpuSched)> {

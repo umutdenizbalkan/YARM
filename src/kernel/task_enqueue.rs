@@ -221,6 +221,60 @@ pub(crate) fn commit_enqueue_on_cpu_locked(
     }
 }
 
+/// FUTEX-WAKE-CAP1 — what filling a reserved slot achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservedCommit {
+    /// The task is now queued exactly once on this CPU.
+    Queued(CpuId),
+    /// The task was already placed on this CPU — its current task, mid-publication of a wait whose
+    /// own read-back owns its placement, or already queued. The reservation is released.
+    AlreadyPlaced(CpuId),
+}
+
+/// rank 1L — FUTEX-WAKE-CAP1: promise `plan` a user slot on this CPU, BEFORE the caller mutates
+/// the task. The plan must name exactly this CPU. Refused — with nothing mutated — for a full
+/// queue, an offline or wake-only CPU, or a plan for another CPU: the same refusals the commit
+/// would make, moved ahead of the irreversible step.
+pub(crate) fn reserve_enqueue_on_cpu_locked(
+    view: &mut CpuView<'_>,
+    plan: &EnqueuePlan,
+) -> Result<(), KernelError> {
+    match plan.target {
+        EnqueueTarget::Pinned(target) if target == view.cpu() => view
+            .reserve_user_slot(plan.priority)
+            .map_err(map_scheduler_error),
+        _ => Err(map_scheduler_error(
+            crate::kernel::scheduler::SchedulerError::CpuOffline,
+        )),
+    }
+}
+
+/// rank 1L — FUTEX-WAKE-CAP1: release a promise made by [`reserve_enqueue_on_cpu_locked`] that
+/// will not be filled (the task was taken by another owner first).
+pub(crate) fn release_enqueue_reservation_on_cpu_locked(
+    view: &mut CpuView<'_>,
+    plan: &EnqueuePlan,
+) {
+    view.release_user_slot(plan.priority);
+}
+
+/// rank 1L — FUTEX-WAKE-CAP1: THE commit of a reserved enqueue. It cannot be refused for capacity
+/// (the slot was promised); `AlreadyQueued` is reported as `AlreadyPlaced`. Anything else is an
+/// invariant break and is returned as the error.
+pub(crate) fn commit_reserved_enqueue_on_cpu_locked(
+    view: &mut CpuView<'_>,
+    plan: &EnqueuePlan,
+) -> Result<ReservedCommit, KernelError> {
+    let cpu = view.cpu();
+    match view.enqueue_reserved_with_priority(ThreadId(plan.tid), plan.priority) {
+        Ok(()) => Ok(ReservedCommit::Queued(cpu)),
+        Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued) => {
+            Ok(ReservedCommit::AlreadyPlaced(cpu))
+        }
+        Err(other) => Err(map_scheduler_error(other)),
+    }
+}
+
 /// The whole-domain commit (boot and hosted tests, under every 1L and 1G): a pinned plan is THE
 /// per-CPU commit above on its CPU; a balanced plan takes the coherent balanced choice.
 pub(crate) fn commit_enqueue_locked(

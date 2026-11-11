@@ -34,7 +34,7 @@
 //! * a record and `TaskStatus::Blocked(WaitReason::Futex(token))` are created together
 //!   ([`register_futex_waiter_locked`]);
 //! * a wake removes the record and makes the task `Runnable` together
-//!   ([`claim_futex_waiters_locked`]);
+//!   ([`claim_futex_waiter_locked`], after [`next_futex_waiter_locked`]);
 //! * an undo removes the record and restores `Running` together
 //!   ([`undo_futex_registration_locked`]).
 //!
@@ -495,59 +495,83 @@ pub fn futex_still_parked_locked(
         .any(|t| t.tid.0 == tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token)))
 }
 
-/// rank 2 — THE wake claim: up to `max` LIVE waiters on `key`, oldest first.
+/// FUTEX-WAKE-CAP1 — the oldest live waiter of a key, as found by [`next_futex_waiter_locked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FutexWakeCandidate {
+    pub tid: u64,
+    pub token: FutexWaitToken,
+}
+
+/// rank 2 — the OLDEST live waiter on `key`, without claiming it. Stale records met on the way
+/// (in this bucket, of any key) are retired. Mutates no TCB.
 ///
-/// Each claimed waiter has its record retired and its TCB made `Runnable` in this one critical
-/// section, so a waiter is claimed at most once and only by its exact token. Stale records met on
-/// the way are retired and not counted. The claimed TIDs are written to `out` in claim order; the
-/// caller owes each exactly one enqueue. Returns how many were claimed.
-pub fn claim_futex_waiters_locked(
-    tcbs: &mut [Option<ThreadControlBlock>],
+/// A wake asks this first so that it can secure the waiter's placement (a reserved run-queue
+/// slot, at rank 1) before anything irreversible happens to the waiter.
+pub fn next_futex_waiter_locked(
+    tcbs: &[Option<ThreadControlBlock>],
     table: &mut FutexWaiterTable,
     key: FutexKey,
-    max: usize,
-    out: &mut [u64],
-) -> usize {
-    let limit = max.min(out.len());
+) -> Option<FutexWakeCandidate> {
     let b = key.bucket();
-    let mut n = 0usize;
     let mut prev = NIL;
     let mut cur = table.head[b];
-    while cur != NIL && n < limit {
+    while cur != NIL {
         let slot = usize::from(cur);
-        let Some(rec) = table.records[slot] else {
-            break;
-        };
+        let rec = table.records[slot]?;
         let next = rec.next;
-        let remove = if rec.key == key {
-            let token = table.token(slot);
-            // O(1): the record names its TCB slot; the tid and the token make the match exact.
-            match tcbs
-                .get_mut(usize::from(rec.tcb))
-                .and_then(Option::as_mut)
-                .filter(|t| {
-                    t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))
-                }) {
-                Some(tcb) => {
-                    tcb.status = TaskStatus::Runnable;
-                    out[n] = rec.tid;
-                    n += 1;
-                    true
-                }
-                // Stale: the TCB moved on through some other owner. Reclaim, do not count.
-                None => true,
+        if table.live(tcbs, slot) {
+            if rec.key == key {
+                return Some(FutexWakeCandidate {
+                    tid: rec.tid,
+                    token: table.token(slot),
+                });
             }
-        } else {
-            !table.live(tcbs, slot)
-        };
-        if remove {
-            table.retire_after(slot, prev);
-        } else {
             prev = cur;
+        } else {
+            // Stale: the TCB moved on through some other owner. Reclaim it.
+            table.retire_after(slot, prev);
         }
         cur = next;
     }
-    n
+    None
+}
+
+/// rank 2 — THE wake claim, of exactly one waiter: `candidate` is made `Runnable` and its record
+/// retired in this one critical section, iff its record is still the live one on `key` that
+/// [`next_futex_waiter_locked`] returned. Returns `false` (and changes nothing) otherwise — another
+/// owner took it first, and that owner is responsible for it.
+///
+/// The caller holds a reserved run-queue slot for the waiter when it calls this, so a `true`
+/// here is always followed by a placement that cannot be refused for capacity.
+pub fn claim_futex_waiter_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    key: FutexKey,
+    candidate: FutexWakeCandidate,
+) -> bool {
+    let slot = usize::from(candidate.token.slot);
+    if slot >= MAX_FUTEX_WAITERS || table.token(slot) != candidate.token {
+        return false;
+    }
+    let Some(rec) = table.records[slot] else {
+        return false;
+    };
+    if rec.key != key || rec.tid != candidate.tid {
+        return false;
+    }
+    let token = candidate.token;
+    let Some(tcb) = tcbs
+        .get_mut(usize::from(rec.tcb))
+        .and_then(Option::as_mut)
+        .filter(|t| {
+            t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))
+        })
+    else {
+        return false;
+    };
+    tcb.status = TaskStatus::Runnable;
+    table.retire(slot);
+    true
 }
 
 /// rank 2 — retire every record naming `tid` (its TCB is being torn down). Eager reclamation; a
@@ -604,6 +628,28 @@ pub(crate) mod futex_phase_hook {
         let hook = AFTER_REGISTER.with(|h| h.borrow_mut().take());
         if let Some(mut hook) = hook {
             hook();
+        }
+    }
+
+    /// FUTEX-WAKE-CAP1 — the wake's own windows, for tests: `WAKE_AFTER_RESERVE` runs after a
+    /// waiter's placement is reserved and before it is claimed; `WAKE_AFTER_CLAIM` after the
+    /// claim and before the reserved commit. One-shot, like the registration hook.
+    pub(crate) const WAKE_AFTER_RESERVE: u8 = 1;
+    pub(crate) const WAKE_AFTER_CLAIM: u8 = 2;
+    type WakeHook = alloc::boxed::Box<dyn FnMut(u8, u64) -> bool>;
+    std::thread_local! {
+        static WAKE_STEP: RefCell<Option<WakeHook>> = const { RefCell::new(None) };
+    }
+    /// The hook sees (step, tid) and returns whether to stay armed.
+    pub(crate) fn arm_wake_step(hook: WakeHook) {
+        WAKE_STEP.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    pub(crate) fn run_wake_step(step: u8, tid: u64) {
+        let hook = WAKE_STEP.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook
+            && hook(step, tid)
+        {
+            WAKE_STEP.with(|h| *h.borrow_mut() = Some(hook));
         }
     }
 }

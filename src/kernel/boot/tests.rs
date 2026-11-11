@@ -63039,11 +63039,26 @@ mod stage191b_futex_wake_retire {
         // (`Blocked(Futex(VirtAddr(addr)))`) and checked that they resembled each other; that
         // predicate is the cross-process wake. Both owners now reach THE keyed claim, so the
         // woken set, count and order are the same by construction, not by resemblance.
-        assert!(
-            EXEC_SRC.contains("super::futex::claim_futex_waiters_locked(")
-                && RUNTIME_SRC.contains("crate::kernel::boot::futex::claim_futex_waiters_locked("),
-            "the broad and split wakes must both reach the one keyed claim"
-        );
+        // FUTEX-WAKE-CAP1: both wakes reach THE exact claim, and only after a reserved placement.
+        for (name, src) in [("exec_state.rs", EXEC_SRC), ("runtime.rs", RUNTIME_SRC)] {
+            let reserve = src
+                .find("te::reserve_enqueue_on_cpu_locked(")
+                .unwrap_or_else(|| panic!("{name}: the wake reserves a placement"));
+            let claim = src
+                .find("fx::claim_futex_waiter_locked(")
+                .unwrap_or_else(|| panic!("{name}: the wake reaches the one keyed claim"));
+            let commit = src
+                .find("te::commit_reserved_enqueue_on_cpu_locked(")
+                .unwrap_or_else(|| panic!("{name}: the wake fills the reserved slot"));
+            assert!(
+                reserve < claim && claim < commit,
+                "{name}: reserve, then claim, then the reserved commit"
+            );
+            assert!(
+                !src.contains("claim_futex_waiters_locked("),
+                "{name}: the claim-everything-then-enqueue batch may not come back"
+            );
+        }
         for (name, src) in [("exec_state.rs", EXEC_SRC), ("runtime.rs", RUNTIME_SRC)] {
             assert!(
                 !src.contains("WaitReason::Futex(VirtAddr("),
@@ -123525,7 +123540,7 @@ mod stage199d_wa2b_wake_owner_census {
         // task (the proof is in `every_cannot_row_pins_its_guard_and_its_caller_closure`).
         (
             "src/kernel/boot/futex.rs",
-            "claim_futex_waiters_locked",
+            "claim_futex_waiter_locked",
             1,
             Verdict::Cannot,
         ),
@@ -123795,12 +123810,14 @@ mod stage199d_wa2b_wake_owner_census {
             "let slot = usize::from(token.slot);",
         ),
         (
+            // FUTEX-WAKE-CAP1: one exact claim per waiter, after its placement is reserved: the
+            // write follows the token-exact TCB match and precedes the record's retirement.
             "src/kernel/boot/futex.rs",
-            "claim_futex_waiters_locked",
+            "claim_futex_waiter_locked",
             "tcb.status",
             "TaskStatus::Runnable",
-            "Some(tcb) => {",
-            "out[n] = rec.tid;",
+            "};",
+            "table.retire(slot);",
         ),
         (
             "src/kernel/boot/ipc_state.rs",
@@ -124736,10 +124753,13 @@ mod stage199d_wa2b_wake_owner_census {
             // the registration of that same record (`table.token(slot)`), so the TCB it moves is
             // in exactly the futex wait that record describes.
             (
+                // FUTEX-WAKE-CAP1: the TID now arrives as a candidate, but the claim acts only
+                // when the candidate names the CURRENT incarnation of a record on the woken key,
+                // and that record's TCB holds exactly its token.
                 "futex.rs",
-                "claim_futex_waiters_locked",
+                "claim_futex_waiter_locked",
                 "t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))",
-                "let token = table.token(slot);",
+                "table.token(slot) != candidate.token",
             ),
             (
                 "exec_state.rs",
@@ -202231,7 +202251,12 @@ mod ap_sched1 {
         ] {
             // SCHED-LOCK1: the split commits are `commit_enqueue_split` (THE per-CPU commit) and
             // the per-CPU view's `enqueue_with_priority`.
-            for pat in [".commit_enqueue_split(&plan)", ".enqueue_with_priority("] {
+            // FUTEX-WAKE-CAP1: the futex wake's reserved commit is one too.
+            for pat in [
+                ".commit_enqueue_split(&plan)",
+                ".enqueue_with_priority(",
+                "te::commit_reserved_enqueue_on_cpu_locked(c, &plan)",
+            ] {
                 for (i, _) in src.match_indices(pat) {
                     let head = &src[..i];
                     let fn_start = head.rfind("fn ").unwrap();

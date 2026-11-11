@@ -650,7 +650,7 @@ impl KernelState {
     /// AP-SCHED1 — the broad twin of `SharedKernel::resolve_plan_home_split`: record the task's
     /// home before the commit (its explicit CPU, or the scheduler's balanced choice) and resolve a
     /// balanced plan to it.
-    fn fix_plan_home(
+    pub(super) fn fix_plan_home(
         &mut self,
         plan: &mut crate::kernel::task_enqueue::EnqueuePlan,
         fallback: CpuId,

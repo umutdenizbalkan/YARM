@@ -1211,38 +1211,97 @@ impl KernelState {
         Ok(woke)
     }
 
-    /// THE broad wake of one key: claim up to `count` live waiters, oldest first, then give each
-    /// exactly one enqueue. The claim makes each `Runnable` and retires its record in one rank-2
-    /// critical section; the enqueue follows at rank 1.
-    ///
-    /// An enqueue can only be refused for a waiter that is still some CPU's `current` — a split
-    /// park caught between its registration and its compare-and-clear. That waiter's own park
-    /// transaction owns its placement (it reads back, finds itself `Runnable` and recovers), so the
-    /// refusal is reported and not propagated: no later waiter is left `Runnable` and unqueued.
+    /// THE broad wake of one key. FUTEX-WAKE-CAP1: the same protocol as the split
+    /// `futex_wake_key_split`, through the broad seams — per waiter, oldest first: the oldest live
+    /// waiter and its plan (rank 2), a user slot reserved on its home CPU (rank 1), the claim of
+    /// exactly that waiter (rank 2), then the reserved commit (rank 1). No waiter is made
+    /// `Runnable` until its placement is guaranteed; a refused reservation ends the wake with
+    /// that waiter and every later one still parked and uncounted. Returns how many were placed.
     fn futex_wake_key(&mut self, key: super::futex::FutexKey, count: u32) -> u32 {
-        if count == 0 {
-            return 0;
-        }
-        let mut claimed = [0u64; super::futex::MAX_FUTEX_WAITERS];
-        let n = self.with_task_futex_mut(|tcbs, table| {
-            super::futex::claim_futex_waiters_locked(
-                tcbs.as_mut_slice(),
-                table,
-                key,
-                count as usize,
-                &mut claimed,
-            )
-        });
-        for &tid in &claimed[..n] {
-            if let Err(err) = self.enqueue_task(tid) {
+        use super::futex as fx;
+        use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
+        let want = (count as usize).min(fx::MAX_FUTEX_WAITERS);
+        let current_cpu = self.current_cpu();
+        let mut woke = 0usize;
+        let mut attempts = 0usize;
+        while woke < want && attempts < want + fx::MAX_FUTEX_WAITERS {
+            attempts += 1;
+            let Some(candidate) = self.with_task_futex_mut(|tcbs, table| {
+                fx::next_futex_waiter_locked(tcbs.as_slice(), table, key)
+            }) else {
+                break;
+            };
+            let mut plan = match self.with_task_enqueue_policy_mut(|tcbs, classes| {
+                te::plan_balanced_enqueue_locked(tcbs, classes, candidate.tid, current_cpu)
+            }) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    crate::yarm_log!(
+                        "FUTEX_WAKE_STOPPED tid={} reason=plan_refused err={:?} woke={}",
+                        candidate.tid,
+                        err,
+                        woke
+                    );
+                    break;
+                }
+            };
+            self.fix_plan_home(&mut plan, current_cpu);
+            let EnqueueTarget::Pinned(target) = plan.target else {
+                break;
+            };
+            let reserved = {
+                let mut guard = self.scheduler_state();
+                let mut all = guard.view();
+                match all.cpu(target) {
+                    Ok(mut view) => te::reserve_enqueue_on_cpu_locked(&mut view, &plan),
+                    Err(err) => Err(super::map_scheduler_error(err)),
+                }
+            };
+            if let Err(err) = reserved {
                 crate::yarm_log!(
-                    "FUTEX_WAKE_ENQUEUE_DEFERRED tid={} err={:?} owner=park_transaction",
-                    tid,
-                    err
+                    "FUTEX_WAKE_STOPPED tid={} cpu={} reason=no_placement err={:?} woke={}",
+                    candidate.tid,
+                    target.0,
+                    err,
+                    woke
+                );
+                break;
+            }
+            #[cfg(test)]
+            fx::futex_phase_hook::run_wake_step(
+                fx::futex_phase_hook::WAKE_AFTER_RESERVE,
+                candidate.tid,
+            );
+            let claimed = self.with_task_futex_mut(|tcbs, table| {
+                fx::claim_futex_waiter_locked(tcbs.as_mut_slice(), table, key, candidate)
+            });
+            #[cfg(test)]
+            if claimed {
+                fx::futex_phase_hook::run_wake_step(
+                    fx::futex_phase_hook::WAKE_AFTER_CLAIM,
+                    candidate.tid,
                 );
             }
+            let mut guard = self.scheduler_state();
+            let mut all = guard.view();
+            let Ok(mut view) = all.cpu(target) else {
+                break;
+            };
+            if !claimed {
+                te::release_enqueue_reservation_on_cpu_locked(&mut view, &plan);
+                continue;
+            }
+            match te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan) {
+                Ok(ReservedCommit::Queued(_) | ReservedCommit::AlreadyPlaced(_)) => woke += 1,
+                Err(err) => crate::yarm_log!(
+                    "FUTEX_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} err={:?}",
+                    candidate.tid,
+                    target.0,
+                    err
+                ),
+            }
         }
-        n as u32
+        woke as u32
     }
 
     /// FUTEX-FOUND1 — the BROAD key resolution for the current task: range, caller, address

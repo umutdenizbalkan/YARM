@@ -368,6 +368,9 @@ fn producer_facts_the_grader_relies_on() {
     let staged = runtime.matches("schedlock1_witness::stage_").count()
         + enqueue.matches("schedlock1_witness::stage_").count();
     let claims = runtime.matches("schedlock1_witness::claim(").count();
-    assert_eq!(claims, 5, "claim sites");
+    // FUTEX-WAKE-CAP1: 5 -> 6. The futex wake no longer commits through
+    // `commit_enqueue_split`; its reserved commit is a commit site of its own and claims for
+    // itself, so the witness still sees every futex wake's placement.
+    assert_eq!(claims, 6, "claim sites");
     assert!(staged >= 6, "stage sites: {staged}");
 }
