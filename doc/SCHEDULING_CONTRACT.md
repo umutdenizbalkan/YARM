@@ -80,6 +80,9 @@ They are never alternate dispatchers:
   FUTEX-WAKE-CAP1: a queue's user room counts *reservations* — slots promised to a wake that has
   not yet made its waiter `Runnable` (`PriorityScheduler::reserve_user_slot`); every user push
   treats them as occupied, and the reserved fill cannot be refused for capacity.
+  FUTEX-REQUEUE1: a compare-and-requeue's MOVE needs no queue room at all — a moved waiter stays
+  blocked and is placed only when a later wake of its new key reaches it, through the same
+  reservation; only its wake portion can meet a full queue, and it reports that stop.
 * **CPU authority.** Every production drain authenticates against a `DispatchAuthority`
   (`src/runtime.rs`), minted only by `arch::trap_entry::TrapPathWindow::establish` from the
   hardware-identified CPU (x86_64 per-CPU record, AArch64 `MPIDR_EL1`, RISC-V hart id). It carries
@@ -294,6 +297,7 @@ bounded and potentially unbounded parts).
 | Server death / reap / exit | `drain_server_death_post_work`, exit/terminal drains | authority | 2, 3, 4, 1 | masked | exiting task has none; replacement via token | per-object teardown; bounded by fixed tables |
 | FutexWait | `try_split_futex_wait_recognized` → `futex_wait_park_exact_split` → drain | authority + per-CPU deferral cell | 2 → 1; drain 1(→2) | masked | caller parked; incoming via token | O(1) + selection |
 | FutexWake | `futex_wake_split_mut` → `futex_wake_key_split` | trapping CPU | 5 → 6 (key); then per waiter 2 (find, plan), 1 (reserve), 2 (claim), 1 (reserved commit) — alternating, never nested | masked | caller continues | per waiter: ≤ 512 record visits in one bucket, O(1) each, and ≤ 4 acquisitions; ≤ `count` waiters (FUTEX-FOUND1, FUTEX-WAKE-CAP1) |
+| FutexCmpRequeue (NR 17) | `futex_cmp_requeue_split` → `compare_and_requeue_locked`, then `futex_wake_key_outcome_split` | trapping CPU | 2 → 5 → 6 held together (keys, word, comparison, transfer: the linearization point); then the FutexWake protocol for the wake portion only | masked | caller continues | transfer: one bucket walk, ≤ 512 O(1) record visits, no scheduler lock; wake portion as FutexWake, ≤ `wake` waiters (FUTEX-REQUEUE1) |
 | Page fault (COW/demand recovered) | COW / demand routes | authority | 2, 5, 6 | masked | faulting task resumes | one frame allocation; page-table walk |
 | Page fault (terminal) | terminal route + queue advance | authority + reserved deferral | 2, 8, 1 | masked | faulting task terminated | as selection |
 | Overtaken deferral | `settle_overtaken_deferral_split` | authority | 1, 2 | masked | as recorded in the deferral | O(1) |
@@ -559,6 +563,10 @@ The first real-time profile is the **smallest analysable configuration**:
     reserves the slot before it claims, so a refused placement leaves the waiter parked rather
     than `Runnable` and unqueued. The queue is no larger; the population bound is still this
     item's to resolve.
+  * FUTEX-REQUEUE1 gives broadcasts a path that does not depend on queue room: the requeue moves
+    blocked waiters without placing them, and reports a capacity-limited wake portion explicitly.
+    `FutexWake`'s `0` stays ambiguous (no waiter left, or the oldest one unplaceable) until this
+    item is resolved.
   * Owner: RT-SCHED1, by sizing queues from the configuration or rejecting the configuration.
 * **SC-POOL-4 — The INITIALIZATION → OPERATIONAL transition.** **SPECIFIED → PARTITION1.**
   * The transition is one-way. Before it, GP boot scheduling applies (BSP-first, the current
@@ -764,6 +772,7 @@ not representative of silicon, and no target hardware is in the loop.
 | W8 | Membership table | `PriorityScheduler::membership_*` | **S** | ≤ 256 probes; the linear fallback is ≤ 192 + 1. |
 | W9 | `RingQueue::remove_tid` | scheduler | **S** | ≤ 64 shifts. |
 | W10 | FutexWake | `futex_wake_split_mut` | **S** | one key resolution, then per placed waiter one bucket walk (≤ 512 O(1) record visits) and four short acquisitions; ≤ `count` (≤ 512) waiters, plus at most 512 waiters taken concurrently by other owners. Each single acquisition is bounded as before. FUTEX-FOUND1, FUTEX-WAKE-CAP1. |
+| W10a | FutexCmpRequeue transfer | `compare_and_requeue_locked` | **S** | one walk of the source key's bucket from its head to its tail at entry (≤ 512 O(1) record visits; moved records are appended past that tail and never revisited), under task, VM and memory held together; no allocation, no scheduler lock. The wake portion is W10 with `count = wake`. FUTEX-REQUEUE1. |
 | W11 | IPC timeout collection | `collect_due_ipc_timeout_work` | **S** | TCB scan ≤ 512; deadline store 4 slots. |
 | W12 | Retry loops in selection | queue-advance owner | **S** | None. The acceptance-filtered selection is single-pass. Contended marks are reported, not retried. |
 | W13 | Timer period | per-port re-arm | **N** | Relative re-arm; drift and jitter (SC-TIME-3). |

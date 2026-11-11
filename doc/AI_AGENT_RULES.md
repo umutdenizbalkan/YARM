@@ -1064,6 +1064,14 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   (`task_enqueue::reserve_enqueue_on_cpu_locked`), then mutates, then fills the reservation
   (`commit_reserved_enqueue_on_cpu_locked`), and releases it if the task was taken by another
   owner. Logging a refused enqueue is not recovery.
+- Move a futex waiter only by relinking its record (`compare_and_requeue_locked`: unlink, rekey,
+  append), never by retiring and re-registering it: its token is its waiter's identity, and the
+  waiter's own re-read, undo and read-back depend on it (FUTEX-REQUEUE1). A requeue never makes a
+  waiter `Runnable` and never takes a run-queue slot; only its wake portion does, through the
+  FUTEX-WAKE-CAP1 protocol.
+- Do not recommend "re-issue FutexWake until it returns 0" as a broadcast: `0` can mean the oldest
+  waiter's queue is full. Broadcast with `FutexCmpRequeue` and the contended-mutex protocol
+  (`doc/SYSCALL_ABI.md`, *Condition-variable broadcast*).
 
 ### 14.4 D3/D6 fences
 

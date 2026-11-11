@@ -1737,6 +1737,11 @@ between registration and the compare-and-clear) arm
 `futex::futex_phase_hook::arm_after_register`. To force a wake's own windows (after a waiter's
 slot is reserved, after it is claimed) arm `futex_phase_hook::arm_wake_step`; the hook gets the
 step and the TID and returns whether to stay armed (FUTEX-WAKE-CAP1).
+A compare-and-requeue's wake portion is a futex wake, so the same hooks reach its windows; a
+hook may itself issue a requeue or a wake through the split owners (FUTEX-REQUEUE1). To check a
+key's FIFO order without waking anyone use `FutexWaiterTable::waiters_in_order`, and to check the
+chains themselves `assert_chains_consistent`; `FutexKey::bucket_for_test` finds keys that share
+a bucket.
 
 ### N+22.6 — MemoryObject refcounts must drop to zero for reclaim
 

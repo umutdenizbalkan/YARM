@@ -66,6 +66,14 @@ claimed and stays parked. Waiters live in a bounded, allocation-free table
 (`boot/futex.rs`, FUTEX-FOUND1) with one slot per possible task; a record is live only while its
 TCB holds the same token.
 
+A compare-and-requeue (NR 17, FUTEX-REQUEUE1) resolves both keys, compares the source word and
+moves waiters in one task → VM → memory critical section: each moved record is unlinked from the
+source key's chain, rekeyed and appended to the target's, keeping its slot and incarnation, so its
+waiter's token — and with it the waiter's own re-read, undo and read-back — is unchanged. The moved
+waiter stays blocked; the wake portion afterwards is an ordinary wake of the source key. This is
+what a condition-variable broadcast uses to hand waiters to the mutex instead of waking them all
+(`yarm_user_rt::futex_sync`).
+
 ## libc / musl mapping
 
 The linux-compat sysdeps thread/TLS/futex hooks now route into kernel mechanisms rather than stand-alone globals:
