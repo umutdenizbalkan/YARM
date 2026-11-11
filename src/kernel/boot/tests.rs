@@ -215544,6 +215544,39 @@ mod futex_requeue1 {
             let _ = observe(&mut w.s, driver, &[head, next], 5);
         }
 
+        /// X17 — the wake portion's only waiter exits in the window AND a new waiter registers
+        /// on the source there: the operation woke A at its commit (A then exited), and D, who
+        /// came later, is not taken in A's place — an emptied wake set is never refilled from the
+        /// source.
+        #[test]
+        fn x17_an_emptied_wake_set_is_not_refilled_from_the_source() {
+            let (w, ws, init) = three(49600);
+            let (a, driver) = (w.a, w.driver);
+            let d = 49700;
+            let k = leak(w.s);
+            let victim = ws[0];
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                k.with(|s| s.exit_task(victim, 0)).expect("exit");
+                sink.borrow_mut().push(Res::Done);
+                sink.borrow_mut().push(Res::Wait(split_wait(k, a, d, 5)));
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(0), a, (SQ, P), (MX, P), 5, 1, 2);
+            let mut results = vec![res(&r)];
+            results.extend(seen.borrow().iter().cloned());
+            let mut subjects = ws.clone();
+            subjects.push(d);
+            let observed = (results, k.with(|s| observe(s, driver, &subjects, 5)));
+            assert_linearizable(
+                &observed,
+                &init,
+                RQ12,
+                &[Op::Exit(victim), Op::Wait { tid: d, exp: 5 }],
+            );
+            assert_eq!(observed.1.s, vec![d], "D still parked on S");
+        }
+
         /// X5 — the waiter the transfer left for the wake portion exits in the window.
         #[test]
         fn x05_the_kept_waiter_exits_inside_the_window() {
