@@ -3023,10 +3023,12 @@ fn run_futex_requeue_witness(s_tid: u64) {
 }
 
 /// FUTEX-WAIT-ATOMIC1 — the live wait witness, selector 18 when init is built with
-/// `futex-wait-witness` (otherwise selector 18 is FUTEX-REQUEUE1's cell). Two threads of init on
+/// `futex-wait-witness` (otherwise selector 18 is FUTEX-REQUEUE1's cell). Threads of init on
 /// SMP: a WAITER that issues `FutexWait(WORD, v)` for `CALLS` cycles, each `v` read just before,
-/// and a SIGNALLER that issues `FutexWake(WORD, 1)` in a loop — after storing a new value on even
-/// cycles, without one on odd cycles. The kernel (built with the same feature) holds each witness
+/// and two SIGNALLERS that issue `FutexWake(WORD, 1)` in a loop — after storing a new value on even
+/// cycles, without one on odd cycles. Two, so that one runs on the other CPU whichever CPU the
+/// waiter lands on; init itself blocks on a futex until the waiter is done, so the only siblings
+/// running are the witness's own. The kernel (built with the same feature) holds each witness
 /// wait open twice, until a wake from the other CPU has run inside: before its compare-and-register
 /// (B) and after it (A). The grader reads the kernel's markers; this cell reports what userspace
 /// saw: each call's result, every return counted exactly once.
@@ -3046,12 +3048,14 @@ pub(super) mod futex_wait_witness {
     pub(super) const STACK_BYTES: usize = 4096;
     const WAIT_YIELDS: u32 = 200_000;
 
+    /// The waiter and the signallers.
+    pub(super) const THREADS: usize = 3;
     #[repr(C, align(16))]
-    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; 2]);
+    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; THREADS]);
     #[allow(unused)]
-    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; 2]);
+    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; THREADS]);
     #[allow(unused)]
-    pub(super) static mut TLS: [[u8; 256]; 2] = [[0; 256]; 2];
+    pub(super) static mut TLS: [[u8; 256]; THREADS] = [[0; 256]; THREADS];
 
     static WORD: AtomicU32 = AtomicU32::new(MAGIC);
     static CYCLE: AtomicU32 = AtomicU32::new(0);
@@ -3060,6 +3064,8 @@ pub(super) mod futex_wait_witness {
     static ERRORS: AtomicU32 = AtomicU32::new(0);
     static DONE: AtomicU32 = AtomicU32::new(0);
     static PARK: AtomicU32 = AtomicU32::new(0);
+    /// The signallers' shared store counter: every store writes a value never written before.
+    static NEXT: AtomicU32 = AtomicU32::new(1);
 
     fn park() -> ! {
         loop {
@@ -3092,19 +3098,18 @@ pub(super) mod futex_wait_witness {
             }
         }
         DONE.store(1, SeqCst);
+        let _ = futex_wake(DONE.as_ptr(), 1, P);
         park()
     }
 
     /// The signaller: wake one, after a store on even cycles; park once the waiter is done.
     pub(super) extern "C" fn signaller_body() -> ! {
-        let mut n = 1u32;
         loop {
             if DONE.load(SeqCst) != 0 {
                 park();
             }
             if CYCLE.load(SeqCst) % 2 == 0 {
-                WORD.store(MAGIC | (n & 0xFFFF), SeqCst);
-                n = n.wrapping_add(1);
+                WORD.store(MAGIC | (NEXT.fetch_add(1, SeqCst) & 0xFFFF), SeqCst);
             }
             let _ = futex_wake(WORD.as_ptr(), 1, P);
             let _ = yield_now();
@@ -3117,19 +3122,21 @@ pub(super) mod futex_wait_witness {
         pub(super) tls_base: usize,
     }
 
-    pub(super) fn run_once(s_tid: u64, children: &[Child; 2]) {
+    pub(super) fn run_once(s_tid: u64, children: &[Child; THREADS]) {
         yarm_user_rt::user_log!("FWAW_BEGIN s_tid={} calls={}", s_tid, CALLS);
-        let mut tids = [0u64; 2];
+        let mut tids = [0u64; THREADS];
         for (i, c) in children.iter().enumerate() {
             // SAFETY: a valid entry; the static stack and TLS outlive the thread.
             tids[i] =
                 unsafe { yarm_user_rt::syscall::spawn_thread(c.tls_base, c.stack_top, c.entry) }
                     .unwrap_or(0);
         }
-        let mut yields = 0;
-        while DONE.load(SeqCst) == 0 && yields < WAIT_YIELDS {
-            let _ = yield_now();
-            yields += 1;
+        // Block (not yield) until the waiter is done: init is then no running sibling, so the
+        // kernel's peer check sees only the witness threads. Bounded by the waiter's own end.
+        let mut waits = 0;
+        while DONE.load(SeqCst) == 0 && waits < WAIT_YIELDS {
+            let _ = futex_wait(DONE.as_ptr(), 0, P);
+            waits += 1;
         }
         let (returns, blocked, errors) = (
             RETURNS.load(SeqCst),
@@ -3141,9 +3148,10 @@ pub(super) mod futex_wait_witness {
             && returns == CALLS
             && errors == 0;
         yarm_user_rt::user_log!(
-            "FWAW_DONE waiter={} signaller={} calls={} returns={} blocked={} errors={} result={}",
+            "FWAW_DONE waiter={} signallers={},{} calls={} returns={} blocked={} errors={} result={}",
             tids[0],
             tids[1],
+            tids[2],
             CALLS,
             returns,
             blocked,
@@ -3191,15 +3199,17 @@ fn run_futex_wait_witness(s_tid: u64) {
     let entries = [
         x86_futex_wait::waiter_entry as *const () as usize,
         x86_futex_wait::signaller_entry as *const () as usize,
+        x86_futex_wait::signaller_entry as *const () as usize,
     ];
     #[cfg(not(target_arch = "x86_64"))]
     let entries = [
         w::waiter_body as *const () as usize,
         w::signaller_body as *const () as usize,
+        w::signaller_body as *const () as usize,
     ];
     let stacks = core::ptr::addr_of_mut!(w::STACKS) as usize;
     let tls = core::ptr::addr_of_mut!(w::TLS) as usize;
-    let children: [w::Child; 2] = core::array::from_fn(|i| w::Child {
+    let children: [w::Child; w::THREADS] = core::array::from_fn(|i| w::Child {
         entry: entries[i],
         stack_top: (stacks + (i + 1) * w::STACK_BYTES) & !0xF,
         tls_base: tls + i * 256,

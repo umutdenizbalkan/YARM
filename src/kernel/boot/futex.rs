@@ -1220,6 +1220,8 @@ pub mod race_witness {
 /// `..._IN_WINDOW_WAKE` before it releases it, `..._WINDOW_CLOSE` after (B's close also reports the
 /// word it reads then, so a grader can tell whether the window saw a store). `..._RESULT` is the
 /// wait's own outcome. Bounded: a window gives up after `SPIN_BOUND` polls (`competing_wakes=0`).
+/// A wait opens its windows only while a sibling thread of the waiter (same address space, another
+/// TID) is current on another CPU; otherwise it is logged `..._SKIPPED` and runs unwindowed.
 #[cfg(feature = "futex-wait-witness")]
 pub mod wait_witness {
     use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -1244,6 +1246,17 @@ pub mod wait_witness {
             LAST_WAIT.store(w, SeqCst);
             w
         })
+    }
+
+    /// A witness wait that opens no window: no sibling thread of the waiter is current on another
+    /// CPU, so no competing wake could arrive (a window held then would only spin to its bound).
+    pub fn skip(wait: u64, cpu: u8, tid: u64) {
+        crate::yarm_log!(
+            "FUTEX_WAIT_WITNESS_SKIPPED wait={} cpu={} tid={} reason=no_peer_running",
+            wait,
+            cpu,
+            tid
+        );
     }
 
     /// The witness wait the park transaction just ran, for the route's outcome line.

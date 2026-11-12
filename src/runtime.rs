@@ -18660,7 +18660,13 @@ impl SharedKernel {
         fx::futex_phase_hook::run_before_register();
         // FUTEX-WAIT-ATOMIC1 live witness (default off): window B, before the compare-and-register.
         #[cfg(feature = "futex-wait-witness")]
-        let witness = fx::wait_witness::begin(expected);
+        let witness = fx::wait_witness::begin(expected).filter(|&w| {
+            let peer = self.futex_wait_witness_peer_running_split(cpu, tid, asid);
+            if !peer {
+                fx::wait_witness::skip(w, cpu.0, tid);
+            }
+            peer
+        });
         #[cfg(feature = "futex-wait-witness")]
         if let Some(w) = witness {
             let held = fx::wait_witness::hold('B', w, cpu.0, tid);
@@ -18792,6 +18798,24 @@ impl SharedKernel {
             entering,
             recovered,
         }
+    }
+
+    /// FUTEX-WAIT-ATOMIC1 live witness only: whether a sibling thread of `tid` (same address
+    /// space, another TID) is current on a CPU other than `cpu` — the only CPU a competing wake can
+    /// come from while this one holds a window open with interrupts masked.
+    #[cfg(feature = "futex-wait-witness")]
+    fn futex_wait_witness_peer_running_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> bool {
+        (0..crate::kernel::scheduler::MAX_CPUS)
+            .filter(|&c| c != usize::from(cpu.0))
+            .filter_map(|c| self.current_tid_authoritative(CpuId(c as u8)))
+            .any(|t| {
+                t != 0 && t != tid && self.task_asid_for_tid_split_read(t) == u64::from(asid.0)
+            })
     }
 
     /// FUTEX-WAIT-ATOMIC1 live witness only: the word as window B closes, for the grader. It

@@ -26,6 +26,10 @@ competing_wakes >= 1. Then:
 The first B rule is what the old separated protocol breaks: it compared before B and registered
 after it without comparing again, so a B that saw a store could still register and be taken in A.
 
+A wait the kernel logs FUTEX_WAIT_WITNESS_SKIPPED (no sibling of the waiter was current on another
+CPU, so no competing wake could have arrived) opens no window and is not graded by the window
+rules; its outcome still counts below.
+
 Userspace: FWAW_DONE result=ok; every cycle 1..CALLS returned exactly once; the number of calls that
 reported `blocked=1` equals the number of waits the kernel registered (woken or parked).
 Coverage: at least two B windows that saw a store, and at least two A windows. Plus the standard
@@ -57,7 +61,7 @@ def kv(line):
 def grade(lines, smp):
     fails = []
     fail = fails.append
-    opens, closes, wakes, results = {}, {}, [], {}
+    opens, closes, wakes, results, skipped = {}, {}, [], {}, set()
     calls, done = [], None
     for i, l in enumerate(lines):
         for f in FATAL:
@@ -69,6 +73,8 @@ def grade(lines, smp):
             d = kv(l); d["at"] = i; closes[d["window"]] = d
         elif "FUTEX_WAIT_WITNESS_IN_WINDOW_WAKE" in l:
             d = kv(l); d["at"] = i; wakes.append(d)
+        elif "FUTEX_WAIT_WITNESS_SKIPPED" in l:
+            skipped.add(kv(l)["wait"])
         elif "FUTEX_WAIT_WITNESS_RESULT" in l:
             d = kv(l); results[d["wait"]] = d
         elif "FWAW_CALL" in l:
@@ -87,6 +93,8 @@ def grade(lines, smp):
         fail(f"every cycle 1..{n} must return exactly once (saw {sorted(cycles)})")
     by_wait = {}
     for wid, o in opens.items():
+        if o["wait"] in skipped:
+            fail(f"wait {o['wait']} was skipped but opened window {wid}")
         by_wait.setdefault(o["wait"], {})[o["kind"]] = wid
         c = closes.get(wid)
         if c is None:
@@ -134,7 +142,7 @@ def grade(lines, smp):
         fail(f"coverage: {a_windows} A windows (need {MIN_A})")
     wcpu = {o["cpu"] for o in opens.values()}
     kcpu = {w["cpu"] for w in wakes}
-    facts.update(waits=len(by_wait), windows=len(opens), b_changed=b_changed, a=a_windows,
+    facts.update(waits=len(by_wait), skipped=len(skipped), windows=len(opens), b_changed=b_changed, a=a_windows,
                  in_window_wakes=len(wakes), waiter_cpus=",".join(sorted(wcpu)) or "none",
                  waker_cpus=",".join(sorted(kcpu)) or "none", calls=n,
                  returns=done.get("returns", "?"), blocked=done.get("blocked", "?"))
@@ -194,6 +202,15 @@ def self_test():
     assert grade(dup, 2)[0], "a cycle that returns twice must fail"
     thin = [l for l in good if "wait=4" not in l and "window=4" not in l]
     assert grade(thin, 2)[0], "coverage below the minimum must fail"
+    # A skipped wait opens no window and is not window-graded; its outcome still counts.
+    skip = good + ["FUTEX_WAIT_WITNESS_SKIPPED wait=5 cpu=0 tid=7 reason=no_peer_running",
+                   "FUTEX_WAIT_WITNESS_RESULT wait=5 tid=7 outcome=parked",
+                   f"FWAW_CALL cycle=5 expected={M} blocked=1"]
+    skip = [l.replace("calls=4 returns=4 blocked=2", "calls=5 returns=5 blocked=3") for l in skip]
+    f, facts = grade(skip, 2)
+    assert not f and facts["skipped"] == 1, (f, facts)
+    leaky = skip + ["FUTEX_WAIT_WITNESS_WINDOW_OPEN kind=B wait=5 window=50 cpu=0 tid=7"]
+    assert grade(leaky, 2)[0], "a skipped wait that opens a window must fail"
     broad = good + ["FUTEX_WAIT_BROAD_ENTRY nr=9 tid=7 result=broad_entry"]
     assert grade(broad, 2)[0], "a broad NR 9 must fail"
     print("[futex-wait-grade] self-test ok")
