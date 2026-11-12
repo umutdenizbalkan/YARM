@@ -215908,7 +215908,6 @@ mod futex_requeue1 {
                         outputs.push(n);
                     }
                 }
-                assert_eq!(outputs, [10, 11, 12], "the results are a0..a2");
                 assert!(!inputs.is_empty());
                 let caller = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0xA3, 0xA4, 0xA5]);
                 let mut done = caller.clone();
@@ -215961,7 +215960,15 @@ mod futex_requeue1 {
                         );
                     }
                     assert_eq!(r.x[10], 1, "{label}: the result");
+                    // Every register an arm writes with a RESULT must be an output of the wrapper.
+                    for n in [10, 11, 12] {
+                        assert!(
+                            outputs.contains(&n),
+                            "{label}: x{n} carries a result but the wrapper does not declare it an output"
+                        );
+                    }
                 }
+                assert_eq!(outputs, [10, 11, 12], "the results are a0..a2");
             }
 
             /// 2 — the bridge imports the number from `a7` into the number lane AND the register
