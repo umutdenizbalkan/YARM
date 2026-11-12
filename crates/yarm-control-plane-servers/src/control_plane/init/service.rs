@@ -2740,9 +2740,14 @@ pub(super) mod futex_requeue_witness {
     static SIG_CALLS: AtomicU32 = AtomicU32::new(0);
     #[cfg(feature = "futex-requeue-race-witness")]
     static SIG_NEXT: AtomicU32 = AtomicU32::new(0);
+    /// Set once the last round is over: each signaller then parks instead of yielding, so the
+    /// rest of the boot never competes with two always-runnable threads.
+    #[cfg(feature = "futex-requeue-race-witness")]
+    static SIG_DONE: AtomicU32 = AtomicU32::new(0);
 
     /// A signaller: while ARM is odd, `FutexWake(seq, 1)` as fast as it can; otherwise report the
-    /// generation it saw (so the broadcaster knows no wake of its is still in flight) and yield.
+    /// generation it saw (so the broadcaster knows no wake of its is still in flight) and yield,
+    /// or park for good once the witness is done.
     #[cfg(feature = "futex-requeue-race-witness")]
     pub(super) extern "C" fn signaller_body() -> ! {
         let me = (SIG_NEXT.fetch_add(1, SeqCst) as usize).min(SIGNALLERS - 1);
@@ -2754,6 +2759,9 @@ pub(super) mod futex_requeue_witness {
                 SIG_CALLS.fetch_add(1, SeqCst);
             } else {
                 SIG_SEEN[me].store(armed_gen, SeqCst);
+                if SIG_DONE.load(SeqCst) != 0 {
+                    park();
+                }
                 let _ = yield_now();
             }
         }
@@ -2909,6 +2917,8 @@ pub(super) mod futex_requeue_witness {
                 if ok { "ok" } else { "fail" }
             );
         }
+        #[cfg(feature = "futex-requeue-race-witness")]
+        SIG_DONE.store(1, SeqCst);
         let finished = wait_for(&FINISHED, w);
         all &= finished;
         let mut list = [0u8; 160];
