@@ -5492,10 +5492,10 @@ fn try_split_timer_into_frame(
 ///
 /// # The ABI is unchanged
 ///
-/// `expected` and `observed` are both the CALLER'S arguments and the kernel compares them; it
-/// reads no futex word to decide whether to block, only to prove the address is readable. No
-/// timeout, no bitset, no requeue, no PI, no new flag, no new lane. The success encoding is
-/// `set_ok(usize::from(blocked), 0, 0)`, byte-for-byte the broad handler's.
+/// FUTEX-FOUND1 replaced the caller's `observed` with the word the kernel reads, and
+/// FUTEX-WAIT-ATOMIC1 made that read, the comparison and the registration one hold
+/// (`futex_wait_park_exact_split`). No timeout, no bitset, no PI, no new flag, no new lane. The
+/// success encoding is `set_ok(usize::from(blocked), 0, 0)`, byte-for-byte the broad handler's.
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_futex_wait_into_frame(
     shared: &SharedKernel,

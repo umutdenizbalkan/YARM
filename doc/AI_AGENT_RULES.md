@@ -1066,7 +1066,7 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   owner. Logging a refused enqueue is not recovery.
 - Move a futex waiter only by relinking its record (`compare_and_requeue_locked`: unlink, rekey,
   append), never by retiring and re-registering it: its token is its waiter's identity, and the
-  waiter's own re-read, undo and read-back depend on it (FUTEX-REQUEUE1). A requeue never makes a
+  waiter's own undo and read-back depend on it (FUTEX-REQUEUE1). A requeue never makes a
   waiter `Runnable` and never takes a run-queue slot; only its wake portion does, through the
   FUTEX-WAKE-CAP1 protocol.
 - Decide every part of a compound futex operation in ONE critical section, and let nothing else
@@ -1077,9 +1077,11 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   any waiter), and treat a commit that finds them short as stale: write nothing, release, retry.
 - Never skip an unplaceable FIFO head to wake a later waiter whose CPU has room: the wake portion
   stops there, and that waiter is the first the requeue portion takes.
-- A split wait's second read may retract its registration only while no other operation has acted
-  on it (`undo_futex_registration_unless_acted_on_locked`); a moved or selected waiter keeps that
-  outcome.
+- `FutexWait` compares its word and registers in ONE task → VM → memory hold
+  (`compare_and_register_futex_waiter_locked`, FUTEX-WAIT-ATOMIC1), on every route. Never compare in
+  one acquisition and register in another, never resolve the key outside the hold that registers
+  on it, and never read the word again after registering: a registration is retracted only by its
+  own exact undo when the compare-and-clear finds another task current, never because of the word.
 - Do not recommend "re-issue FutexWake until it returns 0" as a broadcast: `0` can mean the oldest
   waiter's queue is full. Broadcast with `FutexCmpRequeue` and the contended-mutex protocol
   (`doc/SYSCALL_ABI.md`, *Condition-variable broadcast*).

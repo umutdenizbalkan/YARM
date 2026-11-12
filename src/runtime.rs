@@ -18664,10 +18664,7 @@ impl SharedKernel {
         #[cfg(feature = "futex-wait-witness")]
         if let Some(w) = witness {
             let held = fx::wait_witness::hold('B', w, cpu.0, tid);
-            let word = self
-                .resolve_futex_word_in_split(asid, addr, kind)
-                .ok()
-                .map(|(_, v)| v);
+            let word = self.futex_wait_witness_word_split(asid, addr, kind);
             fx::wait_witness::close('B', w, held, cpu.0, expected, word);
         }
 
@@ -18795,6 +18792,20 @@ impl SharedKernel {
             entering,
             recovered,
         }
+    }
+
+    /// FUTEX-WAIT-ATOMIC1 live witness only: the word as window B closes, for the grader. It
+    /// decides nothing; the compare-and-register reads the word again inside its own hold.
+    #[cfg(feature = "futex-wait-witness")]
+    fn futex_wait_witness_word_split(
+        &self,
+        asid: crate::kernel::vm::Asid,
+        addr: usize,
+        kind: crate::kernel::boot::futex::FutexKind,
+    ) -> Option<u32> {
+        self.resolve_futex_word_in_split(asid, addr, kind)
+            .ok()
+            .map(|(_, v)| v)
     }
 
     /// Stage 191E (FUTEXWAIT PHASE-C SELECTION SEAM): peek the next-runnable dispatch

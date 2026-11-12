@@ -217,11 +217,22 @@ reserved holes from implemented privileged paths.
   is `{MemoryObject id, offset}`: every process that maps the object, at any VA, reaches the same
   waiters. Object ids are never reused. A shared wait or wake on memory that no allocator-owned
   MemoryObject backs is refused with `WrongObject`; it is never silently treated as private.
-- `FutexWait` blocks only while the word at `addr` still holds `expected`: the kernel reads the
-  word itself, in the same acquisition that resolves the key, and reads it again after the waiter
-  is registered, so a `FutexWake` issued after a store to the word can never be lost. A word that
-  no longer holds `expected` returns `0` (not blocked); `1` means the caller blocked and was woken.
-  A return of `1` is a wake of the same key, so callers re-check their condition.
+- `FutexWait` blocks only while the word at `addr` still holds `expected`. **One operation
+  (FUTEX-WAIT-ATOMIC1):** the key is resolved, the word read (one atomic acquire load) and
+  compared, and the waiter registered on that key, all in ONE critical section (task lock, then
+  VM, then memory). That load is the wait's linearization point. Every `FutexWake`,
+  `FutexCmpRequeue`, exit and mapping change takes the task or VM lock, so it is wholly before the
+  point — and then a store the waker made before its call is visible to the load, and the wait
+  returns `0` — or wholly after it, and then it finds this waiter, oldest first among later ones.
+  A plain store that no futex call follows is ordered by the load alone: a wait that loaded the old
+  value blocks, and stays blocked until a wake (the store wakes nobody). A word that no longer
+  holds `expected` returns `0` (not blocked); `1` means the caller blocked and was woken. The
+  physical park (leaving the CPU) and the return to userspace come later and are separate: a wake
+  that reaches the waiter after its registration but before it has left the CPU is detected and
+  the caller continues exactly once. A return of `1` is a wake of the same key, so callers re-check
+  their condition. (Before FUTEX-WAIT-ATOMIC1 the word was compared before the registration and
+  read again after it; a wake or requeue between the two did not see the waiter, and one after
+  the registration could still take it although the word had already moved.)
 - `FutexWake` wakes up to `count` waiters of the key `addr` resolves to in the caller's address
   space, oldest first, and returns how many it woke. `count = 0` wakes nobody.
 - **Every waiter counted is placed (FUTEX-WAKE-CAP1).** A waiter is claimed only after a run-queue
@@ -259,10 +270,10 @@ reserved holes from implemented privileged paths.
     was an ordinary `FutexWake` run after the transfer, and took whichever waiter was oldest by
     then.)
   - *A waiter still in its own `FutexWait`.* A waiter registered but still finishing its wait when
-    this operation moves it, or selects it to be woken, keeps that outcome even if its own re-read
-    of its word then sees a change: it does not retract a wait another operation has acted on. A
-    moved one stays parked on the target; a selected one is woken. (Its re-read retracts the wait
-    only while nothing has acted on it.)
+    this operation moves it, or selects it to be woken, keeps that outcome: a moved one stays
+    parked on the target; a selected one is woken. Since FUTEX-WAIT-ATOMIC1 a wait never reads its
+    word again after registering, so nothing retracts a registration another operation has acted
+    on.
   - *Wake portion and capacity.* The wake portion is the longest prefix of the source queue, up to
     `wake` waiters, whose placement is secured (a run-queue slot reserved on each one's home CPU). It
     stops at the first waiter that cannot be placed — its home queue full, its CPU unable to take
