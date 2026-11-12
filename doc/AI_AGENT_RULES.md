@@ -1082,6 +1082,12 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   one acquisition and register in another, never resolve the key outside the hold that registers
   on it, and never read the word again after registering: a registration is retracted only by its
   own exact undo when the compare-and-clear finds another task current, never because of the word.
+- On RISC-V, `set_ok` / `set_err` reach `a0..a2` only for a trap that returns through its own
+  frame. A syscall that PARKS is resumed from its captured context, so a class whose result is final
+  at the park must have it committed into the frame's register and argument lanes before the
+  capture (`riscv_commit_final_park_result`, RISCV-PARK-RET1); a class whose result a later
+  completion supplies (receive, send) must not, or the commit would race that completion. Add any
+  new parking class to one of the two explicitly, and test what ring 3 observes, not `ret0`.
 - Do not recommend "re-issue FutexWake until it returns 0" as a broadcast: `0` can mean the oldest
   waiter's queue is full. Broadcast with `FutexCmpRequeue` and the contended-mutex protocol
   (`doc/SYSCALL_ABI.md`, *Condition-variable broadcast*).

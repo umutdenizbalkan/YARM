@@ -552,6 +552,28 @@ context-management stage first.
 - `ret2`: transferred capability id (`u64::MAX` sentinel when none)
 - `error`: syscall error code (`0` means success)
 
+### RISC-V: the return of a syscall that parks (RISCV-PARK-RET1)
+
+On RISC-V the user runtime's `ecall` declares `a0..a2` as outputs and `a3..a5`, `a7` as preserved
+inputs; `a0` carries the error code when non-zero, otherwise `ret0`, and `a1`, `a2` carry `ret1`,
+`ret2`. Every syscall continuation resumes with the result of THAT invocation, at the instruction
+after its `ecall` (the bridge advances `sepc` once, at trap entry), whichever way it resumes:
+
+- **through its own trap** (it never left the CPU): from the frame's return fields;
+- **after it parked** (it left the CPU and a later dispatch resumes its saved context): from that
+  context. A class whose result is final when the caller leaves the CPU — `FutexWait` (`1`: a parked
+  wait is resumed only after a wake, or a requeue and a wake, claimed it) and `Yield` (`0`) — has
+  its result committed into the frame's `a0..a2` register and argument lanes immediately before the
+  park capture (`riscv_commit_final_park_result`), so every resume arm installs it. A blocking IPC
+  receive or send is NOT committed at the park: its result belongs to the completion that ends it
+  (a delivery, a timeout, a server death), which publishes it into the saved context or parks an
+  exact `{tid, asid, generation}` record the resume consumes;
+- **after an asynchronous preemption**: the interrupted register file, verbatim — no syscall result
+  is substituted.
+
+A task that exits while parked is given no result. Before this stage a parked `FutexWait` resumed
+with its own futex address in `a0`, which the runtime reported as an error.
+
 ## `IpcRecv` / `IpcRecvTimeout` recv-v2 out-meta contract (current)
 
 - Return register success/error only:
