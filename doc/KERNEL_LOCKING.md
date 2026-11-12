@@ -1946,6 +1946,9 @@ handled via a dedicated helper with clear lock-contract comments.
   aligned with this document:
   - `with_task_then_capability`: task -> capability
   - `with_scheduler_then_ipc`: scheduler -> ipc
+  - `with_task_futex_then_vm_memory_mut` / `_split_mut`: task -> vm -> memory — NR 17's commit
+    (FUTEX-REQUEUE-ATOMIC1) and NR 9's compare-and-register (FUTEX-WAIT-ATOMIC1); nothing inside
+    takes a scheduler lock or calls back into the kernel state
 - Hooks remain debug-only/non-enforcing scaffolding; no runtime locking behavior
   change is introduced at this stage.
 
