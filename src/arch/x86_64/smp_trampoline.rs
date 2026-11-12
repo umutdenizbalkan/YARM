@@ -226,7 +226,7 @@ yarm_ap_trampoline_start:
     cld
 
     // Breadcrumb: AP started executing real-mode trampoline.
-    mov dx, 0xE9
+    mov dx, 0x3F8
     mov al, 'g'
     out dx, al
 
@@ -323,7 +323,7 @@ ap_gdt_end:
 
     .code32
 ap_protected_entry:
-    mov dx, 0xE9
+    mov dx, 0x3F8
     mov al, 'h'        // reached 32-bit protected mode
     out dx, al
 
@@ -415,7 +415,7 @@ ap_protected_entry:
 
     .code64
 ap_long_entry:
-    mov dx, 0xE9
+    mov dx, 0x3F8
     mov al, 'L'        // reached long mode
     out dx, al
 
@@ -586,12 +586,17 @@ pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch 
 // low-memory stage word at [handoff+48] before every risky action; the stage word
 // is the trace the BSP names on timeout (`last_stage=<name> last_stage_raw=<hex>`).
 //
-// RISCV-ECALL-A7-RET1 §8: the breadcrumbs go to the DEBUGCON port (0xE9), as the
-// late ones already did — no longer to COM1 (0x3F8). On COM1 they interleaved with
-// the BSP's structured bring-up lines while the AP ran, and split a REQUIRED one
-// (`X86_AP_KEiRNEL_CRy3_BEGIN cupu=1`, a failed qualification run). The byte map
-// below is unchanged and is read with QEMU `-debugcon`; an `out` to 0xE9 without
-// that device is ignored. No logger, lock or Rust is added to the trampoline.
+// RISCV-ECALL-A7-RET1 §8: the RUST-ENTRY ladder (`yarm_x86_64_ap_entry` and the
+// admission path it runs, from '@' on) goes to the DEBUGCON port (0xE9), as the late
+// breadcrumbs already did — no longer to COM1. Each of its bytes follows a stage-word
+// write the BSP names on timeout, so COM1 loses no evidence, and on COM1 these bytes
+// interleaved with the BSP's structured bring-up lines and split a REQUIRED one
+// (`X86_AP_KEiRNEL_CRy3_BEGIN cupu=1`: the bytes 'i', 'y', 'u'; a failed
+// qualification run). The PRE-RUST trampoline ladder ('g' .. '>') stays on COM1: it
+// has no stage word, so it is the only record of how far a failing AP got, and it
+// runs before the BSP prints the AP's progress lines. The byte map below is
+// unchanged; the debugcon half is read with QEMU `-debugcon`, and an `out` to 0xE9
+// without that device is ignored. No logger, lock or Rust is added anywhere here.
 //
 // Trampoline breadcrumbs (pre-Rust, no stage word — asm in the global_asm! above):
 //   byte  asm block / instruction boundary          meaning / precondition

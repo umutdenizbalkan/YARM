@@ -332,16 +332,22 @@ fn ap_gs_ready_is_never_faked() {
 // of marker lines and corrupt them. They now go to the independent x86 debugcon
 // port (0xE9), which `arch/x86_64/console.rs` already uses as a secondary channel.
 //
-// The EARLY ladder is deliberately untouched: it emits as one contiguous run that
-// completes before the BSP resumes formatted admission logging, and was never
-// observed splitting a structured line.
+// RISCV-ECALL-A7-RET1 re-derives the early-ladder half. The Rust-entry ladder ('@' onward,
+// `yarm_x86_64_ap_entry` and the admission path it runs) WAS observed splitting structured
+// lines: `X86_AP_KEiRNEL_CRy3_BEGIN cupu=1` (its 'i', 'y', 'u' inside a REQUIRED marker,
+// a failed qualification run) and `X86_AP_ENTER_RUrST`, `X86_AP_PcERCPU_BEGIN`,
+// `X86_AP_nPiyuERCPU_RECORD_READY` in ordinary boots. Every one of its bytes follows a
+// stage-word write the BSP names on timeout, so it now goes to debugcon as well. The
+// PRE-RUST trampoline ladder ('g' .. '>') stays on COM1: it has no stage word, so it is
+// the only record of how far a failing AP got.
 
 const TRAMPOLINE: &str = include_str!("../src/arch/x86_64/smp_trampoline.rs");
 
-/// Each late breadcrumb still emits its byte, but selects debugcon first and
-/// restores the COM1 port immediately afterwards for the code that assumes `rdx`.
+/// Each late breadcrumb still emits its byte, and selects debugcon first; the port the
+/// code after it finds in `rdx` is debugcon too (RISCV-ECALL-A7-RET1: the whole Rust-entry
+/// path writes no COM1 byte).
 #[test]
-fn late_ap_breadcrumbs_go_to_debugcon_and_restore_com1() {
+fn late_ap_breadcrumbs_go_to_debugcon() {
     for (byte, what) in [
         ("0x61", "'a' persistent IRQ ack"),
         ("0x64", "'d' ack follow-up"),
@@ -360,18 +366,27 @@ fn late_ap_breadcrumbs_go_to_debugcon_and_restore_com1() {
             TRAMPOLINE[prev..at].contains("0xE9"),
             "{what}: must select debugcon (0xE9), not COM1"
         );
-        // ... and COM1 must be restored right after the `out`.
+        // ... and the byte is emitted on it.
         let after = &TRAMPOLINE[at..];
-        let out = after.find("\"out dx, al\"").expect("the byte is emitted");
-        let tail = &after[out..];
-        let restore = tail
-            .find("\"mov dx, 0x3F8\"")
-            .expect("COM1 must be restored after the redirected out");
         assert!(
-            restore < 200,
-            "{what}: COM1 restore must follow the redirected out immediately"
+            after.find("\"out dx, al\"").is_some(),
+            "{what}: the byte is emitted"
         );
     }
+    let entry = rust_entry_body();
+    assert!(
+        !entry.contains("\"mov dx, 0x3F8\""),
+        "the Rust-entry AP path must select no COM1 port"
+    );
+}
+
+/// The naked Rust-entry body (`yarm_x86_64_ap_entry`, through the end of its `naked_asm!`).
+fn rust_entry_body() -> &'static str {
+    let start = TRAMPOLINE
+        .find("pub(super) extern \"C\" fn yarm_x86_64_ap_entry(")
+        .expect("the naked AP entry");
+    let rest = &TRAMPOLINE[start..];
+    &rest[..rest.find("\n}\n").expect("its end")]
 }
 
 #[allow(non_snake_case)]
@@ -404,19 +419,28 @@ fn late_ap_breadcrumb_state_publications_are_unchanged() {
     }
 }
 
-/// The early breadcrumb ladder still writes to COM1 — it is not the corruption
-/// source and must not be redirected.
+/// The PRE-RUST trampoline ladder still writes to COM1 (it has no stage word); the Rust-entry
+/// ladder from '@' on selects debugcon, and every one of its bytes is still emitted.
 #[test]
-fn early_ap_breadcrumb_ladder_still_uses_com1() {
-    // The ladder's first byte is emitted right after the COM1 port is selected.
+fn pre_rust_ladder_uses_com1_and_the_rust_entry_ladder_uses_debugcon() {
+    // The trampoline's first byte is emitted right after the COM1 port is selected.
+    let g = TRAMPOLINE
+        .find("    mov al, 'g'")
+        .expect("'g' trampoline breadcrumb");
+    let prev = TRAMPOLINE[..g].rfind("mov dx, ").expect("port selection");
+    assert!(
+        TRAMPOLINE[prev..g].contains("0x3F8"),
+        "the pre-Rust trampoline ladder must keep using COM1"
+    );
+    // The Rust-entry ladder's first byte is emitted right after debugcon is selected.
     let at = TRAMPOLINE
         .find("\"mov al, 0x40\"")
         .expect("'@' entry breadcrumb");
     let before = &TRAMPOLINE[..at];
     let prev = before.rfind("\"mov dx, ").expect("port selection");
     assert!(
-        TRAMPOLINE[prev..at].contains("0x3F8"),
-        "the early ladder must keep using COM1"
+        TRAMPOLINE[prev..at].contains("0xE9"),
+        "the Rust-entry ladder selects debugcon"
     );
     for byte in ["0x48", "0x56", "0x57", "0x4F", "0x4B", "0x79", "0x75"] {
         assert!(
