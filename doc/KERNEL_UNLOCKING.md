@@ -5383,6 +5383,236 @@ bindings, the baseline reproducer run, controls, live runs): orphan branch
 Verdict: **FUTEX_REQUEUE_ATOMIC1_ACCEPTED_WITH_BASELINE_DEBT**. Refs: `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/futex-requeue-atomic1`
 at the commit that adds this record; `main` `b81e0317` and every other ref unchanged.
 
+#### FUTEX-WAIT-ATOMIC1 (from delivered `c2b9893e`)
+
+**The question.** Does `FutexWait` (NR 9) have one comparison-and-registration point? FUTEX-FOUND1's
+split wait compared its word in one acquisition and registered in another, and read the word
+again after registering; FUTEX-REQUEUE-ATOMIC1 recorded the gap as an open observation.
+
+**The protocol, as it was** (`c2b9893e`; every recognized NR 9 is settled by the split route
+`try_split_futex_wait_recognized`, which never falls through to the broad dispatcher — the broad
+twin `futex_wait_current` is reachable only hosted):
+
+| step | owner | locks | effect |
+|---|---|---|---|
+| decode, range | `decode_futex_args`, `futex_word_range_check` | none | `InvalidArgs`, `WrongObject`, `UserMemoryFault` |
+| caller | `current_tid_authoritative(cpu)`; ASID read while the caller is still this CPU's current | 1, then 2 | `TaskMissing` |
+| decision | `futex_wait_decide_split_read` → `resolve_futex_word_locked` | 5 → 6 | the key (private `{asid, generation, va}`, shared `{object, offset}`) and the word (an `AtomicU32` acquire load); a mismatch returns `0` |
+| admission, deferral | `queue_advance_admit_with_authority_split`, `futex_wait_dispatch_try_defer` | 1 / per-CPU cell | |
+| (0) first read | `resolve_futex_word_in_split` | 5 → 6, released | the key and word again; mismatch → `ValueChanged` |
+| (1) registration | `register_futex_waiter_locked` | 2, released | the keyed record and `Blocked(Futex(token))` together, from `Running` `{tid, asid}` only |
+| (1b) second read | `resolve_futex_word_in_split`, then `undo_futex_registration_unless_acted_on_locked` on a change | 5 → 6, then 2 | retract unless another operation already moved or claimed the record |
+| (2) compare-and-clear | `block_current_exact` + quantum reset | 1 | mutates nothing unless the slot names this task; a mismatch undoes the registration exactly |
+| (3) read-back | `futex_still_parked_locked` | 2 | still `Blocked(Futex(token))` → parked; otherwise a waker won → `restore_entering_incarnation_exact_split` puts the caller back as current, out of the run queue |
+| exit | `retire_futex_waiters_for_task_locked` | 2 | the dying task's record leaves with it; any record whose TCB moved on is stale and inert |
+
+The trap frame stays the caller's own until the park commits (`QueueAdvanceCommitted`); every
+earlier refusal answers through it.
+
+**The sequential contract.** A `FutexWait(addr, expected)` that returns `0` or blocks has one
+point at which the address resolves to its current key, the word is loaded, and — on a match —
+this exact wait cycle becomes visible to every later wake and requeue. A wake that is wholly
+earlier need not see it; one that is wholly later must (subject to FIFO, its count and FUTEX-WAKE-CAP1's
+capacity rule). The logical registration, the physical park (leaving the CPU) and the return to
+userspace are three different instants. A plain user store is serialized by no kernel lock: it
+is ordered against a wait by the wait's load alone; a store followed by a futex call reaches that
+load through the task lock the call takes.
+
+**The counterexample, reproduced.** Hosted, deterministic: `futex_requeue1::wait_atomic1`, with
+test-only hooks (`#[cfg(test)]`) before the registration, after it and after the compare-and-clear;
+each history is checked against `atomic1`'s sequential model with the wait as the floating
+operation. On `c2b9893e`, with only the hooks added (`baseline_harness.patch`), four fail:
+
+| | in the interval | observed on `c2b9893e` | every legal order gives |
+|---|---|---|---|
+| w01b | before the registration: store 6, `FutexWake(S,1)`; after it: `FutexWake(S,1)` | blocked, wakes `0` then `1` | blocked and wakes `1, 0`, or not blocked and `0, 0` |
+| w04 | the same with two `FutexCmpRequeue(S,T,6,0,ALL)` | blocked, `(0,0)` then `(0,1)`, on T | `(0,1), (0,0)` on T, or not blocked and `(0,0), (0,0)` |
+| w06 | before the registration: 0x8_0000 remapped from object 1 onto object 2, a wake of object 1; after it, another | blocked on object 1, wakes `0` then `1` | on object 1 and woken by the first, or on object 2 and woken by neither |
+| w16 | before the registration: the address space destroyed and its ASID number reused | registered on the destroyed generation: the new space's wake finds nobody | registered on the live generation |
+
+The other seventeen pass on `c2b9893e` (the second read compensates whenever nothing acts on the
+registration before it). The defect is the gap itself: an operation that ran between the first
+read and the registration did not see the waiter, and one that ran after the registration but
+before the second read could still act on it, although the word — or the mapping — had moved.
+
+**The repair.** `compare_and_register_futex_waiter_locked`, ranks 2 → 5 → 6 in ONE hold
+(`with_task_futex_then_vm_memory_split_mut`, the helper NR 17's commit already uses): resolve the
+key, load the word, compare (`futex_should_park`), register through the one registration owner.
+Both twins call it; the broad one through `with_task_futex_then_vm_memory_mut`. The first read,
+the second read and the undo they drove are gone; `undo_futex_registration_unless_acted_on_locked`
+has no caller and is removed. Refusal precedence is unchanged: a word that cannot be read and a
+caller that is not the entering incarnation is `IncarnationMoved`; a mismatch is `ValueChanged`
+before the incarnation is consulted; then `IncarnationMoved`, then `Full`. Every refusal writes
+nothing. The decision read before admission stays: it returns `0` on a mismatch without reserving
+the deferral, and a wait that returns there is linearized at that load.
+
+**Why one point.** Every claim, requeue commit, undo and retirement of a waiter record holds the
+task lock, and every mapping or address-space change holds the VM lock; the compare-and-register
+holds both, and memory, for the whole of key, load and registration. So each concurrent operation
+is wholly before the hold or wholly after it. Before: a waker's store precedes its release of the
+task lock, which precedes this hold's acquisition of it, so the load sees the store (or a later
+one) and the wait returns `0`. After: the waiter is registered, and the waker finds it. A wait
+whose registration is followed by a store and nothing else stays blocked — exactly as the store
+alone would leave it. The key and the generation are those of the hold, so no wait registers on an
+identity validated only against an obsolete mapping (w06, w16).
+
+**The second read, removed.** It existed because the comparison and the registration were apart.
+With the comparison inside the registration's hold, a change seen after it is a later operation;
+retracting the wait would linearize it at the re-read instead, with an unnecessary acquisition and
+a second key resolution. No word-driven undo remains, so FUTEX-REQUEUE-ATOMIC1's rule (never undo a
+registration another operation acted on) now holds by construction: the only undo left is the
+exact-token one for the established-impossible victim mismatch. NC4 restores the re-read with an
+unconditional undo and is caught.
+
+**Park, wake and requeue ownership, unchanged.** After the hold, the waiter is reachable and the
+caller is still current. A wake that claims it before the compare-and-clear (w02), or after it
+(w10), is detected by the read-back and the one placement recovery restores the caller exactly
+once, out of the run queue; a requeue moves it with its token unchanged and it parks on the target
+(w03, w11); exit before the hold refuses the registration (w13), exit after it leaves no live
+record and no resurrection (w14). A wake that cannot place the waiter claims nothing, so it stays
+registered and parks (w20).
+
+**Negative controls** (`fwa_nc.py`; each patch reintroduces one defect into `9ce9845f`, builds, and
+runs the 216 hosted tests matching `futex`; every one is caught by behaviour, none by a compile
+error or a source-text guard alone; the unmodified tree passes all 216):
+
+| | defect reintroduced | failed | caught by (among others) |
+|---|---|---|---|
+| NC1 | the separated protocol: compare under VM → memory, release, register under the task lock | 12 | w01, w01b, w04, w06, w16, w18, w21, w22, f06 |
+| NC2 | no comparison: every wait registers | 13 | w01, w01b, w04, w07, w21, w22, f05, f06 |
+| NC3 | a stale key: the identity resolved before the hold, the word compared inside it | 5 | w06, w16 |
+| NC4 | the second read restored, retracting unconditionally | 6 | w03, `atomic1::x10`, `x11`, r16, f06 |
+| NC5 | the victim-mismatch undo ignores the exact token | 2 | f09, r19 |
+| NC6 | the read-back ignored: a wake racing the park is not recovered | 11 | w02, w10, w12, w17, f05, f07 |
+| NC7 | the TCB status set with no record published | 96 | w02, w03, w06, … |
+| NC8 | a record published without the exact TCB wait status | 98 | w02, w03, w06, … |
+| NC9 | the private key without the address-space generation | 47 | w16, f10, `atomic1::x01` |
+| NC10 | a wake claims its waiter before its placement is secured | 3 | w20, `futex_wake_cap1::c5`, `w3` |
+| NC11 | a record survives its task's exit, and liveness accepts the exited TCB | 10 | w14, f08, f10b, r12 |
+
+**Live witness** (`--features futex-wait-witness`, armed by `yarm.futex_requeue_witness=1`, default
+off and absent from every other build; `scripts/qemu-futex-wait-witness-smoke.sh`, graded by
+`scripts/grade-futex-wait-witness.py`). A waiter thread on one CPU issues sixteen `FutexWait`s on a
+word whose high half is the witness magic; a signaller on the other CPU stores (on even cycles) and
+wakes. The kernel holds the waiter in window **B** — after the decision read, before the
+compare-and-register — and in window **A** — after the registration, before the compare-and-clear —
+spinning, with interrupts masked, until a wake from another CPU has run inside the window. Causal
+markers: `..._WINDOW_OPEN`, the waker's `..._IN_WINDOW_WAKE … woke=N` (logged by NR 10 while the
+window is open), `..._WINDOW_CLOSE` (B's carries the word it reads then), `..._RESULT outcome=…`, and
+userspace's `FWAW_CALL` / `FWAW_DONE`. The grader requires per window a wake from the other CPU
+between OPEN and CLOSE; in B every such wake woke `0` (nothing registered yet); a B that saw the
+word move is followed by no A and the result `value_changed`; an unchanged B is followed by an A
+whose wake woke `1` and the result `woken_during_publication`; every cycle returns exactly once and
+userspace's blocking count equals the kernel's registrations; at least two changed B windows and
+two A windows.
+
+| `9ce9845f`, SMP 2 | waits | windows | B changed | A | in-window wakes | result |
+|---|---|---|---|---|---|---|
+| x86_64 (matrix FX9) | 16 | 24 | 8 | 8 | 24 | `witness=ok core_smoke=ok result=ok` |
+| AArch64 (matrix FX9) | 16 | 24 | 8 | 8 | 24 | `witness=ok core_smoke=ok result=ok` |
+| RISC-V (matrix FX9) | 16 | 24 | 8 | 8 | 24 | `witness=ok core_smoke=ok result=ok` |
+| live NC1, x86_64 (the separated protocol) | 16 | 32 | 8 | 16 | 32 | `witness=fail`: "wait 2: registered although its word had changed before the compare-and-register (B saw 0xf7a10001 for 0xf7a10000)", likewise waits 4–16 |
+
+The earlier live step (before the matrix, same source) passed on x86_64 and AArch64 and failed on
+RISC-V: its first B window held no wake and the boot timed out — the window spun with interrupts
+masked while the one signaller was queued behind the waiter on the same hart. That is the
+witness's own scheduling, not the wait under test (the window code is not in any other build),
+and the matrix run of the same candidate passed. A corrected witness (`ae65c57e`: two signallers,
+init blocked meanwhile, a window only while a sibling of the waiter is current on another CPU,
+unique stored values) was declared and run as an appended candidate before any matrix result was
+used: x86_64 and AArch64 pass (9 and 10 windowed waits, 6 and 4 unwindowed), its live NC1 is
+caught, and RISC-V fails `FWAW_DONE errors=11` — every unwindowed wait that parked came back
+`Err`. Reproduced on `c2b9893e` with only the userspace witness added: RISC-V 16 of 16 `Err`,
+AArch64 none. That is a pre-existing RISC-V defect in the parked syscall's return lane (recorded in
+`KERNEL_UNLOCK_DEFERRED_DEFECTS.md`, with the mechanism), outside this stage. `ae65c57e` is not
+delivered: its default and strict artifacts are not byte-identical to `9ce9845f`'s, so by the
+predeclared rule `9ce9845f`'s matrix cells would not carry over to it. (On the x86_64 default
+kernel the two differ in one 32-bit word of `.rodata`, by +24 — the line of a panic location below
+the 24 feature-gated lines added to `runtime.rs`; `.text` is identical. The rule asked for
+identity, not an explanation, and was kept.) Its patch and logs are in the evidence.
+
+**Locks.** Ranks ascend and nothing nests below: the hold is 2 → 5 → 6 and takes no scheduler
+lock; the compare-and-clear is rank 1 alone; the read-back rank 2 alone. No rank-2 → rank-1
+nesting, no broad acquisition, no new lock. Blocking path, acquisition sections: before 6 (decision
+5→6; first read 5→6; registration 2; second read 5→6; clear 1; read-back 2), 9 lock acquisitions,
+3 key resolutions; after 4 (decision 5→6; compare-and-register 2→5→6; clear 1; read-back 2), 7
+lock acquisitions, 2 key resolutions. A mismatch at the park: before 1 section (2 locks), after 1
+section (3 locks). The price is a longer task-lock hold: the key resolution (one page-table lookup;
+for a shared key one frame-owner lookup) and the word load now run under it, and every wait on
+every CPU, on independent keys, serializes that work on the one task lock — as every waker,
+requeue and registration already serialized its table work there. Optimization opportunities,
+not taken (out of scope): resolve the key optimistically outside the hold and revalidate the
+address-space generation and mapping inside it; per-bucket waiter-table locks.
+
+**Footprint.** No new table, slot, lock or static outside the default-off witness. The refusal enum
+is 1 byte; the transaction's `Result<(FutexKey, FutexWaitToken), FutexCompareRegisterRefusal>` is 32
+bytes, the size of the read result it replaces (`Result<(FutexKey, u32), KernelError>`, 32). No
+stack array, no allocation; `MAX_TASKS` 512, the 64-entry run queues and the waiter table are
+unchanged.
+
+**ABI.** v11; NR 9, 10 and 17 unchanged; `FutexWait`'s `0` / `1` unchanged in meaning (the
+contract text now names the linearization point). No compatibility wrapper.
+
+**Verification infrastructure.** (A) `scripts/check-contract-doc-enforcement.sh` grepped for a
+literal `ABI Version: 10` and so failed on every tree from v11 on; it now reads
+`SYSCALL_ABI_VERSION` from the kernel, requires the doc to declare that version exactly once, and
+from v11 requires NR 17 to be `FutexCmpRequeue` in the kernel, in the user runtime and in the
+documented table, with the v10 → v11 entry. It passes on F and fails on `c2b9893e` as before; five
+mutations (doc says 10; code bumped, doc not; NR 17 rows removed; user-runtime NR drift; the version
+declared twice) each fail it. (B) The qualification marker scan's bare `race: ` alternative matched
+the SCHED-LOCK1 grader's "NATURAL trace:" summary; it is now matched as a word (`\brace: `), with a
+self-test of six positive and four negative lines (`fwa_zscan.sh --self-test`, a matrix step).
+
+**Qualification** (frozen candidate `9ce9845f`, clean tree, against baseline `c2b9893e`, clean
+tree; the schedule was written before the run and is kept with its sha256; sequential, no retries
+in place; every log, rc, duration, HEAD, porcelain and `ARTIFACT_BINDING` kept):
+
+| cell | result |
+|---|---|
+| provenance; source shape | HEAD `9ce9845f`, porcelain 0; the park body calls the compare-and-register once, holds no second read, no separate registration and no undo-unless-acted-on; the broad twin calls the same owner |
+| fmt; clippy (hosted) | rc 0; 425 warnings in the same classes and counts as `c2b9893e` |
+| hosted lib, serial | 6513 passed, 0 failed (3 ignored) |
+| integration | 41 binaries, 396 passed, 0 failed |
+| 26 subsets (`futex_requeue1::wait_atomic1` … `sender_wake`) | 0 failed each |
+| lock order per (test, pair), against `c2b9893e`, common tests | 69 futex tests: per wait, one scheduler-after-task becomes scheduler-after-memory (the compare-and-clear now follows the 2 → 5 → 6 hold) and one task-after-memory disappears (the first read); the pair occurs 439 times in 170 tests on `c2b9893e`; no nesting. `f06` (re-derived). `c09_reply_vs_timeout_terminal_cas_race` (run-to-run: its deltas change sign between two runs, and the baseline's own count moves). Nothing else |
+| contract gate | `9ce9845f` rc 0; `c2b9893e` rc 1 (its stale v10 marker) |
+| marker-scan self-test; grader self-tests | all cases hold; ok |
+| default builds ×3; recv-v2 oracles ×3 | rc 0 |
+| CI-exact strict builds ×3; strict core smokes ×3 | rc 0 |
+| first-cohort futex seal | 12/12 live cells; the RISC-V FutexWait idle cross-check missing (on `c2b9893e`: AArch64 and RISC-V) — the known idle-oracle variance |
+| CI strict timer grep | 0/0/0, inherited #6 |
+| IPC-DISPLACE1 SMP1 ×3 | `witness=ok core_smoke=ok` |
+| overtaken ×2; AP-scheduling, KTHREAD1, SCHED-LOCK1 SMP2 ×3 | pass |
+| FUTEX-REQUEUE1 live witness ×3; FUTEX-REQUEUE-ATOMIC1 race witness ×3 | `result=ok cross_cpu=yes`; `covered=3` |
+| FUTEX-WAIT-ATOMIC1 wait witness ×3 | `witness=ok core_smoke=ok result=ok` (above) |
+| baseline: strict builds, seal, overtaken ×2 | as on the candidate |
+| IRQ witnesses ×3; reply-direct matrix; server-dies ×3 | rc 0 |
+| CI profiles, candidate and baseline | identical: sender-wake, smp2-core, smp4-core pass; inherited #2, #3, #4 and d2-send fail on both |
+| reply-timeout matrix; SMP-request script | inherited #1 (`class=IpcReplyTimeout`), #5 (line 67), identical on both |
+| marker scan (220 candidate logs) | no hit |
+
+Appended at `ae65c57e` (witness-only): provenance, the whole hosted group (6513 / 396 / 0 failed;
+lock-order changes identical to `9ce9845f`'s but for `c09`), gates and self-tests as above; the live
+results are in the previous section.
+
+**Limits.**
+
+* *Contention.* The task lock is now held across the key resolution of every wait (above).
+* *The live witness proves one shape*: a wake from the other CPU inside the wait's windows before
+  and after its registration, sixteen waits per port. Requeue, exit, teardown and ASID reuse inside
+  the windows are proven hosted only.
+* *Not changed:* `FutexWake`'s ambiguous `0` (SC-POOL-3); exited tasks lingering in run queues;
+  timed waits, bitsets, PI, RT-SCHED1, queue sizes.
+* *Found, not repaired:* on RISC-V a wait that parks returns its own address (`Err` to the
+  runtime) when resumed — pre-existing on `c2b9893e`, out of scope (above, and
+  `KERNEL_UNLOCK_DEFERRED_DEFECTS.md`). The grader does not fail closed on a window whose OPEN
+  line two harts' output damaged (seen once, in the appended run; no qualified log of `9ce9845f`
+  has one).
+* *Still open:* the six baseline debts, d2-send and the idle-oracle variance, unchanged.
+
+Verdict: **FUTEX_WAIT_ATOMIC1_ACCEPTED_WITH_BASELINE_DEBT**. Refs: `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/futex-wait-atomic1`
+at the commit that adds this record; `main` `b81e0317` and every other ref unchanged.
+
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 
