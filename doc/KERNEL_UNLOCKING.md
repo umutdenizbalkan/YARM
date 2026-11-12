@@ -5614,6 +5614,225 @@ Verdict: **FUTEX_WAIT_ATOMIC1_ACCEPTED_WITH_BASELINE_DEBT**. Refs: `claude/yarm-
 at the commit that adds this record; `main` `b81e0317` and every other ref unchanged.
 
 
+#### RISCV-PARK-RET1 (from delivered `2a91a6e8`)
+
+**The question.** On RISC-V, a `FutexWait` that genuinely parked and was later woken came back to
+userspace as an error (FUTEX-WAIT-ATOMIC1: 16 of 16 on `c2b9893e`, AArch64 none). Why, and what
+does each RISC-V syscall continuation resume with?
+
+**The defect, reproduced.**
+
+* *Live, at the resume boundary* (`c2b9893e` plus only the userspace witness): every one of the
+  waiter's 16 resumes was a drain's SWITCHED write-back through its ordinary arm,
+  `RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523648 …` — `a0` the futex word's
+  address (`0x415004`), `a1` the expected value (`0xf7a10000`); the park capture before it reported
+  `captured=1`; userspace read `Err`.
+* *Hosted, deterministic* (`futex_requeue1::riscv_park_ret1`, run verbatim on `2a91a6e8` with the
+  one bridge step this stage adds stood in for by `2a91a6e8`'s behaviour, nothing): 8 of its 24 tests fail — `t02`, `t05`, `t06`, `t07`, `t08`, `t09`,
+  `t19` and the order guard `g05` — every behavioural one on the same mechanism: ring 3 resumes a
+  genuinely parked `FutexWait` with `a0` = `0x60000` (the address), `a1` = `5` (the expected value),
+  and a `Yield` with its own arguments `(7, 8, 9)`; the other 16 (own-frame classes, send and receive
+  completions, the async arm, a fresh task, the exit and stale-incarnation refusals, `sepc`, `a3..a5`)
+  pass on `2a91a6e8` as on the candidate (`baseline_repro_2a91a6e8.log`).
+
+**The return path, boundary by boundary** (RISC-V, at `2a91a6e8`):
+
+| boundary | owner | result lanes | `a0` lanes (`user_gprs[10]`, `arg0`) | `sepc` |
+|---|---|---|---|---|
+| `ecall` → trap import | `boot.rs` bridge | zero | the syscall's `a0` (both mirrors), `a7` = nr | advanced `+4` once, here |
+| syscall | NR 9 split route | `Parked` → `set_ok(1, 0, 0)`; a mismatch `set_ok(0, …)`; an error `set_err` | unchanged | unchanged |
+| park commit | route → `QueueAdvanceCommitted` | — | unchanged | unchanged |
+| outgoing capture | bridge's committed arm, `capture_outgoing_user_context_split(t, frame)` | NOT captured (`capture_user_context` copies `user_gprs` and the argument lanes) | still the futex address | `sepc + 4` |
+| TCB | `user_context` of the exact deferral tid | — | the address | `sepc + 4` |
+| wake | `FutexWake` / `FutexCmpRequeue` claim, on any CPU | — | writes no register of the waiter | — |
+| dispatch | the waiter's HOME CPU's queue (only that CPU dequeues it; it parked there, so this follows the capture) | — | — | — |
+| incoming restore | `direct_dispatch_resume_incoming` (exact token) or the in-lock `restore_arch_thread_state`, `apply_user_context` | frame's are the OTHER trap's | the address | `sepc + 4` |
+| write-back | `boot.rs`: async tag → verbatim; continuation tag (a completion consumer ran) → result lanes; otherwise **switched ordinary arm: `a0..a5` = argument lanes, `a7 = 0`**; same task → own result, or a self-resume adopts `user_gprs[10..12]` | — | → `a0` = the address | `sret` to `sepc + 4` |
+
+So the route's `set_ok` reached only the frame's result fields, which become `a0..a2` only when a
+trap returns through its own frame; every resume of a PARKED caller reads its result from the
+captured context, which held its arguments. AArch64 is immune because its shared bridge's
+`split_finalize_handled_syscall` commits FutexWait's result and PC into the incarnation at the park;
+x86_64 resumes the result registers it captured.
+
+**Every class sharing the machinery:**
+
+| class | resumes after a park through | result source, before | after |
+|---|---|---|---|
+| FutexWait NR 9 | switched ordinary arm or self-resume | the argument lanes: **the address (defect)** | the committed `1` |
+| Yield NR 0 | the same | the argument lanes: `a0` = its own first argument (`0` from the runtime — correct only by coincidence) | the committed `0` |
+| blocking IpcRecv | switched ordinary arm | the completion's publication into the saved context (`publish_riscv_user_return`), re-applied after the capture (AP-SCHED1 §4) | unchanged (not committed) |
+| blocking IpcSend | continuation arm | its parked `IpcSend` record, consumed at the exact-token resume (U9-IPC-RESIDUAL3 §3) | unchanged |
+| reply / timeout completions | continuation arm | parked record (oracle) / publication | unchanged |
+| FutexWake NR 10, FutexCmpRequeue NR 17 | own frame (never parks) | `set_ok` | unchanged |
+| timer-preempted task | async arm | the verbatim register file (exact `{tid, asid, generation}` tag) | unchanged |
+| fresh task | switched ordinary arm | the startup argument lanes | unchanged |
+| exiting task | never resumed | — (capture skipped) | — (no commit) |
+
+**The contract.** A syscall continuation resumes with the result of that invocation and incarnation:
+through its own trap from its frame; after a park from its committed result (a class whose result is
+final when it leaves the CPU) or from its completion (a class whose result a later operation
+supplies); after an asynchronous preemption from its verbatim register file — never with its
+arguments (`doc/SYSCALL_ABI.md`, *RISC-V: the return of a syscall that parks*).
+
+**The repair** (Option A). `riscv_commit_final_park_result`, called once, by the RISC-V bridge's
+committed-park arm, immediately before its capture: when this trap's syscall number and the deferral
+naming the outgoing task are FutexWait (or Yield), and that task is not exiting, it copies the
+trap's own result into the frame's `a0..a2` register AND argument lanes
+(`TrapFrame::commit_riscv_parked_syscall_returns`, the canonical publisher's error convention), so
+the capture that follows carries it and every resume arm installs it. Nothing else is written:
+`a3..a7`, `sepc`, `sp`, `tp` keep what the trap saved. A receive is not committed. No lock, no
+record, no allocation; x86_64, AArch64 and the shared bridge are not touched.
+
+*Option B, rejected:* settle the result at the incoming restore. A parked FutexWait has no
+completion record to consume there, so it would need a new per-TCB record and generation (a cycle's
+`FutexWaitToken` is gone from the TCB once a wake claims it), three consumers (the exact-token drain,
+the in-lock restore, the S-mode idle dispatch) plus the self-resume arm, and a residue rule
+(QEMU-SMP3 §4's `IpcRecv` residue showed what an unconsumed record does to the async classifier).
+A, by contrast, writes the one value that cannot change after the park, at the one boundary that
+already owns the frame.
+
+**Why it cannot reach the wrong continuation.** The commit writes the frame of THIS trap only — the
+entering caller's, which no drain has overwritten yet — and the capture keys it on the deferral's
+tid, which each route reserves for its own caller (an occupied cell makes the route settle through
+its own frame). The class is this trap's own syscall number AND the deferral, so neither the exit
+transaction nor the terminal-fault route (which also reserve the FutexWait cell) is ever given a
+result; an exiting task gets nothing. A numeric TID names one TCB for the life of the system
+(IPC-SENDER-ID1), and the waiter is dispatched only by its home CPU after this trap's capture. The
+committed value is final: a parked wait is resumed only after a claim, and a requeue only moves it.
+No completion record is created, consumed or matched, so the IpcRecv / IpcSend generation rules are
+untouched; the async tag still selects the verbatim arm.
+
+**Registers.** After the repair, ring 3 sees on every parked-wait resume: `a0 = 1`, `a1 = a2 = 0`,
+`a3..a5` as the caller left them (the `ecall` declares them inputs), `sepc` = the instruction after
+the `ecall`, advanced once at entry; `sp`, `tp` and every other register as saved; the address space
+and TID ownership are the exact-token resume's, unchanged. `a7`: the switched ordinary arm sets it to
+`0` for every untagged continuation and for a fresh task — pre-existing, not changed here, recorded
+in `KERNEL_UNLOCK_DEFERRED_DEFECTS.md`.
+
+**Tests and controls.** `futex_requeue1::riscv_park_ret1`: 19 behavioural tests (`t01`–`t12`,
+`t15`, `t17`–`t22`) drive the production bridge arms, park, wake (same CPU, other CPU, requeue),
+capture, restore and every RISC-V write-back arm, and read the ring-3 registers; five guards
+(`g01`–`g05`) pin the write-back arms, the user-runtime decode and `ecall` operand list, the route's
+`Parked` result and the bridge order. 24 pass on the candidate. Ten negative controls, each applied
+to the candidate and run against the FULL hosted lib (6537 tests); each fails by behaviour, none by
+compilation (`build_errors=1` in each is only cargo's "test failed" footer), and the unmodified tree
+passes all:
+
+| control | mutation | caught by (failed tests) |
+|---|---|---|
+| NC1 | the resumed `a0` keeps the syscall's argument | 7 (`t02 t05 t06 t07 t08 t09 t19`) |
+| NC2 | the final result is never committed | 6 |
+| NC3 | committed into the register file only (the switched arm's argument install overwrites it) | 7 |
+| NC4 | published for an exiting incarnation | 1 (`t15`) |
+| NC5 | a send completion of an older cycle accepted | 4 (`t11` and three existing U6 / overtaken tests) |
+| NC6 | a syscall result applied to an asynchronously preempted task | 5 (`t18` and four async-preemption tests) |
+| NC7 | the commit overwrites the whole argument mirror `a0..a5` | 3 |
+| NC8 | `sepc` advanced a second time | 5 (incl. `t20`) |
+| NC9 | a delivered completion consumed again | 11 (`t11` and ten existing exactly-once tests) |
+| NC10 | STRUCTURAL: the settlement takes a global lock | 1 (`t22`) — production has no broad lock to reintroduce (`SharedKernel::with` is test-only); any other lock the commit took is found by `t22`, a `with`/`with_cpu` callsite by `broad_lock_census_guard` |
+
+**Live** (SMP 2, the revised wait witness, frozen candidate `194842bc`; schedule predeclared):
+
+| run | result | parked | parked_ok | parked_err | mismatch | during publication | dup/missing |
+|---|---|---|---|---|---|---|---|
+| RISC-V 1 / 2 / 3 | `witness=ok core_smoke=ok result=ok` ×3 | 18 / 24 / 23 | 18 / 24 / 23 | 0 | 5 / 3 / 3 | 9 / 5 / 6 | 0 |
+| AArch64 1 | FAIL: damaged marker `USER_LOG3 …FWAW_CALL cycle=10` (lost call line → cycle 10 missing, two waits for cycle 11) | 6 | 6 | 0 | 13 | 12 | 1 |
+| AArch64 2 | FAIL: damaged marker `FUTEX_WAIT_WITNESS_3SKIPPED` | 4 | 4 | 0 | 14 | 14 | 0 |
+| AArch64 3 | `result=ok` | 4 | 4 | 0 | 13 | 15 | 0 |
+| x86_64 1 / 2 / 3 | `result=ok` ×3 | 7 / 9 / 11 | 7 / 9 / 11 | 0 | 14 / 15 / 10 | 11 / 8 / 11 | 0 |
+| L-NC2 RISC-V (no commit) | FAIL, as it must: `parked_err=24`, "a GENUINELY parked wait … returned Err(Internal)" | 24 | 0 | 24 | 3 | 5 | 0 |
+| L-NC2 x86_64 (same patch) | `result=ok`, as it must (the commit is RISC-V only) | 8 | 8 | 0 | 14 | 10 | 0 |
+
+Both AArch64 failures are the damaged-marker case the schedule names: each damaged byte sits between
+the other CPU's `ASW2` and `ASW3` lines, i.e. `activate_asid`'s `raw_uart_marker(b'3')`, written
+outside the printk drain lock (`KERNEL_UNLOCK_DEFERRED_DEFECTS.md`); no `parked_err` in either; the
+logs are kept unrepaired and counted as failed runs, not rerun. The predeclared acceptance — all
+three RISC-V runs pass, at least one clean run per comparison ISA, no `parked_err` in any run —
+holds. Before the repair (`c2b9893e` plus only the witness) the same RISC-V boundary returned `Err`
+16 of 16.
+
+**Witness and grader.** The witness now opens a window only while a sibling of the waiter is current on
+another CPU (peer gate, from FUTEX-WAIT-ATOMIC1's undelivered `ae65c57e`, cherry-picked as
+`c30b0eba`), with two signallers, so a waiter can no longer spin, interrupts masked, while its only
+waker is queued behind it on the same hart. A held window ends `woke`, `no_peer` (an explicit
+refusal: the peer stayed absent for 8 rechecks × 64K polls) or `bound` (50M polls, a failure); no
+unbounded masked spin is left. 32 cycles. The grader fails closed on a missing, corrupted or
+duplicate OPEN, a CLOSE or in-window wake without OPEN, a wrong window identity, an incomplete final
+window and a damaged witness marker (narrowed so `FORK_PROOF_COW_WITNESS_SKIPPED` is not one); it
+correlates every userspace `FWAW_CALL` with the kernel results since the previous call and reports
+`mismatch`, `during_publication`, `parked`, `parked_ok`, `parked_err`, `dup_or_missing`, requiring
+`parked_ok >= 2` and `parked_err = 0`. Its self-test covers each refusal with a fixture. Logs are
+never repaired.
+
+**Locks and footprint.** The commit takes no kernel domain lock; it reads three per-CPU deferral
+atomics and the exit cell (a per-CPU spin cell the bridge already reads). Per committed park: one
+extra exit-cell read; no broad acquisition (`broad_lock_census_guard` unchanged). No new static,
+field, record or allocation; `TrapFrame` and `UserRegisterContext` unchanged. RISC-V default kernel `.text`: `0xb03ee` → `0xb05ee` (+512 bytes);
+`riscv_commit_final_park_result` is 288 bytes and the outgoing capture is now an out-of-line
+function (278 bytes; inlined on `2a91a6e8`). x86_64 and AArch64 compile to byte-identical `.text`
+(below).
+
+**Qualification** (frozen candidate `194842bc`, clean tree, against baseline `2a91a6e8`, clean
+tree; schedule written before the run and kept with its sha256, three addenda each declared after
+reading a result and before running anything for it; sequential, no retries in place; every log, rc,
+duration, HEAD, porcelain and `ARTIFACT_BINDING` kept):
+
+| cell | result |
+|---|---|
+| provenance; source shape | HEAD `194842bc`, porcelain 0; `src/arch/x86_64`, `src/arch/aarch64`, `src/arch/trap_entry.rs` unchanged; `riscv_commit_final_park_result` called once in production, by the RISC-V bridge, before the capture |
+| fmt; clippy (hosted) | rc 0; 425 warnings in the same classes and counts as `2a91a6e8` |
+| hosted lib, serial | 6537 passed, 0 failed (3 ignored) |
+| integration | 41 binaries, 396 passed, 0 failed (incl. `broad_lock_census_guard`) |
+| 34 subsets (`riscv_park_ret1` … `sender_wake`) | 0 failed each |
+| lock order per (test, pair), against `2a91a6e8`, 6513 common tests | only `c09_reply_vs_timeout_terminal_cas_race` (the known run-to-run variant); `FUTEX_WAKE_STOPPED` in the same tests on both |
+| contract gate | rc 0 on both |
+| marker-scan self-test; grader self-tests | all cases hold; ok |
+| default builds ×3; recv-v2 oracles ×3 | rc 0 |
+| CI-exact strict builds ×3; strict core smokes ×3 | rc 0 |
+| first-cohort futex seal, candidate and baseline | 12/12 live cells and every idle cross-check present, on both (the idle-oracle variance did not recur) |
+| CI strict timer grep | 0/0/0, inherited #6 |
+| IPC-DISPLACE1 SMP1 ×3 | `witness=ok core_smoke=ok` |
+| overtaken ×2 (candidate and baseline); AP-scheduling, KTHREAD1, SCHED-LOCK1 SMP2 ×3 | pass |
+| FUTEX-REQUEUE1 live witness ×3 | AArch64, RISC-V `result=ok cross_cpu=yes`. x86_64 FAILED: `witness=ok cross_cpu=yes`, but the core smoke rejected the boot on `X86_AP_KERNEL_CR3_BEGIN`, logged as `X86_AP_KEiRNEL_CRy3_BEGIN cupu=1` — the AP trampoline's unlocked raw bytes `i`, `y`, `u` (`smp_trampoline.rs`) inside the BSP's marker (see below) |
+| FUTEX-REQUEUE-ATOMIC1 race witness ×3 | `covered=3` each |
+| RISC-V D2 empty-current settle; NR 1 source-fault send ×3; queued cap-bearing reply ×3 | rc 0; the RISC-V results identical on `2a91a6e8` |
+| baseline: strict builds, seal, overtaken ×2 | as on the candidate |
+| IRQ witnesses ×3; reply-direct matrix; server-dies ×3 | rc 0 |
+| CI profiles, candidate and baseline | identical: sender-wake, smp2-core, smp4-core pass; inherited #2, #3 (`D6_SMP_DISPATCH_OK`), #4 (no idle-entry timeout) and d2-send fail on both |
+| reply-timeout matrix; SMP-request script | inherited #1 (`class=IpcReplyTimeout`), #5 (line 67), identical on both |
+| `.text` identity (fail-closed, Addendum C) | identical at the candidate and the baseline for the AArch64 default kernel, the x86_64 default kernel and the x86_64 futex-requeue-witness kernel, every extraction size-checked against its header; `.rodata` differs only in five panic-location line words (deltas +51 and +26, the lines inserted in `boot/mod.rs` and `runtime.rs`) |
+| marker scan (the matrix's candidate logs) | one hit: the FX7 x86_64 seal line above; none in the appended reruns or the live logs |
+
+*The x86_64 FUTEX-REQUEUE1 failure* (Addendum A). Its byte-split marker has the mechanism of the
+baseline's own logs — `X86_AP_ENTER_RUrST`, `X86_AP_PcERCPU_BEGIN`, `X86_AP_nPiyuERCPU_RECORD_READY`
+in `2a91a6e8`'s seal and overtaken boots, which passed only because those markers are not required —
+and of an earlier stage's record (`X86_AP_TKlERNEL_CR3_BEGIN`, same marker). Appended and declared:
+the same command twice more on the candidate and twice on the baseline, all four `witness=ok
+core_smoke=ok result=ok cross_cpu=yes`; and that kernel's `.text` is byte-identical at the two
+commits (Addendum C). It is classified as the x86 SMP serial interleaving, separate from the six
+debts. Two addenda corrected the identity check itself: the first `.text` comparison's AArch64 half
+(and the first witness-kernel comparison) had hashed EMPTY extractions — `objcopy … /dev/stdout`
+into a pipe yields nothing here — which Addendum B's fail-closed check then refused (rc 1); Addendum
+C extracts to files and checks sizes. Both void logs are kept.
+
+**Limits.** 
+* *Committed classes are FutexWait and Yield only:* both are final when the caller leaves the CPU.
+  A blocking receive and send keep their completion machinery; a class added later that parks
+  with a final result must be added to `riscv_commit_final_park_result` (`AI_AGENT_RULES.md`).
+* *`a7` after an untagged switched resume is `0`* (pre-existing; no RISC-V user binary reads it
+  after an `ecall` on any straight-line path — 554 `ecall`s in 14 binaries scanned), recorded, not
+  changed.
+* *The live witness proves FutexWait* on all three ISAs; Yield's committed `0`, requeue, exit and
+  stale-incarnation refusals are proven hosted.
+* *Console damage, not repaired here:* AArch64 `raw_uart_marker` bytes from `activate_asid`; x86_64
+  AP trampoline raw bytes. Both cost failed runs in this qualification and are recorded.
+* *Still open:* the six baseline debts and d2-send, unchanged; the idle-oracle variance (not seen
+  this run).
+
+Verdict: **RISCV_PARK_RET1_ACCEPTED_WITH_BASELINE_DEBT**. Refs: `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/riscv-park-ret1` at
+the commit that adds this record; `main` `b81e0317` and every other ref unchanged.
+
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 
 **U6 — COMPLETE. CANONICAL 199C — DELIVERED / CLOSED. CENSUS-DELTA 0.**
