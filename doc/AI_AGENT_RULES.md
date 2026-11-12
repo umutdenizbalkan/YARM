@@ -1088,6 +1088,13 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   capture (`riscv_commit_final_park_result`, RISCV-PARK-RET1); a class whose result a later
   completion supplies (receive, send) must not, or the commit would race that completion. Add any
   new parking class to one of the two explicitly, and test what ring 3 observes, not `ret0`.
+- A RISC-V write-back arm writes results into `a0..a2` ONLY (the error in `a0`). `a3..a5` and `a7`
+  are `in` operands of every userspace `ecall`, and every other register is unnamed, so each arm
+  restores them from the saved register file — never zero, never the error, never the argument
+  mirror for a continuation (RISCV-ECALL-A7-RET1). A new arm or a new `ecall` site must keep the two
+  sides in agreement; `ecall_contract::c01` reads the wrapper's operand list and evaluates it
+  against every arm's source, and the live witness (`scripts/qemu-riscv-ecall-witness-smoke.sh`)
+  reads every register back in ring 3.
 - Do not recommend "re-issue FutexWake until it returns 0" as a broadcast: `0` can mean the oldest
   waiter's queue is full. Broadcast with `FutexCmpRequeue` and the contended-mutex protocol
   (`doc/SYSCALL_ABI.md`, *Condition-variable broadcast*).

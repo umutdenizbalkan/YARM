@@ -556,7 +556,7 @@ context-management stage first.
 
 On RISC-V the user runtime's `ecall` declares `a0..a2` as outputs and `a3..a5`, `a7` as preserved
 inputs; `a0` carries the error code when non-zero, otherwise `ret0`, and `a1`, `a2` carry `ret1`,
-`ret2`. Every syscall continuation resumes with the result of THAT invocation, at the instruction
+`ret2` (the whole register contract is the next section). Every syscall continuation resumes with the result of THAT invocation, at the instruction
 after its `ecall` (the bridge advances `sepc` once, at trap entry), whichever way it resumes:
 
 - **through its own trap** (it never left the CPU): from the frame's return fields;
@@ -573,6 +573,35 @@ after its `ecall` (the bridge advances `sepc` once, at trap entry), whichever wa
 
 A task that exits while parked is given no result. Before this stage a parked `FutexWait` resumed
 with its own futex address in `a0`, which the runtime reported as an error.
+
+### The RISC-V `ecall` register contract (RISCV-ECALL-A7-RET1)
+
+Every RISC-V `ecall` in userspace (`yarm-user-rt`'s `raw_syscall`, and the two hand-written sites
+in init's IRQ witness) is an inline-assembly statement, and its operand list IS the contract the
+compiler optimizes against:
+
+| register | the runtime declares | after the `ecall` |
+|---|---|---|
+| `a0` | `inlateout` | `ret0`, or the error code when the call failed |
+| `a1`, `a2` | `inlateout` | `ret1`, `ret2` (`0` on an error) |
+| `a3`, `a4`, `a5` | `in` | **exactly as the caller left them** |
+| `a7` | `in` (the syscall number) | **exactly as the caller left it** |
+| `a6`, `ra`, `sp`, `gp`, `tp`, `t0..t6`, `s0..s11` | not named | **exactly as the caller left them** |
+| `pc` | — | the instruction after the `ecall` (`sepc` advanced once, at trap entry) |
+
+The kernel keeps this contract on EVERY arm that resumes a syscall continuation — its own trap
+(the same-task arm), a completion (the continuation arm, on the bridge and on the S-mode idle
+dispatch), and a park or a switch (the switched ordinary arm, likewise on both): the result lanes
+are `a0..a2` only, and every input and unnamed register comes from the saved register file, which
+the bridge fills from the hardware frame at entry and no completion writes. An asynchronously
+preempted task gets its whole register file back verbatim; a FRESH task (never ran) gets its
+startup arguments in `a0..a5` and every other register from its zeroed register file (`a7 = 0`).
+
+There is no separate error register. Before RISCV-ECALL-A7-RET1 the same-task and continuation
+arms wrote the error code (or `0`) into `a3` and the switched ordinary arm forced `a7 = 0`, so a
+caller resumed after a park lost its syscall number and one returning through its own frame lost
+its fourth argument, behind the back of the compiler that had been told both survive. No consumer
+read the `a3` error lane; userspace decodes errors from `a0`.
 
 ## `IpcRecv` / `IpcRecvTimeout` recv-v2 out-meta contract (current)
 

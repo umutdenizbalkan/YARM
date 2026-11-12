@@ -281,8 +281,8 @@ return tail restores GPRs and CSRs and executes `sret`.
 | Syscall number | `a7` |
 | Args | `a0..a5` |
 | `sepc` advance for ecall | `+4` (RISC-V `ecall` does not auto-advance) |
-| Return — same task, ecall | `a0=ret0`, `a1=ret1`, `a2=ret2`, `a3=error` (mirrors AArch64) |
-| Return — task switch (freshly-spawned task) | `a0..a5` seeded from `tframe.arg(0..5)`; `user_gprs` are zero on first run |
+| Return — same task, ecall | `a0=ret0` (the error code when non-zero), `a1=ret1`, `a2=ret2`; `a3..a5`, `a7` and every unnamed register as the caller left them (RISCV-ECALL-A7-RET1; `doc/SYSCALL_ABI.md`, *The RISC-V `ecall` register contract*) |
+| Return — task switch (freshly-spawned task) | `a0..a5` seeded from `tframe.arg(0..5)`; `a7` and every other register from the register file, which is zero on first run |
 
 The bridge activates the resumed task's `satp` (with kernel-shared
 gigapage ensured present) so `sret` lands in the right user page table.
@@ -1504,8 +1504,8 @@ never inferred from register contents:
 | convention | source of `a0..a7` |
 |---|---|
 | `AsyncPreempted` | the saved integer register file, verbatim; the argument mirror is not read |
-| syscall / D2 continuation | the canonical result lane a completion consumer already encoded |
-| fresh / startup | the startup ABI from the argument mirror, `a7 = 0` |
+| syscall / D2 continuation | the canonical result lane a completion consumer already encoded in `a0..a2`; `a3..a5`, `a7` from the saved register file |
+| fresh / startup (and an untagged parked continuation) | the startup ABI from the argument mirror; `a7` from the saved register file — `0` for a fresh task, the syscall number for a continuation (RISCV-ECALL-A7-RET1) |
 
 Tag lifecycle:
 
