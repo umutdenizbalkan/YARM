@@ -1769,6 +1769,14 @@ pub(crate) fn riscv_async_resume_publish(cpu_idx: usize) {
 ///
 /// Take-once by construction: the bridge's write-back is the sole consumer, so a decision can
 /// never survive into a later, unrelated trap and silently suppress a startup-argument install.
+/// RISCV-ECALL-A7-RET1 witness only: READ the async-resume decision without taking it, so the
+/// S-mode idle dispatch's witness marker can name the arm its write-back is about to choose.
+#[cfg(feature = "riscv-ecall-witness")]
+pub(crate) fn riscv_async_resume_peek(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && RISCV_ASYNC_RESUME_PENDING[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) fn riscv_async_resume_take(cpu_idx: usize) -> bool {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return false;

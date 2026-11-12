@@ -240,6 +240,9 @@ futex-requeue-witness = []
 futex-requeue-race-witness = []
 # FUTEX-WAIT-ATOMIC1: the live wait witness (windows B and A of a witness FutexWait).
 futex-wait-witness = []
+# RISCV-ECALL-A7-RET1: the live RISC-V ecall register-contract witness (kernel half: one marker
+# per keyed write-back naming the arm that resumed the continuation and the registers it wrote).
+riscv-ecall-witness = []
 # QEMU-IRQ1: the first real external-interrupt witness — RISC-V UART0 -> PLIC -> YARM on QEMU
 # virt. Compiles the kernel-only device window install, the idle-origin supervisor-external
 # admission, the UART setup/drain fixture, the provisioning of init's notification + ring page, the

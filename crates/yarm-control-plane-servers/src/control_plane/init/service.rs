@@ -2986,7 +2986,13 @@ mod x86_futex_requeue {
 
 /// FUTEX-REQUEUE1 — resolve this architecture's child entry, the ten stacks, and run the witness.
 #[cfg(all(not(feature = "hosted-dev"), feature = "futex-requeue-witness"))]
-#[cfg_attr(feature = "futex-wait-witness", allow(dead_code))]
+#[cfg_attr(
+    any(
+        feature = "futex-wait-witness",
+        all(feature = "riscv-ecall-witness", target_arch = "riscv64")
+    ),
+    allow(dead_code)
+)]
 fn run_futex_requeue_witness(s_tid: u64) {
     use futex_requeue_witness as w;
     #[cfg(target_arch = "x86_64")]
@@ -3226,6 +3232,597 @@ fn run_futex_wait_witness(s_tid: u64) {
         tls_base: tls + i * 256,
     });
     w::run_once(s_tid, &children);
+}
+
+/// RISCV-ECALL-A7-RET1 — the live RISC-V `ecall` register-contract witness, selector 18 when init
+/// is built with `riscv-ecall-witness` (RISC-V only; the kernel built with the same feature prints
+/// one `RISCV_ECALL_WITNESS_RESUME` marker per keyed write-back).
+///
+/// Every probed syscall is issued from ONE narrowly scoped `asm!` block that seeds a per-cycle
+/// sentinel into every register the user runtime's `ecall` declares an input (`a3`, `a4`, `a5`,
+/// `a7`) and into registers it does not name (`a6` = the cycle's KEY, `s2..s7`, `t3..t6`), records
+/// `sp`, `tp`, `gp` and the `ecall`'s own address, and reads every one of them back after the
+/// `ecall` returns. All operands are declared `inlateout`, so the observation does not depend on
+/// what the compiler would have assumed: it is what the hardware registers held when ring 3 ran
+/// again. The kernel's marker for the same KEY names the arm (same-task, switched, continuation,
+/// async; bridge or S-mode idle) that resumed it.
+///
+/// Roles (threads of init, one naked entry; each records its first registers):
+///
+/// | role | what |
+/// |---|---|
+/// | Y0..Y2 | `Yield` (NR 0) in a loop: switches when another role shares the CPU; Y0 then yields
+/// eight more times alone, after every other role finished, which returns through its own trap |
+/// | W, S | `FutexWait` (NR 9) on a word S stores to and wakes, held open by the kernel's wait
+/// windows: parked, woken before it parked, value changed, or (every fourth cycle) a mismatch |
+/// | RW, RQ | `FutexWait` on QA; RQ requeues it to QB (NR 17) and then wakes QB |
+/// | R | a blocking `IpcRecv` (NR 2) that init answers with one send per cycle |
+/// | P | a register-file spin long enough to be timer-preempted |
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "riscv-ecall-witness",
+    target_arch = "riscv64"
+))]
+pub(super) mod riscv_ecall_witness {
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
+    use yarm_user_rt::syscall::{FutexScope, futex_cmp_requeue, futex_wake, yield_now};
+
+    const P: FutexScope = FutexScope::Private;
+    /// The kernel marker's key prefix (`ecall_witness::KEY_HI`).
+    const KEY_HI: usize = 0xEA7C_0DE5;
+    pub(super) const ROLES: usize = 9;
+    const Y0: usize = 0;
+    const W: usize = 3;
+    const S: usize = 4;
+    const RW: usize = 5;
+    const RQ: usize = 6;
+    const R: usize = 7;
+    const SPIN: usize = 8;
+    const NAMES: [&str; ROLES] = ["Y0", "Y1", "Y2", "W", "S", "RW", "RQ", "R", "P"];
+    const YCALLS: u32 = 24;
+    /// Y0's solo yields, after every other role finished.
+    const SOLO: u32 = 8;
+    const WCALLS: u32 = 24;
+    const RCALLS: u32 = 8;
+    const ICALLS: u32 = 8;
+    const PCALLS: u32 = 3;
+    const SPIN_ITERS: usize = 40_000_000;
+    const BOUND: u32 = 400_000;
+
+    const NR_YIELD: usize = 0;
+    const NR_IPC_RECV: usize = 2;
+    const NR_FUTEX_WAIT: usize = 9;
+
+    pub(super) const STACK_BYTES: usize = 8192;
+    #[repr(C, align(16))]
+    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; ROLES]);
+    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; ROLES]);
+    pub(super) static mut TLS: [[u8; 256]; ROLES] = [[0; 256]; ROLES];
+
+    static NEXT_ROLE: AtomicUsize = AtomicUsize::new(0);
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    static BAD: AtomicU32 = AtomicU32::new(0);
+    static PARK: AtomicU32 = AtomicU32::new(0);
+    /// The kernel's wait-witness magic (`wait_witness::MAGIC`): a wait whose expected value has
+    /// this high half is held open twice (before and after its registration) until a wake from
+    /// another CPU runs inside, which is what makes "woken before it physically parked" occur.
+    const WAIT_MAGIC: u32 = 0xF7A1_0000;
+    static WORD: AtomicU32 = AtomicU32::new(WAIT_MAGIC);
+    static W_CYCLE: AtomicU32 = AtomicU32::new(0);
+    static W_DONE: AtomicU32 = AtomicU32::new(0);
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    static QA: AtomicU32 = AtomicU32::new(0);
+    static QB: AtomicU32 = AtomicU32::new(0);
+    static RW_ARMED: AtomicU32 = AtomicU32::new(0);
+    static RW_BACK: AtomicU32 = AtomicU32::new(0);
+    static R_ARMED: AtomicU32 = AtomicU32::new(0);
+    static R_GOT: AtomicU32 = AtomicU32::new(0);
+    static EP: AtomicU32 = AtomicU32::new(0);
+
+    /// What one probed `ecall` left in ring 3.
+    #[derive(Clone, Copy)]
+    struct Seen {
+        a: [usize; 8],
+        s: [usize; 6],
+        t: [usize; 4],
+        /// `sp`, `tp`, `gp` before and after; the `ecall`'s address.
+        m: [usize; 7],
+    }
+
+    fn key(role: usize, cycle: u32) -> usize {
+        (KEY_HI << 32) | (role << 24) | cycle as usize
+    }
+    fn seed(key: usize) -> usize {
+        key.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1
+    }
+
+    /// One `ecall` with `nr`, `args` in `a0..a5`, `key` in `a6`, every other probed register
+    /// seeded from the key; everything read back.
+    #[inline(never)]
+    fn probe(nr: usize, args: [usize; 6], key: usize) -> (Seen, [usize; 18]) {
+        let sd = seed(key);
+        let mut a = [
+            args[0], args[1], args[2], args[3], args[4], args[5], key, nr,
+        ];
+        let mut s = [
+            sd ^ 0x52,
+            sd ^ 0x53,
+            sd ^ 0x54,
+            sd ^ 0x55,
+            sd ^ 0x56,
+            sd ^ 0x57,
+        ];
+        let mut t = [sd ^ 0x73, sd ^ 0x74, sd ^ 0x75, sd ^ 0x76];
+        let input = {
+            let mut v = [0usize; 18];
+            v[..8].copy_from_slice(&a);
+            v[8..14].copy_from_slice(&s);
+            v[14..].copy_from_slice(&t);
+            v
+        };
+        let mut m = [0usize; 7];
+        // SAFETY: an `ecall` with the kernel's RISC-V syscall ABI; every register it can touch is
+        // an operand (all `inlateout`), the buffer is this frame's own and outlives the block.
+        unsafe {
+            core::arch::asm!(
+                "sd sp, 0({b})",
+                "sd tp, 8({b})",
+                "sd gp, 16({b})",
+                "la {tmp}, 2f",
+                "sd {tmp}, 48({b})",
+                "2: ecall",
+                "sd sp, 24({b})",
+                "sd tp, 32({b})",
+                "sd gp, 40({b})",
+                b = in(reg) m.as_mut_ptr(),
+                tmp = out(reg) _,
+                inlateout("a0") a[0],
+                inlateout("a1") a[1],
+                inlateout("a2") a[2],
+                inlateout("a3") a[3],
+                inlateout("a4") a[4],
+                inlateout("a5") a[5],
+                inlateout("a6") a[6],
+                inlateout("a7") a[7],
+                inlateout("s2") s[0],
+                inlateout("s3") s[1],
+                inlateout("s4") s[2],
+                inlateout("s5") s[3],
+                inlateout("s6") s[4],
+                inlateout("s7") s[5],
+                inlateout("t3") t[0],
+                inlateout("t4") t[1],
+                inlateout("t5") t[2],
+                inlateout("t6") t[3],
+                options(nostack),
+            );
+        }
+        (Seen { a, s, t, m }, input)
+    }
+
+    /// The registers the contract preserves that this observation did not: bit n for `a{n}` (3, 4,
+    /// 5, 6, 7), 8.. for `s2..s7`, 14.. for `t3..t6`, 18/19/20 for `sp`/`tp`/`gp`.
+    fn lost(v: &Seen, input: &[usize; 18]) -> u32 {
+        let mut bad = 0;
+        for n in 3..8 {
+            if v.a[n] != input[n] {
+                bad |= 1 << n;
+            }
+        }
+        for i in 0..6 {
+            if v.s[i] != input[8 + i] {
+                bad |= 1 << (8 + i);
+            }
+        }
+        for i in 0..4 {
+            if v.t[i] != input[14 + i] {
+                bad |= 1 << (14 + i);
+            }
+        }
+        for (i, bit) in [(0, 18), (1, 19), (2, 20)] {
+            if v.m[i] != v.m[3 + i] {
+                bad |= 1 << bit;
+            }
+        }
+        bad
+    }
+
+    fn report(
+        role: usize,
+        cycle: u32,
+        k: usize,
+        nr: usize,
+        v: &Seen,
+        input: &[usize; 18],
+    ) -> usize {
+        let bad = lost(v, input);
+        if bad != 0 {
+            BAD.fetch_add(1, SeqCst);
+        }
+        yarm_user_rt::user_log!(
+            "EA7W role={} cycle={} key=0x{:x} nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x} a3=0x{:x} a7=0x{:x} want_a3=0x{:x} want_a7=0x{:x} bad=0x{:x} pc=0x{:x}",
+            NAMES[role],
+            cycle,
+            k,
+            nr,
+            v.a[0],
+            v.a[1],
+            v.a[2],
+            v.a[3],
+            v.a[7],
+            input[3],
+            input[7],
+            bad,
+            v.m[6]
+        );
+        v.a[0]
+    }
+
+    fn sentinels(k: usize) -> [usize; 3] {
+        let sd = seed(k);
+        [sd ^ 0xA3, sd ^ 0xA4, sd ^ 0xA5]
+    }
+
+    fn park() -> ! {
+        loop {
+            let v = PARK.load(SeqCst);
+            let _ = yarm_user_rt::syscall::futex_wait(PARK.as_ptr(), v, P);
+        }
+    }
+    fn finish() -> ! {
+        DONE.fetch_add(1, SeqCst);
+        let _ = futex_wake(DONE.as_ptr(), 1, P);
+        park()
+    }
+    fn wait_for(cell: &AtomicU32, v: u32) -> bool {
+        let mut n = 0;
+        while cell.load(SeqCst) < v {
+            if n >= BOUND {
+                return false;
+            }
+            let _ = yield_now();
+            n += 1;
+        }
+        true
+    }
+
+    fn yield_probe(role: usize, c: u32) {
+        let k = key(role, c);
+        let [a3, a4, a5] = sentinels(k);
+        let (v, input) = probe(NR_YIELD, [0, 0, 0, a3, a4, a5], k);
+        report(role, c, k, NR_YIELD, &v, &input);
+    }
+
+    fn yielder(role: usize) -> ! {
+        for c in 1..=YCALLS {
+            yield_probe(role, c);
+        }
+        // Y0 then waits until every other role has finished (each is parked in the kernel), and
+        // yields SOLO: nothing else of the witness is runnable, so the drain gives the CPU back to
+        // the caller — the Yield that does not switch.
+        if role == Y0 {
+            let mut n = 0;
+            while (DONE.load(SeqCst) as usize) < ROLES - 1 && n < BOUND {
+                let d = DONE.load(SeqCst);
+                let _ = yarm_user_rt::syscall::futex_wait(DONE.as_ptr(), d, P);
+                n += 1;
+            }
+            for c in YCALLS + 1..=YCALLS + SOLO {
+                yield_probe(role, c);
+            }
+        }
+        finish()
+    }
+
+    fn waiter() -> ! {
+        for c in 1..=WCALLS {
+            W_CYCLE.store(c, SeqCst);
+            // Every fourth cycle a deliberate MISMATCH outside any window (its expected value is
+            // neither the word's nor windowed): answered at once, through the caller's own frame.
+            let val = if c % 4 == 0 {
+                WORD.load(SeqCst) ^ 0x0001_0000
+            } else {
+                WORD.load(SeqCst)
+            };
+            let k = key(W, c);
+            let [a3, a4, a5] = sentinels(k);
+            let (v, input) = probe(
+                NR_FUTEX_WAIT,
+                [WORD.as_ptr() as usize, val as usize, P.flags(), a3, a4, a5],
+                k,
+            );
+            report(W, c, k, NR_FUTEX_WAIT, &v, &input);
+        }
+        W_DONE.store(1, SeqCst);
+        finish()
+    }
+
+    fn signaller() -> ! {
+        while W_DONE.load(SeqCst) == 0 {
+            if W_CYCLE.load(SeqCst) % 2 == 0 {
+                WORD.store(WAIT_MAGIC | (NEXT.fetch_add(1, SeqCst) & 0xFFFF), SeqCst);
+            }
+            let _ = futex_wake(WORD.as_ptr(), 1, P);
+            let _ = yield_now();
+        }
+        finish()
+    }
+
+    fn requeue_waiter() -> ! {
+        for c in 1..=RCALLS {
+            RW_ARMED.store(c, SeqCst);
+            let k = key(RW, c);
+            let [a3, a4, a5] = sentinels(k);
+            let (v, input) = probe(
+                NR_FUTEX_WAIT,
+                [QA.as_ptr() as usize, 0, P.flags(), a3, a4, a5],
+                k,
+            );
+            report(RW, c, k, NR_FUTEX_WAIT, &v, &input);
+            RW_BACK.store(c, SeqCst);
+        }
+        finish()
+    }
+
+    fn requeuer() -> ! {
+        for c in 1..=RCALLS {
+            if !wait_for(&RW_ARMED, c) {
+                yarm_user_rt::user_log!("EA7W_RQ cycle={} result=fail reason=never_armed", c);
+                break;
+            }
+            let mut moved = 0;
+            let mut tries = 0;
+            while moved == 0 && tries < BOUND {
+                if let Ok(o) = futex_cmp_requeue(QA.as_ptr(), P, QB.as_ptr(), P, 0, 0, 1) {
+                    moved = o.requeued;
+                }
+                if moved == 0 {
+                    let _ = yield_now();
+                }
+                tries += 1;
+            }
+            let mut woke = 0;
+            let mut n = 0;
+            while moved == 1 && woke == 0 && n < BOUND {
+                woke = futex_wake(QB.as_ptr(), 1, P).unwrap_or(0);
+                n += 1;
+            }
+            let back = wait_for(&RW_BACK, c);
+            yarm_user_rt::user_log!(
+                "EA7W_RQ cycle={} requeued={} woke={} back={}",
+                c,
+                moved,
+                woke,
+                u32::from(back)
+            );
+        }
+        finish()
+    }
+
+    /// The receive's out-meta, the layout `yarm-user-rt` uses (`IpcRecvMetaV2`, 40 bytes).
+    #[repr(C)]
+    struct Meta {
+        status: u64,
+        opcode: u16,
+        flags: u16,
+        payload_len: u32,
+        cap_id: u64,
+        recv_meta_flags: u64,
+        sender_tid: u64,
+    }
+
+    fn receiver() -> ! {
+        let ep = EP.load(SeqCst) as usize;
+        for c in 1..=ICALLS {
+            let mut payload = [0u8; 2 + yarm_user_rt::ipc::Message::MAX_PAYLOAD];
+            let mut meta = Meta {
+                status: u64::MAX,
+                opcode: 0,
+                flags: 0,
+                payload_len: 0,
+                cap_id: u64::MAX,
+                recv_meta_flags: 0,
+                sender_tid: 0,
+            };
+            R_ARMED.store(c, SeqCst);
+            let k = key(R, c);
+            let (v, input) = probe(
+                NR_IPC_RECV,
+                [
+                    ep,
+                    payload.as_mut_ptr() as usize,
+                    payload.len(),
+                    (&mut meta as *mut Meta) as usize,
+                    core::mem::size_of::<Meta>(),
+                    0,
+                ],
+                k,
+            );
+            let got = report(R, c, k, NR_IPC_RECV, &v, &input);
+            let len = meta.payload_len as usize;
+            yarm_user_rt::user_log!(
+                "EA7W_IPC cycle={} a0=0x{:x} status=0x{:x} len={} body_ok={}",
+                c,
+                got,
+                meta.status,
+                len,
+                u32::from(len >= 4 && payload[len - 4..len] == c.to_be_bytes())
+            );
+            R_GOT.store(c, SeqCst);
+        }
+        finish()
+    }
+
+    fn spinner() -> ! {
+        for c in 1..=PCALLS {
+            let k = key(SPIN, c);
+            let sd = seed(k);
+            let input: [usize; 18] =
+                core::array::from_fn(|i| if i == 6 { k } else { sd ^ (0x100 + i) });
+            let mut r = input;
+            let mut n = SPIN_ITERS;
+            // SAFETY: a register-only loop; every register it holds is an operand.
+            unsafe {
+                core::arch::asm!(
+                    "2:",
+                    "addi {n}, {n}, -1",
+                    "bnez {n}, 2b",
+                    n = inout(reg) n,
+                    inlateout("a0") r[0],
+                    inlateout("a1") r[1],
+                    inlateout("a2") r[2],
+                    inlateout("a3") r[3],
+                    inlateout("a4") r[4],
+                    inlateout("a5") r[5],
+                    inlateout("a6") r[6],
+                    inlateout("a7") r[7],
+                    inlateout("s2") r[8],
+                    inlateout("s3") r[9],
+                    inlateout("s4") r[10],
+                    inlateout("s5") r[11],
+                    inlateout("s6") r[12],
+                    inlateout("s7") r[13],
+                    inlateout("t3") r[14],
+                    inlateout("t4") r[15],
+                    inlateout("t5") r[16],
+                    inlateout("t6") r[17],
+                    options(nostack, nomem),
+                );
+            }
+            let _ = n;
+            let mut bad = 0u32;
+            for i in 0..18 {
+                if r[i] != input[i] {
+                    bad |= 1 << i;
+                }
+            }
+            if bad != 0 {
+                BAD.fetch_add(1, SeqCst);
+            }
+            yarm_user_rt::user_log!("EA7W_SPIN cycle={} key=0x{:x} bad=0x{:x}", c, k, bad);
+        }
+        finish()
+    }
+
+    /// Every thread's first instruction: record `a0..a7` at entry, then the role body.
+    pub(super) extern "C" fn body(entry: *const [usize; 8]) -> ! {
+        // SAFETY: the entry stub stored eight registers at this address on the thread's own stack.
+        let regs = unsafe { *entry };
+        let role = NEXT_ROLE.fetch_add(1, SeqCst);
+        yarm_user_rt::user_log!(
+            "EA7W_FRESH role={} a0=0x{:x} a1=0x{:x} a2=0x{:x} a3=0x{:x} a4=0x{:x} a5=0x{:x} a6=0x{:x} a7=0x{:x}",
+            NAMES.get(role).copied().unwrap_or("?"),
+            regs[0],
+            regs[1],
+            regs[2],
+            regs[3],
+            regs[4],
+            regs[5],
+            regs[6],
+            regs[7]
+        );
+        match role {
+            Y0..=2 => yielder(role),
+            W => waiter(),
+            S => signaller(),
+            RW => requeue_waiter(),
+            RQ => requeuer(),
+            R => receiver(),
+            SPIN => spinner(),
+            _ => park(),
+        }
+    }
+
+    /// The naked entry every witness thread starts at.
+    #[unsafe(naked)]
+    pub(super) extern "C" fn entry() -> ! {
+        core::arch::naked_asm!(
+            "addi sp, sp, -64",
+            "sd a0, 0(sp)",
+            "sd a1, 8(sp)",
+            "sd a2, 16(sp)",
+            "sd a3, 24(sp)",
+            "sd a4, 32(sp)",
+            "sd a5, 40(sp)",
+            "sd a6, 48(sp)",
+            "sd a7, 56(sp)",
+            "mv a0, sp",
+            "call {body}",
+            "unimp",
+            body = sym body,
+        )
+    }
+
+    fn send(ep: u32, cycle: u32) -> bool {
+        let mut body = [0u8; 8];
+        body[..4].copy_from_slice(b"EA7W");
+        body[4..].copy_from_slice(&cycle.to_be_bytes());
+        let Ok(msg) = yarm_user_rt::ipc::Message::new(0, &body) else {
+            return false;
+        };
+        // SAFETY: `ep` carries SEND.
+        unsafe { yarm_user_rt::syscall::ipc_send(ep, &msg) }.is_ok()
+    }
+
+    pub(super) fn run_once(s_tid: u64) {
+        let (_mem, ep) = super::shared_region_oracle_core::oracle_caps();
+        if ep == 0 {
+            yarm_user_rt::user_log!("EA7W_DONE result=fail reason=no_endpoint");
+            return;
+        }
+        EP.store(ep, SeqCst);
+        yarm_user_rt::user_log!("EA7W_BEGIN s_tid={} roles={} ep={}", s_tid, ROLES, ep);
+        let stacks = core::ptr::addr_of_mut!(STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(TLS) as usize;
+        let mut spawned = 0;
+        for i in 0..ROLES {
+            let top = (stacks + (i + 1) * STACK_BYTES) & !0xF;
+            // SAFETY: a valid naked entry; the static stack and TLS outlive the thread.
+            if unsafe {
+                yarm_user_rt::syscall::spawn_thread(tls + i * 256, top, entry as *const () as usize)
+            }
+            .is_ok()
+            {
+                spawned += 1;
+            }
+        }
+        let mut sent = 0;
+        for c in 1..=ICALLS {
+            if !wait_for(&R_ARMED, c) {
+                break;
+            }
+            for _ in 0..8 {
+                let _ = yield_now();
+            }
+            if send(ep, c) {
+                sent += 1;
+            }
+            if !wait_for(&R_GOT, c) {
+                break;
+            }
+        }
+        let mut waits = 0;
+        loop {
+            let d = DONE.load(SeqCst);
+            if d as usize >= ROLES || waits >= BOUND {
+                break;
+            }
+            let _ = yarm_user_rt::syscall::futex_wait(DONE.as_ptr(), d, P);
+            waits += 1;
+        }
+        let done = DONE.load(SeqCst);
+        let bad = BAD.load(SeqCst);
+        let ok = spawned == ROLES && done as usize == ROLES && sent == ICALLS && bad == 0;
+        yarm_user_rt::user_log!(
+            "EA7W_DONE spawned={} done={} sent={} bad={} result={}",
+            spawned,
+            done,
+            sent,
+            bad,
+            if ok { "ok" } else { "fail" }
+        );
+    }
 }
 
 /// U9-TIMER5 §3 — the IDLE-BOUNDARY RETURN witness.
@@ -8077,9 +8674,19 @@ pub fn run() {
     // instead.
     #[cfg(all(not(feature = "hosted-dev"), feature = "futex-requeue-witness"))]
     if futex_requeue_witness::armed(ctx.supervisor_control_recv_ep) {
-        #[cfg(feature = "futex-wait-witness")]
+        // RISCV-ECALL-A7-RET1: built with `riscv-ecall-witness` (RISC-V), the same selector runs
+        // the ecall register-contract witness instead.
+        #[cfg(all(feature = "riscv-ecall-witness", target_arch = "riscv64"))]
+        riscv_ecall_witness::run_once(ctx.task_id);
+        #[cfg(all(
+            feature = "futex-wait-witness",
+            not(all(feature = "riscv-ecall-witness", target_arch = "riscv64"))
+        ))]
         run_futex_wait_witness(ctx.task_id);
-        #[cfg(not(feature = "futex-wait-witness"))]
+        #[cfg(not(any(
+            feature = "futex-wait-witness",
+            all(feature = "riscv-ecall-witness", target_arch = "riscv64")
+        )))]
         run_futex_requeue_witness(ctx.task_id);
     }
     // Stage 200D-0C1: default-off + feature-gated AArch64 LIVE ExitCurrentTask oracle. The slot-5

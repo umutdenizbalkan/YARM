@@ -1583,6 +1583,13 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
             frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
         }
+        #[cfg(feature = "riscv-ecall-witness")]
+        crate::arch::riscv64::ecall_witness::note_resume(
+            "bridge",
+            crate::arch::riscv64::ecall_witness::arm(task_switched, async_resume, continuation),
+            resume_tid,
+            frame,
+        );
     } else {
         // Stage 163P: same-task NON-SYSCALL trap (e.g. COW/demand page fault).
         //
@@ -1944,6 +1951,8 @@ fn riscv_s_mode_idle_landing(
             // into its frame and then had `a0` overwritten with `tframe.arg(0)` — its own stale
             // endpoint capability — by the startup arm below, faulting at `addr=0x20006`.
             let continuation = crate::kernel::boot::riscv_syscall_continuation_take(cpu.0 as usize);
+            #[cfg(feature = "riscv-ecall-witness")]
+            let witness_async = crate::kernel::boot::riscv_async_resume_peek(cpu.0 as usize);
             if crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize) {
                 frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;
                 frame.regs[RiscvTrapFrame::A1] = tframe.user_gpr(11) as u64;
@@ -1996,6 +2005,13 @@ fn riscv_s_mode_idle_landing(
                 frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;
                 frame.regs[RiscvTrapFrame::A7] = 0;
             }
+            #[cfg(feature = "riscv-ecall-witness")]
+            crate::arch::riscv64::ecall_witness::note_resume(
+                "idle",
+                crate::arch::riscv64::ecall_witness::arm(true, witness_async, continuation),
+                resume_tid,
+                frame,
+            );
             // ── Canonical 199E-R2: ACTIVATE the resumed task's address space ────────────
             //
             // This dispatch `sret`s straight to U-mode from here — it never reaches the main
