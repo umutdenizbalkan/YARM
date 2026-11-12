@@ -63595,12 +63595,21 @@ mod stage191d_futex_wait_block_publish {
                 && SCHED_SRC.contains("    word == expected\n"),
             "the one park predicate compares the word the kernel read against `expected`"
         );
-        for (name, src) in [("runtime.rs", RUNTIME_SRC), ("exec_state.rs", EXEC_SRC)] {
+        // FUTEX-WAIT-ATOMIC1 re-derivation: the broad twin no longer compares on its own — it
+        // calls THE compare-and-register owner, which applies the predicate inside its hold. The
+        // owners of the predicate are therefore the split decision and that owner.
+        const FUTEX_OWNER_SRC: &str = include_str!("futex.rs");
+        for (name, src) in [("runtime.rs", RUNTIME_SRC), ("futex.rs", FUTEX_OWNER_SRC)] {
             assert!(
                 src.contains("futex_should_park(expected, word)"),
                 "{name}: the decision must be the shared predicate over the word read"
             );
         }
+        assert!(
+            EXEC_SRC.contains("super::futex::compare_and_register_futex_waiter_locked(")
+                && !EXEC_SRC.contains("futex_should_park("),
+            "exec_state.rs: the broad wait compares only through the compare-and-register owner"
+        );
         for (name, src, owner) in [
             (
                 "runtime.rs",
@@ -63685,10 +63694,13 @@ mod stage191d_futex_wait_block_publish {
             1,
             "one registration owner writes the futex-blocked status"
         );
+        // FUTEX-WAIT-ATOMIC1 re-derivation: both routes reach the one registration owner through
+        // THE compare-and-register, which calls it inside the hold that compared the word.
         assert!(
-            EXEC_SRC.contains("super::futex::register_futex_waiter_locked(")
-                && park.contains(
-                    "fx::register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)"
+            EXEC_SRC.contains("super::futex::compare_and_register_futex_waiter_locked(")
+                && park.contains("fx::compare_and_register_futex_waiter_locked(")
+                && FUTEX_SRC.contains(
+                    "register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)"
                 ),
             "both routes must register through the one owner"
         );
@@ -63697,10 +63709,17 @@ mod stage191d_futex_wait_block_publish {
                 && park.contains("fx::futex_still_parked_locked(tcbs, tid, token)"),
             "and the SAME token must be what the undo and the read-back compare against"
         );
+        // FUTEX-WAIT-ATOMIC1 re-derivation: there is no value re-check after the registration
+        // any more (the comparison is inside it), so the one undo closure serves the clear refusal
+        // alone, and nothing reads the word a second time.
         assert_eq!(
             park.matches("undo_futex_registration_locked(").count(),
             1,
-            "BL3b: ONE undo closure, shared by the clear refusal and the value re-check"
+            "ONE undo closure, for the clear refusal"
+        );
+        assert!(
+            !park.contains("resolve_futex_word_in_split(") && !park.contains("unless_acted_on"),
+            "no second read, and no word-driven retraction of a registration"
         );
         // The transaction must NOT dispatch (the switch is the drain's).
         let start = RUNTIME_SRC
@@ -79492,8 +79511,13 @@ mod stage197_first_cohort_seal {
         // FutexWait publishes Blocked; Yield re-enqueues Runnable — now through the one yield
         // policy, whose broad adapter reaches the same preempt seam `yield_current` always used.
         // FUTEX-FOUND1: through THE registration owner, which writes the keyed token.
+        // FUTEX-WAIT-ATOMIC1 re-derivation: reached through THE compare-and-register, which calls
+        // that owner inside the hold that compared the word.
         assert!(
-            EXEC_STATE_SRC.contains("super::futex::register_futex_waiter_locked(")
+            EXEC_STATE_SRC.contains("super::futex::compare_and_register_futex_waiter_locked(")
+                && include_str!("futex.rs").contains(
+                    "register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)"
+                )
                 && include_str!("futex.rs")
                     .contains("tcb.status = TaskStatus::Blocked(WaitReason::Futex(token));"),
             "FutexWait must publish Blocked(Futex)"
@@ -211949,7 +211973,10 @@ mod futex_found1 {
     }
 
     /// F6 — a word that changes before the park commits prevents the obsolete wait: at the
-    /// decision (broad and split), and AFTER the waiter is registered (the re-read).
+    /// decision (broad and split), and up to the compare-and-register. FUTEX-WAIT-ATOMIC1
+    /// re-derivation: the third case was "a store AFTER the registration retracts it" (the second
+    /// read). The comparison is now inside the registration's hold, so a store after it is a
+    /// later operation: the wait has happened and parks, and only a wake moves it.
     #[test]
     fn f06_a_changed_word_never_commits_an_obsolete_wait() {
         let mut s = Bootstrap::init().expect("init");
@@ -211970,8 +211997,9 @@ mod futex_found1 {
             Ok(crate::kernel::syscall::sched::FutexWaitDecision::Proceed)
         );
         k.with(|s| word(s, 41052, X, 5));
-        // The word moves once the waiter is visible, before the compare-and-clear.
-        fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+        // The word moves after the decision and before the compare-and-register: refused, and
+        // nothing was ever published.
+        fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
             k.with(|s| word(s, 41052, X, 6));
         }));
         assert_eq!(
@@ -211983,8 +212011,26 @@ mod futex_found1 {
         assert_eq!(
             k.with(|s| s.futex_waiter_count(X)),
             0,
-            "the registration was undone"
+            "nothing was registered"
         );
+        // The word moves once the waiter is registered: the wait has happened. It parks, and the
+        // store alone wakes nobody; a wake does.
+        k.with(|s| word(s, 41052, X, 5));
+        fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+            k.with(|s| word(s, 41052, X, 6));
+        }));
+        assert!(matches!(
+            k.futex_wait_park_exact_split(cpu, 41052, asid, X, 5, P),
+            FutexParkOutcome::Parked { .. }
+        ));
+        assert_eq!(k.with(|s| s.futex_waiter_count(X)), 1, "it parks on X");
+        assert!(matches!(
+            k.with(|s| s.task_status(41052)),
+            Some(TaskStatus::Blocked(WaitReason::Futex(_)))
+        ));
+        assert_eq!(k.futex_wake_split_mut(CpuId(1), asid, X, 1, P), Ok(1));
+        assert_eq!(k.with(|s| s.task_status(41052)), Some(TaskStatus::Runnable));
+        assert_eq!(k.with(|s| s.futex_waiter_count(X)), 0);
     }
 
     /// F7 — a wake during publication neither strands the caller nor resumes it through a frame
@@ -214649,6 +214695,368 @@ mod futex_requeue1 {
     /// operations that respects their real-time order (the requeue overlaps all of them, so it may
     /// be placed anywhere; the others ran one after another). A history no order produces is not
     /// linearizable.
+    /// FUTEX-WAIT-ATOMIC1 — is `FutexWait` one operation? A waiter on CPU 0 is paused at its own
+    /// boundaries (after its comparison and before its registration; after its registration) while
+    /// other CPUs' operations run to completion; every observed history is checked against the
+    /// sequential specification of `atomic1`. The wait is the floating operation: the others run
+    /// in this order, all of them inside the wait's interval.
+    mod wait_atomic1 {
+        use super::atomic1::{Model, Op, Q, Res, legal};
+        use super::*;
+
+        /// Panics unless `observed` is one of the histories the specification admits.
+        fn assert_lin(observed: &(Vec<Res>, Model), init: &Model, w: Op, chain: &[Op]) {
+            let admitted = legal(init, w, chain);
+            assert!(
+                admitted.contains(observed),
+                "NOT LINEARIZABLE\n observed: {observed:?}\n admitted:\n{}",
+                admitted
+                    .iter()
+                    .map(|h| alloc::format!("   {h:?}\n"))
+                    .collect::<alloc::string::String>()
+            );
+        }
+
+        /// The new waiter `t` (process A) made current on CPU 0, then `FutexWait(va, exp)` through
+        /// the production split transaction (the route's decision read is the caller's and is not
+        /// repeated here). Blocked (parked, or woken during its publication)
+        /// or refused because the word differed.
+        pub(super) fn wait(
+            k: &SharedKernel,
+            a: Asid,
+            t: u64,
+            va: usize,
+            exp: u32,
+            kind: FutexKind,
+        ) -> (Res, FutexParkOutcome) {
+            k.with(|s| {
+                task(s, t, a);
+                run(s, t);
+            });
+            let o = k.futex_wait_park_exact_split(CpuId(0), t, a, va, exp, kind);
+            // An operation armed for a boundary the wait never reached (it returned first) still
+            // runs, now: after the wait, and in its place in the chain.
+            fx::futex_phase_hook::run_after_register();
+            fx::futex_phase_hook::run_after_clear();
+            let r = match o {
+                FutexParkOutcome::Parked { .. }
+                | FutexParkOutcome::WokenDuringPublication { .. } => Res::Wait(true),
+                FutexParkOutcome::ValueChanged => Res::Wait(false),
+                ref other => panic!("{t}: unexpected park outcome {other:?}"),
+            };
+            (r, o)
+        }
+
+        /// The real kernel in the model's terms. The waiter `d` counts as woken when it was
+        /// placed (Runnable, queued once) or put back as CPU 0's current by the publication
+        /// recovery; either way it continues exactly once.
+        pub(super) fn observe_w(
+            s: &mut KernelState,
+            driver: u64,
+            d: u64,
+            o: &FutexParkOutcome,
+            word_now: u32,
+        ) -> Model {
+            let recovered = matches!(o, FutexParkOutcome::WokenDuringPublication { .. })
+                && s.task_status(d) == Some(TaskStatus::Running)
+                && s.with_scheduler_state(|all| all.placement_of(ThreadId(d)))
+                    == TaskPlacement::Current(CpuId(0));
+            let mut m = atomic1::observe(s, driver, &[d], word_now);
+            if recovered {
+                assert!(!m.woken.contains(&d));
+                m.woken.push(d);
+            }
+            assert!(
+                !(parked(s, d) && m.woken.contains(&d)),
+                "{d}: woken and still parked"
+            );
+            m
+        }
+
+        fn store(k: &SharedKernel, driver: u64, v: u32) {
+            k.with(|s| word(s, driver, SQ, v));
+        }
+
+        /// W1 — store and wake before the registration. The wake finds nobody (`0`, and the queue
+        /// has room, so `0` means absence, not a capacity refusal); the wait must then not block.
+        #[test]
+        fn w01_store_and_wake_before_registration() {
+            let w = world(48000);
+            let (a, driver, d) = (w.a, w.driver, 48100);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                store(k, driver, 6);
+                sink.borrow_mut().push(Res::Done);
+                let n = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                sink.borrow_mut().push(Res::Wake(n));
+            }));
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            let mut results = vec![r];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe_w(s, driver, d, &o, 6)));
+            let init = Model {
+                word: 5,
+                ..Model::default()
+            };
+            assert_lin(
+                &observed,
+                &init,
+                Op::Wait { tid: d, exp: 5 },
+                &[Op::Store(6), Op::Wake(1)],
+            );
+        }
+
+        /// W1b — THE counterexample: as W1, then a second wake runs after the registration and
+        /// before the wait's second read. The first wake found nobody, so the wait cannot have
+        /// blocked before the store; after the store the word is 6 and it cannot block at all.
+        /// No sequential order lets the second wake take it.
+        #[test]
+        fn w01b_a_wake_after_the_registration_takes_a_wait_the_word_had_refused() {
+            let w = world(48200);
+            let (a, driver, d) = (w.a, w.driver, 48300);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let (s1, s2) = (seen.clone(), seen.clone());
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                store(k, driver, 6);
+                s1.borrow_mut().push(Res::Done);
+                let n = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                s1.borrow_mut().push(Res::Wake(n));
+            }));
+            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                let n = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                s2.borrow_mut().push(Res::Wake(n));
+            }));
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            let mut results = vec![r];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe_w(s, driver, d, &o, 6)));
+            let init = Model {
+                word: 5,
+                ..Model::default()
+            };
+            assert_lin(
+                &observed,
+                &init,
+                Op::Wait { tid: d, exp: 5 },
+                &[Op::Store(6), Op::Wake(1), Op::Wake(1)],
+            );
+        }
+
+        /// W2 — a wake after the registration, before the physical park: exactly one owner
+        /// settles the wait, the waiter continues once, nothing is queued twice.
+        #[test]
+        fn w02_a_wake_after_the_registration() {
+            let w = world(48400);
+            let (a, driver, d) = (w.a, w.driver, 48500);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                let n = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                sink.borrow_mut().push(Res::Wake(n));
+            }));
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            assert!(matches!(o, FutexParkOutcome::WokenDuringPublication { .. }));
+            let mut results = vec![r];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe_w(s, driver, d, &o, 5)));
+            let init = Model {
+                word: 5,
+                ..Model::default()
+            };
+            assert_lin(
+                &observed,
+                &init,
+                Op::Wait { tid: d, exp: 5 },
+                &[Op::Wake(1)],
+            );
+        }
+
+        /// W3 — a compare-and-requeue moves the waiter between its registration and its second
+        /// read, after a store; the second read sees the new word. The move stands: the waiter
+        /// stays blocked on T and is reached there.
+        #[test]
+        fn w03_a_requeue_between_the_registration_and_the_second_read() {
+            let w = world(48600);
+            let (a, driver, d) = (w.a, w.driver, 48700);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                store(k, driver, 6);
+                sink.borrow_mut().push(Res::Done);
+                let r = k.futex_cmp_requeue_split(CpuId(1), a, (SQ, P), (MX, P), 6, 0, 1);
+                sink.borrow_mut().push(atomic1::res(&r));
+            }));
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            let mut results = vec![r];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe_w(s, driver, d, &o, 6)));
+            let init = Model {
+                word: 5,
+                ..Model::default()
+            };
+            let rq = Op::Rq {
+                dst: Q::T,
+                exp: 6,
+                wake: 0,
+                req: 1,
+            };
+            assert_lin(
+                &observed,
+                &init,
+                Op::Wait { tid: d, exp: 5 },
+                &[Op::Store(6), rq],
+            );
+            // Reached through T.
+            k.with(|s| {
+                run(s, driver);
+                assert_eq!(s.futex_wake(MX, 1, P), Ok(1));
+                assert!(placed(s, d));
+                consistent(s);
+            });
+        }
+
+        /// W4 — a compare-and-requeue completes before the registration (finding nobody), and a
+        /// second one after it: the second cannot move a waiter the first did not see.
+        #[test]
+        fn w04_a_requeue_before_the_registration() {
+            let w = world(48800);
+            let (a, driver, d) = (w.a, w.driver, 48900);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let (s1, s2) = (seen.clone(), seen.clone());
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                store(k, driver, 6);
+                s1.borrow_mut().push(Res::Done);
+                let r = k.futex_cmp_requeue_split(CpuId(1), a, (SQ, P), (MX, P), 6, 0, ALL);
+                s1.borrow_mut().push(atomic1::res(&r));
+            }));
+            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                let r = k.futex_cmp_requeue_split(CpuId(1), a, (SQ, P), (MX, P), 6, 0, ALL);
+                s2.borrow_mut().push(atomic1::res(&r));
+            }));
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            let mut results = vec![r];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe_w(s, driver, d, &o, 6)));
+            let init = Model {
+                word: 5,
+                ..Model::default()
+            };
+            let rq = Op::Rq {
+                dst: Q::T,
+                exp: 6,
+                wake: 0,
+                req: ALL as usize,
+            };
+            assert_lin(
+                &observed,
+                &init,
+                Op::Wait { tid: d, exp: 5 },
+                &[Op::Store(6), rq, rq],
+            );
+        }
+
+        /// W6 — the mapping moves between the comparison and the registration: the shared word at
+        /// 0x8_0000 (object 1, also mapped at 0xB_0000) is remapped onto object 2, whose word also
+        /// holds 0. A wake of object 1 then finds nobody, and a later one runs after the
+        /// registration. Sequentially the wait is on object 1 (before the remap: the first wake
+        /// takes it) or on object 2 (after: neither wake of object 1 can) — never "the first
+        /// finds nobody and the second takes it".
+        #[test]
+        fn w06_a_remap_before_the_registration() {
+            let mut w = world(49000);
+            let (a, driver, d) = (w.a, w.driver, 49100);
+            let o2 = 0xC_0000usize;
+            // Object 2, one frame, mapped raw at 0xC_0000 in A (its frame names the object).
+            let (id2, _cap2) = w.s.alloc_anonymous_memory_object().expect("object 2");
+            let phys2 = w.s.with_vm_then_memory_mut(|_sp, m| {
+                m.memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|o| o.id == id2)
+                    .expect("object 2 slot")
+                    .phys
+                    .0
+            });
+            w.s.map_user_page_in_asid_raw(
+                a,
+                VirtAddr(o2 as u64),
+                Mapping {
+                    phys: PhysAddr(phys2),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map object 2");
+            word(&mut w.s, driver, o2, 0);
+            let k = leak(w.s);
+            let (k1, k2) = k.with(|s| {
+                let k1 = s
+                    .with_vm_then_memory_mut(|sp, m| {
+                        fx::resolve_futex_key_locked(sp, m, a, 0x8_0000, SH)
+                    })
+                    .expect("k1")
+                    .0;
+                let k2 = s
+                    .with_vm_then_memory_mut(|sp, m| fx::resolve_futex_key_locked(sp, m, a, o2, SH))
+                    .expect("k2")
+                    .0;
+                (k1, k2)
+            });
+            assert_ne!(k1, k2);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let (s1, s2) = (seen.clone(), seen.clone());
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                k.with(|s| {
+                    s.unmap_user_page_in_asid(a, VirtAddr(0x8_0000))
+                        .expect("unmap");
+                    s.map_user_page_in_asid_raw(
+                        a,
+                        VirtAddr(0x8_0000),
+                        Mapping {
+                            phys: PhysAddr(phys2),
+                            flags: PageFlags::USER_RW,
+                        },
+                    )
+                    .expect("remap onto object 2");
+                });
+                let n = k
+                    .futex_wake_split_mut(CpuId(1), a, 0xB_0000, 1, SH)
+                    .expect("wake object 1");
+                s1.borrow_mut().push(n);
+            }));
+            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                let n = k
+                    .futex_wake_split_mut(CpuId(1), a, 0xB_0000, 1, SH)
+                    .expect("wake object 1");
+                s2.borrow_mut().push(n);
+            }));
+            let (r, o) = wait(k, a, d, 0x8_0000, 0, SH);
+            let wakes = seen.borrow().clone();
+            let (on_k2, woken) = k.with(|s| {
+                let on_k2 = order(s, k2) == vec![d];
+                let woken = observe_w(s, driver, d, &o, 5).woken.contains(&d);
+                (on_k2, woken)
+            });
+            let _ = k1;
+            let observed = (r, wakes, on_k2, woken);
+            let admitted = [
+                // Before the remap: on object 1, the first wake takes it.
+                (Res::Wait(true), vec![1, 0], false, true),
+                // After it: on object 2, untouched by either wake.
+                (Res::Wait(true), vec![0, 0], true, false),
+            ];
+            assert!(
+                admitted.contains(&observed),
+                "NOT LINEARIZABLE: {observed:?}, admitted {admitted:?}"
+            );
+        }
+    }
+
     mod atomic1 {
         use super::*;
 

@@ -32,7 +32,8 @@
 //! lock, and every transition writes the record and the TCB status in the SAME critical section:
 //!
 //! * a record and `TaskStatus::Blocked(WaitReason::Futex(token))` are created together
-//!   ([`register_futex_waiter_locked`]);
+//!   ([`register_futex_waiter_locked`]), and `FutexWait` creates them only inside the hold that
+//!   resolved its key and compared its word ([`compare_and_register_futex_waiter_locked`]);
 //! * a wake removes the record and makes the task `Runnable` together
 //!   ([`claim_futex_waiter_locked`], after [`next_futex_waiter_locked`]);
 //! * an undo removes the record and restores `Running` together
@@ -556,6 +557,77 @@ pub fn register_futex_waiter_locked(
     Ok(token)
 }
 
+/// FUTEX-WAIT-ATOMIC1 — why [`compare_and_register_futex_waiter_locked`] published nothing. Every
+/// refusal is decided before anything is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutexCompareRegisterRefusal {
+    /// The caller is not the `Running` `{tid, asid}` incarnation. Also the answer, whatever the
+    /// word, when the word cannot be read and the caller is not that incarnation.
+    IncarnationMoved,
+    /// Every waiter slot holds a live record (unreachable in production; see "Capacity").
+    Full,
+    /// The word did not hold `expected`.
+    ValueChanged,
+    /// The address did not resolve to a readable word (its own error).
+    Word(KernelError),
+}
+
+/// FUTEX-WAIT-ATOMIC1 — ranks 2 → 5 → 6, ONE hold: THE compare-and-register of `FutexWait`.
+///
+/// Resolves `addr`'s key in `asid` (the address space's current generation, or the shared object
+/// the mapping names), reads the word once (the atomic acquire load of [`read_word_locked`]),
+/// compares it with `expected` ([`futex_should_park`](crate::kernel::syscall::sched::futex_should_park)),
+/// and on a match registers the waiter ([`register_futex_waiter_locked`]: the keyed record and
+/// `Blocked(Futex(token))` together, for the exact `Running` `{tid, asid}`).
+///
+/// **The linearization point** of a `FutexWait` that blocks, or that returns because the word
+/// differed, is the word's load inside this hold. Every other futex operation that reads or
+/// changes the waiter population — `FutexWake`'s claim, `FutexCmpRequeue`'s commit (which reads
+/// its own word in the same 2 → 5 → 6 order), a dying task's retirement — holds the task lock to
+/// do it, and every mapping change holds the VM lock. So none of them falls between the
+/// comparison and the registration: each is entirely before this hold (and a waker's earlier
+/// store to the word is visible to the load, because that store precedes the waker's release of
+/// the task lock, which precedes this hold's acquisition of it) or entirely after it (and then
+/// finds this waiter). A user store that no futex operation follows is ordered by the load alone.
+#[allow(clippy::too_many_arguments)]
+pub fn compare_and_register_futex_waiter_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    spaces: &AddressSpaceManager,
+    memory: &MemorySubsystem,
+    tid: u64,
+    asid: Asid,
+    addr: usize,
+    expected: u32,
+    kind: FutexKind,
+) -> Result<(FutexKey, FutexWaitToken), FutexCompareRegisterRefusal> {
+    use FutexCompareRegisterRefusal as Refused;
+    let (key, word) = match resolve_futex_word_locked(spaces, memory, asid, addr, kind) {
+        Ok(found) => found,
+        Err(_) if !entering_incarnation(tcbs, tid, asid) => return Err(Refused::IncarnationMoved),
+        Err(err) => return Err(Refused::Word(err)),
+    };
+    if !crate::kernel::syscall::sched::futex_should_park(expected, word) {
+        return Err(Refused::ValueChanged);
+    }
+    register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)
+        .map(|token| (key, token))
+        .map_err(|refusal| match refusal {
+            FutexRegisterRefusal::IncarnationMoved => Refused::IncarnationMoved,
+            FutexRegisterRefusal::Full => Refused::Full,
+        })
+}
+
+/// rank 2, read-only — whether `tid` is the `Running` `{tid, asid}` incarnation the registration
+/// accepts. Orders a refusal; decides nothing.
+fn entering_incarnation(tcbs: &[Option<ThreadControlBlock>], tid: u64, asid: Asid) -> bool {
+    tcbs.iter().flatten().any(|t| {
+        t.tid.0 == tid
+            && t.asid.unwrap_or(Asid(0)) == asid
+            && matches!(t.status, TaskStatus::Running)
+    })
+}
+
 /// rank 2 — UNDO a registration this caller made: back to `Running` from exactly
 /// `Blocked(Futex(token))`, and the record retired, together. Returns `false` (and changes nothing)
 /// if the TCB is no longer on that token — a waker won, and the TCB is the waker's.
@@ -578,32 +650,6 @@ pub fn undo_futex_registration_locked(
         table.retire(slot);
     }
     true
-}
-
-/// FUTEX-REQUEUE-ATOMIC1 — rank 2: the undo of the split wait's SECOND READ, when that read saw
-/// the word (or key) change. Like [`undo_futex_registration_locked`], and also refused (changing
-/// nothing) when the record is no longer on `key`, the key this wait registered on: another
-/// operation has then ACTED on this waiter as registered — a compare-and-requeue moved it to its
-/// target, or selected it for its wake portion — so the wait is no longer this caller's to
-/// retract. The caller then continues to park, and the other operation's outcome stands (moved:
-/// parked on the target; selected: placed by that operation). Retracting it instead would leave
-/// that operation having moved or woken a waiter that, by its own report, never waited — a
-/// history no sequential order produces.
-pub fn undo_futex_registration_unless_acted_on_locked(
-    tcbs: &mut [Option<ThreadControlBlock>],
-    table: &mut FutexWaiterTable,
-    tid: u64,
-    token: FutexWaitToken,
-    key: FutexKey,
-) -> bool {
-    let slot = usize::from(token.slot);
-    let rekeyed = slot < MAX_FUTEX_WAITERS
-        && table.generations[slot] == token.generation
-        && table.records[slot].is_some_and(|r| r.key != key);
-    if rekeyed {
-        return false;
-    }
-    undo_futex_registration_locked(tcbs, table, tid, token)
 }
 
 /// rank 2 — whether `tid` still waits on exactly `token`.
@@ -1228,6 +1274,32 @@ pub(crate) mod futex_phase_hook {
     }
     pub(crate) fn run_after_register() {
         let hook = AFTER_REGISTER.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
+    }
+
+    // FUTEX-WAIT-ATOMIC1 — the wait's other boundaries, for tests. `BEFORE_REGISTER` runs once
+    // the wait has decided to park and before its compare-and-register; `AFTER_CLEAR` after the
+    // compare-and-clear of the current slot and before the read-back. One-shot.
+    std::thread_local! {
+        static BEFORE_REGISTER: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static AFTER_CLEAR: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn arm_before_register(hook: Hook) {
+        BEFORE_REGISTER.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    pub(crate) fn run_before_register() {
+        let hook = BEFORE_REGISTER.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
+    }
+    pub(crate) fn arm_after_clear(hook: Hook) {
+        AFTER_CLEAR.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    pub(crate) fn run_after_clear() {
+        let hook = AFTER_CLEAR.with(|h| h.borrow_mut().take());
         if let Some(mut hook) = hook {
             hook();
         }

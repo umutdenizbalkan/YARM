@@ -18636,8 +18636,9 @@ impl SharedKernel {
     ///
     /// # Exactness
     ///
-    /// Every step is keyed on the entering incarnation. The rank-2 registration refuses a TCB that
-    /// is not `{tid, asid}` or not `Running`, and writes nothing when it refuses. The rank-1 clear
+    /// Every step is keyed on the entering incarnation. The compare-and-register (ranks 2 → 5 → 6,
+    /// one hold: FUTEX-WAIT-ATOMIC1) refuses a TCB that is not `{tid, asid}` or not `Running`, or
+    /// a word that differs from `expected`, and writes nothing when it refuses. The rank-1 clear
     /// is `block_current_exact_on`, which mutates nothing unless the slot names exactly this task
     /// — so this transaction can never clear another task's placement — and a refusal undoes the
     /// registration exactly. The quantum reset that `block_current_cpu` performs on a successful
@@ -18652,32 +18653,32 @@ impl SharedKernel {
         expected: u32,
         kind: crate::kernel::boot::futex::FutexKind,
     ) -> crate::kernel::syscall::sched::FutexParkOutcome {
-        use crate::kernel::boot::futex::{self as fx, FutexRegisterRefusal};
+        use crate::kernel::boot::futex::{self as fx, FutexCompareRegisterRefusal};
         use crate::kernel::syscall::sched::FutexParkOutcome as O;
 
-        // (0) vm 5 → memory 6 — THE KEY AND THE WORD, from one mapping. Nothing is written yet.
-        let (key, word) = match self.resolve_futex_word_in_split(asid, addr, kind) {
-            Ok(found) => found,
-            // The canonical precedence: a caller that is not the entering incarnation is
-            // `IncarnationMoved` whatever its word, exactly as when the registration refuses it.
-            Err(_) if !self.futex_entering_incarnation_split(tid, asid) => {
-                return O::IncarnationMoved;
-            }
-            Err(err) => return O::WordUnreadable(err),
-        };
-        if !crate::kernel::syscall::sched::futex_should_park(expected, word) {
-            return O::ValueChanged;
-        }
+        #[cfg(test)]
+        fx::futex_phase_hook::run_before_register();
 
-        // (1) rank 2 — REGISTER, exactly: the keyed record and `Blocked(Futex(token))` in ONE
-        // task-lock critical section, from `Running` only and for the exact `{tid, asid}`. A
-        // waker scans the same table under the same lock, so from here on it finds this waiter.
-        let registered = self.with_task_futex_split_mut(|tcbs, table| {
-            fx::register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)
-        });
+        // (1) ranks 2 → 5 → 6, ONE hold — COMPARE AND REGISTER (FUTEX-WAIT-ATOMIC1). The key is
+        // resolved, the word read and compared, and the keyed record and `Blocked(Futex(token))`
+        // published, for the exact `Running` `{tid, asid}`, without releasing anything in between.
+        // That load is the wait's linearization point: every waker, requeue, exit and mapping
+        // change is wholly before this hold or wholly after it (see the owner's doc). So there is
+        // no second read: once this hold has registered the waiter, the wait has happened, and a
+        // later change of the word is a later operation — one that wakes, moves or leaves it, as
+        // its own sequential step would. Nothing here retracts a registration because of the word.
+        let registered = self.with_task_futex_then_vm_memory_split_mut(
+            |tcbs, _classes, table, spaces, memory| {
+                fx::compare_and_register_futex_waiter_locked(
+                    tcbs, table, spaces, memory, tid, asid, addr, expected, kind,
+                )
+            },
+        );
         let token = match registered {
-            Ok(token) => token,
-            Err(FutexRegisterRefusal::IncarnationMoved) => {
+            Ok((_key, token)) => token,
+            Err(FutexCompareRegisterRefusal::ValueChanged) => return O::ValueChanged,
+            Err(FutexCompareRegisterRefusal::Word(err)) => return O::WordUnreadable(err),
+            Err(FutexCompareRegisterRefusal::IncarnationMoved) => {
                 crate::yarm_log!(
                     "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason=incarnation_moved",
                     tid,
@@ -18686,7 +18687,7 @@ impl SharedKernel {
                 );
                 return O::IncarnationMoved;
             }
-            Err(FutexRegisterRefusal::Full) => {
+            Err(FutexCompareRegisterRefusal::Full) => {
                 crate::yarm_log!(
                     "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason=capacity_exhausted",
                     tid,
@@ -18697,7 +18698,8 @@ impl SharedKernel {
             }
         };
         // The ONE undo of that registration: the record and the status together, and only from
-        // exactly this token — a TCB a waker already moved is the waker's.
+        // exactly this token — a TCB a waker already moved is the waker's. Reached only from the
+        // established-impossible victim mismatch below.
         let undo_registration = || {
             self.with_task_futex_split_mut(|tcbs, table| {
                 fx::undo_futex_registration_locked(tcbs, table, tid, token)
@@ -18705,43 +18707,6 @@ impl SharedKernel {
         };
         #[cfg(test)]
         fx::futex_phase_hook::run_after_register();
-
-        // (1b) RE-READ, NOW THAT THE WAITER IS VISIBLE — the key AND the word, again from one
-        // acquisition. A waker stores the word before it takes the task lock to claim; the
-        // registration above and that claim are serialized by the task lock. Either the claim
-        // follows the registration and finds this waiter, or it precedes it — and then the
-        // waker's store precedes the waker's release of the task lock, which precedes this
-        // transaction's acquisition of it, which precedes this read: the value below is the new
-        // one. A changed key (the mapping moved) is a changed word for the same reason.
-        let reread = self.resolve_futex_word_in_split(asid, addr, kind);
-        let unchanged = matches!(reread, Ok((k, w)) if k == key && w == expected);
-        // FUTEX-REQUEUE-ATOMIC1: a changed word retracts the registration only while no other
-        // operation has acted on it. Once a compare-and-requeue has moved this waiter (or selected
-        // it to be woken), the undo refuses, and the wait continues to park: the requeue's
-        // outcome — this waiter moved, or woken — stands, as in the one order that explains it.
-        let undo_unless_acted_on = || {
-            self.with_task_futex_split_mut(|tcbs, table| {
-                fx::undo_futex_registration_unless_acted_on_locked(tcbs, table, tid, token, key)
-            })
-        };
-        if !unchanged && undo_unless_acted_on() {
-            crate::yarm_log!(
-                "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason={} expected={}",
-                tid,
-                asid.0,
-                addr,
-                if reread.is_err() {
-                    "word_unreadable"
-                } else {
-                    "value_changed"
-                },
-                expected
-            );
-            return match reread {
-                Err(err) => O::WordUnreadable(err),
-                Ok(_) => O::ValueChanged,
-            };
-        }
 
         // (2) rank 1 — COMPARE-AND-CLEAR. `block_current_exact_on` mutates nothing unless the slot
         // names exactly this task, so a mismatch costs no other task its placement. The quantum
@@ -18772,6 +18737,9 @@ impl SharedKernel {
             );
             return O::VictimChanged;
         };
+
+        #[cfg(test)]
+        fx::futex_phase_hook::run_after_clear();
 
         // (3) rank 2 — READ BACK. A waker that entered the window between (1) and (2) has already
         // claimed this exact token — its record retired and the TCB `Runnable` — and that is the
@@ -18809,19 +18777,6 @@ impl SharedKernel {
             entering,
             recovered,
         }
-    }
-
-    /// FUTEX-FOUND1 — rank 2, read-only: whether `tid` is the `Running` `{tid, asid}` incarnation
-    /// the registration would accept. Consulted only to order a refusal; it decides nothing.
-    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-    fn futex_entering_incarnation_split(&self, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
-        self.with_task_tcbs_split_mut(|tcbs| {
-            tcbs.iter().flatten().any(|t| {
-                t.tid.0 == tid
-                    && t.asid.unwrap_or(crate::kernel::vm::Asid(0)) == asid
-                    && matches!(t.status, crate::kernel::task::TaskStatus::Running)
-            })
-        })
     }
 
     /// Stage 191E (FUTEXWAIT PHASE-C SELECTION SEAM): peek the next-runnable dispatch

@@ -973,27 +973,37 @@ impl KernelState {
         expected: u32,
         kind: super::futex::FutexKind,
     ) -> Result<bool, KernelError> {
-        // FUTEX-FOUND1: the key and the word in one vm-then-memory acquisition, compared with
-        // `expected`, then the keyed registration. The broad acquisition is held from the read to
-        // the park, so no waker can interleave.
-        let (tid, asid, key, word) = self.resolve_current_futex_word(addr, kind)?;
-        if !crate::kernel::syscall::sched::futex_should_park(expected, word) {
-            return Ok(false);
+        // FUTEX-WAIT-ATOMIC1: the key, the word, the comparison and the keyed registration in ONE
+        // task -> vm -> memory hold — THE compare-and-register the split route uses. The broad
+        // acquisition no longer excludes every waker (FutexWake and FutexCmpRequeue run off it),
+        // so the domain locks are what order this wait against them.
+        super::futex::futex_word_range_check(addr)?;
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        let registered =
+            self.with_task_futex_then_vm_memory_mut(|tcbs, _classes, table, spaces, memory| {
+                super::futex::compare_and_register_futex_waiter_locked(
+                    tcbs.as_mut_slice(),
+                    table,
+                    spaces,
+                    memory,
+                    tid,
+                    asid,
+                    addr,
+                    expected,
+                    kind,
+                )
+            });
+        {
+            use super::futex::FutexCompareRegisterRefusal as Refused;
+            match registered {
+                Ok(_) => {}
+                Err(Refused::ValueChanged) => return Ok(false),
+                Err(Refused::Word(err)) => return Err(err),
+                Err(Refused::IncarnationMoved) => return Err(KernelError::TaskMissing),
+                Err(Refused::Full) => return Err(KernelError::TaskTableFull),
+            }
         }
-        self.with_task_futex_mut(|tcbs, table| {
-            super::futex::register_futex_waiter_locked(
-                tcbs.as_mut_slice(),
-                table,
-                tid,
-                asid,
-                key,
-                addr as u64,
-            )
-        })
-        .map_err(|refusal| match refusal {
-            super::futex::FutexRegisterRefusal::IncarnationMoved => KernelError::TaskMissing,
-            super::futex::FutexRegisterRefusal::Full => KernelError::TaskTableFull,
-        })?;
         let _ = self.block_current_cpu();
         // Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): the caller is now
         // `Blocked(Futex)` and removed from `current`, so the dispatch that follows
