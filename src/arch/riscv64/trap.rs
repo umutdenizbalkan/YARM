@@ -1858,7 +1858,7 @@ pub fn handle_riscv_trap_entry_shared(
             // later reap still reads.
             let exiting = crate::kernel::boot::exit_queue_advance_pending(cpu_idx)
                 .is_some_and(|(et, _)| Some(et) == outgoing);
-            // RISCV-PARK-RET1 — the route's `set_ok` reached only the frame's return FIELDS, which
+            // RISCV-PARK-RET1 — the route's `set_ok` reached only the frame's result FIELDS, which
             // become `a0..a2` only when a trap returns through its own frame. This caller will be
             // resumed later from the context captured below, and every resume arm reads the result
             // from that context's register and argument lanes — which still held the syscall's own
