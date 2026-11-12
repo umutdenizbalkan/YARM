@@ -1,0 +1,16 @@
+nc2 applied
+diff --git a/src/kernel/boot/mod.rs b/src/kernel/boot/mod.rs
+index 5604923a..1a655f8f 100644
+--- a/src/kernel/boot/mod.rs
++++ b/src/kernel/boot/mod.rs
+@@ -1725,9 +1725,7 @@ pub(crate) fn riscv_commit_final_park_result(
+             && futex.is_none()
+             && recv.is_none()
+             && yielded == Some(outgoing));
+-    if final_result {
+-        frame.commit_riscv_parked_syscall_returns();
+-    }
++    let _ = &frame;
+     final_result
+ }
+ 

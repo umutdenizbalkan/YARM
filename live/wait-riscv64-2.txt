@@ -1,0 +1,4 @@
+[futex-wait-witness] building base riscv64 artifacts with futex-requeue-witness,futex-wait-witness
+[futex-wait-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,futex-wait-witness
+[futex-wait-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+FUTEX_WAIT_WITNESS_SEAL arch=riscv64 smp=2 waits=8 skipped=24 windows=13 refused=0 b_changed=3 a=5 in_window_wakes=13 waiter_cpus=1 waker_cpus=0 calls=32 returns=32 blocked=29 mismatch=3 during_publication=5 parked=24 parked_ok=24 parked_err=0 dup_or_missing=0 witness=ok core_smoke=ok result=ok

@@ -1,0 +1,5 @@
+[ipc-send-fault-witness] building base x86_64 artifacts with ipc-send-final-fault-witness
+[ipc-send-fault-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle
+[ipc-send-fault-witness] booting QEMU -smp 1 with yarm.ipc_send_final_fault_witness=1
+[ipc-send-fault-witness] an unreadable NR 1 source faulted, the caller resumed, and the failed sends delivered nothing
+IPC_SEND_FAULT_SEAL arch=x86_64 rounds=6 pagefault=6 recovered=6 drained=6 broad_entries=0 result=ok

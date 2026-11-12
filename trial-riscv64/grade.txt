@@ -1,0 +1,16 @@
+[futex-wait-grade][fail] window 1 (B): ended `no_peer`, not by a wake
+[futex-wait-grade][fail] window 1 (B) held no wake from another CPU
+[futex-wait-grade][fail] window 3 (B): ended `no_peer`, not by a wake
+[futex-wait-grade][fail] window 3 (B) held no wake from another CPU
+[futex-wait-grade][fail] window 5 (B): ended `no_peer`, not by a wake
+[futex-wait-grade][fail] window 5 (B) held no wake from another CPU
+[futex-wait-grade][fail] window 7 (B): ended `no_peer`, not by a wake
+[futex-wait-grade][fail] window 7 (B) held no wake from another CPU
+[futex-wait-grade][fail] window 9 (B): ended `no_peer`, not by a wake
+[futex-wait-grade][fail] window 9 (B) held no wake from another CPU
+[futex-wait-grade][fail] window 11 (B): ended `no_peer`, not by a wake
+[futex-wait-grade][fail] window 11 (B) held no wake from another CPU
+[futex-wait-grade][fail] window 14 (A): ended `no_peer`, not by a wake
+[futex-wait-grade][fail] window 14 (A) held no wake from another CPU
+[futex-wait-grade][fail] wait 19: registered and woken inside A, result parked
+FUTEX_WAIT_WITNESS_SEAL arch=riscv64 smp=2 waits=11 skipped=21 windows=18 b_changed=4 a=7 in_window_wakes=11 waiter_cpus=1 waker_cpus=0 calls=32 returns=32 blocked=28 mismatch=4 during_publication=6 parked=22 parked_ok=22 parked_err=0 dup_or_missing=0 witness=fail core_smoke=ok result=fail

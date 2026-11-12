@@ -1,0 +1,12 @@
+side F 194842bcd63f porcelain=0
+bbbe330bc9188fb782ef70f4d043d2a2635034767c64ab33e06806757f2dd633  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/XC/aarch64_F.elf
+672f9fb7991f9e4debf4cabbd3d97c6d9c617796aec679866c49aa7def2fc00d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/XC/x86_64_F.elf
+rqw base F rc=0
+rqw kernel F rc=0
+03e57601f4340a1e83ec7a0e85ea4a0c65f98b0f2b23460ddf18527569c2a715  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/XC/x86rqw_F.elf
+side B 2a91a6e842d7 porcelain=0
+a4f1e61c5663c6bc0b9d32e31e9442db88b0c03cdf621f5c6717d76006b46de8  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/XC/aarch64_B.elf
+3a8b443bdd733502106ae0d02eb3afa1c3d9ed1931329a90294a87c4bef28f99  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/XC/x86_64_B.elf
+rqw base B rc=0
+rqw kernel B rc=0
+9cb492cfa8f2a9ae86e59c4c997631fb47470f665fe24d0edf514fd0e41e9482  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/XC/x86rqw_B.elf

@@ -1,0 +1,25 @@
+SECTION x86_64 .note.Xen same F=da0ea49ebab94497 B=da0ea49ebab94497
+SECTION x86_64 .text.boot32 same F=007a526f22e6a806 B=007a526f22e6a806
+SECTION x86_64 .text.boot64_thunk same F=a3192d21850cb6f9 B=a3192d21850cb6f9
+SECTION x86_64 .data.boot same F=f1f93a3bfc6e2376 B=f1f93a3bfc6e2376
+SECTION x86_64 .bss.bootstack same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64 .text.boot same F=8189492bac5079d5 B=8189492bac5079d5
+SECTION x86_64 .text same F=718470dba4366aa1 B=718470dba4366aa1
+SECTION x86_64 .rodata DIFF F=462815de034ab8f3 B=4560dabc632dfc3e
+SECTION x86_64 .data same F=400b600e8148cbac B=400b600e8148cbac
+SECTION x86_64 .bss same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64 .yarm_nofp_map same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64 .symtab same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64 .shstrtab same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64 .strtab same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .text.boot same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .text same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .rodata same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .data same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .bss.bootstack same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .bss same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .yarm_nofp_map same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .symtab same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .shstrtab same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION aarch64 .strtab same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+TEXT_IDENTICAL_X86_64_AARCH64

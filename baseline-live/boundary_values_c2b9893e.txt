@@ -1,0 +1,49 @@
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523648 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=1 expected=0xf7a10000 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523648 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=2 expected=0xf7a10000 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523649 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=3 expected=0xf7a10001 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523649 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=4 expected=0xf7a10001 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523650 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=5 expected=0xf7a10002 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523650 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=6 expected=0xf7a10002 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523652 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=7 expected=0xf7a10004 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523652 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=8 expected=0xf7a10004 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523654 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=9 expected=0xf7a10006 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523654 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=10 expected=0xf7a10006 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523656 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=11 expected=0xf7a10008 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523656 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=12 expected=0xf7a10008 error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523659 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=13 expected=0xf7a1000b error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523659 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=14 expected=0xf7a1000b error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523660 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=15 expected=0xf7a1000c error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1
+RISCV_STARTUP_ARGS tid=10008 entering=10009 a0=4280324 a1=4154523660 a2=0 a3=0 a4=0 a5=0
+USER_LOG tid=10008 msg=FWAW_CALL cycle=16 expected=0xf7a1000c error=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=1 result=queue_advance_committed outgoing=10008 captured=1

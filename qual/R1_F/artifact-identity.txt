@@ -1,0 +1,6 @@
+tree=a48bb41ea3f593ecc231d25c0d2c93dbcde80032 head=194842bcd63f31925775208b7eed83e0299ea8d7 dirty=0 kernel_features=--no-default-features --features riscv64-d2-settle-witness userspace_features=--no-default-features
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=virt cpu=rv64 cmdline=console=ttyS0 rdinit=/init
+9ba6e028b2e0cd7577fe439ff004af66e93fda97bef72c6557ab9e3fbf34a362  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/R1_F/build/yarm-riscv64-d2sw.bin
+2c3f72c988c6bf4300243cb06d153f8d486e466b15e51642fdfbf34dc07d38e1  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/R1_F/build/yarm-riscv64-d2sw.elf
+2c91ab3153ac58e3a07f859fe03f418a9bc68f962430745e7e6c4038cf95931a  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/R1_F/build/initramfs-core.cpio
+171a91cceeb419d5cf238008c77641a13c4783d2540fec9294b1ba969bfa095d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/R1_F/build/opensbi-fw_dynamic.bin

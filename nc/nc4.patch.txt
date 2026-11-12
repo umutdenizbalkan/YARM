@@ -1,0 +1,15 @@
+nc4 applied
+diff --git a/src/kernel/boot/mod.rs b/src/kernel/boot/mod.rs
+index 5604923a..4dd6213d 100644
+--- a/src/kernel/boot/mod.rs
++++ b/src/kernel/boot/mod.rs
+@@ -1715,9 +1715,6 @@ pub(crate) fn riscv_commit_final_park_result(
+     let Some(outgoing) = futex.or(recv).or(yielded) else {
+         return false;
+     };
+-    if exit_queue_advance_pending(cpu_idx).is_some_and(|(exiting, _)| exiting == outgoing) {
+-        return false;
+-    }
+     let nr = frame.syscall_num();
+     let final_result = (nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+         && futex == Some(outgoing))

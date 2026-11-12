@@ -1,0 +1,16 @@
+nc7 applied
+diff --git a/src/kernel/trapframe.rs b/src/kernel/trapframe.rs
+index 02faeae4..f7960b66 100644
+--- a/src/kernel/trapframe.rs
++++ b/src/kernel/trapframe.rs
+@@ -246,6 +246,10 @@ impl TrapFrame {
+         self.args[0] = a0;
+         self.args[1] = a1;
+         self.args[2] = a2;
++        for i in 3..6 {
++            self.args[i] = 0;
++            self.user_gprs[10 + i] = 0;
++        }
+     }
+ 
+     /// QEMU-SMP1-ACCEPTANCE §1 — name the incarnation whose continuation this frame now holds.

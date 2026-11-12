@@ -1,0 +1,25 @@
+ .../src/control_plane/init/service.rs              |  61 +-
+ doc/AI_AGENT_RULES.md                              |   6 +
+ doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md              |   4 +
+ doc/SYSCALL_ABI.md                                 |  22 +
+ scripts/grade-futex-wait-witness.py                | 413 ++++++++--
+ scripts/qemu-futex-wait-witness-smoke.sh           |  11 +-
+ src/arch/riscv64/trap.rs                           |  15 +-
+ src/kernel/boot/futex.rs                           |  81 +-
+ src/kernel/boot/mod.rs                             |  51 ++
+ src/kernel/boot/tests.rs                           | 856 +++++++++++++++++++++
+ src/kernel/trapframe.rs                            |  32 +
+ src/runtime.rs                                     |  32 +-
+ 12 files changed, 1469 insertions(+), 115 deletions(-)
+X86_AARCH64_SHARED_BRIDGE_UNCHANGED
+ src/arch/riscv64/trap.rs | 15 +++++++--
+ src/kernel/boot/futex.rs | 81 +++++++++++++++++++++++++++++++++++++++++-------
+ src/kernel/boot/mod.rs   | 51 ++++++++++++++++++++++++++++++
+ src/kernel/trapframe.rs  | 32 +++++++++++++++++++
+ src/runtime.rs           | 32 +++++++++++++++++--
+ 5 files changed, 195 insertions(+), 16 deletions(-)
+production_callers=1
+1869:            let committed = crate::kernel::boot::riscv_commit_final_park_result(cpu_idx, frame);
+1874:                    .map(|t| shared.capture_outgoing_user_context_split(t, frame))
+1706-#[cfg(any(target_arch = "riscv64", test))]
+1707:pub(crate) fn riscv_commit_final_park_result(

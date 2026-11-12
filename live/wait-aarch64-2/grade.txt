@@ -1,0 +1,2 @@
+[futex-wait-grade][fail] line 34171: damaged witness marker: FUTEX_WAIT_WITNESS_3SKIPPED wait=13 cpu=1 tid=10008 reason=no_peer_running
+FUTEX_WAIT_WITNESS_SEAL arch=aarch64 smp=2 waits=21 skipped=3 windows=35 refused=0 b_changed=7 a=14 in_window_wakes=35 waiter_cpus=1 waker_cpus=0 calls=32 returns=32 blocked=18 mismatch=14 during_publication=14 parked=4 parked_ok=4 parked_err=0 dup_or_missing=0 witness=fail core_smoke=ok result=fail

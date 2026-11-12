@@ -1,0 +1,668 @@
+From 51198a57eb2df28544ec8734b2a9768c384d1d76 Mon Sep 17 00:00:00 2001
+From: diag <diag@localhost>
+Date: Thu, 12 Nov 2026 09:40:46 +0000
+Subject: [PATCH] DIAG (never pushed): c2b9893e + the userspace wait witness
+ only, no kernel windows
+
+---
+ Cargo.toml                                    |   2 +
+ crates/yarm-control-plane-servers/Cargo.toml  |   1 +
+ .../src/control_plane/init/service.rs         | 201 ++++++++++++++
+ crates/yarm-driver-servers/Cargo.toml         |   1 +
+ crates/yarm-fs-servers/Cargo.toml             |   1 +
+ scripts/grade-futex-wait-witness.py           | 249 ++++++++++++++++++
+ scripts/qemu-futex-wait-witness-smoke.sh      | 109 ++++++++
+ 7 files changed, 564 insertions(+)
+ create mode 100755 scripts/grade-futex-wait-witness.py
+ create mode 100755 scripts/qemu-futex-wait-witness-smoke.sh
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 68429c92..b6d419db 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -238,6 +238,8 @@ futex-requeue-witness = []
+ # and NR 10 reports such a wake; in init's cell (with futex-requeue-witness), signaller threads
+ # issue those wakes. Default off; no production path changes with it off.
+ futex-requeue-race-witness = []
++# FUTEX-WAIT-ATOMIC1: the live wait witness (windows B and A of a witness FutexWait).
++futex-wait-witness = []
+ # QEMU-IRQ1: the first real external-interrupt witness — RISC-V UART0 -> PLIC -> YARM on QEMU
+ # virt. Compiles the kernel-only device window install, the idle-origin supervisor-external
+ # admission, the UART setup/drain fixture, the provisioning of init's notification + ring page, the
+diff --git a/crates/yarm-control-plane-servers/Cargo.toml b/crates/yarm-control-plane-servers/Cargo.toml
+index ad60df3b..536a73b5 100644
+--- a/crates/yarm-control-plane-servers/Cargo.toml
++++ b/crates/yarm-control-plane-servers/Cargo.toml
+@@ -76,6 +76,7 @@ ipc-displace1-witness = []
+ # FUTEX-REQUEUE1: init's live compare-and-requeue cell (selector 18); inert elsewhere.
+ futex-requeue-witness = []
+ futex-requeue-race-witness = []
++futex-wait-witness = []
+ riscv-uart-irq-witness = []
+ aarch64-pl011-irq-witness = []
+ # QEMU-SMP2: kernel-only witness; accepted and inert here so one feature list builds every image.
+diff --git a/crates/yarm-control-plane-servers/src/control_plane/init/service.rs b/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
+index 1579fff8..f8739443 100644
+--- a/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
++++ b/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
+@@ -2986,6 +2986,7 @@ mod x86_futex_requeue {
+ 
+ /// FUTEX-REQUEUE1 — resolve this architecture's child entry, the ten stacks, and run the witness.
+ #[cfg(all(not(feature = "hosted-dev"), feature = "futex-requeue-witness"))]
++#[cfg_attr(feature = "futex-wait-witness", allow(dead_code))]
+ fn run_futex_requeue_witness(s_tid: u64) {
+     use futex_requeue_witness as w;
+     #[cfg(target_arch = "x86_64")]
+@@ -3021,6 +3022,201 @@ fn run_futex_requeue_witness(s_tid: u64) {
+     );
+ }
+ 
++/// FUTEX-WAIT-ATOMIC1 — the live wait witness, selector 18 when init is built with
++/// `futex-wait-witness` (otherwise selector 18 is FUTEX-REQUEUE1's cell). Threads of init on
++/// SMP: a WAITER that issues `FutexWait(WORD, v)` for `CALLS` cycles, each `v` read just before,
++/// and two SIGNALLERS that issue `FutexWake(WORD, 1)` in a loop — after storing a new value on even
++/// cycles, without one on odd cycles. Two, so that one runs on the other CPU whichever CPU the
++/// waiter lands on; init itself blocks on a futex until the waiter is done, so the only siblings
++/// running are the witness's own. The kernel (built with the same feature) holds each witness
++/// wait open twice, until a wake from the other CPU has run inside: before its compare-and-register
++/// (B) and after it (A). The grader reads the kernel's markers; this cell reports what userspace
++/// saw: each call's result, every return counted exactly once.
++#[cfg(all(
++    not(feature = "hosted-dev"),
++    feature = "futex-requeue-witness",
++    feature = "futex-wait-witness"
++))]
++pub(super) mod futex_wait_witness {
++    use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
++    use yarm_user_rt::syscall::{FutexScope, futex_wait, futex_wake, yield_now};
++
++    const P: FutexScope = FutexScope::Private;
++    /// The high half of every witness word (the kernel's `wait_witness::MAGIC`).
++    pub(super) const MAGIC: u32 = 0xF7A1_0000;
++    pub(super) const CALLS: u32 = 16;
++    pub(super) const STACK_BYTES: usize = 4096;
++    const WAIT_YIELDS: u32 = 200_000;
++
++    /// The waiter and the signallers.
++    pub(super) const THREADS: usize = 3;
++    #[repr(C, align(16))]
++    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; THREADS]);
++    #[allow(unused)]
++    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; THREADS]);
++    #[allow(unused)]
++    pub(super) static mut TLS: [[u8; 256]; THREADS] = [[0; 256]; THREADS];
++
++    static WORD: AtomicU32 = AtomicU32::new(MAGIC);
++    static CYCLE: AtomicU32 = AtomicU32::new(0);
++    static RETURNS: AtomicU32 = AtomicU32::new(0);
++    static BLOCKED: AtomicU32 = AtomicU32::new(0);
++    static ERRORS: AtomicU32 = AtomicU32::new(0);
++    static DONE: AtomicU32 = AtomicU32::new(0);
++    static PARK: AtomicU32 = AtomicU32::new(0);
++    /// The signallers' shared store counter: every store writes a value never written before.
++    static NEXT: AtomicU32 = AtomicU32::new(1);
++
++    fn park() -> ! {
++        loop {
++            let v = PARK.load(SeqCst);
++            let _ = futex_wait(PARK.as_ptr(), v, P);
++        }
++    }
++
++    /// The waiter: one wait per cycle, on the value it has just read.
++    pub(super) extern "C" fn waiter_body() -> ! {
++        for c in 1..=CALLS {
++            CYCLE.store(c, SeqCst);
++            let v = WORD.load(SeqCst);
++            match futex_wait(WORD.as_ptr(), v, P) {
++                Ok(blocked) => {
++                    RETURNS.fetch_add(1, SeqCst);
++                    BLOCKED.fetch_add(u32::from(blocked), SeqCst);
++                    yarm_user_rt::user_log!(
++                        "FWAW_CALL cycle={} expected=0x{:x} blocked={}",
++                        c,
++                        v,
++                        u32::from(blocked)
++                    );
++                }
++                Err(_) => {
++                    RETURNS.fetch_add(1, SeqCst);
++                    ERRORS.fetch_add(1, SeqCst);
++                    yarm_user_rt::user_log!("FWAW_CALL cycle={} expected=0x{:x} error=1", c, v);
++                }
++            }
++        }
++        DONE.store(1, SeqCst);
++        let _ = futex_wake(DONE.as_ptr(), 1, P);
++        park()
++    }
++
++    /// The signaller: wake one, after a store on even cycles; park once the waiter is done.
++    pub(super) extern "C" fn signaller_body() -> ! {
++        loop {
++            if DONE.load(SeqCst) != 0 {
++                park();
++            }
++            if CYCLE.load(SeqCst) % 2 == 0 {
++                WORD.store(MAGIC | (NEXT.fetch_add(1, SeqCst) & 0xFFFF), SeqCst);
++            }
++            let _ = futex_wake(WORD.as_ptr(), 1, P);
++            let _ = yield_now();
++        }
++    }
++
++    pub(super) struct Child {
++        pub(super) entry: usize,
++        pub(super) stack_top: usize,
++        pub(super) tls_base: usize,
++    }
++
++    pub(super) fn run_once(s_tid: u64, children: &[Child; THREADS]) {
++        yarm_user_rt::user_log!("FWAW_BEGIN s_tid={} calls={}", s_tid, CALLS);
++        let mut tids = [0u64; THREADS];
++        for (i, c) in children.iter().enumerate() {
++            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
++            tids[i] =
++                unsafe { yarm_user_rt::syscall::spawn_thread(c.tls_base, c.stack_top, c.entry) }
++                    .unwrap_or(0);
++        }
++        // Block (not yield) until the waiter is done: init is then no running sibling, so the
++        // kernel's peer check sees only the witness threads. Bounded by the waiter's own end.
++        let mut waits = 0;
++        while DONE.load(SeqCst) == 0 && waits < WAIT_YIELDS {
++            let _ = futex_wait(DONE.as_ptr(), 0, P);
++            waits += 1;
++        }
++        let (returns, blocked, errors) = (
++            RETURNS.load(SeqCst),
++            BLOCKED.load(SeqCst),
++            ERRORS.load(SeqCst),
++        );
++        let ok = tids.iter().all(|&t| t != 0)
++            && DONE.load(SeqCst) == 1
++            && returns == CALLS
++            && errors == 0;
++        yarm_user_rt::user_log!(
++            "FWAW_DONE waiter={} signallers={},{} calls={} returns={} blocked={} errors={} result={}",
++            tids[0],
++            tids[1],
++            tids[2],
++            CALLS,
++            returns,
++            blocked,
++            errors,
++            if ok { "ok" } else { "fail" }
++        );
++    }
++}
++
++/// x86_64 entry trampolines for the wait witness (as for FUTEX-REQUEUE1's).
++#[cfg(all(
++    not(feature = "hosted-dev"),
++    feature = "futex-requeue-witness",
++    feature = "futex-wait-witness",
++    target_arch = "x86_64"
++))]
++mod x86_futex_wait {
++    #[unsafe(naked)]
++    pub(super) extern "C" fn waiter_entry() -> ! {
++        core::arch::naked_asm!(
++            "call {body}",
++            "ud2",
++            body = sym super::futex_wait_witness::waiter_body,
++        )
++    }
++    #[unsafe(naked)]
++    pub(super) extern "C" fn signaller_entry() -> ! {
++        core::arch::naked_asm!(
++            "call {body}",
++            "ud2",
++            body = sym super::futex_wait_witness::signaller_body,
++        )
++    }
++}
++
++/// FUTEX-WAIT-ATOMIC1 — resolve this architecture's entries and stacks, and run the wait witness.
++#[cfg(all(
++    not(feature = "hosted-dev"),
++    feature = "futex-requeue-witness",
++    feature = "futex-wait-witness"
++))]
++fn run_futex_wait_witness(s_tid: u64) {
++    use futex_wait_witness as w;
++    #[cfg(target_arch = "x86_64")]
++    let entries = [
++        x86_futex_wait::waiter_entry as *const () as usize,
++        x86_futex_wait::signaller_entry as *const () as usize,
++        x86_futex_wait::signaller_entry as *const () as usize,
++    ];
++    #[cfg(not(target_arch = "x86_64"))]
++    let entries = [
++        w::waiter_body as *const () as usize,
++        w::signaller_body as *const () as usize,
++        w::signaller_body as *const () as usize,
++    ];
++    let stacks = core::ptr::addr_of_mut!(w::STACKS) as usize;
++    let tls = core::ptr::addr_of_mut!(w::TLS) as usize;
++    let children: [w::Child; w::THREADS] = core::array::from_fn(|i| w::Child {
++        entry: entries[i],
++        stack_top: (stacks + (i + 1) * w::STACK_BYTES) & !0xF,
++        tls_base: tls + i * 256,
++    });
++    w::run_once(s_tid, &children);
++}
++
+ /// U9-TIMER5 §3 — the IDLE-BOUNDARY RETURN witness.
+ ///
+ /// # The shape, and why no ordinary boot has it
+@@ -7866,8 +8062,13 @@ pub fn run() {
+     }
+     // FUTEX-REQUEUE1: the live compare-and-requeue witness, selector 18. Mutually exclusive with
+     // every other slot-5 cell; compiled only with `futex-requeue-witness`.
++    // FUTEX-WAIT-ATOMIC1: built with `futex-wait-witness`, the same selector runs the wait witness
++    // instead.
+     #[cfg(all(not(feature = "hosted-dev"), feature = "futex-requeue-witness"))]
+     if futex_requeue_witness::armed(ctx.supervisor_control_recv_ep) {
++        #[cfg(feature = "futex-wait-witness")]
++        run_futex_wait_witness(ctx.task_id);
++        #[cfg(not(feature = "futex-wait-witness"))]
+         run_futex_requeue_witness(ctx.task_id);
+     }
+     // Stage 200D-0C1: default-off + feature-gated AArch64 LIVE ExitCurrentTask oracle. The slot-5
+diff --git a/crates/yarm-driver-servers/Cargo.toml b/crates/yarm-driver-servers/Cargo.toml
+index 52ef4064..0b6d05c9 100644
+--- a/crates/yarm-driver-servers/Cargo.toml
++++ b/crates/yarm-driver-servers/Cargo.toml
+@@ -56,6 +56,7 @@ ipc-displace1-witness = []
+ # FUTEX-REQUEUE1: init's live compare-and-requeue cell (selector 18); inert elsewhere.
+ futex-requeue-witness = []
+ futex-requeue-race-witness = []
++futex-wait-witness = []
+ riscv-uart-irq-witness = []
+ aarch64-pl011-irq-witness = []
+ # QEMU-SMP2: kernel-only witness; accepted and inert here so one feature list builds every image.
+diff --git a/crates/yarm-fs-servers/Cargo.toml b/crates/yarm-fs-servers/Cargo.toml
+index 7e114523..3cb1736b 100644
+--- a/crates/yarm-fs-servers/Cargo.toml
++++ b/crates/yarm-fs-servers/Cargo.toml
+@@ -56,6 +56,7 @@ ipc-displace1-witness = []
+ # FUTEX-REQUEUE1: init's live compare-and-requeue cell (selector 18); inert elsewhere.
+ futex-requeue-witness = []
+ futex-requeue-race-witness = []
++futex-wait-witness = []
+ riscv-uart-irq-witness = []
+ aarch64-pl011-irq-witness = []
+ # QEMU-SMP2: kernel-only witness; accepted and inert here so one feature list builds every image.
+diff --git a/scripts/grade-futex-wait-witness.py b/scripts/grade-futex-wait-witness.py
+new file mode 100755
+index 00000000..07977d45
+--- /dev/null
++++ b/scripts/grade-futex-wait-witness.py
+@@ -0,0 +1,249 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 Umut Deniz Balkan
++"""FUTEX-WAIT-ATOMIC1 — grade one live FutexWait witness boot.
++
++Input: the normalized serial log of a boot built with `futex-wait-witness` (kernel and init) and
++booted with `yarm.futex_requeue_witness=1`. Init's waiter thread issues FutexWait(WORD, v) for
++CALLS cycles; its signaller thread, on the other CPU, issues FutexWake(WORD, 1) in a loop, storing
++a new value first on even cycles. The kernel holds each witness wait open twice, until a wake that
++STARTED inside the window has finished:
++
++  B  after the wait decided to park, before its compare-and-register (the old gap's position)
++  A  after the registration, before the compare-and-clear of its current slot
++
++Causal order on one console: ..._WINDOW_OPEN, the waker's ..._IN_WINDOW_WAKE, ..._WINDOW_CLOSE.
++The grader requires, per window: an in-window wake from ANOTHER CPU between OPEN and CLOSE, and
++competing_wakes >= 1. Then:
++
++  B   every in-window wake woke nobody (no waiter was registered yet);
++      the word B's close read differs from `expected`  -> the wait registered NOTHING: its result is
++                                                          value_changed and it has no A window
++      the word is unchanged                            -> the wait registered: it has an A window
++  A   every in-window wake took the waiter (woke=1), and the wait's result is
++      woken_during_publication: the registered waiter was reached, and its read-back recovered it.
++
++The first B rule is what the old separated protocol breaks: it compared before B and registered
++after it without comparing again, so a B that saw a store could still register and be taken in A.
++
++A wait the kernel logs FUTEX_WAIT_WITNESS_SKIPPED (no sibling of the waiter was current on another
++CPU, so no competing wake could have arrived) opens no window and is not graded by the window
++rules; its outcome still counts below.
++
++Userspace: FWAW_DONE result=ok; every cycle 1..CALLS returned exactly once; the number of calls that
++reported `blocked=1` equals the number of waits the kernel registered (woken or parked).
++Coverage: at least two B windows that saw a store, and at least two A windows. Plus the standard
++core smoke, and no FUTEX_WAIT_BROAD_ENTRY (NR 9 never reached the broad dispatcher).
++
++Exit status 0 = sealed, 1 = not sealed.
++"""
++import argparse
++import re
++import sys
++
++FATAL = (
++    "YARM_AARCH64_TRAP_HANDLE halting",
++    "RISCV_TRAP_HANDLE_FAILED",
++    "x86 shared trap dispatch failed",
++    "FUTEX_WAKE_RESERVED_COMMIT_REFUSED",
++    "FUTEX_WAIT_BROAD_ENTRY",
++    "panicked at",
++    "KERNEL PANIC",
++)
++MIN_B_CHANGED = 2
++MIN_A = 2
++
++
++def kv(line):
++    return dict(re.findall(r"(\w+)=([^\s,]+)", line))
++
++
++def grade(lines, smp):
++    fails = []
++    fail = fails.append
++    opens, closes, wakes, results, skipped = {}, {}, [], {}, set()
++    calls, done = [], None
++    for i, l in enumerate(lines):
++        for f in FATAL:
++            if f in l:
++                fail(f"fatal marker: {l.strip()[:160]}")
++        if "FUTEX_WAIT_WITNESS_WINDOW_OPEN" in l:
++            d = kv(l); d["at"] = i; opens[d["window"]] = d
++        elif "FUTEX_WAIT_WITNESS_WINDOW_CLOSE" in l:
++            d = kv(l); d["at"] = i; closes[d["window"]] = d
++        elif "FUTEX_WAIT_WITNESS_IN_WINDOW_WAKE" in l:
++            d = kv(l); d["at"] = i; wakes.append(d)
++        elif "FUTEX_WAIT_WITNESS_SKIPPED" in l:
++            skipped.add(kv(l)["wait"])
++        elif "FUTEX_WAIT_WITNESS_RESULT" in l:
++            d = kv(l); results[d["wait"]] = d
++        elif "FWAW_CALL" in l:
++            calls.append(kv(l))
++        elif "FWAW_DONE" in l:
++            done = kv(l)
++    facts = {}
++    if done is None:
++        fail("no FWAW_DONE: the cell never finished")
++        done = {}
++    elif done.get("result") != "ok":
++        fail(f"FWAW_DONE result={done.get('result')}")
++    n = int(done.get("calls", "0") or 0)
++    cycles = [int(c["cycle"]) for c in calls if "cycle" in c]
++    if sorted(cycles) != list(range(1, n + 1)):
++        fail(f"every cycle 1..{n} must return exactly once (saw {sorted(cycles)})")
++    by_wait = {}
++    for wid, o in opens.items():
++        if o["wait"] in skipped:
++            fail(f"wait {o['wait']} was skipped but opened window {wid}")
++        by_wait.setdefault(o["wait"], {})[o["kind"]] = wid
++        c = closes.get(wid)
++        if c is None:
++            fail(f"window {wid} never closed")
++            continue
++        inside = [w for w in wakes if w["window"] == wid and o["at"] < w["at"] < c["at"]]
++        if any(w["window"] == wid and not (o["at"] < w["at"] < c["at"]) for w in wakes):
++            fail(f"window {wid}: an in-window wake is logged outside OPEN..CLOSE")
++        foreign = [w for w in inside if w["cpu"] != o["cpu"]]
++        if not foreign or int(c.get("competing_wakes", "0")) < 1:
++            fail(f"window {wid} ({o['kind']}) held no wake from another CPU")
++        if o["kind"] == "B" and any(w["woke"] != "0" for w in inside):
++            fail(f"window {wid} (B): a wake took a waiter that was not registered yet: {inside}")
++        if o["kind"] == "A" and any(w["woke"] != "1" for w in inside):
++            fail(f"window {wid} (A): a wake missed the registered waiter: {inside}")
++    b_changed = a_windows = 0
++    for wait, kinds in sorted(by_wait.items(), key=lambda kv_: int(kv_[0])):
++        r = results.get(wait, {}).get("outcome")
++        if "B" not in kinds:
++            fail(f"wait {wait}: an A window without its B window")
++            continue
++        c = closes.get(kinds["B"], {})
++        changed = c.get("word") != c.get("expected")
++        if changed:
++            b_changed += 1
++            if "A" in kinds:
++                fail(f"wait {wait}: registered although its word had changed before the "
++                     f"compare-and-register (B saw {c.get('word')} for {c.get('expected')})")
++            if r != "value_changed":
++                fail(f"wait {wait}: word changed before its registration, result {r}")
++        else:
++            if "A" not in kinds:
++                fail(f"wait {wait}: an unchanged word, but no registration window (result {r})")
++            if r != "woken_during_publication":
++                fail(f"wait {wait}: registered and woken inside A, result {r}")
++        if "A" in kinds:
++            a_windows += 1
++    registered = sum(1 for r in results.values()
++                     if r.get("outcome") in ("woken_during_publication", "parked"))
++    if done and int(done.get("blocked", "-1")) != registered:
++        fail(f"userspace saw {done.get('blocked')} blocking calls, the kernel registered {registered}")
++    if b_changed < MIN_B_CHANGED:
++        fail(f"coverage: {b_changed} B windows saw a store (need {MIN_B_CHANGED})")
++    if a_windows < MIN_A:
++        fail(f"coverage: {a_windows} A windows (need {MIN_A})")
++    wcpu = {o["cpu"] for o in opens.values()}
++    kcpu = {w["cpu"] for w in wakes}
++    facts.update(waits=len(by_wait), skipped=len(skipped), windows=len(opens), b_changed=b_changed, a=a_windows,
++                 in_window_wakes=len(wakes), waiter_cpus=",".join(sorted(wcpu)) or "none",
++                 waker_cpus=",".join(sorted(kcpu)) or "none", calls=n,
++                 returns=done.get("returns", "?"), blocked=done.get("blocked", "?"))
++    if smp > 1 and opens and not (kcpu - wcpu or wcpu - kcpu):
++        fail("every window and every waker on one CPU")
++    return fails, facts
++
++
++def core_verdict(core_rc, core_logs):
++    reasons = []
++    for path in core_logs:
++        try:
++            with open(path, encoding="utf-8", errors="replace") as fh:
++                for l in fh:
++                    t = l.strip()
++                    if (t.startswith("[fail]") or t.startswith("[error]")) and "check(s) failed" not in t \
++                            and "smoke FAILED" not in t and "witness FAILED" not in t:
++                        reasons.append(t)
++        except OSError:
++            pass
++    reasons = sorted(set(reasons))
++    return (core_rc in (None, 0)) and not reasons, reasons
++
++
++def self_test():
++    M = "0xf7a10000"
++    def wait(w, b_word, a, result, a_woke="1", b_woke="0", wcpu="0", kcpu="1"):
++        base = 10 * w
++        out = [f"FUTEX_WAIT_WITNESS_WINDOW_OPEN kind=B wait={w} window={base} cpu={wcpu} tid=7",
++               f"FUTEX_WAIT_WITNESS_IN_WINDOW_WAKE cpu={kcpu} tid=8 window={base} woke={b_woke}",
++               f"FUTEX_WAIT_WITNESS_WINDOW_CLOSE kind=B wait={w} window={base} cpu={wcpu} "
++               f"competing_wakes=1 expected={M} word={b_word}"]
++        if a:
++            out += [f"FUTEX_WAIT_WITNESS_WINDOW_OPEN kind=A wait={w} window={base + 1} cpu={wcpu} tid=7",
++                    f"FUTEX_WAIT_WITNESS_IN_WINDOW_WAKE cpu={kcpu} tid=8 window={base + 1} woke={a_woke}",
++                    f"FUTEX_WAIT_WITNESS_WINDOW_CLOSE kind=A wait={w} window={base + 1} cpu={wcpu} "
++                    f"competing_wakes=1"]
++        out.append(f"FUTEX_WAIT_WITNESS_RESULT wait={w} tid=7 outcome={result}")
++        return out
++    good = (wait(1, "0xf7a10001", False, "value_changed") + wait(2, M, True, "woken_during_publication")
++            + wait(3, "0xf7a10002", False, "value_changed") + wait(4, M, True, "woken_during_publication"))
++    good += [f"FWAW_CALL cycle={c} expected={M} blocked={1 if c in (2, 4) else 0}" for c in range(1, 5)]
++    good += ["FWAW_DONE waiter=7 signaller=8 calls=4 returns=4 blocked=2 errors=0 result=ok"]
++    f, facts = grade(good, 2)
++    assert not f, f
++    # The old separated protocol: a B that saw a store still registers and is taken in A.
++    old = (wait(1, "0xf7a10001", True, "woken_during_publication") + good[len(wait(1, "", False, "")):])
++    old = [l.replace("blocked=2 errors", "blocked=3 errors") for l in old]
++    assert any("registered although" in x for x in grade(old, 2)[0]), grade(old, 2)
++    took_b = [l.replace("window=10 woke=0", "window=10 woke=1") for l in good]
++    assert grade(took_b, 2)[0], "a B wake that took a waiter must fail"
++    missed_a = [l.replace("window=21 woke=1", "window=21 woke=0") for l in good]
++    assert grade(missed_a, 2)[0], "an A wake that missed the registered waiter must fail"
++    same = [l.replace("IN_WINDOW_WAKE cpu=1", "IN_WINDOW_WAKE cpu=0") for l in good]
++    assert grade(same, 2)[0], "a same-CPU wake is not a race"
++    dup = good + ["FWAW_CALL cycle=2 expected=0xf7a10000 blocked=1"]
++    assert grade(dup, 2)[0], "a cycle that returns twice must fail"
++    thin = [l for l in good if "wait=4" not in l and "window=4" not in l]
++    assert grade(thin, 2)[0], "coverage below the minimum must fail"
++    # A skipped wait opens no window and is not window-graded; its outcome still counts.
++    skip = good + ["FUTEX_WAIT_WITNESS_SKIPPED wait=5 cpu=0 tid=7 reason=no_peer_running",
++                   "FUTEX_WAIT_WITNESS_RESULT wait=5 tid=7 outcome=parked",
++                   f"FWAW_CALL cycle=5 expected={M} blocked=1"]
++    skip = [l.replace("calls=4 returns=4 blocked=2", "calls=5 returns=5 blocked=3") for l in skip]
++    f, facts = grade(skip, 2)
++    assert not f and facts["skipped"] == 1, (f, facts)
++    leaky = skip + ["FUTEX_WAIT_WITNESS_WINDOW_OPEN kind=B wait=5 window=50 cpu=0 tid=7"]
++    assert grade(leaky, 2)[0], "a skipped wait that opens a window must fail"
++    broad = good + ["FUTEX_WAIT_BROAD_ENTRY nr=9 tid=7 result=broad_entry"]
++    assert grade(broad, 2)[0], "a broad NR 9 must fail"
++    print("[futex-wait-grade] self-test ok")
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("log", nargs="?")
++    ap.add_argument("--arch", default="?")
++    ap.add_argument("--smp", type=int, default=2)
++    ap.add_argument("--core-rc", type=int, default=None)
++    ap.add_argument("--core-log", action="append", default=[])
++    ap.add_argument("--self-test", action="store_true")
++    a = ap.parse_args()
++    if a.self_test:
++        self_test()
++        return 0
++    with open(a.log, "rb") as fh:
++        lines = [l.decode("utf-8", "replace").rstrip("\n") for l in fh]
++    fails, facts = grade(lines, a.smp)
++    core_ok, reasons = core_verdict(a.core_rc, a.core_log)
++    for r in reasons:
++        print(f"[futex-wait-grade][core] {r}")
++    facts["witness"] = "fail" if fails else "ok"
++    facts["core_smoke"] = "ok" if core_ok else f"rejected(rc={a.core_rc})"
++    if not core_ok:
++        fails.append("the standard core smoke rejected this boot (see [core] lines)")
++    for f in fails:
++        print(f"[futex-wait-grade][fail] {f}")
++    extra = " ".join(f"{k}={v}" for k, v in facts.items())
++    print(f"FUTEX_WAIT_WITNESS_SEAL arch={a.arch} smp={a.smp} {extra} result={'fail' if fails else 'ok'}")
++    return 1 if fails else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/qemu-futex-wait-witness-smoke.sh b/scripts/qemu-futex-wait-witness-smoke.sh
+new file mode 100755
+index 00000000..1306095d
+--- /dev/null
++++ b/scripts/qemu-futex-wait-witness-smoke.sh
+@@ -0,0 +1,109 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: Apache-2.0
++#
++# FUTEX-WAIT-ATOMIC1 — the LIVE FutexWait witness, per architecture.
++#
++# Usage: scripts/qemu-futex-wait-witness-smoke.sh [x86_64|aarch64|riscv64] [smp]
++#
++# One clean boot with `yarm.futex_requeue_witness=1`, kernel and init both built with
++# `futex-wait-witness`: init's selector-18 cell then runs the wait witness instead of FUTEX-REQUEUE1's
++# rounds. A waiter thread issues FutexWait(WORD, v) for 16 cycles, each v read just before; two
++# signaller threads issue FutexWake(WORD, 1) in a loop, storing a new value first on even cycles,
++# while init blocks. The kernel holds each witness wait open before its compare-and-register (B)
++# and after it (A), each until a wake from another CPU has run inside — but only while a sibling of
++# the waiter is current on another CPU (otherwise the wait is logged SKIPPED and runs unwindowed).
++#
++# The verdict comes from scripts/grade-futex-wait-witness.py (its docstring has the rules), plus
++# the standard core smoke. Raw serial log, normalized log and grader output are kept in $LOGDIR.
++set -uo pipefail
++cd "$(dirname "$0")/.."
++
++ARCH=${1:-x86_64}
++SMP=${2:-${QEMU_SMP:-2}}
++case "$ARCH" in
++  x86_64)
++    FEATURE=x86-shared-region-direct-oracle
++    BUILD_SCRIPT=scripts/build-qemu-x86_64-artifacts.sh
++    SMOKE=scripts/qemu-x86_64-core-smoke.sh
++    INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio
++    DEST=build-x86_64/kernel_boot.elf
++    NEEDS_OBJCOPY=0
++    ;;
++  aarch64)
++    FEATURE=aarch64-shared-region-direct-oracle
++    BUILD_SCRIPT=scripts/build-qemu-aarch64-artifacts.sh
++    SMOKE=scripts/qemu-aarch64-core-smoke.sh
++    INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio
++    DEST=build-aarch64/yarm-aarch64.bin
++    NEEDS_OBJCOPY=1
++    ;;
++  riscv64)
++    FEATURE=riscv-shared-region-direct-oracle
++    BUILD_SCRIPT=scripts/build-qemu-riscv64-artifacts.sh
++    SMOKE=scripts/qemu-riscv64-core-smoke.sh
++    INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio
++    DEST=build-riscv64/yarm-riscv64.bin
++    NEEDS_OBJCOPY=1
++    ;;
++  *) echo "[futex-wait-witness][fail] unknown arch: $ARCH"; exit 1 ;;
++esac
++
++FEATURE="$FEATURE,futex-wait-witness"
++WITNESS_FEATURE=futex-requeue-witness,futex-wait-witness
++LOGDIR=${LOGDIR:-/tmp/futex-wait-witness-$ARCH-smp$SMP}
++TIMEOUT_SECS=${TIMEOUT_SECS:-240}
++SMP=${SMP:-2}
++mkdir -p "$LOGDIR"
++BOOT_LOG="$LOGDIR/boot.log"
++
++fail=0
++note() { echo "[futex-wait-witness] $*"; }
++die()  { echo "[futex-wait-witness][fail] $*"; fail=1; }
++
++if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
++  note "building base $ARCH artifacts with $WITNESS_FEATURE"
++  BOOTSTRAP_FEATURE_ARGS="--no-default-features --features $WITNESS_FEATURE" \
++    "$BUILD_SCRIPT" >"$LOGDIR/build.log" 2>&1 || die "base artifact build failed"
++
++  note "rebuilding kernel_boot with $FEATURE"
++  # BUILD-GATES1: build and publish the feature kernel with its no-FP check and provenance.
++  source scripts/lib/artifact-binding.sh
++  if (( NEEDS_OBJCOPY )); then
++    artifact_build_kernel "$ARCH" "--no-default-features --features $FEATURE" "${DEST%.bin}.elf" "$DEST" \
++      >"$LOGDIR/kbuild.log" 2>&1 || die "feature kernel build failed"
++  else
++    artifact_build_kernel "$ARCH" "--no-default-features --features $FEATURE" "$DEST" \
++      >"$LOGDIR/kbuild.log" 2>&1 || die "feature kernel build failed"
++  fi
++fi
++if (( fail )); then
++  echo "FUTEX_WAIT_WITNESS_SEAL arch=$ARCH smp=$SMP result=fail reason=build"
++  exit 1
++fi
++
++note "booting QEMU -smp $SMP with yarm.futex_requeue_witness=1"
++env \
++  KERNEL_IMAGE="$DEST" \
++  ARTIFACT_REQUIRE="kernel=$FEATURE initramfs=$WITNESS_FEATURE" \
++  INITRAMFS_IMAGE="$INITRAMFS_IMAGE" \
++  KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.futex_requeue_witness=1" \
++  QEMU_SMP="$SMP" \
++  LOGFILE="$BOOT_LOG" \
++  SMOKE_LOG="$LOGDIR/smoke.log" \
++  TIMEOUT_SECS="$TIMEOUT_SECS" \
++  YARM_MODE_ISOLATION=0 \
++  TERMINAL_IDLE_MARKER="FWAW_DONE" \
++  "$SMOKE" >"$LOGDIR/core-smoke.log" 2>&1
++core_rc=$?
++echo "$core_rc" >"$LOGDIR/core-smoke.rc"
++grep -a -m1 'ARTIFACT_BINDING' "$LOGDIR/core-smoke.log" >"$LOGDIR/artifact-binding.txt" 2>/dev/null || true
++
++[[ -s "$BOOT_LOG" ]] || { echo "FUTEX_WAIT_WITNESS_SEAL arch=$ARCH smp=$SMP result=fail reason=no_boot_log"; exit 1; }
++NORM="$LOGDIR/boot.norm.log"
++tr '\r' '\n' <"$BOOT_LOG" >"$NORM"
++sha256sum "$BOOT_LOG" "$DEST" "$INITRAMFS_IMAGE" >"$LOGDIR/sha256.txt" 2>/dev/null || true
++
++python3 -I scripts/grade-futex-wait-witness.py --self-test >/dev/null || { echo "FUTEX_WAIT_WITNESS_SEAL arch=$ARCH smp=$SMP result=fail reason=grader_self_test"; exit 1; }
++python3 -I scripts/grade-futex-wait-witness.py --arch "$ARCH" --smp "$SMP" \
++  --core-rc "$core_rc" --core-log "$LOGDIR/smoke.log" --core-log "$LOGDIR/core-smoke.log" "$NORM" | tee "$LOGDIR/grade.txt"
++exit "${PIPESTATUS[0]}"
+-- 
+2.43.0
+

@@ -1,0 +1,18 @@
+nc1 applied
+diff --git a/src/kernel/trapframe.rs b/src/kernel/trapframe.rs
+index 02faeae4..1f09ec60 100644
+--- a/src/kernel/trapframe.rs
++++ b/src/kernel/trapframe.rs
+@@ -240,10 +240,10 @@ impl TrapFrame {
+         } else {
+             (self.ret0, self.ret1, self.ret2)
+         };
+-        self.user_gprs[10] = a0;
++        self.user_gprs[10] = self.args[0];
+         self.user_gprs[11] = a1;
+         self.user_gprs[12] = a2;
+-        self.args[0] = a0;
++        let _ = a0;
+         self.args[1] = a1;
+         self.args[2] = a2;
+     }

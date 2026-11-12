@@ -1,0 +1,3 @@
+f388a2a6dce86ccd6deefe2038355384774358b93ced5bb8d89219dfe96ec55d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX8_riscv64/boot.log
+2477ac6b624a5c6c543a89383e8c6d1daaf9bfc08c9c2d2639f7d0c4ebbe18e3  build-riscv64/yarm-riscv64.bin
+f4c8511ec530679230b99e01ef701b72bed63326ca9ecc4467c101f215645e0b  build-riscv64/initramfs-core.cpio

@@ -1,0 +1,13 @@
+nc6 applied
+diff --git a/src/kernel/task.rs b/src/kernel/task.rs
+index 6b831aaf..facb07db 100644
+--- a/src/kernel/task.rs
++++ b/src/kernel/task.rs
+@@ -848,6 +848,7 @@ pub(crate) fn publish_async_preempt_snapshot(
+         tcb.user_context.arg5,
+     );
+     tcb.user_context = captured;
++    tcb.user_context.user_gprs[10] = preserved_syscall_lane.0;
+     tcb.user_context.arg0 = preserved_syscall_lane.0;
+     tcb.user_context.arg1 = preserved_syscall_lane.1;
+     tcb.user_context.arg2 = preserved_syscall_lane.2;

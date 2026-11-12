@@ -1,0 +1,14 @@
+nc10 applied
+diff --git a/src/kernel/boot/mod.rs b/src/kernel/boot/mod.rs
+index 5604923a..57e3276c 100644
+--- a/src/kernel/boot/mod.rs
++++ b/src/kernel/boot/mod.rs
+@@ -1708,6 +1708,8 @@ pub(crate) fn riscv_commit_final_park_result(
+     cpu_idx: usize,
+     frame: &mut crate::kernel::trapframe::TrapFrame,
+ ) -> bool {
++    static SETTLE: crate::kernel::lock::SpinLock<()> = crate::kernel::lock::SpinLock::new(());
++    let _global = SETTLE.lock();
+     let futex = futex_wait_dispatch_outgoing(cpu_idx);
+     let recv = d2_recv_dispatch_outgoing(cpu_idx);
+     let yielded = yield_dispatch_outgoing(cpu_idx);

@@ -1,0 +1,15 @@
+SECTION x86_64-requeue-witness .note.Xen same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .text.boot32 same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .text.boot64_thunk same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .data.boot same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .bss.bootstack same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .text.boot same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .text same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .rodata same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .data same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .bss same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .yarm_nofp_map same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .symtab same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .shstrtab same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+SECTION x86_64-requeue-witness .strtab same F=e3b0c44298fc1c14 B=e3b0c44298fc1c14
+TEXT_IDENTICAL_X86_64_REQUEUE_WITNESS

@@ -1,0 +1,3 @@
+503bb93305cae508ba1a54fb59f52cd5017028f7a6855a26fd8aeadc8cf2f51a  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/W_x86_64_smp1/boot.log
+03e57601f4340a1e83ec7a0e85ea4a0c65f98b0f2b23460ddf18527569c2a715  build-x86_64/kernel_boot.elf
+3c778dedb400ae23d73e58a620caf733e763db96864d084e49489f311e103375  build-x86_64/initramfs-core.cpio

@@ -1,0 +1,7 @@
+[futex-wait-witness] building base aarch64 artifacts with futex-requeue-witness,futex-wait-witness
+[futex-wait-witness] rebuilding kernel_boot with aarch64-shared-region-direct-oracle,futex-wait-witness
+[futex-wait-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-wait-grade][fail] line 33427: damaged witness marker: USER_LOG3 tid=10008 msg=FWAW_CALL cycle=10 expected=0xf7a10004 blocked=1
+[futex-wait-grade][fail] every cycle 1..32 must return exactly once (saw [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32])
+[futex-wait-grade][fail] cycle 11: 2 kernel waits for one call (a repeated ecall)
+FUTEX_WAIT_WITNESS_SEAL arch=aarch64 smp=2 waits=28 skipped=4 windows=43 refused=2 b_changed=13 a=13 in_window_wakes=41 waiter_cpus=1 waker_cpus=0 calls=32 returns=32 blocked=19 mismatch=13 during_publication=12 parked=6 parked_ok=6 parked_err=0 dup_or_missing=1 witness=fail core_smoke=ok result=fail

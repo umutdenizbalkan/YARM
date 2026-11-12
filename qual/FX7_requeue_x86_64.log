@@ -1,0 +1,6 @@
+[futex-requeue-witness] building base x86_64 artifacts with futex-requeue-witness
+[futex-requeue-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle
+[futex-requeue-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-requeue-grade][core] [error] SMP-LIVE: AP admission/prereq marker missing: X86_AP_KERNEL_CR3_BEGIN
+[futex-requeue-grade][fail] the standard core smoke rejected this boot (see [core] lines)
+FUTEX_REQUEUE_WITNESS_SEAL arch=x86_64 smp=2 rounds=3 broadcasts=3 census_calls=6 parks=40 park_cpus=0,1 requeuer_cpus=0 mutex_wakes=9,9,9 cross_cpu=yes witness=ok core_smoke=rejected(rc=1) result=fail

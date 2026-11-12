@@ -1,0 +1,1004 @@
++ scripts/qemu-x86_64-core-smoke.sh:17: KERNEL_IMAGE=build-x86_64/kernel_boot.elf
++ scripts/qemu-x86_64-core-smoke.sh:18: KERNEL_DEBUG_ELF=build-x86_64/kernel_boot.elf
++ scripts/qemu-x86_64-core-smoke.sh:19: INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio
++ scripts/qemu-x86_64-core-smoke.sh:20: TIMEOUT_SECS=240
++ scripts/qemu-x86_64-core-smoke.sh:21: QEMU_SMOKE_STRICT=0
++ scripts/qemu-x86_64-core-smoke.sh:22: QEMU_MACHINE=q35
++ scripts/qemu-x86_64-core-smoke.sh:23: QEMU_CPU=qemu64
++ scripts/qemu-x86_64-core-smoke.sh:24: QEMU_MEMORY=512M
++ scripts/qemu-x86_64-core-smoke.sh:32: QEMU_SMP=2
++ scripts/qemu-x86_64-core-smoke.sh:33: DEFAULT_KERNEL_CMDLINE='console=ttyS0 rdinit=/init'
++ scripts/qemu-x86_64-core-smoke.sh:34: KERNEL_CMDLINE='console=ttyS0 rdinit=/init yarm.futex_requeue_witness=1'
++ scripts/qemu-x86_64-core-smoke.sh:44: D6_SWITCH_PROOF=0
++ scripts/qemu-x86_64-core-smoke.sh:45: D6_SWITCH_A=0
++ scripts/qemu-x86_64-core-smoke.sh:46: D6_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:47: D2_RECV_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:48: D2_SEND_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:52: SCHED_TIMEOUT=0
++ scripts/qemu-x86_64-core-smoke.sh:53: VM_COW=0
++ scripts/qemu-x86_64-core-smoke.sh:54: CAP_CNODE=0
++ scripts/qemu-x86_64-core-smoke.sh:55: TERMINAL_FAULT_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:56: TERMINAL_FAULT_FETCH_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:57: TERMINAL_FAULT_WAITER_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:59: TERMINAL_FAULT_PORTIO_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:60: FAULT_DELIVERY=0
++ scripts/qemu-x86_64-core-smoke.sh:61: SPAWN_LIFECYCLE=0
++ scripts/qemu-x86_64-core-smoke.sh:62: GLOBAL_STATE=0
++ scripts/qemu-x86_64-core-smoke.sh:63: SMP_READY=0
++ scripts/qemu-x86_64-core-smoke.sh:64: CROSS_ARCH_D6=0
++ scripts/qemu-x86_64-core-smoke.sh:65: D3_FULL=0
++ scripts/qemu-x86_64-core-smoke.sh:69: UNLOCK_GRADUATED=
++ scripts/qemu-x86_64-core-smoke.sh:70: YARM_MODE_ISOLATION=0
++ scripts/qemu-x86_64-core-smoke.sh:71: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:88: echo '[info] mode isolation: D6_SWITCH_PROOF=0 D6_SWITCH_A=0 D6_GENUINE=0 D2_RECV_GENUINE=0 D2_SEND_GENUINE=0 SCHED_TIMEOUT=0 VM_COW=0 CAP_CNODE=0 FAULT_DELIVERY=0 SPAWN_LIFECYCLE=0 GLOBAL_STATE=0 SMP_READY=0 CROSS_ARCH_D6=0 D3_FULL=0 UNLOCK_GRADUATED=<default>'
++ scripts/qemu-x86_64-core-smoke.sh:93: SMP_READY_CPUS=2
++ scripts/qemu-x86_64-core-smoke.sh:94: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:98: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:103: D6_SWITCH_A=0
++ scripts/qemu-x86_64-core-smoke.sh:110: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:118: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:127: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:132: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:135: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:145: D6_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:146: D2_RECV_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:151: D2_SEND_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:152: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:160: SCHED_TIMEOUT=0
++ scripts/qemu-x86_64-core-smoke.sh:161: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:172: VM_COW=0
++ scripts/qemu-x86_64-core-smoke.sh:173: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:187: CAP_CNODE=0
++ scripts/qemu-x86_64-core-smoke.sh:188: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:198: FAULT_DELIVERY=0
++ scripts/qemu-x86_64-core-smoke.sh:199: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:209: SPAWN_LIFECYCLE=0
++ scripts/qemu-x86_64-core-smoke.sh:210: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:218: GLOBAL_STATE=0
++ scripts/qemu-x86_64-core-smoke.sh:219: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:226: SMP_READY=0
++ scripts/qemu-x86_64-core-smoke.sh:227: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:235: CROSS_ARCH_D6=0
++ scripts/qemu-x86_64-core-smoke.sh:236: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:243: D3_FULL=0
++ scripts/qemu-x86_64-core-smoke.sh:244: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:254: UNLOCK_GRADUATED=
++ scripts/qemu-x86_64-core-smoke.sh:255: [[ -n '' ]]
++ scripts/qemu-x86_64-core-smoke.sh:261: IPC_RECV_PROOF=0
++ scripts/qemu-x86_64-core-smoke.sh:262: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:267: IPC_RECV_PROOF_SENDER_WAKE=0
++ scripts/qemu-x86_64-core-smoke.sh:268: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:274: IPC_SEND_PLAIN_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:275: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:281: IPC_SEND_CAP_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:282: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:289: IPC_SEND_REPLY_CAP_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:290: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:296: IPC_SEND_ENQUEUE_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:297: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:303: IPC_SEND_CAP_ENQUEUE_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:304: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:311: X86_FUTEX_WAKE_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:312: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:316: [[ console=ttyS0 rdinit=/init yarm.futex_requeue_witness=1 != *\c\o\n\s\o\l\e\=* ]]
++ scripts/qemu-x86_64-core-smoke.sh:316: [[ 55 -lt 12 ]]
++ scripts/qemu-x86_64-core-smoke.sh:326: [[ ! -f build-x86_64/kernel_boot.elf ]]
++ scripts/qemu-x86_64-core-smoke.sh:333: [[ ! -f build-x86_64/initramfs-core.cpio ]]
++ scripts/qemu-x86_64-core-smoke.sh:340: command -v qemu-system-x86_64
+++ scripts/qemu-x86_64-core-smoke.sh:351: dirname scripts/qemu-x86_64-core-smoke.sh
++ scripts/qemu-x86_64-core-smoke.sh:351: source scripts/lib/artifact-binding.sh
++ scripts/qemu-x86_64-core-smoke.sh:352: artifact_required=()
++ scripts/qemu-x86_64-core-smoke.sh:353: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:359: artifact_required+=(${ARTIFACT_REQUIRE:-})
++ scripts/qemu-x86_64-core-smoke.sh:360: artifact_binding_check x86_64 0 build-x86_64/kernel_boot.elf build-x86_64/initramfs-core.cpio kernel=x86-shared-region-direct-oracle initramfs=futex-requeue-witness
++ scripts/lib/artifact-binding.sh:151: local arch=x86_64 _strict=0 kernel=build-x86_64/kernel_boot.elf initramfs=build-x86_64/initramfs-core.cpio
++ scripts/lib/artifact-binding.sh:152: shift 4
++ scripts/lib/artifact-binding.sh:153: artifact_boot_guard x86_64 build-x86_64/kernel_boot.elf build-x86_64/initramfs-core.cpio kernel=x86-shared-region-direct-oracle initramfs=futex-requeue-witness
++ scripts/lib/artifact-binding.sh:142: local arch=x86_64 kernel=build-x86_64/kernel_boot.elf initramfs=build-x86_64/initramfs-core.cpio
++ scripts/lib/artifact-binding.sh:143: shift 3
++ scripts/lib/artifact-binding.sh:144: req=()
++ scripts/lib/artifact-binding.sh:144: local -a req
++ scripts/lib/artifact-binding.sh:145: local r
++ scripts/lib/artifact-binding.sh:146: for r in "$@"
++ scripts/lib/artifact-binding.sh:146: req+=(--require "$r")
++ scripts/lib/artifact-binding.sh:146: for r in "$@"
++ scripts/lib/artifact-binding.sh:146: req+=(--require "$r")
++ scripts/lib/artifact-binding.sh:147: _ab_py verify --arch x86_64 --kernel build-x86_64/kernel_boot.elf --initramfs build-x86_64/initramfs-core.cpio --require kernel=x86-shared-region-direct-oracle --require initramfs=futex-requeue-witness
+++ scripts/lib/artifact-binding.sh:34: _ab_repo
++++ scripts/lib/artifact-binding.sh:33: dirname scripts/lib/artifact-binding.sh
+++ scripts/lib/artifact-binding.sh:33: cd scripts/lib/../..
+++ scripts/lib/artifact-binding.sh:33: pwd
++ scripts/lib/artifact-binding.sh:34: python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-wt/scripts/artifact-provenance.py verify --arch x86_64 --kernel build-x86_64/kernel_boot.elf --initramfs build-x86_64/initramfs-core.cpio --require kernel=x86-shared-region-direct-oracle --require initramfs=futex-requeue-witness
++ scripts/qemu-x86_64-core-smoke.sh:391: check_x86_kernel_bootability build-x86_64/kernel_boot.elf
++ scripts/qemu-x86_64-core-smoke.sh:366: local kernel=build-x86_64/kernel_boot.elf
++ scripts/qemu-x86_64-core-smoke.sh:367: [[ ! -f build-x86_64/kernel_boot.elf ]]
++ scripts/qemu-x86_64-core-smoke.sh:370: command -v readelf
++ scripts/qemu-x86_64-core-smoke.sh:372: readelf -l build-x86_64/kernel_boot.elf
++ scripts/qemu-x86_64-core-smoke.sh:372: rg -q NOTE
++ scripts/qemu-x86_64-core-smoke.sh:377: readelf -n build-x86_64/kernel_boot.elf
++ scripts/qemu-x86_64-core-smoke.sh:377: rg -qi '(PVH|Xen)'
++ scripts/qemu-x86_64-core-smoke.sh:378: return 0
++ scripts/qemu-x86_64-core-smoke.sh:397: LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
++ scripts/qemu-x86_64-core-smoke.sh:398: rm -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
++ scripts/qemu-x86_64-core-smoke.sh:418: QEMU_CMD=(qemu-system-x86_64 -machine "$QEMU_MACHINE" -cpu "$QEMU_CPU" -m "$QEMU_MEMORY" -smp "$QEMU_SMP" -nographic -monitor none -serial stdio -no-reboot -no-shutdown -kernel "$KERNEL_IMAGE" -initrd "$INITRAMFS_IMAGE" -append "$KERNEL_CMDLINE")
++ scripts/qemu-x86_64-core-smoke.sh:420: echo '[info] qemu command: qemu-system-x86_64 -machine q35 -cpu qemu64 -m 512M -smp 2 -nographic -monitor none -serial stdio -no-reboot -no-shutdown -kernel build-x86_64/kernel_boot.elf -initrd build-x86_64/initramfs-core.cpio -append console=ttyS0 rdinit=/init yarm.futex_requeue_witness=1'
++ scripts/qemu-x86_64-core-smoke.sh:421: echo '[info] waiting up to 240s for boot markers...'
++ scripts/qemu-x86_64-core-smoke.sh:426: set +e
++ scripts/qemu-x86_64-core-smoke.sh:427: command -v timeout
++ scripts/qemu-x86_64-core-smoke.sh:428: timeout --foreground 240s stdbuf -oL -eL qemu-system-x86_64 -machine q35 -cpu qemu64 -m 512M -smp 2 -nographic -monitor none -serial stdio -no-reboot -no-shutdown -kernel build-x86_64/kernel_boot.elf -initrd build-x86_64/initramfs-core.cpio -append 'console=ttyS0 rdinit=/init yarm.futex_requeue_witness=1'
++ scripts/qemu-x86_64-core-smoke.sh:428: tee /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
++ scripts/qemu-x86_64-core-smoke.sh:429: QEMU_STATUS=124
++ scripts/qemu-x86_64-core-smoke.sh:435: set -e
++ scripts/qemu-x86_64-core-smoke.sh:462: HARD_BLOCKER_PATTERNS=("YARM_SUPERVISOR_ELF_MISSING" "YARM_PM_ELF_MISSING" "BOOTSTRAP_ERROR" "PM_PANIC" "INIT_PANIC" "^PANIC " "D2_PUBLISH_RACE_UNWIND")
++ scripts/qemu-x86_64-core-smoke.sh:464: hard_blocker_found=0
++ scripts/qemu-x86_64-core-smoke.sh:465: for blocker in "${HARD_BLOCKER_PATTERNS[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:466: log_has_pattern YARM_SUPERVISOR_ELF_MISSING
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=YARM_SUPERVISOR_ELF_MISSING
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n YARM_SUPERVISOR_ELF_MISSING
++ scripts/qemu-x86_64-core-smoke.sh:465: for blocker in "${HARD_BLOCKER_PATTERNS[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:466: log_has_pattern YARM_PM_ELF_MISSING
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=YARM_PM_ELF_MISSING
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n YARM_PM_ELF_MISSING
++ scripts/qemu-x86_64-core-smoke.sh:465: for blocker in "${HARD_BLOCKER_PATTERNS[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:466: log_has_pattern BOOTSTRAP_ERROR
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=BOOTSTRAP_ERROR
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n BOOTSTRAP_ERROR
++ scripts/qemu-x86_64-core-smoke.sh:465: for blocker in "${HARD_BLOCKER_PATTERNS[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:466: log_has_pattern PM_PANIC
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=PM_PANIC
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n PM_PANIC
++ scripts/qemu-x86_64-core-smoke.sh:465: for blocker in "${HARD_BLOCKER_PATTERNS[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:466: log_has_pattern INIT_PANIC
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=INIT_PANIC
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n INIT_PANIC
++ scripts/qemu-x86_64-core-smoke.sh:465: for blocker in "${HARD_BLOCKER_PATTERNS[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:466: log_has_pattern '^PANIC '
++ scripts/qemu-x86_64-core-smoke.sh:438: local 'pattern=^PANIC '
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n '^PANIC '
++ scripts/qemu-x86_64-core-smoke.sh:465: for blocker in "${HARD_BLOCKER_PATTERNS[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:466: log_has_pattern D2_PUBLISH_RACE_UNWIND
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=D2_PUBLISH_RACE_UNWIND
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n D2_PUBLISH_RACE_UNWIND
++ scripts/qemu-x86_64-core-smoke.sh:472: [[ 0 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:489: KERNEL_BOOT_SEQUENCE=("YARM_BOOT_PVH_START_INFO" "YARM_BOOT_OK" "YARM_SUPERVISOR_TID2_SPAWNED" "YARM_PM_TID3_SPAWNED")
++ scripts/qemu-x86_64-core-smoke.sh:491: FIRMWARE_FALLBACK_REGEX='SeaBIOS|iPXE|Booting from ROM'
++ scripts/qemu-x86_64-core-smoke.sh:493: log_has_pattern 'SeaBIOS|iPXE|Booting from ROM'
++ scripts/qemu-x86_64-core-smoke.sh:438: local 'pattern=SeaBIOS|iPXE|Booting from ROM'
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n 'SeaBIOS|iPXE|Booting from ROM'
++ scripts/qemu-x86_64-core-smoke.sh:493: log_has_pattern YARM_BOOT_PVH_START_INFO
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=YARM_BOOT_PVH_START_INFO
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n YARM_BOOT_PVH_START_INFO
++ scripts/qemu-x86_64-core-smoke.sh:504: log_has_pattern YARM_BOOT_PVH_START_INFO
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=YARM_BOOT_PVH_START_INFO
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n YARM_BOOT_PVH_START_INFO
++ scripts/qemu-x86_64-core-smoke.sh:517: check_log_sequence /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log YARM_BOOT_PVH_START_INFO YARM_BOOT_OK YARM_SUPERVISOR_TID2_SPAWNED YARM_PM_TID3_SPAWNED
++ scripts/qemu-smoke-common.sh:101: local logfile=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
++ scripts/qemu-smoke-common.sh:102: shift
++ scripts/qemu-smoke-common.sh:103: local last_line=0
++ scripts/qemu-smoke-common.sh:104: local pattern=
++ scripts/qemu-smoke-common.sh:105: local line=0
++ scripts/qemu-smoke-common.sh:106: for pattern in "$@"
+++ scripts/qemu-smoke-common.sh:107: rg -n -m 1 YARM_BOOT_PVH_START_INFO /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
+++ scripts/qemu-smoke-common.sh:107: cut -d: -f1
+++ scripts/qemu-smoke-common.sh:107: head -n1
++ scripts/qemu-smoke-common.sh:107: line=16
++ scripts/qemu-smoke-common.sh:108: [[ -z 16 ]]
++ scripts/qemu-smoke-common.sh:111: ((  line <= last_line  ))
++ scripts/qemu-smoke-common.sh:114: last_line=16
++ scripts/qemu-smoke-common.sh:106: for pattern in "$@"
+++ scripts/qemu-smoke-common.sh:107: rg -n -m 1 YARM_BOOT_OK /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
+++ scripts/qemu-smoke-common.sh:107: cut -d: -f1
+++ scripts/qemu-smoke-common.sh:107: head -n1
++ scripts/qemu-smoke-common.sh:107: line=122
++ scripts/qemu-smoke-common.sh:108: [[ -z 122 ]]
++ scripts/qemu-smoke-common.sh:111: ((  line <= last_line  ))
++ scripts/qemu-smoke-common.sh:114: last_line=122
++ scripts/qemu-smoke-common.sh:106: for pattern in "$@"
+++ scripts/qemu-smoke-common.sh:107: rg -n -m 1 YARM_SUPERVISOR_TID2_SPAWNED /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
+++ scripts/qemu-smoke-common.sh:107: cut -d: -f1
+++ scripts/qemu-smoke-common.sh:107: head -n1
++ scripts/qemu-smoke-common.sh:107: line=600
++ scripts/qemu-smoke-common.sh:108: [[ -z 600 ]]
++ scripts/qemu-smoke-common.sh:111: ((  line <= last_line  ))
++ scripts/qemu-smoke-common.sh:114: last_line=600
++ scripts/qemu-smoke-common.sh:106: for pattern in "$@"
+++ scripts/qemu-smoke-common.sh:107: rg -n -m 1 YARM_PM_TID3_SPAWNED /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
+++ scripts/qemu-smoke-common.sh:107: cut -d: -f1
+++ scripts/qemu-smoke-common.sh:107: head -n1
++ scripts/qemu-smoke-common.sh:107: line=676
++ scripts/qemu-smoke-common.sh:108: [[ -z 676 ]]
++ scripts/qemu-smoke-common.sh:111: ((  line <= last_line  ))
++ scripts/qemu-smoke-common.sh:114: last_line=676
++ scripts/qemu-smoke-common.sh:116: return 0
++ scripts/qemu-x86_64-core-smoke.sh:530: SPAWN_IPC_SEQUENCE=("YARM_PM_RECV_LOOP_START" "INIT_SPAWN_V5_CALL_BEGIN" "INIT_SPAWN_V5_REPLY_RECV_OK")
++ scripts/qemu-x86_64-core-smoke.sh:531: check_log_sequence /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log YARM_PM_RECV_LOOP_START INIT_SPAWN_V5_CALL_BEGIN INIT_SPAWN_V5_REPLY_RECV_OK
++ scripts/qemu-smoke-common.sh:101: local logfile=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
++ scripts/qemu-smoke-common.sh:102: shift
++ scripts/qemu-smoke-common.sh:103: local last_line=0
++ scripts/qemu-smoke-common.sh:104: local pattern=
++ scripts/qemu-smoke-common.sh:105: local line=0
++ scripts/qemu-smoke-common.sh:106: for pattern in "$@"
+++ scripts/qemu-smoke-common.sh:107: rg -n -m 1 YARM_PM_RECV_LOOP_START /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log
+++ scripts/qemu-smoke-common.sh:107: cut -d: -f1
+++ scripts/qemu-smoke-common.sh:107: head -n1
+++ scripts/qemu-smoke-common.sh:107: true
++ scripts/qemu-smoke-common.sh:107: line=
++ scripts/qemu-smoke-common.sh:108: [[ -z '' ]]
++ scripts/qemu-smoke-common.sh:109: return 1
++ scripts/qemu-x86_64-core-smoke.sh:532: echo '[warn] PM/init IPC sequence absent (user_log! is a no-op in no_std; expected in hosted-dev)'
++ scripts/qemu-x86_64-core-smoke.sh:539: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:540: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:540: rg -a -c 'YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=x86_64 shared=1 raw=0'
++ scripts/qemu-x86_64-core-smoke.sh:540: STAGE2N_INSTALLED=1
+++ scripts/qemu-x86_64-core-smoke.sh:541: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:541: rg -a -c 'YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64'
++ scripts/qemu-x86_64-core-smoke.sh:541: STAGE2N_FIRST=1
+++ scripts/qemu-x86_64-core-smoke.sh:542: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:542: rg -a -c 'YARM_LOCK_SPLIT_STAGE2N_FALLBACK arch=x86_64'
+++ scripts/qemu-x86_64-core-smoke.sh:542: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:542: STAGE2N_FALLBACK=0
++ scripts/qemu-x86_64-core-smoke.sh:543: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:544: echo '[ok] Stage2N: x86_64 installed shared trap state count=1'
++ scripts/qemu-x86_64-core-smoke.sh:549: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:550: echo '[ok] Stage2N: x86_64 first shared trap count=1'
++ scripts/qemu-x86_64-core-smoke.sh:555: [[ 0 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:556: echo '[ok] Stage2N: x86_64 fallback count=0'
+++ scripts/qemu-x86_64-core-smoke.sh:561: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:561: rg -a -c YARM_LOCK_SPLIT_CURRENT_TID_MISMATCH
+++ scripts/qemu-x86_64-core-smoke.sh:561: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:561: TID_MISMATCH=0
++ scripts/qemu-x86_64-core-smoke.sh:562: [[ 0 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:563: echo '[ok] L5B: x86_64 current-TID split-read mismatch count=0'
++ scripts/qemu-x86_64-core-smoke.sh:568: [[ 0 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:591: svc_expected=1
++ scripts/qemu-x86_64-core-smoke.sh:592: svc_enforce=0
++ scripts/qemu-x86_64-core-smoke.sh:593: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:593: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:608: declare -A REQUIRED_SERVICE_ENTRIES
++ scripts/qemu-x86_64-core-smoke.sh:619: REQUIRED_SERVICE_ENTRIES=([INITRAMFS_SRV_ENTRY]=$svc_expected [DEVFS_SRV_ENTRY]=$svc_expected [VFS_SRV_ENTRY]=$svc_expected [DRIVER_MANAGER_ENTRY]=$svc_expected [BLKCACHE_SRV_ENTRY]=$svc_expected [VIRTIO_BLK_SRV_ENTRY]=$svc_expected [DRIVER_MANAGER_READY]=$svc_expected [BLKCACHE_SRV_READY]=$svc_expected [VIRTIO_BLK_SRV_READY]=$svc_expected)
++ scripts/qemu-x86_64-core-smoke.sh:621: service_count_fail=0
++ scripts/qemu-x86_64-core-smoke.sh:622: for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:623: expected=1
+++ scripts/qemu-x86_64-core-smoke.sh:624: log_count_pattern INITRAMFS_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INITRAMFS_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINITRAMFS_SRV_ENTRY\b'
++ scripts/qemu-x86_64-core-smoke.sh:624: actual=1
++ scripts/qemu-x86_64-core-smoke.sh:625: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:626: echo '[ok] service entry count: INITRAMFS_SRV_ENTRY=1'
++ scripts/qemu-x86_64-core-smoke.sh:622: for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:623: expected=1
+++ scripts/qemu-x86_64-core-smoke.sh:624: log_count_pattern BLKCACHE_SRV_READY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=BLKCACHE_SRV_READY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bBLKCACHE_SRV_READY\b'
++ scripts/qemu-x86_64-core-smoke.sh:624: actual=1
++ scripts/qemu-x86_64-core-smoke.sh:625: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:626: echo '[ok] service entry count: BLKCACHE_SRV_READY=1'
++ scripts/qemu-x86_64-core-smoke.sh:622: for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:623: expected=1
+++ scripts/qemu-x86_64-core-smoke.sh:624: log_count_pattern DEVFS_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=DEVFS_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bDEVFS_SRV_ENTRY\b'
++ scripts/qemu-x86_64-core-smoke.sh:624: actual=1
++ scripts/qemu-x86_64-core-smoke.sh:625: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:626: echo '[ok] service entry count: DEVFS_SRV_ENTRY=1'
++ scripts/qemu-x86_64-core-smoke.sh:622: for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:623: expected=1
+++ scripts/qemu-x86_64-core-smoke.sh:624: log_count_pattern VFS_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=VFS_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bVFS_SRV_ENTRY\b'
++ scripts/qemu-x86_64-core-smoke.sh:624: actual=1
++ scripts/qemu-x86_64-core-smoke.sh:625: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:626: echo '[ok] service entry count: VFS_SRV_ENTRY=1'
++ scripts/qemu-x86_64-core-smoke.sh:622: for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:623: expected=1
+++ scripts/qemu-x86_64-core-smoke.sh:624: log_count_pattern VIRTIO_BLK_SRV_READY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=VIRTIO_BLK_SRV_READY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bVIRTIO_BLK_SRV_READY\b'
++ scripts/qemu-x86_64-core-smoke.sh:624: actual=1
++ scripts/qemu-x86_64-core-smoke.sh:625: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:626: echo '[ok] service entry count: VIRTIO_BLK_SRV_READY=1'
++ scripts/qemu-x86_64-core-smoke.sh:622: for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:623: expected=1
+++ scripts/qemu-x86_64-core-smoke.sh:624: log_count_pattern BLKCACHE_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=BLKCACHE_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bBLKCACHE_SRV_ENTRY\b'
++ scripts/qemu-x86_64-core-smoke.sh:624: actual=1
++ scripts/qemu-x86_64-core-smoke.sh:625: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:626: echo '[ok] service entry count: BLKCACHE_SRV_ENTRY=1'
++ scripts/qemu-x86_64-core-smoke.sh:622: for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:623: expected=1
+++ scripts/qemu-x86_64-core-smoke.sh:624: log_count_pattern VIRTIO_BLK_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=VIRTIO_BLK_SRV_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bVIRTIO_BLK_SRV_ENTRY\b'
++ scripts/qemu-x86_64-core-smoke.sh:624: actual=1
++ scripts/qemu-x86_64-core-smoke.sh:625: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:626: echo '[ok] service entry count: VIRTIO_BLK_SRV_ENTRY=1'
++ scripts/qemu-x86_64-core-smoke.sh:622: for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:623: expected=1
+++ scripts/qemu-x86_64-core-smoke.sh:624: log_count_pattern DRIVER_MANAGER_READY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=DRIVER_MANAGER_READY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bDRIVER_MANAGER_READY\b'
++ scripts/qemu-x86_64-core-smoke.sh:624: actual=1
++ scripts/qemu-x86_64-core-smoke.sh:625: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:626: echo '[ok] service entry count: DRIVER_MANAGER_READY=1'
++ scripts/qemu-x86_64-core-smoke.sh:622: for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"
++ scripts/qemu-x86_64-core-smoke.sh:623: expected=1
+++ scripts/qemu-x86_64-core-smoke.sh:624: log_count_pattern DRIVER_MANAGER_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=DRIVER_MANAGER_ENTRY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bDRIVER_MANAGER_ENTRY\b'
++ scripts/qemu-x86_64-core-smoke.sh:624: actual=1
++ scripts/qemu-x86_64-core-smoke.sh:625: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:626: echo '[ok] service entry count: DRIVER_MANAGER_ENTRY=1'
++ scripts/qemu-x86_64-core-smoke.sh:639: [[ 0 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:653: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:654: phase3b_fail=0
++ scripts/qemu-x86_64-core-smoke.sh:658: for img_id in 7 8 9
+++ scripts/qemu-x86_64-core-smoke.sh:659: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:659: rg -a -c 'PM_ELF_ZC_DONE image_id=7\b'
++ scripts/qemu-x86_64-core-smoke.sh:659: zc_count=1
+++ scripts/qemu-x86_64-core-smoke.sh:660: rg -a -c 'PM_ELF_ZC_DONE image_id=7\b.*zc_pages=[1-9]'
+++ scripts/qemu-x86_64-core-smoke.sh:660: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:660: zc_nonzero=1
++ scripts/qemu-x86_64-core-smoke.sh:661: [[ 1 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:663: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:663: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:663: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:664: echo '[ok] Phase 3B: PM_ELF_ZC_DONE image_id=7 count=1 zc_pages>0'
++ scripts/qemu-x86_64-core-smoke.sh:658: for img_id in 7 8 9
+++ scripts/qemu-x86_64-core-smoke.sh:659: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:659: rg -a -c 'PM_ELF_ZC_DONE image_id=8\b'
++ scripts/qemu-x86_64-core-smoke.sh:659: zc_count=1
+++ scripts/qemu-x86_64-core-smoke.sh:660: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:660: rg -a -c 'PM_ELF_ZC_DONE image_id=8\b.*zc_pages=[1-9]'
++ scripts/qemu-x86_64-core-smoke.sh:660: zc_nonzero=1
++ scripts/qemu-x86_64-core-smoke.sh:661: [[ 1 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:663: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:663: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:663: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:664: echo '[ok] Phase 3B: PM_ELF_ZC_DONE image_id=8 count=1 zc_pages>0'
++ scripts/qemu-x86_64-core-smoke.sh:658: for img_id in 7 8 9
+++ scripts/qemu-x86_64-core-smoke.sh:659: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:659: rg -a -c 'PM_ELF_ZC_DONE image_id=9\b'
++ scripts/qemu-x86_64-core-smoke.sh:659: zc_count=1
+++ scripts/qemu-x86_64-core-smoke.sh:660: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:660: rg -a -c 'PM_ELF_ZC_DONE image_id=9\b.*zc_pages=[1-9]'
++ scripts/qemu-x86_64-core-smoke.sh:660: zc_nonzero=1
++ scripts/qemu-x86_64-core-smoke.sh:661: [[ 1 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:663: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:663: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:663: [[ 1 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:664: echo '[ok] Phase 3B: PM_ELF_ZC_DONE image_id=9 count=1 zc_pages>0'
+++ scripts/qemu-x86_64-core-smoke.sh:675: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:675: rg -a -c PM_ELF_ZC_FAIL
+++ scripts/qemu-x86_64-core-smoke.sh:675: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:675: ZC_FAIL_TOTAL=0
++ scripts/qemu-x86_64-core-smoke.sh:676: [[ 0 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:677: echo '[ok] Phase 3B: PM_ELF_ZC_FAIL count=0'
++ scripts/qemu-x86_64-core-smoke.sh:684: for img_id in 7 8 9
+++ scripts/qemu-x86_64-core-smoke.sh:685: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:685: rg -a -c 'PM_VFS_READ_BULK_DONE image_id=7\b'
+++ scripts/qemu-x86_64-core-smoke.sh:685: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:685: bulk_done=0
++ scripts/qemu-x86_64-core-smoke.sh:686: [[ 0 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:687: echo '[ok] Phase 3B: PM_VFS_READ_BULK_DONE image_id=7 count=0 (ZC path active)'
++ scripts/qemu-x86_64-core-smoke.sh:684: for img_id in 7 8 9
+++ scripts/qemu-x86_64-core-smoke.sh:685: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:685: rg -a -c 'PM_VFS_READ_BULK_DONE image_id=8\b'
+++ scripts/qemu-x86_64-core-smoke.sh:685: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:685: bulk_done=0
++ scripts/qemu-x86_64-core-smoke.sh:686: [[ 0 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:687: echo '[ok] Phase 3B: PM_VFS_READ_BULK_DONE image_id=8 count=0 (ZC path active)'
++ scripts/qemu-x86_64-core-smoke.sh:684: for img_id in 7 8 9
+++ scripts/qemu-x86_64-core-smoke.sh:685: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:685: rg -a -c 'PM_VFS_READ_BULK_DONE image_id=9\b'
+++ scripts/qemu-x86_64-core-smoke.sh:685: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:685: bulk_done=0
++ scripts/qemu-x86_64-core-smoke.sh:686: [[ 0 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:687: echo '[ok] Phase 3B: PM_VFS_READ_BULK_DONE image_id=9 count=0 (ZC path active)'
+++ scripts/qemu-x86_64-core-smoke.sh:695: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:695: rg -a -c PM_VFS_READ_BULK_PHASE2A_BEGIN
+++ scripts/qemu-x86_64-core-smoke.sh:695: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:695: PHASE2A_COUNT=0
++ scripts/qemu-x86_64-core-smoke.sh:696: [[ 0 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:697: echo '[ok] Phase 3B: PM_VFS_READ_BULK_PHASE2A_BEGIN count=0'
+++ scripts/qemu-x86_64-core-smoke.sh:704: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:704: rg -a -c PM_ELF_ZC_DONE
++ scripts/qemu-x86_64-core-smoke.sh:704: ZC_DONE_TOTAL=5
+++ scripts/qemu-x86_64-core-smoke.sh:705: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:705: rg -a -c 'PM_ELF_ZC_DONE.*zc_pages=[1-9]'
++ scripts/qemu-x86_64-core-smoke.sh:705: ZC_NONZERO_TOTAL=5
++ scripts/qemu-x86_64-core-smoke.sh:706: echo '[ok] Phase 3B summary: PM_ELF_ZC_DONE total=5 zc_pages>0 count=5'
++ scripts/qemu-x86_64-core-smoke.sh:708: [[ 0 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:717: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:831: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:832: FAT_SMOKE_EXPECTED=0
++ scripts/qemu-x86_64-core-smoke.sh:843: FAT_MARKERS=(INIT_FAT_SPAWN_BEGIN INIT_FAT_SPAWN_SKIPPED INIT_FAT_SPAWN_OK PM_IMAGE_ID_10_FAT_SRV FAT_CONFIG_FOUND FAT_BLOCK_BACKEND_STARTUP_CAP FAT_MOUNT_READY FAT_MOUNT_FAILED VFS_MOUNT_REGISTER_FAT_OK)
++ scripts/qemu-x86_64-core-smoke.sh:844: fat_seen=0
++ scripts/qemu-x86_64-core-smoke.sh:845: for marker in "${FAT_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:846: log_count_pattern INIT_FAT_SPAWN_BEGIN
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INIT_FAT_SPAWN_BEGIN
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINIT_FAT_SPAWN_BEGIN\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:846: count=0
++ scripts/qemu-x86_64-core-smoke.sh:847: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:850: echo '[info] FAT smoke marker count: INIT_FAT_SPAWN_BEGIN=0'
++ scripts/qemu-x86_64-core-smoke.sh:845: for marker in "${FAT_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:846: log_count_pattern INIT_FAT_SPAWN_SKIPPED
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INIT_FAT_SPAWN_SKIPPED
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINIT_FAT_SPAWN_SKIPPED\b'
++ scripts/qemu-x86_64-core-smoke.sh:846: count=1
++ scripts/qemu-x86_64-core-smoke.sh:847: [[ 1 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:848: fat_seen=1
++ scripts/qemu-x86_64-core-smoke.sh:850: echo '[info] FAT smoke marker count: INIT_FAT_SPAWN_SKIPPED=1'
++ scripts/qemu-x86_64-core-smoke.sh:845: for marker in "${FAT_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:846: log_count_pattern INIT_FAT_SPAWN_OK
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INIT_FAT_SPAWN_OK
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINIT_FAT_SPAWN_OK\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:846: count=0
++ scripts/qemu-x86_64-core-smoke.sh:847: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:850: echo '[info] FAT smoke marker count: INIT_FAT_SPAWN_OK=0'
++ scripts/qemu-x86_64-core-smoke.sh:845: for marker in "${FAT_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:846: log_count_pattern PM_IMAGE_ID_10_FAT_SRV
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=PM_IMAGE_ID_10_FAT_SRV
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bPM_IMAGE_ID_10_FAT_SRV\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:846: count=0
++ scripts/qemu-x86_64-core-smoke.sh:847: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:850: echo '[info] FAT smoke marker count: PM_IMAGE_ID_10_FAT_SRV=0'
++ scripts/qemu-x86_64-core-smoke.sh:845: for marker in "${FAT_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:846: log_count_pattern FAT_CONFIG_FOUND
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=FAT_CONFIG_FOUND
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bFAT_CONFIG_FOUND\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:846: count=0
++ scripts/qemu-x86_64-core-smoke.sh:847: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:850: echo '[info] FAT smoke marker count: FAT_CONFIG_FOUND=0'
++ scripts/qemu-x86_64-core-smoke.sh:845: for marker in "${FAT_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:846: log_count_pattern FAT_BLOCK_BACKEND_STARTUP_CAP
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=FAT_BLOCK_BACKEND_STARTUP_CAP
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bFAT_BLOCK_BACKEND_STARTUP_CAP\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:846: count=0
++ scripts/qemu-x86_64-core-smoke.sh:847: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:850: echo '[info] FAT smoke marker count: FAT_BLOCK_BACKEND_STARTUP_CAP=0'
++ scripts/qemu-x86_64-core-smoke.sh:845: for marker in "${FAT_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:846: log_count_pattern FAT_MOUNT_READY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=FAT_MOUNT_READY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bFAT_MOUNT_READY\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:846: count=0
++ scripts/qemu-x86_64-core-smoke.sh:847: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:850: echo '[info] FAT smoke marker count: FAT_MOUNT_READY=0'
++ scripts/qemu-x86_64-core-smoke.sh:845: for marker in "${FAT_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:846: log_count_pattern FAT_MOUNT_FAILED
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=FAT_MOUNT_FAILED
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bFAT_MOUNT_FAILED\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:846: count=0
++ scripts/qemu-x86_64-core-smoke.sh:847: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:850: echo '[info] FAT smoke marker count: FAT_MOUNT_FAILED=0'
++ scripts/qemu-x86_64-core-smoke.sh:845: for marker in "${FAT_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:846: log_count_pattern VFS_MOUNT_REGISTER_FAT_OK
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=VFS_MOUNT_REGISTER_FAT_OK
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bVFS_MOUNT_REGISTER_FAT_OK\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:846: count=0
++ scripts/qemu-x86_64-core-smoke.sh:847: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:850: echo '[info] FAT smoke marker count: VFS_MOUNT_REGISTER_FAT_OK=0'
++ scripts/qemu-x86_64-core-smoke.sh:852: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:863: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:864: RAMFS_SMOKE_EXPECTED=0
++ scripts/qemu-x86_64-core-smoke.sh:875: RAMFS_MARKERS=(INIT_RAMFS_SPAWN_BEGIN INIT_RAMFS_SPAWN_SKIPPED INIT_RAMFS_SPAWN_OK PM_IMAGE_ID_11_RAMFS_SRV RAMFS_CONFIG_FOUND RAMFS_CONFIG_DEFAULT RAMFS_MOUNT_READY RAMFS_MOUNT_FAILED VFS_MOUNT_REGISTER_RAMFS_OK)
++ scripts/qemu-x86_64-core-smoke.sh:876: ramfs_seen=0
++ scripts/qemu-x86_64-core-smoke.sh:877: for marker in "${RAMFS_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:878: log_count_pattern INIT_RAMFS_SPAWN_BEGIN
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INIT_RAMFS_SPAWN_BEGIN
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINIT_RAMFS_SPAWN_BEGIN\b'
++ scripts/qemu-x86_64-core-smoke.sh:878: count=1
++ scripts/qemu-x86_64-core-smoke.sh:879: [[ 1 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:880: ramfs_seen=1
++ scripts/qemu-x86_64-core-smoke.sh:882: echo '[info] RAMFS smoke marker count: INIT_RAMFS_SPAWN_BEGIN=1'
++ scripts/qemu-x86_64-core-smoke.sh:877: for marker in "${RAMFS_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:878: log_count_pattern INIT_RAMFS_SPAWN_SKIPPED
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INIT_RAMFS_SPAWN_SKIPPED
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINIT_RAMFS_SPAWN_SKIPPED\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:878: count=0
++ scripts/qemu-x86_64-core-smoke.sh:879: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:882: echo '[info] RAMFS smoke marker count: INIT_RAMFS_SPAWN_SKIPPED=0'
++ scripts/qemu-x86_64-core-smoke.sh:877: for marker in "${RAMFS_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:878: log_count_pattern INIT_RAMFS_SPAWN_OK
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INIT_RAMFS_SPAWN_OK
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINIT_RAMFS_SPAWN_OK\b'
++ scripts/qemu-x86_64-core-smoke.sh:878: count=1
++ scripts/qemu-x86_64-core-smoke.sh:879: [[ 1 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:880: ramfs_seen=1
++ scripts/qemu-x86_64-core-smoke.sh:882: echo '[info] RAMFS smoke marker count: INIT_RAMFS_SPAWN_OK=1'
++ scripts/qemu-x86_64-core-smoke.sh:877: for marker in "${RAMFS_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:878: log_count_pattern PM_IMAGE_ID_11_RAMFS_SRV
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=PM_IMAGE_ID_11_RAMFS_SRV
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bPM_IMAGE_ID_11_RAMFS_SRV\b'
++ scripts/qemu-x86_64-core-smoke.sh:878: count=1
++ scripts/qemu-x86_64-core-smoke.sh:879: [[ 1 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:880: ramfs_seen=1
++ scripts/qemu-x86_64-core-smoke.sh:882: echo '[info] RAMFS smoke marker count: PM_IMAGE_ID_11_RAMFS_SRV=1'
++ scripts/qemu-x86_64-core-smoke.sh:877: for marker in "${RAMFS_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:878: log_count_pattern RAMFS_CONFIG_FOUND
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=RAMFS_CONFIG_FOUND
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bRAMFS_CONFIG_FOUND\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:878: count=0
++ scripts/qemu-x86_64-core-smoke.sh:879: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:882: echo '[info] RAMFS smoke marker count: RAMFS_CONFIG_FOUND=0'
++ scripts/qemu-x86_64-core-smoke.sh:877: for marker in "${RAMFS_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:878: log_count_pattern RAMFS_CONFIG_DEFAULT
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=RAMFS_CONFIG_DEFAULT
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bRAMFS_CONFIG_DEFAULT\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:878: count=1
++ scripts/qemu-x86_64-core-smoke.sh:879: [[ 1 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:880: ramfs_seen=1
++ scripts/qemu-x86_64-core-smoke.sh:882: echo '[info] RAMFS smoke marker count: RAMFS_CONFIG_DEFAULT=1'
++ scripts/qemu-x86_64-core-smoke.sh:877: for marker in "${RAMFS_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:878: log_count_pattern RAMFS_MOUNT_READY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=RAMFS_MOUNT_READY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bRAMFS_MOUNT_READY\b'
++ scripts/qemu-x86_64-core-smoke.sh:878: count=1
++ scripts/qemu-x86_64-core-smoke.sh:879: [[ 1 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:880: ramfs_seen=1
++ scripts/qemu-x86_64-core-smoke.sh:882: echo '[info] RAMFS smoke marker count: RAMFS_MOUNT_READY=1'
++ scripts/qemu-x86_64-core-smoke.sh:877: for marker in "${RAMFS_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:878: log_count_pattern RAMFS_MOUNT_FAILED
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=RAMFS_MOUNT_FAILED
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bRAMFS_MOUNT_FAILED\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:878: count=0
++ scripts/qemu-x86_64-core-smoke.sh:879: [[ 0 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:882: echo '[info] RAMFS smoke marker count: RAMFS_MOUNT_FAILED=0'
++ scripts/qemu-x86_64-core-smoke.sh:877: for marker in "${RAMFS_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:878: log_count_pattern VFS_MOUNT_REGISTER_RAMFS_OK
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=VFS_MOUNT_REGISTER_RAMFS_OK
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bVFS_MOUNT_REGISTER_RAMFS_OK\b'
++ scripts/qemu-x86_64-core-smoke.sh:878: count=1
++ scripts/qemu-x86_64-core-smoke.sh:879: [[ 1 -gt 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:880: ramfs_seen=1
++ scripts/qemu-x86_64-core-smoke.sh:882: echo '[info] RAMFS smoke marker count: VFS_MOUNT_REGISTER_RAMFS_OK=1'
++ scripts/qemu-x86_64-core-smoke.sh:884: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:912: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:919: EXT4_MARKERS=(INIT_EXT4_SPAWN_BEGIN INIT_EXT4_SPAWN_SKIPPED INIT_EXT4_SPAWN_OK PM_IMAGE_ID_12_EXT4_SRV EXT4_SRV_READY)
++ scripts/qemu-x86_64-core-smoke.sh:920: for marker in "${EXT4_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:921: log_count_pattern INIT_EXT4_SPAWN_BEGIN
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INIT_EXT4_SPAWN_BEGIN
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINIT_EXT4_SPAWN_BEGIN\b'
++ scripts/qemu-x86_64-core-smoke.sh:921: count=1
++ scripts/qemu-x86_64-core-smoke.sh:922: echo '[info] EXT4 smoke marker count: INIT_EXT4_SPAWN_BEGIN=1'
++ scripts/qemu-x86_64-core-smoke.sh:920: for marker in "${EXT4_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:921: log_count_pattern INIT_EXT4_SPAWN_SKIPPED
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INIT_EXT4_SPAWN_SKIPPED
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINIT_EXT4_SPAWN_SKIPPED\b'
+++ scripts/qemu-x86_64-core-smoke.sh:447: echo 0
++ scripts/qemu-x86_64-core-smoke.sh:921: count=0
++ scripts/qemu-x86_64-core-smoke.sh:922: echo '[info] EXT4 smoke marker count: INIT_EXT4_SPAWN_SKIPPED=0'
++ scripts/qemu-x86_64-core-smoke.sh:920: for marker in "${EXT4_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:921: log_count_pattern INIT_EXT4_SPAWN_OK
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=INIT_EXT4_SPAWN_OK
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bINIT_EXT4_SPAWN_OK\b'
++ scripts/qemu-x86_64-core-smoke.sh:921: count=1
++ scripts/qemu-x86_64-core-smoke.sh:922: echo '[info] EXT4 smoke marker count: INIT_EXT4_SPAWN_OK=1'
++ scripts/qemu-x86_64-core-smoke.sh:920: for marker in "${EXT4_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:921: log_count_pattern PM_IMAGE_ID_12_EXT4_SRV
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=PM_IMAGE_ID_12_EXT4_SRV
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bPM_IMAGE_ID_12_EXT4_SRV\b'
++ scripts/qemu-x86_64-core-smoke.sh:921: count=1
++ scripts/qemu-x86_64-core-smoke.sh:922: echo '[info] EXT4 smoke marker count: PM_IMAGE_ID_12_EXT4_SRV=1'
++ scripts/qemu-x86_64-core-smoke.sh:920: for marker in "${EXT4_MARKERS[@]}"
+++ scripts/qemu-x86_64-core-smoke.sh:921: log_count_pattern EXT4_SRV_READY
+++ scripts/qemu-x86_64-core-smoke.sh:444: local pattern=EXT4_SRV_READY
+++ scripts/qemu-x86_64-core-smoke.sh:445: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
+++ scripts/qemu-x86_64-core-smoke.sh:447: tr '\r' '\n'
+++ scripts/qemu-x86_64-core-smoke.sh:447: rg -a -c '\bEXT4_SRV_READY\b'
++ scripts/qemu-x86_64-core-smoke.sh:921: count=2
++ scripts/qemu-x86_64-core-smoke.sh:922: echo '[info] EXT4 smoke marker count: EXT4_SRV_READY=2'
++ scripts/qemu-x86_64-core-smoke.sh:929: [[ 0 -eq 0 ]]
++ scripts/qemu-x86_64-core-smoke.sh:930: echo '[ok] x86_64 core smoke: all 6 service entries present exactly once'
++ scripts/qemu-x86_64-core-smoke.sh:935: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1093: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1128: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1179: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1258: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1342: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1438: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1591: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1675: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1762: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1838: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1908: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:1985: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:2051: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:2168: log_has_pattern 'UNLOCK_GRADUATED_DEFERRED reason=emergency_optout'
++ scripts/qemu-x86_64-core-smoke.sh:438: local 'pattern=UNLOCK_GRADUATED_DEFERRED reason=emergency_optout'
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n 'UNLOCK_GRADUATED_DEFERRED reason=emergency_optout'
++ scripts/qemu-x86_64-core-smoke.sh:2172: log_has_pattern UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:2176: unlock_graduated_fatal_scan REMOVE-FALLBACKS
++ scripts/qemu-x86_64-core-smoke.sh:2143: local label=REMOVE-FALLBACKS
++ scripts/qemu-x86_64-core-smoke.sh:2144: local rc=0
++ scripts/qemu-x86_64-core-smoke.sh:2145: for f in "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "UNLOCK_GRADUATED_DOUBLE_DISPATCH" "UNLOCK_GRADUATED_RESTORE_FAIL" "UNLOCK_GRADUATED_D3_ROLLBACK_FAIL" "UNLOCK_GRADUATED_D3_LEAK" "UNLOCK_GRADUATED_INVARIANT_FAIL"
++ scripts/qemu-x86_64-core-smoke.sh:2152: log_has_pattern UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:2145: for f in "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "UNLOCK_GRADUATED_DOUBLE_DISPATCH" "UNLOCK_GRADUATED_RESTORE_FAIL" "UNLOCK_GRADUATED_D3_ROLLBACK_FAIL" "UNLOCK_GRADUATED_D3_LEAK" "UNLOCK_GRADUATED_INVARIANT_FAIL"
++ scripts/qemu-x86_64-core-smoke.sh:2152: log_has_pattern UNLOCK_GRADUATED_DOUBLE_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_DOUBLE_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_DOUBLE_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:2145: for f in "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "UNLOCK_GRADUATED_DOUBLE_DISPATCH" "UNLOCK_GRADUATED_RESTORE_FAIL" "UNLOCK_GRADUATED_D3_ROLLBACK_FAIL" "UNLOCK_GRADUATED_D3_LEAK" "UNLOCK_GRADUATED_INVARIANT_FAIL"
++ scripts/qemu-x86_64-core-smoke.sh:2152: log_has_pattern UNLOCK_GRADUATED_RESTORE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_RESTORE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_RESTORE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2145: for f in "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "UNLOCK_GRADUATED_DOUBLE_DISPATCH" "UNLOCK_GRADUATED_RESTORE_FAIL" "UNLOCK_GRADUATED_D3_ROLLBACK_FAIL" "UNLOCK_GRADUATED_D3_LEAK" "UNLOCK_GRADUATED_INVARIANT_FAIL"
++ scripts/qemu-x86_64-core-smoke.sh:2152: log_has_pattern UNLOCK_GRADUATED_D3_ROLLBACK_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_D3_ROLLBACK_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_D3_ROLLBACK_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2145: for f in "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "UNLOCK_GRADUATED_DOUBLE_DISPATCH" "UNLOCK_GRADUATED_RESTORE_FAIL" "UNLOCK_GRADUATED_D3_ROLLBACK_FAIL" "UNLOCK_GRADUATED_D3_LEAK" "UNLOCK_GRADUATED_INVARIANT_FAIL"
++ scripts/qemu-x86_64-core-smoke.sh:2152: log_has_pattern UNLOCK_GRADUATED_D3_LEAK
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_D3_LEAK
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_D3_LEAK
++ scripts/qemu-x86_64-core-smoke.sh:2145: for f in "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "UNLOCK_GRADUATED_DOUBLE_DISPATCH" "UNLOCK_GRADUATED_RESTORE_FAIL" "UNLOCK_GRADUATED_D3_ROLLBACK_FAIL" "UNLOCK_GRADUATED_D3_LEAK" "UNLOCK_GRADUATED_INVARIANT_FAIL"
++ scripts/qemu-x86_64-core-smoke.sh:2152: log_has_pattern UNLOCK_GRADUATED_INVARIANT_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_INVARIANT_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_INVARIANT_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2158: log_has_pattern 'UNLOCK_GRADUATED_FALLBACK path='
++ scripts/qemu-x86_64-core-smoke.sh:438: local 'pattern=UNLOCK_GRADUATED_FALLBACK path='
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n 'UNLOCK_GRADUATED_FALLBACK path='
++ scripts/qemu-x86_64-core-smoke.sh:2162: return 0
++ scripts/qemu-x86_64-core-smoke.sh:2181: [[ -n '' ]]
++ scripts/qemu-x86_64-core-smoke.sh:2208: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:2208: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:2221: ug_fail=0
++ scripts/qemu-x86_64-core-smoke.sh:2222: for m in "UNLOCK_GRADUATED_D2_RECV_OK" "UNLOCK_GRADUATED_D2_SEND_OK" "UNLOCK_GRADUATED_D6_OK" "UNLOCK_GRADUATED_D3_OK" "UNLOCK_GRADUATED_INVARIANT_OK"
++ scripts/qemu-x86_64-core-smoke.sh:2228: log_has_pattern UNLOCK_GRADUATED_D2_RECV_OK
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_D2_RECV_OK
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_D2_RECV_OK
++ scripts/qemu-x86_64-core-smoke.sh:2229: echo '[ok] REMOVE-FALLBACKS marker present: UNLOCK_GRADUATED_D2_RECV_OK'
++ scripts/qemu-x86_64-core-smoke.sh:2222: for m in "UNLOCK_GRADUATED_D2_RECV_OK" "UNLOCK_GRADUATED_D2_SEND_OK" "UNLOCK_GRADUATED_D6_OK" "UNLOCK_GRADUATED_D3_OK" "UNLOCK_GRADUATED_INVARIANT_OK"
++ scripts/qemu-x86_64-core-smoke.sh:2228: log_has_pattern UNLOCK_GRADUATED_D2_SEND_OK
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_D2_SEND_OK
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_D2_SEND_OK
++ scripts/qemu-x86_64-core-smoke.sh:2229: echo '[ok] REMOVE-FALLBACKS marker present: UNLOCK_GRADUATED_D2_SEND_OK'
++ scripts/qemu-x86_64-core-smoke.sh:2222: for m in "UNLOCK_GRADUATED_D2_RECV_OK" "UNLOCK_GRADUATED_D2_SEND_OK" "UNLOCK_GRADUATED_D6_OK" "UNLOCK_GRADUATED_D3_OK" "UNLOCK_GRADUATED_INVARIANT_OK"
++ scripts/qemu-x86_64-core-smoke.sh:2228: log_has_pattern UNLOCK_GRADUATED_D6_OK
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_D6_OK
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_D6_OK
++ scripts/qemu-x86_64-core-smoke.sh:2229: echo '[ok] REMOVE-FALLBACKS marker present: UNLOCK_GRADUATED_D6_OK'
++ scripts/qemu-x86_64-core-smoke.sh:2222: for m in "UNLOCK_GRADUATED_D2_RECV_OK" "UNLOCK_GRADUATED_D2_SEND_OK" "UNLOCK_GRADUATED_D6_OK" "UNLOCK_GRADUATED_D3_OK" "UNLOCK_GRADUATED_INVARIANT_OK"
++ scripts/qemu-x86_64-core-smoke.sh:2228: log_has_pattern UNLOCK_GRADUATED_D3_OK
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_D3_OK
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_D3_OK
++ scripts/qemu-x86_64-core-smoke.sh:2229: echo '[ok] REMOVE-FALLBACKS marker present: UNLOCK_GRADUATED_D3_OK'
++ scripts/qemu-x86_64-core-smoke.sh:2222: for m in "UNLOCK_GRADUATED_D2_RECV_OK" "UNLOCK_GRADUATED_D2_SEND_OK" "UNLOCK_GRADUATED_D6_OK" "UNLOCK_GRADUATED_D3_OK" "UNLOCK_GRADUATED_INVARIANT_OK"
++ scripts/qemu-x86_64-core-smoke.sh:2228: log_has_pattern UNLOCK_GRADUATED_INVARIANT_OK
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_INVARIANT_OK
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_INVARIANT_OK
++ scripts/qemu-x86_64-core-smoke.sh:2229: echo '[ok] REMOVE-FALLBACKS marker present: UNLOCK_GRADUATED_INVARIANT_OK'
++ scripts/qemu-x86_64-core-smoke.sh:2235: log_has_pattern 'UNLOCK_GRADUATED_DONE result=ok'
++ scripts/qemu-x86_64-core-smoke.sh:438: local 'pattern=UNLOCK_GRADUATED_DONE result=ok'
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n 'UNLOCK_GRADUATED_DONE result=ok'
++ scripts/qemu-x86_64-core-smoke.sh:2240: [[ 0 -eq 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:2244: echo '[ok] REMOVE-FALLBACKS: x86_64 -smp1 graduated seams are the only production path (no fallback)'
++ scripts/qemu-x86_64-core-smoke.sh:2251: [[ 2 -gt 1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:2252: echo '[info] SMP-LIVE: x86_64 -smp 2 acceptance checks'
++ scripts/qemu-x86_64-core-smoke.sh:2253: log_has_pattern X86_SMP_UNLOCK_DONE
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_SMP_UNLOCK_DONE
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_SMP_UNLOCK_DONE
++ scripts/qemu-x86_64-core-smoke.sh:2257: echo '[ok] SMP-LIVE: X86_SMP_UNLOCK audit verdict present'
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern 'UNLOCK_GRADUATED_DEFERRED reason=emergency_optout'
++ scripts/qemu-x86_64-core-smoke.sh:438: local 'pattern=UNLOCK_GRADUATED_DEFERRED reason=emergency_optout'
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n 'UNLOCK_GRADUATED_DEFERRED reason=emergency_optout'
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern 'UNLOCK_GRADUATED_FALLBACK path='
++ scripts/qemu-x86_64-core-smoke.sh:438: local 'pattern=UNLOCK_GRADUATED_FALLBACK path='
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n 'UNLOCK_GRADUATED_FALLBACK path='
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_SMP_ONLINE_ACCOUNTING_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_SMP_ONLINE_ACCOUNTING_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_SMP_ONLINE_ACCOUNTING_BAD
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_GS_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_GS_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_GS_BAD
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_IDLE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_IDLE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_IDLE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_SCHED_ADMIT_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_SCHED_ADMIT_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_SCHED_ADMIT_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_KERNEL_CR3_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_KERNEL_CR3_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_KERNEL_CR3_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_TSS_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_TSS_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_TSS_BAD
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_LAPIC_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_LAPIC_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_LAPIC_BAD
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_IDLE_CONTEXT_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_IDLE_CONTEXT_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_IDLE_CONTEXT_BAD
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_SCHED_PREREQ_INCOMPLETE
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_SCHED_PREREQ_INCOMPLETE
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_SCHED_PREREQ_INCOMPLETE
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_CR4_SYNC_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_CR4_SYNC_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_CR4_SYNC_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_IDT_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_IDT_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_IDT_BAD
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_IDT_VECTOR_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_IDT_VECTOR_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_IDT_VECTOR_BAD
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_IST_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_IST_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_IST_BAD
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_LAPIC_INTERRUPT_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_LAPIC_INTERRUPT_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_LAPIC_INTERRUPT_BAD
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_IPI_FIXED_SEND_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_IPI_FIXED_SEND_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_IPI_FIXED_SEND_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_INTERRUPT_SMOKE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_INTERRUPT_SMOKE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_INTERRUPT_SMOKE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_IDLE_TASK_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_IDLE_TASK_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_IDLE_TASK_BAD
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_SCHED_ONLINE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_SCHED_ONLINE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_SCHED_ONLINE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_SCHED_IDLE_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_SCHED_IDLE_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_SCHED_IDLE_BAD
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern D6_SMP_LOST_WAKE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=D6_SMP_LOST_WAKE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n D6_SMP_LOST_WAKE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern D6_SMP_DUP_WAKE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=D6_SMP_DUP_WAKE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n D6_SMP_DUP_WAKE_FAIL
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern SCHED_ENQUEUE_DENIED_WAKE_ONLY
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=SCHED_ENQUEUE_DENIED_WAKE_ONLY
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n SCHED_ENQUEUE_DENIED_WAKE_ONLY
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_SMP_AP_INTERRUPT_NOT_READY
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_SMP_AP_INTERRUPT_NOT_READY
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_SMP_AP_INTERRUPT_NOT_READY
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_AP_SCHED_IDLE_POLL_PTR_BAD
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_SCHED_IDLE_POLL_PTR_BAD
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_SCHED_IDLE_POLL_PTR_BAD
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern X86_TLB_REMOTE_ACK_TIMEOUT
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_TLB_REMOTE_ACK_TIMEOUT
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_TLB_REMOTE_ACK_TIMEOUT
++ scripts/qemu-x86_64-core-smoke.sh:2259: for f in "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" "UNLOCK_GRADUATED_FALLBACK path=" "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" "X86_SMP_ONLINE_ACCOUNTING_BAD" "X86_AP_GS_BAD" "X86_AP_IDLE_FAIL" "X86_AP_SCHED_ADMIT_FAIL" "X86_AP_KERNEL_CR3_FAIL" "X86_AP_TSS_BAD" "X86_AP_LAPIC_BAD" "X86_AP_IDLE_CONTEXT_BAD" "X86_AP_SCHED_PREREQ_INCOMPLETE" "X86_AP_CR4_SYNC_FAIL" "X86_AP_IDT_BAD" "X86_AP_IDT_VECTOR_BAD" "X86_AP_IST_BAD" "X86_AP_LAPIC_INTERRUPT_BAD" "X86_IPI_FIXED_SEND_FAIL" "X86_AP_INTERRUPT_SMOKE_FAIL" "X86_AP_IDLE_TASK_BAD" "X86_AP_SCHED_ONLINE_FAIL" "X86_AP_SCHED_IDLE_BAD" "D6_SMP_LOST_WAKE_FAIL" "D6_SMP_DUP_WAKE_FAIL" "SCHED_ENQUEUE_DENIED_WAKE_ONLY" "X86_SMP_AP_INTERRUPT_NOT_READY" "X86_AP_SCHED_IDLE_POLL_PTR_BAD" "X86_TLB_REMOTE_ACK_TIMEOUT" "D6_SMP_DISPATCH_FALLBACK"
++ scripts/qemu-x86_64-core-smoke.sh:2289: log_has_pattern D6_SMP_DISPATCH_FALLBACK
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=D6_SMP_DISPATCH_FALLBACK
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n D6_SMP_DISPATCH_FALLBACK
++ scripts/qemu-x86_64-core-smoke.sh:2305: for m in "X86_AP_SCHED_ADMIT_BEGIN" "X86_AP_GS_OK" "X86_AP_KERNEL_CR3_BEGIN" "X86_AP_KERNEL_CR3_OK" "X86_AP_GDT_LOCAL_OK" "X86_AP_TSS_OK" "X86_AP_LAPIC_OK" "X86_AP_LAPIC_TIMER_DEFERRED" "X86_AP_IDLE_TASK_READY" "X86_AP_IDLE_CONTEXT_OK" "X86_AP_SCHED_PREREQ_OK" "X86_AP_CR4_SYNC_OK" "X86_AP_IDT_BEGIN" "X86_AP_IDT_OK" "X86_AP_IDT_VECTOR_OK" "X86_AP_IST_OK" "X86_AP_LAPIC_ENABLE_BEGIN" "X86_AP_LAPIC_SVR_OK" "X86_AP_LAPIC_TPR_OK" "X86_AP_LAPIC_ESR_OK" "X86_AP_LAPIC_INTERRUPT_READY" "X86_AP_INTERRUPT_SMOKE_BEGIN" "X86_IPI_FIXED_SEND_BEGIN" "X86_IPI_FIXED_ICR_WRITTEN" "X86_IPI_FIXED_SEND_DONE" "X86_IPI_REMOTE_WAKE_SEND" "X86_IPI_REMOTE_WAKE_RECV" "X86_IPI_REMOTE_WAKE_ACK" "X86_AP_INTERRUPT_SMOKE_OK" "X86_AP_IDLE_ENTER" "X86_AP_SCHED_ADMIT_DONE" "X86_AP_IDLE_TASK_CREATE_BEGIN" "X86_AP_IDLE_TASK_READY" "X86_AP_IDLE_TASK_ACTIVE" "X86_AP_SCHED_IDLE_POLL_PTR_OK" "X86_AP_SCHED_ONLINE_BEGIN" "X86_AP_SCHED_ONLINE_OK" "X86_AP_SCHED_IDLE_ENTER" "X86_AP_SCHED_IDLE_REENTER" "D6_SMP_REMOTE_WAKE_OK" "X86_SMP_AP_SCHED_ONLINE" "X86_SMP_PLACEMENT_GATED"
++ scripts/qemu-x86_64-core-smoke.sh:2348: log_has_pattern X86_AP_SCHED_ADMIT_BEGIN
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_SCHED_ADMIT_BEGIN
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_SCHED_ADMIT_BEGIN
++ scripts/qemu-x86_64-core-smoke.sh:2352: echo '[ok] SMP-LIVE: AP admission marker present: X86_AP_SCHED_ADMIT_BEGIN'
++ scripts/qemu-x86_64-core-smoke.sh:2305: for m in "X86_AP_SCHED_ADMIT_BEGIN" "X86_AP_GS_OK" "X86_AP_KERNEL_CR3_BEGIN" "X86_AP_KERNEL_CR3_OK" "X86_AP_GDT_LOCAL_OK" "X86_AP_TSS_OK" "X86_AP_LAPIC_OK" "X86_AP_LAPIC_TIMER_DEFERRED" "X86_AP_IDLE_TASK_READY" "X86_AP_IDLE_CONTEXT_OK" "X86_AP_SCHED_PREREQ_OK" "X86_AP_CR4_SYNC_OK" "X86_AP_IDT_BEGIN" "X86_AP_IDT_OK" "X86_AP_IDT_VECTOR_OK" "X86_AP_IST_OK" "X86_AP_LAPIC_ENABLE_BEGIN" "X86_AP_LAPIC_SVR_OK" "X86_AP_LAPIC_TPR_OK" "X86_AP_LAPIC_ESR_OK" "X86_AP_LAPIC_INTERRUPT_READY" "X86_AP_INTERRUPT_SMOKE_BEGIN" "X86_IPI_FIXED_SEND_BEGIN" "X86_IPI_FIXED_ICR_WRITTEN" "X86_IPI_FIXED_SEND_DONE" "X86_IPI_REMOTE_WAKE_SEND" "X86_IPI_REMOTE_WAKE_RECV" "X86_IPI_REMOTE_WAKE_ACK" "X86_AP_INTERRUPT_SMOKE_OK" "X86_AP_IDLE_ENTER" "X86_AP_SCHED_ADMIT_DONE" "X86_AP_IDLE_TASK_CREATE_BEGIN" "X86_AP_IDLE_TASK_READY" "X86_AP_IDLE_TASK_ACTIVE" "X86_AP_SCHED_IDLE_POLL_PTR_OK" "X86_AP_SCHED_ONLINE_BEGIN" "X86_AP_SCHED_ONLINE_OK" "X86_AP_SCHED_IDLE_ENTER" "X86_AP_SCHED_IDLE_REENTER" "D6_SMP_REMOTE_WAKE_OK" "X86_SMP_AP_SCHED_ONLINE" "X86_SMP_PLACEMENT_GATED"
++ scripts/qemu-x86_64-core-smoke.sh:2348: log_has_pattern X86_AP_GS_OK
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_GS_OK
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_GS_OK
++ scripts/qemu-x86_64-core-smoke.sh:2352: echo '[ok] SMP-LIVE: AP admission marker present: X86_AP_GS_OK'
++ scripts/qemu-x86_64-core-smoke.sh:2305: for m in "X86_AP_SCHED_ADMIT_BEGIN" "X86_AP_GS_OK" "X86_AP_KERNEL_CR3_BEGIN" "X86_AP_KERNEL_CR3_OK" "X86_AP_GDT_LOCAL_OK" "X86_AP_TSS_OK" "X86_AP_LAPIC_OK" "X86_AP_LAPIC_TIMER_DEFERRED" "X86_AP_IDLE_TASK_READY" "X86_AP_IDLE_CONTEXT_OK" "X86_AP_SCHED_PREREQ_OK" "X86_AP_CR4_SYNC_OK" "X86_AP_IDT_BEGIN" "X86_AP_IDT_OK" "X86_AP_IDT_VECTOR_OK" "X86_AP_IST_OK" "X86_AP_LAPIC_ENABLE_BEGIN" "X86_AP_LAPIC_SVR_OK" "X86_AP_LAPIC_TPR_OK" "X86_AP_LAPIC_ESR_OK" "X86_AP_LAPIC_INTERRUPT_READY" "X86_AP_INTERRUPT_SMOKE_BEGIN" "X86_IPI_FIXED_SEND_BEGIN" "X86_IPI_FIXED_ICR_WRITTEN" "X86_IPI_FIXED_SEND_DONE" "X86_IPI_REMOTE_WAKE_SEND" "X86_IPI_REMOTE_WAKE_RECV" "X86_IPI_REMOTE_WAKE_ACK" "X86_AP_INTERRUPT_SMOKE_OK" "X86_AP_IDLE_ENTER" "X86_AP_SCHED_ADMIT_DONE" "X86_AP_IDLE_TASK_CREATE_BEGIN" "X86_AP_IDLE_TASK_READY" "X86_AP_IDLE_TASK_ACTIVE" "X86_AP_SCHED_IDLE_POLL_PTR_OK" "X86_AP_SCHED_ONLINE_BEGIN" "X86_AP_SCHED_ONLINE_OK" "X86_AP_SCHED_IDLE_ENTER" "X86_AP_SCHED_IDLE_REENTER" "D6_SMP_REMOTE_WAKE_OK" "X86_SMP_AP_SCHED_ONLINE" "X86_SMP_PLACEMENT_GATED"
++ scripts/qemu-x86_64-core-smoke.sh:2348: log_has_pattern X86_AP_KERNEL_CR3_BEGIN
++ scripts/qemu-x86_64-core-smoke.sh:438: local pattern=X86_AP_KERNEL_CR3_BEGIN
++ scripts/qemu-x86_64-core-smoke.sh:439: [[ -f /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/qual/FX7_x86_64/boot.log ]]
++ scripts/qemu-x86_64-core-smoke.sh:440: tr '\r' '\n'
++ scripts/qemu-x86_64-core-smoke.sh:440: rg -a -n X86_AP_KERNEL_CR3_BEGIN
++ scripts/qemu-x86_64-core-smoke.sh:2349: echo '[error] SMP-LIVE: AP admission/prereq marker missing: X86_AP_KERNEL_CR3_BEGIN'
++ scripts/qemu-x86_64-core-smoke.sh:2350: exit 1

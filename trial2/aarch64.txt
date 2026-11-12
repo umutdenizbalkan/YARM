@@ -1,0 +1,5 @@
+[futex-wait-witness] building base aarch64 artifacts with futex-requeue-witness,futex-wait-witness
+[futex-wait-witness] rebuilding kernel_boot with aarch64-shared-region-direct-oracle,futex-wait-witness
+[futex-wait-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-wait-grade][fail] line 30777: damaged witness marker: FUTEX_W3AIT_WITNESS_SKIPPED wait=3 cpu=1 tid=10008 reason=no_peer_running
+FUTEX_WAIT_WITNESS_SEAL arch=aarch64 smp=2 waits=29 skipped=2 windows=43 refused=0 b_changed=15 a=14 in_window_wakes=43 waiter_cpus=1 waker_cpus=0 calls=32 returns=32 blocked=17 mismatch=15 during_publication=14 parked=3 parked_ok=3 parked_err=0 dup_or_missing=0 witness=fail core_smoke=ok result=fail

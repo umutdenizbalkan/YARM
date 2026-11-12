@@ -1,0 +1,894 @@
+diff --git a/src/kernel/boot/mod.rs b/src/kernel/boot/mod.rs
+index 6bdffdc5..2098c4b0 100644
+--- a/src/kernel/boot/mod.rs
++++ b/src/kernel/boot/mod.rs
+@@ -1671,6 +1671,15 @@ pub(crate) fn yield_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
+     if v == u64::MAX { None } else { Some(v) }
+ }
+ 
++/// BASELINE HARNESS: the 2a91a6e8 bridge has no commit step.
++#[cfg(test)]
++pub(crate) fn riscv_commit_final_park_result(
++    _cpu_idx: usize,
++    _frame: &mut crate::kernel::trapframe::TrapFrame,
++) -> bool {
++    false
++}
++
+ /// Stage 192B: clear the Yield dispatch deferral for `cpu`.
+ pub(crate) fn yield_dispatch_clear(cpu_idx: usize) {
+     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+diff --git a/src/kernel/boot/tests.rs b/src/kernel/boot/tests.rs
+index 7e46b37c..092e472b 100644
+--- a/src/kernel/boot/tests.rs
++++ b/src/kernel/boot/tests.rs
+@@ -214700,6 +214700,854 @@ mod futex_requeue1 {
+     /// other CPUs' operations run to completion; every observed history is checked against the
+     /// sequential specification of `atomic1`. The wait is the floating operation: the others run
+     /// in this order, all of them inside the wait's interval.
++    /// RISCV-PARK-RET1 — a RISC-V syscall continuation resumes with ITS OWN result.
++    ///
++    /// The chain each test walks is the production one wherever the code is hosted: the split
++    /// FutexWait park transaction, the wake, requeue and exit owners, the deferral cells, the
++    /// RISC-V commit (`riscv_commit_final_park_result`), the outgoing capture
++    /// (`capture_outgoing_user_context_split`), the TCB store and `TrapFrame::apply_user_context`.
++    /// Three pieces are RISC-V-only code with no hosted build, and are modelled here exactly: the
++    /// route's `Parked` answer (`set_ok(1, 0, 0)`), the bridge write-back's ABI arms
++    /// (`src/arch/riscv64/boot.rs`) and the user runtime's decode (`yarm-user-rt`). Each model is
++    /// pinned to its source by `g01`–`g05`, so a change to the real code fails a guard here.
++    ///
++    /// "Ring 3" below is the register file the `sret` installs — what the instruction after the
++    /// `ecall` observes — and the user runtime's verdict on it.
++    mod riscv_park_ret1 {
++        use super::wait_atomic1::wait;
++        use super::*;
++        use crate::kernel::boot as kb;
++        use crate::kernel::syscall::{SYSCALL_FUTEX_WAIT_NR, SYSCALL_YIELD_NR, SyscallError};
++        use crate::kernel::task::{
++            BlockedSyscallClass, BlockedSyscallCompletion, UserRegisterContext,
++        };
++        use crate::kernel::trapframe::TrapFrame;
++
++        /// The `ecall` instruction; the bridge pre-advances `sepc` past it once, at entry.
++        const ECALL: usize = 0x40_1000;
++        const USER_SP: usize = 0x7fbf_f7b0;
++        /// Registers no syscall return may touch: `ra`, `tp`, `t0`, `s0`, `a6`.
++        const KEEP: [(usize, usize); 5] = [
++            (1, 0x1111),
++            (4, 0x4444),
++            (5, 0x5555),
++            (8, 0x8888),
++            (16, 0x6666),
++        ];
++
++        /// What the RISC-V bridge imports for an `ecall` with `nr` in `a7` and `args` in `a0..a5`:
++        /// the argument lanes, the register file (`x1..x31`, the ABI block included), `sepc + 4`.
++        fn ecall(nr: usize, args: [usize; 6]) -> TrapFrame {
++            let mut f = TrapFrame::new(nr, args);
++            for (i, v) in args.iter().enumerate() {
++                f.set_user_gpr(10 + i, *v);
++            }
++            f.set_user_gpr(17, nr);
++            f.set_user_gpr(2, USER_SP);
++            for (r, v) in KEEP {
++                f.set_user_gpr(r, v);
++            }
++            f.set_saved_pc(ECALL + 4);
++            f.set_saved_sp(USER_SP);
++            f
++        }
++
++        /// The register file the `sret` installs.
++        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
++        struct Ring3 {
++            a: [usize; 8],
++            sepc: usize,
++            sp: usize,
++            keep: [usize; 5],
++        }
++        impl Ring3 {
++            fn of(a: [usize; 8], sepc: usize, sp: usize, gprs: &[usize; 32]) -> Self {
++                Ring3 {
++                    a,
++                    sepc,
++                    sp,
++                    keep: KEEP.map(|(r, _)| gprs[r]),
++                }
++            }
++            /// `yarm-user-rt::futex_wait` on this port (pinned by `g03`).
++            fn futex_wait(&self) -> Result<bool, usize> {
++                if self.a[0] > 1 {
++                    Err(self.a[0])
++                } else {
++                    Ok(self.a[0] != 0)
++                }
++            }
++            /// `yarm-user-rt::yield_now` on this port.
++            fn yield_now(&self) -> Result<(), usize> {
++                if self.a[0] != 0 {
++                    Err(self.a[0])
++                } else {
++                    Ok(())
++                }
++            }
++        }
++
++        /// The write-back's SWITCHED ordinary arm (`boot.rs`: no async tag, no continuation tag):
++        /// the incoming context is applied to this trap's frame, `a0..a5` come from its argument
++        /// lanes, `a7` is zeroed, every other register is mirrored from its register file.
++        fn switched(this_trap: &TrapFrame, ctx: UserRegisterContext) -> Ring3 {
++            let mut f = this_trap.clone();
++            f.apply_user_context(ctx);
++            let a = [
++                f.arg(0),
++                f.arg(1),
++                f.arg(2),
++                f.arg(3),
++                f.arg(4),
++                f.arg(5),
++                f.user_gpr(16),
++                0,
++            ];
++            Ring3::of(a, f.saved_pc(), f.saved_sp(), &f.user_gprs)
++        }
++
++        /// The write-back's SWITCHED continuation arm (a consumer published the tag): the result
++        /// lanes of the frame, `a3` = the error, `a4`, `a5`, `a7` from the register file.
++        fn switched_continuation(f: &TrapFrame) -> Ring3 {
++            let (a0, a1, a2, a3) = match f.error_code() {
++                Some(e) => (e, 0, 0, e),
++                None => (f.ret0(), f.ret1(), f.ret2(), 0),
++            };
++            let a = [
++                a0,
++                a1,
++                a2,
++                a3,
++                f.user_gpr(14),
++                f.user_gpr(15),
++                f.user_gpr(16),
++                f.user_gpr(17),
++            ];
++            Ring3::of(a, f.saved_pc(), f.saved_sp(), &f.user_gprs)
++        }
++
++        /// The write-back's SAME-TASK arm for the trap `entered`: when an exact-token drain applied
++        /// the caller's own saved continuation (`self_resume`), the published lanes are adopted;
++        /// then `a0..a3` from the result, and `a4`, `a5`, `a7` are the hardware frame's.
++        fn same_task(entered: &TrapFrame, self_resume: Option<UserRegisterContext>) -> Ring3 {
++            let mut f = entered.clone();
++            if let Some(ctx) = self_resume {
++                f.apply_user_context(ctx);
++                f.adopt_restored_riscv_syscall_returns();
++            }
++            let (a0, a1, a2, a3) = match f.error_code() {
++                Some(e) => (e, 0, 0, e),
++                None => (f.ret0(), f.ret1(), f.ret2(), 0),
++            };
++            let hw = entered.user_gprs;
++            let a = [a0, a1, a2, a3, hw[14], hw[15], hw[16], hw[17]];
++            Ring3::of(a, f.saved_pc(), f.saved_sp(), &f.user_gprs)
++        }
++
++        /// The write-back's ASYNC arm: the whole register file, verbatim.
++        fn async_resume(this_trap: &TrapFrame, ctx: UserRegisterContext) -> Ring3 {
++            let mut f = this_trap.clone();
++            f.apply_user_context(ctx);
++            let g = f.user_gprs;
++            Ring3::of(
++                [g[10], g[11], g[12], g[13], g[14], g[15], g[16], g[17]],
++                f.saved_pc(),
++                f.saved_sp(),
++                &g,
++            )
++        }
++
++        fn saved(k: &SharedKernel, t: u64) -> UserRegisterContext {
++            k.with(|s| s.with_tcb_mut(t, |tcb| tcb.user_context))
++                .expect("tcb")
++        }
++
++        fn clear_cells() {
++            kb::futex_wait_dispatch_clear(0);
++            kb::d2_recv_dispatch_clear(0);
++            kb::yield_dispatch_clear(0);
++        }
++
++        /// The RISC-V bridge's committed-park arm, in the bridge's order (pinned by `g05`): the
++        /// outgoing from the deferral chain, the exit check, the commit, the capture, and the
++        /// receive re-application.
++        fn bridge(k: &SharedKernel, f: &mut TrapFrame) -> (bool, bool) {
++            let futex_wait_outgoing = kb::futex_wait_dispatch_outgoing(0);
++            let outgoing = futex_wait_outgoing
++                .or_else(|| kb::d2_recv_dispatch_outgoing(0))
++                .or_else(|| kb::yield_dispatch_outgoing(0));
++            let exiting =
++                kb::exit_queue_advance_pending(0).is_some_and(|(et, _)| Some(et) == outgoing);
++            let committed = kb::riscv_commit_final_park_result(0, f);
++            let captured = if exiting {
++                false
++            } else {
++                outgoing
++                    .map(|t| k.capture_outgoing_user_context_split(t, f))
++                    .unwrap_or(false)
++            };
++            if captured
++                && futex_wait_outgoing.is_none()
++                && let Some(t) = outgoing
++                && kb::d2_recv_dispatch_outgoing(0) == Some(t)
++            {
++                k.reapply_parked_recv_completion_split(t);
++            }
++            (committed, captured)
++        }
++
++        /// A GENUINE park: the split transaction parks `t` (it leaves CPU 0), the route answers
++        /// `Parked` with `set_ok(1, 0, 0)`, its deferral names `t`, and the bridge commits and
++        /// captures. Returns the trap's frame.
++        fn park(k: &SharedKernel, a: Asid, t: u64, va: usize, exp: u32) -> TrapFrame {
++            clear_cells();
++            let mut f = ecall(SYSCALL_FUTEX_WAIT_NR, [va, exp as usize, 0, 0, 0, 0]);
++            let (_r, o) = wait(k, a, t, va, exp, P);
++            assert!(matches!(o, FutexParkOutcome::Parked { .. }), "{t}: {o:?}");
++            f.set_ok(1, 0, 0);
++            assert!(kb::futex_wait_dispatch_try_defer(0, t));
++            assert!(bridge(k, &mut f).1, "captured");
++            clear_cells();
++            f
++        }
++
++        /// The signaller's own trap on the waiter's home CPU, whose drain switches to the waiter.
++        fn other_trap() -> TrapFrame {
++            ecall(SYSCALL_YIELD_NR, [0; 6])
++        }
++
++        fn assert_resumed_with(r: &Ring3, a0: usize) {
++            assert_eq!(
++                (r.a[0], r.a[1], r.a[2]),
++                (a0, 0, 0),
++                "the result lanes: {r:?}"
++            );
++            assert_eq!(
++                (r.a[3], r.a[4], r.a[5]),
++                (0, 0, 0),
++                "a3..a5 as the caller left them"
++            );
++            assert_eq!(r.sepc, ECALL + 4, "exactly once past the ecall");
++            assert_eq!(r.sp, USER_SP);
++            assert_eq!(r.keep, KEEP.map(|(_, v)| v), "ra, tp, t0, s0, a6 untouched");
++        }
++
++        /// 1 — a wake between the registration and the compare-and-clear: the wait never leaves
++        /// the CPU and returns through its own frame, `1`, with nothing committed or captured.
++        #[test]
++        fn t01_a_wait_woken_before_it_leaves_the_cpu_returns_through_its_own_frame() {
++            clear_cells();
++            let w = world(52000);
++            let (a, t) = (w.a, 52100);
++            let k = leak(w.s);
++            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
++                assert_eq!(
++                    k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
++                    1
++                );
++            }));
++            let mut f = ecall(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0, 0, 0]);
++            let (_r, o) = wait(k, a, t, SQ, 5, P);
++            assert!(matches!(o, FutexParkOutcome::WokenDuringPublication { .. }));
++            f.set_ok(1, 0, 0);
++            let r = same_task(&f, None);
++            assert_resumed_with(&r, 1);
++            assert_eq!(r.a[7], SYSCALL_FUTEX_WAIT_NR, "a7 is the hardware frame's");
++            assert_eq!(r.futex_wait(), Ok(true));
++        }
++
++        /// 2 — THE CASE: the caller genuinely parks, another CPU wakes it, its home CPU switches
++        /// to it, and ring 3 observes `a0 = 1`, `Ok(true)`.
++        #[test]
++        fn t02_a_parked_wait_resumes_with_one() {
++            let w = world(52200);
++            let (a, t) = (w.a, 52300);
++            let k = leak(w.s);
++            park(k, a, t, SQ, 5);
++            assert!(k.with(|s| parked(s, t)), "it left the CPU and is parked");
++            assert_eq!(
++                k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
++                1
++            );
++            let r = switched(&other_trap(), saved(k, t));
++            assert_resumed_with(&r, 1);
++            assert_eq!(r.futex_wait(), Ok(true));
++        }
++
++        /// 3 — the word differs: `0`, through the caller's own frame.
++        #[test]
++        fn t03_a_mismatch_returns_zero() {
++            clear_cells();
++            let w = world(52400);
++            let (a, t) = (w.a, 52500);
++            let k = leak(w.s);
++            let mut f = ecall(SYSCALL_FUTEX_WAIT_NR, [SQ, 4, 0, 0, 0, 0]);
++            let (_r, o) = wait(k, a, t, SQ, 4, P);
++            assert!(matches!(o, FutexParkOutcome::ValueChanged));
++            f.set_ok(0, 0, 0);
++            let r = same_task(&f, None);
++            assert_resumed_with(&r, 0);
++            assert_eq!(r.futex_wait(), Ok(false));
++        }
++
++        /// 4 — a wake after the compare-and-clear but before the read-back: still woken during
++        /// publication, still the caller's own frame, still `1`.
++        #[test]
++        fn t04_a_wake_before_the_park_publication_completes() {
++            clear_cells();
++            let w = world(52600);
++            let (a, t) = (w.a, 52700);
++            let k = leak(w.s);
++            fx::futex_phase_hook::arm_after_clear(alloc::boxed::Box::new(move || {
++                assert_eq!(
++                    k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
++                    1
++                );
++            }));
++            let mut f = ecall(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0, 0, 0]);
++            let (_r, o) = wait(k, a, t, SQ, 5, P);
++            assert!(matches!(o, FutexParkOutcome::WokenDuringPublication { .. }));
++            f.set_ok(1, 0, 0);
++            assert_eq!(same_task(&f, None).futex_wait(), Ok(true));
++        }
++
++        /// 5 — the wake comes after the caller switched away (after the capture).
++        #[test]
++        fn t05_a_wake_after_the_caller_switched_away() {
++            let w = world(52800);
++            let (a, t) = (w.a, 52900);
++            let k = leak(w.s);
++            park(k, a, t, SQ, 5);
++            let before = saved(k, t);
++            assert_eq!(
++                k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
++                1
++            );
++            assert_eq!(
++                saved(k, t),
++                before,
++                "a wake writes no register of the waiter"
++            );
++            assert_eq!(k.with(|s| s.task_status(t)), Some(TaskStatus::Runnable));
++            assert_resumed_with(&switched(&other_trap(), saved(k, t)), 1);
++        }
++
++        /// 6 — the wake is another CPU's, and the waiter is placed on its HOME CPU's queue, the CPU
++        /// that captured it: the resume that follows the capture is that CPU's.
++        #[test]
++        fn t06_a_wake_from_another_cpu_places_the_waiter_on_its_home_cpu() {
++            let w = world(53000);
++            let (a, t) = (w.a, 53100);
++            let k = leak(w.s);
++            park(k, a, t, SQ, 5);
++            assert_eq!(
++                k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
++                1
++            );
++            k.with(|s| {
++                assert_eq!(placement(s, t), TaskPlacement::Queued(CpuId(0)));
++                assert_eq!(queued_count(s, t), 1, "queued exactly once");
++            });
++            assert_eq!(switched(&other_trap(), saved(k, t)).futex_wait(), Ok(true));
++        }
++
++        /// 7 — a compare-and-requeue moves the parked waiter to T; a wake of T resumes it with `1`.
++        #[test]
++        fn t07_a_requeued_waiter_resumes_after_the_target_wake() {
++            let w = world(53200);
++            let (a, t) = (w.a, 53300);
++            let k = leak(w.s);
++            park(k, a, t, SQ, 5);
++            let _ = k.futex_cmp_requeue_split(CpuId(1), a, (SQ, P), (MX, P), 5, 0, 1);
++            assert!(k.with(|s| parked(s, t)), "moved, still parked");
++            assert_eq!(
++                k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P)
++                    .expect("wake S"),
++                0
++            );
++            assert_eq!(
++                k.futex_wake_split_mut(CpuId(1), a, MX, 1, P)
++                    .expect("wake T"),
++                1
++            );
++            let r = switched(&other_trap(), saved(k, t));
++            assert_resumed_with(&r, 1);
++            assert_eq!(r.futex_wait(), Ok(true));
++        }
++
++        /// 8 — an error is an error on every route: its own frame, and the lane commit (an error
++        /// in `a0`, `a1` and `a2` cleared), so the runtime reports it.
++        #[test]
++        fn t08_a_futex_wait_error_propagates() {
++            let code = SyscallError::InvalidArgs.code();
++            let mut f = ecall(SYSCALL_FUTEX_WAIT_NR, [SQ + 2, 5, 0, 0, 0, 0]);
++            f.set_err(code);
++            assert_eq!(same_task(&f, None).futex_wait(), Err(code));
++            f.commit_riscv_parked_syscall_returns();
++            let mut ctx = f.capture_user_context();
++            ctx.instruction_ptr = crate::kernel::vm::VirtAddr((ECALL + 4) as u64);
++            let r = switched(&other_trap(), ctx);
++            assert_eq!((r.a[0], r.a[1], r.a[2]), (code, 0, 0));
++            assert_eq!(r.futex_wait(), Err(code));
++        }
++
++        /// 9 — Yield parks through the same chain: it resumes after its `ecall` with `0`, also
++        /// when the caller passed non-zero arguments (the user runtime passes zeros, which is why
++        /// the old resume looked correct).
++        #[test]
++        fn t09_a_yield_returns_after_its_ecall_with_zero() {
++            clear_cells();
++            let w = world(53400);
++            let k = leak(w.s);
++            let t = w.driver;
++            let mut f = ecall(SYSCALL_YIELD_NR, [7, 8, 9, 0, 0, 0]);
++            f.set_ok(0, 0, 0);
++            assert!(kb::yield_dispatch_try_defer(0, t));
++            assert!(bridge(k, &mut f).1, "captured");
++            clear_cells();
++            let r = switched(&other_trap(), saved(k, t));
++            assert_eq!((r.a[0], r.a[1], r.a[2]), (0, 0, 0));
++            assert_eq!(r.sepc, ECALL + 4);
++            assert_eq!(r.yield_now(), Ok(()));
++        }
++
++        /// 10 / 13 / 14 — a blocking RECEIVE's result is not the park's: no commit, and a
++        /// completion published after the capture is what ring 3 sees.
++        #[test]
++        fn t10_a_receive_park_is_not_committed_and_keeps_its_completion() {
++            clear_cells();
++            let w = world(53600);
++            let k = leak(w.s);
++            let t = w.driver;
++            let cap = 0x1_0004;
++            let mut f = ecall(
++                crate::kernel::syscall::SYSCALL_IPC_RECV_NR,
++                [cap, 0, 0, 0, 0, 0],
++            );
++            f.set_err(SyscallError::WouldBlock.code());
++            assert!(kb::d2_recv_dispatch_try_defer(0, t));
++            assert_eq!(bridge(k, &mut f), (false, true), "captured, not committed");
++            clear_cells();
++            assert_eq!(
++                f.user_gpr(10),
++                cap,
++                "the receive's frame lanes are untouched"
++            );
++            let code = SyscallError::TimedOut.code();
++            k.with(|s| s.with_tcb_mut(t, |tcb| tcb.publish_riscv_user_return(0, 0, code)));
++            let r = switched(&other_trap(), saved(k, t));
++            assert_eq!(
++                (r.a[0], r.a[1]),
++                (code, 0),
++                "the completion, not the capability"
++            );
++        }
++
++        /// 12 / 13 — a completion published BEFORE the capture survives it: the park commit stays
++        /// out of the receive, and the AP-SCHED1 §4 re-application (unchanged by this stage) finds
++        /// the exact record after the capture. Its RISC-V branch writes the result through the
++        /// canonical lane publisher (pinned here; the x86_64 host compiles the x86 branch).
++        #[test]
++        fn t12_a_receive_completion_published_before_the_capture_survives_it() {
++            clear_cells();
++            let w = world(53800);
++            let (a, t) = (w.a, w.driver);
++            let k = leak(w.s);
++            let code = SyscallError::TimedOut.code();
++            k.with(|s| {
++                s.with_tcb_mut(t, |tcb| {
++                    tcb.publish_riscv_user_return(0, 0, code);
++                    tcb.pending_syscall_completion = Some(BlockedSyscallCompletion {
++                        syscall_class: BlockedSyscallClass::IpcRecv,
++                        result: code as u64,
++                        tid: t,
++                        asid: a,
++                        blocked_generation: tcb.blocked_recv_generation,
++                    });
++                })
++            });
++            let cap = 0x1_0004;
++            let mut f = ecall(
++                crate::kernel::syscall::SYSCALL_IPC_RECV_NR,
++                [cap, 0, 0, 0, 0, 0],
++            );
++            assert!(kb::d2_recv_dispatch_try_defer(0, t));
++            assert_eq!(
++                bridge(k, &mut f),
++                (false, true),
++                "captured, never committed"
++            );
++            clear_cells();
++            assert_eq!(
++                f.user_gpr(10),
++                cap,
++                "the receive's frame is not given the park's result"
++            );
++            assert!(
++                k.reapply_parked_recv_completion_split(t),
++                "the exact record survived the capture and is re-applied"
++            );
++            const IPC: &str = include_str!("ipc_state.rs");
++            let rv = IPC
++                .split("pub(crate) fn publish_blocked_recv_timeout_result_with_identity(")
++                .nth(1)
++                .and_then(|s| s.split("#[cfg(target_arch = \"riscv64\")]").nth(1))
++                .expect("the RISC-V branch");
++            assert!(rv.trim_start().starts_with(
++                "{\n        tcb.publish_riscv_user_return(0, 0, timed_out as usize);"
++            ));
++            let mut ctx = saved(k, t);
++            let mut tcb_model = crate::kernel::task::ThreadControlBlock::new(ThreadId(t), Some(a));
++            tcb_model.user_context = ctx;
++            tcb_model.publish_riscv_user_return(0, 0, code);
++            ctx = tcb_model.user_context;
++            let r = switched(&other_trap(), ctx);
++            assert_eq!((r.a[0], r.a[1]), (code, 0), "ring 3 sees the completion");
++        }
++
++        /// 11 / 16 / 21 — a blocking SEND's completion is its own exact record, consumed once, and
++        /// the park commit neither creates nor consumes one. A record of another cycle is refused.
++        #[test]
++        fn t11_a_send_completion_is_exact_and_consumed_once() {
++            clear_cells();
++            let w = world(54000);
++            let (a, t) = (w.a, w.driver);
++            let k = leak(w.s);
++            let record = |generation: u64| BlockedSyscallCompletion {
++                syscall_class: BlockedSyscallClass::IpcSend,
++                result: 0,
++                tid: t,
++                asid: a,
++                blocked_generation: generation,
++            };
++            let live = k
++                .with(|s| s.with_tcb_mut(t, |tcb| tcb.blocked_send_generation))
++                .expect("tcb");
++            // A record of an older cycle is not this send's.
++            k.with(|s| {
++                s.with_tcb_mut(t, |tcb| {
++                    tcb.pending_syscall_completion = Some(record(live.wrapping_sub(1)))
++                })
++            });
++            assert!(
++                k.with(
++                    |s| s.take_blocked_syscall_completion_of_class(t, BlockedSyscallClass::IpcSend)
++                )
++                .is_none()
++            );
++            k.with(|s| {
++                s.with_tcb_mut(t, |tcb| tcb.pending_syscall_completion = Some(record(live)))
++            });
++            // A park commit of an unrelated frame touches no record.
++            let mut f = ecall(SYSCALL_YIELD_NR, [0; 6]);
++            f.set_ok(0, 0, 0);
++            assert!(kb::yield_dispatch_try_defer(0, t));
++            assert!(bridge(k, &mut f).1, "captured");
++            clear_cells();
++            assert!(
++                k.with(|s| s.has_pending_syscall_completion(t)),
++                "still parked"
++            );
++            let once = k.with(|s| {
++                s.take_blocked_syscall_completion_of_class(t, BlockedSyscallClass::IpcSend)
++            });
++            assert_eq!(once, Some(record(live)));
++            assert!(
++                k.with(
++                    |s| s.take_blocked_syscall_completion_of_class(t, BlockedSyscallClass::IpcSend)
++                )
++                .is_none(),
++                "never twice"
++            );
++        }
++
++        /// 15 — the deferral names an EXITING task: nothing is committed and nothing captured; it
++        /// names a task with no TCB: nothing is captured and no other task changes.
++        #[test]
++        fn t15_no_result_for_an_exiting_or_absent_incarnation() {
++            clear_cells();
++            let w = world(54200);
++            let (a, k) = (w.a, leak(w.s));
++            let t = 54300;
++            k.with(|s| task(s, t, a));
++            let before = saved(k, t);
++            let mut f = ecall(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0, 0, 0]);
++            f.set_ok(1, 0, 0);
++            assert!(kb::futex_wait_dispatch_try_defer(0, t));
++            assert!(kb::exit_queue_advance_publish(0, t, Some(a)));
++            assert_eq!(
++                bridge(k, &mut f),
++                (false, false),
++                "an exiting task is given nothing"
++            );
++            assert_eq!(f.user_gpr(10), SQ);
++            assert_eq!(saved(k, t), before);
++            clear_cells();
++            let absent = 54398;
++            assert!(kb::futex_wait_dispatch_try_defer(0, absent));
++            assert_eq!(bridge(k, &mut f).1, false, "no TCB, nothing captured");
++            clear_cells();
++            assert_eq!(saved(k, t), before);
++        }
++
++        /// 17 — a fresh task's startup arguments reach `a0..a5`, and no park commit reaches them.
++        #[test]
++        fn t17_startup_arguments_are_preserved() {
++            let w = world(54400);
++            let (a, k) = (w.a, leak(w.s));
++            let fresh = 54500;
++            k.with(|s| task(s, fresh, a));
++            let ctx = saved(k, fresh);
++            park(k, a, 54501, SQ, 5);
++            assert_eq!(
++                saved(k, fresh),
++                ctx,
++                "another task's park changes nothing here"
++            );
++            let r = switched(&other_trap(), ctx);
++            assert_eq!(r.a[0], fresh as usize, "the seeded startup argument");
++            assert_eq!(r.sepc, 0x40_0000);
++        }
++
++        /// 18 — an asynchronously preempted task is restored verbatim; the park commit (an earlier
++        /// cycle's) does not leak into it.
++        #[test]
++        fn t18_an_async_preemption_restores_the_register_file_verbatim() {
++            let w = world(54600);
++            let (a, t) = (w.a, 54700);
++            let k = leak(w.s);
++            park(k, a, t, SQ, 5);
++            assert_eq!(
++                k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
++                1
++            );
++            // It runs on; a timer interrupts it mid-computation with live a0..a7.
++            let mut live = ecall(0, [0; 6]);
++            for (i, v) in [0xa0usize, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7]
++                .iter()
++                .enumerate()
++            {
++                live.set_user_gpr(10 + i, *v);
++            }
++            live.set_saved_pc(0x40_2222);
++            assert!(k.snapshot_async_preempted_split(t, &live));
++            assert!(
++                k.take_async_preempt_for_incoming_split(t, Some(a))
++                    .restores_verbatim(),
++                "the exact tag"
++            );
++            let r = async_resume(&other_trap(), saved(k, t));
++            assert_eq!(r.a, [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7]);
++            assert_eq!(r.sepc, 0x40_2222);
++        }
++
++        /// 19 — the same continuation, resumed on its own trap (a self-resume) or by another
++        /// task's trap (a switch), gives ring 3 the same result.
++        #[test]
++        fn t19_a_self_resume_and_a_switched_resume_agree() {
++            let w = world(54800);
++            let (a, t) = (w.a, 54900);
++            let k = leak(w.s);
++            let f = park(k, a, t, SQ, 5);
++            assert_eq!(
++                k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
++                1
++            );
++            let ctx = saved(k, t);
++            let mine = same_task(&f, Some(ctx));
++            let theirs = switched(&other_trap(), ctx);
++            assert_eq!(mine.futex_wait(), Ok(true));
++            assert_eq!(
++                (mine.a[0], mine.a[1], mine.a[2]),
++                (theirs.a[0], theirs.a[1], theirs.a[2])
++            );
++            assert_eq!((mine.sepc, mine.keep), (theirs.sepc, theirs.keep));
++        }
++
++        /// 20 — `sepc` is advanced once: the commit writes no pc, and committing again changes
++        /// nothing.
++        #[test]
++        fn t20_sepc_is_advanced_exactly_once() {
++            let mut f = ecall(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0, 0, 0]);
++            f.set_ok(1, 0, 0);
++            f.commit_riscv_parked_syscall_returns();
++            let once = f.clone();
++            f.commit_riscv_parked_syscall_returns();
++            assert_eq!(f, once, "idempotent");
++            assert_eq!(f.saved_pc(), ECALL + 4);
++            assert_eq!(
++                f.capture_user_context().instruction_ptr.0,
++                (ECALL + 4) as u64
++            );
++        }
++
++        /// 21 (wakes) — one wake resumes the waiter once; the next finds nobody, and the waiter is
++        /// on its queue once.
++        #[test]
++        fn t21_one_wake_one_resume() {
++            let w = world(55000);
++            let (a, t) = (w.a, 55100);
++            let k = leak(w.s);
++            park(k, a, t, SQ, 5);
++            assert_eq!(
++                k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
++                1
++            );
++            assert_eq!(
++                k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
++                0
++            );
++            assert_eq!(k.with(|s| queued_count(s, t)), 1);
++        }
++
++        /// 22 — the commit is lock-free and the RISC-V bridge acquires no broad lock (none exists
++        /// in production; `tests/broad_lock_census_guard.rs` pins the count).
++        #[test]
++        fn t22_the_commit_takes_no_lock() {
++            const BOOT: &str = include_str!("mod.rs");
++            let body = BOOT
++                .split("pub(crate) fn riscv_commit_final_park_result(")
++                .nth(1)
++                .and_then(|s| s.split("\n}\n").next())
++                .expect("the commit");
++            for forbidden in ["with(", "with_cpu", "lock()", "_split_mut", "SharedKernel"] {
++                assert!(
++                    !body.contains(forbidden),
++                    "the commit reaches `{forbidden}`"
++                );
++            }
++        }
++
++        // ── guards: the modelled pieces are the real ones ─────────────────────────────────────
++
++        const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
++        const RV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
++        const SPLIT: &str = include_str!("../syscall_split.rs");
++
++        /// The switched write-back arms are the ones `switched`, `switched_continuation` and
++        /// `async_resume` model.
++        #[test]
++        fn g01_the_switched_write_back_is_the_modelled_one() {
++            let wb = RV_BOOT
++                .split("let continuation = crate::kernel::boot::riscv_syscall_continuation_take(cpu.0 as usize);")
++                .nth(1)
++                .expect("the bridge write-back");
++            let startup = wb
++                .split("} else if task_switched {")
++                .nth(1)
++                .and_then(|s| s.split("} else {").next())
++                .expect("the switched ordinary arm");
++            for i in 0..6 {
++                assert!(
++                    startup.contains(&alloc::format!(
++                        "frame.regs[RiscvTrapFrame::A{i}] = tframe.arg({i}) as u64;"
++                    )),
++                    "a{i} from the argument lane"
++                );
++            }
++            assert!(startup.contains("frame.regs[RiscvTrapFrame::A7] = 0;"));
++            let cont = wb
++                .split("} else if task_switched && continuation {")
++                .nth(1)
++                .and_then(|s| s.split("} else if task_switched {").next())
++                .expect("the continuation arm");
++            assert!(cont.contains("frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;"));
++            assert!(cont.contains("frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;"));
++            let asy = wb
++                .split("} else if task_switched && continuation {")
++                .next()
++                .unwrap();
++            for (r, g) in [(0, 10), (3, 13), (7, 17)] {
++                assert!(asy.contains(&alloc::format!(
++                    "frame.regs[RiscvTrapFrame::A{r}] = tframe.user_gpr({g}) as u64;"
++                )));
++            }
++            // The mirror loop skips exactly the ABI block, so a6 and every other register come
++            // from the saved register file.
++            assert!(RV_BOOT.contains(
++                "|| i == RiscvTrapFrame::A5\n                || i == RiscvTrapFrame::A7"
++            ));
++        }
++
++        /// The same-task arm adopts the published lanes on a self-resume, as `same_task` models.
++        #[test]
++        fn g02_the_same_task_write_back_is_the_modelled_one() {
++            let arm = RV_BOOT
++                .split("// Same task continuing past its own ecall")
++                .nth(1)
++                .expect("the same-task arm");
++            assert!(arm.contains(
++                "if !continuation && tframe.resume_owner().is_some_and(|o| o.tid == resume_tid) {\n                tframe.adopt_restored_riscv_syscall_returns();"
++            ));
++            assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;"));
++            assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = err as u64;"));
++        }
++
++        /// The runtime decode is the modelled one, and its `ecall` declares `a0..a2` as outputs
++        /// and `a3..a5`, `a7` as preserved inputs.
++        #[test]
++        fn g03_the_user_runtime_decode_is_the_modelled_one() {
++            const LIB: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
++            const RV: &str = include_str!("../../../crates/yarm-user-rt/src/arch/riscv64.rs");
++            let fw = LIB.split("pub fn futex_wait(").nth(1).expect("futex_wait");
++            let fw = &fw[..fw.find("\n    }\n").expect("end")];
++            assert!(fw.contains("#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]\n        if ret.ret0 > 1 {"));
++            assert!(fw.contains("Ok(ret.ret0 != 0)"));
++            for lane in [
++                "inlateout(\"a0\") a0",
++                "inlateout(\"a1\") a1",
++                "inlateout(\"a2\") a2",
++            ] {
++                assert!(RV.contains(lane), "{lane}");
++            }
++            for lane in [
++                "in(\"a3\") a3",
++                "in(\"a4\") a4",
++                "in(\"a5\") a5",
++                "in(\"a7\") a7",
++            ] {
++                assert!(RV.contains(lane), "{lane}");
++            }
++        }
++
++        /// The route's park and yield answers are the modelled `set_ok` lines.
++        #[test]
++        fn g04_the_parked_answers_are_the_modelled_ones() {
++            let parked = SPLIT
++                .split("FutexParkOutcome::Parked { .. } => {")
++                .nth(1)
++                .and_then(|s| s.split("D::QueueAdvanceCommitted").next())
++                .expect("the Parked arm");
++            assert!(parked.trim_end().ends_with("frame.set_ok(1, 0, 0);"));
++            let y = SPLIT
++                .split("pub(crate) fn split_yield_settle<")
++                .nth(1)
++                .expect("the yield settlement");
++            assert!(y.contains("frame.set_ok(0, 0, 0);\n            D::QueueAdvanceCommitted"));
++        }
++
++        /// The RISC-V bridge runs what `bridge` models, in its order: the deferral chain and the
++        /// exit check, then the commit, then the capture.
++        #[test]
++        fn g05_the_bridge_commits_before_it_captures() {
++            let arm = RV_TRAP
++                .split("let futex_wait_outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);")
++                .nth(1)
++                .and_then(|s| s.split("result=queue_advance_committed").next())
++                .expect("the committed-park arm");
++            let at = |needle: &str| arm.find(needle).unwrap_or_else(|| panic!("{needle}"));
++            let exiting =
++                at("let exiting = crate::kernel::boot::exit_queue_advance_pending(cpu_idx)");
++            let commit = at(
++                "let committed = crate::kernel::boot::riscv_commit_final_park_result(cpu_idx, frame);",
++            );
++            let capture = at(".map(|t| shared.capture_outgoing_user_context_split(t, frame))");
++            let reapply = at("shared.reapply_parked_recv_completion_split(t);");
++            assert!(exiting < commit && commit < capture && capture < reapply);
++            assert_eq!(arm.matches("riscv_commit_final_park_result").count(), 1);
++        }
++    }
++
+     mod wait_atomic1 {
+         use super::atomic1::{Model, Op, Q, Res, legal};
+         use super::*;
+diff --git a/src/kernel/trapframe.rs b/src/kernel/trapframe.rs
+index 313e8d04..28e9a8f4 100644
+--- a/src/kernel/trapframe.rs
++++ b/src/kernel/trapframe.rs
+@@ -216,6 +216,10 @@ impl TrapFrame {
+         self.error = 0;
+     }
+ 
++    /// BASELINE HARNESS: 2a91a6e8 commits nothing into the register file.
++    #[cfg(test)]
++    pub(crate) fn commit_riscv_parked_syscall_returns(&mut self) {}
++
+     /// QEMU-SMP1-ACCEPTANCE §1 — name the incarnation whose continuation this frame now holds.
+     /// Called only by an owner that has just put that continuation here from that incarnation.
+     pub(crate) fn bind_resume_owner(&mut self, owner: crate::runtime::FpuHomeOwner) {

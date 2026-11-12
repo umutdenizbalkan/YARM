@@ -1,0 +1,3 @@
+313bc227908e458aeaad4e6faa73c7da2f9d8d6c24f933f1586a89895c947259  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rpr-evidence/live/livenc2-x86_64/boot.log
+cceec5f971a13ba3b259f50436104f198c1a69298189a943e505112f073d2dc2  build-x86_64/kernel_boot.elf
+586be94a538904855760e248c92874c70b173ee7b7fec3c563a4cb88bf6e0e45  build-x86_64/initramfs-core.cpio
