@@ -3044,7 +3044,9 @@ pub(super) mod futex_wait_witness {
     const P: FutexScope = FutexScope::Private;
     /// The high half of every witness word (the kernel's `wait_witness::MAGIC`).
     pub(super) const MAGIC: u32 = 0xF7A1_0000;
-    pub(super) const CALLS: u32 = 16;
+    /// RISCV-PARK-RET1: 32 (was 16) — windows open only while a peer runs, and the grader now
+    /// also requires genuinely parked waits, so each boot needs more cycles for its coverage.
+    pub(super) const CALLS: u32 = 32;
     pub(super) const STACK_BYTES: usize = 4096;
     const WAIT_YIELDS: u32 = 200_000;
 
@@ -3090,10 +3092,19 @@ pub(super) mod futex_wait_witness {
                         u32::from(blocked)
                     );
                 }
-                Err(_) => {
+                // RISCV-PARK-RET1: the runtime's own verdict on the register file the kernel
+                // returned — `Ok(true)` for a wait that blocked, `Ok(false)` for one whose word had
+                // changed, and anything else (a parked wait resumed with its address in `a0`
+                // decodes as an error) logged with the error the runtime decoded.
+                Err(e) => {
                     RETURNS.fetch_add(1, SeqCst);
                     ERRORS.fetch_add(1, SeqCst);
-                    yarm_user_rt::user_log!("FWAW_CALL cycle={} expected=0x{:x} error=1", c, v);
+                    yarm_user_rt::user_log!(
+                        "FWAW_CALL cycle={} expected=0x{:x} error={:?}",
+                        c,
+                        v,
+                        e
+                    );
                 }
             }
         }

@@ -7,11 +7,13 @@
 #
 # One clean boot with `yarm.futex_requeue_witness=1`, kernel and init both built with
 # `futex-wait-witness`: init's selector-18 cell then runs the wait witness instead of FUTEX-REQUEUE1's
-# rounds. A waiter thread issues FutexWait(WORD, v) for 16 cycles, each v read just before; two
+# rounds. A waiter thread issues FutexWait(WORD, v) for 32 cycles, each v read just before; two
 # signaller threads issue FutexWake(WORD, 1) in a loop, storing a new value first on even cycles,
 # while init blocks. The kernel holds each witness wait open before its compare-and-register (B)
 # and after it (A), each until a wake from another CPU has run inside — but only while a sibling of
 # the waiter is current on another CPU (otherwise the wait is logged SKIPPED and runs unwindowed).
+# RISCV-PARK-RET1: the grader also checks every cycle's return value against the kernel's outcome
+# for it: a wait that GENUINELY parked must come back to userspace as Ok(true).
 #
 # The verdict comes from scripts/grade-futex-wait-witness.py (its docstring has the rules), plus
 # the standard core smoke. Raw serial log, normalized log and grader output are kept in $LOGDIR.

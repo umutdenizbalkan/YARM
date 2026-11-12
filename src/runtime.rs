@@ -18669,7 +18669,8 @@ impl SharedKernel {
         });
         #[cfg(feature = "futex-wait-witness")]
         if let Some(w) = witness {
-            let held = fx::wait_witness::hold('B', w, cpu.0, tid);
+            let peer = || self.futex_wait_witness_peer_running_split(cpu, tid, asid);
+            let held = fx::wait_witness::hold('B', w, cpu.0, tid, &peer);
             let word = self.futex_wait_witness_word_split(asid, addr, kind);
             fx::wait_witness::close('B', w, held, cpu.0, expected, word);
         }
@@ -18725,7 +18726,8 @@ impl SharedKernel {
         // FUTEX-WAIT-ATOMIC1 live witness: window A, after the registration and before the clear.
         #[cfg(feature = "futex-wait-witness")]
         if let Some(w) = witness {
-            let held = fx::wait_witness::hold('A', w, cpu.0, tid);
+            let peer = || self.futex_wait_witness_peer_running_split(cpu, tid, asid);
+            let held = fx::wait_witness::hold('A', w, cpu.0, tid, &peer);
             fx::wait_witness::close('A', w, held, cpu.0, expected, None);
         }
 

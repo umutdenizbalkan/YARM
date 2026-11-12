@@ -1219,9 +1219,13 @@ pub mod race_witness {
 /// on one console: `..._WINDOW_OPEN` before the window is published, the waker's
 /// `..._IN_WINDOW_WAKE` before it releases it, `..._WINDOW_CLOSE` after (B's close also reports the
 /// word it reads then, so a grader can tell whether the window saw a store). `..._RESULT` is the
-/// wait's own outcome. Bounded: a window gives up after `SPIN_BOUND` polls (`competing_wakes=0`).
-/// A wait opens its windows only while a sibling thread of the waiter (same address space, another
-/// TID) is current on another CPU; otherwise it is logged `..._SKIPPED` and runs unwindowed.
+/// wait's own outcome. A wait opens its windows only while a sibling thread of the waiter (same
+/// address space, another TID) is current on another CPU; otherwise it is logged `..._SKIPPED` and
+/// runs unwindowed. RISCV-PARK-RET1: a window is bounded and fails closed — it re-checks every
+/// `PEER_RECHECK` polls that such a sibling is still current, and gives up when none has been for
+/// `PEER_MISSES` checks in a row (`end=no_peer`: an explicit refusal — the siblings' own switches
+/// briefly empty that CPU's slot, hence the debounce) or after `SPIN_BOUND` polls (`end=bound`: a
+/// failure). A window never waits on a task that is merely queued.
 #[cfg(feature = "futex-wait-witness")]
 pub mod wait_witness {
     use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -1233,7 +1237,9 @@ pub mod wait_witness {
     static WAKES: AtomicU64 = AtomicU64::new(0);
     /// The witness has one waiter thread, so its last wait is the one in flight.
     static LAST_WAIT: AtomicU64 = AtomicU64::new(0);
-    const SPIN_BOUND: u64 = 400_000_000;
+    const SPIN_BOUND: u64 = 50_000_000;
+    const PEER_RECHECK: u64 = 1 << 16;
+    const PEER_MISSES: u32 = 8;
 
     fn armed(expected: u32) -> bool {
         crate::kernel::boot::futex_requeue_witness_enabled() && expected & 0xFFFF_0000 == MAGIC
@@ -1264,9 +1270,25 @@ pub mod wait_witness {
         armed(expected).then(|| LAST_WAIT.load(SeqCst))
     }
 
-    /// Hold window `kind` (`B` or `A`) of wait `wait` open until a competing wake has run in it.
-    /// Returns the window id and how many wakes ran wholly inside it.
-    pub fn hold(kind: char, wait: u64, cpu: u8, tid: u64) -> (u64, u64) {
+    /// How a window ended: a wake ran inside it, the bound ran out, or no sibling was current.
+    #[derive(Clone, Copy)]
+    pub enum End {
+        Woke,
+        Bound,
+        NoPeer,
+    }
+
+    /// Hold window `kind` (`B` or `A`) of wait `wait` open until a competing wake has run in it,
+    /// while `peer()` (a sibling of the waiter is current on another CPU) holds, for at most
+    /// `SPIN_BOUND` polls. Returns the window id, how many wakes ran wholly inside it, and why it
+    /// ended.
+    pub fn hold(
+        kind: char,
+        wait: u64,
+        cpu: u8,
+        tid: u64,
+        peer: &dyn Fn() -> bool,
+    ) -> (u64, u64, End) {
         let id = NEXT_WINDOW.fetch_add(1, SeqCst);
         let before = WAKES.load(SeqCst);
         crate::yarm_log!(
@@ -1279,41 +1301,65 @@ pub mod wait_witness {
         );
         OPEN.store(id, SeqCst);
         let mut spins = 0u64;
-        while WAKES.load(SeqCst) == before && spins < SPIN_BOUND {
+        let mut end = End::Woke;
+        let mut misses = 0u32;
+        while WAKES.load(SeqCst) == before {
+            if spins >= SPIN_BOUND {
+                end = End::Bound;
+                break;
+            }
+            if spins % PEER_RECHECK == PEER_RECHECK - 1 {
+                if peer() {
+                    misses = 0;
+                } else {
+                    misses += 1;
+                    if misses >= PEER_MISSES {
+                        end = End::NoPeer;
+                        break;
+                    }
+                }
+            }
             core::hint::spin_loop();
             spins += 1;
         }
         OPEN.store(0, SeqCst);
-        (id, WAKES.load(SeqCst) - before)
+        (id, WAKES.load(SeqCst) - before, end)
     }
 
     /// Close window `id`; `word` is what the witness reads now (B only; `None` for A).
     pub fn close(
         kind: char,
         wait: u64,
-        (id, competing): (u64, u64),
+        (id, competing, end): (u64, u64, End),
         cpu: u8,
         expected: u32,
         word: Option<u32>,
     ) {
+        let end = match end {
+            End::Woke => "woke",
+            End::Bound => "bound",
+            End::NoPeer => "no_peer",
+        };
         match word {
             Some(word) => crate::yarm_log!(
-                "FUTEX_WAIT_WITNESS_WINDOW_CLOSE kind={} wait={} window={} cpu={} competing_wakes={} expected=0x{:x} word=0x{:x}",
+                "FUTEX_WAIT_WITNESS_WINDOW_CLOSE kind={} wait={} window={} cpu={} competing_wakes={} end={} expected=0x{:x} word=0x{:x}",
                 kind,
                 wait,
                 id,
                 cpu,
                 competing,
+                end,
                 expected,
                 word
             ),
             None => crate::yarm_log!(
-                "FUTEX_WAIT_WITNESS_WINDOW_CLOSE kind={} wait={} window={} cpu={} competing_wakes={}",
+                "FUTEX_WAIT_WITNESS_WINDOW_CLOSE kind={} wait={} window={} cpu={} competing_wakes={} end={}",
                 kind,
                 wait,
                 id,
                 cpu,
-                competing
+                competing,
+                end
             ),
         }
     }
