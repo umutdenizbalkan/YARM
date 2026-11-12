@@ -401,23 +401,6 @@ fn ensure_reserved_device_mappings(
     ensure_early_device_mapping(state, root_idx, cpu_if_pa)
 }
 
-#[cfg(all(not(feature = "hosted-dev"), not(test), target_arch = "aarch64"))]
-#[inline]
-fn raw_uart_marker(tag: u8) {
-    const UART_BASE: usize = 0x0900_0000;
-    const PL011_DR: usize = 0x000;
-    const PL011_FR: usize = 0x018;
-    const PL011_FR_TXFF: u32 = 1 << 5;
-    unsafe {
-        while core::ptr::read_volatile((UART_BASE + PL011_FR) as *const u32) & PL011_FR_TXFF != 0 {}
-        core::ptr::write_volatile((UART_BASE + PL011_DR) as *mut u32, tag as u32);
-    }
-}
-
-#[cfg(any(feature = "hosted-dev", test, not(target_arch = "aarch64")))]
-#[inline]
-fn raw_uart_marker(_tag: u8) {}
-
 static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTableState::new());
 
 pub fn reset_state() {
@@ -601,10 +584,13 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             value = in(reg) ttbr0,
             options(nostack, preserves_flags)
         );
-        raw_uart_marker(b'3');
+        // RISCV-ECALL-A7-RET1 §8: the raw PL011 bytes `3` / `4` that used to precede ASW3 / ASW4
+        // are retired. They bypassed the printk drain, so another CPU's structured line could carry
+        // a stray `3` or `4` (`FUTEX_WAIT_WI3TNESS_WINDOW_OPEN`, and two failed qualification runs
+        // in RISCV-PARK-RET1). They added nothing: the structured ASW3 / ASW4 markers that follow
+        // each one name the same two progress points, and run in the same place.
         crate::yarm_log!("ASW3 immediately after msr ttbr0_el1 asid={}", asid.0);
         core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
-        raw_uart_marker(b'4');
         crate::yarm_log!("ASW4 after barriers/isb asid={}", asid.0);
     }
     Ok(ttbr0)

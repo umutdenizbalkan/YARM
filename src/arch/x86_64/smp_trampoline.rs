@@ -226,7 +226,7 @@ yarm_ap_trampoline_start:
     cld
 
     // Breadcrumb: AP started executing real-mode trampoline.
-    mov dx, 0x3F8
+    mov dx, 0xE9
     mov al, 'g'
     out dx, al
 
@@ -323,7 +323,7 @@ ap_gdt_end:
 
     .code32
 ap_protected_entry:
-    mov dx, 0x3F8
+    mov dx, 0xE9
     mov al, 'h'        // reached 32-bit protected mode
     out dx, al
 
@@ -415,7 +415,7 @@ ap_protected_entry:
 
     .code64
 ap_long_entry:
-    mov dx, 0x3F8
+    mov dx, 0xE9
     mov al, 'L'        // reached long mode
     out dx, al
 
@@ -532,7 +532,7 @@ unsafe extern "C" {
 /// `AP_READY_FLAGS` (which tracks trampoline assembly reach). Set by the
 /// BSP polling code after observing the trampoline-published online value
 /// (2) at the ready_word slot and confirming the AP entered Rust via the
-/// `@` COM1 breadcrumb. Today, live x86_64 build sets the BSP-side flag
+/// `@` breadcrumb (debugcon, port 0xE9). Today, live x86_64 build sets the BSP-side flag
 /// from `start_secondary_cpus`; hosted-dev tests mirror it directly.
 pub(super) static AP_RUST_ONLINE: [core::sync::atomic::AtomicBool;
     crate::arch::platform_constants::MAX_CPUS] = [const { core::sync::atomic::AtomicBool::new(false) };
@@ -549,7 +549,7 @@ pub(super) static AP_RUST_ONLINE: [core::sync::atomic::AtomicBool;
 ///
 /// Steps (all asm, no Rust ABI):
 ///   1. `cli` — interrupts stay masked (we have no AP IDT).
-///   2. Emit `@` byte to COM1 (Rust entered breadcrumb — proves
+///   2. Emit `@` byte to debugcon (Rust entered breadcrumb — proves
 ///      higher-half Rust text executed and the jump from low-RIP
 ///      trampoline to high-RIP Rust succeeded).
 ///   3. `cli; hlt; jmp` loop forever. The AP is now parked under Rust.
@@ -582,11 +582,16 @@ pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch 
 // ---------------------------------------------------------------------------
 // Stage 183 increment 2 — AP breadcrumb ⇄ stage trace map (offset 48 stage word)
 // ---------------------------------------------------------------------------
-// The AP path emits a serial breadcrumb byte to COM1 (port 0x3F8) AND writes a
-// numeric AP_STAGE_* code to the low-memory stage word at [handoff+48] before
-// every risky action. The breadcrumb bytes are INTENTIONAL, not corruption; the
-// stage word turns the interleaved serial stream into a deterministic trace the
-// BSP can name on timeout (`last_stage=<name> last_stage_raw=<hex>`).
+// The AP path emits a breadcrumb byte AND writes a numeric AP_STAGE_* code to the
+// low-memory stage word at [handoff+48] before every risky action; the stage word
+// is the trace the BSP names on timeout (`last_stage=<name> last_stage_raw=<hex>`).
+//
+// RISCV-ECALL-A7-RET1 §8: the breadcrumbs go to the DEBUGCON port (0xE9), as the
+// late ones already did — no longer to COM1 (0x3F8). On COM1 they interleaved with
+// the BSP's structured bring-up lines while the AP ran, and split a REQUIRED one
+// (`X86_AP_KEiRNEL_CRy3_BEGIN cupu=1`, a failed qualification run). The byte map
+// below is unchanged and is read with QEMU `-debugcon`; an `out` to 0xE9 without
+// that device is ignored. No logger, lock or Rust is added to the trampoline.
 //
 // Trampoline breadcrumbs (pre-Rust, no stage word — asm in the global_asm! above):
 //   byte  asm block / instruction boundary          meaning / precondition
@@ -808,7 +813,7 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
     // ApHandoff offsets (rdi = handoff_ptr, guaranteed by the naked calling-convention
     // contract): ready_word=32, percpu_record_ptr=40, ap_stage=48. Every risky action is
     // preceded by a paired serial breadcrumb byte AND a stage-word write to [rdi+48], so
-    // a BSP timeout can name the last stage. `dx` is reloaded to 0x3F8 before each `out`
+    // a BSP timeout can name the last stage. `dx` is reloaded to 0xE9 (debugcon) before each `out`
     // because rdmsr/wrmsr clobber rdx. See the "AP breadcrumb ⇄ stage trace map" table
     // above for the byte↔stage↔block mapping and "failure after this byte" semantics.
     // `AP_IDLE_ADMIT_PROOF` (compile-time, non-knob) gates the BSP-side admit poll; this
@@ -816,7 +821,7 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
     core::arch::naked_asm!(
         "cli",
         // '@' / stage 10: the Rust-entered breadcrumb — higher-half Rust text ran.
-        "mov dx, 0x3F8",
+        "mov dx, 0xE9",
         "mov al, 0x40", // '@'
         "out dx, al",
         "mov dword ptr [rdi + 48], 10",
@@ -843,7 +848,7 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "shr rdx, 32",
         "wrmsr",
         // 'w' / stage 14: wrmsr returned.
-        "mov dx, 0x3F8",
+        "mov dx, 0xE9",
         "mov al, 0x77", // 'w'
         "out dx, al",
         "mov dword ptr [rdi + 48], 14",
@@ -853,7 +858,7 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "shl rdx, 32",
         "or rax, rdx",
         // 'r' / stage 15: rdmsr returned (rax = readback).
-        "mov dx, 0x3F8",
+        "mov dx, 0xE9",
         "mov r8, rax",  // preserve readback across the breadcrumb
         "mov al, 0x72", // 'r'
         "out dx, al",
@@ -1008,20 +1013,20 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "mov dx, 0xE9", // late breadcrumb -> debugcon, NOT structured COM1
         "mov al, 0x61", // 'a'
         "out dx, al",
-        "mov dx, 0x3F8",                // restore COM1 for later code assuming rdx
+        "mov dx, 0xE9",                 // keep debugcon for later code assuming rdx
         "mov dword ptr gs:[116], 1",    // irq_ack = 1 (persistent)
         "mov dword ptr [rdi + 48], 36", // IRQ_ACK_WRITTEN
         "mov dx, 0xE9",                 // late breadcrumb -> debugcon
         "mov al, 0x64",                 // 'd'
         "out dx, al",
-        "mov dx, 0x3F8", // restore COM1
+        "mov dx, 0xE9", // keep debugcon
         // 'v' / stage 28 (inc.4): smoke handled (handler counted + EOI'd + iretq'd
         // back into the window). Interrupts are masked again; fall through to the
         // MANAGED scheduler-owned idle loop (183.5) — NOT a bare cli/hlt park.
         "mov dx, 0xE9", // late breadcrumb -> debugcon
         "mov al, 0x76", // 'v'
         "out dx, al",
-        "mov dx, 0x3F8", // restore COM1
+        "mov dx, 0xE9", // keep debugcon
         "mov dword ptr [rdi + 48], 28",
         // 'q' / stage 30 (183.5): scheduler-owned idle. The BSP installs
         // current=idle(tid 0) for this CPU and brings it scheduler-online; this
@@ -1032,7 +1037,7 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "mov dx, 0xE9", // late breadcrumb -> debugcon
         "mov al, 0x71", // 'q'
         "out dx, al",
-        "mov dx, 0x3F8", // restore COM1
+        "mov dx, 0xE9", // keep debugcon
         // Publish sched-idle state BOTH into the low handoff stage word (boot-CR3
         // trace) AND the per-CPU record via gs: (kernel .bss — the ONLY thing the
         // post-boot admission polls: the low identity VAs are unmapped on the task
@@ -1091,7 +1096,7 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "mov dx, 0xE9", // late breadcrumb -> debugcon
         "mov al, 0x7A", // 'z'
         "out dx, al",
-        "mov dx, 0x3F8", // restore COM1
+        "mov dx, 0xE9", // keep debugcon
         "mov dword ptr [rdi + 48], 31",
         "mov dword ptr gs:[120], 31",   // sched_stage mirror
         "add dword ptr [rdi + 132], 1", // wake_reenter_out++
