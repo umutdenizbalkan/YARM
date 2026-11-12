@@ -214726,6 +214726,10 @@ mod futex_requeue1 {
         /// The `ecall` instruction; the bridge pre-advances `sepc` past it once, at entry.
         const ECALL: usize = 0x40_1000;
         const USER_SP: usize = 0x7fbf_f7b0;
+        /// What a parked caller leaves in `a3..a5` (inputs its `ecall` declares preserved).
+        const A3: usize = 0x3333;
+        const A4: usize = 0x4444_0000;
+        const A5: usize = 0x5555_0000;
         /// Registers no syscall return may touch: `ra`, `tp`, `t0`, `s0`, `a6`.
         const KEEP: [(usize, usize); 5] = [
             (1, 0x1111),
@@ -214901,7 +214905,7 @@ mod futex_requeue1 {
         /// captures. Returns the trap's frame.
         fn park(k: &SharedKernel, a: Asid, t: u64, va: usize, exp: u32) -> TrapFrame {
             clear_cells();
-            let mut f = ecall(SYSCALL_FUTEX_WAIT_NR, [va, exp as usize, 0, 0, 0, 0]);
+            let mut f = ecall(SYSCALL_FUTEX_WAIT_NR, [va, exp as usize, 0, A3, A4, A5]);
             let (_r, o) = wait(k, a, t, va, exp, P);
             assert!(matches!(o, FutexParkOutcome::Parked { .. }), "{t}: {o:?}");
             f.set_ok(1, 0, 0);
@@ -214916,15 +214920,19 @@ mod futex_requeue1 {
             ecall(SYSCALL_YIELD_NR, [0; 6])
         }
 
+        /// A parked wait's resume: the result in `a0..a2`, `a3..a5` as the caller left them.
         fn assert_resumed_with(r: &Ring3, a0: usize) {
+            assert_resumed_as(r, a0, [A3, A4, A5]);
+        }
+        fn assert_resumed_as(r: &Ring3, a0: usize, a3_a5: [usize; 3]) {
             assert_eq!(
                 (r.a[0], r.a[1], r.a[2]),
                 (a0, 0, 0),
                 "the result lanes: {r:?}"
             );
             assert_eq!(
-                (r.a[3], r.a[4], r.a[5]),
-                (0, 0, 0),
+                [r.a[3], r.a[4], r.a[5]],
+                a3_a5,
                 "a3..a5 as the caller left them"
             );
             assert_eq!(r.sepc, ECALL + 4, "exactly once past the ecall");
@@ -214951,7 +214959,7 @@ mod futex_requeue1 {
             assert!(matches!(o, FutexParkOutcome::WokenDuringPublication { .. }));
             f.set_ok(1, 0, 0);
             let r = same_task(&f, None);
-            assert_resumed_with(&r, 1);
+            assert_resumed_as(&r, 1, [0, 0, 0]);
             assert_eq!(r.a[7], SYSCALL_FUTEX_WAIT_NR, "a7 is the hardware frame's");
             assert_eq!(r.futex_wait(), Ok(true));
         }
@@ -214986,7 +214994,7 @@ mod futex_requeue1 {
             assert!(matches!(o, FutexParkOutcome::ValueChanged));
             f.set_ok(0, 0, 0);
             let r = same_task(&f, None);
-            assert_resumed_with(&r, 0);
+            assert_resumed_as(&r, 0, [0, 0, 0]);
             assert_eq!(r.futex_wait(), Ok(false));
         }
 
