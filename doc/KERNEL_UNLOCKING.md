@@ -5142,6 +5142,248 @@ Verdict: **FUTEX_REQUEUE1_ACCEPTED_WITH_BASELINE_DEBT**. Refs: `claude/yarm-kern
 at the commit that adds this record; `main` `b81e0317` and every other ref unchanged.
 
 
+#### FUTEX-REQUEUE-ATOMIC1 (from delivered `279eb4f5`)
+
+**The question.** Is NR 17 one operation? Both twins (`futex_cmp_requeue_split`,
+`futex_cmp_requeue_current`) compared the word and transferred waiters in one task → VM → memory
+hold (`compare_and_requeue_locked`), released it, and then ran an ordinary FutexWake of the source
+(`futex_wake_key_outcome(_split)`). That wake took "the oldest live waiter" at whatever moment it
+ran, not the waiters the transfer had left for it.
+
+**Ownership, as it was.** Keys: `resolve_futex_word_locked` / `resolve_futex_key_locked` (VM 5 →
+memory 6). Comparison and transfer: `compare_and_requeue_locked` (task 2 → 5 → 6). FIFO selection,
+claim and placement of the wake portion: the FUTEX-WAKE-CAP1 loop, per waiter — `next_futex_waiter_locked`
+and the plan (rank 2), `reserve_enqueue_on_cpu_locked` (the home CPU's rank 1),
+`claim_futex_waiter_locked` (rank 2, token-exact), `commit_reserved_enqueue_on_cpu_locked` /
+`release_enqueue_reservation_on_cpu_locked` (rank 1). Exit: `retire_futex_waiters_for_task_locked`
+(by TID, any key). Split wait: register (rank 2), second read (5 → 6), undo by token, compare-and-clear
+(rank 1), read-back and `restore_entering_incarnation_exact_split`. The interval between the
+transfer's release and each wake claim was open to every one of those owners on every other CPU.
+
+**The counterexample, reproduced.** Hosted, deterministic: a test-only hook stops CPU 0's NR 17 in
+that interval, other operations run to completion through the production split owners, and the
+observable history — each result, who ended woken, the FIFO contents of every key — is checked
+against a sequential futex model over EVERY order the operations' real-time order allows
+(`futex_requeue1::atomic1`; the model is itself tested, `x00`). All five histories on `279eb4f5`
+are admitted by no order:
+
+| | in the interval | observed on `279eb4f5` | every legal order gives |
+|---|---|---|---|
+| x01 | CPU 1 `FutexWake(S, 1)`; then D registers on S through the production split wait (the word still 5) | NR 17 `(1, 2)` woke **D**; B, C moved | A woken by NR 17 and D parked; or B woken and only C (or C, D) moved |
+| x02 | CPU 1 `FutexWake(S, 1)` | NR 17 `(0, 2)`, no capacity stop | `(1, 2)` with the wake taking no one, or `(1, 1)` |
+| x03 | a competing NR 17 (S → U, wake 0) | `(0, 2)` and `(0, 1)` | `(1, 2)` / `(0, 0)`, or `(0, 0)` / `(0, 3)` |
+| x04 | a signal takes A, the word is bumped to 6, D (read 5) is refused by its own wait, E (read 6) registers | NR 17 — which compared 5 — woke **E**, a waiter of the next generation | E parked; NR 17 woke A or B |
+| x05 | the kept waiter A exits | `(0, 2)` | `(1, 2)` (A woken, then exits) or `(1, 1)` |
+
+Two of them distinguish legal futex sequencing from injection on purpose: D and E register through
+`futex_wait_park_exact_split` with the word's real value, and in x04 D is refused by that same path.
+
+**The required contract.** For a successful NR 17 there is one point at which the comparison, the
+wake portion (the oldest eligible source waiters, up to `wake`) and the requeue portion (the next,
+up to `requeue`) are all fixed; every concurrent wait, wake, requeue and exit is wholly before or
+wholly after it; every waiter it woke has exactly one guaranteed continuation; every waiter it moved
+stays blocked with its token. Physical placement may follow the point, if a reservation made before
+it guarantees the slot.
+
+**The repair: preflight, commit, placement.**
+
+1. *Preflight* (`futex_requeue_preflight(_split)`): for the oldest source waiters, up to `wake`,
+   the wake's own plan and home rule and a user slot RESERVED there — task and one CPU's scheduler
+   lock alternately, never nested. Reservations are counted per `(CPU, priority)`
+   (`FutexPlacementCounts`, 384 bytes), the unit the scheduler's reservation already is; the
+   preflight remembers where it was refused, if it was. It decides nothing and owns no waiter.
+2. *Commit* (`compare_and_requeue_locked`, the same one task → VM → memory hold): keys, word,
+   comparison; then, read-only, the wake portion — the FIFO prefix of live source waiters whose
+   placement (`homed_wake_placement_locked`: home CPU, class priority) has a reserved slot left.
+   At the first waiter without one: a capacity stop if the preflight was refused exactly that
+   placement (or that waiter's plan), otherwise the preflight is STALE — nothing is written, the
+   slots are released and the operation preflights again (at most `FUTEX_REQUEUE_ATTEMPTS` = 4; the
+   last attempt reports a stop instead, `CAPACITY_LIMITED`, "placement not secured"). Then one walk
+   moves the wake portion to `FutexKey::Pending { op, cpu, priority }` — still
+   `Blocked(Futex(token))`, token unchanged, a key no resolution produces, so no FutexWait,
+   FutexWake or NR 17 of a user word can reach it — and the next up to `requeue` waiters to the
+   target, starting AT the stop: an unplaceable head is never skipped. This is the linearization
+   point.
+3. *Placement* (`futex_requeue_place(_split)`): per pending key, its waiters claimed in order
+   (rank 2) and their reserved slots filled (rank 1, the FUTEX-WAKE-CAP1 reserved commit, which
+   cannot be refused for capacity); then every unused slot released.
+
+`woken` is the wake portion as committed: a selected waiter that exits before it is placed was
+woken and then exited (x05, r17); its slot is released.
+
+**Why one point.** Every registration, wake claim, requeue, undo and exit takes the task lock, and
+the comparison, both selections and both moves happen under one hold of it. After it, the wake set
+is reachable only through its private key, which only its own operation and task exit touch, so the
+placement cannot change any futex outcome the commit fixed; and the placement's slots were reserved
+before the commit and cannot be taken by ordinary enqueues (a reservation counts as occupied, x13).
+
+**The split wait, re-derived.** A waiter registered but still finishing its own FutexWait can be
+moved or selected by a commit. Its second read could then see the word change and retract the
+registration by token — leaving NR 17 having moved or woken a waiter that, by its own result,
+never waited (FUTEX-REQUEUE1's r16(b) pinned exactly this; `x10` shows no order admits it, and
+`x11` reproduces the selected case with two threads stepped deterministically). The second read's
+undo now refuses once the record is no longer on the key it registered on
+(`undo_futex_registration_unless_acted_on_locked`); the waiter then parks, and the other
+operation's outcome stands. The compare-and-clear failure path keeps its unconditional undo, so no
+task is ever left blocked while current. (FUTEX-REQUEUE1's NC10 — "the undo assumes the waiter is
+on its own key" — was, in hindsight, the linearizable rule; it is now the production one.)
+
+**The capacity rule, defined once.** The source queue is cut into one woken prefix, one moved block
+and the rest, in order. The wake portion stops at the first waiter whose placement is not secured;
+that waiter is the first one moved (`requeue > 0`) or stays at the head of the source
+(`requeue = 0`); a later waiter whose CPU has room is never woken past it (x16: the High queue full,
+the Normal one not). FUTEX-REQUEUE1 left the unplaceable waiter on the source and moved the
+younger ones past it, so a condition variable's `wake = 0` retry then put the oldest waiter LAST on
+the mutex (r21 and r22 re-derived). Requeueing still needs no room at all (r21: wake 0 / requeue 100
+with a full queue).
+
+**The word.** The freestanding reader was `read_volatile`, which is not an atomic access in Rust's
+memory model; another CPU's user code stores the word with atomics while the kernel reads it. It is
+now an `AtomicU32` Acquire load, and it refuses a misaligned frame itself (every syscall already
+refuses one). Ordering against registrations and claims still comes from the task lock; this fixes
+only the read's own atomicity.
+
+**Locks and SMP.** No rank-2 → rank-1 nesting anywhere: the preflight and the placement alternate
+task and ONE CPU's scheduler lock, exactly the pairs FutexWake takes; the commit holds 2 → 5 → 6 as
+before and touches no scheduler state (P1). No scheduler lock is held across a bucket walk, VM or
+memory; no two scheduler CPU locks are ever held together. NR 17 stays off the broad lock on all
+three ports (the route and `broad_lock=0` unchanged). Bounded: ≤ `wake` reservations, two bucket
+walks of ≤ 512 O(1) visits, ≤ `wake` claim/fill pairs, ≤ 4 attempts.
+
+**Footprint** (measured, `size_of`, 64 CPUs). Static: one `AtomicU64` (the operation id). Stack on
+the NR 17 path: `FutexWakePreflight` 400 B (`FutexPlacementCounts` 384 B + refusal 12 B + flag), the
+commit's two counting tables 768 B (transient, inside the hold), `FutexRequeueCommit` 456 B (the
+`Stale` arm costs nothing: niche) — about 1.6 KiB at the peak, no per-waiter array, no allocation.
+A pending key is an ordinary `FutexKey` (24 B), stored in the record that already exists. No table,
+queue or record changes size. Scheduler storage, `MAX_TASKS`, the 64-entry queue limit and the
+reservation accounting are unchanged.
+
+**ABI.** v11 and NR 17 unchanged; `woken`, `requeued`, `CAPACITY_LIMITED` and `DONE` keep their
+encodings. Two documented behaviours changed, both corrections of a v11 syscall that is new in the
+dev line: which waiter a capacity stop leaves where (above), and that a waiter in its publication
+window keeps the outcome another operation gave it. No compatibility path.
+
+**User runtime.** `futex_sync` works unchanged under the repaired semantics (r27–r30; the live
+witnesses). Its `wake = 0` repeat after `CAPACITY_LIMITED` now normally moves nothing; anything it
+moves parked after the bump and sees a permitted spurious wake. Its liveness limits are as before
+and reported separately: a mutex unlock's `FutexWake(1)` that meets a full queue leaves that waiter
+parked until the next contended unlock; the `WouldBlock` fallback wakes every sequence waiter.
+
+**Tests.** `futex_requeue1::atomic1` x00–x17 (18): the model; the five counterexamples (fail on
+`279eb4f5`); a target wake in the window; a new waiter during the preflight; a store between
+preflight and commit (zero mutation, slot released); a stale preflight retried; the publication
+window meeting a move (x10) and a selection (x11, two threads); the queue filling during the
+preflight; a held reservation surviving a filling queue; bounded retries ending in a reported stop;
+repeated window races leaking nothing; the unplaceable head never skipped; an emptied wake set
+never refilled from the source. Plus FUTEX-REQUEUE1's 32 (six re-derived, each change stated in
+the test), FUTEX-WAKE-CAP1's c1–c11 and w1–w3 (the 65-waiter saturation reproducers), and
+FUTEX-FOUND1's.
+
+**Hosted negative controls** (`fra_nc.py`, disposable worktree, final run at `5939c705`, filter
+`futex`: 195 tests; `16c31398` changes only race-witness ring-3 code that no hosted build compiles).
+Each reintroduces one defect class; the unmodified tree passes all 195. All thirteen applied and
+every one is detected by behavioural tests. Earlier runs, kept in the evidence, needed work on the
+control or the suite: at `69dad264` NC2 was undetected (`x17` added) and NC11 a non-defect (walking
+past the bucket tail is harmless, because a moved record no longer carries the source key; NC11
+became the missing unlink); at `140b60c7` NC5's anchor had moved (the run recorded it unpatched;
+the runner now refuses to count an unapplied patch) and NC8 patched only the split twin while its
+dedicated test drives the broad one (it now patches both).
+
+| Control | Defect reintroduced | Detected by |
+|---|---|---|
+| NC1 | the gap restored: the wake portion stays on the source, and the placement wakes whoever is oldest when it runs | 18 tests, x01–x04, x11, x17 among them |
+| NC2 | a newly registered source waiter is claimed by the delayed placement (an emptied wake set refilled from the source) | x17 |
+| NC3 | the claim checks the TID only, not the exact token or key | r13 |
+| NC4 | the commit moves stale records | r17, r19 |
+| NC5 | the reservations are released before the claims, and the placement enqueues ordinarily | x13, r24 |
+| NC6 | an abandoned reservation is never released | x05, x14, x15, x17, r15 |
+| NC7 | the wake portion is selected without secured capacity | 20 tests, x12, x16 and r21 among them |
+| NC8 | the wake portion walks past an unplaceable head to later waiters with room | x16, x09, x14, r24 |
+| NC9 | source FIFO corrupted: the oldest waiters go to the target, younger ones are woken | 21 tests |
+| NC10 | target FIFO corrupted: moved records linked at the head of the target's queue | 26 tests |
+| NC11 | one record on two queues: linked onto the target without being unlinked from the source | 34 tests |
+| NC12 | the split park's read-back recovery restores the wrong incarnation | c6, f07, r16, u9fw |
+| NC13 | the second-read undo retracts a registration a requeue moved or selected (the FUTEX-REQUEUE1 rule) | x10, x11, r16 |
+
+**The live race witness** (default off: feature `futex-requeue-race-witness`, knob
+`yarm.futex_requeue_witness=1`, `RACE=1 scripts/qemu-futex-requeue-witness-smoke.sh`). The
+FUTEX-REQUEUE1 cell, plus two signaller threads that issue `FutexWake(seq, 1)` while each broadcast
+is in flight. The kernel holds NR 17's window — after its commit, before its placement: the
+interval that used to separate the transfer from the wake portion — open until a FutexWake that
+STARTED inside it has finished, logging `WINDOW_OPEN` before publishing the window, the waker's
+`IN_WINDOW_WAKE` before it releases it, and `WINDOW_CLOSE` after: causal order on one console, not
+timing. The grader requires every broadcast to hold such a wake from ANOTHER CPU and every
+in-window wake to take nobody; a round is accounted woken + requeued + signaller-woken = 10. At
+`5939c705`, SMP 2 (and again at `16c31398` inside the matrix, FX8, identical counts):
+
+| arch | windows held / covered | in-window wakes (CPU) | took a waiter | NR 17 per round | result |
+|---|---|---|---|---|---|
+| x86_64 | 3 / 3 | 3 (CPU 1) | 0 | woken 1, requeued 9 | `witness=ok core_smoke=ok cross_cpu=yes` |
+| AArch64 | 3 / 3 | 3 (CPU 1) | 0 | woken 1, requeued 9 | `witness=ok core_smoke=ok cross_cpu=yes` |
+| RISC-V | 3 / 3 | 3 (CPU 1) | 0 | woken 1, requeued 9 | `witness=ok core_smoke=ok cross_cpu=yes` |
+
+*Live negative control:* the same witness with NC1 (the old gap: the wake portion left on the
+source and woken by whoever is oldest when the placement runs) built in, x86_64 SMP 2 — the
+in-window wakes on CPU 1 took waiters the commit had decided (`woke=1`), and the grader refused the
+boot (`witness=fail`). The witness distinguishes the two kernels.
+
+**Qualification** against `279eb4f5`, on a predeclared schedule (`fra_schedule.md`, hashed with the
+runner); steps sequential; nothing retried in place. The full matrix ran at `5939c705`. One cell
+failed for a reason in the witness, not the kernel: FX8 RISC-V returned `witness=ok
+core_smoke=rejected` — the race-mode signallers yield-spun forever after the last round, and under
+TCG the rest of the boot missed the core smoke's PLIC and idle markers inside the QEMU timeout (FX7,
+the same boot without signallers, reaches them 47 lines after its witness ends). `16c31398` makes
+the signallers park once the witness is done (race-witness builds only). Declared before any result
+of the first run was used, an appended rerun at `16c31398` repeated provenance, the hosted group
+and FX7/FX8 ×3, and rebuilt the default and CI-exact strict artifacts of all three ports: kernel
+and initramfs sha256 identical to the `5939c705` bindings, so every other `5939c705` cell stands for
+`16c31398` unchanged. Both runs are kept, as is an earlier run at `140b60c7` that stopped at the
+integration binaries: the SCHED-LOCK1 grader's claim-site census found seven sites against six
+(the new placement), fixed in `5939c705` by staging it like the others. Evidence (logs, rcs,
+bindings, the baseline reproducer run, controls, live runs): orphan branch
+`wip/futex-requeue-atomic1-evidence`.
+
+| Step | Result |
+|---|---|
+| fmt; clippy `--features hosted-dev` | clean; 425 warnings on F and B, classes identical |
+| hosted lib (serial) | 6492 passed, 0 failed, 3 ignored (both runs) |
+| integration: broad-lock census, doc-fragmentation guard, SCHED-LOCK1 grader | 41 binaries, 396 passed (both runs) |
+| subsets: futex_requeue1::atomic1 (18), futex_requeue1 (50), futex_wake_cap1, futex_found1, futex (195), robust, scheduler, sched_, enqueue, ap_sched1, stage199d, stage191b, stage191d, stage200d0a, stage29, syscall, u9qa, kthread, exit, reap, spawn, thread, fork, ipc_displace1, sender_wake | all pass (both runs) |
+| lock order, common test set (F excluding `futex_requeue1::atomic1`) | 20833 / 20832 (test, pair) entries. 33 differ, all in `futex_requeue1` tests that issue a compare-and-requeue (class a: the preflight's and placement's task / scheduler alternation, the pairs FutexWake takes, counted again) or whose body this stage re-derived (class c: r15, r16, r21, r22, r24); the first run also showed the known `c09` variance (class b). One new pair, `r06` scheduler after memory, is the sequential release of a reservation after a SameKey refusal, not a nesting. B's r21, r22 and r24 printed `FUTEX_WAKE_STOPPED` (the old ordinary wake portion); F's do not |
+| `compare_and_requeue_locked` source check | no scheduler, CPU or enqueue reference in the commit; the only `futex_wake_key_outcome` callers left are NR 10's own wrappers |
+| default builds ×3; recv-v2 oracles ×3; CI-exact strict builds + strict core smokes ×3 | pass; rebuilt at `16c31398`, byte-identical |
+| first-cohort futex seal on the CI-exact artifacts | F: 12/12 live cells, every idle cross-check present, `result=ok`. B: 12/12 live cells, the RISC-V FutexWait idle cross-check missing — the known idle-oracle variance, this time on the baseline |
+| IPC-DISPLACE1 SMP1 ×3 | `witness=ok core_smoke=ok` |
+| overtaken witness x86_64, AArch64 | `result=ok` on F and B |
+| AP-scheduling SMP2 ×3; KTHREAD1 SMP2 ×3; SCHED-LOCK1 SMP2 ×3 | `APSW_WITNESS_SEAL` ×3; `KT1W_SEAL result=pass` ×3; `SL1W_SEAL result=pass` ×3 (the placement is now a seventh SCHED-LOCK1 claim site, staged like the other six) |
+| FUTEX-REQUEUE1 witness SMP2 ×3 (FX7), unchanged grading | `result=ok` ×3, `cross_cpu=yes`, woken 1 / requeued 9 every round (both runs) |
+| race witness SMP2 ×3 (FX8) | at `16c31398`: `windows=3 covered=3 in_window_wakes=3 competing_cpus=1 sig_woke=0,0,0 witness=ok core_smoke=ok result=ok` ×3. At `5939c705`: x86_64 and AArch64 the same; RISC-V `witness=ok core_smoke=rejected` (above) |
+| UART / PL011 IRQ witnesses ×3 | `result=ok` ×3 |
+| IpcCall/IpcReply direct matrix; server-dies ×3 | `result=ok`; `result=ok` ×3 |
+| CI profiles, F and B | identical status: sender-wake, smp2-core, smp4-core pass; inherited #2, #3, #4 and d2-send fail on both |
+| reply-timeout matrix; SMP-request script; CI strict timer grep | inherited #1 (`class=IpcReplyTimeout`), #5 (line 67 syntax error), #6 (0/0/0), identical on F and B |
+| every QEMU log of F for the marker list (FUTEX-REQUEUE1's, plus `IN_WINDOW_WAKE ... woke=[1-9]`, grader `race:` lines) | `16c31398`: no hits. `5939c705`: the FX8 RISC-V seal line (above), and three false matches of `race: ` inside the SCHED-LOCK1 grader's "NATURAL trace:" summary (`result=pass`) |
+
+**Limits.**
+
+* *The split wait's first read* (pre-existing, FUTEX-FOUND1): it reads the word before it registers
+  and re-reads after. A store between the first read and the registration, followed by another
+  operation acting on the registration, honours the wait as of its first read — nothing is lost,
+  but against a wake that ran in that short gap it is not strictly linearizable. Fixing it means
+  comparing and registering in one hold, a change to the wait path itself: recorded, not done here.
+* *Contention.* Under sustained interference the wake portion can end in a reported stop after four
+  preflights (x14), not a guess and not a livelock.
+* *The race witness proves one shape live*: a FutexWake from the other CPU inside the window, three
+  rounds per port. Exit, a new registration, a competing requeue and the publication window inside
+  the window are proven hosted only.
+* *Not changed:* `FutexWake`'s ambiguous `0` (SC-POOL-3); exited tasks lingering in run queues;
+  timed waits, bitsets, PI, RT-SCHED1, queue sizes.
+* *Still open:* the six baseline debts, d2-send and the idle-oracle variance, unchanged.
+
+Verdict: **FUTEX_REQUEUE_ATOMIC1_ACCEPTED_WITH_BASELINE_DEBT**. Refs: `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/futex-requeue-atomic1`
+at the commit that adds this record; `main` `b81e0317` and every other ref unchanged.
+
+
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
 
 **U6 — COMPLETE. CANONICAL 199C — DELIVERED / CLOSED. CENSUS-DELTA 0.**
