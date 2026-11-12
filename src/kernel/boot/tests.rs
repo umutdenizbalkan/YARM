@@ -215055,6 +215055,570 @@ mod futex_requeue1 {
                 "NOT LINEARIZABLE: {observed:?}, admitted {admitted:?}"
             );
         }
+
+        fn init5() -> Model {
+            Model {
+                word: 5,
+                ..Model::default()
+            }
+        }
+        fn occ(k: &SharedKernel) -> usize {
+            k.with(|s| s.with_task_futex_mut(|_t, table| table.occupied()))
+        }
+
+        /// 1 — a mismatch publishes nothing, on both twins: no record, `Running`, still current.
+        #[test]
+        fn w07_a_mismatch_registers_nothing() {
+            let mut w = world(49200);
+            let d = 49300;
+            task(&mut w.s, d, w.a);
+            run(&mut w.s, d);
+            assert_eq!(w.s.futex_wait_current(SQ, 4, P), Ok(false));
+            assert_eq!(w.s.task_status(d), Some(TaskStatus::Running));
+            assert_eq!(occupied(&mut w.s), 0);
+            w.back();
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            let (r, o) = wait(k, a, d + 1, SQ, 4, P);
+            assert_eq!(r, Res::Wait(false));
+            assert!(matches!(o, FutexParkOutcome::ValueChanged));
+            k.with(|s| {
+                assert_eq!(s.task_status(d + 1), Some(TaskStatus::Running));
+                assert_eq!(s.current_tid_on_cpu(CpuId(0)), Some(d + 1));
+                assert_eq!(occupied(s), 0);
+                assert!(order(s, key(s, driver, SQ)).is_empty());
+            });
+        }
+
+        /// 2 — a match registers EXACTLY this wait cycle: the TCB's token is the record's, on the
+        /// key the address resolves to now, at the tail of its FIFO.
+        #[test]
+        fn w08_a_match_registers_the_exact_token() {
+            let mut w = world(49400);
+            let first = w.park_n(1, SQ, 5)[0];
+            let (a, driver, d) = (w.a, w.driver, 49500);
+            let k = leak(w.s);
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            assert_eq!(r, Res::Wait(true));
+            assert!(matches!(o, FutexParkOutcome::Parked { .. }));
+            k.with(|s| {
+                let ks = key(s, driver, SQ);
+                let token = token_of(s, d).expect("blocked on a token");
+                assert_eq!(key_of(s, token), Some(ks));
+                assert_eq!(order(s, ks), vec![first, d]);
+                assert_eq!(placement(s, d), TaskPlacement::Nowhere);
+                assert_eq!(occupied(s), 2);
+                consistent(s);
+            });
+        }
+
+        /// 6 / 20 — a wake AFTER the compare-and-clear (the waiter is current nowhere): the wake
+        /// places it, the read-back sees the claim, and the recovery takes it back out of the run
+        /// queue as CPU 0's current — exactly one continuation, nothing queued twice.
+        #[test]
+        fn w10_a_wake_after_the_compare_and_clear() {
+            let w = world(49600);
+            let (a, driver, d) = (w.a, w.driver, 49700);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_after_clear(alloc::boxed::Box::new(move || {
+                let n = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                sink.borrow_mut().push(Res::Wake(n));
+            }));
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            let FutexParkOutcome::WokenDuringPublication { recovered, .. } = o else {
+                panic!("the overtaking wake is detected: {o:?}");
+            };
+            assert!(recovered.may_resume_entering_frame(), "{recovered:?}");
+            let mut results = vec![r];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe_w(s, driver, d, &o, 5)));
+            assert_lin(
+                &observed,
+                &init5(),
+                Op::Wait { tid: d, exp: 5 },
+                &[Op::Wake(1)],
+            );
+            k.with(|s| {
+                assert_eq!(queued_count(s, d), 0, "not also queued");
+                assert_eq!(occupied(s), 0);
+            });
+        }
+
+        /// 9 — a compare-and-requeue AFTER the compare-and-clear moves the parked waiter; the
+        /// read-back sees the same token still blocked, so the wait is parked — on T.
+        #[test]
+        fn w11_a_requeue_after_the_compare_and_clear() {
+            let w = world(49800);
+            let (a, driver, d) = (w.a, w.driver, 49900);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_after_clear(alloc::boxed::Box::new(move || {
+                let r = k.futex_cmp_requeue_split(CpuId(1), a, (SQ, P), (MX, P), 5, 0, 1);
+                sink.borrow_mut().push(atomic1::res(&r));
+            }));
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            assert!(matches!(o, FutexParkOutcome::Parked { .. }), "{o:?}");
+            let mut results = vec![r];
+            results.extend(seen.borrow().iter().cloned());
+            let observed = (results, k.with(|s| observe_w(s, driver, d, &o, 5)));
+            let rq = Op::Rq {
+                dst: Q::T,
+                exp: 5,
+                wake: 0,
+                req: 1,
+            };
+            assert_lin(&observed, &init5(), Op::Wait { tid: d, exp: 5 }, &[rq]);
+            k.with(|s| {
+                run(s, driver);
+                assert_eq!(s.futex_wake(MX, 1, P), Ok(1), "reached through T");
+                assert!(placed(s, d));
+            });
+        }
+
+        /// 11 — a wake and a compare-and-requeue compete for the waiter after its registration.
+        #[test]
+        fn w12_a_wake_and_a_requeue_compete() {
+            for wake_first in [true, false] {
+                let mut w = world(50000);
+                let first = w.park_n(1, SQ, 5)[0];
+                let (a, driver, d) = (w.a, w.driver, 50100);
+                let k = leak(w.s);
+                let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+                let sink = seen.clone();
+                fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                    let wake = |sink: &alloc::rc::Rc<core::cell::RefCell<Vec<Res>>>| {
+                        let n = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+                        sink.borrow_mut().push(Res::Wake(n));
+                    };
+                    let requeue = |sink: &alloc::rc::Rc<core::cell::RefCell<Vec<Res>>>| {
+                        let r = k.futex_cmp_requeue_split(CpuId(1), a, (SQ, P), (MX, P), 5, 0, 1);
+                        sink.borrow_mut().push(atomic1::res(&r));
+                    };
+                    if wake_first {
+                        wake(&sink);
+                        requeue(&sink);
+                    } else {
+                        requeue(&sink);
+                        wake(&sink);
+                    }
+                }));
+                let (r, o) = wait(k, a, d, SQ, 5, P);
+                let mut results = vec![r];
+                results.extend(seen.borrow().iter().cloned());
+                let rq = Op::Rq {
+                    dst: Q::T,
+                    exp: 5,
+                    wake: 0,
+                    req: 1,
+                };
+                let chain = if wake_first {
+                    [Op::Wake(1), rq]
+                } else {
+                    [rq, Op::Wake(1)]
+                };
+                let observed = (
+                    results,
+                    k.with(|s| {
+                        let mut m = observe_w(s, driver, d, &o, 5);
+                        if placed(s, first) {
+                            m.woken.push(first);
+                            m.woken.sort_unstable();
+                        }
+                        m
+                    }),
+                );
+                let init = Model {
+                    word: 5,
+                    s: vec![first],
+                    ..Model::default()
+                };
+                assert_lin(&observed, &init, Op::Wait { tid: d, exp: 5 }, &chain);
+            }
+        }
+
+        /// 12 — the waiter exits before its compare-and-register: nothing is registered, and the
+        /// exited incarnation is never resurrected.
+        #[test]
+        fn w13_exit_before_the_registration() {
+            let w = world(50200);
+            let (a, d) = (w.a, 50300);
+            let k = leak(w.s);
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                k.with(|s| s.exit_task(d, 3)).expect("exit in the window");
+            }));
+            k.with(|s| {
+                task(s, d, a);
+                run(s, d);
+            });
+            let o = k.futex_wait_park_exact_split(CpuId(0), d, a, SQ, 5, P);
+            assert!(matches!(o, FutexParkOutcome::IncarnationMoved), "{o:?}");
+            k.with(|s| {
+                assert_eq!(s.task_status(d), Some(TaskStatus::Exited(3)));
+                assert_eq!(occupied(s), 0);
+                assert_eq!(queued_count(s, d), 0);
+                consistent(s);
+            });
+        }
+
+        /// 13 — the waiter exits after its publication (registered and cleared): its record goes
+        /// with it, the read-back's recovery refuses to bring it back, and a later wake finds
+        /// nobody.
+        #[test]
+        fn w14_exit_after_the_publication() {
+            let w = world(50400);
+            let (a, driver, d) = (w.a, w.driver, 50500);
+            let k = leak(w.s);
+            fx::futex_phase_hook::arm_after_clear(alloc::boxed::Box::new(move || {
+                k.with(|s| s.exit_task(d, 4)).expect("exit in the window");
+            }));
+            k.with(|s| {
+                task(s, d, a);
+                run(s, d);
+            });
+            let o = k.futex_wait_park_exact_split(CpuId(0), d, a, SQ, 5, P);
+            if let FutexParkOutcome::WokenDuringPublication { recovered, .. } = &o {
+                assert!(!recovered.may_resume_entering_frame(), "{recovered:?}");
+            }
+            k.with(|s| {
+                assert_eq!(s.task_status(d), Some(TaskStatus::Exited(4)), "{o:?}");
+                assert_eq!(occupied(s), 0);
+                assert_eq!(queued_count(s, d), 0);
+                assert_ne!(s.current_tid_on_cpu(CpuId(0)), Some(d), "not resurrected");
+                run(s, driver);
+                assert_eq!(s.futex_wake(SQ, 1, P), Ok(0));
+                consistent(s);
+            });
+        }
+
+        /// 14 — a stale TID: the waiter exits and a new task of the same space is created before
+        /// the compare-and-register (exact-token reuse of a slot is f09 and r19). The old TID is refused, and the replacement is not registered on
+        /// its behalf.
+        #[test]
+        fn w15_a_stale_tid_and_a_reused_slot() {
+            let w = world(50600);
+            let (a, d, fresh) = (w.a, 50700, 50701);
+            let k = leak(w.s);
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                k.with(|s| {
+                    s.exit_task(d, 0).expect("exit");
+                    task(s, fresh, a);
+                });
+            }));
+            k.with(|s| {
+                task(s, d, a);
+                run(s, d);
+            });
+            let o = k.futex_wait_park_exact_split(CpuId(0), d, a, SQ, 5, P);
+            assert!(matches!(o, FutexParkOutcome::IncarnationMoved), "{o:?}");
+            k.with(|s| {
+                assert_eq!(occupied(s), 0);
+                assert_eq!(s.task_status(fresh), Some(TaskStatus::Runnable));
+                assert!(!parked(s, fresh));
+            });
+        }
+
+        /// 15 — a stale ASID generation: the address space is destroyed and its number reused by a
+        /// new space (the same VA mapped, the word 5) between the decision and the
+        /// compare-and-register. The wait registers on the NEW generation's key — the one the
+        /// address resolves to at its linearization point — so the new space's wake reaches it.
+        #[test]
+        fn w16_a_reused_asid_between_the_decision_and_the_registration() {
+            let w = world(50800);
+            let (a, d) = (w.a, 50900);
+            let k = leak(w.s);
+            let old = k.with(|s| s.private_futex_key_for_test(w.driver, SQ));
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                k.with(|s| {
+                    s.with_user_spaces_mut(|m| m.destroy(a, 0))
+                        .expect("destroy");
+                    let mut reused = false;
+                    for _ in 0..70_000 {
+                        let n = s
+                            .with_user_spaces_mut(|m| m.create_user_space())
+                            .expect("create");
+                        if n == a {
+                            reused = true;
+                            break;
+                        }
+                        s.with_user_spaces_mut(|m| m.destroy(n, 0))
+                            .expect("destroy");
+                    }
+                    assert!(reused, "the ASID number is reused");
+                    private_page(s, a, SQ);
+                    word(s, d, SQ, 5);
+                });
+            }));
+            k.with(|s| {
+                task(s, d, a);
+                run(s, d);
+            });
+            let o = k.futex_wait_park_exact_split(CpuId(0), d, a, SQ, 5, P);
+            assert!(matches!(o, FutexParkOutcome::Parked { .. }), "{o:?}");
+            k.with(|s| {
+                let new = s.private_futex_key_for_test(d, SQ);
+                assert_ne!(new, old, "a new incarnation of the number");
+                let token = token_of(s, d).expect("parked");
+                assert_eq!(
+                    key_of(s, token),
+                    Some(new),
+                    "registered on the live generation"
+                );
+                assert!(
+                    order(s, old).is_empty(),
+                    "nothing on the destroyed generation"
+                );
+            });
+            assert_eq!(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P), Ok(1));
+        }
+
+        /// 16 — one object at two VAs is one key, inside the windows too: a wake through the other
+        /// VA before the registration finds nobody, one after it takes the waiter.
+        #[test]
+        fn w17_a_shared_word_at_two_vas() {
+            let w = world(51000);
+            let (a, d) = (w.a, 51100);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let (s1, s2) = (seen.clone(), seen.clone());
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                let n = k
+                    .futex_wake_split_mut(CpuId(1), a, 0xB_0000, 1, SH)
+                    .expect("wake");
+                s1.borrow_mut().push(n);
+            }));
+            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                let n = k
+                    .futex_wake_split_mut(CpuId(1), a, 0xB_0000, 1, SH)
+                    .expect("wake");
+                s2.borrow_mut().push(n);
+            }));
+            let (r, o) = wait(k, a, d, 0x8_0000, 0, SH);
+            assert_eq!(r, Res::Wait(true));
+            assert!(matches!(o, FutexParkOutcome::WokenDuringPublication { .. }));
+            assert_eq!(*seen.borrow(), vec![0, 1]);
+            assert_eq!(occ(k), 0);
+        }
+
+        /// 17 — the mapping is torn down between the decision and the compare-and-register: the
+        /// word is unreadable at the linearization point, nothing is registered.
+        #[test]
+        fn w18_teardown_before_the_registration() {
+            let w = world(51200);
+            let (a, d) = (w.a, 51300);
+            let k = leak(w.s);
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                k.with(|s| s.unmap_user_page_in_asid(a, VirtAddr(SQ as u64)))
+                    .expect("unmap");
+            }));
+            k.with(|s| {
+                task(s, d, a);
+                run(s, d);
+            });
+            let o = k.futex_wait_park_exact_split(CpuId(0), d, a, SQ, 5, P);
+            assert!(matches!(o, FutexParkOutcome::WordUnreadable(_)), "{o:?}");
+            k.with(|s| {
+                assert_eq!(s.task_status(d), Some(TaskStatus::Running));
+                assert_eq!(occupied(s), 0);
+            });
+        }
+
+        /// 18 — a hash-bucket neighbour: a key in the waiter's bucket is woken in both windows and
+        /// takes nothing; the waiter's own key still reaches it.
+        #[test]
+        fn w19_a_bucket_collision() {
+            let w = world(51400);
+            let (a, driver, d) = (w.a, w.driver, 51500);
+            let k = leak(w.s);
+            let (ks, other) = k.with(|s| {
+                let ks = key(s, driver, SQ);
+                let other = (1..1024usize)
+                    .map(|i| SQ + 4 * i)
+                    .filter(|&va| va < SQ + 0x1000)
+                    .find(|&va| key(s, driver, va).bucket_for_test() == ks.bucket_for_test())
+                    .expect("a neighbour in the same bucket on the page");
+                word(s, driver, other, 5);
+                (ks, other)
+            });
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let (s1, s2) = (seen.clone(), seen.clone());
+            fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                s1.borrow_mut().push(
+                    k.futex_wake_split_mut(CpuId(1), a, other, 1, P)
+                        .expect("wake"),
+                );
+            }));
+            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                s2.borrow_mut().push(
+                    k.futex_wake_split_mut(CpuId(1), a, other, 1, P)
+                        .expect("wake"),
+                );
+            }));
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            assert_eq!(r, Res::Wait(true));
+            assert!(matches!(o, FutexParkOutcome::Parked { .. }));
+            assert_eq!(*seen.borrow(), vec![0, 0]);
+            k.with(|s| assert_eq!(order(s, ks), vec![d]));
+            assert_eq!(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P), Ok(1));
+        }
+
+        /// 19 — the home CPU's queue is full when a wake runs after the registration: the wake
+        /// returns 0 and the waiter is STILL registered (a capacity refusal, not an absence), parks,
+        /// and is woken once a slot frees.
+        #[test]
+        fn w20_a_full_run_queue() {
+            let w = world(51600);
+            let (a, driver, d) = (w.a, w.driver, 51700);
+            let k = leak(w.s);
+            let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+            let sink = seen.clone();
+            fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                assert!(k.with(|s| fill_queue(s, a, 51800)) > 0);
+                sink.borrow_mut()
+                    .push(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"));
+                k.with(|s| {
+                    let ks = key(s, driver, SQ);
+                    assert_eq!(
+                        order(s, ks),
+                        vec![d],
+                        "refused for capacity, still registered"
+                    );
+                });
+            }));
+            let (r, o) = wait(k, a, d, SQ, 5, P);
+            assert_eq!(r, Res::Wait(true));
+            assert!(matches!(o, FutexParkOutcome::Parked { .. }), "{o:?}");
+            assert_eq!(*seen.borrow(), vec![0]);
+            k.with(|s| {
+                assert!(parked(s, d));
+                assert_eq!(placement(s, d), TaskPlacement::Nowhere);
+                // Free one slot: withdraw a filler from the queue, then retire it.
+                let _ = s.withdraw_queued_tid_on(CpuId(0), 51800);
+                s.exit_task(51800, 0).expect("retire it");
+            });
+            assert_eq!(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P), Ok(1));
+            k.with(|s| assert_eq!(queued_count(s, d), 1));
+        }
+
+        /// 21 — repeated cycles, each with an operation in a different window, leak nothing: every
+        /// cycle has a fresh token, and the table is empty at the end.
+        #[test]
+        fn w21_repeated_cycles_leak_nothing() {
+            let w = world(52000);
+            let (a, driver, d) = (w.a, w.driver, 52100);
+            let k = leak(w.s);
+            k.with(|s| task(s, d, a));
+            let mut tokens = Vec::new();
+            for i in 0..60u32 {
+                k.with(|s| {
+                    if s.task_status(d) != Some(TaskStatus::Running) {
+                        run(s, d);
+                    }
+                });
+                match i % 4 {
+                    0 => fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(
+                        move || {
+                            assert_eq!(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P), Ok(1));
+                        },
+                    )),
+                    1 => fx::futex_phase_hook::arm_after_clear(alloc::boxed::Box::new(move || {
+                        assert_eq!(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P), Ok(1));
+                    })),
+                    2 => fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(
+                        move || {
+                            k.with(|s| word(s, driver, SQ, 6));
+                        },
+                    )),
+                    _ => {}
+                }
+                let o = k.futex_wait_park_exact_split(CpuId(0), d, a, SQ, 5, P);
+                k.with(|s| {
+                    if let Some(t) = token_of(s, d) {
+                        tokens.push(t);
+                    }
+                });
+                match i % 4 {
+                    0 | 1 => assert!(
+                        matches!(o, FutexParkOutcome::WokenDuringPublication { .. }),
+                        "{i}: {o:?}"
+                    ),
+                    2 => {
+                        assert!(matches!(o, FutexParkOutcome::ValueChanged), "{i}: {o:?}");
+                        k.with(|s| word(s, driver, SQ, 5));
+                    }
+                    _ => {
+                        assert!(matches!(o, FutexParkOutcome::Parked { .. }), "{i}: {o:?}");
+                        assert_eq!(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P), Ok(1));
+                    }
+                }
+                k.with(|s| {
+                    assert!(!parked(s, d), "{i}: no cycle is left parked");
+                    assert_eq!(occupied(s), 0, "{i}: no record leaked");
+                    assert_eq!(reserved(s), 0);
+                });
+            }
+            let n = tokens.len();
+            tokens.sort_unstable_by_key(|t| (t.slot, t.generation));
+            tokens.dedup();
+            assert_eq!(tokens.len(), n, "every parked cycle had its own token");
+        }
+
+        /// 22 — repeated condition-variable broadcasts, each arriving while a waiter is in a
+        /// different window: a broadcast before the compare-and-register makes the wait return
+        /// (the sequence moved), one after it reaches the waiter; no round strands it.
+        #[test]
+        fn w22_repeated_broadcasts_never_strand_a_waiter_in_its_window() {
+            let w = world(52200);
+            let (a, driver, d) = (w.a, w.driver, 52300);
+            let k = leak(w.s);
+            k.with(|s| task(s, d, a));
+            let seq = alloc::rc::Rc::new(core::cell::Cell::new(5u32));
+            for round in 0..30u32 {
+                k.with(|s| {
+                    if s.task_status(d) != Some(TaskStatus::Running) {
+                        run(s, d);
+                    }
+                });
+                let v = seq.get();
+                let sq = seq.clone();
+                let broadcast = move || {
+                    let n = sq.get() + 1;
+                    sq.set(n);
+                    k.with(|s| word(s, driver, SQ, n));
+                    k.futex_cmp_requeue_split(CpuId(1), a, (SQ, P), (MX, P), n, 1, ALL)
+                        .expect("broadcast")
+                };
+                let before = round % 2 == 0;
+                if before {
+                    fx::futex_phase_hook::arm_before_register(alloc::boxed::Box::new(move || {
+                        assert_eq!(broadcast().woken, 0, "nobody registered yet");
+                    }));
+                } else {
+                    fx::futex_phase_hook::arm_after_register(alloc::boxed::Box::new(move || {
+                        assert_eq!(broadcast().woken, 1, "the registered waiter is reached");
+                    }));
+                }
+                let o = k.futex_wait_park_exact_split(CpuId(0), d, a, SQ, v, P);
+                if before {
+                    assert!(
+                        matches!(o, FutexParkOutcome::ValueChanged),
+                        "{round}: {o:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(o, FutexParkOutcome::WokenDuringPublication { .. }),
+                        "{round}: {o:?}"
+                    );
+                }
+                k.with(|s| {
+                    assert!(!parked(s, d), "{round}: stranded");
+                    assert_eq!(occupied(s), 0);
+                    assert!(order(s, key(s, driver, MX)).is_empty());
+                });
+            }
+        }
     }
 
     mod atomic1 {
