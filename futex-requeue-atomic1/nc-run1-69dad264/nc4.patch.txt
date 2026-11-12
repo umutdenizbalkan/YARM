@@ -1,0 +1,14 @@
+nc4 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 329db08a..3992ba13 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1057,7 +1057,7 @@ pub fn compare_and_requeue_locked(
+         };
+         let next = rec.next;
+         let at_last = cur == last;
+-        if !table.live(tcbs, slot) {
++        if false && !table.live(tcbs, slot) {
+             table.retire_after(slot, prev);
+         } else if rec.key != s_key {
+             prev = cur;

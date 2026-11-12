@@ -1,0 +1,86 @@
+matrix start 2026-11-12T00:40:22Z only=prov hosted requeue schedule_sha=8fb26a624bcd1743
+=== P0_provenance [16c313980606 porcelain=0]: bash -c git rev-parse HEAD; test $(git rev-parse --short=8 HEAD) = 16c31398 && echo HEAD_IS_F; git status --porcelain | wc -l; rustc -V; cargo -V; qemu-system-x86_64 --version | head -1; qemu-system-aarch64 --version | head -1; qemu-system-riscv64 --version | head -1 (start 00:40:22)
+P0_provenance rc=0 secs=0
+=== P1_source [16c313980606 porcelain=0]: bash -c git diff --stat 279eb4f5 HEAD; awk '/^pub fn compare_and_requeue_locked/,/^}/' src/kernel/boot/futex.rs | grep -n 'with_cpu_sched\|scheduler_state\|enqueue_on_cpu\|reserve_user_slot' || echo NO_SCHEDULER_IN_COMMIT; grep -n 'futex_wake_key_outcome' src/runtime.rs src/kernel/boot/exec_state.rs | grep -v 'fn futex_wake_key_outcome' || echo NO_SEPARATE_WAKE_PORTION; true (start 00:40:22)
+P1_source rc=0 secs=0
+=== H1_fmt [16c313980606 porcelain=0]: cargo fmt --all -- --check (start 00:40:22)
+H1_fmt rc=0 secs=6
+=== H2_clippy [16c313980606 porcelain=0]: hosted cargo clippy --lib --features hosted-dev (start 00:40:28)
+H2_clippy rc=0 secs=0
+=== H3_hosted_lib [16c313980606 porcelain=0]: hosted cargo test --lib -- --test-threads=1 (start 00:40:28)
+H3_hosted_lib rc=0 secs=136
+=== H4_integration [16c313980606 porcelain=0]: hosted cargo test --test * --no-fail-fast -- --test-threads=1 (start 00:42:44)
+H4_integration rc=0 secs=92
+=== H5_futex_requeue1::atomic1 [16c313980606 porcelain=0]: hosted cargo test --lib futex_requeue1::atomic1 -- --test-threads=1 (start 00:44:16)
+H5_futex_requeue1::atomic1 rc=0 secs=0
+=== H5_futex_requeue1 [16c313980606 porcelain=0]: hosted cargo test --lib futex_requeue1 -- --test-threads=1 (start 00:44:16)
+H5_futex_requeue1 rc=0 secs=9
+=== H5_futex_wake_cap1 [16c313980606 porcelain=0]: hosted cargo test --lib futex_wake_cap1 -- --test-threads=1 (start 00:44:26)
+H5_futex_wake_cap1 rc=0 secs=0
+=== H5_futex_found1 [16c313980606 porcelain=0]: hosted cargo test --lib futex_found1 -- --test-threads=1 (start 00:44:26)
+H5_futex_found1 rc=0 secs=8
+=== H5_futex [16c313980606 porcelain=0]: hosted cargo test --lib futex -- --test-threads=1 (start 00:44:34)
+H5_futex rc=0 secs=18
+=== H5_robust [16c313980606 porcelain=0]: hosted cargo test --lib robust -- --test-threads=1 (start 00:44:52)
+H5_robust rc=0 secs=0
+=== H5_scheduler [16c313980606 porcelain=0]: hosted cargo test --lib scheduler -- --test-threads=1 (start 00:44:52)
+H5_scheduler rc=0 secs=0
+=== H5_sched_ [16c313980606 porcelain=0]: hosted cargo test --lib sched_ -- --test-threads=1 (start 00:44:53)
+H5_sched_ rc=0 secs=2
+=== H5_enqueue [16c313980606 porcelain=0]: hosted cargo test --lib enqueue -- --test-threads=1 (start 00:44:54)
+H5_enqueue rc=0 secs=2
+=== H5_ap_sched1 [16c313980606 porcelain=0]: hosted cargo test --lib ap_sched1 -- --test-threads=1 (start 00:44:56)
+H5_ap_sched1 rc=0 secs=0
+=== H5_stage199d [16c313980606 porcelain=0]: hosted cargo test --lib stage199d -- --test-threads=1 (start 00:44:56)
+H5_stage199d rc=0 secs=19
+=== H5_stage191b [16c313980606 porcelain=0]: hosted cargo test --lib stage191b -- --test-threads=1 (start 00:45:15)
+H5_stage191b rc=0 secs=0
+=== H5_stage191d [16c313980606 porcelain=0]: hosted cargo test --lib stage191d -- --test-threads=1 (start 00:45:15)
+H5_stage191d rc=0 secs=0
+=== H5_stage200d0a [16c313980606 porcelain=0]: hosted cargo test --lib stage200d0a -- --test-threads=1 (start 00:45:15)
+H5_stage200d0a rc=0 secs=1
+=== H5_stage29 [16c313980606 porcelain=0]: hosted cargo test --lib stage29 -- --test-threads=1 (start 00:45:16)
+H5_stage29 rc=0 secs=0
+=== H5_syscall [16c313980606 porcelain=0]: hosted cargo test --lib syscall -- --test-threads=1 (start 00:45:16)
+H5_syscall rc=0 secs=1
+=== H5_u9qa [16c313980606 porcelain=0]: hosted cargo test --lib u9qa -- --test-threads=1 (start 00:45:17)
+H5_u9qa rc=0 secs=1
+=== H5_kthread [16c313980606 porcelain=0]: hosted cargo test --lib kthread -- --test-threads=1 (start 00:45:18)
+H5_kthread rc=0 secs=0
+=== H5_exit [16c313980606 porcelain=0]: hosted cargo test --lib exit -- --test-threads=1 (start 00:45:18)
+H5_exit rc=0 secs=3
+=== H5_reap [16c313980606 porcelain=0]: hosted cargo test --lib reap -- --test-threads=1 (start 00:45:21)
+H5_reap rc=0 secs=0
+=== H5_spawn [16c313980606 porcelain=0]: hosted cargo test --lib spawn -- --test-threads=1 (start 00:45:21)
+H5_spawn rc=0 secs=6
+=== H5_thread [16c313980606 porcelain=0]: hosted cargo test --lib thread -- --test-threads=1 (start 00:45:27)
+H5_thread rc=0 secs=1
+=== H5_fork [16c313980606 porcelain=0]: hosted cargo test --lib fork -- --test-threads=1 (start 00:45:28)
+H5_fork rc=0 secs=1
+=== H5_ipc_displace1 [16c313980606 porcelain=0]: hosted cargo test --lib ipc_displace1 -- --test-threads=1 (start 00:45:29)
+H5_ipc_displace1 rc=0 secs=1
+=== H5_sender_wake [16c313980606 porcelain=0]: hosted cargo test --lib sender_wake -- --test-threads=1 (start 00:45:30)
+H5_sender_wake rc=0 secs=0
+=== H2b_clippy_classes_B [279eb4f51bb8 porcelain=0]: bash -c /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra_clipcmp.sh (start 00:45:30)
+H2b_clippy_classes_B rc=0 secs=9
+=== H6_lockorder_attr [16c313980606 porcelain=0]: bash -c /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra_lockattr.sh (start 00:45:39)
+H6_lockorder_attr rc=0 secs=158
+=== FX7_requeue_x86_64 [16c313980606 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/qual-16c31398/FX7_x86_64 timeout 3000 scripts/qemu-futex-requeue-witness-smoke.sh x86_64 2 (start 00:48:17)
+FX7_requeue_x86_64 rc=0 secs=255
+=== FX8_race_x86_64 [16c313980606 porcelain=0]: env RACE=1 REQUIRE_CROSS_CPU=1 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/qual-16c31398/FX8_x86_64 timeout 3000 scripts/qemu-futex-requeue-witness-smoke.sh x86_64 2 (start 00:52:32)
+FX8_race_x86_64 rc=0 secs=256
+=== FX7_requeue_aarch64 [16c313980606 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/qual-16c31398/FX7_aarch64 timeout 3000 scripts/qemu-futex-requeue-witness-smoke.sh aarch64 2 (start 00:56:48)
+FX7_requeue_aarch64 rc=0 secs=28
+=== FX8_race_aarch64 [16c313980606 porcelain=0]: env RACE=1 REQUIRE_CROSS_CPU=1 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/qual-16c31398/FX8_aarch64 timeout 3000 scripts/qemu-futex-requeue-witness-smoke.sh aarch64 2 (start 00:57:16)
+FX8_race_aarch64 rc=0 secs=28
+=== FX7_requeue_riscv64 [16c313980606 porcelain=0]: env LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/qual-16c31398/FX7_riscv64 timeout 3000 scripts/qemu-futex-requeue-witness-smoke.sh riscv64 2 (start 00:57:44)
+FX7_requeue_riscv64 rc=0 secs=253
+=== FX8_race_riscv64 [16c313980606 porcelain=0]: env RACE=1 REQUIRE_CROSS_CPU=1 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/qual-16c31398/FX8_riscv64 timeout 3000 scripts/qemu-futex-requeue-witness-smoke.sh riscv64 2 (start 01:01:57)
+FX8_race_riscv64 rc=0 secs=253
+=== Z_markers [16c313980606 porcelain=0]: bash -c for f in $(find /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/qual-16c31398 -name '*.log' ! -name 'H*' ! -name 'Z_*' ! -name 'P*' ! -path '*/C4_*' ! -path '*/FB*' ! -name 'C3_*' ! -name 'C4_*' ! -name 'C5b_*' ! -name 'C5d_*' ! -name 'FB*'); do n=$(grep -acE 'SCHED_WAKE_FAIL|SCHED_TIMEOUT_STRANDED_WAITER|IPC_RECV_BLOCKED_COMPLETE_FAILED|x86 shared trap dispatch failed|YARM_AARCH64_TRAP_HANDLE halting|RISCV_TRAP_HANDLE_FAILED|U6_SEND_COMPLETION_REFUSED_STALE|U7_SEND_TIMEOUT_CLAIM_AFTER_WITHDRAW_REFUSED|SEND_ARB_PUBLICATION_REFUSED_UNWIND|endpoint=Published|outcome=Published|SPAWN_LEDGER_OVERFLOW|FUTEX_WAKE_RESERVED_COMMIT_REFUSED|FUTEX_WAKE_STOPPED|FUTEX_WAIT_PARK_REFUSED|reason=capacity_exhausted|OVT_.*result=fail|SL1W.*result=fail|FUTEX_REQUEUE_SPLIT_REFUSED|FUTEX_REQUEUE_RACE_IN_WINDOW_WAKE.*woke=[1-9]|race: |CRQ_WITNESS.*result=fail|FUTEX_REQUEUE_WITNESS_SEAL.*result=fail' $f); [ $n -gt 0 ] && echo "$n $f"; done; true (start 01:06:10)
+Z_markers rc=0 secs=0
+matrix end 2026-11-12T01:06:10Z F_porcelain=0 B_porcelain=0
+MATRIX_DONE
+=== E_equiv [16c313980606 porcelain=0] (start 01:06:10)
+E_equiv rc=0 secs=44
+RERUN_DONE

@@ -1,0 +1,3 @@
+05c4251fe93a09c0493db458fd7f31c02b668271a14d4c01c61a0eaeebab1a6c  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/live/livenc1-x86_64/boot.log
+d2fc75aa6864b650c197ae8e358c4ff8078f034b3475bd1805a2d112905e90c5  build-x86_64/kernel_boot.elf
+25c58d14693b4ea0f2acb4e1f6732ea8c75de97d232f3e538514d901f3883f32  build-x86_64/initramfs-core.cpio

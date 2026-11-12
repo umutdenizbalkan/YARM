@@ -1,0 +1,73 @@
+matrix start 2026-11-11T21:49:45Z only=all schedule_sha=76fd0e5522aeaa9d
+=== P0_provenance [140b60c7ec08 porcelain=0]: bash -c git rev-parse HEAD; test $(git rev-parse --short=8 HEAD) = 140b60c7 && echo HEAD_IS_F; git status --porcelain | wc -l; rustc -V; cargo -V; qemu-system-x86_64 --version | head -1; qemu-system-aarch64 --version | head -1; qemu-system-riscv64 --version | head -1 (start 21:49:45)
+P0_provenance rc=0 secs=0
+=== P1_source [140b60c7ec08 porcelain=0]: bash -c git diff --stat 279eb4f5 HEAD; awk '/^pub fn compare_and_requeue_locked/,/^}/' src/kernel/boot/futex.rs | grep -n 'with_cpu_sched\|scheduler_state\|enqueue_on_cpu\|reserve_user_slot' || echo NO_SCHEDULER_IN_COMMIT; grep -n 'futex_wake_key_outcome' src/runtime.rs src/kernel/boot/exec_state.rs | grep -v 'fn futex_wake_key_outcome' || echo NO_SEPARATE_WAKE_PORTION; true (start 21:49:45)
+P1_source rc=0 secs=0
+=== H1_fmt [140b60c7ec08 porcelain=0]: cargo fmt --all -- --check (start 21:49:45)
+H1_fmt rc=0 secs=6
+=== H2_clippy [140b60c7ec08 porcelain=0]: hosted cargo clippy --lib --features hosted-dev (start 21:49:51)
+H2_clippy rc=0 secs=7
+=== H3_hosted_lib [140b60c7ec08 porcelain=0]: hosted cargo test --lib -- --test-threads=1 (start 21:49:58)
+H3_hosted_lib rc=0 secs=146
+=== H4_integration [140b60c7ec08 porcelain=0]: hosted cargo test --test * --no-fail-fast -- --test-threads=1 (start 21:52:24)
+H4_integration rc=101 secs=116
+=== H5_futex_requeue1::atomic1 [140b60c7ec08 porcelain=0]: hosted cargo test --lib futex_requeue1::atomic1 -- --test-threads=1 (start 21:54:20)
+H5_futex_requeue1::atomic1 rc=0 secs=1
+=== H5_futex_requeue1 [140b60c7ec08 porcelain=0]: hosted cargo test --lib futex_requeue1 -- --test-threads=1 (start 21:54:21)
+H5_futex_requeue1 rc=0 secs=8
+=== H5_futex_wake_cap1 [140b60c7ec08 porcelain=0]: hosted cargo test --lib futex_wake_cap1 -- --test-threads=1 (start 21:54:29)
+H5_futex_wake_cap1 rc=0 secs=1
+=== H5_futex_found1 [140b60c7ec08 porcelain=0]: hosted cargo test --lib futex_found1 -- --test-threads=1 (start 21:54:30)
+H5_futex_found1 rc=0 secs=7
+=== H5_futex [140b60c7ec08 porcelain=0]: hosted cargo test --lib futex -- --test-threads=1 (start 21:54:37)
+H5_futex rc=0 secs=18
+=== H5_robust [140b60c7ec08 porcelain=0]: hosted cargo test --lib robust -- --test-threads=1 (start 21:54:55)
+H5_robust rc=0 secs=0
+=== H5_scheduler [140b60c7ec08 porcelain=0]: hosted cargo test --lib scheduler -- --test-threads=1 (start 21:54:55)
+H5_scheduler rc=0 secs=1
+=== H5_sched_ [140b60c7ec08 porcelain=0]: hosted cargo test --lib sched_ -- --test-threads=1 (start 21:54:56)
+H5_sched_ rc=0 secs=3
+=== H5_enqueue [140b60c7ec08 porcelain=0]: hosted cargo test --lib enqueue -- --test-threads=1 (start 21:54:59)
+H5_enqueue rc=0 secs=2
+=== H5_ap_sched1 [140b60c7ec08 porcelain=0]: hosted cargo test --lib ap_sched1 -- --test-threads=1 (start 21:55:01)
+H5_ap_sched1 rc=0 secs=0
+=== H5_stage199d [140b60c7ec08 porcelain=0]: hosted cargo test --lib stage199d -- --test-threads=1 (start 21:55:01)
+H5_stage199d rc=0 secs=20
+=== H5_stage191b [140b60c7ec08 porcelain=0]: hosted cargo test --lib stage191b -- --test-threads=1 (start 21:55:21)
+H5_stage191b rc=0 secs=0
+=== H5_stage191d [140b60c7ec08 porcelain=0]: hosted cargo test --lib stage191d -- --test-threads=1 (start 21:55:21)
+H5_stage191d rc=0 secs=0
+=== H5_stage200d0a [140b60c7ec08 porcelain=0]: hosted cargo test --lib stage200d0a -- --test-threads=1 (start 21:55:21)
+H5_stage200d0a rc=0 secs=0
+=== H5_stage29 [140b60c7ec08 porcelain=0]: hosted cargo test --lib stage29 -- --test-threads=1 (start 21:55:21)
+H5_stage29 rc=0 secs=1
+=== H5_syscall [140b60c7ec08 porcelain=0]: hosted cargo test --lib syscall -- --test-threads=1 (start 21:55:22)
+H5_syscall rc=0 secs=2
+=== H5_u9qa [140b60c7ec08 porcelain=0]: hosted cargo test --lib u9qa -- --test-threads=1 (start 21:55:24)
+H5_u9qa rc=0 secs=0
+=== H5_kthread [140b60c7ec08 porcelain=0]: hosted cargo test --lib kthread -- --test-threads=1 (start 21:55:24)
+H5_kthread rc=0 secs=1
+=== H5_exit [140b60c7ec08 porcelain=0]: hosted cargo test --lib exit -- --test-threads=1 (start 21:55:25)
+H5_exit rc=0 secs=2
+=== H5_reap [140b60c7ec08 porcelain=0]: hosted cargo test --lib reap -- --test-threads=1 (start 21:55:27)
+H5_reap rc=0 secs=1
+=== H5_spawn [140b60c7ec08 porcelain=0]: hosted cargo test --lib spawn -- --test-threads=1 (start 21:55:28)
+H5_spawn rc=0 secs=5
+=== H5_thread [140b60c7ec08 porcelain=0]: hosted cargo test --lib thread -- --test-threads=1 (start 21:55:33)
+H5_thread rc=0 secs=1
+=== H5_fork [140b60c7ec08 porcelain=0]: hosted cargo test --lib fork -- --test-threads=1 (start 21:55:34)
+H5_fork rc=0 secs=2
+=== H5_ipc_displace1 [140b60c7ec08 porcelain=0]: hosted cargo test --lib ipc_displace1 -- --test-threads=1 (start 21:55:36)
+H5_ipc_displace1 rc=0 secs=0
+=== H5_sender_wake [140b60c7ec08 porcelain=0]: hosted cargo test --lib sender_wake -- --test-threads=1 (start 21:55:36)
+H5_sender_wake rc=0 secs=1
+=== H2b_clippy_classes_B [279eb4f51bb8 porcelain=0]: bash -c /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra_clipcmp.sh (start 21:55:37)
+H2b_clippy_classes_B rc=0 secs=10
+=== H6_lockorder_attr [140b60c7ec08 porcelain=0]: bash -c /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra_lockattr.sh (start 21:55:47)
+H6_lockorder_attr rc=0 secs=224
+=== D1_build_x86_64 [140b60c7ec08 porcelain=0]: scripts/build-qemu-x86_64-artifacts.sh (start 21:59:31)
+D1_build_x86_64 rc=0 secs=28
+=== D2_build_aarch64 [140b60c7ec08 porcelain=0]: scripts/build-qemu-aarch64-artifacts.sh (start 21:59:59)
+D2_build_aarch64 rc=0 secs=29
+=== D3_build_riscv64 [140b60c7ec08 porcelain=0]: scripts/build-qemu-riscv64-artifacts.sh (start 22:00:28)
+ABORTED 2026-11-11T22:00:45Z: H4 failed (sched_lock1_grader_cli claim sites 7 != 6); candidate superseded

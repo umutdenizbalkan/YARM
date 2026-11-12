@@ -1,0 +1,32 @@
+nc3 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 329db08a..ed999942 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -672,22 +672,20 @@ pub fn claim_futex_waiter_locked(
+     candidate: FutexWakeCandidate,
+ ) -> bool {
+     let slot = usize::from(candidate.token.slot);
+-    if slot >= MAX_FUTEX_WAITERS || table.token(slot) != candidate.token {
++    if slot >= MAX_FUTEX_WAITERS {
+         return false;
+     }
+     let Some(rec) = table.records[slot] else {
+         return false;
+     };
+-    if rec.key != key || rec.tid != candidate.tid {
++    let _ = key;
++    if rec.tid != candidate.tid {
+         return false;
+     }
+-    let token = candidate.token;
+     let Some(tcb) = tcbs
+         .get_mut(usize::from(rec.tcb))
+         .and_then(Option::as_mut)
+-        .filter(|t| {
+-            t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))
+-        })
++        .filter(|t| t.tid.0 == rec.tid && matches!(t.status, TaskStatus::Blocked(_)))
+     else {
+         return false;
+     };

@@ -1,0 +1,3 @@
+0b66ef7fbe7e741d9cb24e7a317fa0e3ec36ea39385e1e483f5b9b9a176a7788  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/live/race-aarch64/boot.log
+7a1b7c3411e85ac8da0ec4ff00f25f80843f74d05c570382c190f91881fb6bda  build-aarch64/yarm-aarch64.bin
+5a67ef8b410f71297aae3bd0b3f86dba5b8e8f3ce41941f611503b2dec824cfc  build-aarch64/initramfs-core.cpio

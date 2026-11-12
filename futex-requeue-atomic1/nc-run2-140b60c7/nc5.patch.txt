@@ -1,0 +1,32 @@
+nc5 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 0b337d50..2de9fc87 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13812,6 +13812,8 @@ impl SharedKernel {
+                     return Err(refusal);
+                 }
+             };
++            let mut early = preflight.held;
++            self.futex_release_placements_split(&mut early);
+             #[cfg(test)]
+             fx::futex_phase_hook::run_requeue_window();
+             #[cfg(feature = "futex-requeue-race-witness")]
+@@ -13822,7 +13824,7 @@ impl SharedKernel {
+                 fx::race_witness::hold_window(cpu.0, committed.woken, committed.moved);
+             }
+             self.futex_requeue_place_split(&committed, &mut preflight.held);
+-            self.futex_release_placements_split(&mut preflight.held);
++            preflight.held = fx::FutexPlacementCounts::new();
+             return Ok(fx::FutexRequeueOutcome {
+                 woken: committed.woken,
+                 requeued: committed.moved,
+@@ -13944,7 +13946,7 @@ impl SharedKernel {
+                     target: EnqueueTarget::Pinned(home),
+                 };
+                 match self.with_cpu_sched_split(home, |c| {
+-                    te::commit_reserved_enqueue_on_cpu_locked(c, &plan)
++                    te::commit_enqueue_on_cpu_locked(c, &plan).map(ReservedCommit::Queued)
+                 }) {
+                     Ok(Ok(ReservedCommit::Queued(t))) => {
+                         #[cfg(feature = "sched-lock1-witness")]

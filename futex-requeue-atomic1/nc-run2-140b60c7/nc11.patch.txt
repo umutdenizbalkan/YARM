@@ -1,0 +1,14 @@
+nc11 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index f86acab6..128e6a09 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -940,7 +940,7 @@ fn record_placement(
+ /// Move `slot` (bucket predecessor `prev`) to `key`, appended at that key's tail: unlink, rekey,
+ /// append. Its slot and incarnation, and so its waiter's token, are unchanged.
+ fn rekey(table: &mut FutexWaiterTable, slot: usize, prev: u16, key: FutexKey, va: Option<u64>) {
+-    table.unlink_after(slot, prev);
++    let _ = prev;
+     if let Some(r) = table.records[slot].as_mut() {
+         r.key = key;
+         if let Some(va) = va {

@@ -1,0 +1,16 @@
+nc2 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index d174ba34..65c2598a 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13922,7 +13922,9 @@ impl SharedKernel {
+             };
+             for _ in 0..count {
+                 let Some(tid) = self.with_task_futex_split_mut(|tcbs, table| {
+-                    fx::claim_pending_futex_waiter_locked(tcbs, table, key)
++                    fx::claim_pending_futex_waiter_locked(tcbs, table, key).or_else(|| {
++                        fx::claim_pending_futex_waiter_locked(tcbs, table, committed.source)
++                    })
+                 }) else {
+                     break;
+                 };

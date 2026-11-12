@@ -1,0 +1,33 @@
+nc7 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 329db08a..4abcce16 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1022,7 +1022,13 @@ pub fn compare_and_requeue_locked(
+         if rec.key == s_key && table.live(tcbs, slot) {
+             let at = record_placement(tcbs, classes, table, slot);
+             match at {
+-                Some((cpu, priority)) if avail.take(cpu, priority) => woken += 1,
++                Some((cpu, priority)) if {
++                    let _ = avail.take(cpu, priority);
++                    true
++                } =>
++                {
++                    woken += 1
++                }
+                 _ => {
+                     let explained = match preflight.refused {
+                         Some(FutexPlacementRefusal::Slot { cpu, priority }) => {
+diff --git a/src/runtime.rs b/src/runtime.rs
+index d174ba34..89b69895 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13937,7 +13937,7 @@ impl SharedKernel {
+                     target: EnqueueTarget::Pinned(home),
+                 };
+                 match self.with_cpu_sched_split(home, |c| {
+-                    te::commit_reserved_enqueue_on_cpu_locked(c, &plan)
++                    te::commit_enqueue_on_cpu_locked(c, &plan).map(ReservedCommit::Queued)
+                 }) {
+                     Ok(Ok(ReservedCommit::Queued(t))) => {
+                         #[cfg(feature = "sched-lock1-witness")]

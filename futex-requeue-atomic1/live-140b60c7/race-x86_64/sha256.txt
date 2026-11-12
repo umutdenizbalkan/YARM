@@ -1,0 +1,3 @@
+6db0f22c74b1c846dee20c3c15e9d1503d708b19cce70530aeef95d229a33fbe  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra-evidence/live/race-x86_64/boot.log
+d431b727e46024181658cd231f3dabc34704799c5e62ca355018bc019daf765f  build-x86_64/kernel_boot.elf
+25c58d14693b4ea0f2acb4e1f6732ea8c75de97d232f3e538514d901f3883f32  build-x86_64/initramfs-core.cpio

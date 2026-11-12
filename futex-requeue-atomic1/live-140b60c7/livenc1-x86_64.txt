@@ -1,0 +1,16 @@
+[futex-requeue-witness] building base x86_64 artifacts with futex-requeue-witness,futex-requeue-race-witness
+[futex-requeue-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle,futex-requeue-race-witness
+[futex-requeue-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-requeue-grade][fail] round 1: requeued=9 (want 8)
+[futex-requeue-grade][fail] round 1: result=fail (want ok)
+[futex-requeue-grade][fail] round 2: requeued=9 (want 8)
+[futex-requeue-grade][fail] round 2: result=fail (want ok)
+[futex-requeue-grade][fail] round 3: requeued=9 (want 8)
+[futex-requeue-grade][fail] round 3: result=fail (want ok)
+[futex-requeue-grade][fail] CRQ_WITNESS_DONE result=fail finished=10
+[futex-requeue-grade][fail] kernel: broadcast requeued=9 (the cell accounts 8)
+[futex-requeue-grade][fail] kernel: broadcast requeued=9 (the cell accounts 8)
+[futex-requeue-grade][fail] kernel: broadcast requeued=9 (the cell accounts 8)
+[futex-requeue-grade][fail] race: a wake INSIDE the window took a waiter the commit had decided: {'cpu': '1', 'tid': '10018', 'window': '2', 'woke': '1'}
+[futex-requeue-grade][fail] race: a wake INSIDE the window took a waiter the commit had decided: {'cpu': '1', 'tid': '10018', 'window': '3', 'woke': '1'}
+FUTEX_REQUEUE_WITNESS_SEAL arch=x86_64 smp=2 rounds=3 broadcasts=3 census_calls=6 parks=43 park_cpus=0,1 requeuer_cpus=0 mutex_wakes=10,10,10 windows=3 covered=3 in_window_wakes=3 competing_cpus=1 sig_woke=1,1,1 cross_cpu=yes witness=fail core_smoke=ok result=fail

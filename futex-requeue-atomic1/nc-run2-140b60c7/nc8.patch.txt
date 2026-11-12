@@ -1,0 +1,104 @@
+nc8 applied
+diff --git a/src/kernel/boot/exec_state.rs b/src/kernel/boot/exec_state.rs
+index 65cb691c..350d1d14 100644
+--- a/src/kernel/boot/exec_state.rs
++++ b/src/kernel/boot/exec_state.rs
+@@ -1271,7 +1271,10 @@ impl KernelState {
+         let current_cpu = self.current_cpu();
+         let want = (wake as usize).min(fx::MAX_FUTEX_WAITERS);
+         let mut cursor = None;
+-        for _ in 0..want {
++        for _ in 0..fx::MAX_FUTEX_WAITERS {
++            if out.held.total() as usize >= want {
++                break;
++            }
+             let Ok(Some(candidate)) = self.with_task_futex_mut(|tcbs, table| {
+                 fx::next_futex_waiter_after_locked(tcbs.as_slice(), table, key, cursor)
+             }) else {
+@@ -1312,7 +1315,8 @@ impl KernelState {
+                     cpu: home,
+                     priority: plan.priority,
+                 });
+-                break;
++                cursor = Some(candidate);
++                continue;
+             }
+             out.held.add(home, plan.priority);
+             #[cfg(test)]
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index f86acab6..fc5d1048 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1031,11 +1031,8 @@ pub fn compare_and_requeue_locked(
+                         Some(FutexPlacementRefusal::Plan { token }) => token == table.token(slot),
+                         None => false,
+                     };
+-                    if !explained && !preflight.last_attempt {
+-                        return Ok(FutexRequeueCommit::Stale);
+-                    }
++                    let _ = explained;
+                     capacity_limited = true;
+-                    break;
+                 }
+             }
+         }
+@@ -1061,6 +1058,11 @@ pub fn compare_and_requeue_locked(
+             table.retire_after(slot, prev);
+         } else if rec.key != s_key {
+             prev = cur;
++        } else if selected < woken
++            && !record_placement(tcbs, classes, table, slot)
++                .is_some_and(|(c, p)| assigned_room(&preflight.held, &assigned, c, p))
++        {
++            prev = cur;
+         } else if selected < woken
+             && let Some((cpu, priority)) = record_placement(tcbs, classes, table, slot)
+         {
+@@ -1164,6 +1166,21 @@ pub mod race_witness {
+     }
+ }
+ 
++fn assigned_room(
++    held: &FutexPlacementCounts,
++    assigned: &FutexPlacementCounts,
++    cpu: CpuId,
++    priority: TaskPriority,
++) -> bool {
++    let mut h = *held;
++    for (c, p, n) in assigned.nonzero() {
++        for _ in 0..n {
++            h.take(c, p);
++        }
++    }
++    h.take(cpu, priority)
++}
++
+ /// rank 2 — claim the oldest waiter still on the pending key `key` (`Runnable`, record retired),
+ /// exactly as a wake claims. `None` once no live waiter is left on it (the rest exited, or undid
+ /// their own registration in their publication window).
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 0b337d50..1b10736a 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13856,7 +13856,10 @@ impl SharedKernel {
+         }
+         let want = (wake as usize).min(fx::MAX_FUTEX_WAITERS);
+         let mut cursor = None;
+-        for _ in 0..want {
++        for _ in 0..fx::MAX_FUTEX_WAITERS {
++            if out.held.total() as usize >= want {
++                break;
++            }
+             // rank 2: the next source waiter in FIFO order, then its plan.
+             let Ok(Some(candidate)) = self.with_task_futex_split_mut(|tcbs, table| {
+                 fx::next_futex_waiter_after_locked(tcbs, table, key, cursor)
+@@ -13895,7 +13898,8 @@ impl SharedKernel {
+                     cpu: home,
+                     priority: plan.priority,
+                 });
+-                break;
++                cursor = Some(candidate);
++                continue;
+             }
+             out.held.add(home, plan.priority);
+             #[cfg(test)]

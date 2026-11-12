@@ -1,0 +1,16 @@
+nc2 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 46ec473c..69f41d97 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13929,7 +13929,9 @@ impl SharedKernel {
+             };
+             for _ in 0..count {
+                 let Some(tid) = self.with_task_futex_split_mut(|tcbs, table| {
+-                    let tid = fx::claim_pending_futex_waiter_locked(tcbs, table, key)?;
++                    let tid = fx::claim_pending_futex_waiter_locked(tcbs, table, key).or_else(|| {
++                        fx::claim_pending_futex_waiter_locked(tcbs, table, committed.source)
++                    })?;
+                     // SCHED-LOCK1 witness only: the incarnation this owner places — exactly the
+                     // waiter it claimed, which may differ from the one its preflight planned for.
+                     #[cfg(feature = "sched-lock1-witness")]

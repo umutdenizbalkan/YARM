@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra_nc.py", line 209, in <module>
+    patch(rel, old, new)
+  File "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fra_nc.py", line 9, in patch
+    assert s.count(old) == 1, (rel, old[:100], s.count(old))
+           ^^^^^^^^^^^^^^^^^
+AssertionError: ('src/runtime.rs', '            #[cfg(test)]\n            fx::futex_phase_hook::run_requeue_window();\n            self.fu', 0)

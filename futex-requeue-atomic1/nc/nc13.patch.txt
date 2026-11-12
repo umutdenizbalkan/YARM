@@ -1,0 +1,14 @@
+nc13 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 46ec473c..716ac690 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18721,7 +18721,7 @@ impl SharedKernel {
+         // outcome — this waiter moved, or woken — stands, as in the one order that explains it.
+         let undo_unless_acted_on = || {
+             self.with_task_futex_split_mut(|tcbs, table| {
+-                fx::undo_futex_registration_unless_acted_on_locked(tcbs, table, tid, token, key)
++                fx::undo_futex_registration_locked(tcbs, table, tid, token)
+             })
+         };
+         if !unchanged && undo_unless_acted_on() {

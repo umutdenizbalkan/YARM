@@ -1,0 +1,24 @@
+nc10 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 329db08a..dae09628 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1080,7 +1080,17 @@ pub fn compare_and_requeue_locked(
+             if selected < woken {
+                 woken = selected;
+             }
+-            rekey(table, slot, prev, t_key, Some(target.0 as u64));
++            table.unlink_after(slot, prev);
++            let tb = t_key.bucket();
++            if let Some(r) = table.records[slot].as_mut() {
++                r.key = t_key;
++                r.va = target.0 as u64;
++                r.next = table.head[tb];
++            }
++            if table.head[tb] == NIL {
++                table.tail[tb] = slot as u16;
++            }
++            table.head[tb] = slot as u16;
+             moved += 1;
+         } else {
+             break;

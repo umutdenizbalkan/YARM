@@ -1,0 +1,24 @@
+ Cargo.toml                                         |    5 +
+ crates/yarm-control-plane-servers/Cargo.toml       |    1 +
+ .../src/control_plane/init/service.rs              |  119 +-
+ crates/yarm-driver-servers/Cargo.toml              |    1 +
+ crates/yarm-fs-servers/Cargo.toml                  |    1 +
+ crates/yarm-user-rt/src/lib.rs                     |    6 +-
+ doc/AI_AGENT_RULES.md                              |   11 +
+ doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md              |    3 +
+ doc/SCHEDULING_CONTRACT.md                         |    4 +-
+ doc/SYSCALL_ABI.md                                 |   56 +-
+ scripts/grade-futex-requeue-witness.py             |   86 +-
+ scripts/qemu-futex-requeue-witness-smoke.sh        |   11 +-
+ src/kernel/boot/exec_state.rs                      |  233 +++-
+ src/kernel/boot/futex.rs                           |  500 ++++++++-
+ src/kernel/boot/orchestrator_state.rs              |    8 +-
+ src/kernel/boot/tests.rs                           | 1151 +++++++++++++++++++-
+ src/kernel/syscall_split.rs                        |    4 +
+ src/kernel/task_enqueue.rs                         |   23 +
+ src/runtime.rs                                     |  283 ++++-
+ tests/sched_lock1_grader_cli.rs                    |    5 +-
+ 20 files changed, 2332 insertions(+), 179 deletions(-)
+NO_SCHEDULER_IN_COMMIT
+src/runtime.rs:14017:        self.futex_wake_key_outcome_split(cpu, key, count).woke
+src/kernel/boot/exec_state.rs:1447:        self.futex_wake_key_outcome(key, count).woke

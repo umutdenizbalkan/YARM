@@ -1,0 +1,9 @@
+candidate=5939c705 porcelain=0
+race-x86_64 rc=0 FUTEX_REQUEUE_WITNESS_SEAL arch=x86_64 smp=2 rounds=3 broadcasts=3 census_calls=6 parks=43 park_cpus=0,1 requeuer_cpus=0 mutex_wakes=10,10,10 windows=3 covered=3 in_window_wakes=3 competing_cpus=1 sig_woke=0,0,0 cross_cpu=yes witness=ok core_smoke=ok result=ok
+race-aarch64 rc=0 FUTEX_REQUEUE_WITNESS_SEAL arch=aarch64 smp=2 rounds=3 broadcasts=3 census_calls=6 parks=43 park_cpus=0,1 requeuer_cpus=0 mutex_wakes=10,10,10 windows=3 covered=3 in_window_wakes=3 competing_cpus=1 sig_woke=0,0,0 cross_cpu=yes witness=ok core_smoke=ok result=ok
+race-riscv64 rc=0 FUTEX_REQUEUE_WITNESS_SEAL arch=riscv64 smp=2 rounds=3 broadcasts=3 census_calls=6 parks=42 park_cpus=0,1 requeuer_cpus=0 mutex_wakes=10,9,10 windows=3 covered=3 in_window_wakes=3 competing_cpus=1 sig_woke=0,0,0 cross_cpu=yes witness=ok core_smoke=ok result=ok
+livenc1-x86_64 rc=1 FUTEX_REQUEUE_WITNESS_SEAL arch=x86_64 smp=2 rounds=3 broadcasts=3 census_calls=6 parks=43 park_cpus=0,1 requeuer_cpus=0 mutex_wakes=10,10,10 windows=3 covered=3 in_window_wakes=3 competing_cpus=1 sig_woke=1,1,1 cross_cpu=yes witness=fail core_smoke=ok result=fail
+[futex-requeue-grade][fail] race: a wake INSIDE the window took a waiter the commit had decided: {'cpu': '1', 'tid': '10018', 'window': '1', 'woke': '1'}
+[futex-requeue-grade][fail] race: a wake INSIDE the window took a waiter the commit had decided: {'cpu': '1', 'tid': '10018', 'window': '2', 'woke': '1'}
+[futex-requeue-grade][fail] race: a wake INSIDE the window took a waiter the commit had decided: {'cpu': '1', 'tid': '10018', 'window': '3', 'woke': '1'}
+LIVE_DONE

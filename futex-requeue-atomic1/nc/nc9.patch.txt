@@ -1,0 +1,15 @@
+nc9 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index f86acab6..f08e6922 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1061,6 +1061,9 @@ pub fn compare_and_requeue_locked(
+             table.retire_after(slot, prev);
+         } else if rec.key != s_key {
+             prev = cur;
++        } else if woken > 0 && selected == 0 && moved < max_move.min(2) {
++            rekey(table, slot, prev, t_key, Some(target.0 as u64));
++            moved += 1;
+         } else if selected < woken
+             && let Some((cpu, priority)) = record_placement(tcbs, classes, table, slot)
+         {

@@ -1,0 +1,33 @@
+nc1 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index f86acab6..79e74e27 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1073,7 +1073,8 @@ pub fn compare_and_requeue_locked(
+                 cpu: cpu.0,
+                 priority: priority as u8,
+             };
+-            rekey(table, slot, prev, pending, None);
++            let _ = pending;
++            prev = cur;
+             assigned.add(cpu, priority);
+             selected += 1;
+         } else if moved < max_move {
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 0b337d50..c4a3e3e0 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13922,11 +13922,12 @@ impl SharedKernel {
+         use crate::kernel::boot::futex::{self as fx, FutexKey};
+         use crate::kernel::task_enqueue::{self as te, EnqueuePlan, EnqueueTarget, ReservedCommit};
+         for (home, priority, count) in committed.assigned.nonzero() {
+-            let key = FutexKey::Pending {
++            let _ = FutexKey::Pending {
+                 op: committed.op,
+                 cpu: home.0,
+                 priority: priority as u8,
+             };
++            let key = committed.source;
+             for _ in 0..count {
+                 let Some(tid) = self.with_task_futex_split_mut(|tcbs, table| {
+                     fx::claim_pending_futex_waiter_locked(tcbs, table, key)

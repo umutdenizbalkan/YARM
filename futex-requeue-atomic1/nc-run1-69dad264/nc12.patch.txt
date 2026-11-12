@@ -1,0 +1,14 @@
+nc12 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index d174ba34..958f61b3 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18781,7 +18781,7 @@ impl SharedKernel {
+         // `Runnable -> Running` on the exact incarnation and pulls it out of the run queue if the
+         // waker's enqueue landed there.
+         let entering = crate::kernel::recv_waiter_split::RecvEnteringIncarnation {
+-            tid,
++            tid: tid + 1,
+             asid,
+             priority,
+         };

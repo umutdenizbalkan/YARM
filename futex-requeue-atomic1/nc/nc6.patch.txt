@@ -1,0 +1,13 @@
+nc6 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 46ec473c..14fc933b 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13822,7 +13822,6 @@ impl SharedKernel {
+                 fx::race_witness::hold_window(cpu.0, committed.woken, committed.moved);
+             }
+             self.futex_requeue_place_split(&committed, &mut preflight.held);
+-            self.futex_release_placements_split(&mut preflight.held);
+             return Ok(fx::FutexRequeueOutcome {
+                 woken: committed.woken,
+                 requeued: committed.moved,

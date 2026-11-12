@@ -1,0 +1,62 @@
+nc8 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 329db08a..309fc1f0 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1031,11 +1031,8 @@ pub fn compare_and_requeue_locked(
+                         Some(FutexPlacementRefusal::Plan { token }) => token == table.token(slot),
+                         None => false,
+                     };
+-                    if !explained && !preflight.last_attempt {
+-                        return Ok(FutexRequeueCommit::Stale);
+-                    }
++                    let _ = explained;
+                     capacity_limited = true;
+-                    break;
+                 }
+             }
+         }
+@@ -1063,6 +1060,7 @@ pub fn compare_and_requeue_locked(
+             prev = cur;
+         } else if selected < woken
+             && let Some((cpu, priority)) = record_placement(tcbs, classes, table, slot)
++            && assigned_room(&preflight.held, &assigned, cpu, priority)
+         {
+             // Step 3 proved this waiter's placement has a slot: the walk meets the same waiters in
+             // the same order, because nothing can change under the held locks. (Were a placement
+@@ -1102,6 +1100,21 @@ pub fn compare_and_requeue_locked(
+     }))
+ }
+ 
++fn assigned_room(
++    held: &FutexPlacementCounts,
++    assigned: &FutexPlacementCounts,
++    cpu: CpuId,
++    priority: TaskPriority,
++) -> bool {
++    let mut h = *held;
++    for (c, p, n) in assigned.nonzero() {
++        for _ in 0..n {
++            h.take(c, p);
++        }
++    }
++    h.take(cpu, priority)
++}
++
+ /// rank 2 — claim the oldest waiter still on the pending key `key` (`Runnable`, record retired),
+ /// exactly as a wake claims. `None` once no live waiter is left on it (the rest exited, or undid
+ /// their own registration in their publication window).
+diff --git a/src/runtime.rs b/src/runtime.rs
+index d174ba34..367f33e7 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -13888,7 +13888,8 @@ impl SharedKernel {
+                     cpu: home,
+                     priority: plan.priority,
+                 });
+-                break;
++                cursor = Some(candidate);
++                continue;
+             }
+             out.held.add(home, plan.priority);
+             #[cfg(test)]
