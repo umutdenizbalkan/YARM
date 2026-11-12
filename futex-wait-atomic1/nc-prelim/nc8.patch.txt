@@ -1,0 +1,15 @@
+nc8 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 3b9e544e..14e92437 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -554,6 +554,9 @@ pub fn register_futex_waiter_locked(
+     if let Some(tcb) = tcbs[tcb_idx].as_mut() {
+         tcb.status = TaskStatus::Blocked(WaitReason::Futex(token));
+     }
++    if let Some(tcb) = tcbs[tcb_idx].as_mut() {
++        tcb.status = TaskStatus::Running;
++    }
+     Ok(token)
+ }
+ 

@@ -1,0 +1,43 @@
+nc1 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index dc8f1e65..4264c74b 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18656,24 +18656,19 @@ impl SharedKernel {
+         use crate::kernel::boot::futex::{self as fx, FutexCompareRegisterRefusal};
+         use crate::kernel::syscall::sched::FutexParkOutcome as O;
+ 
+-        #[cfg(test)]
+-        fx::futex_phase_hook::run_before_register();
+-
+-        // (1) ranks 2 → 5 → 6, ONE hold — COMPARE AND REGISTER (FUTEX-WAIT-ATOMIC1). The key is
+-        // resolved, the word read and compared, and the keyed record and `Blocked(Futex(token))`
+-        // published, for the exact `Running` `{tid, asid}`, without releasing anything in between.
+-        // That load is the wait's linearization point: every waker, requeue, exit and mapping
+-        // change is wholly before this hold or wholly after it (see the owner's doc). So there is
+-        // no second read: once this hold has registered the waiter, the wait has happened, and a
+-        // later change of the word is a later operation — one that wakes, moves or leaves it, as
+-        // its own sequential step would. Nothing here retracts a registration because of the word.
+-        let registered = self.with_task_futex_then_vm_memory_split_mut(
+-            |tcbs, _classes, table, spaces, memory| {
+-                fx::compare_and_register_futex_waiter_locked(
+-                    tcbs, table, spaces, memory, tid, asid, addr, expected, kind,
+-                )
+-            },
+-        );
++        let registered = match self.resolve_futex_word_in_split(asid, addr, kind) {
++            Err(e) => Err(FutexCompareRegisterRefusal::Word(e)),
++            Ok((_, w)) if w != expected => Err(FutexCompareRegisterRefusal::ValueChanged),
++            Ok((key, _)) => {
++                #[cfg(test)]
++                fx::futex_phase_hook::run_before_register();
++                self.with_task_futex_split_mut(|tcbs, table| {
++                    fx::register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)
++                })
++                .map(|t| (key, t))
++                .map_err(|_| FutexCompareRegisterRefusal::IncarnationMoved)
++            }
++        };
+         let token = match registered {
+             Ok((_key, token)) => token,
+             Err(FutexCompareRegisterRefusal::ValueChanged) => return O::ValueChanged,

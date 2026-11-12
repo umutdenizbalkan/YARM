@@ -1,0 +1,6 @@
+tree=5b50dd181114622866a646f4b91c8f314d6e209f head=9ce9845f9ac6f33070d45f131037fbc09436ae20 dirty=0 kernel_features=--no-default-features --features aarch64-sched-lock1-witness
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=virt,gic-version=2 cpu=cortex-a72 append=(none)
+8a714b2eda2c752ddee7a887b1d3bd5ca15845cd12c527e0a6be1e79ebec09f8  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fwa-evidence/qual/FX6_aarch64/build/yarm-aarch64.bin
+ddf410a80882eac0749e817c32f49dc9c94c8c71b1cf09aa914ad7e3812d1575  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fwa-evidence/qual/FX6_aarch64/build/yarm-aarch64.elf
+86137a3c7138c04a811e6ab503fcd2abe7342338d28b2ad842fe50287672e99d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fwa-evidence/qual/FX6_aarch64/build/initramfs-core.cpio
+boot smp=2

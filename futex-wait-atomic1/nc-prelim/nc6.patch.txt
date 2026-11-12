@@ -1,0 +1,15 @@
+nc6 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index dc8f1e65..fdda9b4d 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18745,7 +18745,8 @@ impl SharedKernel {
+         // claimed this exact token — its record retired and the TCB `Runnable` — and that is the
+         // ONLY thing that can have moved it.
+         let still_parked = self.with_task_futex_split_mut(|tcbs, _table| {
+-            fx::futex_still_parked_locked(tcbs, tid, token)
++            let _ = fx::futex_still_parked_locked(tcbs, tid, token);
++            true
+         });
+         if still_parked {
+             crate::yarm_log!(

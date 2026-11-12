@@ -1,0 +1,24 @@
+nc11 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 3b9e544e..b5575cc5 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -416,7 +416,9 @@ impl FutexWaiterTable {
+         tcbs.get(usize::from(rec.tcb))
+             .and_then(Option::as_ref)
+             .is_some_and(|t| {
+-                t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))
++                t.tid.0 == rec.tid
++                    && (t.status == TaskStatus::Blocked(WaitReason::Futex(token))
++                        || matches!(t.status, TaskStatus::Exited(_)))
+             })
+     }
+ 
+@@ -1228,7 +1230,6 @@ pub fn retire_futex_waiters_for_task_locked(table: &mut FutexWaiterTable, tid: u
+     let mut n = 0;
+     for slot in 0..MAX_FUTEX_WAITERS {
+         if table.records[slot].is_some_and(|r| r.tid == tid) {
+-            table.retire(slot);
+             n += 1;
+         }
+     }

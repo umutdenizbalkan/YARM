@@ -1,0 +1,24 @@
+ Cargo.toml                                         |   2 +
+ crates/yarm-control-plane-servers/Cargo.toml       |   1 +
+ .../src/control_plane/init/service.rs              | 201 +++++
+ crates/yarm-driver-servers/Cargo.toml              |   1 +
+ crates/yarm-fs-servers/Cargo.toml                  |   1 +
+ doc/AI_AGENT_RULES.md                              |  10 +-
+ doc/KERNEL_LOCKING.md                              |   3 +
+ doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md              |   3 +-
+ doc/SCHEDULING_CONTRACT.md                         |   3 +-
+ doc/SYSCALL_ABI.md                                 |  29 +-
+ scripts/check-contract-doc-enforcement.sh          |  23 +-
+ scripts/grade-futex-wait-witness.py                | 249 ++++++
+ scripts/qemu-futex-wait-witness-smoke.sh           | 109 +++
+ src/kernel/boot/exec_state.rs                      |  50 +-
+ src/kernel/boot/futex.rs                           | 274 +++++-
+ src/kernel/boot/tests.rs                           | 992 ++++++++++++++++++++-
+ src/kernel/syscall_split.rs                        |  20 +-
+ src/runtime.rs                                     | 152 ++--
+ 18 files changed, 1973 insertions(+), 150 deletions(-)
+park_lines=155
+1
+NO_SECOND_READ_NO_SEPARATE_REGISTER
+985:                super::futex::compare_and_register_futex_waiter_locked(
+UNDO_UNLESS_ACTED_ON_GONE

@@ -1,0 +1,16 @@
+nc2 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 3b9e544e..bef8f7bc 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -607,9 +607,7 @@ pub fn compare_and_register_futex_waiter_locked(
+         Err(_) if !entering_incarnation(tcbs, tid, asid) => return Err(Refused::IncarnationMoved),
+         Err(err) => return Err(Refused::Word(err)),
+     };
+-    if !crate::kernel::syscall::sched::futex_should_park(expected, word) {
+-        return Err(Refused::ValueChanged);
+-    }
++    let _ = (expected, word);
+     register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)
+         .map(|token| (key, token))
+         .map_err(|refusal| match refusal {

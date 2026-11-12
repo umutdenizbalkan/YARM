@@ -1,0 +1,3 @@
+tree=51198a57 base=c2b9893e porcelain=0
+riscv64 rc=1 FWAW_DONE waiter=10008 signallers=10009,10010 calls=16 returns=16 blocked=0 errors=16 result=fail
+aarch64 rc=1 FWAW_DONE waiter=10008 signallers=10009,10010 calls=16 returns=16 blocked=16 errors=0 result=ok

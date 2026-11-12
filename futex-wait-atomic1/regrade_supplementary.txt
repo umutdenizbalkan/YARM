@@ -1,0 +1,50 @@
+REGRADE live-ae65c57e/livenc1-x86_64/boot.norm.log damaged=0 as_logged_fails=12 repaired_fails=12 windows 24->24 waits 12->12
+  repaired-fail: wait 4: registered although its word had changed before the compare-and-register (B saw 0xf7a10003 for 0xf7a10002)
+  repaired-fail: wait 4: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 6: registered although its word had changed before the compare-and-register (B saw 0xf7a10005 for 0xf7a10004)
+  repaired-fail: wait 6: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 8: registered although its word had changed before the compare-and-register (B saw 0xf7a10007 for 0xf7a10006)
+  repaired-fail: wait 8: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 10: registered although its word had changed before the compare-and-register (B saw 0xf7a1000e for 0xf7a1000d)
+  repaired-fail: wait 10: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 14: registered although its word had changed before the compare-and-register (B saw 0xf7a10013 for 0xf7a10012)
+  repaired-fail: wait 14: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 16: registered although its word had changed before the compare-and-register (B saw 0xf7a10015 for 0xf7a10014)
+  repaired-fail: wait 16: word changed before its registration, result woken_during_publication
+REGRADE live-ae65c57e/wait-aarch64/boot.norm.log damaged=1 as_logged_fails=0 repaired_fails=0 windows 16->17 waits 10->11
+  damaged: FUTEX_WAIT_WI3TNESS_WINDOW_OPEN kind=B wait=8 window=9 cpu=1 tid=10008
+REGRADE live-ae65c57e/wait-riscv64/boot.norm.log damaged=0 as_logged_fails=3 repaired_fails=3 windows 9->9 waits 5->5
+  repaired-fail: FWAW_DONE result=fail
+  repaired-fail: userspace saw 4 blocking calls, the kernel registered 15
+  repaired-fail: coverage: 1 B windows saw a store (need 2)
+REGRADE live-ae65c57e/wait-x86_64/boot.norm.log damaged=0 as_logged_fails=0 repaired_fails=0 windows 13->13 waits 9->9
+REGRADE live/livenc1-x86_64/boot.norm.log damaged=0 as_logged_fails=16 repaired_fails=16 windows 32->32 waits 16->16
+  repaired-fail: wait 2: registered although its word had changed before the compare-and-register (B saw 0xf7a10001 for 0xf7a10000)
+  repaired-fail: wait 2: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 4: registered although its word had changed before the compare-and-register (B saw 0xf7a10003 for 0xf7a10002)
+  repaired-fail: wait 4: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 6: registered although its word had changed before the compare-and-register (B saw 0xf7a10005 for 0xf7a10004)
+  repaired-fail: wait 6: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 8: registered although its word had changed before the compare-and-register (B saw 0xf7a10007 for 0xf7a10006)
+  repaired-fail: wait 8: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 10: registered although its word had changed before the compare-and-register (B saw 0xf7a10009 for 0xf7a10008)
+  repaired-fail: wait 10: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 12: registered although its word had changed before the compare-and-register (B saw 0xf7a1000b for 0xf7a1000a)
+  repaired-fail: wait 12: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 14: registered although its word had changed before the compare-and-register (B saw 0xf7a1000d for 0xf7a1000c)
+  repaired-fail: wait 14: word changed before its registration, result woken_during_publication
+  repaired-fail: wait 16: registered although its word had changed before the compare-and-register (B saw 0xf7a1000f for 0xf7a1000e)
+  repaired-fail: wait 16: word changed before its registration, result woken_during_publication
+REGRADE live/wait-aarch64/boot.norm.log damaged=0 as_logged_fails=0 repaired_fails=0 windows 24->24 waits 16->16
+REGRADE live/wait-riscv64/boot.norm.log damaged=0 as_logged_fails=6 repaired_fails=6 windows 1->1 waits 1->1
+  repaired-fail: no FWAW_DONE: the cell never finished
+  repaired-fail: window 1 never closed
+  repaired-fail: wait 1: an unchanged word, but no registration window (result None)
+  repaired-fail: wait 1: registered and woken inside A, result None
+  repaired-fail: coverage: 0 B windows saw a store (need 2)
+  repaired-fail: coverage: 0 A windows (need 2)
+REGRADE live/wait-x86_64/boot.norm.log damaged=0 as_logged_fails=0 repaired_fails=0 windows 24->24 waits 16->16
+REGRADE qual/../live-trial-prefreeze/x86_64/boot.norm.log damaged=0 as_logged_fails=0 repaired_fails=0 windows 24->24 waits 16->16
+REGRADE qual/FX9_aarch64/boot.norm.log damaged=0 as_logged_fails=0 repaired_fails=0 windows 24->24 waits 16->16
+REGRADE qual/FX9_riscv64/boot.norm.log damaged=0 as_logged_fails=0 repaired_fails=0 windows 24->24 waits 16->16
+REGRADE qual/FX9_x86_64/boot.norm.log damaged=0 as_logged_fails=0 repaired_fails=0 windows 24->24 waits 16->16

@@ -1,0 +1,4 @@
+[futex-wait-witness] building base aarch64 artifacts with futex-requeue-witness,futex-wait-witness
+[futex-wait-witness] rebuilding kernel_boot with aarch64-shared-region-direct-oracle,futex-wait-witness
+[futex-wait-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+FUTEX_WAIT_WITNESS_SEAL arch=aarch64 smp=2 waits=10 skipped=4 windows=16 b_changed=4 a=6 in_window_wakes=17 waiter_cpus=1 waker_cpus=0 calls=16 returns=16 blocked=10 witness=ok core_smoke=ok result=ok

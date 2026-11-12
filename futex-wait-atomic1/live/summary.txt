@@ -1,0 +1,11 @@
+candidate=9ce9845f porcelain=0
+wait-x86_64 rc=0 FUTEX_WAIT_WITNESS_SEAL arch=x86_64 smp=2 waits=16 windows=24 b_changed=8 a=8 in_window_wakes=24 waiter_cpus=1 waker_cpus=0 calls=16 returns=16 blocked=8 witness=ok core_smoke=ok result=ok
+wait-aarch64 rc=0 FUTEX_WAIT_WITNESS_SEAL arch=aarch64 smp=2 waits=16 windows=24 b_changed=8 a=8 in_window_wakes=24 waiter_cpus=1 waker_cpus=0 calls=16 returns=16 blocked=8 witness=ok core_smoke=ok result=ok
+wait-riscv64 rc=1 FUTEX_WAIT_WITNESS_SEAL arch=riscv64 smp=2 waits=1 windows=1 b_changed=0 a=0 in_window_wakes=0 waiter_cpus=1 waker_cpus=none calls=0 returns=? blocked=? witness=fail core_smoke=rejected(rc=0) result=fail
+livenc1-x86_64 rc=1 FUTEX_WAIT_WITNESS_SEAL arch=x86_64 smp=2 waits=16 windows=32 b_changed=8 a=16 in_window_wakes=32 waiter_cpus=1 waker_cpus=0 calls=16 returns=16 blocked=16 witness=fail core_smoke=ok result=fail
+[futex-wait-grade][fail] wait 2: registered although its word had changed before the compare-and-register (B saw 0xf7a10001 for 0xf7a10000)
+[futex-wait-grade][fail] wait 2: word changed before its registration, result woken_during_publication
+[futex-wait-grade][fail] wait 4: registered although its word had changed before the compare-and-register (B saw 0xf7a10003 for 0xf7a10002)
+[futex-wait-grade][fail] wait 4: word changed before its registration, result woken_during_publication
+[futex-wait-grade][fail] wait 6: registered although its word had changed before the compare-and-register (B saw 0xf7a10005 for 0xf7a10004)
+LIVE_DONE

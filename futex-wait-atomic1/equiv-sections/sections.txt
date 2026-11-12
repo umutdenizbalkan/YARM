@@ -1,0 +1,14 @@
+.note.Xen same
+.text.boot32 same
+.text.boot64_thunk same
+.data.boot same
+.bss.bootstack same
+.text.boot same
+.text same
+.rodata DIFF
+.data same
+.bss same
+.yarm_nofp_map same
+.symtab same
+.shstrtab same
+.strtab same

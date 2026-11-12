@@ -1,0 +1,3 @@
+6993f3ba165951f09e2cc40f33e2cd44a8a67e6664b5649c7ed018f8c0a24441  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fwa-evidence/live/wait-x86_64/boot.log
+526dd91bbd9ab62e0f82b8d498644f69c2b1a168b2a261ee53be1a2d0a99886d  build-x86_64/kernel_boot.elf
+405b0dca4e9066864df1d726807e8347bca8ef2c4db47f248358bf783a3bf62a  build-x86_64/initramfs-core.cpio

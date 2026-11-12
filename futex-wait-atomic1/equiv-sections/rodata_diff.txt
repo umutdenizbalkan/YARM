@@ -1,0 +1,2 @@
+rodata bytes 188752 differing aligned u32 words 1
+u32 deltas (new - old): {24: 1}

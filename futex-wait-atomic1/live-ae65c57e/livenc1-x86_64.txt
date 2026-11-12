@@ -1,0 +1,16 @@
+[futex-wait-witness] building base x86_64 artifacts with futex-requeue-witness,futex-wait-witness
+[futex-wait-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle,futex-wait-witness
+[futex-wait-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-wait-grade][fail] wait 4: registered although its word had changed before the compare-and-register (B saw 0xf7a10003 for 0xf7a10002)
+[futex-wait-grade][fail] wait 4: word changed before its registration, result woken_during_publication
+[futex-wait-grade][fail] wait 6: registered although its word had changed before the compare-and-register (B saw 0xf7a10005 for 0xf7a10004)
+[futex-wait-grade][fail] wait 6: word changed before its registration, result woken_during_publication
+[futex-wait-grade][fail] wait 8: registered although its word had changed before the compare-and-register (B saw 0xf7a10007 for 0xf7a10006)
+[futex-wait-grade][fail] wait 8: word changed before its registration, result woken_during_publication
+[futex-wait-grade][fail] wait 10: registered although its word had changed before the compare-and-register (B saw 0xf7a1000e for 0xf7a1000d)
+[futex-wait-grade][fail] wait 10: word changed before its registration, result woken_during_publication
+[futex-wait-grade][fail] wait 14: registered although its word had changed before the compare-and-register (B saw 0xf7a10013 for 0xf7a10012)
+[futex-wait-grade][fail] wait 14: word changed before its registration, result woken_during_publication
+[futex-wait-grade][fail] wait 16: registered although its word had changed before the compare-and-register (B saw 0xf7a10015 for 0xf7a10014)
+[futex-wait-grade][fail] wait 16: word changed before its registration, result woken_during_publication
+FUTEX_WAIT_WITNESS_SEAL arch=x86_64 smp=2 waits=12 skipped=4 windows=24 b_changed=6 a=12 in_window_wakes=24 waiter_cpus=1 waker_cpus=0 calls=16 returns=16 blocked=16 witness=fail core_smoke=ok result=fail

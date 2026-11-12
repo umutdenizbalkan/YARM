@@ -1,0 +1,16 @@
+[futex-wait-witness] building base riscv64 artifacts with futex-requeue-witness,futex-wait-witness
+[futex-wait-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,futex-wait-witness
+[futex-wait-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-wait-grade][core] [fail] neither RISCV_EXTIRQ_SMOKE_OK nor RISCV_EXTIRQ_DEFERRED present
+[futex-wait-grade][core] [fail] neither RISCV_PLIC_INIT_DONE nor RISCV_PLIC_DEFERRED present
+[futex-wait-grade][core] [fail] required marker missing: RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked
+[futex-wait-grade][core] [fail] required marker missing: RISCV_PLIC_BASE value=
+[futex-wait-grade][core] [fail] required marker missing: RISCV_PLIC_CONTEXT value=
+[futex-wait-grade][fail] no FWAW_DONE: the cell never finished
+[futex-wait-grade][fail] window 1 never closed
+[futex-wait-grade][fail] wait 1: an unchanged word, but no registration window (result None)
+[futex-wait-grade][fail] wait 1: registered and woken inside A, result None
+[futex-wait-grade][fail] coverage: 0 B windows saw a store (need 2)
+[futex-wait-grade][fail] coverage: 0 A windows (need 2)
+[futex-wait-grade][fail] the standard core smoke rejected this boot (see [core] lines)
+FUTEX_WAIT_WITNESS_SEAL arch=riscv64 smp=2 waits=1 windows=1 b_changed=0 a=0 in_window_wakes=0 waiter_cpus=1 waker_cpus=none calls=0 returns=? blocked=? witness=fail core_smoke=rejected(rc=0) result=fail

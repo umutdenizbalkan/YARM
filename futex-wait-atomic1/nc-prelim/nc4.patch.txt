@@ -1,0 +1,17 @@
+nc4 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index dc8f1e65..d4063e69 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18707,6 +18707,11 @@ impl SharedKernel {
+         };
+         #[cfg(test)]
+         fx::futex_phase_hook::run_after_register();
++        if !matches!(self.resolve_futex_word_in_split(asid, addr, kind), Ok((_, w)) if w == expected)
++            && undo_registration()
++        {
++            return O::ValueChanged;
++        }
+ 
+         // (2) rank 1 — COMPARE-AND-CLEAR. `block_current_exact_on` mutates nothing unless the slot
+         // names exactly this task, so a mismatch costs no other task its placement. The quantum

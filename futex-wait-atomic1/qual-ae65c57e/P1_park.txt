@@ -1,0 +1,155 @@
+    pub(crate) fn futex_wait_park_exact_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+        addr: usize,
+        expected: u32,
+        kind: crate::kernel::boot::futex::FutexKind,
+    ) -> crate::kernel::syscall::sched::FutexParkOutcome {
+        use crate::kernel::boot::futex::{self as fx, FutexCompareRegisterRefusal};
+        use crate::kernel::syscall::sched::FutexParkOutcome as O;
+
+        #[cfg(test)]
+        fx::futex_phase_hook::run_before_register();
+        // FUTEX-WAIT-ATOMIC1 live witness (default off): window B, before the compare-and-register.
+        #[cfg(feature = "futex-wait-witness")]
+        let witness = fx::wait_witness::begin(expected).filter(|&w| {
+            let peer = self.futex_wait_witness_peer_running_split(cpu, tid, asid);
+            if !peer {
+                fx::wait_witness::skip(w, cpu.0, tid);
+            }
+            peer
+        });
+        #[cfg(feature = "futex-wait-witness")]
+        if let Some(w) = witness {
+            let held = fx::wait_witness::hold('B', w, cpu.0, tid);
+            let word = self.futex_wait_witness_word_split(asid, addr, kind);
+            fx::wait_witness::close('B', w, held, cpu.0, expected, word);
+        }
+
+        // (1) ranks 2 → 5 → 6, ONE hold — COMPARE AND REGISTER (FUTEX-WAIT-ATOMIC1). The key is
+        // resolved, the word read and compared, and the keyed record and `Blocked(Futex(token))`
+        // published, for the exact `Running` `{tid, asid}`, without releasing anything in between.
+        // That load is the wait's linearization point: every waker, requeue, exit and mapping
+        // change is wholly before this hold or wholly after it (see the owner's doc). So there is
+        // no second read: once this hold has registered the waiter, the wait has happened, and a
+        // later change of the word is a later operation — one that wakes, moves or leaves it, as
+        // its own sequential step would. Nothing here retracts a registration because of the word.
+        let registered = self.with_task_futex_then_vm_memory_split_mut(
+            |tcbs, _classes, table, spaces, memory| {
+                fx::compare_and_register_futex_waiter_locked(
+                    tcbs, table, spaces, memory, tid, asid, addr, expected, kind,
+                )
+            },
+        );
+        let token = match registered {
+            Ok((_key, token)) => token,
+            Err(FutexCompareRegisterRefusal::ValueChanged) => return O::ValueChanged,
+            Err(FutexCompareRegisterRefusal::Word(err)) => return O::WordUnreadable(err),
+            Err(FutexCompareRegisterRefusal::IncarnationMoved) => {
+                crate::yarm_log!(
+                    "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason=incarnation_moved",
+                    tid,
+                    asid.0,
+                    addr
+                );
+                return O::IncarnationMoved;
+            }
+            Err(FutexCompareRegisterRefusal::Full) => {
+                crate::yarm_log!(
+                    "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason=capacity_exhausted",
+                    tid,
+                    asid.0,
+                    addr
+                );
+                return O::CapacityExhausted;
+            }
+        };
+        // The ONE undo of that registration: the record and the status together, and only from
+        // exactly this token — a TCB a waker already moved is the waker's. Reached only from the
+        // established-impossible victim mismatch below.
+        let undo_registration = || {
+            self.with_task_futex_split_mut(|tcbs, table| {
+                fx::undo_futex_registration_locked(tcbs, table, tid, token)
+            })
+        };
+        #[cfg(test)]
+        fx::futex_phase_hook::run_after_register();
+        // FUTEX-WAIT-ATOMIC1 live witness: window A, after the registration and before the clear.
+        #[cfg(feature = "futex-wait-witness")]
+        if let Some(w) = witness {
+            let held = fx::wait_witness::hold('A', w, cpu.0, tid);
+            fx::wait_witness::close('A', w, held, cpu.0, expected, None);
+        }
+
+        // (2) rank 1 — COMPARE-AND-CLEAR. `block_current_exact_on` mutates nothing unless the slot
+        // names exactly this task, so a mismatch costs no other task its placement. The quantum
+        // reset is `block_current_cpu`'s and is preserved on the successful clear.
+        // SCHED-LOCK1: `cpu`'s own 1L — its current slot and its own quantum together.
+        let removed = self
+            .with_cpu_sched_split(cpu, |c| {
+                let priority = c.block_current_exact(crate::kernel::ipc::ThreadId(tid));
+                if priority.is_some() {
+                    c.reset_quantum();
+                }
+                priority
+            })
+            .ok()
+            .flatten();
+        let Some(priority) = removed else {
+            // Undo the registration exactly: this transaction published a block it could not
+            // complete, and leaving the TCB `Blocked` would strand a task the scheduler still
+            // believes is elsewhere. (A waker that claimed it meanwhile owns it; the undo then
+            // changes nothing.)
+            let restored = undo_registration();
+            crate::yarm_log!(
+                "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason=victim_changed undone={}",
+                tid,
+                asid.0,
+                addr,
+                u8::from(restored)
+            );
+            return O::VictimChanged;
+        };
+
+        #[cfg(test)]
+        fx::futex_phase_hook::run_after_clear();
+
+        // (3) rank 2 — READ BACK. A waker that entered the window between (1) and (2) has already
+        // claimed this exact token — its record retired and the TCB `Runnable` — and that is the
+        // ONLY thing that can have moved it.
+        let still_parked = self.with_task_futex_split_mut(|tcbs, _table| {
+            fx::futex_still_parked_locked(tcbs, tid, token)
+        });
+        if still_parked {
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={} priority=exact",
+                tid,
+                addr
+            );
+            return O::Parked { priority };
+        }
+
+        // A waker won. The clear has already run, so the caller is current on no CPU while being
+        // `Runnable` — put it back through the ONE placement recovery, which commits
+        // `Runnable -> Running` on the exact incarnation and pulls it out of the run queue if the
+        // waker's enqueue landed there.
+        let entering = crate::kernel::recv_waiter_split::RecvEnteringIncarnation {
+            tid,
+            asid,
+            priority,
+        };
+        let recovered = self.restore_entering_incarnation_exact_split(cpu, entering);
+        crate::yarm_log!(
+            "FUTEX_WAIT_PARK_WOKEN_DURING_PUBLISH tid={} asid={} addr={} recovery={}",
+            tid,
+            asid.0,
+            addr,
+            recovered.slug()
+        );
+        O::WokenDuringPublication {
+            entering,
+            recovered,
+        }
+    }

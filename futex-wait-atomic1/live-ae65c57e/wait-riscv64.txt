@@ -1,0 +1,7 @@
+[futex-wait-witness] building base riscv64 artifacts with futex-requeue-witness,futex-wait-witness
+[futex-wait-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,futex-wait-witness
+[futex-wait-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-wait-grade][fail] FWAW_DONE result=fail
+[futex-wait-grade][fail] userspace saw 4 blocking calls, the kernel registered 15
+[futex-wait-grade][fail] coverage: 1 B windows saw a store (need 2)
+FUTEX_WAIT_WITNESS_SEAL arch=riscv64 smp=2 waits=5 skipped=11 windows=9 b_changed=1 a=4 in_window_wakes=9 waiter_cpus=1 waker_cpus=0 calls=16 returns=16 blocked=4 witness=fail core_smoke=ok result=fail

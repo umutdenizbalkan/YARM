@@ -1,0 +1,15 @@
+nc10 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index dc8f1e65..4ae77512 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -14064,6 +14064,9 @@ impl SharedKernel {
+                 .map_err(crate::kernel::boot::map_scheduler_error)
+                 .and_then(|r| r);
+             if let Err(err) = reserved {
++                let _ = self.with_task_futex_split_mut(|tcbs, table| {
++                    fx::claim_futex_waiter_locked(tcbs, table, key, candidate)
++                });
+                 crate::yarm_log!(
+                     "FUTEX_WAKE_STOPPED tid={} cpu={} reason=no_placement err={:?} woke={}",
+                     candidate.tid,

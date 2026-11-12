@@ -1,0 +1,17 @@
+nc4 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index fda62f43..71b3df1a 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18716,6 +18716,11 @@ impl SharedKernel {
+         };
+         #[cfg(test)]
+         fx::futex_phase_hook::run_after_register();
++        if !matches!(self.resolve_futex_word_in_split(asid, addr, kind), Ok((_, w)) if w == expected)
++            && undo_registration()
++        {
++            return O::ValueChanged;
++        }
+         // FUTEX-WAIT-ATOMIC1 live witness: window A, after the registration and before the clear.
+         #[cfg(feature = "futex-wait-witness")]
+         if let Some(w) = witness {

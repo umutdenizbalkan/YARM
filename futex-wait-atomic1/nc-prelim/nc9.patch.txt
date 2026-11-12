@@ -1,0 +1,17 @@
+nc9 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 3b9e544e..d95b6677 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -199,7 +199,10 @@ pub fn resolve_futex_key_locked(
+     let key = match kind {
+         FutexKind::Private => FutexKey::Private {
+             asid,
+-            aspace_generation,
++            aspace_generation: {
++                let _ = aspace_generation;
++                0
++            },
+             va: addr as u64,
+         },
+         FutexKind::Shared => {

@@ -1,0 +1,3 @@
+335203684f12a84f6f4829ae2108ad6712ee73a1f6c1334ef0ff0b7a9545bf47  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fwa-evidence/live-ae65c57e/wait-aarch64/boot.log
+e1dcaf39a062a6e82371fb7f2fcee86bd79219d03d855c09127e2fc0ea649647  build-aarch64/yarm-aarch64.bin
+241b3945a3ae5cbf282ba5ba1b62c7c87ba4a41379d98e2ce8e6ff1c237646f8  build-aarch64/initramfs-core.cpio

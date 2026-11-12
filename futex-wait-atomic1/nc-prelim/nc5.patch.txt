@@ -1,0 +1,14 @@
+nc5 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 3b9e544e..88fbc17a 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -640,7 +640,7 @@ pub fn undo_futex_registration_locked(
+     let Some(tcb) = tcbs
+         .iter_mut()
+         .flatten()
+-        .find(|t| t.tid.0 == tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token)))
++        .find(|t| t.tid.0 == tid && matches!(t.status, TaskStatus::Blocked(WaitReason::Futex(_))))
+     else {
+         return false;
+     };

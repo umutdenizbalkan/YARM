@@ -1,0 +1,33 @@
+nc3 applied
+diff --git a/src/runtime.rs b/src/runtime.rs
+index fda62f43..a566624e 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18656,6 +18656,7 @@ impl SharedKernel {
+         use crate::kernel::boot::futex::{self as fx, FutexCompareRegisterRefusal};
+         use crate::kernel::syscall::sched::FutexParkOutcome as O;
+ 
++        let early = self.resolve_futex_word_in_split(asid, addr, kind).map(|(k, _)| k);
+         #[cfg(test)]
+         fx::futex_phase_hook::run_before_register();
+         // FUTEX-WAIT-ATOMIC1 live witness (default off): window B, before the compare-and-register.
+@@ -18678,9 +18679,16 @@ impl SharedKernel {
+         // its own sequential step would. Nothing here retracts a registration because of the word.
+         let registered = self.with_task_futex_then_vm_memory_split_mut(
+             |tcbs, _classes, table, spaces, memory| {
+-                fx::compare_and_register_futex_waiter_locked(
+-                    tcbs, table, spaces, memory, tid, asid, addr, expected, kind,
+-                )
++                match fx::resolve_futex_word_locked(spaces, memory, asid, addr, kind) {
++                    Err(e) => Err(FutexCompareRegisterRefusal::Word(e)),
++                    Ok((_, w)) if w != expected => Err(FutexCompareRegisterRefusal::ValueChanged),
++                    Ok((fresh, _)) => {
++                        let key = early.clone().unwrap_or(fresh);
++                        fx::register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)
++                            .map(|t| (key, t))
++                            .map_err(|_| FutexCompareRegisterRefusal::IncarnationMoved)
++                    }
++                }
+             },
+         );
+         let token = match registered {

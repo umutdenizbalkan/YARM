@@ -1,0 +1,10 @@
+[serverdies:aarch64] exact commit sha=9ce9845f9ac6f33070d45f131037fbc09436ae20 tree=5b50dd181114622866a646f4b91c8f314d6e209f (clean)
+[serverdies:aarch64] RUN_A feature-off binary audit
+[serverdies:aarch64] RUN_A oracle_literals_present=0 production_literals_missing=0
+[serverdies:aarch64] RUN_B feature-on live cell (selector=server-dies)
+[serverdies:aarch64] staged image=build-aarch64/yarm-aarch64.bin initrd=build-aarch64/initramfs-core.cpio sha256=e60df55055276896 initrd_sha256=86137a3c7138c04a
+ARTIFACT_BINDING arch=aarch64 kernel=build-aarch64/yarm-aarch64.bin kernel_sha256=e60df55055276896bd8fa841e33eed66d1516340113ab824e36e0bfb13b0c60c kernel_features=aarch64-ipc-reply-timeout-oracle kernel_resolved_features=aarch64-ipc-reply-timeout-oracle,ipc-reply-timeout-oracle-core kernel_nofp=pass initramfs=build-aarch64/initramfs-core.cpio initramfs_sha256=86137a3c7138c04a811e6ab503fcd2abe7342338d28b2ad842fe50287672e99d initramfs_features=none initramfs_compile_env=none source=clean:5b50dd181114622866a646f4b91c8f314d6e209f required=kernel=aarch64-ipc-reply-timeout-oracle,initramfs=none result=ok
+[serverdies:aarch64] boot cmdline: yarm.aarch64_ipc_reply_timeout_oracle=server-dies
+[serverdies:aarch64] RUN_B witnessed scenario: server={10008,1} caller={1,1} record={0,18}
+[serverdies:aarch64] RUN_B caller_wakes=1 peer_death_winners=1
+STAGE_200D2B1C_AARCH64_SERVER_DIES_SEAL arch=aarch64 sha=9ce9845f9ac6f33070d45f131037fbc09436ae20 tree=5b50dd181114622866a646f4b91c8f314d6e209f live_cells=1 caller_wakes=1 peer_death_winners=1 exit_returns=0 feature_off_oracle_literals=0 result=ok

@@ -1,0 +1,21 @@
+nc7 applied
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 7dcaef58..483b2613 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -542,14 +542,7 @@ pub fn register_futex_waiter_locked(
+     let Some(slot) = free else {
+         return Err(FutexRegisterRefusal::Full);
+     };
+-    table.records[slot] = Some(FutexWaiterRecord {
+-        key,
+-        tid,
+-        tcb: tcb_idx as u16,
+-        va,
+-        next: NIL,
+-    });
+-    table.link_tail(slot);
++    let _ = (key, va);
+     let token = table.token(slot);
+     if let Some(tcb) = tcbs[tcb_idx].as_mut() {
+         tcb.status = TaskStatus::Blocked(WaitReason::Futex(token));
