@@ -1425,8 +1425,9 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         // of them existed:
         //
         //   1. FRESH/STARTUP — never run; `a0..a5` carry the startup ABI from the argument
-        //      mirror and `a7` is zeroed. Its `user_gprs` are all zero, which is why they must
-        //      not be mirrored over the arguments.
+        //      mirror and `a7` comes from its register file, which is all zero (that is also why
+        //      `user_gprs` must not be mirrored over the arguments). The same arm resumes an
+        //      untagged syscall continuation, whose `a7` is its syscall number (RISCV-ECALL-A7-RET1).
         //   2. SYSCALL / BLOCKED-SYSCALL CONTINUATION — resuming past its own `ecall`; `a0`/`a1`
         //      carry the result lane, published into both mirrors by the completion consumers.
         //   3. ASYNCHRONOUSLY PREEMPTED — interrupted by a timer at an arbitrary instruction.
@@ -1483,13 +1484,15 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
                 frame.regs[RiscvTrapFrame::A0] = err as u64;
                 frame.regs[RiscvTrapFrame::A1] = 0;
                 frame.regs[RiscvTrapFrame::A2] = 0;
-                frame.regs[RiscvTrapFrame::A3] = err as u64;
             } else {
                 frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
                 frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;
                 frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;
-                frame.regs[RiscvTrapFrame::A3] = 0;
             }
+            // RISCV-ECALL-A7-RET1: `a3..a5` and `a7` are INPUTS of the caller's `ecall` (the user
+            // runtime declares them `in(..)`), so they resume as the caller left them — from the
+            // saved register file, which no completion writes. The error is in `a0`.
+            frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
             frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
             frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
             frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
@@ -1534,13 +1537,15 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             frame.regs[RiscvTrapFrame::A3] = tframe.arg(3) as u64;
             frame.regs[RiscvTrapFrame::A4] = tframe.arg(4) as u64;
             frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;
-            // a7 holds the syscall-number lane on RISC-V; on first run it can
-            // remain whatever the user code expects (0 for a freshly-zeroed
-            // context is fine — task hasn't issued any ecall yet).
-            frame.regs[RiscvTrapFrame::A7] = 0;
+            // RISCV-ECALL-A7-RET1: `a7` from the saved register file. This arm resumes a FRESH
+            // task — whose context is built with `user_gprs: [0; 32]`, so `a7 = 0` as before — and
+            // also every untagged syscall continuation (a parked FutexWait or Yield, a receive a
+            // remote completion published, a fork child), whose `ecall` declares `a7` an input:
+            // it must come back as the syscall number the caller issued, not zero.
+            frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
         } else {
             // Same task continuing past its own ecall: YARM ABI returns
-            // a0=ret0, a1=ret1, a2=ret2, a3=error (mirrors AArch64).
+            // a0=ret0 (or the error), a1=ret1, a2=ret2; a3..a5, a7 are preserved inputs.
             //
             // KTHREAD1: a drain on this trap re-selected the trap's own task and applied its saved
             // continuation (only the exact-token resume names a frame's owner, and this frame was
@@ -1559,7 +1564,6 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
                 frame.regs[RiscvTrapFrame::A0] = err as u64;
                 frame.regs[RiscvTrapFrame::A1] = 0;
                 frame.regs[RiscvTrapFrame::A2] = 0;
-                frame.regs[RiscvTrapFrame::A3] = err as u64;
             } else {
                 if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
                     crate::yarm_log!(
@@ -1573,12 +1577,12 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
                 frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
                 frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;
                 frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;
-                frame.regs[RiscvTrapFrame::A3] = 0;
             }
-            // a4, a5, a7 keep their user-side values from the saved frame at
-            // trap time (they're caller-saved temps in the RISC-V ABI but YARM
-            // userspace may rely on a7 staying as the syscall nr until next call).
-            // The asm save preserved them and the mirror loop skipped them.
+            // RISCV-ECALL-A7-RET1: a3, a4, a5, a7 keep their user-side values from the saved
+            // frame at trap time — the user runtime's `ecall` declares them INPUTS (`in(..)`), so
+            // the compiler may read them after it. The results are `a0..a2` only (the error, when
+            // there is one, in `a0`). The asm save preserved them and the mirror loop skipped them.
+            frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
             frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
             frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
             frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
@@ -1973,19 +1977,19 @@ fn riscv_s_mode_idle_landing(
                 // Convention (2): a completion consumer already encoded the canonical result
                 // into `tframe` during this trap. Install exactly the lanes the main bridge's
                 // own continuation arm installs — a0 from the error lane when the completion
-                // failed, otherwise the return lane — and leave a4/a5/a7 as the saved register
+                // failed, otherwise the return lane — and leave a3/a4/a5/a7 as the saved register
                 // file holds them, which is the same treatment the bridge gives them.
                 if let Some(err) = tframe.error_code() {
                     frame.regs[RiscvTrapFrame::A0] = err as u64;
                     frame.regs[RiscvTrapFrame::A1] = 0;
                     frame.regs[RiscvTrapFrame::A2] = 0;
-                    frame.regs[RiscvTrapFrame::A3] = err as u64;
                 } else {
                     frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
                     frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;
                     frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;
-                    frame.regs[RiscvTrapFrame::A3] = 0;
                 }
+                // RISCV-ECALL-A7-RET1: the caller's `ecall` inputs, as the bridge's arm installs.
+                frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
                 frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
                 frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
                 frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
@@ -2003,7 +2007,8 @@ fn riscv_s_mode_idle_landing(
                 frame.regs[RiscvTrapFrame::A3] = tframe.arg(3) as u64;
                 frame.regs[RiscvTrapFrame::A4] = tframe.arg(4) as u64;
                 frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;
-                frame.regs[RiscvTrapFrame::A7] = 0;
+                // RISCV-ECALL-A7-RET1: as the bridge's switched arm (`0` for a fresh task).
+                frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
             }
             #[cfg(feature = "riscv-ecall-witness")]
             crate::arch::riscv64::ecall_witness::note_resume(

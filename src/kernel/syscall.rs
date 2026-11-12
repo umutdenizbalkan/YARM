@@ -7821,9 +7821,10 @@ mod tests {
 
     #[test]
     fn riscv_round_trip_writes_yarm_abi_returns_to_a0_a1_a2_a3() {
-        // YARM syscall return ABI: a0=ret0, a1=ret1, a2=ret2, a3=error
-        // (matches AArch64). The bridge must write into the saved register
-        // frame, not the generic TrapFrame.user_gprs.
+        // YARM syscall return ABI: a0=ret0 (the error when there is one), a1=ret1, a2=ret2. The
+        // bridge must write into the saved register frame, not the generic TrapFrame.user_gprs.
+        // RISCV-ECALL-A7-RET1: `a3` is an INPUT of the user runtime's `ecall` (`in("a3")`), so it
+        // is restored from the saved register file, never overwritten with the error.
         let src = include_str!("../arch/riscv64/boot.rs");
         assert!(
             src.contains("frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;"),
@@ -7838,8 +7839,12 @@ mod tests {
             "bridge must write ret2 -> a2"
         );
         assert!(
-            src.contains("frame.regs[RiscvTrapFrame::A3] = err as u64;"),
-            "bridge must write error -> a3 on Err"
+            src.contains("frame.regs[RiscvTrapFrame::A0] = err as u64;"),
+            "bridge must write error -> a0 on Err"
+        );
+        assert!(
+            !src.contains("frame.regs[RiscvTrapFrame::A3] = err as u64;"),
+            "the error must not overwrite the caller's a3 input"
         );
     }
 

@@ -47687,9 +47687,11 @@ mod stage184_riscv_trap_return_provenance {
                 "task-switch write-back must set the ABI lane from tframe: `{stmt}`"
             );
         }
+        // RISCV-ECALL-A7-RET1: `a7` from the saved register file — zero on fresh entry (the
+        // context is built with zero GPRs), the syscall number for a parked continuation.
         assert!(
-            bridge.contains("frame.regs[RiscvTrapFrame::A7] = 0;"),
-            "task-switch write-back must clear a7 (syscall-number lane) on fresh entry"
+            bridge.contains("frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;"),
+            "task-switch write-back must restore a7 from the saved register file"
         );
     }
 
@@ -116949,7 +116951,8 @@ mod stage199d_riscv_production_readiness_audit {
     }
 
     /// The same-task return lanes are the YARM ABI, matching the encoder the direct disposition
-    /// writes: a0=ret0, a1=ret1, a2=ret2, a3=error.
+    /// writes: a0=ret0 (or the error), a1=ret1, a2=ret2. RISCV-ECALL-A7-RET1: `a3` is NOT a result
+    /// lane — the user runtime's `ecall` declares it an input — so it is restored, never written.
     #[test]
     fn the_same_task_return_lanes_match_the_shared_encoder() {
         for (reg, lane) in [
@@ -116963,7 +116966,11 @@ mod stage199d_riscv_production_readiness_audit {
                 "return lane {reg} must carry {lane}"
             );
         }
-        assert!(RISCV_BRIDGE.contains("frame.regs[RiscvTrapFrame::A3] = 0;"));
+        assert!(
+            RISCV_BRIDGE.contains("frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;")
+        );
+        assert!(!RISCV_BRIDGE.contains("frame.regs[RiscvTrapFrame::A3] = 0;"));
+        assert!(!RISCV_BRIDGE.contains("frame.regs[RiscvTrapFrame::A3] = err as u64;"));
     }
 
     /// The GPR mirror preserves every non-ABI register — including `tp` (x4), the TLS base —
@@ -140079,9 +140086,11 @@ mod riscv64_async_preemption {
         );
         assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = err as u64;"));
         assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;"));
-        // (3) fresh/startup — the argument mirror, unchanged.
+        // (3) fresh/startup — the argument mirror, unchanged; `a7` from the register file (zero
+        // for a fresh task, the syscall number for an untagged continuation: RISCV-ECALL-A7-RET1).
         assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;"));
-        assert!(arm.contains("frame.regs[RiscvTrapFrame::A7] = 0;"));
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;"));
+        assert!(!arm.contains("frame.regs[RiscvTrapFrame::A7] = 0;"));
         // The continuation decision is published only where a completion was consumed, and it is
         // cleared at every trap entry so it cannot be inherited.
         //
@@ -140256,10 +140265,11 @@ mod riscv64_async_preemption {
                 "{label}: a7 must not be forced to zero for a preempted task"
             );
         }
-        // …and the ordinary arms still DO install the startup ABI, unchanged.
+        // …and the ordinary arms still DO install the startup ABI, unchanged; their `a7` comes from
+        // the register file, which a fresh context zeroes (RISCV-ECALL-A7-RET1: no arm forces it).
         assert!(
-            RV_BOOT_SRC.contains("frame.regs[RiscvTrapFrame::A7] = 0;"),
-            "fresh/startup resume keeps its a7 convention"
+            !RV_BOOT_SRC.contains("frame.regs[RiscvTrapFrame::A7] = 0;"),
+            "no arm forces a7 to zero"
         );
         assert_eq!(
             RV_BOOT_SRC
@@ -214793,7 +214803,7 @@ mod futex_requeue1 {
 
         /// The write-back's SWITCHED ordinary arm (`boot.rs`: no async tag, no continuation tag):
         /// the incoming context is applied to this trap's frame, `a0..a5` come from its argument
-        /// lanes, `a7` is zeroed, every other register is mirrored from its register file.
+        /// lanes, `a7` and every other register from its register file (RISCV-ECALL-A7-RET1).
         fn switched(this_trap: &TrapFrame, ctx: UserRegisterContext) -> Ring3 {
             let mut f = this_trap.clone();
             f.apply_user_context(ctx);
@@ -214805,17 +214815,17 @@ mod futex_requeue1 {
                 f.arg(4),
                 f.arg(5),
                 f.user_gpr(16),
-                0,
+                f.user_gpr(17),
             ];
             Ring3::of(a, f.saved_pc(), f.saved_sp(), &f.user_gprs)
         }
 
         /// The write-back's SWITCHED continuation arm (a consumer published the tag): the result
-        /// lanes of the frame, `a3` = the error, `a4`, `a5`, `a7` from the register file.
+        /// lanes of the frame; `a3`, `a4`, `a5`, `a7` from the register file (RISCV-ECALL-A7-RET1).
         fn switched_continuation(f: &TrapFrame) -> Ring3 {
             let (a0, a1, a2, a3) = match f.error_code() {
-                Some(e) => (e, 0, 0, e),
-                None => (f.ret0(), f.ret1(), f.ret2(), 0),
+                Some(e) => (e, 0, 0, f.user_gpr(13)),
+                None => (f.ret0(), f.ret1(), f.ret2(), f.user_gpr(13)),
             };
             let a = [
                 a0,
@@ -214832,16 +214842,18 @@ mod futex_requeue1 {
 
         /// The write-back's SAME-TASK arm for the trap `entered`: when an exact-token drain applied
         /// the caller's own saved continuation (`self_resume`), the published lanes are adopted;
-        /// then `a0..a3` from the result, and `a4`, `a5`, `a7` are the hardware frame's.
+        /// then `a0..a2` from the result, and `a3`, `a4`, `a5`, `a7` are the hardware frame's
+        /// (RISCV-ECALL-A7-RET1).
         fn same_task(entered: &TrapFrame, self_resume: Option<UserRegisterContext>) -> Ring3 {
             let mut f = entered.clone();
             if let Some(ctx) = self_resume {
                 f.apply_user_context(ctx);
                 f.adopt_restored_riscv_syscall_returns();
             }
+            let hw13 = f.user_gpr(13);
             let (a0, a1, a2, a3) = match f.error_code() {
-                Some(e) => (e, 0, 0, e),
-                None => (f.ret0(), f.ret1(), f.ret2(), 0),
+                Some(e) => (e, 0, 0, hw13),
+                None => (f.ret0(), f.ret1(), f.ret2(), hw13),
             };
             let hw = entered.user_gprs;
             let a = [a0, a1, a2, a3, hw[14], hw[15], hw[16], hw[17]];
@@ -215453,7 +215465,9 @@ mod futex_requeue1 {
                     "a{i} from the argument lane"
                 );
             }
-            assert!(startup.contains("frame.regs[RiscvTrapFrame::A7] = 0;"));
+            assert!(
+                startup.contains("frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;")
+            );
             let cont = wb
                 .split("} else if task_switched && continuation {")
                 .nth(1)
