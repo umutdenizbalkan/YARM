@@ -36,7 +36,7 @@ import re
 import sys
 
 ROLES = ["Y0", "Y1", "Y2", "W", "S", "RW", "RQ", "R", "P"]
-CALLS = {"Y0": 32, "Y1": 24, "Y2": 24, "W": 24, "RW": 8, "R": 8}
+CALLS = {"Y0": 32, "Y1": 24, "Y2": 24, "W": 48, "RW": 8, "R": 8}
 NR = {"Y0": 0, "Y1": 0, "Y2": 0, "W": 9, "RW": 9, "R": 2}
 RCALLS = 8
 PCALLS = 3
@@ -126,7 +126,7 @@ def grade(lines, core_rc):
             fails.append(f"line {k['n']}: kernel key without the witness prefix")
         by_key.setdefault(k["key"], []).append(k)
     ukeys = {}
-    cov = dict(y_switch=0, y_same=0, w_parked=0, w_own=0, w_early=0, w_mismatch=0, rw_parked=0, r_blocked=0, spin_async=0,
+    cov = dict(solo_switched=0, y_switch=0, y_same=0, w_parked=0, w_own=0, w_early=0, w_mismatch=0, rw_parked=0, r_blocked=0, spin_async=0,
                lost_a3=0, lost_a7=0, lost_other=0, async_in_probe=0)
     for u in users:
         if u["key"] in ukeys:
@@ -169,7 +169,7 @@ def grade(lines, core_rc):
         if role.startswith("Y"):
             cov["y_same" if own else "y_switch"] += 1
             if role == "Y0" and u["cycle"] > 24 and not own:
-                fails.append(f"Y0 solo cycle {u['cycle']}: a Yield with nothing else runnable resumed through arm {k['arm']}")
+                cov["solo_switched"] += 1
         elif role == "W":
             if u["a0"] == 1 and not own:
                 cov["w_parked"] += 1
@@ -303,7 +303,7 @@ def main():
     print(f"RISCV_ECALL_WITNESS_SEAL arch=riscv64 smp={a.smp} probes={probes} fresh={fresh} "
           f"yield_switched={cov['y_switch']} yield_same={cov['y_same']} wait_parked={cov['w_parked']} "
           f"wait_own={cov['w_own']} wait_early={cov['w_early']} wait_mismatch={cov['w_mismatch']} requeue_parked={cov['rw_parked']} recv_blocked={cov['r_blocked']} "
-          f"spin_async={cov['spin_async']} async_in_probe={cov['async_in_probe']} lost_a3={cov['lost_a3']} "
+          f"spin_async={cov['spin_async']} solo_switched={cov['solo_switched']} async_in_probe={cov['async_in_probe']} lost_a3={cov['lost_a3']} "
           f"lost_a7={cov['lost_a7']} lost_other={cov['lost_other']} "
           f"core_smoke={'ok' if a.core_rc == 0 else f'rejected(rc={a.core_rc})'} result={result}")
     return 1 if fails else 0

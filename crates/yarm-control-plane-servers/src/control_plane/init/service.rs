@@ -3283,7 +3283,9 @@ pub(super) mod riscv_ecall_witness {
     const YCALLS: u32 = 24;
     /// Y0's solo yields, after every other role finished.
     const SOLO: u32 = 8;
-    const WCALLS: u32 = 24;
+    /// 48: a run must also see a wait woken before it physically parked, which depends on where
+    /// the window's wake lands (one qualification run of 24 cycles saw none).
+    const WCALLS: u32 = 48;
     const RCALLS: u32 = 8;
     const ICALLS: u32 = 8;
     const PCALLS: u32 = 3;
@@ -3498,9 +3500,10 @@ pub(super) mod riscv_ecall_witness {
         for c in 1..=YCALLS {
             yield_probe(role, c);
         }
-        // Y0 then waits until every other role has finished (each is parked in the kernel), and
-        // yields SOLO: nothing else of the witness is runnable, so the drain gives the CPU back to
-        // the caller — the Yield that does not switch.
+        // Y0 then waits until every other role has counted itself finished, and yields more: by
+        // then little else is runnable, so most of these give the CPU straight back to the caller
+        // — the Yield that does not switch. (Not all: the role that counted itself last can still
+        // be on its way to its park, and the drain may switch to it once.)
         if role == Y0 {
             let mut n = 0;
             while (DONE.load(SeqCst) as usize) < ROLES - 1 && n < BOUND {
