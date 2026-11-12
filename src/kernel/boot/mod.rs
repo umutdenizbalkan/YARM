@@ -1680,6 +1680,57 @@ pub(crate) fn yield_dispatch_clear(cpu_idx: usize) {
     YIELD_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }
 
+/// RISCV-PARK-RET1 — on a committed RISC-V park, commit THIS trap's own result into the RISC-V
+/// return lanes of its frame when the parked class's result is final, so the bridge's capture
+/// (which runs next, on the same frame) carries it into the saved continuation. Returns whether
+/// it committed.
+///
+/// A class's result is final when nothing can change it after the caller leaves the CPU:
+///
+/// * `FutexWait` (NR 9) — a parked wait has one outcome, `1`: it is resumed only after a wake (or
+///   a compare-and-requeue and then a wake) claimed it, and an exit retires it without a resume.
+///   The route wrote `set_ok(1, 0, 0)` before it answered `QueueAdvanceCommitted`.
+/// * `Yield` (NR 0) — `0`, written by `split_yield_settle` the same way.
+///
+/// A blocking receive is NOT final: a delivery, a timeout or a server death publishes its result
+/// later (into the saved context, `publish_riscv_user_return`), so committing the provisional one
+/// would race that publication; it keeps the AP-SCHED1 §4 re-application instead. A blocking send
+/// is captured on its own committed-blocked arm and completed through its parked record.
+///
+/// The class is decided by THIS trap's syscall number and the deferral that names the outgoing
+/// task, both: the FutexWait cell is also reserved by the exit transaction and the terminal-fault
+/// route, and an exiting task is never resumed, so it is given no result. The outgoing named by
+/// the deferral is this trap's caller by construction — each route reserves the cell for its own
+/// caller and settles through its own frame if the cell is occupied — and the frame is still that
+/// caller's (the drain overwrites it only after the capture). No lock is taken.
+#[cfg(any(target_arch = "riscv64", test))]
+pub(crate) fn riscv_commit_final_park_result(
+    cpu_idx: usize,
+    frame: &mut crate::kernel::trapframe::TrapFrame,
+) -> bool {
+    let futex = futex_wait_dispatch_outgoing(cpu_idx);
+    let recv = d2_recv_dispatch_outgoing(cpu_idx);
+    let yielded = yield_dispatch_outgoing(cpu_idx);
+    // The chain the bridge's capture reads, in its order.
+    let Some(outgoing) = futex.or(recv).or(yielded) else {
+        return false;
+    };
+    if exit_queue_advance_pending(cpu_idx).is_some_and(|(exiting, _)| exiting == outgoing) {
+        return false;
+    }
+    let nr = frame.syscall_num();
+    let final_result = (nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+        && futex == Some(outgoing))
+        || (nr == crate::kernel::syscall::SYSCALL_YIELD_NR
+            && futex.is_none()
+            && recv.is_none()
+            && yielded == Some(outgoing));
+    if final_result {
+        frame.commit_riscv_parked_syscall_returns();
+    }
+    final_result
+}
+
 // ─── Canonical 199E-R1D: the RISC-V ASYNC-PREEMPTED resume decision ───────────────────
 //
 // The sixth member of the `YIELD_DISPATCH_*` / `FUTEX_WAIT_*` / `D2_RECV_*` per-CPU flag family,

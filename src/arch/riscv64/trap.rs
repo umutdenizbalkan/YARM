@@ -1858,6 +1858,15 @@ pub fn handle_riscv_trap_entry_shared(
             // later reap still reads.
             let exiting = crate::kernel::boot::exit_queue_advance_pending(cpu_idx)
                 .is_some_and(|(et, _)| Some(et) == outgoing);
+            // RISCV-PARK-RET1 — the route's `set_ok` reached only the frame's return FIELDS, which
+            // become `a0..a2` only when a trap returns through its own frame. This caller will be
+            // resumed later from the context captured below, and every resume arm reads the result
+            // from that context's register and argument lanes — which still held the syscall's own
+            // arguments, so a parked `FutexWait` resumed with its futex address in `a0` and the
+            // user runtime read it as an error. For a class whose result is final at the park
+            // (FutexWait, Yield) the result is committed into those lanes HERE, before the capture
+            // that carries it; a blocking receive's result belongs to its later completion.
+            let committed = crate::kernel::boot::riscv_commit_final_park_result(cpu_idx, frame);
             let captured = if exiting {
                 false
             } else {
@@ -1881,11 +1890,13 @@ pub fn handle_riscv_trap_entry_shared(
                 shared.reapply_parked_recv_completion_split(t);
             }
             crate::yarm_log!(
-                "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu={} result=queue_advance_committed outgoing={} captured={}",
+                "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu={} result=queue_advance_committed outgoing={} captured={} committed={} a0={}",
                 nr,
                 cpu.0,
                 outgoing.unwrap_or(u64::MAX),
-                u8::from(captured)
+                u8::from(captured),
+                u8::from(committed),
+                frame.user_gpr(10)
             );
             crate::yarm_log!(
                 "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=publication_committed",

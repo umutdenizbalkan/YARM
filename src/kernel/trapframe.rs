@@ -216,6 +216,38 @@ impl TrapFrame {
         self.error = 0;
     }
 
+    /// RISCV-PARK-RET1 — the inverse of [`Self::adopt_restored_riscv_syscall_returns`]: put this
+    /// trap's own committed syscall result into the RISC-V return lanes of its REGISTER FILE, so
+    /// the park capture that follows carries the result into the saved continuation.
+    ///
+    /// `set_ok` / `set_err` write the frame's return FIELDS, and on RISC-V those reach `a0..a2`
+    /// only when this trap returns through its own frame. A caller that parks is resumed later
+    /// from its saved `UserRegisterContext` instead, and every RISC-V resume arm reads the result
+    /// from that context: the switched write-back installs `a0..a5` from the argument lanes, the
+    /// self-resume adopts `user_gprs[10..12]`. Without this, both still held the syscall's own
+    /// arguments, and a parked `FutexWait` resumed with its futex ADDRESS in `a0`.
+    ///
+    /// Both mirrors are written, as the canonical `publish_riscv_user_return` does for a remote
+    /// completion: `a0` = the error code when non-zero, else `ret0`; `a1`, `a2` = `ret1`, `ret2`
+    /// (cleared on an error). Nothing else is touched — `a3..a7`, `sepc`, `sp`, `tp` and every other
+    /// register keep the values the trap saved, and `sepc` was advanced past the `ecall` once, at
+    /// trap entry. Only for a class whose result is FINAL when the caller leaves the CPU (see
+    /// `riscv_commit_final_park_result`); a blocking IPC result is owned by its completion.
+    #[cfg(any(target_arch = "riscv64", test))]
+    pub(crate) fn commit_riscv_parked_syscall_returns(&mut self) {
+        let (a0, a1, a2) = if self.error != 0 {
+            (self.error, 0, 0)
+        } else {
+            (self.ret0, self.ret1, self.ret2)
+        };
+        self.user_gprs[10] = a0;
+        self.user_gprs[11] = a1;
+        self.user_gprs[12] = a2;
+        self.args[0] = a0;
+        self.args[1] = a1;
+        self.args[2] = a2;
+    }
+
     /// QEMU-SMP1-ACCEPTANCE §1 — name the incarnation whose continuation this frame now holds.
     /// Called only by an owner that has just put that continuation here from that incarnation.
     pub(crate) fn bind_resume_owner(&mut self, owner: crate::runtime::FpuHomeOwner) {
