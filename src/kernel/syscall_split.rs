@@ -5644,7 +5644,13 @@ fn try_split_futex_wait_recognized(
     // its TCB cannot be reclaimed — so what the transaction authenticates against is the
     // incarnation this trap entered from and not whatever later answers to the number.
     let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
-    match shared.futex_wait_park_exact_split(cpu, tid, asid, addr, expected, args.kind) {
+    let outcome = shared.futex_wait_park_exact_split(cpu, tid, asid, addr, expected, args.kind);
+    // FUTEX-WAIT-ATOMIC1 live witness (default off): the witness wait's own outcome.
+    #[cfg(feature = "futex-wait-witness")]
+    if let Some(w) = crate::kernel::boot::futex::wait_witness::current_wait(expected) {
+        crate::kernel::boot::futex::wait_witness::result(w, tid, &outcome);
+    }
+    match outcome {
         FutexParkOutcome::Parked { .. } => {
             crate::yarm_log!(
                 "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid={} cpu={}",
@@ -6609,9 +6615,13 @@ fn try_split_futex_wake_into_frame(
     crate::yarm_log!("FUTEX_WAKE_SPLIT_BEGIN");
     #[cfg(feature = "futex-requeue-race-witness")]
     let race_window = crate::kernel::boot::futex::race_witness::wake_begin();
+    #[cfg(feature = "futex-wait-witness")]
+    let wait_window = crate::kernel::boot::futex::wait_witness::wake_begin();
     let woke = shared.futex_wake_key_split(cpu, key, args.value);
     #[cfg(feature = "futex-requeue-race-witness")]
     crate::kernel::boot::futex::race_witness::wake_end(race_window, cpu.0, tid, woke);
+    #[cfg(feature = "futex-wait-witness")]
+    crate::kernel::boot::futex::wait_witness::wake_end(wait_window, cpu.0, tid, woke);
     crate::yarm_log!("FUTEX_WAKE_SPLIT_WAKE_OK count={}", woke);
     frame.set_ok(woke as usize, 0, 0);
     #[cfg(target_arch = "aarch64")]

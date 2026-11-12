@@ -238,6 +238,8 @@ futex-requeue-witness = []
 # and NR 10 reports such a wake; in init's cell (with futex-requeue-witness), signaller threads
 # issue those wakes. Default off; no production path changes with it off.
 futex-requeue-race-witness = []
+# FUTEX-WAIT-ATOMIC1: the live wait witness (windows B and A of a witness FutexWait).
+futex-wait-witness = []
 # QEMU-IRQ1: the first real external-interrupt witness — RISC-V UART0 -> PLIC -> YARM on QEMU
 # virt. Compiles the kernel-only device window install, the idle-origin supervisor-external
 # admission, the UART setup/drain fixture, the provisioning of init's notification + ring page, the

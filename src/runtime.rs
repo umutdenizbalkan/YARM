@@ -18658,6 +18658,18 @@ impl SharedKernel {
 
         #[cfg(test)]
         fx::futex_phase_hook::run_before_register();
+        // FUTEX-WAIT-ATOMIC1 live witness (default off): window B, before the compare-and-register.
+        #[cfg(feature = "futex-wait-witness")]
+        let witness = fx::wait_witness::begin(expected);
+        #[cfg(feature = "futex-wait-witness")]
+        if let Some(w) = witness {
+            let held = fx::wait_witness::hold('B', w, cpu.0, tid);
+            let word = self
+                .resolve_futex_word_in_split(asid, addr, kind)
+                .ok()
+                .map(|(_, v)| v);
+            fx::wait_witness::close('B', w, held, cpu.0, expected, word);
+        }
 
         // (1) ranks 2 → 5 → 6, ONE hold — COMPARE AND REGISTER (FUTEX-WAIT-ATOMIC1). The key is
         // resolved, the word read and compared, and the keyed record and `Blocked(Futex(token))`
@@ -18707,6 +18719,12 @@ impl SharedKernel {
         };
         #[cfg(test)]
         fx::futex_phase_hook::run_after_register();
+        // FUTEX-WAIT-ATOMIC1 live witness: window A, after the registration and before the clear.
+        #[cfg(feature = "futex-wait-witness")]
+        if let Some(w) = witness {
+            let held = fx::wait_witness::hold('A', w, cpu.0, tid);
+            fx::wait_witness::close('A', w, held, cpu.0, expected, None);
+        }
 
         // (2) rank 1 — COMPARE-AND-CLEAR. `block_current_exact_on` mutates nothing unless the slot
         // names exactly this task, so a mismatch costs no other task its placement. The quantum

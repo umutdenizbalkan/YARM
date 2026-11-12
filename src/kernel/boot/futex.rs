@@ -1210,6 +1210,141 @@ pub mod race_witness {
     }
 }
 
+/// FUTEX-WAIT-ATOMIC1 — the live wait witness (default off: feature `futex-wait-witness`, armed by
+/// `yarm.futex_requeue_witness=1`, and only for a word whose high half is [`wait_witness::MAGIC`]).
+///
+/// A witness `FutexWait` holds two windows open, each until a `FutexWake` that STARTED inside it
+/// has finished: **B** after the wait has decided to park and before its compare-and-register, and
+/// **A** after the registration and before the compare-and-clear of its current slot. Causal order
+/// on one console: `..._WINDOW_OPEN` before the window is published, the waker's
+/// `..._IN_WINDOW_WAKE` before it releases it, `..._WINDOW_CLOSE` after (B's close also reports the
+/// word it reads then, so a grader can tell whether the window saw a store). `..._RESULT` is the
+/// wait's own outcome. Bounded: a window gives up after `SPIN_BOUND` polls (`competing_wakes=0`).
+#[cfg(feature = "futex-wait-witness")]
+pub mod wait_witness {
+    use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    /// The high half of a witness word.
+    pub const MAGIC: u32 = 0xF7A1_0000;
+    static OPEN: AtomicU64 = AtomicU64::new(0);
+    static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
+    static NEXT_WAIT: AtomicU64 = AtomicU64::new(1);
+    static WAKES: AtomicU64 = AtomicU64::new(0);
+    /// The witness has one waiter thread, so its last wait is the one in flight.
+    static LAST_WAIT: AtomicU64 = AtomicU64::new(0);
+    const SPIN_BOUND: u64 = 400_000_000;
+
+    fn armed(expected: u32) -> bool {
+        crate::kernel::boot::futex_requeue_witness_enabled() && expected & 0xFFFF_0000 == MAGIC
+    }
+
+    /// A new witness wait id, when this wait is the witness's.
+    pub fn begin(expected: u32) -> Option<u64> {
+        armed(expected).then(|| {
+            let w = NEXT_WAIT.fetch_add(1, SeqCst);
+            LAST_WAIT.store(w, SeqCst);
+            w
+        })
+    }
+
+    /// The witness wait the park transaction just ran, for the route's outcome line.
+    pub fn current_wait(expected: u32) -> Option<u64> {
+        armed(expected).then(|| LAST_WAIT.load(SeqCst))
+    }
+
+    /// Hold window `kind` (`B` or `A`) of wait `wait` open until a competing wake has run in it.
+    /// Returns the window id and how many wakes ran wholly inside it.
+    pub fn hold(kind: char, wait: u64, cpu: u8, tid: u64) -> (u64, u64) {
+        let id = NEXT_WINDOW.fetch_add(1, SeqCst);
+        let before = WAKES.load(SeqCst);
+        crate::yarm_log!(
+            "FUTEX_WAIT_WITNESS_WINDOW_OPEN kind={} wait={} window={} cpu={} tid={}",
+            kind,
+            wait,
+            id,
+            cpu,
+            tid
+        );
+        OPEN.store(id, SeqCst);
+        let mut spins = 0u64;
+        while WAKES.load(SeqCst) == before && spins < SPIN_BOUND {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        OPEN.store(0, SeqCst);
+        (id, WAKES.load(SeqCst) - before)
+    }
+
+    /// Close window `id`; `word` is what the witness reads now (B only; `None` for A).
+    pub fn close(
+        kind: char,
+        wait: u64,
+        (id, competing): (u64, u64),
+        cpu: u8,
+        expected: u32,
+        word: Option<u32>,
+    ) {
+        match word {
+            Some(word) => crate::yarm_log!(
+                "FUTEX_WAIT_WITNESS_WINDOW_CLOSE kind={} wait={} window={} cpu={} competing_wakes={} expected=0x{:x} word=0x{:x}",
+                kind,
+                wait,
+                id,
+                cpu,
+                competing,
+                expected,
+                word
+            ),
+            None => crate::yarm_log!(
+                "FUTEX_WAIT_WITNESS_WINDOW_CLOSE kind={} wait={} window={} cpu={} competing_wakes={}",
+                kind,
+                wait,
+                id,
+                cpu,
+                competing
+            ),
+        }
+    }
+
+    /// The wait's outcome.
+    pub fn result(wait: u64, tid: u64, outcome: &crate::kernel::syscall::sched::FutexParkOutcome) {
+        use crate::kernel::syscall::sched::FutexParkOutcome as O;
+        let slug = match outcome {
+            O::Parked { .. } => "parked",
+            O::WokenDuringPublication { .. } => "woken_during_publication",
+            O::ValueChanged => "value_changed",
+            O::WordUnreadable(_) => "word_unreadable",
+            O::VictimChanged => "victim_changed",
+            O::IncarnationMoved => "incarnation_moved",
+            O::CapacityExhausted => "capacity_exhausted",
+        };
+        crate::yarm_log!(
+            "FUTEX_WAIT_WITNESS_RESULT wait={} tid={} outcome={}",
+            wait,
+            tid,
+            slug
+        );
+    }
+
+    /// NR 10, before it selects anything: the window open now, if any.
+    pub fn wake_begin() -> u64 {
+        OPEN.load(SeqCst)
+    }
+
+    /// NR 10, after its wake: report it, and release the window, iff it ran wholly inside one.
+    pub fn wake_end(window: u64, cpu: u8, tid: u64, woke: u32) {
+        if window != 0 && OPEN.load(SeqCst) == window {
+            crate::yarm_log!(
+                "FUTEX_WAIT_WITNESS_IN_WINDOW_WAKE cpu={} tid={} window={} woke={}",
+                cpu,
+                tid,
+                window,
+                woke
+            );
+            WAKES.fetch_add(1, SeqCst);
+        }
+    }
+}
+
 /// rank 2 — claim the oldest waiter still on the pending key `key` (`Runnable`, record retired),
 /// exactly as a wake claims. `None` once no live waiter is left on it (the rest exited, or undid
 /// their own registration in their publication window).

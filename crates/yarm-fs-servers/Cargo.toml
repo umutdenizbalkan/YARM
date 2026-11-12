@@ -56,6 +56,7 @@ ipc-displace1-witness = []
 # FUTEX-REQUEUE1: init's live compare-and-requeue cell (selector 18); inert elsewhere.
 futex-requeue-witness = []
 futex-requeue-race-witness = []
+futex-wait-witness = []
 riscv-uart-irq-witness = []
 aarch64-pl011-irq-witness = []
 # QEMU-SMP2: kernel-only witness; accepted and inert here so one feature list builds every image.
