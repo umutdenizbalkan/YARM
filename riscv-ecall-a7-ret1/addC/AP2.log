@@ -1,0 +1,90 @@
+a64 F raw_ttbr_bytes=0 asw3=286 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX5_aarch64/boot.norm.log
+a64 F raw_ttbr_bytes=0 asw3=286 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX5_aarch64/boot.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C2-yarm-oracle-x86_64-3223/qemu-x86_64-core.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C2-yarm-oracle-x86_64-3223/ipc-oracle-core-stdout-x86_64.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=6 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C2-yarm-oracle-x86_64-3223/ipc-oracle-run-x86_64.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C2_ci-profiles/qemu-smp4-sender-wake.wrapper.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C2_ci-profiles/qemu-smp4-core.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C2_ci-profiles/qemu-smp2-core.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C2_ci-profiles/qemu-smp2-core.wrapper.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C2_ci-profiles/qemu-smp4-core.wrapper.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C2_ci-profiles/qemu-smp2-sender-wake.wrapper.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=8 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C2_ci_profiles_F.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/UN0a_x86_64_smp2.boot.log
+a64 F raw_ttbr_bytes=0 asw3=286 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX6_aarch64/boot.norm.log
+a64 F raw_ttbr_bytes=0 asw3=286 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX6_aarch64/boot.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C2-yarm-oracle-x86_64-2596/qemu-x86_64-core.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C2-yarm-oracle-x86_64-2596/ipc-oracle-core-stdout-x86_64.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=2 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C2-yarm-oracle-x86_64-2596/ipc-oracle-run-x86_64.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX4_x86_64/boot.norm.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX4_x86_64/boot.log
+a64 F raw_ttbr_bytes=0 asw3=167 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX7_aarch64/boot.norm.log
+a64 F raw_ttbr_bytes=0 asw3=167 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX7_aarch64/boot.log
+a64 F raw_ttbr_bytes=0 asw3=281 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX4_aarch64/boot.norm.log
+a64 F raw_ttbr_bytes=0 asw3=281 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX4_aarch64/boot.log
+a64 F raw_ttbr_bytes=0 asw3=161 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/R2_aarch64_F/boot.norm.log
+a64 F raw_ttbr_bytes=0 asw3=161 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/R2_aarch64_F/boot.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=25 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX7_x86_64/smoke.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX7_x86_64/core-smoke.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX7_x86_64/boot.norm.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX7_x86_64/boot.log
+a64 F raw_ttbr_bytes=0 asw3=153 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX3/boot.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX5_x86_64/boot.norm.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX5_x86_64/boot.log
+a64 F raw_ttbr_bytes=0 asw3=163 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/W_aarch64_smp1/boot.norm.log
+a64 F raw_ttbr_bytes=0 asw3=163 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/W_aarch64_smp1/boot.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX6_x86_64/boot.norm.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX6_x86_64/boot.log
+a64 F raw_ttbr_bytes=0 asw3=139 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX1/arm_core.log
+a64 F raw_ttbr_bytes=0 asw3=139 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX1/arm_ytwo.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX1/x86_smp2.log
+a64 F raw_ttbr_bytes=0 asw3=141 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX1/arm_idle.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX1/x86_smp4.log
+a64 F raw_ttbr_bytes=0 asw3=134 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX1/arm_fwait.log
+a64 F raw_ttbr_bytes=0 asw3=135 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX1/arm_ylone.log
+a64 F raw_ttbr_bytes=0 asw3=167 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX1/arm_fw.log
+a64 F raw_ttbr_bytes=0 asw3=139 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/UN0b_aarch64_smp2.boot.log
+a64 F raw_ttbr_bytes=0 asw3=169 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX8_aarch64/boot.norm.log
+a64 F raw_ttbr_bytes=0 asw3=169 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX8_aarch64/boot.log
+a64 F raw_ttbr_bytes=0 asw3=163 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/R3_aarch64_F/boot.norm.log
+a64 F raw_ttbr_bytes=0 asw3=163 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/R3_aarch64_F/boot.log
+a64 F raw_ttbr_bytes=0 asw3=375 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/U2/boot.norm.log
+a64 F raw_ttbr_bytes=0 asw3=375 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/U2/boot.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/UN0a_record_x86_64_smp2.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=25 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX8_x86_64/smoke.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX8_x86_64/core-smoke.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX8_x86_64/boot.norm.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX8_x86_64/boot.log
+x86 F split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX2/boot.log
+a64 B raw_ttbr_bytes=304 asw3=156 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB3/boot.log
+x86 B split=2 rust_ladder_on_com1=4 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C4_ci-profiles/qemu-smp4-sender-wake.wrapper.log
+x86 B split=3 rust_ladder_on_com1=2 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C4_ci-profiles/qemu-smp4-core.log
+x86 B split=2 rust_ladder_on_com1=2 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C4_ci-profiles/qemu-smp2-core.log
+x86 B split=2 rust_ladder_on_com1=2 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C4_ci-profiles/qemu-smp2-core.wrapper.log
+x86 B split=3 rust_ladder_on_com1=2 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C4_ci-profiles/qemu-smp4-core.wrapper.log
+x86 B split=3 rust_ladder_on_com1=1 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C4_ci-profiles/qemu-smp2-sender-wake.wrapper.log
+x86 B split=2 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB2/boot.log
+x86 B split=10 rust_ladder_on_com1=9 ap_online=8 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/C4_ci_profiles_B.log
+a64 B raw_ttbr_bytes=272 asw3=136 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB1/arm_core.log
+a64 B raw_ttbr_bytes=278 asw3=140 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB1/arm_ytwo.log
+x86 B split=0 rust_ladder_on_com1=1 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB1/x86_smp2.log
+a64 B raw_ttbr_bytes=280 asw3=140 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB1/arm_idle.log
+x86 B split=1 rust_ladder_on_com1=2 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB1/x86_smp4.log
+a64 B raw_ttbr_bytes=282 asw3=143 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB1/arm_fwait.log
+a64 B raw_ttbr_bytes=280 asw3=140 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB1/arm_ylone.log
+a64 B raw_ttbr_bytes=324 asw3=162 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FB1/arm_fw.log
+x86 B split=2 rust_ladder_on_com1=4 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C4-yarm-oracle-x86_64-6876/qemu-x86_64-core.log
+x86 B split=2 rust_ladder_on_com1=4 ap_online=3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C4-yarm-oracle-x86_64-6876/ipc-oracle-core-stdout-x86_64.log
+x86 B split=4 rust_ladder_on_com1=8 ap_online=6 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C4-yarm-oracle-x86_64-6876/ipc-oracle-run-x86_64.log
+x86 B split=3 rust_ladder_on_com1=1 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C4-yarm-oracle-x86_64-6253/qemu-x86_64-core.log
+x86 B split=3 rust_ladder_on_com1=1 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C4-yarm-oracle-x86_64-6253/ipc-oracle-core-stdout-x86_64.log
+x86 B split=6 rust_ladder_on_com1=2 ap_online=2 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/oracle-C4-yarm-oracle-x86_64-6253/ipc-oracle-run-x86_64.log
+x86 CONTROL split=0 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/UN/x86_verbatim.log
+a64 CONTROL raw_ttbr_bytes=0 asw3=139 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/UN/a64_damaged.log
+a64 CONTROL raw_ttbr_bytes=0 asw3=139 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/UN/a64_verbatim.log
+x86 CONTROL split=1 rust_ladder_on_com1=0 ap_online=1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/UN/x86_damaged.log
+AP_MARKER_INTEGRITY_OK
+rc=0
+B-side oracle-C4-yarm-oracle-x86_64-4593 kernel_sha256=672f9fb7991f
+B-side oracle-C4-yarm-oracle-x86_64-6253 kernel_sha256=672f9fb7991f
+B-side oracle-C4-yarm-oracle-x86_64-6876 kernel_sha256=672f9fb7991f

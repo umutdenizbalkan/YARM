@@ -1,0 +1,14 @@
+nc10 applied
+diff --git a/src/kernel/task.rs b/src/kernel/task.rs
+index 6b831aaf..f0ec0bf0 100644
+--- a/src/kernel/task.rs
++++ b/src/kernel/task.rs
+@@ -955,8 +955,6 @@ pub(crate) fn take_blocked_syscall_completion_for(
+     }
+     // Exact identity: same incarnation AND the class's own generation at block time.
+     let exact = pending.matches_tcb(tcb);
+-    // Take it either way — a stale entry must not linger to be seen by a later block.
+-    tcb.pending_syscall_completion = None;
+     if !exact {
+         return None;
+     }

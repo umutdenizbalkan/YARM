@@ -1,0 +1,13 @@
+nc3 applied
+diff --git a/src/arch/riscv64/boot.rs b/src/arch/riscv64/boot.rs
+index 4000cf09..5c385594 100644
+--- a/src/arch/riscv64/boot.rs
++++ b/src/arch/riscv64/boot.rs
+@@ -1496,6 +1496,7 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
+             frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
+             frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
+             frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
++            frame.regs[RiscvTrapFrame::A7] = 0;
+             crate::yarm_log!(
+                 "RISCV_SYSCALL_CONTINUATION_RESUME tid={} origin=bridge sepc=0x{:016x} a0={} a1={} startup_rewrite=0 result=ok",
+                 resume_tid,

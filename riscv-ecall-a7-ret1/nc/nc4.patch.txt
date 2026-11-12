@@ -1,0 +1,14 @@
+nc4 applied
+diff --git a/src/arch/riscv64/boot.rs b/src/arch/riscv64/boot.rs
+index 4000cf09..c70635e8 100644
+--- a/src/arch/riscv64/boot.rs
++++ b/src/arch/riscv64/boot.rs
+@@ -1459,7 +1459,7 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
+             // values the trap saved and `sret` returns to U-mode with interrupts restored.
+             // `sscratch` is re-pointed at the canonical per-hart trap-stack top by the return
+             // tail, so the repaired non-drift invariant is retained unchanged.
+-            frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;
++            frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
+             frame.regs[RiscvTrapFrame::A1] = tframe.user_gpr(11) as u64;
+             frame.regs[RiscvTrapFrame::A2] = tframe.user_gpr(12) as u64;
+             frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;

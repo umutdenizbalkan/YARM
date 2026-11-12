@@ -1,0 +1,33 @@
+F HEAD=3091f14365ad porcelain=0
+build x86_64 F rc=0
+build aarch64 F rc=0
+build riscv64 F rc=0
+FP HEAD=83be1921b7c6 porcelain=0
+build x86_64 FP rc=0
+build aarch64 FP rc=0
+build riscv64 FP rc=0
+XW2 x86_64 section_headers(name,type,addr,size) same
+XW2 kernel x86_64 .note.Xen F=20:da0ea49ebab94497 F'=20:da0ea49ebab94497 same
+XW2 kernel x86_64 .text.boot32 F=379:007a526f22e6a806 F'=379:007a526f22e6a806 same
+XW2 kernel x86_64 .text.boot64_thunk F=20:a3192d21850cb6f9 F'=20:a3192d21850cb6f9 same
+XW2 kernel x86_64 .data.boot F=28720:f1f93a3bfc6e2376 F'=28720:f1f93a3bfc6e2376 same
+XW2 kernel x86_64 .text.boot F=185:8189492bac5079d5 F'=185:8189492bac5079d5 same
+XW2 kernel x86_64 .text F=1267534:f9f577df5e595f68 F'=1267534:f9f577df5e595f68 same
+XW2 kernel x86_64 .rodata F=188752:8295601e4be995a4 F'=188752:8295601e4be995a4 same
+XW2 kernel x86_64 .data F=204092:400b600e8148cbac F'=204092:400b600e8148cbac same
+XW2 kernel x86_64 .yarm_nofp_map F=0:e3b0c44298fc1c14 F'=0:e3b0c44298fc1c14 same
+XW2 initramfs x86_64 F=bb8daa86b2e0bd1b F'=bb8daa86b2e0bd1b same
+XW2 aarch64 section_headers(name,type,addr,size) same
+XW2 kernel aarch64 .text.boot F=4856:d4117a2b3fd4d8cd F'=4856:d4117a2b3fd4d8cd same
+XW2 kernel aarch64 .text F=960596:f807831ed1b86225 F'=960596:f807831ed1b86225 same
+XW2 kernel aarch64 .rodata F=147232:fbe241ae495f656d F'=147232:fbe241ae495f656d same
+XW2 kernel aarch64 .data F=188616:00d86467f1a8d278 F'=188616:00d86467f1a8d278 same
+XW2 kernel aarch64 .yarm_nofp_map F=0:e3b0c44298fc1c14 F'=0:e3b0c44298fc1c14 same
+XW2 initramfs aarch64 F=86137a3c7138c04a F'=86137a3c7138c04a same
+XW2 riscv64 section_headers(name,type,addr,size) same
+XW2 kernel riscv64 .text.boot F=148:9f89ca088bc32f1f F'=148:9f89ca088bc32f1f same
+XW2 kernel riscv64 .text F=722412:b11e98478a923cc8 F'=722412:b11e98478a923cc8 same
+XW2 kernel riscv64 .rodata F=156531:296003986408cea7 F'=156531:296003986408cea7 same
+XW2 kernel riscv64 .data F=186384:224931f3b4277878 F'=186384:224931f3b4277878 same
+XW2 initramfs riscv64 F=2c91ab3153ac58e3 F'=2c91ab3153ac58e3 same
+XW2 identical=yes

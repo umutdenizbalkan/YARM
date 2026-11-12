@@ -1,0 +1,33 @@
+Addendum C (schedule sha db59ec2f942c1f7f) — appended checks; the original XW and AP lines and rcs stand.
+
+XW2  symmetric F (3091f143) vs F' (83be1921) default artifacts: section headers (name,type,addr,size)
+     identical on x86_64, AArch64, RISC-V; every PROGBITS/NOTE section identical by size and sha256
+     (.yarm_nofp_map is 0 bytes on both); initramfs identical on all three. XW2 identical=yes
+     (XW2/summary.txt). The original XW "DIFF" was the F-only EMPTY label.
+
+AP2  same scan, B-produced oracle-C4-* (kernel_sha256=672f9fb7..., B's x86_64 kernel) on the B side and
+     UN/ control replays on the control side (AP2.log): rc=0 AP_MARKER_INTEGRITY_OK.
+     F: 32 x86_64 AP logs + 26 AArch64 logs — 0 split X86_AP_* markers, 0 Rust-entry ladder bytes on
+        COM1, 0 raw TTBR0 bytes.
+     B: 16 x86_64 AP logs, 15 with a split marker (48 split, 45 ladder bytes); 7 AArch64 logs, all 7
+        with raw TTBR0 bytes (2020).
+
+C2/C4 per profile (F / B): sender-wake PASS/PASS; d2-send FAIL/FAIL (D2-SEND-GENUINE markers);
+     smp2-core PASS/FAIL — B's failure is "AP admission/prereq marker missing: X86_AP_SCHED_ADMIT_BEGIN",
+     the line reading "iX86_AP_SCHEyD_AuDMIT_BEGIN cpu=1" (the Rust-entry ladder bytes 'y','u' interleaved on
+     COM1) — the §8 defect on B, repaired on F; smp4-core PASS/PASS; smp2/smp4-sender-wake FAIL/FAIL
+     ("183.6: SMP sender-wake marker missing: D6_SMP_DISPATCH_OK", inherited #2/#3); sched-timeout
+     FAIL/FAIL ("no idle-entry timeout marker", inherited #4).
+C5   reply-timeout matrix fails identically on F and B (class=IpcReplyTimeout, inherited #1); SMP-request
+     script fails identically (line 67 syntax error, inherited #5). S7 timer grep 0/0/0 (inherited #6).
+
+Z    248 F logs scanned, 0 hits; Addendum A logs scanned, 0 hits.
+
+FP   RISC-V: the only text symbol whose size changed is yarm_riscv64_trap_bridge, 4016 -> 4014 bytes;
+     1245 -> 1245 instructions; stores 322 -> 321, loads 124 -> 127, `sd zero` 6 -> 4 (the forced a7 = 0
+     and a3 = 0 writes gone, the saved a3/a7 loaded instead); branches 57 = 57; no AMO/LR/SC; csr 1 = 1;
+     stack frame 0x380 = 0x380. .text 722414 -> 722412; .rodata/.data/.bss sizes unchanged.
+     x86_64: every section size unchanged (.text bytes differ: `mov dx, 0x3F8` -> `0xE9`, same encoding
+     length; .rodata bytes differ at the same size).
+     AArch64: .text 960444 -> 960596 (+152), .rodata 147264 -> 147232 (-32), .data same size,
+     .bss 75418752 -> 75414672 (-4096, one page of section alignment), .text.boot same size.

@@ -1,0 +1,27 @@
+ src/kernel/boot/tests.rs | 1062 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 1062 insertions(+)
+B=3ac4f578 F=3091f143
+rc=101 test result: FAILED. 8 passed; 15 failed; 0 ignored; 0 measured; 6540 filtered out; finished in 0.33s
+test c00_the_evaluator_covers_every_arm ... ok
+test c01_the_wrappers_inputs_are_what_every_continuation_arm_preserves ... FAILED
+test c02_the_syscall_number_is_captured_into_the_register_file ... ok
+test c03_a_same_task_return_keeps_the_inputs ... FAILED
+test c03b_a_same_task_error_keeps_the_inputs ... FAILED
+test c04_a_switched_continuation_keeps_the_inputs ... FAILED
+test c05_a_parked_futex_wait_keeps_its_number_and_inputs ... FAILED
+test c06_a_futex_wait_mismatch_keeps_the_inputs ... FAILED
+test c07_a_yield_without_a_switch_keeps_the_inputs ... FAILED
+test c08_a_yield_with_a_switch_keeps_the_inputs ... ok
+test c09_a_blocking_receive_completion_keeps_the_inputs ... FAILED
+test c10_a_blocking_send_completion_keeps_the_inputs ... FAILED
+test c11_a_reply_timeout_result_keeps_the_inputs ... FAILED
+test c12_a_completion_before_the_capture_keeps_the_inputs ... FAILED
+test c13_a_completion_after_the_capture_keeps_the_inputs ... FAILED
+test c14_an_async_preemption_restores_every_register ... ok
+test c15_a_fresh_task_gets_its_startup_registers ... ok
+test c16_a_stale_dispatch_token_restores_nothing ... FAILED
+test c17_a_new_task_inherits_no_registers ... FAILED
+test c18_an_exiting_task_is_given_nothing ... ok
+test c19_c20_pc_sp_and_tp_on_every_continuation_arm ... ok
+test c21_repeated_switches_keep_each_cycles_inputs ... FAILED
+test c22_the_write_back_arms_take_no_lock ... ok

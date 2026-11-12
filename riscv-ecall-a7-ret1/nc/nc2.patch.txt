@@ -1,0 +1,14 @@
+nc2 applied
+diff --git a/crates/yarm-user-rt/src/arch/riscv64.rs b/crates/yarm-user-rt/src/arch/riscv64.rs
+index 2e33f7b1..501c64b2 100644
+--- a/crates/yarm-user-rt/src/arch/riscv64.rs
++++ b/crates/yarm-user-rt/src/arch/riscv64.rs
+@@ -18,7 +18,7 @@ pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
+             "ecall",
+             inlateout("a0") a0,
+             inlateout("a1") a1,
+-            inlateout("a2") a2,
++            in("a2") a2,
+             in("a3") a3,
+             in("a4") a4,
+             in("a5") a5,

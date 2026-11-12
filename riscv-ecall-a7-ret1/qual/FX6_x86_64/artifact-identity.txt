@@ -1,0 +1,5 @@
+tree=dfac4177d7cd6d4687537f02e236f6036460e227 head=3091f14365ad2cd411685665e5da3d8ed803095e dirty=0 kernel_features=--no-default-features --features x86-sched-lock1-witness
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=q35 cpu=qemu64 m=512M
+a2ffe7015419df15f538d14523a27bc47140569e58f22492c9fd2b40b1f61353  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX6_x86_64/build/kernel_boot.elf
+bb8daa86b2e0bd1b4203e2c3807cd7299eda150554278a45efd0fe18c09a0dfd  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX6_x86_64/build/initramfs-core.cpio
+boot smp=2 append=console=ttyS0 rdinit=/init

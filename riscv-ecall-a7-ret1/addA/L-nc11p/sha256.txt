@@ -1,0 +1,3 @@
+646aaf59a50a5acaf4336f814fb380cd76b87698b22dd3bdf9d284be7b90553f  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/addA/L-nc11p/boot.log
+e20e7b4d454e3d007b13e666deb57807a3162d4a3157766b462aeddfdc7ba491  build-riscv64/yarm-riscv64.bin
+0991661c783e776ffe4482b219b496cb76ae1cd662ee0176de78ac055a7a622e  build-riscv64/initramfs-core.cpio

@@ -1,0 +1,3236 @@
+warning: unused import: `enqueue_reply_into_endpoint_locked`
+  --> src/kernel/boot/mod.rs:74:33
+   |
+74 |     complete_server_death_over, enqueue_reply_into_endpoint_locked, log_parked_death_handoff,
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `orchestrator_state::x86_smp_unlock_audit_claimed`
+  --> src/kernel/boot/mod.rs:85:16
+   |
+85 | pub(crate) use orchestrator_state::x86_smp_unlock_audit_claimed;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+    --> src/kernel/boot/futex.rs:1524:5
+     |
+1524 | /     /// FUTEX-REQUEUE-ATOMIC1 — the compare-and-requeue's own window, for tests: after the
+1525 | |     /// transaction that compares and moves has released its locks, before the woken waiters are
+1526 | |     /// placed. One-shot.
+     | |_____--------------------^
+     |       |
+     |       rustdoc does not generate documentation for macro invocations
+     |
+     = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+     = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `TaskClass`
+  --> src/kernel/boot/scheduler_state.rs:10:27
+   |
+10 | use crate::kernel::task::{TaskClass, TaskStatus};
+   |                           ^^^^^^^^^
+
+warning: unused import: `TaskClass`
+ --> src/kernel/boot/thread_state.rs:8:47
+  |
+8 |     KernelExecutionContext, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
+  |                                               ^^^^^^^^^
+
+warning: unused import: `crate::kernel::vm::Asid`
+  --> src/kernel/boot/thread_state.rs:12:5
+   |
+12 | use crate::kernel::vm::Asid;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc_state::rt_detach_server_link`
+    --> src/kernel/boot/mod.rs:5601:16
+     |
+5601 | pub(crate) use ipc_state::rt_detach_server_link;
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `RecvBlockingPolicy`, `RecvMetaTarget`, and `RecvPayloadTarget`
+     --> src/kernel/boot/tests.rs:25569:25
+      |
+25569 |         FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
+      |                         ^^^^^^^^^^^^^^^^^^                 ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `RecvMetaTarget`
+     --> src/kernel/boot/tests.rs:26017:40
+      |
+26017 |         FallbackReason, RecvMapIntent, RecvMetaTarget, RecvPlan, RecvRequest,
+      |                                        ^^^^^^^^^^^^^^
+
+warning: unused imports: `KernelError` and `TrapHandleError`
+     --> src/kernel/boot/tests.rs:26669:42
+      |
+26669 |     use crate::kernel::boot::{Bootstrap, KernelError, TrapHandleError};
+      |                                          ^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `WaitReason`
+     --> src/kernel/boot/tests.rs:26679:43
+      |
+26679 |     use crate::kernel::task::{TaskStatus, WaitReason};
+      |                                           ^^^^^^^^^^
+
+warning: unused imports: `PageFlags` and `VirtAddr`
+     --> src/kernel/boot/tests.rs:26681:29
+      |
+26681 |     use crate::kernel::vm::{PageFlags, VirtAddr};
+      |                             ^^^^^^^^^  ^^^^^^^^
+
+warning: unused imports: `PageFlags` and `VirtAddr`
+     --> src/kernel/boot/tests.rs:27159:33
+      |
+27159 |         use crate::kernel::vm::{PageFlags, VirtAddr};
+      |                                 ^^^^^^^^^  ^^^^^^^^
+
+warning: unused imports: `PageFlags` and `VirtAddr`
+     --> src/kernel/boot/tests.rs:27627:33
+      |
+27627 |         use crate::kernel::vm::{PageFlags, VirtAddr};
+      |                                 ^^^^^^^^^  ^^^^^^^^
+
+warning: unused imports: `RecvCapTransferPlan`, `RecvDelivery`, `RecvSchedulerWakePlan`, `RecvWritebackPlan`, and `try_recv_core_user_plain`
+     --> src/kernel/boot/tests.rs:27663:9
+      |
+27663 |         RecvCapTransferPlan, RecvDelivery, RecvOutcome, RecvRequest, RecvSchedulerWakePlan,
+      |         ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^                            ^^^^^^^^^^^^^^^^^^^^^
+27664 |         RecvWritebackPlan, try_recv_core_kernel_plain, try_recv_core_user_plain,
+      |         ^^^^^^^^^^^^^^^^^                              ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SYSCALL_RECV_SHARED_V3_NR`
+     --> src/kernel/boot/tests.rs:27944:24
+      |
+27944 |         SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, Syscall, SyscallError, dispatch,
+      |                        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `SYSCALL_COUNT` and `SYSCALL_RECV_SHARED_V3_NR`
+     --> src/kernel/boot/tests.rs:30655:9
+      |
+30655 |         SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, SYSCALL_RECV_SHARED_V3_NR, Syscall, SyscallError,
+      |         ^^^^^^^^^^^^^                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `vfs-shared-io`
+     --> src/kernel/boot/tests.rs:31279:19
+      |
+31279 |             !cfg!(feature = "vfs-shared-io"),
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: expected values for `feature` are: `aarch64-apsched-witness`, `aarch64-exit-current-task-oracle`, `aarch64-ipc-reply-timeout-oracle`, `aarch64-ipccall-direct-oracle`, `aarch64-kthread1-witness`, `aarch64-lock2-witness`, `aarch64-overtaken-witness`, `aarch64-pl011-irq-witness`, `aarch64-sched-lock1-witness`, `aarch64-shared-region-direct-oracle`, `aarch64-smp2-witness`, `apsched-witness`, `context1-clobber`, `context1-witness`, `default`, `futex-requeue-race-witness`, `futex-requeue-witness`, `futex-wait-nonblock-probe`, `futex-wait-witness`, `hosted-dev`, `ipc-displace1-witness`, `ipc-reply-timeout-oracle-core`, `ipc-send-final-fault-witness`, `ipccall-direct-oracle`, `irq-saturation-witness`, `kstack-probe`, `kstack-probe-access`, `kstack-probe-frame`, `kstack-probe-recursion`, `kthread-irq-witness`, `kthread1-witness`, `legacy-tests`, `linux-compat`, `lock-witness`, and `oracle-handshake-race` and 41 more
+      = help: consider adding `vfs-shared-io` as a feature in `Cargo.toml`
+      = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+      = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unused import: `SYSCALL_NO_TRANSFER_CAP`
+     --> src/kernel/boot/tests.rs:31315:24
+      |
+31315 |         SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, SYSCALL_RECV_MAP_INTENT_WRITE,
+      |                        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `vfs-shared-io`
+     --> src/kernel/boot/tests.rs:31692:19
+      |
+31692 |             !cfg!(feature = "vfs-shared-io"),
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: expected values for `feature` are: `aarch64-apsched-witness`, `aarch64-exit-current-task-oracle`, `aarch64-ipc-reply-timeout-oracle`, `aarch64-ipccall-direct-oracle`, `aarch64-kthread1-witness`, `aarch64-lock2-witness`, `aarch64-overtaken-witness`, `aarch64-pl011-irq-witness`, `aarch64-sched-lock1-witness`, `aarch64-shared-region-direct-oracle`, `aarch64-smp2-witness`, `apsched-witness`, `context1-clobber`, `context1-witness`, `default`, `futex-requeue-race-witness`, `futex-requeue-witness`, `futex-wait-nonblock-probe`, `futex-wait-witness`, `hosted-dev`, `ipc-displace1-witness`, `ipc-reply-timeout-oracle-core`, `ipc-send-final-fault-witness`, `ipccall-direct-oracle`, `irq-saturation-witness`, `kstack-probe`, `kstack-probe-access`, `kstack-probe-frame`, `kstack-probe-recursion`, `kthread-irq-witness`, `kthread1-witness`, `legacy-tests`, `linux-compat`, `lock-witness`, and `oracle-handshake-race` and 41 more
+      = help: consider adding `vfs-shared-io` as a feature in `Cargo.toml`
+      = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unused import: `SYSCALL_NO_TRANSFER_CAP`
+     --> src/kernel/boot/tests.rs:31732:24
+      |
+31732 |         SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, SYSCALL_RECV_SHARED_V3_NR,
+      |                        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `vfs-shared-io`
+     --> src/kernel/boot/tests.rs:32011:19
+      |
+32011 |             !cfg!(feature = "vfs-shared-io"),
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: expected values for `feature` are: `aarch64-apsched-witness`, `aarch64-exit-current-task-oracle`, `aarch64-ipc-reply-timeout-oracle`, `aarch64-ipccall-direct-oracle`, `aarch64-kthread1-witness`, `aarch64-lock2-witness`, `aarch64-overtaken-witness`, `aarch64-pl011-irq-witness`, `aarch64-sched-lock1-witness`, `aarch64-shared-region-direct-oracle`, `aarch64-smp2-witness`, `apsched-witness`, `context1-clobber`, `context1-witness`, `default`, `futex-requeue-race-witness`, `futex-requeue-witness`, `futex-wait-nonblock-probe`, `futex-wait-witness`, `hosted-dev`, `ipc-displace1-witness`, `ipc-reply-timeout-oracle-core`, `ipc-send-final-fault-witness`, `ipccall-direct-oracle`, `irq-saturation-witness`, `kstack-probe`, `kstack-probe-access`, `kstack-probe-frame`, `kstack-probe-recursion`, `kthread-irq-witness`, `kthread1-witness`, `legacy-tests`, `linux-compat`, `lock-witness`, and `oracle-handshake-race` and 41 more
+      = help: consider adding `vfs-shared-io` as a feature in `Cargo.toml`
+      = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unused import: `SyscallError`
+     --> src/kernel/boot/tests.rs:32047:9
+      |
+32047 |         SyscallError, dispatch,
+      |         ^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `vfs-shared-io`
+     --> src/kernel/boot/tests.rs:32221:19
+      |
+32221 |             !cfg!(feature = "vfs-shared-io"),
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: expected values for `feature` are: `aarch64-apsched-witness`, `aarch64-exit-current-task-oracle`, `aarch64-ipc-reply-timeout-oracle`, `aarch64-ipccall-direct-oracle`, `aarch64-kthread1-witness`, `aarch64-lock2-witness`, `aarch64-overtaken-witness`, `aarch64-pl011-irq-witness`, `aarch64-sched-lock1-witness`, `aarch64-shared-region-direct-oracle`, `aarch64-smp2-witness`, `apsched-witness`, `context1-clobber`, `context1-witness`, `default`, `futex-requeue-race-witness`, `futex-requeue-witness`, `futex-wait-nonblock-probe`, `futex-wait-witness`, `hosted-dev`, `ipc-displace1-witness`, `ipc-reply-timeout-oracle-core`, `ipc-send-final-fault-witness`, `ipccall-direct-oracle`, `irq-saturation-witness`, `kstack-probe`, `kstack-probe-access`, `kstack-probe-frame`, `kstack-probe-recursion`, `kthread-irq-witness`, `kthread1-witness`, `legacy-tests`, `linux-compat`, `lock-witness`, and `oracle-handshake-race` and 41 more
+      = help: consider adding `vfs-shared-io` as a feature in `Cargo.toml`
+      = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `vfs-shared-io`
+     --> src/kernel/boot/tests.rs:32659:19
+      |
+32659 |             !cfg!(feature = "vfs-shared-io"),
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: expected values for `feature` are: `aarch64-apsched-witness`, `aarch64-exit-current-task-oracle`, `aarch64-ipc-reply-timeout-oracle`, `aarch64-ipccall-direct-oracle`, `aarch64-kthread1-witness`, `aarch64-lock2-witness`, `aarch64-overtaken-witness`, `aarch64-pl011-irq-witness`, `aarch64-sched-lock1-witness`, `aarch64-shared-region-direct-oracle`, `aarch64-smp2-witness`, `apsched-witness`, `context1-clobber`, `context1-witness`, `default`, `futex-requeue-race-witness`, `futex-requeue-witness`, `futex-wait-nonblock-probe`, `futex-wait-witness`, `hosted-dev`, `ipc-displace1-witness`, `ipc-reply-timeout-oracle-core`, `ipc-send-final-fault-witness`, `ipccall-direct-oracle`, `irq-saturation-witness`, `kstack-probe`, `kstack-probe-access`, `kstack-probe-frame`, `kstack-probe-recursion`, `kthread-irq-witness`, `kthread1-witness`, `legacy-tests`, `linux-compat`, `lock-witness`, and `oracle-handshake-race` and 41 more
+      = help: consider adding `vfs-shared-io` as a feature in `Cargo.toml`
+      = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `vfs-shared-io`
+     --> src/kernel/boot/tests.rs:33115:19
+      |
+33115 |             !cfg!(feature = "vfs-shared-io"),
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: expected values for `feature` are: `aarch64-apsched-witness`, `aarch64-exit-current-task-oracle`, `aarch64-ipc-reply-timeout-oracle`, `aarch64-ipccall-direct-oracle`, `aarch64-kthread1-witness`, `aarch64-lock2-witness`, `aarch64-overtaken-witness`, `aarch64-pl011-irq-witness`, `aarch64-sched-lock1-witness`, `aarch64-shared-region-direct-oracle`, `aarch64-smp2-witness`, `apsched-witness`, `context1-clobber`, `context1-witness`, `default`, `futex-requeue-race-witness`, `futex-requeue-witness`, `futex-wait-nonblock-probe`, `futex-wait-witness`, `hosted-dev`, `ipc-displace1-witness`, `ipc-reply-timeout-oracle-core`, `ipc-send-final-fault-witness`, `ipccall-direct-oracle`, `irq-saturation-witness`, `kstack-probe`, `kstack-probe-access`, `kstack-probe-frame`, `kstack-probe-recursion`, `kthread-irq-witness`, `kthread1-witness`, `legacy-tests`, `linux-compat`, `lock-witness`, and `oracle-handshake-race` and 41 more
+      = help: consider adding `vfs-shared-io` as a feature in `Cargo.toml`
+      = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unused import: `SYSCALL_ARG_CAP`
+     --> src/kernel/boot/tests.rs:33398:34
+      |
+33398 |     use crate::kernel::syscall::{SYSCALL_ARG_CAP, Syscall, SyscallError};
+      |                                  ^^^^^^^^^^^^^^^
+
+warning: unused import: `Capability`
+     --> src/kernel/boot/tests.rs:48584:70
+      |
+48584 |     use crate::kernel::capabilities::{CNodeId, CapObject, CapRights, Capability};
+      |                                                                      ^^^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:66859:9
+      |
+66859 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:67109:9
+      |
+67109 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:67324:9
+      |
+67324 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:67569:9
+      |
+67569 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:74479:9
+      |
+74479 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:75178:9
+      |
+75178 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `string::String`
+     --> src/kernel/boot/tests.rs:75179:23
+      |
+75179 |     use std::{format, string::String, vec::Vec};
+      |                       ^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:75754:9
+      |
+75754 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:75950:9
+      |
+75950 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:76216:9
+      |
+76216 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `AckLease`
+     --> src/kernel/boot/tests.rs:83075:41
+      |
+83075 |     use crate::kernel::ipccall_direct::{AckLease, IpcCallDirectSnapshot};
+      |                                         ^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:85304:9
+      |
+85304 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:85531:9
+      |
+85531 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `IpcCallDirectSnapshot`
+     --> src/kernel/boot/tests.rs:85993:55
+      |
+85993 |         AckLease, BlockedCallerAck, BlockedServerAck, IpcCallDirectSnapshot, IpcReplyDirectSnapshot,
+      |                                                       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `BlockedServerAck`
+     --> src/kernel/boot/tests.rs:87937:41
+      |
+87937 |             AckLease, BlockedCallerAck, BlockedServerAck, IpcReplyDirectSnapshot,
+      |                                         ^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+     --> src/kernel/boot/tests.rs:92271:9
+      |
+92271 |     use super::*;
+      |         ^^^^^^^^
+
+warning: unused import: `crate::kernel::task::UserRegisterContext`
+      --> src/kernel/boot/tests.rs:113322:9
+       |
+113322 |     use crate::kernel::task::UserRegisterContext;
+       |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:115163:9
+       |
+115163 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:116090:9
+       |
+116090 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:116284:9
+       |
+116284 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:116572:9
+       |
+116572 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:117681:9
+       |
+117681 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:118147:9
+       |
+118147 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:118699:9
+       |
+118699 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `crate::kernel::scheduler::SchedulerError`
+      --> src/kernel/boot/tests.rs:120741:9
+       |
+120741 |     use crate::kernel::scheduler::SchedulerError;
+       |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:121159:9
+       |
+121159 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:121342:9
+       |
+121342 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:137561:9
+       |
+137561 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:140551:9
+       |
+140551 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:157090:9
+       |
+157090 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:157376:9
+       |
+157376 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:157627:9
+       |
+157627 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:157868:9
+       |
+157868 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:158405:9
+       |
+158405 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:163050:9
+       |
+163050 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `ProvisionalCap`
+      --> src/kernel/boot/tests.rs:164875:38
+       |
+164875 |         MAX_PROVISIONAL_DESCENDANTS, ProvisionalCap, ProvisionalCapRelease,
+       |                                      ^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:166637:9
+       |
+166637 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:167156:9
+       |
+167156 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:168053:9
+       |
+168053 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:170698:9
+       |
+170698 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `super::*`
+      --> src/kernel/boot/tests.rs:172525:9
+       |
+172525 |     use super::*;
+       |         ^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskStatus`
+      --> src/kernel/boot/tests.rs:177769:9
+       |
+177769 |     use crate::kernel::task::TaskStatus;
+       |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskTransition`
+      --> src/kernel/boot/tests.rs:177771:53
+       |
+177771 |         EnteringFrameAuthority, FrameForfeitReason, TaskTransition,
+       |                                                     ^^^^^^^^^^^^^^
+
+warning: unused import: `CapRights`
+      --> src/kernel/boot/tests.rs:184099:57
+       |
+184099 |     use crate::kernel::capabilities::{CapId, CapObject, CapRights};
+       |                                                         ^^^^^^^^^
+
+warning: unused import: `CapObject`
+  --> src/kernel/recv_waiter_split.rs:94:42
+   |
+94 | use crate::kernel::capabilities::{CapId, CapObject};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `frame_ipc_send_message`
+   --> src/kernel/syscall.rs:318:59
+    |
+318 |     IpcSendPayloadShape, classify_ipc_send_payload_shape, frame_ipc_send_message,
+    |                                                           ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::ipc_abi::transfer_cap_arg_present`
+   --> src/kernel/syscall.rs:324:16
+    |
+324 | pub(crate) use self::ipc_abi::transfer_cap_arg_present;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc::split_inline_payload_from_frame`
+   --> src/kernel/syscall.rs:329:16
+    |
+329 | pub(crate) use ipc::split_inline_payload_from_frame;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SYSCALL_NO_TRANSFER_CAP`
+  --> src/kernel/syscall/recv_shared_v3.rs:12:26
+   |
+12 |     SYSCALL_ABI_VERSION, SYSCALL_NO_TRANSFER_CAP, SyscallError, current_tid,
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapRights`
+  --> src/kernel/syscall/recv_shared_v3.rs:16:42
+   |
+16 | use crate::kernel::capabilities::{CapId, CapRights};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::Message`
+  --> src/kernel/syscall/recv_shared_v3.rs:17:5
+   |
+17 | use crate::kernel::ipc::Message;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CachePolicy`, `Mapping`, `PAGE_SIZE`, `PageFlags`, `PhysAddr`, and `VirtAddr`
+  --> src/kernel/syscall/recv_shared_v3.rs:20:25
+   |
+20 | use crate::kernel::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                         ^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^  ^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+  --> src/kernel/syscall/vm.rs:28:40
+   |
+28 | use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                                        ^^^^^^^^^
+
+warning: unused import: `phase_a_take_reply_envelope`
+    --> src/kernel/syscall.rs:6852:13
+     |
+6852 |             phase_a_take_reply_envelope,
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+    --> src/runtime.rs:2683:13
+     |
+2683 |         use crate::kernel::task::TaskClass;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+    --> src/runtime.rs:6313:35
+     |
+6313 |         use crate::kernel::task::{TaskClass, TaskStatus};
+     |                                   ^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+    --> src/runtime.rs:6743:13
+     |
+6743 |         use crate::kernel::task::TaskClass;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_CAP`, `SYSCALL_ARG_LEN`, and `SYSCALL_ARG_PTR`
+    --> src/runtime.rs:9765:55
+     |
+9765 |             OPCODE_SHARED_MEM, RecvQueuedSplitPhaseA, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0,
+     |                                                       ^^^^^^^^^^^^^^^
+9766 |             SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError,
+     |                                          ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+     --> src/runtime.rs:16383:35
+      |
+16383 |         use crate::kernel::task::{TaskClass, TaskStatus};
+      |                                   ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+     --> src/runtime.rs:16813:13
+      |
+16813 |         use crate::kernel::ipc::ThreadId;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:16815:13
+      |
+16815 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:16849:13
+      |
+16849 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:18214:13
+      |
+18214 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+     --> src/runtime.rs:20057:9
+      |
+20057 |     use std::sync::Arc;
+      |         ^^^^^^^^^^^^^^
+
+warning: unused import: `std::thread`
+     --> src/runtime.rs:20058:9
+      |
+20058 |     use std::thread;
+      |         ^^^^^^^^^^^
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> src/kernel/direct_ack_census.rs:53:29
+   |
+53 |     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |                             ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+53 -     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+53 +     let _ = WAITERS_CURRENT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |
+
+warning: variable does not need to be mutable
+   --> src/arch/fdt.rs:708:17
+    |
+708 |         let mut str_off = |strings: &mut Vec<u8>, s: &[u8]| -> u32 {
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/arch/fdt.rs:837:17
+    |
+837 |         let mut str_off = |strings: &mut Vec<u8>, s: &[u8]| -> u32 {
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src/arch/fdt.rs:1001:17
+     |
+1001 |         let mut str_off = |strings: &mut Vec<u8>, s: &[u8]| -> u32 {
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `deadline`
+    --> src/kernel/boot/ipc_state.rs:5607:30
+     |
+5607 |                     let Some(deadline) = tcb.ipc_timeout_deadline else {
+     |                              ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_deadline`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `tid`
+    --> src/kernel/boot/orchestrator_state.rs:1463:51
+     |
+1463 |     fn run_unlock_graduated_proof_with(&mut self, tid: u64, cnode: CNodeId) {
+     |                                                   ^^^ help: if this is intentional, prefix it with an underscore: `_tid`
+
+warning: variable does not need to be mutable
+     --> src/kernel/boot/tests.rs:16770:13
+      |
+16770 |     let mut state = k;
+      |         ----^^^^^
+      |         |
+      |         help: remove this `mut`
+
+warning: unused variable: `endpoint_idx`
+     --> src/kernel/boot/tests.rs:52998:14
+      |
+52998 |         let (endpoint_idx, send_cap_a, recv_cap_a) = state.create_endpoint(2).expect("endpoint A");
+      |              ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_endpoint_idx`
+
+warning: unused variable: `state`
+     --> src/kernel/boot/tests.rs:69255:21
+      |
+69255 |     fn mapped_pages(state: &KernelState, asid: crate::kernel::vm::Asid, pages: usize) -> usize {
+      |                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_state`
+
+warning: unused variable: `d`
+     --> src/kernel/boot/tests.rs:71875:20
+      |
+71875 |     fn stash_empty(d: &Drn) -> bool {
+      |                    ^ help: if this is intentional, prefix it with an underscore: `_d`
+
+warning: unused variable: `ack`
+     --> src/kernel/boot/tests.rs:91424:13
+      |
+91424 |         let ack = fx.published_ack;
+      |             ^^^ help: if this is intentional, prefix it with an underscore: `_ack`
+
+warning: unused variable: `fx`
+     --> src/kernel/boot/tests.rs:91517:13
+      |
+91517 |         let fx = smp_server_fixture();
+      |             ^^ help: if this is intentional, prefix it with an underscore: `_fx`
+
+warning: variable does not need to be mutable
+      --> src/kernel/boot/tests.rs:170217:17
+       |
+170217 |         let mut h = three_task_world();
+       |             ----^
+       |             |
+       |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+      --> src/kernel/boot/tests.rs:170252:17
+       |
+170252 |         let mut h = three_task_world();
+       |             ----^
+       |             |
+       |             help: remove this `mut`
+
+warning: unused variable: `sidx`
+      --> src/kernel/boot/tests.rs:187188:27
+       |
+187188 |         let (split, scap, sidx) = build();
+       |                           ^^^^ help: if this is intentional, prefix it with an underscore: `_sidx`
+
+warning: value assigned to `stash_bound_receiver_tid` is never read
+   --> src/kernel/syscall/ipc.rs:464:78
+    |
+464 |     let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
+    |                                                                              ^^^^ this value is reassigned later and never used
+...
+509 |             stash_bound_receiver_tid = bound_tid;
+    |             ------------------------------------ `stash_bound_receiver_tid` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `cpu`
+    --> src/runtime.rs:7908:9
+     |
+7908 |         cpu: CpuId,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: unused variable: `virt`
+     --> src/runtime.rs:16213:9
+      |
+16213 |         virt: crate::kernel::vm::VirtAddr,
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_virt`
+
+warning: type `ipccall_direct::BlockedServerAck` is more private than the item `kernel::boot::ipccall_direct_ack::snapshot`
+    --> src/kernel/boot/mod.rs:7593:5
+     |
+7593 |     pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedServerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `kernel::boot::ipccall_direct_ack::snapshot` is reachable at visibility `pub`
+     |
+note: but type `ipccall_direct::BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `ipccall_direct::BlockedServerAck` is more private than the item `kernel::boot::ipccall_direct_ack::claim`
+    --> src/kernel/boot/mod.rs:7607:5
+     |
+7607 | /     pub fn claim(
+7608 | |         endpoint_index: usize,
+7609 | |         endpoint_generation: u64,
+7610 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `kernel::boot::ipccall_direct_ack::claim` is reachable at visibility `pub`
+     |
+note: but type `ipccall_direct::BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `kernel::boot::ipccall_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:7616:5
+     |
+7616 | /     pub fn claim_exact(
+7617 | |         endpoint_index: usize,
+7618 | |         endpoint_generation: u64,
+7619 | |         expect_server: Option<ReceiverWaiterIdentity>,
+7620 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `kernel::boot::ipccall_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ipccall_direct::BlockedServerAck` is more private than the item `kernel::boot::ipccall_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:7616:5
+     |
+7616 | /     pub fn claim_exact(
+7617 | |         endpoint_index: usize,
+7618 | |         endpoint_generation: u64,
+7619 | |         expect_server: Option<ReceiverWaiterIdentity>,
+7620 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `kernel::boot::ipccall_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `ipccall_direct::BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `kernel::boot::ipccall_direct_ack::release`
+    --> src/kernel/boot/mod.rs:7633:5
+     |
+7633 | /     pub fn release(
+7634 | |         endpoint_index: usize,
+7635 | |         endpoint_generation: u64,
+7636 | |         server: ReceiverWaiterIdentity,
+7637 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `kernel::boot::ipccall_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `AckRelease` is more private than the item `kernel::boot::ipccall_direct_ack::release`
+    --> src/kernel/boot/mod.rs:7633:5
+     |
+7633 | /     pub fn release(
+7634 | |         endpoint_index: usize,
+7635 | |         endpoint_generation: u64,
+7636 | |         server: ReceiverWaiterIdentity,
+7637 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `kernel::boot::ipccall_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `AckRelease` is only usable at visibility `pub(crate)`
+    --> src/kernel/direct_ack_store.rs:346:1
+     |
+ 346 | pub(crate) enum AckRelease {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ipccall_direct::BlockedServerAck` is more private than the item `kernel::boot::ipccall_direct_ack::sole_snapshot`
+    --> src/kernel/boot/mod.rs:7692:5
+     |
+7692 |     pub fn sole_snapshot() -> Option<BlockedServerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `kernel::boot::ipccall_direct_ack::sole_snapshot` is reachable at visibility `pub`
+     |
+note: but type `ipccall_direct::BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ipccall_direct::BlockedServerAck` is more private than the item `kernel::boot::ipccall_direct_ack::sole_claim`
+    --> src/kernel/boot/mod.rs:7698:5
+     |
+7698 |     pub fn sole_claim() -> Option<(BlockedServerAck, u64)> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `kernel::boot::ipccall_direct_ack::sole_claim` is reachable at visibility `pub`
+     |
+note: but type `ipccall_direct::BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::snapshot`
+    --> src/kernel/boot/mod.rs:8077:5
+     |
+8077 |     pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedCallerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `ipcreply_direct_ack::snapshot` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::claim`
+    --> src/kernel/boot/mod.rs:8085:5
+     |
+8085 | /     pub fn claim(
+8086 | |         endpoint_index: usize,
+8087 | |         endpoint_generation: u64,
+8088 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `ipcreply_direct_ack::claim` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipcreply_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:8093:5
+     |
+8093 | /     pub fn claim_exact(
+8094 | |         endpoint_index: usize,
+8095 | |         endpoint_generation: u64,
+8096 | |         expect_caller: Option<ReceiverWaiterIdentity>,
+8097 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `ipcreply_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:8093:5
+     |
+8093 | /     pub fn claim_exact(
+8094 | |         endpoint_index: usize,
+8095 | |         endpoint_generation: u64,
+8096 | |         expect_caller: Option<ReceiverWaiterIdentity>,
+8097 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `ipcreply_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipcreply_direct_ack::release`
+    --> src/kernel/boot/mod.rs:8109:5
+     |
+8109 | /     pub fn release(
+8110 | |         endpoint_index: usize,
+8111 | |         endpoint_generation: u64,
+8112 | |         caller: ReceiverWaiterIdentity,
+8113 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipcreply_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `AckRelease` is more private than the item `ipcreply_direct_ack::release`
+    --> src/kernel/boot/mod.rs:8109:5
+     |
+8109 | /     pub fn release(
+8110 | |         endpoint_index: usize,
+8111 | |         endpoint_generation: u64,
+8112 | |         caller: ReceiverWaiterIdentity,
+8113 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipcreply_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `AckRelease` is only usable at visibility `pub(crate)`
+    --> src/kernel/direct_ack_store.rs:346:1
+     |
+ 346 | pub(crate) enum AckRelease {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::sole_snapshot`
+    --> src/kernel/boot/mod.rs:8158:5
+     |
+8158 |     pub fn sole_snapshot() -> Option<BlockedCallerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `ipcreply_direct_ack::sole_snapshot` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::sole_claim`
+    --> src/kernel/boot/mod.rs:8164:5
+     |
+8164 |     pub fn sole_claim() -> Option<(BlockedCallerAck, u64)> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `ipcreply_direct_ack::sole_claim` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:322:1
+     |
+ 322 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `RecvImmediateOutcome` is more private than the item `runtime::SharedKernel::try_split_ipc_recv_timeout_immediate_into_frame`
+     --> src/runtime.rs:11271:5
+      |
+11271 | /     pub fn try_split_ipc_recv_timeout_immediate_into_frame(
+11272 | |         &self,
+11273 | |         cpu: CpuId,
+11274 | |         frame: &mut TrapFrame,
+11275 | |     ) -> crate::kernel::syscall::RecvImmediateOutcome {
+      | |_____________________________________________________^ method `runtime::SharedKernel::try_split_ipc_recv_timeout_immediate_into_frame` is reachable at visibility `pub`
+      |
+note: but type `RecvImmediateOutcome` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall.rs:1921:1
+      |
+ 1921 | pub(crate) enum RecvImmediateOutcome {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `RecvImmediateOutcome` is more private than the item `runtime::SharedKernel::try_split_ipc_recv_queued_plain_into_frame`
+     --> src/runtime.rs:11600:5
+      |
+11600 | /     pub fn try_split_ipc_recv_queued_plain_into_frame(
+11601 | |         &self,
+11602 | |         cpu: CpuId,
+11603 | |         frame: &mut TrapFrame,
+11604 | |     ) -> crate::kernel::syscall::RecvImmediateOutcome {
+      | |_____________________________________________________^ method `runtime::SharedKernel::try_split_ipc_recv_queued_plain_into_frame` is reachable at visibility `pub`
+      |
+note: but type `RecvImmediateOutcome` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall.rs:1921:1
+      |
+ 1921 | pub(crate) enum RecvImmediateOutcome {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `FutexWaitDecision` is more private than the item `runtime::SharedKernel::futex_wait_decide_split_read`
+     --> src/runtime.rs:18548:5
+      |
+18548 | /     pub fn futex_wait_decide_split_read(
+18549 | |         &self,
+18550 | |         tid: u64,
+18551 | |         addr: usize,
+18552 | |         expected: u32,
+18553 | |         kind: crate::kernel::boot::futex::FutexKind,
+18554 | |     ) -> Result<crate::kernel::syscall::sched::FutexWaitDecision, crate::kernel::boot::KernelError>
+      | |___________________________________________________________________________________________________^ method `runtime::SharedKernel::futex_wait_decide_split_read` is reachable at visibility `pub`
+      |
+note: but type `FutexWaitDecision` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall/sched.rs:167:1
+      |
+  167 | pub(crate) enum FutexWaitDecision {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_DISPATCH_STACK_BYTES` is never used
+   --> src/arch/x86_64/descriptor_tables.rs:194:18
+    |
+194 | pub(crate) const AP_DISPATCH_STACK_BYTES: usize = 2 * 1024 * 1024;
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `read_boot_tss_rsp0` is never used
+    --> src/arch/x86_64/descriptor_tables.rs:3521:15
+     |
+3521 | pub(crate) fn read_boot_tss_rsp0() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^
+
+warning: constant `LAPIC_ICR_LOW_OFFSET` is never used
+  --> src/arch/x86_64/smp.rs:25:7
+   |
+25 | const LAPIC_ICR_LOW_OFFSET: usize = 0x300;
+   |       ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `LAPIC_ICR_HIGH_OFFSET` is never used
+  --> src/arch/x86_64/smp.rs:26:7
+   |
+26 | const LAPIC_ICR_HIGH_OFFSET: usize = 0x310;
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ICR_DELIVERY_STATUS_PENDING` is never used
+  --> src/arch/x86_64/smp.rs:30:7
+   |
+30 | const ICR_DELIVERY_STATUS_PENDING: u32 = 1 << 12;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ICR_IDLE_POLL_ITERS` is never used
+  --> src/arch/x86_64/smp.rs:47:7
+   |
+47 | const ICR_IDLE_POLL_ITERS: usize = 1_000_000;
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: static `AP_HANDOFF_OFFS` is never used
+  --> src/arch/x86_64/smp.rs:96:8
+   |
+96 | static AP_HANDOFF_OFFS: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS] =
+   |        ^^^^^^^^^^^^^^^
+
+warning: static `AP_IRQ_READY_FLAGS` is never used
+   --> src/arch/x86_64/smp.rs:101:8
+    |
+101 | static AP_IRQ_READY_FLAGS: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `lapic_mmio_base` is never used
+   --> src/arch/x86_64/smp.rs:116:4
+    |
+116 | fn lapic_mmio_base() -> usize {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `apic_of` is never used
+   --> src/arch/x86_64/smp.rs:122:15
+    |
+122 | pub(crate) fn apic_of(cpu: CpuId) -> Option<u8> {
+    |               ^^^^^^^
+
+warning: function `planned_secondaries_bitmap` is never used
+   --> src/arch/x86_64/smp.rs:701:15
+    |
+701 | pub(crate) fn planned_secondaries_bitmap() -> u64 {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `bound_apic_id` is never used
+   --> src/arch/x86_64/smp.rs:801:4
+    |
+801 | fn bound_apic_id(cpu: CpuId) -> Option<u32> {
+    |    ^^^^^^^^^^^^^
+
+warning: constant `AP_PRODUCTION_ADMISSION_REQUEST` is never used
+    --> src/arch/x86_64/smp.rs:2599:18
+     |
+2599 | pub(crate) const AP_PRODUCTION_ADMISSION_REQUEST: u32 = 2;
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `PRODUCTION_ADMISSION_OWED` is never used
+    --> src/arch/x86_64/smp.rs:2603:8
+     |
+2603 | static PRODUCTION_ADMISSION_OWED: AtomicU64 = AtomicU64::new(0);
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `send_reschedule_ipi_to` is never used
+    --> src/arch/x86_64/smp.rs:2995:15
+     |
+2995 | pub(crate) fn send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `c2c_send_reschedule_ipi_to` is never used
+    --> src/arch/x86_64/smp.rs:3023:15
+     |
+3023 | pub(crate) fn c2c_send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_TRAMPOLINE_SIZE` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:33:18
+   |
+33 | pub(super) const AP_TRAMPOLINE_SIZE: usize = crate::kernel::vm::PAGE_SIZE;
+   |                  ^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_HANDOFF_TPR_OUT_OFFSET` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:75:18
+   |
+75 | pub(super) const AP_HANDOFF_TPR_OUT_OFFSET: usize = 124;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KERNEL_CR3_RELOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:84:15
+   |
+84 |     pub const KERNEL_CR3_RELOADED: u32 = 1 << 0; // mov cr3 + post-reload fetch survived
+   |               ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GDT_LOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:85:15
+   |
+85 |     pub const GDT_LOADED: u32 = 1 << 1; // lgdt + SS/DS/ES + far-return CS=0x08
+   |               ^^^^^^^^^^
+
+warning: constant `TSS_LOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:86:15
+   |
+86 |     pub const TSS_LOADED: u32 = 1 << 2; // ltr 0x28 (per-AP TSS)
+   |               ^^^^^^^^^^
+
+warning: constant `LAPIC_READ` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:87:15
+   |
+87 |     pub const LAPIC_READ: u32 = 1 << 3; // LAPIC ID register MMIO read done
+   |               ^^^^^^^^^^
+
+warning: constant `IDLE_CTX_PUBLISHED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:88:15
+   |
+88 |     pub const IDLE_CTX_PUBLISHED: u32 = 1 << 4; // canary + live rsp stored via gs:
+   |               ^^^^^^^^^^^^^^^^^^
+
+warning: constant `CR4_SYNCED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:90:15
+   |
+90 |     pub const CR4_SYNCED: u32 = 1 << 5; // mov cr4 = handoff.bsp_cr4 survived
+   |               ^^^^^^^^^^
+
+warning: constant `IDT_LOADED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:91:15
+   |
+91 |     pub const IDT_LOADED: u32 = 1 << 6; // lidt of the AP-safe IDT done
+   |               ^^^^^^^^^^
+
+warning: constant `LAPIC_SW_ENABLED` is never used
+  --> src/arch/x86_64/smp_trampoline.rs:95:15
+   |
+95 |     pub const LAPIC_SW_ENABLED: u32 = 1 << 7;
+   |               ^^^^^^^^^^^^^^^^
+
+warning: function `handle_trap_entry_with_fault_bookkeeping_mode` is never used
+  --> src/arch/trap_entry.rs:74:15
+   |
+74 | pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `VmBrkPlan` is never constructed
+   --> src/kernel/boot/mod.rs:438:19
+    |
+438 | pub(crate) struct VmBrkPlan {
+    |                   ^^^^^^^^^
+
+warning: struct `VmAnonMapPlan` is never constructed
+   --> src/kernel/boot/mod.rs:484:19
+    |
+484 | pub(crate) struct VmAnonMapPlan {
+    |                   ^^^^^^^^^^^^^
+
+warning: struct `VmAnonMapValidatedArgs` is never constructed
+   --> src/kernel/boot/mod.rs:498:19
+    |
+498 | pub(crate) struct VmAnonMapValidatedArgs {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `VmAnonMapProgressPlan` is never constructed
+   --> src/kernel/boot/mod.rs:570:19
+    |
+570 | pub(crate) struct VmAnonMapProgressPlan {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `FUTEX_WAIT_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:1557:8
+     |
+1557 | static FUTEX_WAIT_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_futex_wait_default_on` is never used
+    --> src/kernel/boot/mod.rs:1563:15
+     |
+1563 | pub(crate) fn maybe_log_futex_wait_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_ASYNC_RESUME_PENDING` is never used
+    --> src/kernel/boot/mod.rs:1755:19
+     |
+1755 | pub(crate) static RISCV_ASYNC_RESUME_PENDING: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_publish` is never used
+    --> src/kernel/boot/mod.rs:1761:15
+     |
+1761 | pub(crate) fn riscv_async_resume_publish(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_take` is never used
+    --> src/kernel/boot/mod.rs:1780:15
+     |
+1780 | pub(crate) fn riscv_async_resume_take(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_clear` is never used
+    --> src/kernel/boot/mod.rs:1792:15
+     |
+1792 | pub(crate) fn riscv_async_resume_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_SYSCALL_CONTINUATION_PENDING` is never used
+    --> src/kernel/boot/mod.rs:1816:19
+     |
+1816 | pub(crate) static RISCV_SYSCALL_CONTINUATION_PENDING: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_publish` is never used
+    --> src/kernel/boot/mod.rs:1822:15
+     |
+1822 | pub(crate) fn riscv_syscall_continuation_publish(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_take` is never used
+    --> src/kernel/boot/mod.rs:1830:15
+     |
+1830 | pub(crate) fn riscv_syscall_continuation_take(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_clear` is never used
+    --> src/kernel/boot/mod.rs:1839:15
+     |
+1839 | pub(crate) fn riscv_syscall_continuation_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED` is never used
+    --> src/kernel/boot/mod.rs:1851:19
+     |
+1851 | pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING` is never used
+    --> src/kernel/boot/mod.rs:1854:19
+     |
+1854 | pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING: [core::sync::atomic::AtomicU64;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_try_defer` is never used
+    --> src/kernel/boot/mod.rs:1886:15
+     |
+1886 | pub(crate) fn riscv_queue_switch_foundation_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_is_deferred` is never used
+    --> src/kernel/boot/mod.rs:1918:15
+     |
+1918 | pub(crate) fn riscv_queue_switch_foundation_is_deferred(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_outgoing` is never used
+    --> src/kernel/boot/mod.rs:1924:15
+     |
+1924 | pub(crate) fn riscv_queue_switch_foundation_outgoing(cpu_idx: usize) -> Option<u64> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_clear` is never used
+    --> src/kernel/boot/mod.rs:1935:15
+     |
+1935 | pub(crate) fn riscv_queue_switch_foundation_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:1987:8
+     |
+1987 | static RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_riscv_futex_wait_retire_default_on` is never used
+    --> src/kernel/boot/mod.rs:1992:15
+     |
+1992 | pub(crate) fn maybe_log_riscv_futex_wait_retire_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `YIELD_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:2039:8
+     |
+2039 | static YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_yield_default_on` is never used
+    --> src/kernel/boot/mod.rs:2045:15
+     |
+2045 | pub(crate) fn maybe_log_yield_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_YIELD_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:2071:8
+     |
+2071 | static RISCV_YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_riscv_yield_retire_default_on` is never used
+    --> src/kernel/boot/mod.rs:2076:15
+     |
+2076 | pub(crate) fn maybe_log_riscv_yield_retire_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `current_arch_tag` is never used
+    --> src/kernel/boot/mod.rs:2251:21
+     |
+2251 | pub(crate) const fn current_arch_tag() -> &'static str {
+     |                     ^^^^^^^^^^^^^^^^
+
+warning: function `ipccall_direct_smp_request_note_early_wouldblock` is never used
+    --> src/kernel/boot/mod.rs:4411:15
+     |
+4411 | pub(crate) fn ipccall_direct_smp_request_note_early_wouldblock() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipccall_direct_smp_request_note_delivered` is never used
+    --> src/kernel/boot/mod.rs:4426:15
+     |
+4426 | pub(crate) fn ipccall_direct_smp_request_note_delivered() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_smp_request_delivery` is never used
+    --> src/kernel/boot/mod.rs:4576:15
+     |
+4576 | pub(crate) fn record_smp_request_delivery(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_smp_request_ipi_sent` is never used
+    --> src/kernel/boot/mod.rs:4599:15
+     |
+4599 | pub(crate) fn record_smp_request_ipi_sent(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_reply_note_delivered` is never used
+    --> src/kernel/boot/mod.rs:4650:15
+     |
+4650 | pub(crate) fn ipcreply_direct_smp_reply_note_delivered() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_reply_note_early_wouldblock` is never used
+    --> src/kernel/boot/mod.rs:4663:15
+     |
+4663 | pub(crate) fn ipcreply_direct_smp_reply_note_early_wouldblock() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_note_duplicate_refused` is never used
+    --> src/kernel/boot/mod.rs:4680:15
+     |
+4680 | pub(crate) fn ipcreply_direct_smp_note_duplicate_refused() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_echo_smp_oracle_block` is never used
+    --> src/kernel/boot/mod.rs:4785:15
+     |
+4785 | pub(crate) fn maybe_echo_smp_oracle_block(_cpu: u8, _tid: u64, _endpoint: usize, _wait_gen: u64) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_reply_timeout_oracle_reply_endpoint` is never used
+    --> src/kernel/boot/mod.rs:5277:15
+     |
+5277 | pub(crate) fn set_ipc_reply_timeout_oracle_reply_endpoint(eidx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `IPC_REPLY_TIMEOUT_RW_DEADLINE` is never used
+    --> src/kernel/boot/mod.rs:5284:8
+     |
+5284 | static IPC_REPLY_TIMEOUT_RW_DEADLINE: core::sync::atomic::AtomicU64 =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `IPC_REPLY_TIMEOUT_RW_LATE_EMITTED` is never used
+    --> src/kernel/boot/mod.rs:5286:8
+     |
+5286 | static IPC_REPLY_TIMEOUT_RW_LATE_EMITTED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_reply_timeout_rw_deadline` is never used
+    --> src/kernel/boot/mod.rs:5289:15
+     |
+5289 | pub(crate) fn set_ipc_reply_timeout_rw_deadline(tick: u64) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipc_reply_timeout_rw_deadline` is never used
+    --> src/kernel/boot/mod.rs:5292:15
+     |
+5292 | pub(crate) fn ipc_reply_timeout_rw_deadline() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipc_reply_timeout_rw_late_scan_once` is never used
+    --> src/kernel/boot/mod.rs:5296:15
+     |
+5296 | pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_emit_server_dies_link_balance` is never used
+    --> src/kernel/boot/mod.rs:6320:15
+     |
+6320 | pub(crate) fn maybe_emit_server_dies_link_balance(_msg: &str, _live_links: usize) {}
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `slot` is never used
+    --> src/kernel/boot/mod.rs:6461:19
+     |
+6460 | impl ServerDeathWorkReservation {
+     | ------------------------------- method in this implementation
+6461 |     pub(crate) fn slot(&self) -> usize {
+     |                   ^^^^
+
+warning: function `server_death_work_published_count` is never used
+    --> src/kernel/boot/mod.rs:6789:15
+     |
+6789 | pub(crate) fn server_death_work_published_count() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_drained_count` is never used
+    --> src/kernel/boot/mod.rs:6792:15
+     |
+6792 | pub(crate) fn server_death_work_drained_count() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `note_recv_broad_entry` is never used
+    --> src/kernel/boot/mod.rs:9034:15
+     |
+9034 | pub(crate) fn note_recv_broad_entry() {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `resolved_cap_object_split` is never used
+    --> src/kernel/boot/capability_lifecycle_state.rs:1072:19
+     |
+1063 | impl crate::runtime::SharedKernel {
+     | --------------------------------- method in this implementation
+...
+1072 |     pub(crate) fn resolved_cap_object_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CowPageRecord` is never constructed
+   --> src/kernel/boot/defs.rs:219:19
+    |
+219 | pub(crate) struct CowPageRecord {
+    |                   ^^^^^^^^^^^^^
+
+warning: methods `d2_recv_switch_incoming_asid` and `d6_emit_proof_cleanup_arch_markers` are never used
+    --> src/kernel/boot/exec_state.rs:2834:19
+     |
+ 426 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+2834 |     pub(crate) fn d2_recv_switch_incoming_asid(&mut self, incoming: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3413 |     pub(crate) fn d6_emit_proof_cleanup_arch_markers(&mut self) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `fault_current_task_unsupported_instruction` is never used
+    --> src/kernel/boot/fault_state.rs:2034:19
+     |
+1188 | impl KernelState {
+     | ---------------- method in this implementation
+...
+2034 |     pub(crate) fn fault_current_task_unsupported_instruction(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: multiple methods are never used
+    --> src/kernel/boot/ipc_state.rs:2981:19
+     |
+2075 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+2981 |     pub(crate) fn cancel_deadline_exact(
+     |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+3040 |     pub(crate) fn claim_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3054 |     pub(crate) fn complete_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3069 |     pub(crate) fn restore_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3319 |     pub(crate) fn take_blocked_syscall_completion(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4253 |     pub(crate) fn deadline_token_is_armed(&self, token_index: usize) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+4261 |     pub(crate) fn deadline_token_is_completed(&self, token_index: usize) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4269 |     pub(crate) fn deadline_token_is_reply_leased(&self, token_index: usize) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+6934 |     pub(crate) fn try_ipc_send_boundary_split_ordinary_cap_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `cpu` and `status_before` are never used
+   --> src/kernel/boot/exit_claim.rs:224:25
+    |
+221 | impl ExitClaim {
+    | -------------- methods in this implementation
+...
+224 |     pub(crate) const fn cpu(&self) -> CpuId {
+    |                         ^^^
+...
+255 |     pub(crate) const fn status_before(&self) -> TaskStatus {
+    |                         ^^^^^^^^^^^^^
+
+warning: method `memory_object_len_for_test` is never used
+   --> src/kernel/boot/memory_lifecycle_state.rs:607:19
+    |
+ 72 | impl KernelState {
+    | ---------------- method in this implementation
+...
+607 |     pub(crate) fn memory_object_len_for_test(&self, phys: PhysAddr) -> Option<usize> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `mark_cow_page` is never used
+  --> src/kernel/boot/memory_state.rs:46:8
+   |
+13 | impl KernelState {
+   | ---------------- method in this implementation
+...
+46 |     fn mark_cow_page(&mut self, asid: Asid, virt: VirtAddr) -> Result<(), KernelError> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `x86_smp_unlock_audit_claimed` is never used
+  --> src/kernel/boot/orchestrator_state.rs:23:15
+   |
+23 | pub(crate) fn x86_smp_unlock_audit_claimed() -> bool {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `run_cross_arch_live_audit_at_first_dispatch` and `run_unlock_graduated_proof_at_bootstrap` are never used
+    --> src/kernel/boot/orchestrator_state.rs:885:19
+     |
+ 100 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+ 885 |     pub(crate) fn run_cross_arch_live_audit_at_first_dispatch(&self, tid: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1413 |     pub(crate) fn run_unlock_graduated_proof_at_bootstrap(&mut self, tid: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `nothing_created` is never used
+  --> src/kernel/boot/process_cnode_txn.rs:91:25
+   |
+88 | impl ProcessCNodeGrant {
+   | ---------------------- associated function in this implementation
+...
+91 |     pub(crate) const fn nothing_created(cnode: CNodeId) -> Self {
+   |                         ^^^^^^^^^^^^^^^
+
+warning: methods `on_dispatch_selection_on_cpu`, `on_preempt_prefer_current_cpu`, and `task_priority` are never used
+   --> src/kernel/boot/scheduler_state.rs:156:19
+    |
+ 23 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+156 |     pub(crate) fn on_dispatch_selection_on_cpu(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+318 |     pub(crate) fn on_preempt_prefer_current_cpu(&mut self, preferred: u64) -> Option<u64> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+563 |     fn task_priority(&self, tid: u64) -> Result<TaskPriority, KernelError> {
+    |        ^^^^^^^^^^^^^
+
+warning: constant `D6_PROOF_MAX_TASKS` is never used
+  --> src/kernel/boot/thread_state.rs:94:7
+   |
+94 | const D6_PROOF_MAX_TASKS: usize = 128;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: associated items `fork_should_inherit_capability`, `inherit_parent_capabilities_for_fork`, `clear_blocked_recv_return_regs_locked`, and `d6_ensure_live_rsp_region_mapped` are never used
+    --> src/kernel/boot/thread_state.rs:324:8
+     |
+ 323 | impl KernelState {
+     | ---------------- associated items in this implementation
+ 324 |     fn fork_should_inherit_capability(object: CapObject) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 340 |     fn inherit_parent_capabilities_for_fork(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 438 |     pub(crate) fn clear_blocked_recv_return_regs_locked(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1270 |     pub(crate) fn d6_ensure_live_rsp_region_mapped(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `update_active_transfer_mapping_len_locked` is never used
+   --> src/kernel/boot/transfer_state.rs:426:19
+    |
+  6 | impl KernelState {
+    | ---------------- associated function in this implementation
+...
+426 |     pub(crate) fn update_active_transfer_mapping_len_locked(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `recv_timeout_frame` is never used
+     --> src/kernel/boot/tests.rs:25311:8
+      |
+25311 |     fn recv_timeout_frame(recv_cap: CapId, timeout_ticks: u64) -> TrapFrame {
+      |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `recv_frame_with_buf` is never used
+     --> src/kernel/boot/tests.rs:25588:8
+      |
+25588 |     fn recv_frame_with_buf(recv_cap: CapId, ptr: usize, len: usize) -> TrapFrame {
+      |        ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CAP1` is never used
+     --> src/kernel/boot/tests.rs:27673:11
+      |
+27673 |     const CAP1: CapId = CapId(1);
+      |           ^^^^
+
+warning: constant `RECV_V3_STATUS_WOULD_BLOCK` is never used
+     --> src/kernel/boot/tests.rs:30664:11
+      |
+30664 |     const RECV_V3_STATUS_WOULD_BLOCK: u32 = 1;
+      |           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `RECV_V3_STATUS_OK` is never used
+     --> src/kernel/boot/tests.rs:31323:11
+      |
+31323 |     const RECV_V3_STATUS_OK: u32 = 0;
+      |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `TESTS_SRC` is never used
+     --> src/kernel/boot/tests.rs:34721:11
+      |
+34721 |     const TESTS_SRC: &str = include_str!("tests.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:34723:11
+      |
+34723 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `RUNTIME_SRC` is never used
+     --> src/kernel/boot/tests.rs:35027:11
+      |
+35027 |     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+      |           ^^^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:35028:11
+      |
+35028 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `EXEC_STATE_SRC` is never used
+     --> src/kernel/boot/tests.rs:35925:11
+      |
+35925 |     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+      |           ^^^^^^^^^^^^^^
+
+warning: constant `EXEC_STATE_SRC` is never used
+     --> src/kernel/boot/tests.rs:36067:11
+      |
+36067 |     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+      |           ^^^^^^^^^^^^^^
+
+warning: constant `EXEC_STATE_SRC` is never used
+     --> src/kernel/boot/tests.rs:36521:11
+      |
+36521 |     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+      |           ^^^^^^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:43796:15
+      |
+43796 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:44018:11
+      |
+44018 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `THREAD_STATE_SRC` is never used
+     --> src/kernel/boot/tests.rs:44960:11
+      |
+44960 |     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+      |           ^^^^^^^^^^^^^^^^
+
+warning: constant `MEM_SRC` is never used
+     --> src/kernel/boot/tests.rs:46515:11
+      |
+46515 |     const MEM_SRC: &str = include_str!("memory_state.rs");
+      |           ^^^^^^^
+
+warning: constant `THREAD_SRC` is never used
+     --> src/kernel/boot/tests.rs:46766:11
+      |
+46766 |     const THREAD_SRC: &str = include_str!("thread_state.rs");
+      |           ^^^^^^^^^^
+
+warning: constant `MEM_SRC` is never used
+     --> src/kernel/boot/tests.rs:46768:11
+      |
+46768 |     const MEM_SRC: &str = include_str!("memory_state.rs");
+      |           ^^^^^^^
+
+warning: constant `THREAD_STATE_SRC` is never used
+     --> src/kernel/boot/tests.rs:47312:11
+      |
+47312 |     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+      |           ^^^^^^^^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:47841:11
+      |
+47841 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:49542:11
+      |
+49542 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:49930:11
+      |
+49930 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `RUNTIME_SRC` is never used
+     --> src/kernel/boot/tests.rs:50312:11
+      |
+50312 |     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+      |           ^^^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:50313:11
+      |
+50313 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:50450:11
+      |
+50450 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:50610:11
+      |
+50610 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:51168:15
+      |
+51168 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:51245:11
+      |
+51245 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:51947:11
+      |
+51947 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:53200:11
+      |
+53200 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:54534:11
+      |
+54534 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:54736:11
+      |
+54736 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:55087:11
+      |
+55087 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `EXEC_STATE_SRC` is never used
+     --> src/kernel/boot/tests.rs:55090:11
+      |
+55090 |     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+      |           ^^^^^^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:55442:11
+      |
+55442 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `THREAD_SRC` is never used
+     --> src/kernel/boot/tests.rs:60164:11
+      |
+60164 |     const THREAD_SRC: &str = include_str!("thread_state.rs");
+      |           ^^^^^^^^^^
+
+warning: constant `EXEC_SRC` is never used
+     --> src/kernel/boot/tests.rs:62295:11
+      |
+62295 |     const EXEC_SRC: &str = include_str!("exec_state.rs");
+      |           ^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:62551:15
+      |
+62551 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:62810:11
+      |
+62810 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:63493:11
+      |
+63493 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:64874:11
+      |
+64874 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:65064:11
+      |
+65064 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:65425:11
+      |
+65425 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:65840:11
+      |
+65840 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:66370:11
+      |
+66370 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:66625:11
+      |
+66625 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `IPC_SRC` is never used
+     --> src/kernel/boot/tests.rs:66860:11
+      |
+66860 |     const IPC_SRC: &str = include_str!("../../kernel/syscall/ipc.rs");
+      |           ^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:66863:11
+      |
+66863 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: field `asid` is never read
+     --> src/kernel/boot/tests.rs:69709:9
+      |
+69705 |     struct QueuedFixture {
+      |            ------------- field in this struct
+...
+69709 |         asid: crate::kernel::vm::Asid,
+      |         ^^^^
+
+warning: constant `CPU0` is never used
+     --> src/kernel/boot/tests.rs:70755:11
+      |
+70755 |     const CPU0: CpuId = CpuId(0);
+      |           ^^^^
+
+warning: constant `AUDIT_DOC` is never used
+     --> src/kernel/boot/tests.rs:75428:11
+      |
+75428 |     const AUDIT_DOC: &str = include_str!("../../../doc/IPC.md");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:75759:11
+      |
+75759 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:76476:11
+      |
+76476 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:76963:11
+      |
+76963 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:78503:11
+      |
+78503 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `ARCHES` is never used
+     --> src/kernel/boot/tests.rs:79397:11
+      |
+79397 |     const ARCHES: [&str; 3] = ["x86_64", "aarch64", "riscv64"];
+      |           ^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:80424:11
+      |
+80424 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:80745:11
+      |
+80745 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `SPLIT_SRC` is never used
+     --> src/kernel/boot/tests.rs:81223:11
+      |
+81223 |     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:82084:11
+      |
+82084 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: field `record_generation` is never read
+     --> src/kernel/boot/tests.rs:84633:9
+      |
+84627 |     struct Fx {
+      |            -- field in this struct
+...
+84633 |         record_generation: u64,
+      |         ^^^^^^^^^^^^^^^^^
+
+warning: field `published_ack` is never read
+     --> src/kernel/boot/tests.rs:86231:9
+      |
+86226 |     struct ServerFx {
+      |            -------- field in this struct
+...
+86231 |         published_ack: BlockedServerAck,
+      |         ^^^^^^^^^^^^^
+
+warning: field `endpoint_generation` is never read
+     --> src/kernel/boot/tests.rs:91101:9
+      |
+91092 |     struct SmpFx {
+      |            ----- field in this struct
+...
+91101 |         endpoint_generation: u64,
+      |         ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:92285:11
+      |
+92285 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+     --> src/kernel/boot/tests.rs:92558:11
+      |
+92558 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+      |           ^^^^^^^^^
+
+warning: constant `IPC_STATE_SRC` is never used
+      --> src/kernel/boot/tests.rs:100221:11
+       |
+100221 |     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+       |           ^^^^^^^^^^^^^
+
+warning: constant `RESTART_SRC` is never used
+      --> src/kernel/boot/tests.rs:100222:11
+       |
+100222 |     const RESTART_SRC: &str = include_str!("restart_state.rs");
+       |           ^^^^^^^^^^^
+
+warning: constant `RUNTIME_SRC` is never used
+      --> src/kernel/boot/tests.rs:100223:11
+       |
+100223 |     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+       |           ^^^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:100224:11
+       |
+100224 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `TXN_SRC` is never used
+      --> src/kernel/boot/tests.rs:100225:11
+       |
+100225 |     const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+       |           ^^^^^^^
+
+warning: constant `TASK_SRC` is never used
+      --> src/kernel/boot/tests.rs:100226:11
+       |
+100226 |     const TASK_SRC: &str = include_str!("../task.rs");
+       |           ^^^^^^^^
+
+warning: function `record_live` is never used
+      --> src/kernel/boot/tests.rs:100270:8
+       |
+100270 |     fn record_live(fx: &CallerFx) -> bool {
+       |        ^^^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:100811:11
+       |
+100811 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:101410:11
+       |
+101410 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:102067:11
+       |
+102067 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:102886:11
+       |
+102886 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `ABI_SRC` is never used
+      --> src/kernel/boot/tests.rs:103784:11
+       |
+103784 |     const ABI_SRC: &str = include_str!("../../../crates/yarm-ipc-abi/src/exit_current_task_abi.rs");
+       |           ^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:103790:11
+       |
+103790 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:105144:11
+       |
+105144 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:105294:15
+       |
+105294 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:108560:11
+       |
+108560 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:109484:11
+       |
+109484 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:109867:11
+       |
+109867 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:114424:15
+       |
+114424 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:114773:11
+       |
+114773 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:116579:11
+       |
+116579 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:118154:11
+       |
+118154 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: variant `Runtime` is never constructed
+      --> src/kernel/boot/tests.rs:118195:9
+       |
+118189 |     enum Scope {
+       |          ----- variant in this enum
+...
+118195 |         Runtime,
+       |         ^^^^^^^
+       |
+       = note: `Scope` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:119867:11
+       |
+119867 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:120187:11
+       |
+120187 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:120745:11
+       |
+120745 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:121163:11
+       |
+121163 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:121562:15
+       |
+121562 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:123226:11
+       |
+123226 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: function `extracted` is never used
+      --> src/kernel/boot/tests.rs:123781:8
+       |
+123781 |     fn extracted() -> alloc::vec::Vec<(String, String, usize)> {
+       |        ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:127895:11
+       |
+127895 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:128440:11
+       |
+128440 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:128953:11
+       |
+128953 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:129155:11
+       |
+129155 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:130063:11
+       |
+130063 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:131354:11
+       |
+131354 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:131809:11
+       |
+131809 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:132445:11
+       |
+132445 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:132676:11
+       |
+132676 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:135877:11
+       |
+135877 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:137567:11
+       |
+137567 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:139528:11
+       |
+139528 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:142168:11
+       |
+142168 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:142476:11
+       |
+142476 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:142747:11
+       |
+142747 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:143142:11
+       |
+143142 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:143748:11
+       |
+143748 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:144516:11
+       |
+144516 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:146213:11
+       |
+146213 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:147978:11
+       |
+147978 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:148581:15
+       |
+148581 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:148700:15
+       |
+148700 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:148808:15
+       |
+148808 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:149752:11
+       |
+149752 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:150259:11
+       |
+150259 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `RUNTIME` is never used
+      --> src/kernel/boot/tests.rs:150457:11
+       |
+150457 |     const RUNTIME: &str = include_str!("../../runtime.rs");
+       |           ^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:150458:11
+       |
+150458 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `TIMER` is never used
+      --> src/kernel/boot/tests.rs:150459:11
+       |
+150459 |     const TIMER: &str = include_str!("../scheduler_timer.rs");
+       |           ^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:151977:11
+       |
+151977 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:152289:11
+       |
+152289 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:152481:11
+       |
+152481 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:152704:11
+       |
+152704 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:152799:15
+       |
+152799 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `ENTRY_SRC` is never used
+      --> src/kernel/boot/tests.rs:152934:11
+       |
+152934 |     const ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+       |           ^^^^^^^^^
+
+warning: constant `RUNTIME_SRC` is never used
+      --> src/kernel/boot/tests.rs:152935:11
+       |
+152935 |     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+       |           ^^^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:152936:11
+       |
+152936 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:153200:11
+       |
+153200 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:153370:11
+       |
+153370 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:155133:11
+       |
+155133 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:156145:15
+       |
+156145 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:156823:15
+       |
+156823 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:156862:11
+       |
+156862 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:157101:11
+       |
+157101 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:157387:11
+       |
+157387 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:157633:11
+       |
+157633 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:157880:11
+       |
+157880 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:158130:11
+       |
+158130 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:159306:11
+       |
+159306 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:159521:11
+       |
+159521 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:159795:11
+       |
+159795 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:160812:15
+       |
+160812 |         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |               ^^^^^^^^^
+
+warning: constant `OWNER_SRC` is never used
+      --> src/kernel/boot/tests.rs:161167:11
+       |
+161167 |     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+       |           ^^^^^^^^^
+
+warning: constant `FORK_OWNERS` is never used
+      --> src/kernel/boot/tests.rs:166093:11
+       |
+166093 |     const FORK_OWNERS: &str = include_str!("fork_owners.rs");
+       |           ^^^^^^^^^^^
+
+warning: constant `X86_SMP` is never used
+      --> src/kernel/boot/tests.rs:170716:11
+       |
+170716 |     const X86_SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+       |           ^^^^^^^
+
+warning: constant `TRANSITION` is never used
+      --> src/kernel/boot/tests.rs:177776:11
+       |
+177776 |     const TRANSITION: &str = include_str!("../task_transition.rs");
+       |           ^^^^^^^^^^
+
+warning: constant `YIELD_TXN` is never used
+      --> src/kernel/boot/tests.rs:177777:11
+       |
+177777 |     const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+       |           ^^^^^^^^^
+
+warning: function `switched_continuation` is never used
+      --> src/kernel/boot/tests.rs:214825:12
+       |
+214825 |         fn switched_continuation(f: &TrapFrame) -> Ring3 {
+       |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_raw_cmdline_from_bytes_monotonic` is never used
+   --> src/kernel/boot_command_line.rs:695:8
+    |
+695 | pub fn set_raw_cmdline_from_bytes_monotonic(source: &[u8]) -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `boot_command_line` is never used
+   --> src/kernel/boot_command_line.rs:709:8
+    |
+709 | pub fn boot_command_line() -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: constant `NO_ENDPOINT` is never used
+   --> src/kernel/direct_ack_store.rs:180:7
+    |
+180 | const NO_ENDPOINT: usize = usize::MAX;
+    |       ^^^^^^^^^^^
+
+warning: method `is_anomaly` is never used
+   --> src/kernel/direct_ack_store.rs:389:19
+    |
+372 | impl AckRelease {
+    | --------------- method in this implementation
+...
+389 |     pub(crate) fn is_anomaly(self) -> bool {
+    |                   ^^^^^^^^^^
+
+warning: field `admission` is never read
+   --> src/kernel/direct_ack_store.rs:504:5
+    |
+491 | pub(crate) struct DirectAckStore {
+    |                   -------------- field in this struct
+...
+504 |     admission: AtomicBool,
+    |     ^^^^^^^^^
+    |
+    = note: `DirectAckStore` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `peek_recv_core_user_plain` is never used
+   --> src/kernel/recv_core.rs:766:15
+    |
+766 | pub(crate) fn peek_recv_core_user_plain(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `reserved_user_slots` is never used
+    --> src/kernel/scheduler.rs:1430:19
+     |
+1339 | impl CpuView<'_> {
+     | ---------------- method in this implementation
+...
+1430 |     pub(crate) fn reserved_user_slots(&self, priority: TaskPriority) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: function `transfer_cap_arg_value` is never used
+  --> src/kernel/syscall/ipc_abi.rs:58:15
+   |
+58 | pub(crate) fn transfer_cap_arg_value(frame: &TrapFrame) -> Option<CapId> {
+   |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `frame_reply_message_with_cap` is never used
+  --> src/kernel/syscall/ipc_abi.rs:68:15
+   |
+68 | pub(crate) fn frame_reply_message_with_cap(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `frame_call_request_message` is never used
+  --> src/kernel/syscall/ipc_abi.rs:91:15
+   |
+91 | pub(crate) fn frame_call_request_message(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `rollback_claim` is never used
+   --> src/kernel/syscall/exit_txn.rs:137:8
+    |
+ 86 | pub(crate) trait ExitOwners: ClearedCurrentOwners {
+    |                  ---------- method in this trait
+...
+137 |     fn rollback_claim(&mut self, claim: &ExitClaim) -> bool;
+    |        ^^^^^^^^^^^^^^
+
+warning: function `write_v3_output_to_user` is never used
+   --> src/kernel/syscall/recv_shared_v3.rs:144:4
+    |
+144 | fn write_v3_output_to_user(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `read_user` is never used
+  --> src/kernel/syscall/recv_v3_txn.rs:82:8
+   |
+77 | pub(crate) trait RecvV3Owners {
+   |                  ------------ method in this trait
+...
+82 |     fn read_user(&mut self, asid: Asid, ptr: usize, len: usize) -> Option<[u8; 80]>;
+   |        ^^^^^^^^^
+
+warning: field `asid` is never read
+   --> src/kernel/syscall/spawn_image_txn.rs:369:16
+    |
+364 | pub(crate) struct SpawnImageCommitted {
+    |                   ------------------- field in this struct
+...
+369 |     pub(crate) asid: Asid,
+    |                ^^^^
+
+warning: variant `NoAsid` is never constructed
+   --> src/kernel/syscall/xfer_txn.rs:140:5
+    |
+122 | pub(crate) enum XferRefusal {
+    |                 ----------- variant in this enum
+...
+140 |     NoAsid,
+    |     ^^^^^^
+    |
+    = note: `XferRefusal` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variant `TimerIdleQueueAdvance` is never constructed
+    --> src/kernel/syscall_split.rs:2285:5
+     |
+2206 | pub(crate) enum SplitDispatchDisposition {
+     |                 ------------------------ variant in this enum
+...
+2285 |     TimerIdleQueueAdvance,
+     |     ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `SplitDispatchDisposition` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `try_split_blocking_ipc_recv_into_frame` is never used
+    --> src/kernel/syscall_split.rs:4888:4
+     |
+4888 | fn try_split_blocking_ipc_recv_into_frame(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `marker` is never used
+   --> src/runtime.rs:840:19
+    |
+830 | impl CpuDispatch {
+    | ---------------- method in this implementation
+...
+840 |     pub(crate) fn marker(self) -> &'static str {
+    |                   ^^^^^^
+
+warning: method `marker` is never used
+    --> src/runtime.rs:1416:25
+     |
+1413 | impl OvertakenSettlement {
+     | ------------------------ method in this implementation
+...
+1416 |     pub(crate) const fn marker(self) -> &'static str {
+     |                         ^^^^^^
+
+warning: multiple methods are never used
+     --> src/runtime.rs:2970:19
+      |
+ 1576 | impl SharedKernel {
+      | ----------------- methods in this implementation
+...
+ 2970 |     pub(crate) fn continued_dispatch_mark_token_for_test(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3219 |     pub(crate) fn server_reply_link_for_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5197 |     pub(crate) fn direct_dispatch_current_agrees_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5367 |     pub(crate) fn direct_dispatch_take_completion_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5454 |     pub(crate) fn cancel_async_preempt_for_split(&self, tid: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9495 |     pub(crate) fn ipc_try_recv_queued_plain_endpoint_only_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9552 |     pub(crate) fn ipc_try_recv_queued_with_cap_transfer_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9588 |     pub(crate) fn peek_transfer_envelope_source_object_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+10555 |     pub(crate) fn memory_object_phys_by_id_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+13461 |     pub(crate) fn fault_or_supervisor_endpoint_split_read(&self, endpoint_idx: usize) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+13633 |     pub(crate) fn d6_live_kernel_stacks_split(&self, out: &mut [(u64, usize, usize)]) -> usize {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+14161 |     pub(crate) fn sr_update_mapped_prefix_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15947 |     pub(crate) fn reply_terminal_committed_winner_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15969 |     pub(crate) fn reply_record_caller_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15985 |     pub(crate) fn reply_record_endpoint_ref_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16999 |     pub(crate) fn take_preread_recv_timeout_deadline_split(&self, cpu: CpuId) -> Option<u64> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+17238 |     pub(crate) fn smp_blocked_server_task_facts_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused `AckReservation` that must be used
+     --> src/kernel/boot/tests.rs:90312:13
+      |
+90312 | /             store
+90313 | |                 .reserve(AckEndpoint::new(i, 1), AckWaiter::new(1000 + i as u64, 1))
+90314 | |                 .unwrap_or_else(|e| panic!("endpoint {i} must always have a slot ({e:?})"));
+      | |___________________________________________________________________________________________^
+      |
+      = note: a reservation must be committed or cancelled, or the slot leaks
+      = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: if you wish to disregard this recommendation, use `let _ = ...` to ignore the value
+      |
+90312 |             let _ = store
+      |             +++++++
+
+warning: unused `AckReservation` that must be used
+     --> src/kernel/boot/tests.rs:90991:17
+      |
+90991 | /                 store
+90992 | |                     .reserve(ep(t, 1), waiter(t as u64, 1))
+90993 | |                     .expect("full capacity restored after rollback");
+      | |____________________________________________________________________^
+      |
+      = note: a reservation must be committed or cancelled, or the slot leaks
+help: if you wish to disregard this recommendation, use `let _ = ...` to ignore the value
+      |
+90991 |                 let _ = store
+      |                 +++++++
+
+warning: unused `AckReservation` that must be used
+    --> src/kernel/direct_ack_store.rs:1587:9
+     |
+1587 |         s.reserve(e2, waiter(13, 1)).expect("spent slot reused");
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: a reservation must be committed or cancelled, or the slot leaks
+help: if you wish to disregard this recommendation, use `let _ = ...` to ignore the value
+     |
+1587 |         let _ = s.reserve(e2, waiter(13, 1)).expect("spent slot reused");
+     |         +++++++
+
+warning: `yarm` (lib test) generated 393 warnings (run `cargo fix --lib -p yarm --tests` to apply 103 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-target/debug/build/yarm/26ee070b0a27ee82/out/yarm-26ee070b0a27ee82)
+
+running 423 tests
+test kernel::boot::tests::ap_sched1::an_undelivered_recv_v2_waiter_is_woken_with_would_block ... ok
+test kernel::boot::tests::endpoint_only_plain_recv_dequeues_without_scheduler_mutation ... ok
+test kernel::boot::tests::endpoint_only_plain_recv_rejects_complex_sender_waiter_message ... ok
+test kernel::boot::tests::endpoint_only_plain_recv_rejects_transfer_and_reply_messages_without_dequeue ... ok
+test kernel::boot::tests::endpoint_only_plain_recv_two_phase_refills_plain_sender_waiter ... ok
+test kernel::boot::tests::exit_before_ipc_recv_timeout_clears_waiter_and_deadline ... ok
+test kernel::boot::tests::ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver ... ok
+test kernel::boot::tests::ipc_recv_deadline_timeout_wakes_blocked_waiter_on_timer_tick ... ok
+test kernel::boot::tests::ipc_recv_syscall_sender_waiter_fallback_preserves_refill_and_wake ... ok
+test kernel::boot::tests::ipc_recv_syscall_split_two_phase_refills_plain_sender_waiter ... ok
+test kernel::boot::tests::ipc_recv_syscall_transfer_message_falls_back_to_full_path ... ok
+test kernel::boot::tests::ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation ... ok
+test kernel::boot::tests::ipc_recv_timeout_syscall_nonzero_timeout_uses_split_when_message_queued ... ok
+test kernel::boot::tests::ipc_recv_timeout_try_recv_uses_split_path ... ok
+test kernel::boot::tests::ipc_recv_until_deadline_timeout_wakes_blocked_waiter_on_timer_tick ... ok
+test kernel::boot::tests::ipc_recv_until_deadline_with_queued_message_succeeds_immediately ... ok
+test kernel::boot::tests::ipc_recv_with_deadline_split_bridge_returns_none_when_no_sender ... ok
+test kernel::boot::tests::ipc_recv_with_deadline_split_bridge_zero_ticks_returns_none ... ok
+test kernel::boot::tests::ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter ... ok
+test kernel::boot::tests::ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake ... ok
+test kernel::boot::tests::ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue ... ok
+test kernel::boot::tests::ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requester ... ok
+test kernel::boot::tests::ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiver ... ok
+test kernel::boot::tests::ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver ... ok
+test kernel::boot::tests::kernel_fault_report_completes_blocked_supervisor_recv_v2_without_stranding_queue ... ok
+test kernel::boot::tests::qb1_recv_deadline_staging::the_deadline_is_staged_before_the_split_dispatch_and_only_there ... ok
+test kernel::boot::tests::recv_on_empty_endpoint_blocks_then_send_wakes ... ok
+test kernel::boot::tests::recv_timeout_process_clears_endpoint_waiter_and_deadline ... ok
+test kernel::boot::tests::recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once ... ok
+test kernel::boot::tests::recv_v2_materializes_reply_cap_once_per_message ... ok
+test kernel::boot::tests::repeated_recv_block_timeout_delivery_no_stale_timeout ... ok
+test kernel::boot::tests::repeated_recv_timeout_cycles_no_stale_receiver_waiter ... ok
+test kernel::boot::tests::riscv64_async_preemption::a_never_consumed_recv_record_is_not_a_competing_continuation ... ok
+test kernel::boot::tests::riscv64_s_mode_timer_bridge::the_d2_recv_idle_outcome_publishes_return_provenance ... ok
+test kernel::boot::tests::split_recv_timeout_deadline_slot_is_consumed_exactly_once ... ok
+test kernel::boot::tests::stage114_d3_vm_brk_shrink_live::stage114_d2_recv_block_remains_outcome_b_with_documented_reason ... ok
+test kernel::boot::tests::stage115_d2_d6_seam_analysis::stage115_d2_blocking_recv_orchestrator_still_calls_with_cpu ... ok
+test kernel::boot::tests::stage147_ipc_boundary_audit::stage147_complete_blocked_recv_stays_in_syscall ... ok
+test kernel::boot::tests::stage147_ipc_boundary_audit::stage147_recv_meta_len_constant_in_syscall_rs ... ok
+test kernel::boot::tests::stage148_decomposition_map::stage148_split_recv_seam_in_syscall_rs ... ok
+test kernel::boot::tests::stage151_ipc_abi_boundary_audit::stage151_no_complete_blocked_recv_in_ipc_abi ... ok
+test kernel::boot::tests::stage151_ipc_abi_boundary_audit::stage151_recv_meta_len_stays_in_syscall_rs ... ok
+test kernel::boot::tests::stage152_syscall_decomposition_completeness_audit::stage152_ipc_imports_split_recv_from_super ... ok
+test kernel::boot::tests::stage152_syscall_decomposition_completeness_audit::stage152_recv_meta_len_not_duplicated ... ok
+test kernel::boot::tests::stage153_ipc_cap_boundary_audit::stage153_complete_blocked_recv_is_pub_crate ... ok
+test kernel::boot::tests::stage153_ipc_cap_boundary_audit::stage153_ipc_recv_core_stays_pure_helper_only ... ok
+test kernel::boot::tests::stage153_ipc_cap_boundary_audit::stage153_recv_meta_len_owned_by_syscall_rs ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_counts_unchanged ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_d6_cr3_pf_markers_remain ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_dispatch_stays_in_syscall_rs ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_ipc_module_remains_stateful_owner ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_module_documents_orderings ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_module_does_not_define_dispatch ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_module_exists_and_declared ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_recv_core_and_ipc_abi_remain_pure ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_recv_meta_len_single_definition ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_stage153_ordering_note_remains ... ok
+test kernel::boot::tests::stage154_ipc_recv_core_boundary::stage154_stateful_seams_still_pinned_in_syscall_rs ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_blocked_waiter_uses_helper ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_counts_unchanged ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_d6_cr3_pf_markers_remain ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_dispatch_ownership_unchanged ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_ipc_immediate_path_uses_helper ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_no_duplicate_inline_encoder ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_no_rpi5_boot_coupling_in_codec ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_prior_ordering_notes_remain ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_pure_modules_stay_pure ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_recv_core_path_uses_helper ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_recv_meta_len_single_definition ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_single_encoder_exists ... ok
+test kernel::boot::tests::stage155_recv_v2_codec_convergence::stage155_stateful_seams_still_pinned ... ok
+test kernel::boot::tests::stage156_ipc_smoke_oracle::stage156_ipc_recv_core_still_pure ... ok
+test kernel::boot::tests::stage156_ipc_smoke_oracle::stage156_recv_meta_len_single_definition ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_arch_boots_gated_uniformly ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_counts_unchanged ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_no_kernel_user_mmu_or_bootstrap_harness ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_no_new_service_binary ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_no_stateful_seam_moved ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_oracle_acceptance_is_arch_aware ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_oracle_modes ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_proof_env_implies_boot_knob ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_sender_wake_not_faked_by_base_workload ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_sequence_markers_are_conditional ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_target_markers_are_kernel_emitted ... ok
+test kernel::boot::tests::stage159bcd_ipc_recv_proof_workload::stage159bcd_workload_is_default_off ... ok
+test kernel::boot::tests::stage160_aarch64_split_recv_routing::stage160_both_arches_share_trap_dispatch_hook ... ok
+test kernel::boot::tests::stage160_aarch64_split_recv_routing::stage160_fallback_diagnostics_exist ... ok
+test kernel::boot::tests::stage160_aarch64_split_recv_routing::stage160_no_rpi5_coupling_counts_unchanged ... ok
+test kernel::boot::tests::stage160_aarch64_split_recv_routing::stage160_no_stateful_seam_moved ... ok
+test kernel::boot::tests::stage160_aarch64_split_recv_routing::stage160_split_recv_binds_current_cpu ... ok
+test kernel::boot::tests::stage160b_aarch64_recv_split_dispatch_audit::stage160b_counts_unchanged ... ok
+test kernel::boot::tests::stage160b_aarch64_recv_split_dispatch_audit::stage160b_diagnostics_gated_by_proof_knob ... ok
+test kernel::boot::tests::stage160b_aarch64_recv_split_dispatch_audit::stage160b_no_seam_moved_and_abi_helpers_intact ... ok
+test kernel::boot::tests::stage160b_aarch64_recv_split_dispatch_audit::stage160b_routing_diagnostics_exist ... ok
+test kernel::boot::tests::stage163l_nonx86_fork_return::stage163l_child_park_uses_blocking_ipc_recv ... ok
+test kernel::boot::tests::stage163m_sender_wake_completion::stage163m_e2_wait_uses_blocking_recv ... ok
+test kernel::boot::tests::stage163n_sender_wake_fix::stage163n_e2_uses_polling_loop_not_blocking_recv ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_counts_unchanged ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_d2_recv_explicit_phases ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_d2_recv_genuine_default_off_x86_only ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_d2_send_untouched ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_d6_genuine_default_off ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_d6_mut_markers_present ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_in_lock_skipped_only_when_eligible_else_fallback ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_mut_dispatch_is_x86_64_only ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_mut_dispatch_out_of_lock_call_site ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_no_d3_d5_livewire ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_no_double_advance_guarantee ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_sender_wake_oracle_unchanged ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_smoke_supports_both_knobs ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_stage167_accepted_recorded ... ok
+test kernel::boot::tests::stage168_d6_genuine_b_and_d2_recv::stage168_switch_proof_and_switch_a_untouched ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_blocking_recv_defers_dispatch_out_of_lock ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_d2_send_untouched ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_deferral_is_admitted_on_all_three_architectures ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_docs_updated ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_no_d3_d5_livewire ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_no_inlock_dispatch_for_accepted_recv ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_regressions_and_counts ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_reuses_hardened_switch_restore ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_reverify_and_queue_advancing ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_rollback_preserved ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_script_mode_isolation ... ok
+test kernel::boot::tests::stage168b_d2_recv_genuine_completion::stage168b_smoke_requires_out_of_lock_recv_dispatch ... ok
+test kernel::boot::tests::stage169_d2_send_genuine::stage169_d2_recv_untouched ... ok
+test kernel::boot::tests::stage186d4_ordinary_cap_transfer_live_wiring_hard_stop::stage186d4_seam_not_wired_into_live_recv ... ok
+test kernel::boot::tests::stage187a_ipc_recv_delivery_boundary_split::stage187a_boundary_executors_use_copy_seam_without_ipc ... ok
+test kernel::boot::tests::stage187a_ipc_recv_delivery_boundary_split::stage187a_docs_do_not_overclaim ... ok
+test kernel::boot::tests::stage187a_ipc_recv_delivery_boundary_split::stage187a_kernel_receiver_completes_in_phase_a ... ok
+test kernel::boot::tests::stage187a_ipc_recv_delivery_boundary_split::stage187a_no_forbidden_markers ... ok
+test kernel::boot::tests::stage187a_ipc_recv_delivery_boundary_split::stage187a_no_seam_call_inside_with_cpu_closure ... ok
+test kernel::boot::tests::stage187a_ipc_recv_delivery_boundary_split::stage187a_snapshot_is_by_value_no_sender_authority ... ok
+test kernel::boot::tests::stage187a_ipc_recv_delivery_boundary_split::stage187a_user_recv_delivers_via_boundary_and_is_one_shot ... ok
+test kernel::boot::tests::stage187a_ipc_recv_delivery_boundary_split::stage187a_user_recv_undersized_buffer_real_error ... ok
+test kernel::boot::tests::stage187a_ipc_recv_delivery_boundary_split::stage187a_wake_before_writeback_and_reply_arm_legacy ... ok
+test kernel::boot::tests::stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary::stage187b_boundary_method_no_ipc_lock ... ok
+test kernel::boot::tests::stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary::stage187b_docs_do_not_overclaim ... ok
+test kernel::boot::tests::stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary::stage187b_materialize_before_wake_before_writeback ... ok
+test kernel::boot::tests::stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary::stage187b_phase_a_helper_consumes_only_no_mint ... ok
+test kernel::boot::tests::stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary::stage187b_queued_endpoint_cap_transfer_uses_boundary_seam ... ok
+test kernel::boot::tests::stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary::stage187b_queued_mem_cap_transfer_uses_boundary_seam ... ok
+test kernel::boot::tests::stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary::stage187b_reply_and_shared_excluded_from_ordinary_path ... ok
+test kernel::boot::tests::stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary::stage187b_seam_materialize_only_post_boundary ... ok
+test kernel::boot::tests::stage193e_ipc_send_plain_enqueue::enqueue_oracle_is_plain_send_then_recv ... ok
+test kernel::boot::tests::stage193f_ipc_send_cap_enqueue::cap_enqueue_oracle_is_cap_send_then_recv_fresh ... ok
+test kernel::boot::tests::stage193f_ipc_send_cap_enqueue::recv_v2_writeback_encodes_materialized_cap ... ok
+test kernel::boot::tests::stage193g_remaining_shapes_audit::reply_cap_recv_classification_is_flag_based ... ok
+test kernel::boot::tests::stage193g_remaining_shapes_audit::shared_region_recv_is_vm_mapping_coupled ... ok
+test kernel::boot::tests::stage198a_second_cohort_plain_parity::riscv_blocked_recv_idle_requires_typed_provenance ... ok
+test kernel::boot::tests::stage198c2b_reply_cap_one_shot_wiring::boot_slot17_reply_recv_all_arches ... ok
+test kernel::boot::tests::stage198e3c1_direct_live_policy::pre_recv_signal_is_not_blocked_proof ... ok
+test kernel::boot::tests::stage198e3c1_direct_live_policy::userspace_recv_helper_encoding ... ok
+test kernel::boot::tests::stage199a2b2f_wiring::ack_published_from_recv_commit ... ok
+test kernel::boot::tests::stage199a2b3_wiring::caller_ack_published_from_recv_commit ... ok
+test kernel::boot::tests::stage199a2d2c2b1_guards::recv_v2_server_declines_saved_frame_resume ... ok
+test kernel::boot::tests::stage199a2d2c2b1_guards::recv_v2_server_marker_string_is_canonical ... ok
+test kernel::boot::tests::stage199a2d2c2b1_guards::recv_v2_server_stub_issues_real_recv_v2_syscall ... ok
+test kernel::boot::tests::stage199a2d2c2b1_guards::server_recv_cap_minted_into_own_cnode ... ok
+test kernel::boot::tests::stage199a2d2c2b2_guards::recv_v2_result_completed_before_runnable ... ok
+test kernel::boot::tests::stage199a2d2c2b3_guards::recv_result_not_overwritten_by_fresh_entry ... ok
+test kernel::boot::tests::stage199a2d2c2b_guards::request_seal_requires_live_recv_v2_and_prior_seals_intact ... ok
+test kernel::boot::tests::stage199a2d2c2c_reply_guards::client_stub_recv_v2_and_markers ... ok
+test kernel::boot::tests::stage199d_delivery_projection_differential::oracle_server_uses_the_production_recv_contract ... ok
+test kernel::boot::tests::stage199d_riscv_production_readiness_audit::the_current_clear_that_owes_dispatch_is_on_the_recv_path_and_is_aarch64_only ... ok
+test kernel::boot::tests::stage199d_wa3a_transition_barriers::u9recvblock2b_selection_refuses_a_task_the_apply_would_fatally_refuse ... ok
+test kernel::boot::tests::stage199d_wa3a_transition_barriers::u9recvblock2b_selection_skips_the_unresumable_head_and_serves_the_peer ... ok
+test kernel::boot::tests::stage200b_deadline_races::race_11_stale_fire_after_blocked_recv_generation_replacement ... ok
+test kernel::boot::tests::stage200c_reply_timeout_transaction::c01_arm_on_committed_recv_v2 ... ok
+test kernel::boot::tests::stage200c_reply_timeout_transaction::c03_ordinary_recv_timeout_unchanged ... ok
+test kernel::boot::tests::stage200c_reply_timeout_transaction::c16_blocked_recv_generation_replacement ... ok
+test kernel::boot::tests::stage21_signal_before_wait_leaves_pending_for_later_recv ... ok
+test kernel::boot::tests::stage23_stale_notification_cap_after_revoke_cannot_signal_or_recv ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_nr8_split_still_works ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_blocking_flag_falls_back ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_cap_transfer_flag_falls_back ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_dequeues_exactly_one_message ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_empty_queue_falls_back ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_invalid_cap_matches_dispatch_error ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_invalid_endpoint_cap_error ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_live_wired_kernel_task_stage32b ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_no_waiter_leak ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_non_ipc_syscalls_rejected ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_queued_plain_succeeds ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_return_lanes_match_old_path ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_sharedkernel_wrapper_succeeds ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_split_recv_task_switched_false ... ok
+test kernel::boot::tests::stage31_split_recv_tests::stage31_syscall_count_still_30 ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32_cap_resolution_missing_recv_right_error ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32_cap_resolution_valid_endpoint_recv_right ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32_integrated_queued_recv_valid_cap_succeeds ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32_integrated_recv_v2_fallback ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32b_ipc_recv_empty_queue_still_fallback ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32b_ipc_recv_invalid_cap_matches_old_path_error ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32b_ipc_recv_live_kernel_task_queued_plain ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32b_ipc_recv_live_wired_into_seam_kernel_task ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32b_ipc_recv_timeout_nr_not_split_eligible ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32b_ipc_recv_user_asid_still_fallback ... ok
+test kernel::boot::tests::stage32_cap_resolution_tests::stage32b_ipc_recv_v2_fallback ... ok
+test kernel::boot::tests::stage33_34::stage33_canonical_core_fallback_for_recv_v2 ... ok
+test kernel::boot::tests::stage33_34::stage33_copy_failure_user_asid_recv_falls_back_not_dequeues ... ok
+test kernel::boot::tests::stage33_34::stage33_kernel_task_queued_plain_recv_through_canonical_core ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_core_metadata_v2_min_len_constant ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v2_adapter_meta_target_populated ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v2_adapter_small_meta_len_yields_no_meta ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v2_full_path_still_fallback_via_seam ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v3_future_adapter_is_helper_only ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v3_no_syscall_added ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v3_output_record_version_checked ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v3_request_parses_read_only_intent ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v3_request_parses_read_write_intent ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v3_request_rejects_map_intent_without_metadata_buffer ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v3_request_rejects_nonzero_reserved ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v3_request_rejects_short_record ... ok
+test kernel::boot::tests::stage33_34::stage33_recv_v3_request_validates_version ... ok
+test kernel::boot::tests::stage33_34::stage33_timeout_adapter_nonzero_ticks_is_timed_recv ... ok
+test kernel::boot::tests::stage35::stage35_ipc_recv_adapter_kernel_task_has_register_target ... ok
+test kernel::boot::tests::stage35::stage35_ipc_recv_adapter_no_meta_when_len_too_small ... ok
+test kernel::boot::tests::stage35::stage35_ipc_recv_adapter_no_meta_when_ptr_zero ... ok
+test kernel::boot::tests::stage35::stage35_ipc_recv_adapter_user_asid_has_user_memory_target ... ok
+test kernel::boot::tests::stage35::stage35_ipc_recv_adapter_v2_meta_detected_when_len_sufficient ... ok
+test kernel::boot::tests::stage35::stage35_ipc_recv_timeout_nonblocking_adapter_shape ... ok
+test kernel::boot::tests::stage35::stage35_ipc_recv_timeout_zero_ticks_empty_queue_returns_none ... ok
+test kernel::boot::tests::stage35::stage35_recv_v3_still_helper_only ... ok
+test kernel::boot::tests::stage36::stage36_mapped_recv_still_falls_back ... ok
+test kernel::boot::tests::stage36::stage36_plan_user_asid_mapped_recv_falls_back_copy_semantics ... ok
+test kernel::boot::tests::stage36::stage36_recv_v2_still_falls_back ... ok
+test kernel::boot::tests::stage36::stage36_recv_v3_still_helper_only ... ok
+test kernel::boot::tests::stage36::stage36_try_recv_core_user_plain_empty_queue_is_would_block ... ok
+test kernel::boot::tests::stage37::stage37_mapped_recv_still_falls_back ... ok
+test kernel::boot::tests::stage37::stage37_recv_v3_still_helper_only ... ok
+test kernel::boot::tests::stage37::stage37_try_recv_core_user_plain_v2_delivers_message ... ok
+test kernel::boot::tests::stage37::stage37_try_recv_core_user_plain_v2_empty_queue_is_would_block ... ok
+test kernel::boot::tests::stage38::stage38_plan_user_asid_mapped_recv_still_falls_back_copy_semantics ... ok
+test kernel::boot::tests::stage38::stage38_recv_shared_v3_remains_helper_only ... ok
+test kernel::boot::tests::stage38::stage38_try_recv_core_kernel_plain_sender_waiter_returns_delivered_with_wake ... ok
+test kernel::boot::tests::stage38::stage38_try_recv_core_user_plain_sender_waiter_returns_delivered_with_wake ... ok
+test kernel::boot::tests::stage42::stage42_recv_shared_v3_decodes_from_30 ... ok
+test kernel::boot::tests::stage42::stage42_recv_shared_v3_nr_is_30 ... ok
+test kernel::boot::tests::stage44::stage44_ipc_recv_nr2_still_dispatches ... ok
+test kernel::boot::tests::stage44::stage44_syscall_nr30_is_recv_shared_v3 ... ok
+test kernel::boot::tests::stage4s_ipc_recv_endpoint_take_direct_delivery_from_sender_waiter ... ok
+test kernel::boot::tests::stage4s_ipc_recv_endpoint_take_empty_queue_no_waiter_returns_none ... ok
+test kernel::boot::tests::stage4s_ipc_recv_endpoint_take_queued_message_no_waiter ... ok
+test kernel::boot::tests::stage4s_ipc_recv_endpoint_take_refill_from_sender_waiter ... ok
+test kernel::boot::tests::stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically ... ok
+test kernel::boot::tests::stage4s_try_ipc_recv_delegates_to_endpoint_take ... ok
+test kernel::boot::tests::stage4t_ipc_recv_handles_sparse_sender_waiter_queue ... ok
+test kernel::boot::tests::stage52::stage52_recv_writes_exactly_88_bytes_for_dma_region ... ok
+test kernel::boot::tests::stage52::stage52_recv_writes_exactly_88_bytes_for_plain_message ... ok
+test kernel::boot::tests::stage59::stage59_legacy_ipc_recv_unaffected_by_mapping ... ok
+test kernel::boot::tests::stage60::stage60_legacy_ipc_recv_unaffected ... ok
+test kernel::boot::tests::stage61_62::stage61_legacy_ipc_recv_unaffected ... ok
+test kernel::boot::tests::stage63::stage63_plain_recv_cleanup_token_zero ... ok
+test kernel::boot::tests::stage63::stage63_plain_recv_from_output_via_abi_struct ... ok
+test kernel::boot::tests::stage63::stage63_plain_recv_mapped_base_zero ... ok
+test kernel::boot::tests::stage63::stage63_plain_recv_no_active_mapping_registered ... ok
+test kernel::boot::tests::stage63::stage63_plain_recv_result_status_ok ... ok
+test kernel::boot::tests::stage63::stage63_plain_recv_transferred_cap_present ... ok
+test kernel::boot::tests::stage71::stage71_mark_task_dead_cleans_active_recv_v3_mapping ... ok
+test kernel::boot::tests::staged_deadline_cleared_on_try_recv_dispatch ... ok
+test kernel::boot::tests::staged_deadline_consumed_by_recv_timeout_dispatch ... ok
+test kernel::boot::tests::sync_endpoint_phase4_helper_skips_enqueue_when_recv_v2_completed ... ok
+test kernel::boot::tests::syscall_recv_can_copy_to_user_memory_when_task_has_asid ... ok
+test kernel::boot::tests::syscall_recv_reports_page_fault_on_unwritable_user_buffer ... ok
+test kernel::boot::tests::syscall_trap_dispatches_ipc_send_recv ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::a_valid_idle_cpu_succeeds_without_any_current_tid ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::an_offline_cpu_refuses_and_mutates_nothing ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::an_out_of_range_cpu_refuses_and_mutates_nothing ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::binds_current_cpu_on_success ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::both_target_acquisitions_are_gone_and_only_the_rollback_re_entry_remains ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::differential_against_the_retired_broad_record_body ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::no_ownership_primitive_gained_a_production_caller ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::no_task_status_runqueue_or_current_task_changes ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::records_a_write_fault_at_the_exact_address_and_sets_page_fault ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::the_dependency_blocked_and_deferred_acquisitions_all_remain ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::the_plain_production_entry_reaches_copy_fault_and_returns_ok ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::the_promoted_binding_transaction_is_architecture_neutral_and_unduplicated ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::the_recv_v2_meta_fault_arm_is_untouched_and_still_errs ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::the_recv_v2_production_entry_reaches_payload_copy_fault_after_meta_success ... ok
+test kernel::boot::tests::u3_recv_copy_fault_completion::the_transaction_is_rank_ordered_and_takes_each_domain_once ... ok
+test kernel::boot::tests::u9_recv_block1_closure::no_publication_yield_survives ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_blocking_lane_reads_the_queue_no_second_time ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_blocking_lane_takes_the_settled_facts_as_parameters ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_bridge_captures_before_it_publishes ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_deep_divergence_helper_and_its_adapter_are_gone ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_family_entry_declines_only_a_non_receive ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_immediate_outcome_adapter_is_test_only ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_legacy_nr2_shape_parks_with_no_record_exactly_as_the_broad_arm_does ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_outcomes_separate_the_three_questions_a_settlement_asks ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_production_family_has_no_empty_answer_substitute ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_recognized_body_settles_both_admission_escapes ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_recv_family_cannot_construct_an_unserved_shape ... ok
+test kernel::boot::tests::u9_recv_block1_closure::the_unsettled_receive_is_reported_not_landed ... ok
+test kernel::boot::tests::u9_recv_final_boot_chain::neither_driver_opens_a_broad_acquisition ... ok
+test kernel::boot::tests::u9_recv_final_boot_chain::the_bootstrap_driver_uses_the_cnode_the_mint_actually_targets ... ok
+test kernel::boot::tests::u9_recv_final_boot_chain::the_graduated_proof_runs_from_bootstrap_on_every_port ... ok
+test kernel::boot::tests::u9_recv_final_boot_chain::the_two_drivers_share_one_latch_and_one_body ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::a_queued_message_is_delivered_and_consumed_exactly_once ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::a_racing_consumer_never_turns_a_finite_receive_into_would_block ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::a_ready_message_takes_the_immediate_engine_under_a_finite_timeout ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::an_empty_probe_answers_would_block_on_both_paths ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::an_empty_probe_publishes_nothing ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::an_empty_timed_receive_is_declined_rather_than_answered_would_block ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::an_invalid_capability_is_answered_with_the_canonical_error ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::arg_three_is_a_timeout_here_and_not_a_metadata_pointer ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::the_delivered_frame_matches_the_canonical_handlers ... ok
+test kernel::boot::tests::u9_recv_final_probe_parity::the_lane_reuses_the_shared_engine_through_nr5s_own_builder ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::a_cap_bearing_refill_is_queued_unchanged_rather_than_declining_the_receive ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::a_drained_endpoint_does_not_redeliver ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::a_later_page_map_failure_rolls_back_the_installed_prefix ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::a_multi_page_region_is_released_then_reclaimed_after_its_last_reference ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::a_null_shared_region_base_is_refused_identically ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::a_queued_shared_region_transfer_matches_the_canonical_handler ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::a_reply_cap_flagged_refill_is_also_queued_unchanged ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::a_shared_region_transfer_is_delivered_exactly_once ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::a_sparse_waiter_queue_is_served_and_the_first_live_waiter_is_taken ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::an_all_expired_waiter_queue_reads_as_empty ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::an_interior_gap_is_fully_compacted ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::an_unaligned_shared_region_base_is_refused_identically ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::an_undersized_shared_region_buffer_is_refused_and_compensated ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::both_queued_mapping_loops_resolve_each_page_through_the_offset_aware_owner ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::every_page_of_a_multi_page_region_is_backed_by_its_own_frame ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::the_forbidden_queued_reply_shape_is_refused_with_the_canonical_cleanup ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::the_region_is_mapped_and_registered_on_both_routes ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::the_reported_region_length_comes_from_the_senders_descriptor ... ok
+test kernel::boot::tests::u9_recv_queue1_parity::the_shared_region_page_owner_refuses_everything_outside_the_window ... ok
+test kernel::boot::tests::u9pf1_not_running::the_recv_restoration_precedent_requires_a_running_commit ... ok
+test kernel::boot::tests::u9rx3_route::aarch64_imports_the_recv_abi_now_that_the_writeback_is_repaired ... ok
+test kernel::boot::tests::u9rx3_route::the_route_reuses_the_existing_blocking_recv_deferral_only ... ok
+test kernel::boot::tests::u9rx_blocked_recv::arm_a_fault_waiter_delivery_reuses_the_receive_producer ... ok
+test kernel::boot::tests::u9rx_blocked_recv::completion_and_wake_have_one_owner ... ok
+test kernel::boot::tests::u9rx_blocked_recv::failure_rolls_the_cap_back_off_lock ... ok
+test kernel::boot::tests::u9rx_blocked_recv::the_blocked_waiter_twin_exists_in_four_classes ... ok
+test kernel::boot::tests::u9rx_blocked_recv::the_broad_form_is_untouched_and_not_called_off_lock ... ok
+test kernel::boot::tests::u9rx_blocked_recv::the_user_copy_is_lock_free ... ok
+test kernel::boot::tests::u9rx_blocked_recv::u9rx_introduced_no_new_surface ... ok
+test kernel::boot_command_line::tests::ipc_recv_proof_knob_parses_and_defaults_off ... ok
+test kernel::boot_command_line::tests::ipc_recv_proof_sender_wake_subknob_parses_and_defaults_off ... ok
+test kernel::recv_core::tests::plan_recv_core_legacy_mapped_recv_falls_back_user_asid ... ok
+test kernel::recv_core::tests::plan_recv_core_timed_recv_kernel_task_eligible ... ok
+test kernel::recv_core::tests::recv_core_legacy_adapter_kernel_task_sets_register_target ... ok
+test kernel::recv_core::tests::recv_core_legacy_adapter_no_v2_meta_when_len_too_small ... ok
+test kernel::recv_core::tests::recv_core_legacy_adapter_no_v2_meta_when_ptr_zero ... ok
+test kernel::recv_core::tests::recv_core_legacy_adapter_user_asid_sets_user_memory_target ... ok
+test kernel::recv_core::tests::recv_core_legacy_adapter_v2_meta_detected_when_ptr_and_len_valid ... ok
+test kernel::recv_core::tests::recv_core_plan_kernel_task_no_meta_is_eligible ... ok
+test kernel::recv_core::tests::recv_core_plan_kernel_task_with_v2_meta_falls_back ... ok
+test kernel::recv_core::tests::recv_core_plan_recv_v2_returns_fallback_meta_copy ... ok
+test kernel::recv_core::tests::recv_core_plan_user_asid_plain_is_eligible ... ok
+test kernel::recv_core::tests::recv_core_plan_v3_future_meta_still_falls_back ... ok
+test kernel::recv_core::tests::recv_core_recv_v2_adapter_meta_target_populated ... ok
+test kernel::recv_core::tests::recv_core_recv_v2_adapter_small_meta_len_yields_no_meta ... ok
+test kernel::recv_core::tests::recv_core_timeout_adapter_nonzero_ticks_is_timed_recv ... ok
+test kernel::recv_core::tests::recv_core_timeout_adapter_nonzero_ticks_without_preread_uses_max ... ok
+test kernel::recv_core::tests::recv_core_timeout_adapter_zero_ticks_is_nonblocking_probe ... ok
+test kernel::recv_core::tests::recv_shared_v3_accepts_read_only_map_intent ... ok
+test kernel::recv_core::tests::recv_shared_v3_accepts_read_write_map_intent ... ok
+test kernel::recv_core::tests::recv_shared_v3_future_adapter_helper_only_falls_back ... ok
+test kernel::recv_core::tests::recv_shared_v3_future_adapter_nowait ... ok
+test kernel::recv_core::tests::recv_shared_v3_future_adapter_wait_forever ... ok
+test kernel::recv_core::tests::recv_shared_v3_output_record_rejects_bad_version ... ok
+test kernel::recv_core::tests::recv_shared_v3_output_record_rejects_short_len ... ok
+test kernel::recv_core::tests::recv_shared_v3_output_record_valid_passes ... ok
+test kernel::recv_core::tests::recv_shared_v3_rejects_bad_version ... ok
+test kernel::recv_core::tests::recv_shared_v3_rejects_map_intent_without_metadata_buffer ... ok
+test kernel::recv_core::tests::recv_shared_v3_rejects_nonzero_flags ... ok
+test kernel::recv_core::tests::recv_shared_v3_rejects_nonzero_reserved ... ok
+test kernel::recv_core::tests::recv_shared_v3_rejects_short_record ... ok
+test kernel::recv_core::tests::recv_shared_v3_rejects_unknown_map_intent_bits ... ok
+test kernel::recv_core::tests::recv_shared_v3_rejects_version_zero ... ok
+test kernel::recv_core::tests::recv_shared_v3_rejects_zero_record_len ... ok
+test kernel::recv_core::tests::recv_shared_v3_valid_request_passes ... ok
+test kernel::recv_waiter_split::tests::stage105_d2_publish_invalid_endpoint_index ... ok
+test kernel::recv_waiter_split::tests::stage105_d2_publish_on_empty_waiter_slot_lands ... ok
+test kernel::recv_waiter_split::tests::stage105_d2_publish_when_another_waiter_present_returns_already_waiting ... ok
+test kernel::recv_waiter_split::tests::stage105_d2_publish_when_queue_nonempty_signals_dequeue_now ... ok
+test kernel::recv_waiter_split::tests::stage106_d2_blocked_recv_publishes_waiter_and_counts_telemetry ... ok
+test kernel::recv_waiter_split::tests::stage106_d2_live_wire_call_site_present ... ok
+test kernel::recv_waiter_split::tests::stage106_d2_no_lost_wakeup_unwind_sequence_drains_message ... ok
+test kernel::recv_waiter_split::tests::stage106_d2_sender_after_waiter_delivers_and_wakes ... ok
+test kernel::recv_waiter_split::tests::stage106_d2_sender_before_waiter_dequeues_without_publish ... ok
+test kernel::recv_waiter_split::tests::stage106_d2_timeout_deadline_staged_through_live_publish_fires ... ok
+test kernel::recv_waiter_split::tests::stage106_d2_validation_labels_present ... ok
+test kernel::recv_waiter_split::tests::stage111_d2_lock_order_documented_scheduler_task_ipc ... ok
+test kernel::recv_waiter_split::tests::stage111_d2_no_cap_vm_or_user_copy_work_in_phase_functions ... ok
+test kernel::recv_waiter_split::tests::stage111_d2_phase_functions_present_in_rank_order ... ok
+test kernel::recv_waiter_split::tests::stage111_d2_phase_plan_struct_is_copy ... ok
+test kernel::recv_waiter_split::tests::stage111_d2_seam_helper_only_fence_not_live_wired_from_d2_path ... ok
+test kernel::recv_waiter_split::tests::stage111_d2_telemetry_markers_present ... ok
+test kernel::syscall::ipc_recv_core::tests::encode_recv_v2_meta_matches_frozen_layout ... ok
+test kernel::syscall::ipc_recv_core::tests::encode_recv_v2_meta_reproduces_per_path_bytes ... ok
+test kernel::syscall::tests::blocked_recv_completion_rejects_missing_state ... ok
+test kernel::syscall::tests::recv_v2_materializes_reply_cap_once_per_message ... ok
+test kernel::syscall::tests::recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload ... ok
+test kernel::syscall::tests::shared_mem_recv_intent_failures_do_not_drift_map_release_telemetry ... ok
+test kernel::syscall::tests::shared_mem_recv_read_intent_attenuates_receiver_transfer_cap ... ok
+test kernel::syscall::tests::shared_mem_recv_write_intent_failures_do_not_drift_map_release_telemetry ... ok
+test kernel::syscall::tests::stage101_d1_audit_recv_core_cap_transfer_plumbing_present ... ok
+test kernel::syscall::tests::stage101_recv_core_extract_cap_transfer_plan_labels_d1_status ... ok
+test kernel::syscall::tests::stage101_syscall_count_and_recv_shared_v3_dispatch_remain ... ok
+test kernel::syscall::tests::syscall_recv_materializes_receiver_local_transfer_cap ... ok
+test kernel::syscall::tests::syscall_recv_shared_mem_auto_map_rejects_unaligned_target_va ... ok
+test kernel::syscall::tests::syscall_recv_shared_mem_auto_map_requires_len_budget ... ok
+test kernel::syscall::tests::syscall_recv_shared_mem_can_auto_map_into_receiver_when_requested ... ok
+test kernel::syscall::tests::syscall_recv_shared_mem_rejects_invalid_map_intent_flags ... ok
+test kernel::syscall::tests::syscall_recv_shared_mem_requires_nonzero_map_target ... ok
+test kernel::syscall::tests::syscall_recv_shared_mem_write_intent_requires_write_right_on_transfer_cap ... ok
+test kernel::syscall::tests::syscall_recv_timeout_can_pull_queued_message ... ok
+test kernel::syscall::tests::syscall_recv_timeout_decode_is_stable ... ok
+test kernel::syscall::tests::syscall_recv_timeout_nonzero_returns_timed_out_when_empty ... ok
+test kernel::syscall::tests::syscall_recv_timeout_zero_returns_would_block_when_empty ... ok
+test kernel::syscall_split::tests::stage28_split_dispatch_whitelist_rejects_ipc_recv ... ok
+test kernel::syscall_split::tests::stage32b_arg_only_dispatch_defers_ipc_recv ... ok
+test kernel::syscall_split::tests::stage32b_ipc_recv_classify_nr2_eligible ... ok
+test kernel::syscall_split::tests::stage32b_ipc_recv_timeout_nr_not_in_whitelist ... ok
+test kernel::task::tests::a64rc_recv_completion_is_returned_once_and_only_once ... ok
+test runtime::tests::u9recvblock1_a_doubly_refused_restore_reports_unpublished_and_does_not_publish ... ok
+test runtime::tests::u9recvblock1_an_enqueued_victim_is_recovered_exactly_by_the_prefer_primitive ... ok
+test runtime::tests::u9recvblock1_the_unwind_refuses_a_replacement_incarnation ... ok
+test runtime::tests::u9recvblock2b_a_reused_tid_is_refused_before_any_placement_is_written ... ok
+test runtime::tests::u9recvblock2b_an_unverifiable_post_state_claims_nothing ... ok
+test runtime::tests::u9recvblock2b_restored_proves_the_exact_placement_not_just_the_tid ... ok
+test runtime::tests::u9recvblock2b_runnable_elsewhere_reads_the_post_state_back ... ok
+
+test result: ok. 423 passed; 0 failed; 0 ignored; 0 measured; 6140 filtered out; finished in 2.06s
+

@@ -1,0 +1,14 @@
+nc8 applied
+diff --git a/src/kernel/boot/mod.rs b/src/kernel/boot/mod.rs
+index 579defdf..bb3b3dd6 100644
+--- a/src/kernel/boot/mod.rs
++++ b/src/kernel/boot/mod.rs
+@@ -1721,7 +1721,7 @@ pub(crate) fn riscv_commit_final_park_result(
+     let nr = frame.syscall_num();
+     let final_result = (nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+         && futex == Some(outgoing))
+-        || (nr == crate::kernel::syscall::SYSCALL_YIELD_NR
++        || (nr == usize::MAX
+             && futex.is_none()
+             && recv.is_none()
+             && yielded == Some(outgoing));

@@ -1,0 +1,23 @@
+nc1 applied
+diff --git a/src/arch/riscv64/boot.rs b/src/arch/riscv64/boot.rs
+index 4000cf09..6cac2847 100644
+--- a/src/arch/riscv64/boot.rs
++++ b/src/arch/riscv64/boot.rs
+@@ -1542,7 +1542,7 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
+             // also every untagged syscall continuation (a parked FutexWait or Yield, a receive a
+             // remote completion published, a fork child), whose `ecall` declares `a7` an input:
+             // it must come back as the syscall number the caller issued, not zero.
+-            frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
++            frame.regs[RiscvTrapFrame::A7] = 0;
+         } else {
+             // Same task continuing past its own ecall: YARM ABI returns
+             // a0=ret0 (or the error), a1=ret1, a2=ret2; a3..a5, a7 are preserved inputs.
+@@ -2008,7 +2008,7 @@ fn riscv_s_mode_idle_landing(
+                 frame.regs[RiscvTrapFrame::A4] = tframe.arg(4) as u64;
+                 frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;
+                 // RISCV-ECALL-A7-RET1: as the bridge's switched arm (`0` for a fresh task).
+-                frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
++                frame.regs[RiscvTrapFrame::A7] = 0;
+             }
+             #[cfg(feature = "riscv-ecall-witness")]
+             crate::arch::riscv64::ecall_witness::note_resume(

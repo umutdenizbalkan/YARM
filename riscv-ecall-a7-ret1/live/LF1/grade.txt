@@ -1,0 +1,2 @@
+[riscv-ecall-grade][fail] coverage: no a FutexWait woken before it physically parked (1 through its own frame)
+RISCV_ECALL_WITNESS_SEAL arch=riscv64 smp=2 probes=120 fresh=9 yield_switched=72 yield_same=8 wait_parked=18 wait_own=6 wait_early=0 wait_mismatch=6 requeue_parked=8 recv_blocked=8 spin_async=5 async_in_probe=5 lost_a3=0 lost_a7=0 lost_other=0 core_smoke=ok result=fail

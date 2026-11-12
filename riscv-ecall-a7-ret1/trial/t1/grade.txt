@@ -1,0 +1,1 @@
+RISCV_ECALL_WITNESS_SEAL arch=riscv64 smp=2 probes=120 fresh=9 yield_switched=72 yield_same=8 wait_parked=4 wait_own=20 wait_early=12 wait_mismatch=6 requeue_parked=8 recv_blocked=8 spin_async=6 async_in_probe=9 lost_a3=0 lost_a7=0 lost_other=0 core_smoke=ok result=ok

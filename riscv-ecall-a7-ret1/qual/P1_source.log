@@ -1,0 +1,48 @@
+ Cargo.toml                                         |    3 +
+ crates/yarm-control-plane-servers/Cargo.toml       |    1 +
+ .../src/control_plane/init/service.rs              |  613 ++++++++++-
+ crates/yarm-driver-servers/Cargo.toml              |    1 +
+ crates/yarm-fs-servers/Cargo.toml                  |    1 +
+ doc/AI_AGENT_RULES.md                              |    7 +
+ doc/ARCH_RISCV64.md                                |    8 +-
+ doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md              |    4 +
+ doc/SYSCALL_ABI.md                                 |   31 +-
+ scripts/grade-riscv-ecall-witness.py               |  313 ++++++
+ scripts/qemu-riscv-ecall-witness-smoke.sh          |   79 ++
+ src/arch/aarch64/page_table.rs                     |   24 +-
+ src/arch/riscv64/boot.rs                           |   59 +-
+ src/arch/riscv64/ecall_witness.rs                  |   50 +
+ src/arch/riscv64/mod.rs                            |    6 +
+ src/arch/x86_64/smp_trampoline.rs                  |   42 +-
+ src/kernel/boot/mod.rs                             |    8 +
+ src/kernel/boot/tests.rs                           | 1113 +++++++++++++++++++-
+ src/kernel/syscall.rs                              |   15 +-
+ tests/x86_64_ap_env_scope.rs                       |   64 +-
+ 20 files changed, 2337 insertions(+), 105 deletions(-)
+ src/arch/aarch64/page_table.rs    | 24 ++++------------
+ src/arch/riscv64/boot.rs          | 59 ++++++++++++++++++++++++++-------------
+ src/arch/riscv64/ecall_witness.rs | 50 +++++++++++++++++++++++++++++++++
+ src/arch/riscv64/mod.rs           |  6 ++++
+ src/arch/x86_64/smp_trampoline.rs | 42 +++++++++++++++++-----------
+ src/kernel/boot/mod.rs            |  8 ++++++
+ src/kernel/syscall.rs             | 15 ++++++----
+ 7 files changed, 145 insertions(+), 59 deletions(-)
+1465:            frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
+1468:            frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+1495:            frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
+1498:            frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+1537:            frame.regs[RiscvTrapFrame::A3] = tframe.arg(3) as u64;
+1545:            frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+1585:            frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
+1588:            frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+1964:                frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
+1967:                frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+1992:                frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
+1995:                frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+2007:                frame.regs[RiscvTrapFrame::A3] = tframe.arg(3) as u64;
+2011:                frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+forced_a7_zero=0 a3_error=0
+22:            in("a3") a3,
+23:            in("a4") a4,
+24:            in("a5") a5,
+25:            in("a7") a7,

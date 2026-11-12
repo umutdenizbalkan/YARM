@@ -1,0 +1,5 @@
+tree=dfac4177d7cd6d4687537f02e236f6036460e227 head=3091f14365ad2cd411685665e5da3d8ed803095e dirty=0 kernel_features=--no-default-features --features x86-apsched-witness
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=q35 cpu=qemu64 m=512M
+b5a6745a61190b298a4be33a2a9ba62004721c34b1519772903e14def19e88ac  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX4_x86_64/build/kernel_boot.elf
+bb8daa86b2e0bd1b4203e2c3807cd7299eda150554278a45efd0fe18c09a0dfd  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX4_x86_64/build/initramfs-core.cpio
+boot smp=2 append=console=ttyS0 rdinit=/init

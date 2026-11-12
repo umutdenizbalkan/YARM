@@ -1,0 +1,3 @@
+b5091c23a37ccef42bf61ada0aab0371bd7bfd122817d2481c9943ff5320a963  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/live/LB2/boot.log
+2ec9e8bd5c9e74c98f613898f272a9d8eddb0d7cd8054f4ba219c5366f37fa28  build-riscv64/yarm-riscv64.bin
+c3516b8a1429b27734008619bcce5e5af508dd8a1a7c74bab754aa596344f0b8  build-riscv64/initramfs-core.cpio

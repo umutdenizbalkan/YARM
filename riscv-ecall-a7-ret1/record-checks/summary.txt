@@ -1,0 +1,8 @@
+HEAD=83be1921b7c6 dirty=1
+contract_gate rc=0
+integration(misinvoked: --tests ran the lib in parallel; log kept as integration.misinvoked-parallel-lib.log) rc=101 passed 6516 failed 44
+integration rc=0 binaries=41 passed 396 failed 0
+hosted_lib rc=0 test result: ok. 6560 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 86.71s
+fmt rc=0
+ doc/KERNEL_UNLOCKING.md | 166 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 166 insertions(+)

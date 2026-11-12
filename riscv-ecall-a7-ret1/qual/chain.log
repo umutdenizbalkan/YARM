@@ -1,0 +1,7 @@
+chain start 2026-11-12T18:33:21Z F=3091f143 B=3ac4f578 BW=1a570728 schedule_sha=552769735a2d159c
+inserted 48418 bytes
+baseline done 18:34:27
+nc done 19:05:54
+live done 19:55:17
+resume start 2026-11-12T22:07:58Z schedule_sha=a217b13df027a257
+matrix (resumed) done 22:39:09

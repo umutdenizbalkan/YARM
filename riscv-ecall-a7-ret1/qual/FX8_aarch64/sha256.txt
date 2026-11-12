@@ -1,0 +1,3 @@
+57533e22852caf2f3de37ed98effdee32ab6f57805f47cff680f3a2987564c6e  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX8_aarch64/boot.log
+5dee4871e0e43db4307bda6791f9cfcf08fe40cc7586df1eec9a006854f74f67  build-aarch64/yarm-aarch64.bin
+52ff1bef27e4f0a5abb8c6174a71bd598783f5d005146a58517ec0660f06c838  build-aarch64/initramfs-core.cpio

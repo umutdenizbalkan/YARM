@@ -1,0 +1,3 @@
+6849f8f288d7e5c29aa486e9f0d453b35e5e6209aad1f16136733b3a88a85015  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ea7-evidence/qual/FX8_x86_64/boot.log
+361a76c9cb5ce9e74c218e561403d1ce27f3dd74a3b048391f248133644cd488  build-x86_64/kernel_boot.elf
+c13eaf1c551184cdddc3c93194b0f7757261b092687d57f80bbae200aa40ef79  build-x86_64/initramfs-core.cpio

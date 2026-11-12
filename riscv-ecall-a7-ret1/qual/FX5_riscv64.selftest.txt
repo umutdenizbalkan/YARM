@@ -1,0 +1,1 @@
+KT1_GRADER_SELF_TEST result=pass

@@ -1,0 +1,1055 @@
+        /// RISCV-ECALL-A7-RET1 — the compiler-visible `ecall` register contract, on every RISC-V
+        /// resume convention.
+        ///
+        /// The user runtime's `ecall` declares `a0..a2` outputs and `a3`, `a4`, `a5`, `a7` INPUTS
+        /// (`in(..)`): the compiler may keep a value in an input register across the statement and
+        /// read it afterwards. Every register the wrapper does not name — `ra`, `sp`, `gp`, `tp`,
+        /// `t0..t6`, `s0..s11`, `a6` — must survive as well. A continuation must therefore resume
+        /// with its inputs intact whichever arm resumes it: its own trap, a completion, a park, a
+        /// switch.
+        ///
+        /// These tests do not re-implement the write-back. [`writeback`] EVALUATES the statements
+        /// of the arm as they stand in `src/arch/riscv64/boot.rs` — the mirror loop's skip set and
+        /// every `frame.regs[RiscvTrapFrame::X] = ..;` assignment, inside the error / success
+        /// branches where they are written — against the trap frame the production restore
+        /// produced. A change to an arm changes what these tests observe.
+        mod ecall_contract {
+            use super::*;
+            use crate::kernel::syscall::{
+                SYSCALL_FORK_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_IPC_RECV_NR,
+                SYSCALL_IPC_RECV_TIMEOUT_NR, SYSCALL_IPC_SEND_NR,
+            };
+
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            enum Origin {
+                /// The main bridge's write-back (`if task_switched || scause == EXC_USER_ECALL`).
+                Bridge,
+                /// The S-mode idle dispatch's write-back.
+                Idle,
+            }
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            enum Arm {
+                Async,
+                Continuation,
+                /// The switched ordinary arm: no async tag, no continuation tag.
+                Switched,
+                /// The bridge's same-task arm (its own trap).
+                SameTask,
+            }
+
+            fn between<'a>(s: &'a str, from: &str, to: &str) -> &'a str {
+                let tail = s
+                    .split(from)
+                    .nth(1)
+                    .unwrap_or_else(|| panic!("marker `{from}` not found"));
+                tail.split(to)
+                    .next()
+                    .unwrap_or_else(|| panic!("marker `{to}` not found"))
+            }
+
+            /// The bridge write-back region, and the idle dispatch's.
+            fn region(origin: Origin) -> &'static str {
+                match origin {
+                    Origin::Bridge => between(
+                        RV_BOOT,
+                        "if task_switched || scause == EXC_USER_ECALL {",
+                        "// Stage 163P: same-task NON-SYSCALL trap",
+                    ),
+                    Origin::Idle => between(
+                        RV_BOOT,
+                        "// Same write-back the main bridge performs for a task switch",
+                        "// ── Canonical 199E-R2: ACTIVATE the resumed task's address space",
+                    ),
+                }
+            }
+
+            /// The source text of one arm.
+            fn arm_src(origin: Origin, arm: Arm) -> &'static str {
+                let r = region(origin);
+                match (origin, arm) {
+                    (Origin::Bridge, Arm::Async) => between(
+                        r,
+                        "if task_switched && async_resume {",
+                        "} else if task_switched && continuation {",
+                    ),
+                    (Origin::Bridge, Arm::Continuation) => between(
+                        r,
+                        "} else if task_switched && continuation {",
+                        "} else if task_switched {",
+                    ),
+                    (Origin::Bridge, Arm::Switched) => between(
+                        r,
+                        "} else if task_switched {",
+                        "// Same task continuing past its own ecall",
+                    ),
+                    (Origin::Bridge, Arm::SameTask) => r
+                        .split("// Same task continuing past its own ecall")
+                        .nth(1)
+                        .expect("the same-task arm"),
+                    (Origin::Idle, Arm::Async) => between(
+                        r,
+                        "if crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize) {",
+                        "} else if continuation {",
+                    ),
+                    (Origin::Idle, Arm::Continuation) => r
+                        .split("} else if continuation {")
+                        .nth(1)
+                        .and_then(|s| s.split("\n            } else {\n").next())
+                        .expect("the idle continuation arm"),
+                    (Origin::Idle, Arm::Switched) => r
+                        .split("} else if continuation {")
+                        .nth(1)
+                        .and_then(|s| s.split("\n            } else {\n").nth(1))
+                        .expect("the idle ordinary arm"),
+                    (Origin::Idle, Arm::SameTask) => panic!("the idle dispatch always switches"),
+                }
+            }
+
+            /// `RiscvTrapFrame::<NAME>` → the x-register number.
+            fn xreg(name: &str) -> usize {
+                match name {
+                    "SP" => 2,
+                    "A0" => 10,
+                    "A1" => 11,
+                    "A2" => 12,
+                    "A3" => 13,
+                    "A4" => 14,
+                    "A5" => 15,
+                    "A6" => 16,
+                    "A7" => 17,
+                    other => panic!("unmodelled register RiscvTrapFrame::{other}"),
+                }
+            }
+
+            /// The registers the region's GPR mirror loop skips.
+            fn mirror_skips(origin: Origin) -> Vec<usize> {
+                let lp = between(region(origin), "for n in 1..32usize {", "frame.regs[i] =");
+                lp.split("RiscvTrapFrame::")
+                    .skip(1)
+                    .map(|s| {
+                        xreg(
+                            s.split(|c: char| !c.is_ascii_alphanumeric())
+                                .next()
+                                .unwrap(),
+                        )
+                    })
+                    .collect()
+            }
+
+            fn eval(expr: &str, tf: &TrapFrame, err: Option<usize>) -> usize {
+                let e = expr
+                    .trim()
+                    .trim_end_matches(" as u64")
+                    .trim_end_matches(" as usize");
+                let num = |p: &str| -> usize {
+                    e.strip_prefix(p)
+                        .and_then(|s| s.strip_suffix(')'))
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| panic!("unmodelled expression `{e}`"))
+                };
+                match e {
+                    "0" => 0,
+                    "err" => err.expect("`err` outside the error branch"),
+                    "tframe.ret0()" => tf.ret0(),
+                    "tframe.ret1()" => tf.ret1(),
+                    "tframe.ret2()" => tf.ret2(),
+                    _ if e.starts_with("tframe.user_gpr(") => tf.user_gpr(num("tframe.user_gpr(")),
+                    _ if e.starts_with("tframe.arg(") => tf.arg(num("tframe.arg(")),
+                    _ => panic!("unmodelled expression `{e}`"),
+                }
+            }
+
+            #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+            enum Block {
+                Err,
+                Ok,
+                Other,
+            }
+
+            /// What ring 3 holds after `sret`: the register file and `sepc`.
+            #[derive(Clone, Debug, PartialEq, Eq)]
+            struct Regs {
+                x: [usize; 32],
+                sepc: usize,
+            }
+
+            /// Evaluate one arm. `hw` is the frame the CPU trapped with (this trap's), `tf` the
+            /// generic frame after the production restore (the incoming context applied for a
+            /// switch; this trap's own for the same task). `self_resume` models the same-task arm's
+            /// `resume_owner` condition.
+            fn writeback(
+                origin: Origin,
+                arm: Arm,
+                hw: &TrapFrame,
+                tf: &TrapFrame,
+                self_resume: bool,
+            ) -> Regs {
+                let mut tf = tf.clone();
+                let src = arm_src(origin, arm);
+                if self_resume {
+                    assert!(src.contains("tframe.adopt_restored_riscv_syscall_returns();"));
+                    tf.adopt_restored_riscv_syscall_returns();
+                }
+                // The CPU's own registers, then the mirror, then `sp` and `sepc`.
+                let mut x = hw.user_gprs;
+                x[0] = 0;
+                let skips = mirror_skips(origin);
+                for (n, slot) in x.iter_mut().enumerate().skip(1) {
+                    if !skips.contains(&n) {
+                        *slot = tf.user_gpr(n);
+                    }
+                }
+                x[2] = tf.saved_sp();
+                let err = tf.error_code();
+                let mut stack: Vec<Block> = Vec::new();
+                for line in src.lines() {
+                    let t = line.trim();
+                    if t.starts_with("if let Some(err) = tframe.error_code() {") {
+                        stack.push(Block::Err);
+                        continue;
+                    }
+                    if t.starts_with("if ") && t.ends_with('{') {
+                        stack.push(Block::Other);
+                        continue;
+                    }
+                    if t == "} else {" {
+                        if stack.last() == Some(&Block::Err) {
+                            *stack.last_mut().unwrap() = Block::Ok;
+                        }
+                        continue;
+                    }
+                    if t == "}" {
+                        stack.pop();
+                        continue;
+                    }
+                    let Some(rest) = t.strip_prefix("frame.regs[RiscvTrapFrame::") else {
+                        continue;
+                    };
+                    let Some((name, rhs)) = rest.split_once("] = ") else {
+                        continue;
+                    };
+                    let live = stack.iter().all(|b| match b {
+                        Block::Err => err.is_some(),
+                        Block::Ok => err.is_none(),
+                        Block::Other => {
+                            panic!("an assignment under a condition the model does not know: `{t}`")
+                        }
+                    });
+                    if live {
+                        x[xreg(name)] = eval(rhs.trim_end_matches(';'), &tf, err);
+                    }
+                }
+                Regs {
+                    x,
+                    sepc: tf.saved_pc(),
+                }
+            }
+
+            /// Sentinels for every register the wrapper does not name and the caller's inputs.
+            const RA: usize = 0x1111;
+            const GP: usize = 0x3_3000;
+            const TP: usize = 0x4444;
+            const A6: usize = 0x6666;
+            fn sentinel(n: usize) -> usize {
+                0x5E00_0000 + n
+            }
+
+            /// The `ecall` a caller issues: `nr` in `a7`, `args` in `a0..a5`, a distinct sentinel in
+            /// every other register.
+            fn call(nr: usize, args: [usize; 6]) -> TrapFrame {
+                let mut f = ecall(nr, args);
+                for n in 1..32 {
+                    if !(10..=17).contains(&n) && n != 2 {
+                        f.set_user_gpr(n, sentinel(n));
+                    }
+                }
+                f.set_user_gpr(1, RA);
+                f.set_user_gpr(3, GP);
+                f.set_user_gpr(4, TP);
+                f.set_user_gpr(16, A6);
+                f
+            }
+
+            /// The compiler-visible contract for `caller`'s `ecall`, as the wrapper declares it.
+            fn assert_contract(r: &Regs, caller: &TrapFrame, results: (usize, usize, usize)) {
+                assert_eq!((r.x[10], r.x[11], r.x[12]), results, "a0..a2: the result");
+                for n in [13, 14, 15, 17] {
+                    assert_eq!(
+                        r.x[n],
+                        caller.user_gpr(n),
+                        "x{n} is an `in` operand of the caller's ecall: {r:x?}"
+                    );
+                }
+                for n in (1..32).filter(|n| !(10..=15).contains(n) && *n != 17) {
+                    assert_eq!(r.x[n], caller.user_gpr(n), "x{n} is not named by the ecall");
+                }
+                assert_eq!(r.sepc, ECALL + 4, "exactly once past the ecall");
+            }
+
+            /// The incoming context applied to another task's trap (the production restore).
+            fn restored(ctx: UserRegisterContext) -> TrapFrame {
+                let mut f = call(SYSCALL_YIELD_NR, [0x77; 6]);
+                for n in 1..32 {
+                    f.set_user_gpr(n, 0xDEAD_0000 + n);
+                }
+                f.apply_user_context(ctx);
+                f
+            }
+            fn other_hw() -> TrapFrame {
+                let mut f = call(SYSCALL_YIELD_NR, [0x77; 6]);
+                for n in 1..32 {
+                    f.set_user_gpr(n, 0xBAD0_0000 + n);
+                }
+                f
+            }
+
+            /// Park `t` through the bridge's committed-park arm with the cell for `nr`.
+            fn park_call(
+                k: &SharedKernel,
+                t: u64,
+                f: &mut TrapFrame,
+                defer: fn(usize, u64) -> bool,
+            ) {
+                clear_cells();
+                assert!(defer(0, t));
+                assert!(bridge(k, f).1, "captured");
+                clear_cells();
+            }
+
+            // ── 1 / 2 — the declared contract and the number's capture ──────────────────────
+
+            /// 1 — every operand the wrapper declares `in(..)` is preserved by EVERY arm that
+            /// resumes a continuation, and every register it leaves unnamed too; outputs are the
+            /// only lanes an arm may write. Read from the wrapper itself, so changing its operand
+            /// list is checked against the kernel's behaviour.
+            #[test]
+            fn c01_the_wrappers_inputs_are_what_every_continuation_arm_preserves() {
+                const RV: &str = include_str!("../../../crates/yarm-user-rt/src/arch/riscv64.rs");
+                let asm = between(RV, "\"ecall\",", "options(nostack)");
+                let mut inputs = Vec::new();
+                let mut outputs = Vec::new();
+                for op in asm.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    let reg = between(op, "(\"", "\")");
+                    let n = xreg(&reg.to_ascii_uppercase());
+                    if op.starts_with("in(") {
+                        inputs.push(n);
+                    } else {
+                        outputs.push(n);
+                    }
+                }
+                assert_eq!(outputs, [10, 11, 12], "the results are a0..a2");
+                assert!(!inputs.is_empty());
+                let caller = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0xA3, 0xA4, 0xA5]);
+                let mut done = caller.clone();
+                done.set_ok(1, 0, 0);
+                let mut committed = done.clone();
+                committed.commit_riscv_parked_syscall_returns();
+                let ctx = committed.capture_user_context();
+                let mut cont = restored(ctx);
+                cont.set_ok(1, 0, 0);
+                let cases = [
+                    (
+                        "bridge same-task",
+                        writeback(Origin::Bridge, Arm::SameTask, &done, &done, false),
+                    ),
+                    (
+                        "bridge switched",
+                        writeback(
+                            Origin::Bridge,
+                            Arm::Switched,
+                            &other_hw(),
+                            &restored(ctx),
+                            false,
+                        ),
+                    ),
+                    (
+                        "bridge continuation",
+                        writeback(Origin::Bridge, Arm::Continuation, &other_hw(), &cont, false),
+                    ),
+                    (
+                        "idle switched",
+                        writeback(
+                            Origin::Idle,
+                            Arm::Switched,
+                            &other_hw(),
+                            &restored(ctx),
+                            false,
+                        ),
+                    ),
+                    (
+                        "idle continuation",
+                        writeback(Origin::Idle, Arm::Continuation, &other_hw(), &cont, false),
+                    ),
+                ];
+                for (label, r) in cases {
+                    for &n in &inputs {
+                        assert_eq!(
+                            r.x[n],
+                            caller.user_gpr(n),
+                            "{label}: `in` operand x{n}: {r:x?}"
+                        );
+                    }
+                    assert_eq!(r.x[10], 1, "{label}: the result");
+                }
+            }
+
+            /// 2 — the bridge imports the number from `a7` into the number lane AND the register
+            /// file, once, and the import is what the write-back reads back.
+            #[test]
+            fn c02_the_syscall_number_is_captured_into_the_register_file() {
+                let imp = between(
+                    RV_BOOT,
+                    "tframe.set_user_gpr(n, frame.regs[n - 1] as usize);",
+                    "tframe.set_arg(0,",
+                );
+                assert!(
+                    imp.contains(
+                        "tframe.set_syscall_num(frame.regs[RiscvTrapFrame::A7] as usize);"
+                    )
+                );
+                let f = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0, 0, 0]);
+                assert_eq!(f.user_gpr(17), SYSCALL_FUTEX_WAIT_NR);
+                assert_eq!(
+                    f.capture_user_context().user_gprs[17],
+                    SYSCALL_FUTEX_WAIT_NR
+                );
+            }
+
+            // ── 3 / 7 — own frame ─────────────────────────────────────────────────────────
+
+            /// 3 — a syscall that never leaves the CPU (FutexWake) returns through its own frame
+            /// with its result, its inputs, and every other register.
+            #[test]
+            fn c03_a_same_task_return_keeps_the_inputs() {
+                let f = call(SYSCALL_FUTEX_WAKE_NR, [SQ, 1, 0, 0x3a3, 0x3a4, 0x3a5]);
+                let mut done = f.clone();
+                done.set_ok(1, 0, 0);
+                let r = writeback(Origin::Bridge, Arm::SameTask, &done, &done, false);
+                assert_contract(&r, &f, (1, 0, 0));
+            }
+
+            /// 3 (error) — an error through the own frame: `a0` the code, `a1 = a2 = 0`, the inputs
+            /// intact.
+            #[test]
+            fn c03b_a_same_task_error_keeps_the_inputs() {
+                let f = call(SYSCALL_FUTEX_WAIT_NR, [SQ + 1, 5, 0, 0x3a3, 0x3a4, 0x3a5]);
+                let mut done = f.clone();
+                done.set_err(SyscallError::InvalidArgs.code());
+                let r = writeback(Origin::Bridge, Arm::SameTask, &done, &done, false);
+                assert_contract(&r, &f, (SyscallError::InvalidArgs.code(), 0, 0));
+            }
+
+            /// 7 — a Yield the drain answers with the caller itself (no switch): its own frame, `0`,
+            /// inputs intact; and the self-resume variant (the drain applied its own continuation).
+            #[test]
+            fn c07_a_yield_without_a_switch_keeps_the_inputs() {
+                let f = call(SYSCALL_YIELD_NR, [0, 0, 0, 0x7a3, 0x7a4, 0x7a5]);
+                let mut done = f.clone();
+                done.set_ok(0, 0, 0);
+                let r = writeback(Origin::Bridge, Arm::SameTask, &done, &done, false);
+                assert_contract(&r, &f, (0, 0, 0));
+                let mut committed = done.clone();
+                committed.commit_riscv_parked_syscall_returns();
+                let mut own = done.clone();
+                own.apply_user_context(committed.capture_user_context());
+                let r = writeback(Origin::Bridge, Arm::SameTask, &done, &own, true);
+                assert_contract(&r, &f, (0, 0, 0));
+            }
+
+            // ── 4 / 5 / 6 / 8 — parks and switches ─────────────────────────────────────────
+
+            /// 5 — a GENUINELY parked FutexWait, woken by another CPU and resumed by a switch on
+            /// its home CPU (bridge) or from terminal idle (S-mode dispatch): `1`, and `a3..a5`,
+            /// `a7 = 9` as the caller left them.
+            #[test]
+            fn c05_a_parked_futex_wait_keeps_its_number_and_inputs() {
+                let w = world(56000);
+                let (a, t) = (w.a, 56100);
+                let k = leak(w.s);
+                let f0 = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0x5a3, 0x5a4, 0x5a5]);
+                let (_r, o) = wait(k, a, t, SQ, 5, P);
+                assert!(matches!(o, FutexParkOutcome::Parked { .. }));
+                let mut f = f0.clone();
+                f.set_ok(1, 0, 0);
+                park_call(k, t, &mut f, kb::futex_wait_dispatch_try_defer);
+                assert_eq!(
+                    k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
+                    1
+                );
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    let r = writeback(
+                        origin,
+                        Arm::Switched,
+                        &other_hw(),
+                        &restored(saved(k, t)),
+                        false,
+                    );
+                    assert_contract(&r, &f0, (1, 0, 0));
+                }
+            }
+
+            /// 6 — a mismatch never leaves the CPU: `0` through the own frame, inputs intact.
+            #[test]
+            fn c06_a_futex_wait_mismatch_keeps_the_inputs() {
+                let f = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 4, 0, 0x6a3, 0x6a4, 0x6a5]);
+                let mut done = f.clone();
+                done.set_ok(0, 0, 0);
+                let r = writeback(Origin::Bridge, Arm::SameTask, &done, &done, false);
+                assert_contract(&r, &f, (0, 0, 0));
+            }
+
+            /// 8 — a Yield that really switches: parked through the chain, resumed by another
+            /// task's trap with `0` and its inputs.
+            #[test]
+            fn c08_a_yield_with_a_switch_keeps_the_inputs() {
+                let w = world(56200);
+                let k = leak(w.s);
+                let t = w.driver;
+                let f0 = call(SYSCALL_YIELD_NR, [0, 0, 0, 0x8a3, 0x8a4, 0x8a5]);
+                let mut f = f0.clone();
+                f.set_ok(0, 0, 0);
+                park_call(k, t, &mut f, kb::yield_dispatch_try_defer);
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    let r = writeback(
+                        origin,
+                        Arm::Switched,
+                        &other_hw(),
+                        &restored(saved(k, t)),
+                        false,
+                    );
+                    assert_contract(&r, &f0, (0, 0, 0));
+                }
+            }
+
+            /// 4 — a switched SYSCALL CONTINUATION (a completion consumer encoded the result into
+            /// this trap's frame and published the tag): the result, and the caller's inputs.
+            #[test]
+            fn c04_a_switched_continuation_keeps_the_inputs() {
+                let f0 = call(
+                    SYSCALL_IPC_SEND_NR,
+                    [0x1_0004, 0x5000, 9, 0x4a3, 0x4a4, 0x4a5],
+                );
+                let ctx = f0.capture_user_context();
+                let mut tf = restored(ctx);
+                tf.set_ok(0, 0, 0);
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    let r = writeback(origin, Arm::Continuation, &other_hw(), &tf, false);
+                    assert_contract(&r, &f0, (0, 0, 0));
+                }
+            }
+
+            // ── 9 / 10 / 11 / 12 / 13 — completions ────────────────────────────────────────
+
+            /// 9 — a blocking RECEIVE parked, its completion published into the saved context
+            /// after the capture (13); the switched resume: the completion in `a0`/`a1`, and the
+            /// receive's own `a3..a5` (its meta pointer, size, map intent) and `a7 = 2`.
+            #[test]
+            fn c09_a_blocking_receive_completion_keeps_the_inputs() {
+                let w = world(56400);
+                let k = leak(w.s);
+                let t = w.driver;
+                let f0 = call(
+                    SYSCALL_IPC_RECV_NR,
+                    [0x1_0004, 0x5000, 64, 0x9a3, 0x9a4, 0x9a5],
+                );
+                let mut f = f0.clone();
+                f.set_err(SyscallError::WouldBlock.code());
+                park_call(k, t, &mut f, kb::d2_recv_dispatch_try_defer);
+                k.with(|s| s.with_tcb_mut(t, |tcb| tcb.publish_riscv_user_return(0x2a, 0x9, 0)));
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    let r = writeback(
+                        origin,
+                        Arm::Switched,
+                        &other_hw(),
+                        &restored(saved(k, t)),
+                        false,
+                    );
+                    assert_eq!(
+                        (r.x[10], r.x[11]),
+                        (0x2a, 0x9),
+                        "{origin:?}: the completion"
+                    );
+                    for n in [13, 14, 15, 17] {
+                        assert_eq!(r.x[n], f0.user_gpr(n), "{origin:?}: x{n}");
+                    }
+                    assert_eq!(r.x[16], A6);
+                    assert_eq!(r.sepc, ECALL + 4);
+                }
+            }
+
+            /// 10 — a blocking SEND completed by its parked record, consumed at the exact-token
+            /// resume (the continuation arm): the result and the inputs.
+            #[test]
+            fn c10_a_blocking_send_completion_keeps_the_inputs() {
+                let w = world(56600);
+                let (a, t) = (w.a, w.driver);
+                let k = leak(w.s);
+                let f0 = call(
+                    SYSCALL_IPC_SEND_NR,
+                    [0x1_0004, 0x5000, 9, 0xaa3, 0xaa4, 0xaa5],
+                );
+                let mut f = f0.clone();
+                f.set_ok(0, 0, 0);
+                park_call(k, t, &mut f, kb::yield_dispatch_try_defer);
+                let live = k
+                    .with(|s| s.with_tcb_mut(t, |tcb| tcb.blocked_send_generation))
+                    .expect("tcb");
+                k.with(|s| {
+                    s.with_tcb_mut(t, |tcb| {
+                        tcb.pending_syscall_completion = Some(BlockedSyscallCompletion {
+                            syscall_class: BlockedSyscallClass::IpcSend,
+                            result: 0,
+                            tid: t,
+                            asid: a,
+                            blocked_generation: live,
+                        })
+                    })
+                });
+                let rec = k
+                    .with(|s| {
+                        s.take_blocked_syscall_completion_of_class(t, BlockedSyscallClass::IpcSend)
+                    })
+                    .expect("the exact record");
+                let mut tf = restored(saved(k, t));
+                tf.set_ok(rec.result as usize, 0, 0);
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    let r = writeback(origin, Arm::Continuation, &other_hw(), &tf, false);
+                    assert_contract(&r, &f0, (0, 0, 0));
+                }
+            }
+
+            /// 11 — a timed receive's TIMEOUT through the continuation arm (an error): `a0` the
+            /// code, `a1 = a2 = 0`, and the caller's `a3` (its own timeout argument) intact.
+            #[test]
+            fn c11_a_reply_timeout_result_keeps_the_inputs() {
+                let f0 = call(
+                    SYSCALL_IPC_RECV_TIMEOUT_NR,
+                    [0x1_0004, 0x5000, 64, 0x3e8, 0xba4, 0xba5],
+                );
+                let mut tf = restored(f0.capture_user_context());
+                tf.set_err(SyscallError::TimedOut.code());
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    let r = writeback(origin, Arm::Continuation, &other_hw(), &tf, false);
+                    assert_contract(&r, &f0, (SyscallError::TimedOut.code(), 0, 0));
+                }
+            }
+
+            /// 12 — the receive's completion published BEFORE the capture (concurrent with the
+            /// park): the re-application after the capture leaves the inputs intact.
+            #[test]
+            fn c12_a_completion_before_the_capture_keeps_the_inputs() {
+                let w = world(56800);
+                let (a, t) = (w.a, w.driver);
+                let k = leak(w.s);
+                let code = SyscallError::TimedOut.code();
+                k.with(|s| {
+                    s.with_tcb_mut(t, |tcb| {
+                        tcb.publish_riscv_user_return(0, 0, code);
+                        tcb.pending_syscall_completion = Some(BlockedSyscallCompletion {
+                            syscall_class: BlockedSyscallClass::IpcRecv,
+                            result: code as u64,
+                            tid: t,
+                            asid: a,
+                            blocked_generation: tcb.blocked_recv_generation,
+                        });
+                    })
+                });
+                let f0 = call(
+                    SYSCALL_IPC_RECV_NR,
+                    [0x1_0004, 0x5000, 64, 0xca3, 0xca4, 0xca5],
+                );
+                let mut f = f0.clone();
+                park_call(k, t, &mut f, kb::d2_recv_dispatch_try_defer);
+                let mut ctx = saved(k, t);
+                let mut tcb = crate::kernel::task::ThreadControlBlock::new(ThreadId(t), Some(a));
+                tcb.user_context = ctx;
+                tcb.publish_riscv_user_return(0, 0, code);
+                ctx = tcb.user_context;
+                let r = writeback(
+                    Origin::Bridge,
+                    Arm::Switched,
+                    &other_hw(),
+                    &restored(ctx),
+                    false,
+                );
+                assert_eq!(r.x[10], code);
+                for n in [13, 14, 15, 17] {
+                    assert_eq!(r.x[n], f0.user_gpr(n), "x{n}");
+                }
+            }
+
+            /// 13 — a completion published AFTER the capture: also exact (covered with 9); here,
+            /// a second completion of the SAME continuation is not a new result: the inputs are
+            /// the park's, whichever completion ran last.
+            #[test]
+            fn c13_a_completion_after_the_capture_keeps_the_inputs() {
+                let w = world(57000);
+                let k = leak(w.s);
+                let t = w.driver;
+                let f0 = call(
+                    SYSCALL_IPC_RECV_NR,
+                    [0x1_0004, 0x5000, 64, 0xda3, 0xda4, 0xda5],
+                );
+                let mut f = f0.clone();
+                park_call(k, t, &mut f, kb::d2_recv_dispatch_try_defer);
+                let before = saved(k, t);
+                k.with(|s| s.with_tcb_mut(t, |tcb| tcb.publish_riscv_user_return(3, 4, 0)));
+                let after = saved(k, t);
+                assert_eq!(
+                    after.user_gprs[13..18],
+                    before.user_gprs[13..18],
+                    "a completion writes only a0/a1"
+                );
+                let r = writeback(
+                    Origin::Idle,
+                    Arm::Switched,
+                    &other_hw(),
+                    &restored(after),
+                    false,
+                );
+                assert_eq!((r.x[10], r.x[11]), (3, 4));
+                assert_eq!(r.x[17], SYSCALL_IPC_RECV_NR);
+            }
+
+            // ── 14 / 15 — async and fresh ─────────────────────────────────────────────────
+
+            /// 14 — an asynchronously preempted task: every register verbatim, on both
+            /// write-backs; no syscall lane, no argument lane, no zero.
+            #[test]
+            fn c14_an_async_preemption_restores_every_register() {
+                let mut live = call(0, [0; 6]);
+                for n in 1..32 {
+                    live.set_user_gpr(n, 0xA500_0000 + n);
+                }
+                live.set_saved_pc(0x40_2222);
+                live.set_saved_sp(0x7f00_0000);
+                let ctx = live.capture_user_context();
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    let r = writeback(origin, Arm::Async, &other_hw(), &restored(ctx), false);
+                    for n in 1..32 {
+                        let want = if n == 2 { 0x7f00_0000 } else { 0xA500_0000 + n };
+                        assert_eq!(r.x[n], want, "{origin:?}: x{n}");
+                    }
+                    assert_eq!(r.sepc, 0x40_2222);
+                }
+            }
+
+            /// 15 — a FRESH task (never ran): `a0..a5` = its startup arguments, `a7 = 0` and every
+            /// other register zero, on both write-backs — what the spawn and exec constructors
+            /// seed (`user_gprs: [0; 32]`), checked here on the production constructors' output.
+            #[test]
+            fn c15_a_fresh_task_gets_its_startup_registers() {
+                let w = world(57200);
+                let (a, k) = (w.a, leak(w.s));
+                let fresh = 57300;
+                k.with(|s| task(s, fresh, a));
+                let ctx = saved(k, fresh);
+                assert_eq!(
+                    ctx.user_gprs, [0; 32],
+                    "a fresh context has no register file"
+                );
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    let r = writeback(origin, Arm::Switched, &other_hw(), &restored(ctx), false);
+                    assert_eq!(
+                        r.x[10], fresh as usize,
+                        "{origin:?}: the seeded startup argument"
+                    );
+                    assert_eq!(
+                        r.x[17], 0,
+                        "{origin:?}: no syscall number before the first ecall"
+                    );
+                    for n in (1..32).filter(|n| !(10..=15).contains(n) && *n != 2) {
+                        assert_eq!(r.x[n], 0, "{origin:?}: x{n}");
+                    }
+                }
+                for src in [
+                    include_str!("spawn_thread_core.rs"),
+                    include_str!("exec_state.rs"),
+                ] {
+                    assert!(src.contains("tcb.user_context = UserRegisterContext {\n"));
+                    let ctor = between(src, "tcb.user_context = UserRegisterContext {\n", "};");
+                    assert!(
+                        ctor.contains("user_gprs: [0; 32],"),
+                        "a fresh constructor seeds no register"
+                    );
+                }
+            }
+
+            // ── 16 / 17 / 18 — identity ──────────────────────────────────────────────────
+
+            /// 16 — a dispatch token for ANOTHER incarnation (the right tid, another address
+            /// space) restores nothing, so it can authorize no register write; the exact token
+            /// restores the continuation, whose write-back keeps the contract.
+            #[test]
+            fn c16_a_stale_dispatch_token_restores_nothing() {
+                let w = world(57400);
+                let (a, t) = (w.a, 57500);
+                let k = leak(w.s);
+                let f0 = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0xea3, 0xea4, 0xea5]);
+                let (_r, o) = wait(k, a, t, SQ, 5, P);
+                assert!(matches!(o, FutexParkOutcome::Parked { .. }));
+                let mut f = f0.clone();
+                f.set_ok(1, 0, 0);
+                park_call(k, t, &mut f, kb::futex_wait_dispatch_try_defer);
+                assert_eq!(
+                    k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
+                    1
+                );
+                let stale =
+                    k.stale_dispatch_mark_token_for_test(CpuId(0), t, Asid(a.0.wrapping_add(7)));
+                assert!(
+                    k.direct_dispatch_restore_context_split(stale).is_none(),
+                    "a stale incarnation restores no context"
+                );
+                let exact = k.stale_dispatch_mark_token_for_test(CpuId(0), t, a);
+                let (ctx, _) = k
+                    .direct_dispatch_restore_context_split(exact)
+                    .expect("the exact incarnation");
+                let r = writeback(
+                    Origin::Bridge,
+                    Arm::Switched,
+                    &other_hw(),
+                    &restored(ctx),
+                    false,
+                );
+                assert_contract(&r, &f0, (1, 0, 0));
+            }
+
+            /// 17 — a TCB slot that held a parked continuation (`a7 = 9`, live inputs) and is given
+            /// to a NEW thread: the spawn constructor replaces the whole context, so the new task
+            /// starts with `a7 = 0` and none of the old task's registers.
+            #[test]
+            fn c17_a_new_task_inherits_no_registers() {
+                let mut old = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0x17a3, 0x17a4, 0x17a5]);
+                old.set_ok(1, 0, 0);
+                old.commit_riscv_parked_syscall_returns();
+                let mut tcb = crate::kernel::task::ThreadControlBlock::new(ThreadId(57600), None);
+                tcb.user_context = old.capture_user_context();
+                // What `spawn_thread_core` installs (pinned by c15).
+                tcb.user_context = UserRegisterContext {
+                    instruction_ptr: VirtAddr(0x40_0000),
+                    stack_ptr: VirtAddr(USER_SP as u64),
+                    user_gprs: [0; 32],
+                    user_status: 0,
+                    arg0: 0,
+                    arg1: 0,
+                    arg2: 0,
+                    arg3: 0,
+                    arg4: 0,
+                    arg5: 0,
+                };
+                let r = writeback(
+                    Origin::Bridge,
+                    Arm::Switched,
+                    &other_hw(),
+                    &restored(tcb.user_context),
+                    false,
+                );
+                assert_eq!(r.x[17], 0);
+                assert!(r.x[10..16].iter().all(|&v| v == 0));
+                // A fork child continues its parent's `ecall`: its number and inputs, `a0 = 0`.
+                let parent = call(SYSCALL_FORK_NR, [0, 0, 0, 0x17b3, 0x17b4, 0x17b5]);
+                let child = crate::kernel::syscall::fork_txn::fork_child_context(
+                    &parent.capture_user_context(),
+                );
+                let r = writeback(
+                    Origin::Bridge,
+                    Arm::Switched,
+                    &other_hw(),
+                    &restored(child),
+                    false,
+                );
+                assert_eq!(r.x[10], 0, "the child's zero");
+                for n in [13, 14, 15, 17] {
+                    assert_eq!(r.x[n], parent.user_gpr(n), "fork child x{n}");
+                }
+            }
+
+            /// 18 — an exiting task is given no result and is never resumed: the commit and the
+            /// capture both refuse it, so its saved `a7` and inputs are never written either.
+            #[test]
+            fn c18_an_exiting_task_is_given_nothing() {
+                clear_cells();
+                let w = world(57700);
+                let (a, k) = (w.a, leak(w.s));
+                let t = 57800;
+                k.with(|s| task(s, t, a));
+                let before = saved(k, t);
+                let mut f = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0x18a3, 0x18a4, 0x18a5]);
+                f.set_ok(1, 0, 0);
+                assert!(kb::futex_wait_dispatch_try_defer(0, t));
+                assert!(kb::exit_queue_advance_publish(0, t, Some(a)));
+                assert_eq!(bridge(k, &mut f), (false, false));
+                clear_cells();
+                assert_eq!(saved(k, t), before);
+                assert_eq!(f.user_gpr(10), SQ, "nothing committed into the frame");
+            }
+
+            // ── 19 / 20 / 21 — pc, sp, tp, repetition ──────────────────────────────────────
+
+            /// 19 / 20 — `sepc` is the instruction after the `ecall` and `sp`, `tp` the caller's,
+            /// on every arm that resumes a syscall continuation.
+            #[test]
+            fn c19_c20_pc_sp_and_tp_on_every_continuation_arm() {
+                let f0 = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0x19a3, 0, 0]);
+                let mut done = f0.clone();
+                done.set_ok(1, 0, 0);
+                let mut c = done.clone();
+                c.commit_riscv_parked_syscall_returns();
+                let ctx = c.capture_user_context();
+                let mut cont = restored(ctx);
+                cont.set_ok(1, 0, 0);
+                for (label, r) in [
+                    (
+                        "same",
+                        writeback(Origin::Bridge, Arm::SameTask, &done, &done, false),
+                    ),
+                    (
+                        "switched",
+                        writeback(
+                            Origin::Bridge,
+                            Arm::Switched,
+                            &other_hw(),
+                            &restored(ctx),
+                            false,
+                        ),
+                    ),
+                    (
+                        "continuation",
+                        writeback(Origin::Bridge, Arm::Continuation, &other_hw(), &cont, false),
+                    ),
+                    (
+                        "idle switched",
+                        writeback(
+                            Origin::Idle,
+                            Arm::Switched,
+                            &other_hw(),
+                            &restored(ctx),
+                            false,
+                        ),
+                    ),
+                    (
+                        "idle continuation",
+                        writeback(Origin::Idle, Arm::Continuation, &other_hw(), &cont, false),
+                    ),
+                ] {
+                    assert_eq!(r.sepc, ECALL + 4, "{label}");
+                    assert_eq!(r.x[2], USER_SP, "{label}: sp");
+                    assert_eq!(r.x[4], TP, "{label}: tp");
+                    assert_eq!(r.x[3], GP, "{label}: gp");
+                }
+                // The bridge's import advances once and the write-back adds nothing.
+                assert_eq!(
+                    RV_BOOT
+                        .matches("let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    RV_BOOT
+                        .matches("tframe.set_saved_pc(sepc + advance);")
+                        .count(),
+                    1
+                );
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    assert_eq!(
+                        region(origin)
+                            .matches("frame.sepc = tframe.saved_pc() as u64;")
+                            .count(),
+                        1
+                    );
+                }
+            }
+
+            /// 21 — the same task parks and resumes repeatedly, through different arms, with
+            /// different inputs each time: every resume returns THAT cycle's inputs, never an older
+            /// cycle's.
+            #[test]
+            fn c21_repeated_switches_keep_each_cycles_inputs() {
+                let w = world(57900);
+                let (a, t) = (w.a, 58000);
+                let k = leak(w.s);
+                for cycle in 0..4usize {
+                    let base = 0x2100 + cycle * 0x10;
+                    let f0 = call(
+                        SYSCALL_FUTEX_WAIT_NR,
+                        [SQ, 5, 0, base + 3, base + 4, base + 5],
+                    );
+                    let o = if cycle == 0 {
+                        wait(k, a, t, SQ, 5, P).1
+                    } else {
+                        k.with(|s| run(s, t));
+                        k.futex_wait_park_exact_split(CpuId(0), t, a, SQ, 5, P)
+                    };
+                    assert!(
+                        matches!(o, FutexParkOutcome::Parked { .. }),
+                        "{cycle}: {o:?}"
+                    );
+                    let mut f = f0.clone();
+                    f.set_ok(1, 0, 0);
+                    park_call(k, t, &mut f, kb::futex_wait_dispatch_try_defer);
+                    assert_eq!(
+                        k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"),
+                        1
+                    );
+                    let origin = if cycle % 2 == 0 {
+                        Origin::Bridge
+                    } else {
+                        Origin::Idle
+                    };
+                    let r = writeback(
+                        origin,
+                        Arm::Switched,
+                        &other_hw(),
+                        &restored(saved(k, t)),
+                        false,
+                    );
+                    assert_contract(&r, &f0, (1, 0, 0));
+                }
+            }
+
+            /// 22 — the write-back arms take no lock: no kernel-state accessor, no lock and no
+            /// `with` inside any arm (the census guard pins the production broad-lock count).
+            #[test]
+            fn c22_the_write_back_arms_take_no_lock() {
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    for arm in [Arm::Async, Arm::Continuation, Arm::Switched, Arm::SameTask] {
+                        if origin == Origin::Idle && arm == Arm::SameTask {
+                            continue;
+                        }
+                        let src = arm_src(origin, arm);
+                        for forbidden in [".lock(", "with(", "with_cpu", "_split_mut(", "shared."] {
+                            assert!(
+                                !src.contains(forbidden),
+                                "{origin:?} {arm:?} reaches `{forbidden}`"
+                            );
+                        }
+                    }
+                }
+            }
+
+            /// The evaluator reads every assignment of every arm (an unknown expression or a
+            /// conditional write fails it), and finds the arms where they are.
+            #[test]
+            fn c00_the_evaluator_covers_every_arm() {
+                let f = call(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 1, 2, 3]);
+                let mut ok = f.clone();
+                ok.set_ok(1, 0, 0);
+                let mut er = f.clone();
+                er.set_err(SyscallError::InvalidArgs.code());
+                for origin in [Origin::Bridge, Origin::Idle] {
+                    for arm in [Arm::Async, Arm::Continuation, Arm::Switched, Arm::SameTask] {
+                        if origin == Origin::Idle && arm == Arm::SameTask {
+                            continue;
+                        }
+                        let n = arm_src(origin, arm)
+                            .matches("frame.regs[RiscvTrapFrame::")
+                            .count();
+                        assert!(n >= 6, "{origin:?} {arm:?}: {n} assignments");
+                        let _ = writeback(origin, arm, &other_hw(), &ok, false);
+                        let _ = writeback(origin, arm, &other_hw(), &er, false);
+                    }
+                }
+                assert_eq!(mirror_skips(Origin::Bridge), mirror_skips(Origin::Idle));
+            }
+        }

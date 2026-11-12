@@ -1,0 +1,7 @@
+[detached HEAD 617bf622] RISCV-ECALL-A7-RET1: ecall witness — drop the solo rule, 48 waiter cycles
+ Author: Claude <noreply@anthropic.com>
+ Date: Thu Nov 12 19:57:28 2026 +0000
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+ .../src/control_plane/init/service.rs                         | 11 +++++++----
+ scripts/grade-riscv-ecall-witness.py                          |  8 ++++----
+ 2 files changed, 11 insertions(+), 8 deletions(-)
