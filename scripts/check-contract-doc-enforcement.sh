@@ -32,7 +32,28 @@ rg -q "Mechanism-layer contract freeze" doc/SYSCALL_ABI.md
 # and `src/linux_compat/mod.rs` no longer exist in the tree. Assert the retirement is
 # documented rather than re-asserting a symbol that is gone.
 rg -q "Retired freeze — Linux-compat syscall dispatch table" doc/SYSCALL_ABI.md
-rg -q 'ABI Version: `10`' doc/SYSCALL_ABI.md
+# ABI version: cross-validated, not a hard-coded marker. The kernel's `SYSCALL_ABI_VERSION` is the
+# authority; doc/SYSCALL_ABI.md must declare that same version exactly once. (This line used to
+# grep for a literal `ABI Version: \`10\``, which failed from v11 — FUTEX-REQUEUE1 — onward.)
+abi_code=$(sed -n 's/^pub const SYSCALL_ABI_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' src/kernel/syscall.rs)
+if [[ -z "${abi_code}" ]]; then
+  echo "[gate] SYSCALL_ABI_VERSION not found in src/kernel/syscall.rs"
+  exit 1
+fi
+abi_doc_lines=$(grep -c '^- ABI Version: `[0-9][0-9]*`$' doc/SYSCALL_ABI.md || true)
+abi_doc=$(sed -n 's/^- ABI Version: `\([0-9][0-9]*\)`$/\1/p' doc/SYSCALL_ABI.md)
+if [[ "${abi_doc_lines}" != "1" || "${abi_doc}" != "${abi_code}" ]]; then
+  echo "[gate] ABI version mismatch: code=${abi_code} doc=${abi_doc:-none} (declarations: ${abi_doc_lines})"
+  exit 1
+fi
+# The v11 assignment: NR 17 is FutexCmpRequeue in the kernel, in the user runtime and in the
+# documented syscall table, and the doc records the v10 -> v11 change that assigned it.
+if (( abi_code >= 11 )); then
+  rg -q '^pub const SYSCALL_FUTEX_CMP_REQUEUE_NR: usize = 17;$' src/kernel/syscall.rs
+  rg -q '^    pub const SYSCALL_FUTEX_CMP_REQUEUE_NR: usize = 17;$' crates/yarm-user-rt/src/lib.rs
+  rg -q '^\| `17` \| `FutexCmpRequeue` \| public' doc/SYSCALL_ABI.md
+  rg -q 'v10 → v11 \(FUTEX-REQUEUE1\)' doc/SYSCALL_ABI.md
+fi
 rg -q "TransferRelease" doc/SYSCALL_ABI.md
 rg -q "PROC_CODEC_V2_VERSION = 2" doc/VFS.md
 rg -q "VFS_CODEC_V1_VERSION = 1" doc/VFS.md
