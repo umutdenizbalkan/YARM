@@ -1,0 +1,5 @@
+[futex-wait-witness] building base x86_64 artifacts with futex-requeue-witness,futex-wait-witness
+[futex-wait-witness][fail] base artifact build failed
+[futex-wait-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle,futex-wait-witness
+[futex-wait-witness][fail] feature kernel build failed
+FUTEX_WAIT_WITNESS_SEAL arch=x86_64 smp=2 result=fail reason=build

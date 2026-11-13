@@ -1,0 +1,45 @@
+applied nc29
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 9b6082e1..b6ef970d 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -432,6 +432,9 @@ impl FutexWaiterTable {
+     fn retire_after(&mut self, slot: usize, prev: u16) -> Option<FutexWaiterRecord> {
+         let rec = self.records[slot]?;
+         self.unlink_after(slot, prev);
++        if let Some(d) = rec.deadline {
++            NC29_SLOT_DEADLINE[slot].store(d.saturating_add(1), core::sync::atomic::Ordering::SeqCst);
++        }
+         self.records[slot] = None;
+         self.generations[slot] = self.generations[slot].wrapping_add(1);
+         // FUTEX-TIME1: the deadline dies with its record, here and nowhere else.
+@@ -605,6 +608,9 @@ impl FutexKey {
+ /// Only from `Running`, and only for the exact `{tid, asid}` incarnation (a kernel task's `None`
+ /// compares equal to the reserved `Asid(0)`, the placement owners' normalization). Writes nothing
+ /// when it refuses.
++static NC29_SLOT_DEADLINE: [core::sync::atomic::AtomicU64; MAX_FUTEX_WAITERS] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_FUTEX_WAITERS];
++
+ pub fn register_futex_waiter_locked(
+     tcbs: &mut [Option<ThreadControlBlock>],
+     table: &mut FutexWaiterTable,
+@@ -641,11 +647,18 @@ pub fn register_futex_waiter_locked(
+         tid,
+         tcb: tcb_idx as u16,
+         va,
+-        deadline: None,
++        deadline: match NC29_SLOT_DEADLINE[slot].swap(0, core::sync::atomic::Ordering::SeqCst) {
++            0 => None,
++            d => Some(d - 1),
++        },
+         #[cfg(feature = "futex-time-witness")]
+         g_race: false,
+         next: NIL,
+     });
++    if table.records[slot].is_some_and(|r| r.deadline.is_some()) {
++        table.timed = table.timed.saturating_add(1);
++        FUTEX_TIMED_RECORDS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
++    }
+     table.link_tail(slot);
+     let token = table.token(slot);
+     if let Some(tcb) = tcbs[tcb_idx].as_mut() {

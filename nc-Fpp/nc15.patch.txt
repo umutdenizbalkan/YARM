@@ -1,0 +1,14 @@
+applied nc15
+diff --git a/src/kernel/syscall/sched.rs b/src/kernel/syscall/sched.rs
+index c444b7ff..9b2f40b1 100644
+--- a/src/kernel/syscall/sched.rs
++++ b/src/kernel/syscall/sched.rs
+@@ -85,7 +85,7 @@ pub(crate) fn decode_futex_wait_args(frame: &TrapFrame) -> Result<FutexWaitArgs,
+     let mut key_frame = frame.clone();
+     key_frame.set_arg(SYSCALL_ARG_LEN, flags & !FUTEX_FLAG_TIMED);
+     let key = decode_futex_args(&key_frame)?;
+-    let timeout_ns = (flags & FUTEX_FLAG_TIMED != 0).then(|| frame.arg(3) as u64);
++    let timeout_ns = (frame.arg(3) != 0 || flags & FUTEX_FLAG_TIMED != 0).then(|| frame.arg(3) as u64);
+     Ok(FutexWaitArgs { key, timeout_ns })
+ }
+ 

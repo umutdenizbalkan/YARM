@@ -1,0 +1,16 @@
+applied nc28
+diff --git a/src/arch/x86_64/trap.rs b/src/arch/x86_64/trap.rs
+index 84ae536f..101f4b70 100644
+--- a/src/arch/x86_64/trap.rs
++++ b/src/arch/x86_64/trap.rs
+@@ -482,9 +482,7 @@ pub(crate) fn encode_x86_blocked_completion(
+     } else {
+         frame.set_err(done.result as usize);
+     }
+-    if done.syscall_class == crate::kernel::task::BlockedSyscallClass::FutexWait {
+-        frame.commit_x86_syscall_returns();
+-    }
++    let _ = done.syscall_class;
+ }
+ 
+ /// U3 (canonical 203C) — the arch half of the owner-revalidation transaction, with NO lock

@@ -1,0 +1,17 @@
+diff --git a/src/kernel/boot/tests.rs b/src/kernel/boot/tests.rs
+index 4ec25676..1bbae8d4 100644
+--- a/src/kernel/boot/tests.rs
++++ b/src/kernel/boot/tests.rs
+@@ -218511,3 +218511,12 @@ mod futex_requeue1 {
+         }
+     }
+ }
++
++#[test]
++fn m01b_baseline_footprint() {
++    extern crate std;
++    std::println!("M_SIZE_B FutexWaiterTable={} ThreadControlBlock={} BlockedSyscallCompletion={}",
++        core::mem::size_of::<crate::kernel::boot::futex::FutexWaiterTable>(),
++        core::mem::size_of::<crate::kernel::task::ThreadControlBlock>(),
++        core::mem::size_of::<crate::kernel::task::BlockedSyscallCompletion>());
++}

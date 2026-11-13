@@ -1,0 +1,6 @@
+F' checks=132 pass=107; B checks=129 pass=107
+only at F': [('futex-time-witness', 'aarch64'), ('futex-time-witness', 'riscv64'), ('futex-time-witness', 'x86_64')] [0, 0, 0]
+only at B: []
+F' fails, B passes (NEW): [('futex-wait-witness', 'aarch64'), ('futex-wait-witness', 'riscv64'), ('futex-wait-witness', 'x86_64')]
+F' passes, B fails: []
+fail on both (inherited): ['apsched-witness/x86_64', 'kstack-probe-access/aarch64', 'kstack-probe-access/riscv64', 'kstack-probe-access/x86_64', 'kstack-probe-frame/aarch64', 'kstack-probe-frame/riscv64', 'kstack-probe-frame/x86_64', 'kstack-probe-recursion/aarch64', 'kstack-probe-recursion/riscv64', 'kstack-probe-recursion/x86_64', 'kstack-probe/aarch64', 'kstack-probe/riscv64', 'kstack-probe/x86_64', 'kthread1-witness/aarch64', 'kthread1-witness/riscv64', 'kthread1-witness/x86_64', 'lock-witness/aarch64', 'lock-witness/riscv64', 'lock-witness/x86_64', 'sched-lock1-witness/aarch64', 'sched-lock1-witness/riscv64', 'sched-lock1-witness/x86_64']

@@ -1,0 +1,4 @@
+[futex-wait-grade] self-test ok
+[futex-requeue-grade] self-test ok
+[riscv-ecall-grade] self-test ok (17 refusals, 1 pass)
+FUTEX_TIME_WITNESS_GRADER_SELF_TEST result=ok

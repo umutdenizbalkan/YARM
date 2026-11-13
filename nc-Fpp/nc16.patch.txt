@@ -1,0 +1,14 @@
+applied nc16
+diff --git a/src/kernel/syscall/sched.rs b/src/kernel/syscall/sched.rs
+index c444b7ff..8b006019 100644
+--- a/src/kernel/syscall/sched.rs
++++ b/src/kernel/syscall/sched.rs
+@@ -113,7 +113,7 @@ pub(crate) const fn futex_timeout_ticks(timeout_ns: u64, period_ns: u64) -> u64
+ pub(crate) fn futex_wait_deadline(now: u64, timeout_ns: u64) -> Option<u64> {
+     let period = crate::arch::platform_constants::SCHED_TICK_PERIOD_NS;
+     let ticks = futex_timeout_ticks(timeout_ns, period);
+-    let deadline = now.checked_add(ticks);
++    let deadline = Some(now.wrapping_add(ticks));
+     #[cfg(feature = "futex-time-witness")]
+     crate::kernel::boot::futex::time_witness::deadline(timeout_ns, period, ticks, now, deadline);
+     deadline

@@ -1,0 +1,2 @@
+b31cd5b9db27056250f079a7f2e907e738a7d907c8cedd32b928555222277ece  build-riscv64/yarm-riscv64.bin
+3fe73e962be10172e0ca683131aa254095a9a345012dfa2e9d4034d7bf9ea624  build-riscv64/initramfs-core.cpio

@@ -1,0 +1,51 @@
+[futex-time-witness][fail] cell reported FTW_FAIL what=A
+[futex-time-witness][fail] cell reported FTW_FAIL what=A
+[futex-time-witness][fail] cell reported FTW_FAIL what=A
+[futex-time-witness][fail] cell reported FTW_FAIL what=B2
+[futex-time-witness][fail] cell reported FTW_FAIL what=C
+[futex-time-witness][fail] cell reported FTW_FAIL what=D2
+[futex-time-witness][fail] expected exactly one U_DONE, saw 0
+[futex-time-witness][fail] expected exactly one U_WAITER_DONE, saw 0
+[futex-time-witness][fail] calls per role {'A': 3, 'B': 1, 'B2': 1, 'C': 1, 'D': 1, 'D2': 1, 'G': 22}, expected {'A': 3, 'B': 1, 'B2': 1, 'C': 1, 'D': 1, 'D2': 1, 'G': 32, 'E': 1}
+[futex-time-witness][fail] call 1 (A): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 1 (A): result woken, sequence requires timed_out
+[futex-time-witness][fail] call 2 (A): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 2 (A): result woken, sequence requires timed_out
+[futex-time-witness][fail] call 3 (A): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 3 (A): result woken, sequence requires timed_out
+[futex-time-witness][fail] call 5 (B2): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 5 (B2): result woken, sequence requires timed_out
+[futex-time-witness][fail] call 6 (C): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 6 (C): result woken, sequence requires timed_out
+[futex-time-witness][fail] call 8 (D2): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 8 (D2): result woken, sequence requires timed_out
+[futex-time-witness][fail] call 9 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 10 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 11 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 12 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 13 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 14 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 15 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 16 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 17 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 18 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 19 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 20 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 21 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 22 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 23 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 24 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 25 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 26 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 27 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 28 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 29 (G): kernel TIMEOUT but ring 3 saw woken
+[futex-time-witness][fail] call 30 (G): never returned
+[futex-time-witness][fail] gen 30: a window decision for a non-G cycle
+[futex-time-witness][fail] G coverage: woken=0 timed_out=21 (need both >= 1)
+[futex-time-witness][fail] expected exactly one U_G_SUMMARY, saw 0
+[futex-time-witness][fail] expected exactly one U_E_SATURATED, saw 0
+[futex-time-witness][fail] E: spawning must stop at exactly one SchedulerFull refusal (kernel: [])
+[futex-time-witness][fail] expected exactly one U_E_EXPIRED_SEEN, saw 0
+[futex-time-witness][fail] core smoke not clean (rc=0): ['[fail] RISC-V Yield split dispatch is not reconciled with its committed yield transactions (nr0=8054 committed=8055 unpaired_or_wrong_disposition=1)']
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail a_idle_collections=2 g_woken=0 g_timed_out=21 g_windows_woke=5 g_windows_refused=3 g_skipped=13 in_window_wakes=5 e_spawn_refusal=none calls=30 cycles=29

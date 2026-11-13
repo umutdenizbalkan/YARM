@@ -1,0 +1,14 @@
+applied nc10
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 9b6082e1..24b5ad60 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -435,7 +435,7 @@ impl FutexWaiterTable {
+         self.records[slot] = None;
+         self.generations[slot] = self.generations[slot].wrapping_add(1);
+         // FUTEX-TIME1: the deadline dies with its record, here and nowhere else.
+-        if rec.deadline.is_some() {
++        if rec.deadline.is_some() && rec.tid == u64::MAX {
+             self.timed = self.timed.saturating_sub(1);
+             FUTEX_TIMED_RECORDS.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+         }

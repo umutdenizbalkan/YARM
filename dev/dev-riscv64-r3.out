@@ -1,0 +1,12 @@
+[futex-time-witness] building base riscv64 artifacts with futex-requeue-witness,futex-time-witness
+[futex-time-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,futex-time-witness
+[futex-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-time-witness][fail] cell reported FTW_FAIL what=E_saturation
+[futex-time-witness][fail] FTW_DONE result=fail
+[futex-time-witness][fail] FTW_WAITER_DONE fails=1
+[futex-time-witness][fail] E: fillers=144 spawn_refused=0 — not saturated
+[futex-time-witness][fail] E: the cell counted 144 fillers, the kernel spawned 0 for H
+[futex-time-witness][fail] E: spawning must stop at exactly one SchedulerFull refusal (kernel: [])
+[futex-time-witness][fail] E: no FUTEX_TIMEOUT_EXPIRED_UNPLACED for the waiter — the queue was not full
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail a_idle_collections=1 g_woken=10 g_timed_out=22 g_windows_woke=8 g_windows_refused=0 g_skipped=14 in_window_wakes=8 e_spawn_refusal=none calls=41 cycles=41
+rc=1

@@ -1,0 +1,8 @@
+tree=5e65684e0bec168e7aaaa26872b0eef3cc3ca3cc head=85f23d6123d0e5aa3c1f0d00e083c782d9b10627 dirty=0 kernel_features=--no-default-features --features riscv64-sched-lock1-witness userspace_features=--no-default-features
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=virt cpu=rv64 cmdline=console=ttyS0 rdinit=/init
+firmware_path=/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin firmware_banner=OpenSBI v1.3
+69c50d13d3d0b33af41024e86f5698cc25f4abee4fa0dac443475f138de042a0  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-evidence/addF/FX6F-Fd-3/build/yarm-riscv64-apsw.bin
+7344054402f442f71927c12e88c4dd830224a8f04fece016939a2ce66abdd2e0  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-evidence/addF/FX6F-Fd-3/build/yarm-riscv64-apsw.elf
+06ea89a74ab9b0608297908f37285a9289900d957204b79a1261700ff4ca9b65  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-evidence/addF/FX6F-Fd-3/build/initramfs-core.cpio
+171a91cceeb419d5cf238008c77641a13c4783d2540fec9294b1ba969bfa095d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-evidence/addF/FX6F-Fd-3/build/opensbi-fw_dynamic.bin
+boot smp=2

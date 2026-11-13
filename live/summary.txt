@@ -1,0 +1,56 @@
+live start 2026-11-13T11:31:35Z candidate=04a09b2b [04a09b2b porcelain=0]
+LT-riscv64-1 [04a09b2b porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=ok a_idle_collections=3 g_woken=5 g_timed_out=27 g_windows_woke=11 g_windows_refused=0 g_skipped=16 in_window_wakes=11 e_spawn_refusal=SchedulerFull e_fillers=128 e_pings=4484 calls=41 cycles=41
+LT-aarch64-1 [04a09b2b porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=aarch64 smp=2 result=ok a_idle_collections=3 g_woken=11 g_timed_out=21 g_windows_woke=10 g_windows_refused=6 g_skipped=5 in_window_wakes=10 e_spawn_refusal=SchedulerFull e_fillers=129 e_pings=17609 calls=41 cycles=41
+LT-x86_64-1 [04a09b2b porcelain=0] rc=1 FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=fail a_idle_collections=3 g_woken=12 g_timed_out=20 g_windows_woke=11 g_windows_refused=0 g_skipped=9 in_window_wakes=11 e_spawn_refusal=SchedulerFull calls=41 cycles=40
+          1 [futex-time-witness][fail] expected exactly one U_WAITER_DONE, saw 0
+          1 [futex-time-witness][fail] expected exactly one U_E_EXPIRED_SEEN, saw 0
+          1 [futex-time-witness][fail] expected exactly one U_DONE, saw 0
+          1 [futex-time-witness][fail] call N (E): never returned
+LT-riscv64-2 [04a09b2b porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=ok a_idle_collections=1 g_woken=8 g_timed_out=24 g_windows_woke=11 g_windows_refused=0 g_skipped=13 in_window_wakes=11 e_spawn_refusal=SchedulerFull e_fillers=128 e_pings=2502 calls=41 cycles=41
+LT-aarch64-2 [04a09b2b porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=aarch64 smp=2 result=ok a_idle_collections=3 g_woken=12 g_timed_out=20 g_windows_woke=15 g_windows_refused=3 g_skipped=2 in_window_wakes=15 e_spawn_refusal=SchedulerFull e_fillers=128 e_pings=15350 calls=41 cycles=41
+LT-x86_64-2 [04a09b2b porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=ok a_idle_collections=3 g_woken=12 g_timed_out=20 g_windows_woke=8 g_windows_refused=0 g_skipped=12 in_window_wakes=8 e_spawn_refusal=SchedulerFull e_fillers=129 e_pings=5406 calls=41 cycles=41
+LT-riscv64-3 [04a09b2b porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=ok a_idle_collections=2 g_woken=9 g_timed_out=23 g_windows_woke=12 g_windows_refused=0 g_skipped=11 in_window_wakes=12 e_spawn_refusal=SchedulerFull e_fillers=128 e_pings=2268 calls=41 cycles=41
+LT-aarch64-3 [04a09b2b porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=aarch64 smp=2 result=ok a_idle_collections=3 g_woken=11 g_timed_out=21 g_windows_woke=16 g_windows_refused=2 g_skipped=3 in_window_wakes=16 e_spawn_refusal=SchedulerFull e_fillers=129 e_pings=16463 calls=41 cycles=41
+LT-x86_64-3 [04a09b2b porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=ok a_idle_collections=3 g_woken=12 g_timed_out=20 g_windows_woke=14 g_windows_refused=0 g_skipped=6 in_window_wakes=14 e_spawn_refusal=SchedulerFull e_fillers=128 e_pings=5231 calls=41 cycles=41
+L-nc2 [1ec8ef09 porcelain=0] rc=1 FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail a_idle_collections=2 g_woken=0 g_timed_out=21 g_windows_woke=5 g_windows_refused=3 g_skipped=13 in_window_wakes=5 e_spawn_refusal=none calls=30 cycles=29
+         21 [futex-time-witness][fail] call N (G): kernel TIMEOUT but ring 3 saw woken
+          3 [futex-time-witness][fail] cell reported FTW_FAIL what=A
+          3 [futex-time-witness][fail] call N (A): result woken, sequence requires timed_out
+          3 [futex-time-witness][fail] call N (A): kernel TIMEOUT but ring 3 saw woken
+          1 [futex-time-witness][fail] gen N: a window decision for a non-G cycle
+          1 [futex-time-witness][fail] expected exactly one U_WAITER_DONE, saw 0
+L-nc28 [1ac80b9b porcelain=0] rc=1 FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=fail a_idle_collections=3 g_woken=32 g_timed_out=0 g_windows_woke=0 g_windows_refused=0 g_skipped=0 in_window_wakes=0 e_spawn_refusal=SchedulerFull e_fillers=129 e_pings=4882 calls=41 cycles=41
+         32 [futex-time-witness][fail] cell reported FTW_FAIL what=G
+         32 [futex-time-witness][fail] call N (G): kernel WAKE but ring 3 saw error InvalidNumber
+          3 [futex-time-witness][fail] cell reported FTW_FAIL what=A
+          3 [futex-time-witness][fail] call N (A): result error, sequence requires timed_out
+          3 [futex-time-witness][fail] call N (A): kernel TIMEOUT but ring 3 saw error Internal
+          1 [futex-time-witness][fail] cell reported FTW_FAIL what=E
+LW-riscv64 [04a09b2b porcelain=0] rc=1 FUTEX_WAIT_WITNESS_SEAL arch=riscv64 smp=2 result=fail reason=build
+LW-aarch64 [04a09b2b porcelain=0] rc=1 FUTEX_WAIT_WITNESS_SEAL arch=aarch64 smp=2 result=fail reason=build
+LW-x86_64 [04a09b2b porcelain=0] rc=1 FUTEX_WAIT_WITNESS_SEAL arch=x86_64 smp=2 result=fail reason=build
+LE [04a09b2b porcelain=0] rc=1 RISCV_ECALL_WITNESS_SEAL arch=riscv64 smp=2 result=fail reason=build
+LS-x86_64 [04a09b2b porcelain=0] rc=0 IRQSAT_WITNESS_SEAL arch=x86_64 items=8 saturation_interrupts=10 queued=8 coalesced=2 received=9 result=ok
+LS-aarch64 [04a09b2b porcelain=0] rc=0 IRQSAT_WITNESS_SEAL arch=aarch64 items=8 saturation_interrupts=10 queued=8 coalesced=2 received=9 result=ok
+LS-riscv64 [04a09b2b porcelain=0] rc=0 IRQSAT_WITNESS_SEAL arch=riscv64 items=8 saturation_interrupts=10 queued=8 coalesced=2 received=9 result=ok
+live end 2026-11-13T12:58:44Z
+LIVE_DONE
+liveC start 2026-11-13T13:35:09Z candidate=fb1406666e466400c74a3f92361cdb44e38fa17a [fb140666 porcelain=0]
+ID-riscv64 [fb140666 porcelain=0] rc=0 identical vs LT-riscv64-1
+ID-aarch64 [fb140666 porcelain=0] rc=0 identical vs LT-aarch64-1
+ID-x86_64 [fb140666 porcelain=0] rc=0 identical vs LT-x86_64-1
+LW-riscv64-C [fb140666 porcelain=0] rc=0 FUTEX_WAIT_WITNESS_SEAL arch=riscv64 smp=2 waits=9 skipped=23 windows=13 refused=0 b_changed=5 a=4 in_window_wakes=13 waiter_cpus=1 waker_cpus=0 calls=32 returns=32 blocked=27 mismatch=5 during_publication=4 parked=23 parked_ok=23 parked_err=0 dup_or_missing=0 witness=ok core_smoke=ok result=ok
+LW-aarch64-C [fb140666 porcelain=0] rc=0 FUTEX_WAIT_WITNESS_SEAL arch=aarch64 smp=2 waits=30 skipped=2 windows=46 refused=0 b_changed=14 a=16 in_window_wakes=46 waiter_cpus=1 waker_cpus=0 calls=32 returns=32 blocked=18 mismatch=14 during_publication=16 parked=2 parked_ok=2 parked_err=0 dup_or_missing=0 witness=ok core_smoke=ok result=ok
+LW-x86_64-C [fb140666 porcelain=0] rc=0 FUTEX_WAIT_WITNESS_SEAL arch=x86_64 smp=2 waits=18 skipped=13 windows=25 refused=0 b_changed=11 a=7 in_window_wakes=25 waiter_cpus=1 waker_cpus=0 calls=32 returns=32 blocked=20 mismatch=12 during_publication=7 parked=13 parked_ok=13 parked_err=0 dup_or_missing=0 witness=ok core_smoke=ok result=ok
+LE-C [fb140666 porcelain=0] rc=0 RISCV_ECALL_WITNESS_SEAL arch=riscv64 smp=2 probes=144 fresh=9 yield_switched=72 yield_same=8 wait_parked=14 wait_own=34 wait_early=14 wait_mismatch=12 requeue_parked=8 recv_blocked=8 spin_async=9 solo_switched=0 async_in_probe=6 lost_a3=0 lost_a7=0 lost_other=0 core_smoke=ok result=ok
+LT-x86_64-4 [fb140666 porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=ok a_idle_collections=3 g_woken=12 g_timed_out=20 g_windows_woke=9 g_windows_refused=0 g_skipped=11 in_window_wakes=9 e_spawn_refusal=SchedulerFull e_fillers=129 e_pings=5409 calls=41 cycles=41
+LT-x86_64-5 [fb140666 porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=ok a_idle_collections=3 g_woken=12 g_timed_out=20 g_windows_woke=10 g_windows_refused=0 g_skipped=10 in_window_wakes=10 e_spawn_refusal=SchedulerFull e_fillers=128 e_pings=5683 calls=41 cycles=41
+LT-x86_64-6 [fb140666 porcelain=0] rc=0 FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=ok a_idle_collections=3 g_woken=12 g_timed_out=20 g_windows_woke=12 g_windows_refused=0 g_skipped=8 in_window_wakes=12 e_spawn_refusal=SchedulerFull e_fillers=128 e_pings=5862 calls=41 cycles=41
+liveC end 2026-11-13T14:20:14Z
+LIVEC_DONE
+liveD start 2026-11-13T18:34:22Z candidate=fb1406666e466400c74a3f92361cdb44e38fa17a [fb140666 porcelain=0]
+LS-x86_64-D [fb140666 porcelain=0] rc=0 kernel identical vs LS-x86_64 (130e77fd07e080fb30ebceab0f104a226c9281a546b95cafa9140488cf6b1eaf) IRQSAT_WITNESS_SEAL arch=x86_64 items=8 saturation_interrupts=10 queued=8 coalesced=2 received=9 result=ok
+LS-aarch64-D [fb140666 porcelain=0] rc=0 kernel identical vs LS-aarch64 (e68eef6fc1e33bd12bbde022018e7147604e6f885f629db3ff66a6b0acfaaa68) IRQSAT_WITNESS_SEAL arch=aarch64 items=8 saturation_interrupts=10 queued=8 coalesced=2 received=9 result=ok
+LS-riscv64-D [fb140666 porcelain=0] rc=1 kernel identical vs LS-riscv64 (5d7c25eb4f7fb103771b3875a808e05dc32356cde357d9ffaea135e73c85f8a9) IRQSAT_WITNESS_SEAL arch=riscv64 result=fail
+liveD end 2026-11-13T18:38:48Z
+LIVED_DONE

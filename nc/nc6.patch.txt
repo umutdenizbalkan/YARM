@@ -1,0 +1,23 @@
+applied nc6
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 97badfb1..279e883b 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1065,8 +1065,7 @@ pub fn collect_due_futex_timeouts_locked(
+             continue;
+         };
+         timed_seen += 1;
+-        if deadline > now || matches!(rec.key, FutexKey::Pending { .. }) || !table.live(tcbs, slot)
+-        {
++        if deadline > now || !table.live(tcbs, slot) {
+             continue;
+         }
+         out[n] = Some(FutexTimeoutCandidate {
+@@ -1168,7 +1167,6 @@ fn timeout_claimable(
+     };
+     rec.tid == candidate.tid
+         && rec.deadline.is_some_and(|d| d <= now)
+-        && !matches!(rec.key, FutexKey::Pending { .. })
+         && table.live(tcbs, slot)
+ }
+ 

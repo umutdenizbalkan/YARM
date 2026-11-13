@@ -1,0 +1,15 @@
+applied nc13
+diff --git a/src/kernel/boot/ipc_state.rs b/src/kernel/boot/ipc_state.rs
+index 3b5c0cb8..fc719c6f 100644
+--- a/src/kernel/boot/ipc_state.rs
++++ b/src/kernel/boot/ipc_state.rs
+@@ -3364,9 +3364,6 @@ impl KernelState {
+     ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+         use crate::kernel::task::BlockedSyscallClass;
+         self.take_blocked_syscall_completion_of_class(tid, BlockedSyscallClass::IpcSend)
+-            .or_else(|| {
+-                self.take_blocked_syscall_completion_of_class(tid, BlockedSyscallClass::FutexWait)
+-            })
+     }
+ 
+     /// U6 §2 — PUBLISH the completion of a blocked send, for the exact cycle a

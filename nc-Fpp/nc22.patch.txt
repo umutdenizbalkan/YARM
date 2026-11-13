@@ -1,0 +1,18 @@
+applied nc22
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 9b6082e1..0c244bcc 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1588,7 +1588,11 @@ pub fn compare_and_requeue_locked(
+             if selected < woken {
+                 woken = selected;
+             }
+-            rekey(table, slot, prev, t_key, Some(target.0 as u64));
++            if table.records[slot].is_some_and(|r| r.deadline.is_some()) {
++                let _ = prev;
++            } else {
++                rekey(table, slot, prev, t_key, Some(target.0 as u64));
++            }
+             moved += 1;
+         } else {
+             break;

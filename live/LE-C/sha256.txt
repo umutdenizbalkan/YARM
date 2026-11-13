@@ -1,0 +1,3 @@
+70237b14e8af5f0a8b17c077687e072d2da916482cb589bef842b2faa2c4b00e  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-evidence/live/LE-C/boot.log
+9d54f7f0a3c47551ce46e042cc551b3b2d5a1eb411e77b481e29d00ed210659f  build-riscv64/yarm-riscv64.bin
+d30055a98eb6f08249fd3f4b6b8cfde2ddc7b9fe21af5edc0611a9aca4f405dc  build-riscv64/initramfs-core.cpio

@@ -1,0 +1,75 @@
+ Cargo.toml                                         |    2 +
+ crates/yarm-control-plane-servers/Cargo.toml       |    2 +
+ .../src/control_plane/init/service.rs              |  554 +++++++-
+ crates/yarm-driver-servers/Cargo.toml              |    1 +
+ crates/yarm-fs-servers/Cargo.toml                  |    1 +
+ crates/yarm-user-rt/src/lib.rs                     |   85 +-
+ doc/AI_AGENT_RULES.md                              |   12 +
+ doc/KERNEL_LOCKING.md                              |    9 +-
+ doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md              |    3 +
+ doc/SCHEDULING_CONTRACT.md                         |    2 +
+ doc/SYSCALL_ABI.md                                 |   60 +-
+ scripts/grade-futex-time-witness.py                |  655 ++++++++++
+ scripts/qemu-futex-time-witness-smoke.sh           |  109 ++
+ src/arch/aarch64/platform_layout.rs                |    7 +
+ src/arch/aarch64/trap.rs                           |   13 +-
+ src/arch/platform_constants.rs                     |    3 +
+ src/arch/riscv64/platform_layout.rs                |    7 +
+ src/arch/riscv64/trap.rs                           |   23 +-
+ src/arch/trap_entry.rs                             |    7 +
+ src/arch/x86_64/platform_layout.rs                 |    7 +
+ src/arch/x86_64/trap.rs                            |   37 +-
+ src/kernel/boot/exec_state.rs                      |   52 +-
+ src/kernel/boot/futex.rs                           |  651 ++++++++-
+ src/kernel/boot/ipc_state.rs                       |   17 +
+ src/kernel/boot/mod.rs                             |   12 +
+ src/kernel/boot/tests.rs                           | 1381 +++++++++++++++++++-
+ src/kernel/kthread.rs                              |    2 +
+ src/kernel/syscall/sched.rs                        |   99 +-
+ src/kernel/syscall_split.rs                        |   82 +-
+ src/kernel/task.rs                                 |   56 +
+ src/kernel/trapframe.rs                            |   17 +
+ src/runtime.rs                                     |  236 +++-
+ tests/sched_lock1_grader_cli.rs                    |    5 +-
+ 33 files changed, 4120 insertions(+), 89 deletions(-)
+ crates/yarm-control-plane-servers/Cargo.toml       |   2 +
+ .../src/control_plane/init/service.rs              | 554 +++++++++++++++++-
+ crates/yarm-driver-servers/Cargo.toml              |   1 +
+ crates/yarm-fs-servers/Cargo.toml                  |   1 +
+ crates/yarm-user-rt/src/lib.rs                     |  85 ++-
+ src/arch/aarch64/platform_layout.rs                |   7 +
+ src/arch/aarch64/trap.rs                           |  13 +-
+ src/arch/platform_constants.rs                     |   3 +
+ src/arch/riscv64/platform_layout.rs                |   7 +
+ src/arch/riscv64/trap.rs                           |  23 +-
+ src/arch/trap_entry.rs                             |   7 +
+ src/arch/x86_64/platform_layout.rs                 |   7 +
+ src/arch/x86_64/trap.rs                            |  37 +-
+ src/kernel/boot/exec_state.rs                      |  52 +-
+ src/kernel/boot/futex.rs                           | 651 ++++++++++++++++++++-
+ src/kernel/boot/ipc_state.rs                       |  17 +
+ src/kernel/boot/mod.rs                             |  12 +
+ src/kernel/kthread.rs                              |   2 +
+ src/kernel/syscall/sched.rs                        |  99 +++-
+ src/kernel/syscall_split.rs                        |  82 ++-
+ src/kernel/task.rs                                 |  56 ++
+ src/kernel/trapframe.rs                            |  17 +
+ src/runtime.rs                                     | 236 +++++++-
+ 23 files changed, 1918 insertions(+), 53 deletions(-)
+fb140666 FUTEX-TIME1: futex-wait-witness marker covers the TimedOut park outcome
+27956ed9 FUTEX-TIME1: tests for the resume takes and the cycle identity of a timed wait
+04a09b2b FUTEX-TIME1: agent rules, collector lock sequence, x86 resume lanes
+e4f6c0bb FUTEX-TIME1: x86_64 resumed timed waits return their result in registers
+d9eee449 FUTEX-TIME1: witness E waits 60 s so its deadline passes on a full queue
+f28f160a FUTEX-TIME1: witness E fillers get TLS; grader takes the kernel's spawn record
+7d9bedc5 FUTEX-TIME1: document timed FutexWait (relative ns), timeout collector, two observations
+a4be8174 FUTEX-TIME1: live timed-wait witness cell, smoke and fail-closed grader
+2f3be94d FUTEX-TIME1: kernel half of the live timed-wait witness
+ef7e8a3f FUTEX-TIME1: user-rt timed wait, collector bound, 41 hosted tests
+73ba1971 FUTEX-TIME1: timed FutexWait with exact timeout/wake/requeue arbitration
+69:pub const FUTEX_FLAG_TIMED: usize = 1 << 1;
+72:/// Every flag NR 9 defines: the key flags and [`FUTEX_FLAG_TIMED`].
+73:pub const FUTEX_WAIT_FLAGS_DEFINED: usize = FUTEX_FLAGS_DEFINED | FUTEX_FLAG_TIMED;
+src/arch/x86_64/trap.rs:472:/// ([`TrapFrame::commit_x86_syscall_returns`]): these consumers resume a task on another task's
+src/arch/x86_64/trap.rs:486:        frame.commit_x86_syscall_returns();
+src/kernel/trapframe.rs:213:    pub(crate) fn commit_x86_syscall_returns(&mut self) {

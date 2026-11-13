@@ -1,0 +1,62 @@
+diff --git a/src/kernel/boot/tests.rs b/src/kernel/boot/tests.rs
+index 38b1aa14..55089a20 100644
+--- a/src/kernel/boot/tests.rs
++++ b/src/kernel/boot/tests.rs
+@@ -215835,6 +215835,57 @@ mod futex_requeue1 {
+             assert!(RT.contains("if !pending.consumed_with_send() {"));
+         }
+ 
++        #[test]
++        fn m01_measure_collector_and_footprint() {
++            extern crate std;
++            use std::println;
++            println!("M_SIZE FutexWaiterTable={} ThreadControlBlock={} BlockedSyscallCompletion={} FutexTimeoutCandidate={} due_array={}",
++                core::mem::size_of::<fx::FutexWaiterTable>(),
++                core::mem::size_of::<crate::kernel::task::ThreadControlBlock>(),
++                core::mem::size_of::<BlockedSyscallCompletion>(),
++                core::mem::size_of::<fx::FutexTimeoutCandidate>(),
++                core::mem::size_of::<[Option<fx::FutexTimeoutCandidate>; fx::FUTEX_TIMEOUT_DUE_MAX]>());
++            for n in [1usize, 64, 256, 440] {
++                let mut w = world(79000 + n as u64);
++                let mut ts = Vec::new();
++                for _ in 0..n {
++                    ts.push(tpark(&mut w, SQ, 5, P, 10));
++                }
++                w.back();
++                let k = leak(w.s);
++                // not yet due: one pass examines what?
++                let idle = collect(k, 9);
++                let t0 = std::time::Instant::now();
++                let p0 = collect(k, 9);
++                let idle_ns = t0.elapsed().as_nanos();
++                let mut passes = 0;
++                let mut done = 0;
++                let mut max_examined = 0;
++                let mut max_due = 0;
++                let mut max_ns = 0u128;
++                while done < n as u32 && passes < 10_000 {
++                    let t = std::time::Instant::now();
++                    let p = collect(k, 10 + passes as u64);
++                    max_ns = max_ns.max(t.elapsed().as_nanos());
++                    max_examined = max_examined.max(p.examined);
++                    max_due = max_due.max(p.due);
++                    done += p.timed_out;
++                    passes += 1;
++                    // Dispatch stand-in: take every placed waiter back off CPU 0's queue.
++                    k.with(|s| {
++                        for &t in &ts {
++                            if timed_out(s, t) {
++                                drain_one(s, t);
++                            }
++                        }
++                    });
++                }
++                println!("M_COLLECT timed={} idle_examined={} idle_examined2={} idle_pass_ns={} drain_passes={} max_examined={} max_due={} max_pass_ns={} settled={}",
++                    n, idle.examined, p0.examined, idle_ns, passes, max_examined, max_due, max_ns, done);
++                assert_eq!(done, n as u32);
++            }
++        }
++
+         /// 42 — x86_64, the switched resume (live defect found by the FUTEX-TIME1 witness): a
+         /// parked timed wait is resumed on ANOTHER task's trap, where the epilogue restores the
+         /// continuation's registers (RAX, RCX = error, RDX, R8), not the frame's fields. The

@@ -1,0 +1,16 @@
+applied nc24
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 97badfb1..e625a358 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1065,7 +1065,9 @@ pub fn collect_due_futex_timeouts_locked(
+             continue;
+         };
+         timed_seen += 1;
+-        if deadline > now || matches!(rec.key, FutexKey::Pending { .. }) || !table.live(tcbs, slot)
++        if deadline > now
++            || matches!(rec.key, FutexKey::Pending { .. } | FutexKey::Expired { .. })
++            || !table.live(tcbs, slot)
+         {
+             continue;
+         }

@@ -1,0 +1,23 @@
+applied nc12
+diff --git a/src/kernel/syscall_split.rs b/src/kernel/syscall_split.rs
+index e4427433..27066cb3 100644
+--- a/src/kernel/syscall_split.rs
++++ b/src/kernel/syscall_split.rs
+@@ -5699,7 +5699,7 @@ fn try_split_futex_wait_recognized(
+             // (`Internal`) — never `1` — and the terminal claim parks the real result as its
+             // `FutexWait` completion, which the resume boundary encodes over this.
+             if deadline.is_some() {
+-                frame.set_err(SyscallError::Internal.code());
++                frame.set_ok(1, 0, 0);
+             } else {
+                 frame.set_ok(1, 0, 0);
+             }
+@@ -5742,7 +5742,7 @@ fn try_split_futex_wait_recognized(
+             // FUTEX-TIME1: a timed cycle's completion stays parked for the resume that consumes
+             // it; the captured frame carries the fail-closed provisional, never `1`.
+             if deadline.is_some() {
+-                frame.set_err(SyscallError::Internal.code());
++                frame.set_ok(1, 0, 0);
+             } else {
+                 frame.set_ok(1, 0, 0);
+             }

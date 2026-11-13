@@ -1,0 +1,13 @@
+applied nc3
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 9b6082e1..d500c34a 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1117,7 +1117,6 @@ pub fn claim_futex_timeout_locked(
+         return false;
+     };
+     tcb.status = TaskStatus::Runnable;
+-    table.retire(slot);
+     publish_futex_wait_completion_locked(tcb, FutexWaitEnding::TimedOut);
+     true
+ }

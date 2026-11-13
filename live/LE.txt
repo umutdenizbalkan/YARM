@@ -1,0 +1,4 @@
+[riscv-ecall-witness] building base riscv64 artifacts with futex-requeue-witness,riscv-ecall-witness
+[riscv-ecall-witness] rebuilding the kernel with riscv-shared-region-direct-oracle,riscv-ecall-witness,futex-wait-witness
+[riscv-ecall-witness][fail] feature kernel build failed
+RISCV_ECALL_WITNESS_SEAL arch=riscv64 smp=2 result=fail reason=build

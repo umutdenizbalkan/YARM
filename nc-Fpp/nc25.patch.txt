@@ -1,0 +1,14 @@
+applied nc25
+diff --git a/src/kernel/task.rs b/src/kernel/task.rs
+index 238fc157..39315349 100644
+--- a/src/kernel/task.rs
++++ b/src/kernel/task.rs
+@@ -572,7 +572,7 @@ impl BlockedSyscallCompletion {
+     /// completion is encoded: `success_ret0()` on success, the error code otherwise.
+     #[must_use]
+     pub const fn result_register(&self) -> usize {
+-        if self.result == 0 {
++        if self.result == 0 || matches!(self.syscall_class, BlockedSyscallClass::FutexWait) {
+             self.success_ret0()
+         } else {
+             self.result as usize

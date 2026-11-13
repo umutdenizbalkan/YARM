@@ -1,0 +1,14 @@
+applied nc1
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 97badfb1..50c08838 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -954,7 +954,7 @@ pub fn claim_futex_waiter_locked(
+     // provisional), so the winning wake publishes it, here, in the hold that made it `Runnable`
+     // (`rec` is the record's value, read before its retirement).
+     if rec.deadline.is_some() {
+-        publish_futex_wait_completion_locked(tcb, FutexWaitEnding::Woken);
++        publish_futex_wait_completion_locked(tcb, FutexWaitEnding::TimedOut);
+         #[cfg(feature = "futex-time-witness")]
+         time_witness::woken(rec.tid, tcb.futex_wait_generation, rec.va as u64);
+     }

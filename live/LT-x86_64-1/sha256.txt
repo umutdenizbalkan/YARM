@@ -1,0 +1,3 @@
+fefa96f5185b143f6b0bb4cc78984438eff940f215e30e6eee07d46c99105d00  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-evidence/live/LT-x86_64-1/boot.log
+045f1e5b5f1f038491ce495f4c8e898dd81119ad461b17e9017a7d627f3cb70c  build-x86_64/kernel_boot.elf
+8243d762498534b511ee81abb3cd1828a6694a5c077799d0aa6bd0d46cd6e096  build-x86_64/initramfs-core.cpio

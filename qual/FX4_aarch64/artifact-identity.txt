@@ -1,0 +1,6 @@
+tree=90b7f5b0c9a3052e26d47447ded514df2bac8786 head=fb1406666e466400c74a3f92361cdb44e38fa17a dirty=0 kernel_features=--no-default-features --features aarch64-apsched-witness
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=virt,gic-version=2 cpu=cortex-a72 append=(none)
+28e6c5579b72d70d664badf659ab10d63b1c328dc5e5d5b501398af6925cde90  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-evidence/qual/FX4_aarch64/build/yarm-aarch64.bin
+d772076ef6c72dc3b46c51b3b941a36a4f4abac44151d8498b7692670bb17427  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-evidence/qual/FX4_aarch64/build/yarm-aarch64.elf
+86137a3c7138c04a811e6ab503fcd2abe7342338d28b2ad842fe50287672e99d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-evidence/qual/FX4_aarch64/build/initramfs-core.cpio
+boot smp=2

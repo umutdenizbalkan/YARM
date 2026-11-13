@@ -1,0 +1,8 @@
+live/LS-riscv64/boot.log host_lines_after_partial_guest_line=0 []
+live/LS-riscv64-D/boot.log host_lines_after_partial_guest_line=1 [(13245, 'IR')]
+addF/LSF-B-1/boot.log host_lines_after_partial_guest_line=0 []
+addF/LSF-B-2/boot.log host_lines_after_partial_guest_line=0 []
+addF/LSF-B-3/boot.log host_lines_after_partial_guest_line=3 [(12936, 'QUEUE_ADVANCE_BROAD_DISPATCH_'), (12967, 'Y'), (12983, 'QUEUE_ADVANCE_B')]
+addF/LSF-F-1/boot.log host_lines_after_partial_guest_line=0 []
+addF/LSF-F-2/boot.log host_lines_after_partial_guest_line=0 []
+addF/LSF-F-3/boot.log host_lines_after_partial_guest_line=0 []

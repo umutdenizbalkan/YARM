@@ -1,0 +1,8 @@
+[futex-time-witness] building base x86_64 artifacts with futex-requeue-witness,futex-time-witness
+[futex-time-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle,futex-time-witness
+[futex-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-time-witness][fail] expected exactly one U_DONE, saw 0
+[futex-time-witness][fail] expected exactly one U_WAITER_DONE, saw 0
+[futex-time-witness][fail] call 41 (E): never returned
+[futex-time-witness][fail] expected exactly one U_E_EXPIRED_SEEN, saw 0
+FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=fail a_idle_collections=3 g_woken=12 g_timed_out=20 g_windows_woke=11 g_windows_refused=0 g_skipped=9 in_window_wakes=11 e_spawn_refusal=SchedulerFull calls=41 cycles=40

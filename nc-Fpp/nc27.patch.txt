@@ -1,0 +1,14 @@
+applied nc27
+diff --git a/src/kernel/scheduler.rs b/src/kernel/scheduler.rs
+index 7d4318f4..d7364980 100644
+--- a/src/kernel/scheduler.rs
++++ b/src/kernel/scheduler.rs
+@@ -1599,7 +1599,7 @@ impl CpuView<'_> {
+     /// consumes only its own quantum. Returns `(scheduler tick, this CPU's quantum expired)`.
+     pub fn tick(&mut self) -> (Tick, bool) {
+         let (_, expired) = self.sched.quantum.tick_and_check();
+-        let now = if self.idx == CLOCK_OWNER_CPU.0 as usize {
++        let now = if self.idx == CLOCK_OWNER_CPU.0 as usize && self.current_tid().is_some() {
+             self.clock.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+         } else {
+             self.clock.load(Ordering::Acquire)

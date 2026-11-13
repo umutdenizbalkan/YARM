@@ -1,0 +1,100 @@
+[futex-time-witness] building base x86_64 artifacts with futex-requeue-witness,futex-time-witness
+[futex-time-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle,futex-time-witness
+[futex-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-time-witness][fail] cell reported FTW_FAIL what=A
+[futex-time-witness][fail] cell reported FTW_FAIL what=A
+[futex-time-witness][fail] cell reported FTW_FAIL what=A
+[futex-time-witness][fail] cell reported FTW_FAIL what=B
+[futex-time-witness][fail] cell reported FTW_FAIL what=B2
+[futex-time-witness][fail] cell reported FTW_FAIL what=C
+[futex-time-witness][fail] cell reported FTW_FAIL what=D
+[futex-time-witness][fail] cell reported FTW_FAIL what=D2
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=G
+[futex-time-witness][fail] cell reported FTW_FAIL what=E
+[futex-time-witness][fail] FTW_DONE result=fail
+[futex-time-witness][fail] FTW_WAITER_DONE fails=41
+[futex-time-witness][fail] call 1 (A): kernel TIMEOUT but ring 3 saw error Internal
+[futex-time-witness][fail] call 1 (A): result error, sequence requires timed_out
+[futex-time-witness][fail] call 2 (A): kernel TIMEOUT but ring 3 saw error Internal
+[futex-time-witness][fail] call 2 (A): result error, sequence requires timed_out
+[futex-time-witness][fail] call 3 (A): kernel TIMEOUT but ring 3 saw error Internal
+[futex-time-witness][fail] call 3 (A): result error, sequence requires timed_out
+[futex-time-witness][fail] call 4 (B): kernel WAKE but ring 3 saw error Internal
+[futex-time-witness][fail] call 4 (B): result error, sequence requires woken
+[futex-time-witness][fail] call 5 (B2): kernel TIMEOUT but ring 3 saw error Internal
+[futex-time-witness][fail] call 5 (B2): result error, sequence requires timed_out
+[futex-time-witness][fail] call 6 (C): kernel TIMEOUT but ring 3 saw error Internal
+[futex-time-witness][fail] call 6 (C): result error, sequence requires timed_out
+[futex-time-witness][fail] call 7 (D): kernel WAKE but ring 3 saw error Internal
+[futex-time-witness][fail] call 7 (D): result error, sequence requires woken
+[futex-time-witness][fail] call 8 (D2): kernel TIMEOUT but ring 3 saw error Internal
+[futex-time-witness][fail] call 8 (D2): result error, sequence requires timed_out
+[futex-time-witness][fail] call 9 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 10 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 11 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 12 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 13 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 14 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 15 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 16 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 17 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 18 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 19 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 20 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 21 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 22 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 23 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 24 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 25 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 26 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 27 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 28 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 29 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 30 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 31 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 32 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 33 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 34 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 35 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 36 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 37 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 38 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 39 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 40 (G): kernel WAKE but ring 3 saw error InvalidNumber
+[futex-time-witness][fail] call 41 (E): kernel TIMEOUT but ring 3 saw error Internal
+[futex-time-witness][fail] call 41 (E): result error, sequence requires timed_out
+[futex-time-witness][fail] G coverage: no window held a wake from another CPU
+[futex-time-witness][fail] G coverage: woken=32 timed_out=0 (need both >= 1)
+[futex-time-witness][fail] G: the cell counted 0/0, the kernel 32/0
+FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=fail a_idle_collections=3 g_woken=32 g_timed_out=0 g_windows_woke=0 g_windows_refused=0 g_skipped=0 in_window_wakes=0 e_spawn_refusal=SchedulerFull e_fillers=129 e_pings=4882 calls=41 cycles=41

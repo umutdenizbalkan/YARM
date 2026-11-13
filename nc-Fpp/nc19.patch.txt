@@ -1,0 +1,14 @@
+applied nc19
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 9b6082e1..67dc56ad 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1055,7 +1055,7 @@ pub fn collect_due_futex_timeouts_locked(
+     let mut n = 0usize;
+     let mut examined = 0usize;
+     let mut timed_seen = 0usize;
+-    while examined < cap && timed_seen < FUTEX_TIMEOUT_SCAN_WINDOW && n < FUTEX_TIMEOUT_DUE_MAX {
++    while examined < cap && n < FUTEX_TIMEOUT_DUE_MAX {
+         let slot = (start + examined) % cap;
+         examined += 1;
+         let Some(rec) = table.records[slot] else {

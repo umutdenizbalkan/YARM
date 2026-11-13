@@ -1,0 +1,43 @@
+applied nc23
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 97badfb1..83b4471f 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1065,8 +1065,7 @@ pub fn collect_due_futex_timeouts_locked(
+             continue;
+         };
+         timed_seen += 1;
+-        if deadline > now || matches!(rec.key, FutexKey::Pending { .. }) || !table.live(tcbs, slot)
+-        {
++        if deadline > now || matches!(rec.key, FutexKey::Pending { .. }) {
+             continue;
+         }
+         out[n] = Some(FutexTimeoutCandidate {
+@@ -1111,7 +1110,8 @@ pub fn claim_futex_timeout_locked(
+         .get_mut(usize::from(rec.tcb))
+         .and_then(Option::as_mut)
+         .filter(|t| {
+-            t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))
++            let _ = token;
++            t.tid.0 == rec.tid
+         })
+     else {
+         return false;
+@@ -1169,7 +1169,7 @@ fn timeout_claimable(
+     rec.tid == candidate.tid
+         && rec.deadline.is_some_and(|d| d <= now)
+         && !matches!(rec.key, FutexKey::Pending { .. })
+-        && table.live(tcbs, slot)
++        && !tcbs.is_empty()
+ }
+ 
+ /// FUTEX-TIME1 live witness only — rank 2: `(generation, g_race, va)` of the cycle `candidate`
+@@ -2037,7 +2037,7 @@ pub fn claim_pending_futex_waiter_locked(
+ pub fn retire_futex_waiters_for_task_locked(table: &mut FutexWaiterTable, tid: u64) -> usize {
+     let mut n = 0;
+     for slot in 0..MAX_FUTEX_WAITERS {
+-        if table.records[slot].is_some_and(|r| r.tid == tid) {
++        if table.records[slot].is_some_and(|r| r.tid == tid && r.deadline.is_none()) {
+             table.retire(slot);
+             n += 1;
+         }

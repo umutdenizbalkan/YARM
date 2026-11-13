@@ -1,0 +1,14 @@
+applied nc11
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 97badfb1..1fb580e8 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -723,7 +723,7 @@ fn arm_futex_deadline_locked(
+     let Some(next) = tcb.futex_wait_generation.checked_add(1) else {
+         return false;
+     };
+-    tcb.futex_wait_generation = next;
++    let _ = next;
+     rec.deadline = Some(deadline);
+     table.timed = table.timed.saturating_add(1);
+     FUTEX_TIMED_RECORDS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);

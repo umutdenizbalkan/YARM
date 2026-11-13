@@ -1,0 +1,16 @@
+applied nc26
+diff --git a/src/kernel/task.rs b/src/kernel/task.rs
+index 238fc157..4a26f44b 100644
+--- a/src/kernel/task.rs
++++ b/src/kernel/task.rs
+@@ -1079,9 +1079,7 @@ pub(crate) fn take_thread_restore_facts(
+     // encoded by the class's own `result_register`.
+     let send_completion =
+         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcSend);
+-    let send_completion = send_completion.or_else(|| {
+-        take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::FutexWait)
+-    });
++    let send_completion = send_completion.or(None);
+     #[cfg(any(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
+     let recv_completion =
+         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcRecv);

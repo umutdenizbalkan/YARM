@@ -1,0 +1,38 @@
+applied nc20
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 97badfb1..97b0d998 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -702,7 +702,7 @@ impl core::fmt::Debug for FutexWaitTiming<'_> {
+ /// completion will carry. Called with no release since the registration, so no wake, requeue or
+ /// exit can see the record untimed; `false` (and nothing written) only if the token is not the
+ /// record this hold registered, which the caller treats as an invariant break.
+-fn arm_futex_deadline_locked(
++pub(crate) fn arm_futex_deadline_locked(
+     tcbs: &mut [Option<ThreadControlBlock>],
+     table: &mut FutexWaiterTable,
+     token: FutexWaitToken,
+@@ -805,6 +805,7 @@ pub fn compare_and_register_futex_waiter_locked(
+         },
+     )?;
+     if let Some(deadline) = deadline
++        && deadline == u64::MAX
+         && !arm_futex_deadline_locked(tcbs, table, token, deadline)
+     {
+         // Unreachable (the registration just wrote this record and checked the counter); an
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 141f57c0..bb29e44d 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18943,6 +18943,11 @@ impl SharedKernel {
+         };
+         #[cfg(test)]
+         fx::futex_phase_hook::run_after_register();
++        if let Some(d) = deadline {
++            let _ = self.with_task_futex_split_mut(|tcbs, table| {
++                fx::arm_futex_deadline_locked(tcbs, table, token, d)
++            });
++        }
+         // FUTEX-WAIT-ATOMIC1 live witness: window A, after the registration and before the clear.
+         #[cfg(feature = "futex-wait-witness")]
+         if let Some(w) = witness {

@@ -1,0 +1,15 @@
+applied nc21
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 141f57c0..b78575ac 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -14229,7 +14229,8 @@ impl SharedKernel {
+                 // placement is owed by a later pass. Nothing becomes `Runnable`.
+                 let expired = !candidate.expired
+                     && self.with_task_futex_split_mut(|tcbs, table| {
+-                        fx::expire_futex_waiter_locked(tcbs, table, candidate, now)
++                        let _ = (tcbs, now);
++                        fx::retire_futex_waiters_for_task_locked(table, candidate.tid) > 0
+                     });
+                 if expired {
+                     pass.expired += 1;

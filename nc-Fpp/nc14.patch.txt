@@ -1,0 +1,14 @@
+applied nc14
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 9b6082e1..0797f7e9 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1076,7 +1076,7 @@ pub fn collect_due_futex_timeouts_locked(
+         });
+         n += 1;
+     }
+-    table.timeout_cursor = ((start + examined) % cap.max(1)) as u16;
++    let _ = examined;
+     (n, timed_seen)
+ }
+ 

@@ -1,0 +1,299 @@
+[integrity] build-start=2026-11-13T12:52:24Z epoch=1794574344 commit=04a09b2bad0fa2993f89d137f1db6d21744fe403 out_dir=build-riscv64
+[info] building yarm/kernel_boot for riscv64gc-unknown-none-elf and yarm-control-plane-servers/init_server for targets/riscv64-yarm-user-none.json
+   Compiling yarm v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/ft1-wt)
+warning: unused import: `crate::kernel::capabilities::CapRights`
+ --> src/kernel/boot/exec_state.rs:6:5
+  |
+6 | use crate::kernel::capabilities::CapRights;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `TaskStatus`
+ --> src/kernel/boot/exec_state.rs:9:27
+  |
+9 | use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext};
+  |                           ^^^^^^^^^^
+
+warning: unused import: `QueueAdvanceOutcome`
+  --> src/kernel/boot/mod.rs:41:50
+   |
+41 |     IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome, QueueAdvanceRefusal,
+   |                                                  ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SUPERVISOR_FAULT_REPORT_WIRE_LEN`
+  --> src/kernel/boot/mod.rs:57:60
+   |
+57 |     PageFaultFacts, PageFaultRoute, PreMutationSettlement, SUPERVISOR_FAULT_REPORT_WIRE_LEN,
+   |                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `DetachOutcome` and `enqueue_reply_into_endpoint_locked`
+  --> src/kernel/boot/mod.rs:69:34
+   |
+69 |     BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ParkedDeathHandoff,
+   |                                  ^^^^^^^^^^^^^
+...
+74 |     complete_server_death_over, enqueue_reply_into_endpoint_locked, log_parked_death_handoff,
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `orchestrator_state::x86_smp_unlock_audit_claimed`
+  --> src/kernel/boot/mod.rs:85:16
+   |
+85 | pub(crate) use orchestrator_state::x86_smp_unlock_audit_claimed;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+  --> src/kernel/boot/scheduler_state.rs:10:27
+   |
+10 | use crate::kernel::task::{TaskClass, TaskStatus};
+   |                           ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+ --> src/kernel/boot/task_policy_state.rs:6:5
+  |
+6 | use crate::kernel::ipc::ThreadId;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ThreadControlBlock`
+ --> src/kernel/boot/task_policy_state.rs:7:38
+  |
+7 | use crate::kernel::task::{TaskClass, ThreadControlBlock};
+  |                                      ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+ --> src/kernel/boot/thread_state.rs:8:47
+  |
+8 |     KernelExecutionContext, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
+  |                                               ^^^^^^^^^
+
+warning: unused import: `crate::kernel::vm::Asid`
+  --> src/kernel/boot/thread_state.rs:12:5
+   |
+12 | use crate::kernel::vm::Asid;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc_state::rt_detach_server_link`
+    --> src/kernel/boot/mod.rs:5613:16
+     |
+5613 | pub(crate) use ipc_state::rt_detach_server_link;
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapObject`
+  --> src/kernel/recv_waiter_split.rs:94:42
+   |
+94 | use crate::kernel::capabilities::{CapId, CapObject};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+ --> src/kernel/syscall.rs:9:17
+  |
+9 | use super::vm::{PAGE_SIZE, VirtAddr};
+  |                 ^^^^^^^^^
+
+warning: unused import: `SYSCALL_NO_TRANSFER_CAP`
+  --> src/kernel/syscall/recv_shared_v3.rs:12:26
+   |
+12 |     SYSCALL_ABI_VERSION, SYSCALL_NO_TRANSFER_CAP, SyscallError, current_tid,
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapRights`
+  --> src/kernel/syscall/recv_shared_v3.rs:16:42
+   |
+16 | use crate::kernel::capabilities::{CapId, CapRights};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::Message`
+  --> src/kernel/syscall/recv_shared_v3.rs:17:5
+   |
+17 | use crate::kernel::ipc::Message;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CachePolicy`, `Mapping`, `PAGE_SIZE`, `PageFlags`, `PhysAddr`, and `VirtAddr`
+  --> src/kernel/syscall/recv_shared_v3.rs:20:25
+   |
+20 | use crate::kernel::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                         ^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^  ^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+  --> src/kernel/syscall/vm.rs:28:40
+   |
+28 | use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                                        ^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_CAP`, `SYSCALL_ARG_LEN`, and `SYSCALL_ARG_PTR`
+    --> src/kernel/syscall_split.rs:5506:34
+     |
+5506 |     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
+     |                                  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_LEN` and `SYSCALL_ARG_PTR`
+    --> src/kernel/syscall_split.rs:5525:51
+     |
+5525 |     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError};
+     |                                                   ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `SYSCALL_ARG_PTR`
+    --> src/kernel/syscall_split.rs:6573:51
+     |
+6573 |     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_PTR};
+     |                                                   ^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+    --> src/runtime.rs:6348:35
+     |
+6348 |         use crate::kernel::task::{TaskClass, TaskStatus};
+     |                                   ^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_CAP`, `SYSCALL_ARG_LEN`, and `SYSCALL_ARG_PTR`
+    --> src/runtime.rs:9800:55
+     |
+9800 |             OPCODE_SHARED_MEM, RecvQueuedSplitPhaseA, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0,
+     |                                                       ^^^^^^^^^^^^^^^
+9801 |             SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError,
+     |                                          ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+     --> src/runtime.rs:16572:35
+      |
+16572 |         use crate::kernel::task::{TaskClass, TaskStatus};
+      |                                   ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+     --> src/runtime.rs:17002:13
+      |
+17002 |         use crate::kernel::ipc::ThreadId;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:17004:13
+      |
+17004 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:17038:13
+      |
+17038 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:18403:13
+      |
+18403 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unreachable expression
+    --> src/arch/riscv64/boot.rs:1024:13
+     |
+1024 |             return riscv_s_mode_timer_trap(shared, cpu, frame, sepc, sstatus);
+     |             ^^^^^^^----------------------------------------------------------
+     |             |      |
+     |             |      any code following this expression is unreachable
+     |             unreachable expression
+     |
+     = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> src/kernel/direct_ack_census.rs:53:29
+   |
+53 |     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |                             ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+53 -     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+53 +     let _ = WAITERS_CURRENT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |
+
+warning: unnecessary `unsafe` block
+    --> src/arch/riscv64/boot.rs:3449:26
+     |
+3449 |             let vector = unsafe { core::ptr::addr_of!(yarm_riscv64_trap_vector) as usize };
+     |                          ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+    --> src/arch/riscv64/boot.rs:4111:23
+     |
+4111 |     let trap_vector = unsafe { core::ptr::addr_of!(yarm_riscv64_trap_vector) as u64 };
+     |                       ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+   --> src/arch/trap_entry.rs:550:9
+    |
+550 |     mut frame: Option<&mut TrapFrame>,
+    |     ----^^^^^
+    |     |
+    |     help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `frame`
+   --> src/arch/trap_entry.rs:550:5
+    |
+550 |     mut frame: Option<&mut TrapFrame>,
+    |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_frame`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `deadline`
+    --> src/kernel/boot/ipc_state.rs:5624:30
+     |
+5624 |                     let Some(deadline) = tcb.ipc_timeout_deadline else {
+     |                              ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_deadline`
+
+warning: unused variable: `tid`
+    --> src/kernel/boot/orchestrator_state.rs:1463:51
+     |
+1463 |     fn run_unlock_graduated_proof_with(&mut self, tid: u64, cnode: CNodeId) {
+     |                                                   ^^^ help: if this is intentional, prefix it with an underscore: `_tid`
+
+error[E0004]: non-exhaustive patterns: `&FutexParkOutcome::TimedOut` not covered
+    --> src/kernel/boot/futex.rs:1832:26
+     |
+1832 |         let slug = match outcome {
+     |                          ^^^^^^^ pattern `&FutexParkOutcome::TimedOut` not covered
+     |
+note: `FutexParkOutcome` defined here
+    --> src/kernel/syscall/sched.rs:244:17
+     |
+ 244 | pub(crate) enum FutexParkOutcome {
+     |                 ^^^^^^^^^^^^^^^^
+...
+ 285 |     TimedOut,
+     |     -------- not covered
+     = note: the matched value is of type `&FutexParkOutcome`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+1839 ~             O::CapacityExhausted => "capacity_exhausted",
+1840 ~             &FutexParkOutcome::TimedOut => todo!(),
+     |
+
+warning: value assigned to `stash_bound_receiver_tid` is never read
+   --> src/kernel/syscall/ipc.rs:464:78
+    |
+464 |     let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
+    |                                                                              ^^^^ this value is reassigned later and never used
+...
+509 |             stash_bound_receiver_tid = bound_tid;
+    |             ------------------------------------ `stash_bound_receiver_tid` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `cpu`
+    --> src/kernel/syscall_split.rs:9186:5
+     |
+9186 |     cpu: CpuId,
+     |     ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: unused variable: `cpu`
+    --> src/runtime.rs:7943:9
+     |
+7943 |         cpu: CpuId,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+For more information about this error, try `rustc --explain E0004`.
+warning: `yarm` (lib) generated 40 warnings
+error: could not compile `yarm` (lib) due to 1 previous error; 40 warnings emitted

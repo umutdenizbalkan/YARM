@@ -1,0 +1,14 @@
+applied nc9
+diff --git a/src/kernel/syscall/sched.rs b/src/kernel/syscall/sched.rs
+index c444b7ff..d8b26208 100644
+--- a/src/kernel/syscall/sched.rs
++++ b/src/kernel/syscall/sched.rs
+@@ -102,7 +102,7 @@ pub(crate) const fn futex_timeout_ticks(timeout_ns: u64, period_ns: u64) -> u64
+     if timeout_ns == 0 {
+         0
+     } else {
+-        timeout_ns.div_ceil(period_ns) + 1
++        timeout_ns.div_ceil(period_ns)
+     }
+ }
+ 

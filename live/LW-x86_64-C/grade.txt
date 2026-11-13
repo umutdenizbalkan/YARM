@@ -1,0 +1,1 @@
+FUTEX_WAIT_WITNESS_SEAL arch=x86_64 smp=2 waits=18 skipped=13 windows=25 refused=0 b_changed=11 a=7 in_window_wakes=25 waiter_cpus=1 waker_cpus=0 calls=32 returns=32 blocked=20 mismatch=12 during_publication=7 parked=13 parked_ok=13 parked_err=0 dup_or_missing=0 witness=ok core_smoke=ok result=ok

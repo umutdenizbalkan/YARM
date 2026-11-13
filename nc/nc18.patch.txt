@@ -1,0 +1,20 @@
+applied nc18
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 97badfb1..4524167e 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1142,13 +1142,7 @@ pub fn expire_futex_waiter_locked(
+         return false;
+     }
+     let prev = table.prev_of(slot);
+-    rekey(
+-        table,
+-        slot,
+-        prev,
+-        FutexKey::Expired { tid: candidate.tid },
+-        None,
+-    );
++    let _ = prev;
+     true
+ }
+ 
