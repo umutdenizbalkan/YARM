@@ -214788,6 +214788,1096 @@ mod futex_requeue1 {
     ///
     /// "Ring 3" below is the register file the `sret` installs — what the instruction after the
     /// `ecall` observes — and the user runtime's verdict on it.
+    /// FUTEX-TIME1 — timed `FutexWait`: one exact generation-bearing wait identity and one
+    /// terminal outcome, among the timeout, `FutexWake`, the NR 17 wake portion, task exit and
+    /// the waiter's own publication. Every race is driven deterministically through the phase
+    /// hooks and an explicit collector clock; nothing sleeps.
+    mod time1 {
+        use super::*;
+        use crate::kernel::boot::FutexWaitBroadOutcome as B;
+        use crate::kernel::boot::futex::{
+            FutexTimeoutPass, FutexWaitEnding, futex_phase_hook as hook,
+        };
+        use crate::kernel::syscall::SyscallError;
+        use crate::kernel::syscall::sched::{futex_timeout_ticks, futex_wait_deadline};
+        use crate::kernel::task::{BlockedSyscallClass, BlockedSyscallCompletion};
+
+        const TIMED_OUT: u64 = 9;
+
+        fn completion(s: &KernelState, t: u64) -> Option<BlockedSyscallCompletion> {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|x| x.tid.0 == t)
+                    .and_then(|x| x.pending_syscall_completion)
+            })
+        }
+        /// Placed once, with exactly one `FutexWait` completion of `result`.
+        fn settled(s: &KernelState, t: u64, result: u64) -> bool {
+            placed(s, t)
+                && completion(s, t).is_some_and(|c| {
+                    c.syscall_class == BlockedSyscallClass::FutexWait && c.result == result
+                })
+        }
+        fn timed_out(s: &KernelState, t: u64) -> bool {
+            settled(s, t, TIMED_OUT)
+        }
+        fn woken(s: &KernelState, t: u64) -> bool {
+            settled(s, t, 0)
+        }
+        fn deadline(s: &mut KernelState, t: u64) -> Option<u64> {
+            let token = token_of(s, t)?;
+            s.with_task_futex_mut(|_tcbs, table| table.deadline_of(token))
+        }
+        fn timed_records(s: &mut KernelState) -> usize {
+            s.with_task_futex_mut(|_tcbs, table| table.timed_records())
+        }
+        fn expired(s: &mut KernelState, t: u64) -> bool {
+            let Some(token) = token_of(s, t) else {
+                return false;
+            };
+            s.with_task_futex_mut(|_tcbs, table| fx::futex_waiter_expired_locked(table, token))
+        }
+        fn now(k: &SharedKernel) -> u64 {
+            k.scheduler_clock_now()
+        }
+        fn tick(k: &SharedKernel, n: u64) {
+            for _ in 0..n {
+                k.with(|s| s.with_scheduler_state_mut(|sched| sched.advance_clock_owner_tick()));
+            }
+        }
+        fn collect(k: &SharedKernel, at: u64) -> FutexTimeoutPass {
+            k.run_due_futex_timeouts_at(CpuId(0), at)
+        }
+        /// A new task of `w`'s process, parked TIMED on `va` (holding `v`) through the broad
+        /// body (the same compare-and-register as the split route), deadline `d`.
+        fn tpark(w: &mut W, va: usize, v: u32, kind: FutexKind, d: u64) -> u64 {
+            let t = w.next;
+            w.next += 1;
+            task(&mut w.s, t, w.a);
+            run(&mut w.s, t);
+            assert_eq!(
+                w.s.futex_wait_current_timed(va, v, kind, Some(d)),
+                Ok(B::Blocked { timed: true }),
+                "{t} parks timed"
+            );
+            t
+        }
+        /// Fill CPU 0's normal-priority user queue with runnable fillers; returns them.
+        fn fill(s: &mut KernelState, a: Asid, base: u64) -> Vec<u64> {
+            let mut fillers = Vec::new();
+            for i in 0..200u64 {
+                let t = base + i;
+                s.register_task(t).expect("task");
+                s.bind_task_asid(t, a).expect("bind");
+                s.set_task_status_for_test(t, TaskStatus::Runnable);
+                s.seed_resumable_user_context_for_test(t);
+                s.set_task_home_cpu(t, CpuId(0)).expect("home");
+                if s.enqueue_task(t).is_err() {
+                    s.set_task_status_for_test(
+                        t,
+                        TaskStatus::Blocked(WaitReason::Join(ThreadId(1))),
+                    );
+                    return fillers;
+                }
+                fillers.push(t);
+            }
+            panic!("the queue never filled");
+        }
+        fn drain_one(s: &mut KernelState, t: u64) {
+            assert_eq!(
+                s.withdraw_queued_tid_on(CpuId(0), t),
+                crate::kernel::scheduler::WithdrawOutcome::Removed
+            );
+            s.set_task_status_for_test(t, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
+        }
+
+        // ── ABI ──────────────────────────────────────────────────────────────────────────────
+
+        /// 1 — an untimed NR 9 is the FUTEX-WAIT-ATOMIC1 transaction: no deadline, no
+        /// completion, `1` from a wake; the collector never touches it.
+        #[test]
+        fn t01_untimed_nr9_is_unchanged() {
+            let mut w = world(70000);
+            let ws = w.park_n(1, SQ, 5);
+            assert_eq!(deadline(&mut w.s, ws[0]), None);
+            assert_eq!(timed_records(&mut w.s), 0);
+            let k = leak(w.s);
+            assert_eq!(collect(k, u64::MAX), FutexTimeoutPass::default());
+            k.with(|s| {
+                assert!(parked(s, ws[0]));
+                assert_eq!(s.futex_wake(SQ, 1, P), Ok(1));
+                assert!(placed(s, ws[0]));
+                assert_eq!(
+                    completion(s, ws[0]),
+                    None,
+                    "an untimed wake parks no completion"
+                );
+            });
+        }
+
+        /// 2 — decode: bit 1 is NR 9's timed flag; any other unknown bit, or bit 1 on NR 10,
+        /// is `InvalidArgs`; without bit 1, slot 3 is not read.
+        #[test]
+        fn t02_invalid_timed_flag_and_malformed_arguments() {
+            use crate::kernel::syscall::sched::{decode_futex_args, decode_futex_wait_args};
+            use crate::kernel::trapframe::TrapFrame;
+            let f = |args: [usize; 6]| TrapFrame::new(9, args);
+            let ok = decode_futex_wait_args(&f([0x6_0000, 5, 0b10, 1_000, 0, 0])).unwrap();
+            assert_eq!(ok.timeout_ns, Some(1_000));
+            assert_eq!(ok.key.kind, P);
+            let shared = decode_futex_wait_args(&f([0x6_0000, 5, 0b11, 7, 0, 0])).unwrap();
+            assert_eq!((shared.key.kind, shared.timeout_ns), (SH, Some(7)));
+            let untimed = decode_futex_wait_args(&f([0x6_0000, 5, 0, 99, 0, 0])).unwrap();
+            assert_eq!(
+                untimed.timeout_ns, None,
+                "slot 3 is not read without the flag"
+            );
+            for bad in [
+                [0x6_0000, 5, 0b100, 0, 0, 0],
+                [0x6_0002, 5, 0b10, 0, 0, 0],
+                [0x6_0000, 1 << 40, 0b10, 0, 0, 0],
+            ] {
+                assert_eq!(
+                    decode_futex_wait_args(&f(bad)),
+                    Err(SyscallError::InvalidArgs)
+                );
+            }
+            assert_eq!(
+                decode_futex_args(&TrapFrame::new(10, [0x6_0000, 1, 0b10, 0, 0, 0])),
+                Err(SyscallError::InvalidArgs),
+                "NR 10 refuses the timed bit"
+            );
+            assert_eq!(
+                futex_wait_deadline(u64::MAX - 1, 1),
+                None,
+                "overflow refused"
+            );
+        }
+
+        /// 3 — zero timeout, matching word: `TimedOut`, nothing published.
+        #[test]
+        fn t03_zero_timeout_matching_word_times_out_without_parking() {
+            let mut w = world(70100);
+            let t = w.next;
+            task(&mut w.s, t, w.a);
+            run(&mut w.s, t);
+            let d = futex_wait_deadline(w.s.scheduler_tick_now(), 0).unwrap();
+            assert_eq!(
+                w.s.futex_wait_current_timed(SQ, 5, P, Some(d)),
+                Ok(B::TimedOut)
+            );
+            assert_eq!(w.s.current_tid(), Some(t), "still current");
+            assert_eq!(w.s.task_status(t), Some(TaskStatus::Running));
+            assert_eq!(occupied(&mut w.s), 0);
+            assert_eq!(timed_records(&mut w.s), 0);
+        }
+
+        /// 4 — zero timeout, differing word: `0` (`NotBlocked`), never `TimedOut`.
+        #[test]
+        fn t04_zero_timeout_mismatching_word_answers_zero() {
+            let mut w = world(70200);
+            let t = w.next;
+            task(&mut w.s, t, w.a);
+            run(&mut w.s, t);
+            let d = futex_wait_deadline(w.s.scheduler_tick_now(), 0).unwrap();
+            assert_eq!(
+                w.s.futex_wait_current_timed(SQ, 6, P, Some(d)),
+                Ok(B::NotBlocked)
+            );
+            assert_eq!(occupied(&mut w.s), 0);
+        }
+
+        /// 5 — a deadline not yet reached: the collector leaves the waiter parked.
+        #[test]
+        fn t05_deadline_not_reached_keeps_the_waiter_parked() {
+            let mut w = world(70300);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            assert_eq!(deadline(&mut w.s, t), Some(10));
+            let k = leak(w.s);
+            assert_eq!(collect(k, 9).timed_out, 0);
+            k.with(|s| {
+                assert!(parked(s, t));
+                assert_eq!(completion(s, t), None);
+            });
+        }
+
+        /// 6 — the deadline reached exactly (`now == deadline`) times out.
+        #[test]
+        fn t06_deadline_reached_exactly_times_out() {
+            let mut w = world(70400);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let k = leak(w.s);
+            let pass = collect(k, 10);
+            assert_eq!((pass.due, pass.timed_out), (1, 1));
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert_eq!(timed_records(s), 0);
+                assert_eq!(occupied(s), 0);
+            });
+        }
+
+        /// 7 — a deadline already passed at the compare-and-register: `TimedOut`, nothing
+        /// published (the hold reads the clock after its comparison).
+        #[test]
+        fn t07_deadline_already_expired_at_admission() {
+            let w = world(70500);
+            let (a, t) = (w.a, w.next);
+            let k = leak(w.s);
+            tick(k, 5);
+            k.with(|s| {
+                task(s, t, a);
+                run(s, t);
+            });
+            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 5, P, Some(3));
+            assert_eq!(o, FutexParkOutcome::TimedOut);
+            k.with(|s| {
+                assert_eq!(s.task_status(t), Some(TaskStatus::Running));
+                assert_eq!(occupied(s), 0);
+            });
+            // …and a differing word still answers `0` with the same expired deadline.
+            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 6, P, Some(3));
+            assert_eq!(o, FutexParkOutcome::ValueChanged);
+        }
+
+        // ── Wake versus timeout ──────────────────────────────────────────────────────────────
+
+        /// 8 — a wake before the deadline wins: `Ok(true)` as its completion; a later collector
+        /// pass at any time finds nothing.
+        #[test]
+        fn t08_wake_before_timeout() {
+            let mut w = world(70600);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            assert_eq!(w.s.futex_wake(SQ, 1, P), Ok(1));
+            assert!(woken(&w.s, t));
+            let k = leak(w.s);
+            assert_eq!(collect(k, 1_000), FutexTimeoutPass::default());
+            k.with(|s| assert!(woken(s, t), "the wake result survives"));
+        }
+
+        /// 9 — the timeout wins first; a later wake on the key finds nobody, counts 0, and the
+        /// next waiter in FIFO order is still selectable.
+        #[test]
+        fn t09_timeout_before_wake() {
+            let mut w = world(70700);
+            let t1 = tpark(&mut w, SQ, 5, P, 10);
+            let t2 = w.park(SQ, 5, P);
+            w.back();
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| {
+                assert!(timed_out(s, t1));
+                assert_eq!(
+                    s.futex_wake(SQ, 1, P),
+                    Ok(1),
+                    "the wake takes the next waiter"
+                );
+                assert!(placed(s, t2));
+                assert!(timed_out(s, t1), "and cannot overwrite the timeout");
+                assert_eq!(queued_count(s, t1), 1);
+            });
+        }
+
+        /// 10 (T3) — a waker RESERVED a slot for the waiter, then the timeout claims it: the
+        /// reservation conferred no ownership; the waker releases it and counts 0.
+        #[test]
+        fn t10_wake_reservation_racing_timeout() {
+            let mut w = world(70800);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let (a, k) = (w.a, leak(w.s));
+            let ran = alloc::rc::Rc::new(core::cell::Cell::new(0u32));
+            let r = ran.clone();
+            hook::arm_wake_step(alloc::boxed::Box::new(move |step, tid| {
+                if step == hook::WAKE_AFTER_RESERVE && tid == t {
+                    r.set(collect(k, 10).timed_out);
+                    return false;
+                }
+                true
+            }));
+            let n = k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake");
+            assert_eq!(ran.get(), 1, "the timeout claimed inside the window");
+            assert_eq!(n, 0, "the wake counts nobody");
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert_eq!(reserved(s), 0, "the waker's reservation was released");
+            });
+        }
+
+        /// 11 (T1) — the wake CLAIMED, then the collector's pass finds the deadline due: the
+        /// wake stays authoritative, no `TimedOut`, one placement.
+        #[test]
+        fn t11_wake_claim_racing_timeout() {
+            let mut w = world(70900);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let (a, k) = (w.a, leak(w.s));
+            let pass = alloc::rc::Rc::new(core::cell::Cell::new(None));
+            let p2 = pass.clone();
+            hook::arm_wake_step(alloc::boxed::Box::new(move |step, tid| {
+                if step == hook::WAKE_AFTER_CLAIM && tid == t {
+                    p2.set(Some(collect(k, 10)));
+                    return false;
+                }
+                true
+            }));
+            assert_eq!(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P), Ok(1));
+            let pass = pass.get().expect("collector ran");
+            assert_eq!(
+                (pass.due, pass.timed_out),
+                (0, 0),
+                "the claimed cycle is gone"
+            );
+            k.with(|s| {
+                assert!(woken(s, t));
+                assert_eq!(reserved(s), 0);
+            });
+        }
+
+        /// 12 — the timeout's reserved commit races a wake: the wake, entering between the
+        /// timeout's claim and its commit, finds nobody; the waiter is queued exactly once.
+        #[test]
+        fn t12_scheduler_enqueue_racing_timeout() {
+            let mut w = world(71000);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let (a, k) = (w.a, leak(w.s));
+            let woke = alloc::rc::Rc::new(core::cell::Cell::new(u32::MAX));
+            let wk = woke.clone();
+            hook::arm_timeout_step(alloc::boxed::Box::new(move |step, tid| {
+                if step == hook::TIMEOUT_AFTER_CLAIM && tid == t {
+                    wk.set(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P).expect("wake"));
+                    return false;
+                }
+                true
+            }));
+            assert_eq!(collect(k, 10).timed_out, 1);
+            assert_eq!(woke.get(), 0);
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert_eq!(reserved(s), 0);
+            });
+        }
+
+        // ── Capacity ─────────────────────────────────────────────────────────────────────────
+
+        /// 13 — a full home queue: the timeout WINS (Expired key) but the waiter is not
+        /// `Runnable` — never Runnable-but-unqueued — and no wake can take it now.
+        #[test]
+        fn t13_full_home_queue_commits_the_timeout_without_placement() {
+            let mut w = world(71100);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let a = w.a;
+            let _fillers = fill(&mut w.s, a, 75000);
+            let k = leak(w.s);
+            let pass = collect(k, 10);
+            assert_eq!((pass.timed_out, pass.expired), (0, 1));
+            k.with(|s| {
+                assert!(parked(s, t), "still Blocked, not Runnable-unqueued");
+                assert_eq!(placement(s, t), TaskPlacement::Nowhere);
+                assert!(expired(s, t));
+                assert_eq!(s.futex_wake(SQ, 1, P), Ok(0), "no wake can claim it now");
+                assert_eq!(reserved(s), 0);
+            });
+            // A repeated pass with the queue still full changes nothing.
+            let again = collect(k, 11);
+            assert_eq!((again.timed_out, again.expired), (0, 0));
+            k.with(|s| assert!(parked(s, t) && expired(s, t)));
+        }
+
+        /// 14 — capacity becomes available after expiry: the next pass places the waiter with
+        /// `TimedOut` (never `Ok(true)`), exactly once.
+        #[test]
+        fn t14_capacity_after_expiry_places_with_timed_out() {
+            let mut w = world(71200);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let a = w.a;
+            let fillers = fill(&mut w.s, a, 75500);
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).expired, 1);
+            k.with(|s| drain_one(s, fillers[0]));
+            assert_eq!(collect(k, 12).timed_out, 1);
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert_eq!(timed_records(s), 0);
+            });
+            assert_eq!(collect(k, 13), FutexTimeoutPass::default());
+        }
+
+        // ── Requeue ──────────────────────────────────────────────────────────────────────────
+
+        /// 15 (T4) — requeued S → T, then the deadline: the record is found by token on T,
+        /// removed, `TimedOut`; a later wake of T or S finds nothing.
+        #[test]
+        fn t15_requeue_before_expiry_times_out_on_the_target() {
+            let mut w = world(71300);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, 1), Ok(out(0, 1, false)));
+            assert_eq!(
+                {
+                    let tok = token_of(&w.s, t).unwrap();
+                    key_of(&mut w.s, tok)
+                },
+                Some(w.k(MX))
+            );
+            assert_eq!(
+                deadline(&mut w.s, t),
+                Some(10),
+                "the deadline moved with the record"
+            );
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert_eq!(s.futex_wake(MX, 1, P), Ok(0));
+                assert_eq!(s.futex_wake(SQ, 1, P), Ok(0));
+                consistent(s);
+            });
+        }
+
+        /// 16 (T5) — timeout first: NR 17 then moves only the remaining waiter, and its count
+        /// excludes the timed-out one.
+        #[test]
+        fn t16_timeout_before_requeue_is_excluded_from_it() {
+            let mut w = world(71400);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            let u = w.park(SQ, 5, P);
+            w.back();
+            let mx = w.k(MX);
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| {
+                assert_eq!(
+                    rq(s, SQ, MX, 5, 0, ALL),
+                    Ok(out(0, 1, false)),
+                    "only `u` moves"
+                );
+                assert_eq!(order(s, mx), vec![u]);
+                assert!(timed_out(s, t));
+                consistent(s);
+            });
+        }
+
+        /// 17 (T6) — NR 17 selected the timed waiter for its wake portion (Pending key), then
+        /// the deadline: the timeout cannot steal it; it is placed with `Ok(true)`.
+        #[test]
+        fn t17_pending_requeue_wake_beats_the_timeout() {
+            let mut w = world(71500);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let (a, k) = (w.a, leak(w.s));
+            let pass = alloc::rc::Rc::new(core::cell::Cell::new(None));
+            let p2 = pass.clone();
+            hook::arm_requeue_window(alloc::boxed::Box::new(move || {
+                p2.set(Some(collect(k, 10)));
+            }));
+            let r = k.futex_cmp_requeue_split(CpuId(1), a, (SQ, P), (MX, P), 5, 1, 0);
+            assert_eq!(r, Ok(out(1, 0, false)));
+            let pass = pass.get().expect("the window ran");
+            assert_eq!(
+                (pass.due, pass.timed_out),
+                (0, 0),
+                "a Pending waiter is skipped"
+            );
+            k.with(|s| {
+                assert!(woken(s, t), "the committed wake portion won");
+                assert_eq!(reserved(s), 0);
+            });
+        }
+
+        /// 18 — requeue across two different keys keeps one identity and one deadline.
+        #[test]
+        fn t18_requeue_across_two_keys_keeps_identity_and_deadline() {
+            let mut w = world(71600);
+            let t = tpark(&mut w, SQ, 5, P, 40);
+            w.back();
+            let before = token_of(&w.s, t).unwrap();
+            assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, 1), Ok(out(0, 1, false)));
+            assert_eq!(token_of(&w.s, t), Some(before), "the same wait cycle");
+            assert_eq!(deadline(&mut w.s, t), Some(40));
+            assert_eq!(timed_records(&mut w.s), 1);
+        }
+
+        /// 19 (T7) — S → T → U: expiry removes the record from U, never from an obsolete key.
+        #[test]
+        fn t19_requeue_across_three_keys_expires_on_the_last() {
+            let mut w = world(71700);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            assert_eq!(rq(&mut w.s, SQ, MX, 5, 0, 1), Ok(out(0, 1, false)));
+            assert_eq!(rq(&mut w.s, MX, UQ, 0, 0, 1), Ok(out(0, 1, false)));
+            assert_eq!(
+                {
+                    let tok = token_of(&w.s, t).unwrap();
+                    key_of(&mut w.s, tok)
+                },
+                Some(w.k(UQ))
+            );
+            let (sq, mx, uq) = (w.k(SQ), w.k(MX), w.k(UQ));
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                for kk in [sq, mx, uq] {
+                    assert!(
+                        order(s, kk).is_empty(),
+                        "removed from U, and from no obsolete key"
+                    );
+                }
+                consistent(s);
+            });
+        }
+
+        /// 20 — a timed waiter on a SHARED key requeued onto a PRIVATE key keeps its deadline
+        /// and times out there.
+        #[test]
+        fn t20_private_shared_identity_transition() {
+            let mut w = world(71800);
+            let t = tpark(&mut w, 0x8_0000, 0, SH, 10);
+            w.back();
+            let r =
+                w.s.futex_cmp_requeue_current((0x8_0000, SH), (MX, P), 0, 0, 1);
+            assert_eq!(r, Ok(out(0, 1, false)));
+            assert_eq!(
+                {
+                    let tok = token_of(&w.s, t).unwrap();
+                    key_of(&mut w.s, tok)
+                },
+                Some(w.k(MX))
+            );
+            assert_eq!(deadline(&mut w.s, t), Some(10));
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| assert!(timed_out(s, t)));
+        }
+
+        /// 21 — unrelated keys in ONE hash bucket: the timeout of one removes only it.
+        #[test]
+        fn t21_same_hash_bucket_with_unrelated_keys() {
+            let mut w = world(71900);
+            let target = w.k(SQ).bucket_for_test();
+            let other = (0..512usize)
+                .map(|i| SQ + 0x100 + 4 * i)
+                .find(|&va| va != SQ && key(&w.s, w.driver, va).bucket_for_test() == target)
+                .expect("a colliding VA on the same page");
+            let driver = w.driver;
+            word(&mut w.s, driver, other, 3);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            let u = tpark(&mut w, other, 3, P, 50);
+            w.back();
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert!(
+                    parked(s, u),
+                    "the unrelated waiter in the bucket is untouched"
+                );
+                assert_eq!(deadline(s, u), Some(50));
+                consistent(s);
+            });
+        }
+
+        // ── Publication windows ──────────────────────────────────────────────────────────────
+
+        /// 22 — the deadline is reached and the collector runs INSIDE the split park's
+        /// publication window (after the registration, before the clear): the caller settles in
+        /// place with `TimedOut` from the completion, which is consumed, not left behind.
+        #[test]
+        fn t22_timeout_during_split_park_publication() {
+            let w = world(72000);
+            let (a, t) = (w.a, w.next);
+            let k = leak(w.s);
+            k.with(|s| {
+                task(s, t, a);
+                run(s, t);
+            });
+            hook::arm_after_register(alloc::boxed::Box::new(move || {
+                assert_eq!(collect(k, 10).timed_out, 1);
+            }));
+            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 5, P, Some(10));
+            hook::run_after_register();
+            assert!(
+                matches!(o, FutexParkOutcome::WokenDuringPublication { .. }),
+                "{o:?}"
+            );
+            let done = k
+                .take_futex_wait_completion_split(t, a)
+                .expect("its result");
+            assert_eq!(done.result, TIMED_OUT, "the timeout's result, not 1");
+            k.with(|s| {
+                assert_eq!(completion(s, t), None, "consumed exactly once");
+                assert_eq!(occupied(s), 0);
+            });
+        }
+
+        /// 23 — a wake inside the same window: the completion is `Ok(true)`.
+        #[test]
+        fn t23_wake_during_split_park_publication() {
+            let w = world(72100);
+            let (a, t) = (w.a, w.next);
+            let k = leak(w.s);
+            k.with(|s| {
+                task(s, t, a);
+                run(s, t);
+            });
+            hook::arm_after_register(alloc::boxed::Box::new(move || {
+                assert_eq!(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P), Ok(1));
+            }));
+            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 5, P, Some(10));
+            hook::run_after_register();
+            assert!(
+                matches!(o, FutexParkOutcome::WokenDuringPublication { .. }),
+                "{o:?}"
+            );
+            let done = k
+                .take_futex_wait_completion_split(t, a)
+                .expect("its result");
+            assert_eq!((done.result, done.result_register()), (0, 1));
+            assert_eq!(
+                collect(k, 10),
+                FutexTimeoutPass::default(),
+                "nothing left to time out"
+            );
+        }
+
+        // ── Exit, reap, reuse ────────────────────────────────────────────────────────────────
+
+        /// 24 — exit before expiry: record and deadline retired; the collector finds nothing and
+        /// never resurrects the task.
+        #[test]
+        fn t24_task_exit_before_expiry() {
+            let mut w = world(72200);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            w.s.mark_task_dead(t).expect("dead");
+            assert_eq!(timed_records(&mut w.s), 0);
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10), FutexTimeoutPass::default());
+            k.with(|s| {
+                assert_eq!(s.task_status(t), Some(TaskStatus::Dead));
+                assert_eq!(placement(s, t), TaskPlacement::Nowhere);
+            });
+        }
+
+        /// 25 — exit after the timeout won but before placement (Expired, queue full): the exit
+        /// retires the record; a later pass with room places nobody.
+        #[test]
+        fn t25_task_exit_after_timeout_claim_before_placement() {
+            let mut w = world(72300);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let a = w.a;
+            let fillers = fill(&mut w.s, a, 76000);
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).expired, 1);
+            k.with(|s| {
+                s.mark_task_dead(t).expect("dead");
+                drain_one(s, fillers[0]);
+            });
+            assert_eq!(collect(k, 11), FutexTimeoutPass::default());
+            k.with(|s| {
+                assert_eq!(s.task_status(t), Some(TaskStatus::Dead));
+                assert_eq!(placement(s, t), TaskPlacement::Nowhere);
+                assert_eq!(reserved(s), 0);
+            });
+        }
+
+        /// 26 — reap and numeric-TID reuse: the replacement incarnation inherits no deadline and
+        /// is never timed out by the old one.
+        #[test]
+        fn t26_reap_and_numeric_tid_reuse() {
+            let mut w = world(72400);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            w.s.mark_task_dead(t).expect("dead");
+            w.s.with_tcbs_mut(|tcbs| {
+                let i = tcbs
+                    .iter()
+                    .position(|x| x.as_ref().is_some_and(|x| x.tid.0 == t))
+                    .unwrap();
+                tcbs[i] = None;
+            });
+            let (b2, _) = space(&mut w.s);
+            private_page(&mut w.s, b2, SQ);
+            task(&mut w.s, t, b2);
+            word(&mut w.s, t, SQ, 5);
+            run(&mut w.s, t);
+            assert!(
+                w.s.futex_wait_current(SQ, 5, P).expect("wait"),
+                "the replacement parks"
+            );
+            w.back();
+            assert_eq!(deadline(&mut w.s, t), None, "it inherited no deadline");
+            let k = leak(w.s);
+            assert_eq!(collect(k, u64::MAX), FutexTimeoutPass::default());
+            k.with(|s| assert!(parked(s, t)));
+        }
+
+        /// 27 — waiter-slot reuse: a new cycle in the slot an old timed cycle used is untimed
+        /// unless its own registration says otherwise, and has a new generation.
+        #[test]
+        fn t27_waiter_slot_and_generation_reuse() {
+            let mut w = world(72500);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let old = token_of(&w.s, t).unwrap();
+            assert_eq!(w.s.futex_wake(SQ, 1, P), Ok(1));
+            let u = w.park(SQ, 5, P);
+            w.back();
+            let new = token_of(&w.s, u).unwrap();
+            assert_eq!(new.slot, old.slot, "the slot is reused");
+            assert_ne!(new.generation, old.generation);
+            assert_eq!(deadline(&mut w.s, u), None, "no deadline follows the slot");
+            let k = leak(w.s);
+            assert_eq!(collect(k, u64::MAX), FutexTimeoutPass::default());
+        }
+
+        /// 28 — address-space generation reuse: a timed waiter of a destroyed space is retired
+        /// with its task; the reused ASID's waiter is untouched.
+        #[test]
+        fn t28_address_space_generation_reuse() {
+            let mut w = world(72600);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let gen_a = match key(&w.s, w.driver, SQ) {
+                FutexKey::Private {
+                    aspace_generation, ..
+                } => aspace_generation,
+                _ => unreachable!(),
+            };
+            let tk = {
+                let tok = token_of(&w.s, t).unwrap();
+                key_of(&mut w.s, tok)
+            };
+            assert!(
+                matches!(tk, Some(FutexKey::Private { aspace_generation, .. }) if aspace_generation == gen_a)
+            );
+            w.s.mark_task_dead(t).expect("dead");
+            let (b2, _) = space(&mut w.s);
+            private_page(&mut w.s, b2, SQ);
+            let u = w.next + 100;
+            task(&mut w.s, u, b2);
+            word(&mut w.s, u, SQ, 5);
+            run(&mut w.s, u);
+            assert!(w.s.futex_wait_current(SQ, 5, P).expect("wait"));
+            w.back();
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10), FutexTimeoutPass::default());
+            k.with(|s| assert!(parked(s, u)));
+        }
+
+        /// 29 — mapping teardown before expiry: the timeout terminates the wait through its
+        /// registered identity, without resolving the unmapped VA.
+        #[test]
+        fn t29_mapping_teardown_before_expiry() {
+            let mut w = world(72700);
+            let t = tpark(&mut w, Y, 9, P, 10);
+            w.back();
+            let a = w.a;
+            w.s.unmap_user_page_in_asid(a, VirtAddr(Y as u64))
+                .expect("unmap");
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| assert!(timed_out(s, t)));
+        }
+
+        // ── Collector ────────────────────────────────────────────────────────────────────────
+
+        /// 30 — two collectors on two CPUs at once: exactly one claims; the other loses and
+        /// releases its reservation.
+        #[test]
+        fn t30_simultaneous_deadline_collectors() {
+            let mut w = world(72800);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let k = leak(w.s);
+            let inner = alloc::rc::Rc::new(core::cell::Cell::new(None));
+            let i2 = inner.clone();
+            hook::arm_timeout_step(alloc::boxed::Box::new(move |step, tid| {
+                if step == hook::TIMEOUT_AFTER_RESERVE && tid == t {
+                    k.with(|s| {
+                        s.with_task_futex_mut(|_t, table| table.reset_timeout_cursor_for_test())
+                    });
+                    i2.set(Some(k.run_due_futex_timeouts_at(CpuId(1), 10)));
+                    return false;
+                }
+                true
+            }));
+            let outer = collect(k, 10);
+            let inner = inner.get().expect("the second collector ran");
+            assert_eq!(outer.timed_out + inner.timed_out, 1, "exactly one claim");
+            assert_eq!(outer.lost + inner.lost, 1);
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert_eq!(reserved(s), 0);
+            });
+        }
+
+        /// 31 — repeated overdue scans deliver one timeout.
+        #[test]
+        fn t31_repeated_overdue_scans_are_idempotent() {
+            let mut w = world(72900);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let k = leak(w.s);
+            let total: u32 = (10..30).map(|n| collect(k, n).timed_out).sum();
+            assert_eq!(total, 1);
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert_eq!(queued_count(s, t), 1);
+            });
+        }
+
+        /// 32 — the cursor wraps and a refused (Expired) record is revisited: with high table
+        /// indices, a full window and a refusal, every due waiter is settled within one cycle.
+        #[test]
+        fn t32_scanner_cursor_wrap_and_refusal() {
+            let mut w = world(73000);
+            let mut ts = Vec::new();
+            for _ in 0..12 {
+                ts.push(tpark(&mut w, SQ, 5, P, 10));
+            }
+            w.back();
+            let k = leak(w.s);
+            k.with(|s| s.with_task_futex_mut(|_t, table| table.set_timeout_cursor_for_test(500)));
+            let mut done = 0;
+            for n in 0..(fx::MAX_FUTEX_WAITERS / fx::FUTEX_TIMEOUT_SCAN_WINDOW + 2) as u64 {
+                done += collect(k, 10 + n).timed_out;
+            }
+            assert_eq!(done, 12, "the cursor wrapped and reached every slot");
+            k.with(|s| assert!(ts.iter().all(|&t| timed_out(s, t))));
+        }
+
+        /// 33 — every user thread blocked (the only tasks are parked waiters, none current): the
+        /// collector alone settles the timed one.
+        #[test]
+        fn t33_all_user_threads_blocked() {
+            let mut w = world(73100);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            let u = w.park(MX, 0, P);
+            let driver = w.driver;
+            w.s.mark_task_dead(driver).expect("driver gone");
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert!(parked(s, u));
+            });
+        }
+
+        /// 34 — the clock the collector uses is the scheduler tick: advancing it by the
+        /// converted duration makes the deadline due; one tick less does not.
+        #[test]
+        fn t34_timer_progress_reaches_the_deadline() {
+            let period = crate::arch::platform_constants::SCHED_TICK_PERIOD_NS;
+            assert_eq!(futex_timeout_ticks(0, period), 0);
+            assert_eq!(
+                futex_timeout_ticks(1, period),
+                2,
+                "a partial period plus one"
+            );
+            assert_eq!(futex_timeout_ticks(period, period), 2);
+            assert_eq!(futex_timeout_ticks(period + 1, period), 3);
+            assert_eq!(futex_timeout_ticks(u64::MAX, period), u64::MAX / period + 2);
+            let mut w = world(73200);
+            let d = futex_wait_deadline(w.s.scheduler_tick_now(), 3 * period).unwrap();
+            let t = tpark(&mut w, SQ, 5, P, d);
+            w.back();
+            let k = leak(w.s);
+            tick(k, d - now(k) - 1);
+            assert_eq!(k.run_due_futex_timeouts(CpuId(0)).timed_out, 0);
+            tick(k, 1);
+            assert_eq!(k.run_due_futex_timeouts(CpuId(0)).timed_out, 1);
+            k.with(|s| assert!(timed_out(s, t)));
+        }
+
+        /// 35 — a collector on another CPU delivers a timeout to a waiter whose home is CPU 0.
+        #[test]
+        fn t35_multi_cpu_timeout_delivery() {
+            let mut w = world(73300);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let k = leak(w.s);
+            assert_eq!(k.run_due_futex_timeouts_at(CpuId(1), 10).timed_out, 1);
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert_eq!(
+                    placement(s, t),
+                    TaskPlacement::Queued(CpuId(0)),
+                    "on its home"
+                );
+            });
+        }
+
+        /// 41 — bounded collector work: with more timed waiters than the window, one pass
+        /// examines exactly `FUTEX_TIMEOUT_SCAN_WINDOW` timed records and hands out at most
+        /// `FUTEX_TIMEOUT_DUE_MAX`; the passes together still reach the last-registered waiter.
+        #[test]
+        fn t41_bounded_collector_work_with_many_timed_waiters() {
+            let mut w = world(74000);
+            let n = fx::FUTEX_TIMEOUT_SCAN_WINDOW + 20;
+            let mut far = Vec::new();
+            for _ in 0..n {
+                far.push(tpark(&mut w, SQ, 5, P, 1_000_000));
+            }
+            let last = tpark(&mut w, MX, 0, P, 10);
+            w.back();
+            let k = leak(w.s);
+            let first = collect(k, 10);
+            assert_eq!(
+                first.examined as usize,
+                fx::FUTEX_TIMEOUT_SCAN_WINDOW,
+                "bounded"
+            );
+            assert!(first.due as usize <= fx::FUTEX_TIMEOUT_DUE_MAX);
+            let mut total = first.timed_out;
+            for _ in 0..4 {
+                let p = collect(k, 10);
+                assert!(p.examined as usize <= fx::FUTEX_TIMEOUT_SCAN_WINDOW);
+                total += p.timed_out;
+            }
+            assert_eq!(total, 1, "the high slot was reached");
+            k.with(|s| {
+                assert!(timed_out(s, last));
+                assert!(far.iter().all(|&t| parked(s, t)));
+            });
+        }
+
+        // ── The ring-3 result on each port ───────────────────────────────────────────────────
+
+        /// The frame a parked timed wait leaves: the fail-closed provisional, then the resume
+        /// boundary's encoding of the completion (each port's consumer, as written there).
+        fn resumed(done: BlockedSyscallCompletion) -> crate::kernel::trapframe::TrapFrame {
+            let mut f = crate::kernel::trapframe::TrapFrame::new(9, [SQ, 5, 2, 1_000, 0, 0]);
+            f.set_err(SyscallError::Internal.code());
+            if done.result == 0 {
+                f.set_ok(done.success_ret0(), 0, 0);
+            } else {
+                f.set_err(done.result as usize);
+            }
+            f.set_user_gpr(10, done.result_register());
+            f.set_user_gpr(11, 0);
+            f
+        }
+        fn ending(e: FutexWaitEnding) -> BlockedSyscallCompletion {
+            BlockedSyscallCompletion {
+                syscall_class: BlockedSyscallClass::FutexWait,
+                result: if e == FutexWaitEnding::TimedOut {
+                    TIMED_OUT
+                } else {
+                    0
+                },
+                tid: 1,
+                asid: Asid(1),
+                blocked_generation: 1,
+            }
+        }
+
+        /// 36 — RISC-V: `a0` is `9` after a timeout and `1` after a wake (the user-rt decode:
+        /// `a0 > 1` is an error); the drain encodes `result_register` and publishes the
+        /// continuation tag.
+        #[test]
+        fn t36_riscv_parked_timeout_return_value() {
+            const RV: &str = include_str!("../../arch/riscv64/trap.rs");
+            assert!(RV.contains("frame.set_user_gpr(10, done.result_register());"));
+            assert!(RV.contains("kernel.take_resume_completion(current_tid)"));
+            assert_eq!(resumed(ending(FutexWaitEnding::TimedOut)).user_gpr(10), 9);
+            assert_eq!(resumed(ending(FutexWaitEnding::Woken)).user_gpr(10), 1);
+            assert_eq!(resumed(ending(FutexWaitEnding::Woken)).error_code(), None);
+        }
+
+        /// 37 — AArch64: `x0` is the result register (`encode_blocked_completion_result`).
+        #[test]
+        fn t37_aarch64_parked_timeout_return_value() {
+            const A64: &str = include_str!("../../arch/aarch64/trap.rs");
+            assert_eq!(
+                A64.matches(
+                    "encode_blocked_completion_result(frame, done.result_register() as u64)"
+                )
+                .count(),
+                2,
+                "both the post-lock and the in-lock send-class consumers"
+            );
+            assert!(A64.contains("kernel.take_resume_completion(current_tid)"));
+            assert_eq!(ending(FutexWaitEnding::TimedOut).result_register(), 9);
+            assert_eq!(ending(FutexWaitEnding::Woken).result_register(), 1);
+        }
+
+        /// 38 — x86_64: the error lane carries `TimedOut`; a wake is `set_ok(1, 0, 0)`.
+        #[test]
+        fn t38_x86_64_parked_timeout_return_value() {
+            const X86: &str = include_str!("../../arch/x86_64/trap.rs");
+            assert_eq!(
+                X86.matches("frame.set_ok(done.success_ret0(), 0, 0);")
+                    .count(),
+                2
+            );
+            let timed = resumed(ending(FutexWaitEnding::TimedOut));
+            assert_eq!(timed.error_code(), Some(9));
+            let woke = resumed(ending(FutexWaitEnding::Woken));
+            assert_eq!((woke.error_code(), woke.ret0()), (None, 1));
+            // The shared take every exact-token resume uses takes the FutexWait class.
+            const RT: &str = include_str!("../../runtime.rs");
+            assert!(RT.contains("if !pending.consumed_with_send() {"));
+        }
+
+        /// 39 — no duplicate enqueue or completion across every owner in one history: the
+        /// timeout, then a wake, a requeue and a second pass; the waiter is queued once with one
+        /// completion.
+        #[test]
+        fn t39_no_duplicate_enqueue_or_completion() {
+            let mut w = world(73400);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| {
+                assert_eq!(s.futex_wake(SQ, ALL, P), Ok(0));
+                assert_eq!(rq(s, SQ, MX, 5, 1, ALL), Ok(out(0, 0, false)));
+            });
+            assert_eq!(collect(k, 20), FutexTimeoutPass::default());
+            k.with(|s| {
+                assert!(timed_out(s, t));
+                assert_eq!(queued_count(s, t), 1);
+            });
+            let first =
+                k.take_futex_wait_completion_split(t, Asid(k.with(|s| s.task_asid(t).unwrap().0)));
+            assert!(first.is_some());
+            assert_eq!(
+                k.take_futex_wait_completion_split(t, Asid(k.with(|s| s.task_asid(t).unwrap().0))),
+                None,
+                "consumed exactly once"
+            );
+        }
+
+        /// 40 — no leak: after a mixed history every record, deadline and reservation is gone.
+        #[test]
+        fn t40_no_deadline_reservation_or_record_leak() {
+            let mut w = world(73500);
+            let t1 = tpark(&mut w, SQ, 5, P, 10);
+            let t2 = tpark(&mut w, SQ, 5, P, 100);
+            let t3 = tpark(&mut w, MX, 0, P, 10);
+            w.back();
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 2);
+            k.with(|s| {
+                assert_eq!(s.futex_wake(SQ, 1, P), Ok(1));
+                assert!(timed_out(s, t1) && woken(s, t2) && timed_out(s, t3));
+                assert_eq!(occupied(s), 0);
+                assert_eq!(timed_records(s), 0);
+                assert_eq!(reserved(s), 0);
+                consistent(s);
+            });
+        }
+    }
+
     mod riscv_park_ret1 {
         use super::wait_atomic1::wait;
         use super::*;

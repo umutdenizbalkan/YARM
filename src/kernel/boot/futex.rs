@@ -462,6 +462,16 @@ impl FutexWaiterTable {
             .flatten()
     }
 
+    /// FUTEX-TIME1 — place the collector's cursor. Test use (wrap and simultaneous passes).
+    #[cfg(test)]
+    pub fn set_timeout_cursor_for_test(&mut self, slot: usize) {
+        self.timeout_cursor = (slot % MAX_FUTEX_WAITERS) as u16;
+    }
+    #[cfg(test)]
+    pub fn reset_timeout_cursor_for_test(&mut self) {
+        self.timeout_cursor = 0;
+    }
+
     /// FUTEX-TIME1 — how many records hold a deadline. Test and census use.
     #[cfg(test)]
     pub fn timed_records(&self) -> usize {
@@ -975,6 +985,8 @@ pub struct FutexTimeoutCandidate {
 /// FUTEX-TIME1 — what one collector pass did (counts; telemetry and tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FutexTimeoutPass {
+    /// Timed records the scan examined (at most `FUTEX_TIMEOUT_SCAN_WINDOW`).
+    pub examined: u32,
     /// Due live timed waiters the scan handed out.
     pub due: u32,
     /// Timeouts committed and placed (`TimedOut` delivered at the next resume).
@@ -987,15 +999,20 @@ pub struct FutexTimeoutPass {
     pub refused: u32,
 }
 
-/// FUTEX-TIME1 — how many slots one collector pass examines, and how many due waiters it hands
-/// out. Every slot is examined once per `MAX_FUTEX_WAITERS / FUTEX_TIMEOUT_SCAN_WINDOW` passes,
-/// whatever the outcome of the placements it attempted, so no slot can starve.
+/// FUTEX-TIME1 — how many TIMED records one collector pass examines, and how many due waiters it
+/// hands out. A pass walks the slots from the cursor and stops after that many timed records, or
+/// one whole wrap of the table, whichever comes first — the same bound the IPC collector uses
+/// (occupied entries, at most one wrap). So with fewer timed waits than the window every pass sees
+/// every one of them, and with 512 a timed record is examined at least once every
+/// `MAX_FUTEX_WAITERS / FUTEX_TIMEOUT_SCAN_WINDOW` passes, whatever the outcome of the placements
+/// attempted: no slot can starve, and a refused one is retried.
 pub const FUTEX_TIMEOUT_SCAN_WINDOW: usize = 64;
 pub const FUTEX_TIMEOUT_DUE_MAX: usize = 8;
 
 /// FUTEX-TIME1 — rank 2, read-mostly: one bounded pass of the timeout collector.
 ///
-/// Examines at most [`FUTEX_TIMEOUT_SCAN_WINDOW`] slots from the table's cursor and returns the
+/// Walks at most one wrap of the slots from the table's cursor, examining at most
+/// [`FUTEX_TIMEOUT_SCAN_WINDOW`] TIMED records, and returns the
 /// LIVE timed waiters whose deadline is `<= now` (at most [`FUTEX_TIMEOUT_DUE_MAX`]), in slot
 /// order: each on a user key (the timeout has not been decided) or on its `Expired` key (it has,
 /// and only its placement is owed). A record on an NR 17 `Pending` key is skipped: that wake
@@ -1008,15 +1025,16 @@ pub fn collect_due_futex_timeouts_locked(
     table: &mut FutexWaiterTable,
     now: u64,
     out: &mut [Option<FutexTimeoutCandidate>; FUTEX_TIMEOUT_DUE_MAX],
-) -> usize {
+) -> (usize, usize) {
     if table.timed == 0 {
-        return 0;
+        return (0, 0);
     }
     let cap = table.capacity();
     let start = usize::from(table.timeout_cursor) % cap.max(1);
     let mut n = 0usize;
     let mut examined = 0usize;
-    while examined < FUTEX_TIMEOUT_SCAN_WINDOW.min(cap) && n < FUTEX_TIMEOUT_DUE_MAX {
+    let mut timed_seen = 0usize;
+    while examined < cap && timed_seen < FUTEX_TIMEOUT_SCAN_WINDOW && n < FUTEX_TIMEOUT_DUE_MAX {
         let slot = (start + examined) % cap;
         examined += 1;
         let Some(rec) = table.records[slot] else {
@@ -1025,6 +1043,7 @@ pub fn collect_due_futex_timeouts_locked(
         let Some(deadline) = rec.deadline else {
             continue;
         };
+        timed_seen += 1;
         if deadline > now || matches!(rec.key, FutexKey::Pending { .. }) || !table.live(tcbs, slot)
         {
             continue;
@@ -1037,7 +1056,7 @@ pub fn collect_due_futex_timeouts_locked(
         n += 1;
     }
     table.timeout_cursor = ((start + examined) % cap.max(1)) as u16;
-    n
+    (n, timed_seen)
 }
 
 /// FUTEX-TIME1 — rank 2, THE timeout claim: the exact cycle `candidate` names is made `Runnable`,

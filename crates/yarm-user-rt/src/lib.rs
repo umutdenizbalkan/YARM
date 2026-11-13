@@ -1662,6 +1662,66 @@ pub mod syscall {
         Ok(ret.ret0 != 0)
     }
 
+    /// FUTEX-TIME1 — NR 9 flag (bit 1): the wait is timed, and argument slot 3 is its relative
+    /// timeout in nanoseconds.
+    pub const FUTEX_FLAG_TIMED: usize = 1 << 1;
+
+    /// FUTEX-TIME1 — what a timed wait returned.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FutexTimedWait {
+        /// The word did not hold `expected`: nothing parked (even if the timeout was zero).
+        ValueChanged,
+        /// A wake (`futex_wake`, the wake portion of `futex_cmp_requeue`) took this wait.
+        Woken,
+        /// The timeout took this wait: at least `timeout` elapsed and no wake won.
+        TimedOut,
+    }
+
+    /// FUTEX-TIME1 — [`futex_wait`] with a relative `timeout` (NR 9 with `FUTEX_FLAG_TIMED`; the
+    /// same kernel transaction).
+    ///
+    /// The kernel reads the word and compares it first, so a word that already differs is
+    /// `ValueChanged` whatever the timeout; a matching word with a zero timeout is `TimedOut`
+    /// without parking. Otherwise exactly one of a wake and the timeout ends the wait, and this
+    /// returns which: `Woken` is never reported for a wait the timeout ended. The timeout is a
+    /// LOWER bound: the kernel rounds it up to its scheduler tick (0.8 s on x86_64, 50 ms on
+    /// AArch64, 10 ms on RISC-V) plus one, and adds scheduling latency. A requeue keeps the
+    /// deadline. Durations beyond `u64::MAX` nanoseconds are clamped to it.
+    #[inline]
+    pub fn futex_wait_timeout(
+        addr: *const u32,
+        expected: u32,
+        scope: FutexScope,
+        timeout: core::time::Duration,
+    ) -> core::result::Result<FutexTimedWait, SyscallError> {
+        let ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        // SAFETY: Uses architecture syscall ABI to enter kernel. The kernel validates that `addr`
+        // names a readable current-user futex word before blocking.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_FUTEX_WAIT_NR,
+                [
+                    addr as usize,
+                    expected as usize,
+                    scope.flags() | FUTEX_FLAG_TIMED,
+                    ns as usize,
+                    0,
+                    0,
+                ],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        let err = (ret.error != 0).then_some(ret.error);
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        let err = (ret.ret0 > 1).then_some(ret.ret0);
+        match err.map(decode_syscall_error) {
+            Some(SyscallError::TimedOut) => Ok(FutexTimedWait::TimedOut),
+            Some(other) => Err(other),
+            None if ret.ret0 != 0 => Ok(FutexTimedWait::Woken),
+            None => Ok(FutexTimedWait::ValueChanged),
+        }
+    }
+
     /// Wake up to `count` waiters of the futex word at `addr` in `scope`, oldest first (NR 10).
     /// Returns the number actually woken. The count is in `ret0` on every architecture.
     #[inline]
@@ -1833,10 +1893,14 @@ pub mod syscall {
 }
 
 /// FUTEX-REQUEUE1 — a minimal futex mutex and condition variable, enough to show the
-/// compare-and-requeue broadcast. Not a pthread implementation: no timeouts, no attributes, no
-/// robustness, no priority protocol.
+/// compare-and-requeue broadcast. Not a pthread implementation: no attributes, no robustness, no
+/// priority protocol, and (FUTEX-TIME1) only a bounded relative-timeout condition wait — no
+/// absolute or clock-selected timeouts, no timed mutex lock.
 pub mod futex_sync {
-    use crate::syscall::{FutexScope, SyscallError, futex_cmp_requeue, futex_wait, futex_wake};
+    use crate::syscall::{
+        FutexScope, FutexTimedWait, SyscallError, futex_cmp_requeue, futex_wait,
+        futex_wait_timeout, futex_wake,
+    };
     use core::sync::atomic::{AtomicU32, Ordering};
 
     const UNLOCKED: u32 = 0;
@@ -1931,6 +1995,21 @@ pub mod futex_sync {
             // Woken from the sequence, or from the mutex after a requeue: other waiters may be
             // parked on the mutex, so take it in the contended state.
             mutex.lock_contended();
+        }
+
+        /// FUTEX-TIME1 — [`Self::wait`] for at most `timeout`. Returns `true` iff the TIMEOUT
+        /// ended the wait. Either way the caller holds `mutex` again on return: a waiter a
+        /// broadcast requeued onto the mutex word keeps its deadline there, and still takes the
+        /// mutex before returning. Spurious returns are possible: re-check the predicate.
+        pub fn wait_timeout(&self, mutex: &FutexMutex, timeout: core::time::Duration) -> bool {
+            let seen = self.seq.load(Ordering::Relaxed);
+            mutex.unlock();
+            let timed_out = matches!(
+                futex_wait_timeout(self.seq.as_ptr(), seen, self.scope, timeout),
+                Ok(FutexTimedWait::TimedOut)
+            );
+            mutex.lock_contended();
+            timed_out
         }
 
         pub fn signal(&self) {

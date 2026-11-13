@@ -14193,10 +14193,11 @@ impl SharedKernel {
         use crate::kernel::boot::futex::{self as fx, FutexTimeoutPass};
         use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
         let mut due = [None; fx::FUTEX_TIMEOUT_DUE_MAX];
-        let found = self.with_task_futex_split_mut(|tcbs, table| {
+        let (found, examined) = self.with_task_futex_split_mut(|tcbs, table| {
             fx::collect_due_futex_timeouts_locked(tcbs, table, now, &mut due)
         });
         let mut pass = FutexTimeoutPass {
+            examined: examined as u32,
             due: found as u32,
             ..FutexTimeoutPass::default()
         };
