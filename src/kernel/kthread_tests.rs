@@ -880,9 +880,11 @@ fn every_kernel_thread_fits_beside_a_user_full_queue() {
         assert_eq!(g.q.wake_all(&k.kthreads), KWAIT_CAPACITY);
     }
     // 64 user entries and 32 kernel threads: the reserved bound, reached and not exceeded.
+    // SCHED-TIME-FOUNDATION1 A: `MAX_QUEUED_PER_PRIORITY` also holds the one rotation slot of a
+    // returning current task, unused here, so the count is named by its two parts.
     assert_eq!(
         queued(&k, CPU).len(),
-        crate::kernel::scheduler::MAX_QUEUED_PER_PRIORITY
+        crate::kernel::scheduler::MAX_RUN_QUEUE + KTHREAD_CAPACITY
     );
     for &id in &ids {
         assert_eq!(occurrences(&k, CPU, id.raw()), 1);

@@ -96,9 +96,16 @@ pub(crate) trait ReplyTimeoutDomains {
         &mut self,
         f: impl FnOnce(&mut [Option<crate::kernel::task::ThreadControlBlock>]) -> R,
     ) -> R;
-    /// Enqueue a woken caller onto its run queue — the transaction's LAST, non-fallible
-    /// step, taken with NO ipc/task lock held.
-    fn rtd_enqueue(&mut self, tid: u64);
+    /// SCHED-TIME-FOUNDATION1 A (IPC-TIMEOUT-CAP1) — a run-queue slot promised to the caller.
+    type Placement;
+    /// Promise the caller a slot on its home run queue BEFORE any claim, with no ipc/task lock
+    /// held. `None`: no room — the transaction claims nothing and returns `PlacementDeferred`.
+    fn rtd_reserve(&mut self, tid: u64) -> Option<Self::Placement>;
+    /// Fill the promise: the transaction's LAST step, taken with NO ipc/task lock held. It cannot
+    /// be refused for capacity.
+    fn rtd_enqueue_reserved(&mut self, placement: Self::Placement);
+    /// Give back a promise whose claim did not commit.
+    fn rtd_release(&mut self, placement: Self::Placement);
 }
 
 /// The broad/hosted path: per-domain sub-locks on `&mut KernelState`. Used by
@@ -114,8 +121,53 @@ impl ReplyTimeoutDomains for KernelState {
     ) -> R {
         self.with_tcbs_mut(|arr| f(arr.as_mut_slice()))
     }
-    fn rtd_enqueue(&mut self, tid: u64) {
-        let _ = self.enqueue_task(tid);
+    type Placement = crate::kernel::task_enqueue::EnqueuePlan;
+    fn rtd_reserve(&mut self, tid: u64) -> Option<Self::Placement> {
+        use crate::kernel::task_enqueue::{self as te, EnqueueTarget};
+        let cpu = self.current_cpu();
+        let mut plan = self
+            .with_task_enqueue_policy_mut(|tcbs, classes| {
+                te::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)
+            })
+            .ok()?;
+        self.fix_plan_home(&mut plan, cpu);
+        let EnqueueTarget::Pinned(home) = plan.target else {
+            return None;
+        };
+        let mut guard = self.scheduler_state();
+        let mut all = guard.view();
+        let mut view = all.cpu(home).ok()?;
+        te::reserve_enqueue_on_cpu_locked(&mut view, &plan).ok()?;
+        Some(plan)
+    }
+    fn rtd_enqueue_reserved(&mut self, plan: Self::Placement) {
+        use crate::kernel::task_enqueue::{self as te, EnqueueTarget};
+        let EnqueueTarget::Pinned(home) = plan.target else {
+            return;
+        };
+        let mut guard = self.scheduler_state();
+        let mut all = guard.view();
+        if let Ok(mut view) = all.cpu(home)
+            && let Err(err) = te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan)
+        {
+            crate::yarm_log!(
+                "IPC_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} err={:?}",
+                plan.tid,
+                home.0,
+                err
+            );
+        }
+    }
+    fn rtd_release(&mut self, plan: Self::Placement) {
+        use crate::kernel::task_enqueue::{self as te, EnqueueTarget};
+        let EnqueueTarget::Pinned(home) = plan.target else {
+            return;
+        };
+        let mut guard = self.scheduler_state();
+        let mut all = guard.view();
+        if let Ok(mut view) = all.cpu(home) {
+            te::release_enqueue_reservation_on_cpu_locked(&mut view, &plan);
+        }
     }
 }
 
@@ -481,14 +533,22 @@ pub(crate) fn complete_reply_timeout_over<D: ReplyTimeoutDomains>(
     let record_index = identity.reply_record_index;
     let record_generation = identity.reply_record_generation;
     let token_index = handle.token_index();
+    // SCHED-TIME-FOUNDATION1 A (IPC-TIMEOUT-CAP1): the caller's slot, promised BEFORE any claim.
+    // No room: nothing is claimed and the obligation stays armed for a later pass, so the caller
+    // can never be made `Runnable` without a placement.
+    let Some(placement) = d.rtd_reserve(identity.caller_tid.0) else {
+        return ReplyTimeoutOutcome::PlacementDeferred;
+    };
 
     // (1) Claim the exact due token. Stale/duplicate fires fail HERE.
     let Some(fire_owner) = rt_claim_deadline_fire(d, handle) else {
+        d.rtd_release(placement);
         return ReplyTimeoutOutcome::StaleToken;
     };
     // (2) Claim Timeout terminal ownership. Reply/peer/exit/endpoint may have won.
     let Some(terminal_owner) = rt_try_claim_timeout_terminal(d, record_index, &identity) else {
         rt_disarm_deadline_fire(d, token_index, &fire_owner);
+        d.rtd_release(placement);
         return ReplyTimeoutOutcome::LostToTerminal;
     };
     // (3–5) Revalidate exact caller / endpoint gen / blocked-recv gen; claim waiter.
@@ -513,6 +573,7 @@ pub(crate) fn complete_reply_timeout_over<D: ReplyTimeoutDomains>(
         let _ = rt_invalidate_reply_record(d, record_index, record_generation);
         let _ = rt_commit_reply_terminal(d, record_index, &terminal_owner);
         let _ = rt_complete_deadline_fire(d, token_index, &fire_owner);
+        d.rtd_release(placement);
         return ReplyTimeoutOutcome::CleanupNoWake;
     }
     // (6) Prepare the canonical recv-v2 TIMEOUT result on the still-blocked caller.
@@ -529,10 +590,11 @@ pub(crate) fn complete_reply_timeout_over<D: ReplyTimeoutDomains>(
         caller.asid,
         crate::kernel::syscall::SyscallError::TimedOut as u64,
     ) else {
+        d.rtd_release(placement);
         return ReplyTimeoutOutcome::CleanupNoWake;
     };
     // (12) Scheduler enqueue LAST — the sole externally visible action, no lock held.
-    d.rtd_enqueue(caller.tid.0);
+    d.rtd_enqueue_reserved(placement);
     let _ = affinity;
     ReplyTimeoutOutcome::Woken
 }
@@ -566,6 +628,12 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
     use crate::runtime::ReplyTimeoutOutcome;
     let record_index = identity.reply_record_index;
     let record_generation = identity.reply_record_generation;
+    // SCHED-TIME-FOUNDATION1 A (IPC-TIMEOUT-CAP1): the caller's slot, promised BEFORE any claim.
+    // No room: nothing is claimed and the obligation stays armed for a later pass, so the caller
+    // can never be made `Runnable` without a placement.
+    let Some(placement) = d.rtd_reserve(identity.caller_tid.0) else {
+        return ReplyTimeoutOutcome::PlacementDeferred;
+    };
 
     // (1) The SINGLE authority. A reply that already reserved, a timeout that already
     // claimed, or a caller that already exited all make this fail — death then loses,
@@ -575,6 +643,7 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
             .get(record_index)
             .and_then(|cell| cell.try_claim_peer_death_terminal(identity))
     }) else {
+        d.rtd_release(placement);
         return ReplyTimeoutOutcome::LostToTerminal;
     };
     // (2–5) Revalidate the exact caller incarnation, endpoint generation and blocked
@@ -619,6 +688,7 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
         // why caller exit yields `caller wake = 0`.)
         let _ = rt_invalidate_reply_record(d, record_index, record_generation);
         let _ = rt_commit_reply_terminal(d, record_index, &terminal_owner);
+        d.rtd_release(placement);
         return ReplyTimeoutOutcome::CleanupNoWake;
     }
     // (6) Mark the blocked receive as completed-by-error, reusing the timeout path's
@@ -653,6 +723,7 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
         caller.asid,
         crate::kernel::syscall::SyscallError::ServerDied as u64,
     ) else {
+        d.rtd_release(placement);
         return ReplyTimeoutOutcome::CleanupNoWake;
     };
     // Stage 200D-2B1B-i (classes 7 and 8): `rt_commit_receiver_runnable` performs BOTH the
@@ -681,7 +752,7 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
         record_generation
     );
     // (10) Scheduler enqueue LAST — the sole externally visible action, exactly once.
-    d.rtd_enqueue(caller.tid.0);
+    d.rtd_enqueue_reserved(placement);
     // Stage 200D-2B1B-i (class 9): stamped after the real enqueue, so
     // `result_before_enqueue()` compares two stamps taken at the two real operations.
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]

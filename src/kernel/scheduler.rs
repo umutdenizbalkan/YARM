@@ -22,7 +22,16 @@ const _: () = assert!(MAX_RUN_QUEUE.is_power_of_two());
 /// A kernel thread is queued only on its home CPU and at most once there (`AlreadyQueued`), so a
 /// queue never holds more than that many kernel-thread entries, and a kernel thread's enqueue —
 /// its wake, its yield, its creation — is never refused for capacity.
-pub const MAX_QUEUED_PER_PRIORITY: usize = MAX_RUN_QUEUE + crate::kernel::kthread::KTHREAD_CAPACITY;
+///
+/// SCHED-TIME-FOUNDATION1 A (SCHED-FULL-ROT1): plus ONE entry for the returning occupant. The
+/// rotation owners return the outgoing current task to its own queue without the admission check
+/// ([`PriorityScheduler::requeue_current_with_priority`]); that is what lets a CPU whose queue is
+/// at the user limit keep rotating. Admission still stops every other user push at
+/// [`MAX_RUN_QUEUE`], so a queue holds at most `MAX_RUN_QUEUE + 1` user entries (proof at
+/// `requeue_current_with_priority`) beside at most `KTHREAD_CAPACITY` kernel threads.
+pub const ROTATION_SLOTS: usize = 1;
+pub const MAX_QUEUED_PER_PRIORITY: usize =
+    MAX_RUN_QUEUE + ROTATION_SLOTS + crate::kernel::kthread::KTHREAD_CAPACITY;
 /// The ring's physical slots (a power of two, for the index mask).
 const RING_SLOTS: usize = MAX_QUEUED_PER_PRIORITY.next_power_of_two();
 const _: () = assert!(RING_SLOTS >= MAX_QUEUED_PER_PRIORITY);
@@ -458,6 +467,42 @@ impl PriorityScheduler {
         self.push_unchecked_capacity(tid, priority)
     }
 
+    /// SCHED-TIME-FOUNDATION1 A (SCHED-FULL-ROT1) — return the OUTGOING current task to the tail
+    /// of its own priority queue. Used by every rotation owner (`on_preempt_selection`,
+    /// `preempt_reenqueue_only`, `on_preempt_prefer_selection`) and by nothing else.
+    ///
+    /// It is not an admission. The task already holds a placement on this CPU (it was current a
+    /// moment ago), so it is NOT refused for user capacity; that refusal is what kept a full CPU
+    /// from ever rotating (FUTEX-TIME1 `LT-x86_64-1`: 47 120 refused yields). Only the duplicate
+    /// refusal (`AlreadyQueued`) and the ring's physical bound remain.
+    ///
+    /// **Why it always fits.** Let `V[p]` = user entries queued at `p` + reservations at `p` + 1
+    /// if the current task is a user task at `p`. An admitted push requires
+    /// `len[p] + reserved[p] < MAX_RUN_QUEUE`, so after it `V[p] <= MAX_RUN_QUEUE + 1`. A dequeue
+    /// into `current`, a rotation (this function) and a reserved fill leave `V[p]` unchanged; a
+    /// block or exit lowers it; `restore_exact_current` only undoes a `block_current_exact` and no
+    /// admission can succeed in between at `V[p] = MAX_RUN_QUEUE + 1`. Hence at most
+    /// `MAX_RUN_QUEUE + 1` user entries plus at most `KTHREAD_CAPACITY` kernel threads, which is
+    /// exactly [`MAX_QUEUED_PER_PRIORITY`] — never more, so the push below cannot hit the bound.
+    fn requeue_current_with_priority(
+        &mut self,
+        tid: ThreadId,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        if self.contains_tid(tid) {
+            return Err(SchedulerError::AlreadyQueued);
+        }
+        let pushed = self.push_unchecked_capacity(tid, priority);
+        // The one current that is installed rather than admitted is an AP's idle (tid 0,
+        // `install_ap_idle_current`), so the bound does not cover it; at the physical bound its
+        // push is refused and the caller keeps it current, exactly the pre-repair behaviour.
+        debug_assert!(
+            pushed.is_ok() || tid.0 == 0,
+            "SCHED-FULL-ROT1: the returning occupant exceeded MAX_QUEUED_PER_PRIORITY"
+        );
+        pushed
+    }
+
     /// FUTEX-WAKE-CAP1 — whether one more user entry fits at `priority`, counting reservations.
     fn user_room(&self, priority: TaskPriority) -> bool {
         let p = Self::priority_index(priority);
@@ -679,7 +724,7 @@ impl PriorityScheduler {
             if !self.membership_tracking_exhausted {
                 self.membership_remove(running.tid);
             }
-            if let Err(err) = self.enqueue_with_priority(running.tid, running.priority) {
+            if let Err(err) = self.requeue_current_with_priority(running.tid, running.priority) {
                 if err != SchedulerError::AlreadyQueued && self.runnable_count() != 0 {
                     crate::yarm_log!(
                         "scheduler inconsistency: failed to re-enqueue preempted task {:?}; preserving current task",
@@ -710,8 +755,9 @@ impl PriorityScheduler {
         if !self.membership_tracking_exhausted {
             self.membership_remove(running.tid);
         }
-        if let Err(_err) = self.enqueue_with_priority(running.tid, running.priority) {
-            // Re-enqueue failed — restore as current and signal the caller to fall back.
+        if let Err(_err) = self.requeue_current_with_priority(running.tid, running.priority) {
+            // Re-enqueue failed (`AlreadyQueued` only: SCHED-FULL-ROT1 removed the capacity
+            // refusal) — restore as current and signal the caller to fall back.
             if !self.membership_tracking_exhausted {
                 let _ = self.membership_insert(running.tid);
             }
@@ -744,7 +790,7 @@ impl PriorityScheduler {
             if !self.membership_tracking_exhausted {
                 self.membership_remove(running.tid);
             }
-            if let Err(err) = self.enqueue_with_priority(running.tid, running.priority) {
+            if let Err(err) = self.requeue_current_with_priority(running.tid, running.priority) {
                 if err != SchedulerError::AlreadyQueued && self.runnable_count() != 0 {
                     crate::yarm_log!(
                         "scheduler inconsistency: failed to re-enqueue preempted task {:?}; preserving current task",
@@ -2975,3 +3021,7 @@ mod tests {
         let _err: yarm_kernel::scheduler::SchedulerError = SchedulerError::QueueFull;
     }
 }
+
+#[cfg(test)]
+#[path = "sched_full_rot1_tests.rs"]
+mod sched_full_rot1_tests;

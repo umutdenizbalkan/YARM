@@ -99185,8 +99185,17 @@ mod stage200c2c2c_r2a_riscv_publication {
         let commit = txn
             .find("rt_commit_receiver_runnable(")
             .expect("commit call");
-        let enqueue = txn.find("d.rtd_enqueue(caller.tid.0)").expect("enqueue");
+        // SCHED-TIME-FOUNDATION1 A: the enqueue is the RESERVED commit of the slot promised
+        // before the claim (IPC-TIMEOUT-CAP1); it is still the transaction's last step.
+        let enqueue = txn
+            .find("d.rtd_enqueue_reserved(placement)")
+            .expect("enqueue");
         assert!(commit < enqueue, "publication precedes scheduler enqueue");
+        let reserve = txn.find("d.rtd_reserve(").expect("the promise");
+        assert!(
+            reserve < txn.find("rt_claim_deadline_fire(").expect("the claim"),
+            "promise before claim"
+        );
     }
 
     // (7) SOURCE GUARD: no completion path writes only one mirror — every RISC-V result
@@ -101357,10 +101366,13 @@ mod stage200d1_publication_and_guards {
             .expect("death txn");
         let body = body.split("\nimpl IpcSubsystem").next().unwrap();
         // The enqueue is the last statement and is not nested in any domain closure.
-        let enqueue = body.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        // SCHED-TIME-FOUNDATION1 A: the enqueue is the reserved commit (IPC-TIMEOUT-CAP1).
+        let enqueue = body
+            .find("d.rtd_enqueue_reserved(placement);")
+            .expect("enqueue");
         let commit = body.find("rt_commit_receiver_runnable(").expect("commit");
         assert!(commit < enqueue, "publication precedes the enqueue");
-        // `rtd_enqueue` is the scheduler seam; no tcb closure wraps it.
+        // `rtd_enqueue_reserved` is the scheduler seam; no tcb closure wraps it.
         let tail = &body[enqueue..];
         assert!(!tail.contains("rtd_tcbs"), "no TCB claim spans the enqueue");
     }
@@ -101857,8 +101869,16 @@ mod stage200d2a_deferred_death {
             .expect("txn");
         let txn = txn.split("\nimpl IpcSubsystem").next().unwrap();
         let commit = txn.find("rt_commit_receiver_runnable(").expect("commit");
-        let enqueue = txn.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        let enqueue = txn
+            .find("d.rtd_enqueue_reserved(placement);")
+            .expect("enqueue");
         assert!(commit < enqueue, "Runnable precedes the enqueue");
+        // SCHED-TIME-FOUNDATION1 A (IPC-TIMEOUT-CAP1): the slot is promised before the claim.
+        let reserve = txn.find("d.rtd_reserve(").expect("the promise");
+        let claim = txn
+            .find("try_claim_peer_death_terminal(")
+            .expect("the claim");
+        assert!(reserve < claim, "the promise precedes the PeerDeath claim");
     }
 
     #[test]
@@ -102128,9 +102148,19 @@ mod stage200df0_feature_gating {
                 "pub(crate) struct OffLockReplyTimeout<",
             ),
             (
-                "caller-enqueue helper",
+                "caller-placement promise (SCHED-TIME-FOUNDATION1 A)",
                 RUNTIME_SRC,
-                "fn enqueue_reply_timeout_wake_split(",
+                "pub(crate) fn reserve_ipc_wake_split(",
+            ),
+            (
+                "caller-placement commit",
+                RUNTIME_SRC,
+                "pub(crate) fn commit_ipc_wake_split(",
+            ),
+            (
+                "caller-placement release",
+                RUNTIME_SRC,
+                "pub(crate) fn release_ipc_wake_split(",
             ),
             (
                 "peer-death completion transaction",
@@ -136428,8 +136458,9 @@ mod u7_production_timeout_promotion {
         let settle = body
             .find("self.settle_blocked_send_envelope_split(")
             .expect("the envelope settle");
+        // SCHED-TIME-FOUNDATION1 A: the enqueue is the reserved commit (IPC-TIMEOUT-CAP1).
         let enqueue = body
-            .find("self.enqueue_reply_timeout_wake_split(work.tid);")
+            .find("self.commit_ipc_wake_split(placement);")
             .expect("the enqueue");
         assert!(
             runnable < settle && settle < enqueue,
@@ -214196,6 +214227,96 @@ mod futex_requeue1 {
         }
     }
 
+    /// SCHED-TIME-FOUNDATION1 A (SCHED-FULL-ROT1) — the FUTEX-TIME1 live defect, deterministically:
+    /// an UNTIMED wake takes the last free slot of a CPU whose current task is outside the queue.
+    /// The CPU must keep rotating: the current task returns to its tail, and the woken waiter is
+    /// dispatched within one pass over the queue. (On `8062c216` every rotation was refused.)
+    #[test]
+    fn sfr1_k01_a_wake_into_the_last_slot_never_stops_rotation() {
+        let mut w = world(47000);
+        let ws = w.park_n(1, SQ, 5);
+        let wt = ws[0];
+        let a = w.a;
+        let n = fill_queue(&mut w.s, a, 47100);
+        assert!(n > 2, "filled {n}");
+        let cur = w.s.current_tid().expect("a current task");
+        assert_eq!(
+            w.s.futex_wake(SQ, 1, P),
+            Ok(0),
+            "a full queue refuses the wake (WAKE-CAP1)"
+        );
+        let last = 47100 + n as u64 - 1;
+        assert_eq!(
+            w.s.withdraw_queued_tid_on(CpuId(0), last),
+            crate::kernel::scheduler::WithdrawOutcome::Removed
+        );
+        w.s.set_task_status_for_test(last, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
+        assert_eq!(
+            w.s.futex_wake(SQ, 1, P),
+            Ok(1),
+            "the wake takes the one free slot"
+        );
+        assert!(queue(&w.s).contains(&wt));
+        assert_eq!(
+            w.s.preempt_reenqueue_current_cpu(),
+            Some(cur),
+            "the current task rotates"
+        );
+        assert_eq!(queue(&w.s).last(), Some(&cur), "at its tail");
+        assert_eq!(queue(&w.s).iter().filter(|&&t| t == cur).count(), 1);
+        let mut ran_waiter = false;
+        for _ in 0..(n + 2) {
+            let next = w.s.dispatch_next_current_cpu();
+            if next == Some(wt) {
+                ran_waiter = true;
+                break;
+            }
+            assert!(
+                w.s.preempt_reenqueue_current_cpu().is_some(),
+                "rotation never refused"
+            );
+        }
+        assert!(ran_waiter, "the woken waiter was dispatched");
+    }
+
+    /// SCHED-TIME-FOUNDATION1 A — the same full CPU, driven through the in-lock TIMER preempt
+    /// (`on_preempt_current_cpu`): every tick rotates, and every queued task runs within one pass.
+    /// (The split Yield and the deferred timer preempt rotate through `preempt_reenqueue_only`,
+    /// which `sfr1_k01` drives.)
+    #[test]
+    fn sfr1_k02_timer_preempt_and_yield_rotate_a_full_cpu() {
+        let mut w = world(48000);
+        let a = w.a;
+        let n = fill_queue(&mut w.s, a, 48100);
+        assert!(n > 2, "filled {n}");
+        let cur = w.s.current_tid().expect("a current task");
+        let next = w.s.on_preempt_current_cpu().expect("a task");
+        assert_ne!(
+            next, cur,
+            "the timer preempt dispatched the head, not the current task"
+        );
+        assert_eq!(queue(&w.s).last(), Some(&cur));
+        let mut seen = std::collections::BTreeSet::new();
+        seen.insert(next);
+        for _ in 0..(n + 1) {
+            seen.insert(w.s.on_preempt_current_cpu().expect("a task"));
+        }
+        assert!(
+            seen.len() > n,
+            "the ticks rotated through the whole queue: {} of {}",
+            seen.len(),
+            n + 1
+        );
+        for t in seen.iter().copied() {
+            assert_eq!(
+                queue(&w.s).iter().filter(|&&q| q == t).count()
+                    + usize::from(w.s.current_tid() == Some(t)),
+                1,
+                "tid {t} placed exactly once"
+            );
+        }
+    }
+
     /// 21 — wake 0 / requeue 100 with the destination CPU's queue completely full: all 100 move,
     /// no scheduler slot is reserved or consumed, the queue is byte-for-byte unchanged.
     #[test]
@@ -219840,5 +219961,449 @@ mod futex_requeue1 {
                 &[Op::Exit(victim)],
             );
         }
+    }
+}
+
+/// SCHED-TIME-FOUNDATION1 checkpoint A (IPC-TIMEOUT-CAP1) — an IPC terminal completion (receive,
+/// blocking-send and reply-receive timeouts, server death) never leaves its task `Runnable` but
+/// neither current nor queued. On `8062c216` each of these owners made the task `Runnable` under
+/// the task lock, then tried an ordinary refusable enqueue and discarded `QueueFull`. Now each one
+/// promises the home run-queue slot BEFORE its terminal claim (FUTEX-WAKE-CAP1's order): with no
+/// room, nothing is claimed and the deadline / death obligation stays armed for a later pass.
+mod sched_time_foundation1_a_ipc {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::{Bootstrap, DeferredServerDeathCompletion, KernelState};
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::scheduler::{CpuId, TaskPriority};
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::runtime::SharedKernel;
+    use std::vec::Vec;
+
+    const CPU: CpuId = CpuId(0);
+    const TOKEN_GEN: u64 = 1;
+
+    fn queue(s: &KernelState) -> Vec<u64> {
+        let mut q = Vec::new();
+        s.for_each_queued_on_for_test(CPU, |_, t| q.push(t.0));
+        q
+    }
+    fn placed(s: &KernelState, tid: u64) -> usize {
+        queue(s).iter().filter(|&&t| t == tid).count() + usize::from(s.current_tid() == Some(tid))
+    }
+    /// THE invariant: `Runnable` ⇒ placed exactly once.
+    fn conserved(s: &KernelState, tid: u64) {
+        if s.task_status(tid) == Some(TaskStatus::Runnable) {
+            assert_eq!(
+                placed(s, tid),
+                1,
+                "tid {tid} is Runnable but placed {} times",
+                placed(s, tid)
+            );
+        }
+    }
+    fn reserved(s: &KernelState) -> usize {
+        s.with_scheduler_state(|all| all.reserved_user_slots_on(CPU))
+    }
+    /// Fill CPU 0's queue with runnable fillers until a push is refused; returns them.
+    fn fill(s: &mut KernelState, base: u64) -> Vec<u64> {
+        let mut v = Vec::new();
+        loop {
+            let t = base + v.len() as u64;
+            s.register_task(t).expect("filler");
+            s.set_task_status_for_test(t, TaskStatus::Runnable);
+            s.set_task_home_cpu(t, CPU).expect("home");
+            if s.enqueue_task(t).is_err() {
+                s.exit_task(t, 0).expect("retire the refused filler");
+                return v;
+            }
+            v.push(t);
+        }
+    }
+    /// Free one queue slot: withdraw a filler and park it.
+    fn free_one(s: &mut KernelState, t: u64) {
+        assert_eq!(
+            s.withdraw_queued_tid_on(CPU, t),
+            crate::kernel::scheduler::WithdrawOutcome::Removed
+        );
+        s.set_task_status_for_test(
+            t,
+            TaskStatus::Blocked(WaitReason::Join(crate::kernel::ipc::ThreadId(1))),
+        );
+    }
+    fn timeouts(k: &SharedKernel, now: u64) {
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(0);
+        k.run_due_ipc_timeout_work_at(CPU, now, now, now);
+    }
+
+    fn recv_world(tid: u64) -> SharedKernel {
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(0);
+        while crate::kernel::boot::recv_timeout_work_drain_next(0).is_some() {}
+        crate::kernel::boot::send_timeout_work_clear(0);
+        while crate::kernel::boot::reply_timeout_work_drain_next(0).is_some() {}
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(tid).expect("receiver");
+            s.set_task_home_cpu(tid, CPU).expect("home");
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
+                tcb.ipc_timeout_deadline = Some(5);
+            });
+        });
+        k
+    }
+
+    #[test]
+    fn i01_receive_timeout_on_a_full_home_queue_is_conserved() {
+        let k = recv_world(60);
+        let fillers = k.with(|s| fill(s, 9000));
+        timeouts(&k, 10);
+        k.with(|s| {
+            conserved(s, 60);
+            assert!(
+                matches!(s.task_status(60), Some(TaskStatus::Blocked(_))),
+                "no room: the timeout is not claimed"
+            );
+            assert_eq!(reserved(s), 0, "no promise left behind");
+        });
+        timeouts(&k, 11);
+        k.with(|s| conserved(s, 60));
+        k.with(|s| free_one(s, fillers[0]));
+        timeouts(&k, 12);
+        k.with(|s| {
+            assert_eq!(
+                s.task_status(60),
+                Some(TaskStatus::Runnable),
+                "placed once room appears"
+            );
+            conserved(s, 60);
+            assert!(s.consume_ipc_timeout_fired_for_tid(60).expect("fired"));
+            assert_eq!(reserved(s), 0);
+        });
+        timeouts(&k, 13);
+        k.with(|s| assert_eq!(placed(s, 60), 1, "no second completion"));
+    }
+
+    #[test]
+    fn i02_blocking_send_timeout_on_a_full_home_queue_is_conserved() {
+        use crate::kernel::boot::{Message, SenderWaiter};
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(0);
+        crate::kernel::boot::send_timeout_work_clear(0);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let ep_idx = k.with(|s| {
+            s.register_task(281).expect("sender");
+            s.set_task_home_cpu(281, CPU).expect("home");
+            let (ep_idx, send_cap, _r) = s.create_endpoint(4).expect("endpoint");
+            s.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+                    asid: None,
+                    send_generation: 0,
+                    tid: crate::kernel::ipc::ThreadId(281),
+                    msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
+                });
+            });
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 281).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
+                tcb.ipc_timeout_deadline = Some(10);
+            });
+            ep_idx
+        });
+        let fillers = k.with(|s| fill(s, 9000));
+        timeouts(&k, 10);
+        k.with(|s| {
+            conserved(s, 281);
+            assert!(matches!(s.task_status(281), Some(TaskStatus::Blocked(_))));
+            assert_eq!(
+                s.sender_waiter_count(ep_idx),
+                1,
+                "the waiter is not withdrawn yet"
+            );
+            assert_eq!(reserved(s), 0);
+        });
+        k.with(|s| free_one(s, fillers[0]));
+        timeouts(&k, 11);
+        k.with(|s| {
+            assert_eq!(s.task_status(281), Some(TaskStatus::Runnable));
+            conserved(s, 281);
+            assert_eq!(s.sender_waiter_count(ep_idx), 0);
+            assert_eq!(reserved(s), 0);
+        });
+    }
+
+    fn reply_setup(fx: &CallerFx) -> (usize, TerminalIdentity) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(1);
+        let id =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, brg, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, id));
+        fx.k.with(|s| {
+            s.register_reply_receive_deadline(
+                idx,
+                rgen,
+                brg,
+                TOKEN_GEN,
+                100,
+                crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick,
+            )
+        })
+        .expect("register");
+        (idx, id)
+    }
+    fn caller_home(fx: &CallerFx) {
+        fx.k.with(|s| s.set_task_home_cpu(1, CPU)).expect("home");
+    }
+
+    #[test]
+    fn i03_reply_timeout_on_a_full_home_queue_is_conserved() {
+        while crate::kernel::boot::reply_timeout_work_drain_next(0).is_some() {}
+        let fx = caller_fixture();
+        caller_home(&fx);
+        let (idx, _id) = reply_setup(&fx);
+        let fillers = fx.k.with(|s| fill(s, 9000));
+        timeouts(&fx.k, 200);
+        fx.k.with(|s| {
+            conserved(s, 1);
+            assert!(matches!(s.task_status(1), Some(TaskStatus::Blocked(_))));
+            assert_eq!(
+                s.reply_terminal_committed_winner(idx),
+                None,
+                "nothing claimed without room"
+            );
+            assert_eq!(reserved(s), 0);
+        });
+        fx.k.with(|s| free_one(s, fillers[0]));
+        timeouts(&fx.k, 201);
+        fx.k.with(|s| {
+            assert_eq!(
+                s.reply_terminal_committed_winner(idx),
+                Some(TerminalClaimant::Timeout)
+            );
+            assert_eq!(s.task_status(1), Some(TaskStatus::Runnable));
+            conserved(s, 1);
+            assert_eq!(reserved(s), 0);
+        });
+        while crate::kernel::boot::reply_timeout_work_drain_next(0).is_some() {}
+        teardown();
+    }
+
+    #[test]
+    fn i04_server_death_on_a_full_home_queue_is_conserved() {
+        crate::kernel::boot::server_death_work_clear(0);
+        let fx = caller_fixture();
+        caller_home(&fx);
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(1);
+        let id =
+            fx.k.with(|s| {
+                s.reply_terminal_identity(
+                    fx.record_index,
+                    fx.record_generation,
+                    brg,
+                    Some(TOKEN_GEN),
+                )
+            })
+            .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(fx.record_index, id));
+        assert!(fx.k.with(|s| s.register_server_reply_link(
+            fx.replier.tid.0,
+            fx.replier.asid,
+            fx.record_index,
+            fx.record_generation
+        )));
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        let l =
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+                .expect("link");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: l.reply_record_index,
+                reply_record_generation: l.reply_record_generation,
+            },
+        ));
+        let fillers = fx.k.with(|s| fill(s, 9000));
+        let _ = fx.k.drain_server_death_post_work(CPU);
+        fx.k.with(|s| {
+            conserved(s, 1);
+            assert!(matches!(s.task_status(1), Some(TaskStatus::Blocked(_))));
+            assert_eq!(s.reply_terminal_committed_winner(fx.record_index), None);
+            assert_eq!(reserved(s), 0);
+        });
+        let _ = fx.k.drain_server_death_post_work(CPU);
+        fx.k.with(|s| conserved(s, 1));
+        fx.k.with(|s| free_one(s, fillers[0]));
+        let _ = fx.k.drain_server_death_post_work(CPU);
+        fx.k.with(|s| {
+            assert_eq!(
+                s.reply_terminal_committed_winner(fx.record_index),
+                Some(TerminalClaimant::PeerDeath)
+            );
+            assert_eq!(s.task_status(1), Some(TaskStatus::Runnable));
+            conserved(s, 1);
+            assert_eq!(
+                s.pending_syscall_completion_result(1),
+                Some(10),
+                "ServerDied, once"
+            );
+            assert_eq!(reserved(s), 0);
+        });
+        crate::kernel::boot::server_death_work_clear(0);
+        teardown();
+    }
+
+    #[test]
+    fn i05_a_reply_that_wins_while_the_timeout_waits_for_room_is_never_overwritten() {
+        while crate::kernel::boot::reply_timeout_work_drain_next(0).is_some() {}
+        let fx = caller_fixture();
+        caller_home(&fx);
+        let (idx, id) = reply_setup(&fx);
+        let fillers = fx.k.with(|s| fill(s, 9000));
+        timeouts(&fx.k, 200);
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("reply claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        fx.k.with(|s| free_one(s, fillers[0]));
+        timeouts(&fx.k, 201);
+        fx.k.with(|s| {
+            assert_eq!(
+                s.reply_terminal_committed_winner(idx),
+                Some(TerminalClaimant::Reply),
+                "no overwrite"
+            );
+            assert_ne!(
+                s.pending_syscall_completion_result(1),
+                Some(crate::kernel::syscall::SyscallError::TimedOut as u64)
+            );
+            conserved(s, 1);
+            assert_eq!(reserved(s), 0, "the lost timeout gave its promise back");
+        });
+        while crate::kernel::boot::reply_timeout_work_drain_next(0).is_some() {}
+        teardown();
+    }
+
+    #[test]
+    fn i09_a_deferred_reply_timeout_and_server_death_have_one_winner() {
+        while crate::kernel::boot::reply_timeout_work_drain_next(0).is_some() {}
+        crate::kernel::boot::server_death_work_clear(0);
+        let fx = caller_fixture();
+        caller_home(&fx);
+        let (idx, _id) = reply_setup(&fx);
+        assert!(fx.k.with(|s| s.register_server_reply_link(
+            fx.replier.tid.0,
+            fx.replier.asid,
+            fx.record_index,
+            fx.record_generation
+        )));
+        let fillers = fx.k.with(|s| fill(s, 9000));
+        timeouts(&fx.k, 200);
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        let l =
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+                .expect("link");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: l.reply_record_index,
+                reply_record_generation: l.reply_record_generation,
+            },
+        ));
+        let _ = fx.k.drain_server_death_post_work(CPU);
+        fx.k.with(|s| {
+            assert_eq!(
+                s.reply_terminal_committed_winner(idx),
+                None,
+                "both owners are still owed"
+            );
+            conserved(s, 1);
+            free_one(s, fillers[0]);
+        });
+        let _ = fx.k.drain_server_death_post_work(CPU);
+        timeouts(&fx.k, 201);
+        let _ = fx.k.drain_server_death_post_work(CPU);
+        fx.k.with(|s| {
+            let w = s.reply_terminal_committed_winner(idx);
+            assert!(
+                matches!(
+                    w,
+                    Some(TerminalClaimant::PeerDeath) | Some(TerminalClaimant::Timeout)
+                ),
+                "exactly one terminal winner: {w:?}"
+            );
+            assert_eq!(s.task_status(1), Some(TaskStatus::Runnable));
+            assert_eq!(placed(s, 1), 1, "woken exactly once");
+            assert_eq!(reserved(s), 0);
+        });
+        while crate::kernel::boot::reply_timeout_work_drain_next(0).is_some() {}
+        crate::kernel::boot::server_death_work_clear(0);
+        teardown();
+    }
+
+    #[test]
+    fn i06_exit_while_the_timeout_waits_for_room_resurrects_nobody() {
+        let k = recv_world(61);
+        let fillers = k.with(|s| fill(s, 9000));
+        timeouts(&k, 10);
+        k.with(|s| s.exit_task(61, 0)).expect("exit");
+        k.with(|s| free_one(s, fillers[0]));
+        timeouts(&k, 11);
+        k.with(|s| {
+            assert_eq!(placed(s, 61), 0, "an exited task is never placed");
+            assert!(!matches!(s.task_status(61), Some(TaskStatus::Runnable)));
+            assert_eq!(reserved(s), 0);
+        });
+    }
+
+    #[test]
+    fn i07_a_new_receive_cycle_is_not_completed_by_the_old_deadline() {
+        let k = recv_world(62);
+        let fillers = k.with(|s| fill(s, 9000));
+        timeouts(&k, 10);
+        // The receiver's cycle ends another way and it blocks again with a fresh generation and a
+        // later deadline; the old due deadline must not complete the new cycle.
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 62).unwrap();
+                tcb.blocked_recv_generation += 1;
+                tcb.ipc_timeout_deadline = Some(1_000);
+            });
+            free_one(s, fillers[0]);
+        });
+        timeouts(&k, 11);
+        k.with(|s| {
+            assert!(
+                matches!(s.task_status(62), Some(TaskStatus::Blocked(_))),
+                "the new cycle is untouched"
+            );
+            assert_eq!(reserved(s), 0);
+            conserved(s, 62);
+        });
+    }
+
+    #[test]
+    fn i08_capacity_never_counts_a_lost_or_refused_promise() {
+        let k = recv_world(63);
+        let fillers = k.with(|s| fill(s, 9000));
+        for now in 10..40 {
+            timeouts(&k, now);
+            k.with(|s| assert_eq!(reserved(s), 0, "now={now}"));
+        }
+        k.with(|s| {
+            free_one(s, fillers[0]);
+            assert!(
+                s.enqueue_task(fillers[0]).is_ok(),
+                "the freed slot is really free"
+            );
+            assert_eq!(s.enqueue_task(9999).is_err(), true);
+            let _ = TaskPriority::Normal;
+        });
     }
 }

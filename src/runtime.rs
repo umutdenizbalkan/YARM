@@ -310,6 +310,15 @@ const _: () = {
 // repair, and a rename would spread an unrelated diff across every call site.
 pub(crate) struct OffLockReplyTimeout<'a>(pub(crate) &'a SharedKernel);
 
+/// SCHED-TIME-FOUNDATION1 A (IPC-TIMEOUT-CAP1) — a run-queue slot promised on `home` to an IPC
+/// terminal completion's wake, held across its claim. Not `Clone`: one promise, one consumer.
+#[derive(Debug)]
+#[must_use = "an IPC wake promise must be committed or released"]
+pub(crate) struct IpcWakePlacement {
+    plan: crate::kernel::task_enqueue::EnqueuePlan,
+    home: CpuId,
+}
+
 impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout<'_> {
     fn rtd_ipc<R>(&mut self, f: impl FnOnce(&mut crate::kernel::boot::IpcSubsystem) -> R) -> R {
         self.0.with_ipc_split_mut(f)
@@ -320,8 +329,16 @@ impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout<'_> {
     ) -> R {
         self.0.with_task_tcbs_split_mut(f)
     }
-    fn rtd_enqueue(&mut self, tid: u64) {
-        self.0.enqueue_reply_timeout_wake_split(tid);
+    type Placement = IpcWakePlacement;
+    fn rtd_reserve(&mut self, tid: u64) -> Option<IpcWakePlacement> {
+        let cpu = self.0.executing_cpu_split();
+        self.0.reserve_ipc_wake_split(tid, cpu)
+    }
+    fn rtd_enqueue_reserved(&mut self, placement: IpcWakePlacement) {
+        self.0.commit_ipc_wake_split(placement);
+    }
+    fn rtd_release(&mut self, placement: IpcWakePlacement) {
+        self.0.release_ipc_wake_split(placement);
     }
 }
 
@@ -15487,9 +15504,15 @@ impl SharedKernel {
         // AP-SCHED4 §A1: queued items first, then every parked item an arming made claimable.
         // Both are owned by this drain from the moment they are taken, and both are settled by
         // the one body below.
+        //
+        // IPC-TIMEOUT-CAP1: once a death has been re-parked for want of a run-queue slot, this pass
+        // stops taking parked deaths, so it cannot take the one it just parked again; the next
+        // drain (any CPU's trap tail) retries it.
+        let mut parked_for_placement = false;
         loop {
             let work = match crate::kernel::boot::server_death_work_drain_next(cpu_idx) {
                 Some(work) => work,
+                None if parked_for_placement => break,
                 None => match self.accept_next_claimable_server_death(cpu_idx) {
                     Some(work) => work,
                     None => break,
@@ -15617,6 +15640,44 @@ impl SharedKernel {
             }
             let mut d = OffLockReplyTimeout(self);
             let outcome = crate::kernel::boot::complete_server_death_over(&mut d, &identity);
+            if outcome == ReplyTimeoutOutcome::PlacementDeferred {
+                // IPC-TIMEOUT-CAP1: the caller's home queue had no room, so nothing was claimed.
+                // The death stays owed: back into its record's park slot, already claimable, with
+                // its claim bit set — exactly the handoff an arming makes (AP-SCHED4 §A1), so any
+                // later drain on any CPU takes it, and the item always has one owner.
+                let reparked = self.with_ipc_split_mut(|ipc| {
+                    match ipc.reply_death_unclaimed.get_mut(work.reply_record_index) {
+                        Some(slot @ None) => {
+                            *slot = Some(crate::kernel::boot::ParkedServerDeath {
+                                work,
+                                claimable: true,
+                            });
+                            crate::kernel::boot::server_death_claimable_note(
+                                work.reply_record_index,
+                            );
+                            true
+                        }
+                        _ => false,
+                    }
+                });
+                #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                if reparked {
+                    crate::kernel::boot::server_dies_counters::note_deferred_parked(
+                        work.reply_record_index,
+                        work.reply_record_generation,
+                    );
+                }
+                parked_for_placement = true;
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_PLACEMENT_DEFERRED cpu={} record_index={} record_generation={} reparked={} caller_wakes=0 result={}",
+                    cpu_idx,
+                    work.reply_record_index,
+                    work.reply_record_generation,
+                    u8::from(reparked),
+                    if reparked { "ok" } else { "fail" }
+                );
+                continue;
+            }
             crate::yarm_log!(
                 "IPC_SERVER_DEATH_DRAIN outcome={:?} record_index={} record_generation={} broad_lock=0 result=ok",
                 outcome,
@@ -17915,6 +17976,16 @@ impl SharedKernel {
                     #[cfg(target_arch = "x86_64")]
                     crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
                 }
+                // IPC-TIMEOUT-CAP1: nothing was claimed; the registration stays armed and due, so
+                // the collector publishes it again on a later pass.
+                ReplyTimeoutOutcome::PlacementDeferred => {
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_PLACEMENT_DEFERRED arch={} caller_tid={} cpu={} result=ok",
+                        crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                        work.handle.identity().terminal_identity.caller_tid.0,
+                        cpu_idx
+                    );
+                }
                 other => {
                     // BL5a-2b: the reply-wins oracle's registration must never get here.
                     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
@@ -18095,6 +18166,18 @@ impl SharedKernel {
                 );
                 continue;
             }
+            // ── (0) rank 1: IPC-TIMEOUT-CAP1 — the slot, promised before anything is touched ──
+            // No room: nothing is withdrawn or claimed; the deadline stays armed and due, and the
+            // collector publishes this cycle again on a later pass.
+            let Some(placement) = self.reserve_ipc_wake_split(work.tid, cpu) else {
+                crate::yarm_log!(
+                    "U7_SEND_TIMEOUT_PLACEMENT_DEFERRED tid={} send_generation={} cpu={}",
+                    work.tid,
+                    work.send_generation,
+                    cpu_idx
+                );
+                continue;
+            };
             // ── (1) rank 3: withdraw exactly this cycle's waiter — THE arbitration point ─────
             // SEND-TIMEOUT-ARB1: the waiter carries the message, so removing it is what decides
             // the cycle. No waiter means a receiver already took the message, the waiter is not
@@ -18127,6 +18210,7 @@ impl SharedKernel {
                 Some(owed)
             });
             let Some(envelope) = withdrawn else {
+                self.release_ipc_wake_split(placement);
                 crate::yarm_log!(
                     "U7_SEND_TIMEOUT_REFUSED_NO_WAITER tid={} asid={} send_generation={} deadline={}",
                     work.tid,
@@ -18178,10 +18262,11 @@ impl SharedKernel {
                 );
             }
             if !claimed {
+                self.release_ipc_wake_split(placement);
                 continue;
             }
-            // ── (4) rank 1: the wake, last ─────────────────────────────────────────────────
-            self.enqueue_reply_timeout_wake_split(work.tid);
+            // ── (4) rank 1: the wake, last — the promised slot, which cannot be refused ─────
+            self.commit_ipc_wake_split(placement);
             crate::yarm_log!(
                 "U7_SEND_TIMEOUT_SETTLED arch={} tid={} asid={} send_generation={} deadline={} now={} broad_lock=0 result=ok",
                 crate::kernel::boot::REPLY_TIMEOUT_ARCH,
@@ -18231,6 +18316,18 @@ impl SharedKernel {
         use crate::kernel::task::{TaskStatus, WaitReason};
         let cpu_idx = cpu.0 as usize;
         while let Some(work) = crate::kernel::boot::recv_timeout_work_drain_next(cpu_idx) {
+            // ── (0) rank 1: IPC-TIMEOUT-CAP1 — the slot, promised before the claim ──────────
+            // No room: nothing is claimed; the deadline stays armed and due, and the collector
+            // publishes this cycle again on a later pass.
+            let Some(placement) = self.reserve_ipc_wake_split(work.tid, cpu) else {
+                crate::yarm_log!(
+                    "U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid={} wait_generation={} cpu={}",
+                    work.tid,
+                    work.wait_generation,
+                    cpu_idx
+                );
+                continue;
+            };
             // ── (1) rank 2: the exact claim + the TimedOut publication ──────────────────────
             let claimed = self.with_task_tcbs_split_mut(|tcbs| {
                 let Some(tcb) = tcbs
@@ -18290,6 +18387,7 @@ impl SharedKernel {
                 true
             });
             if !claimed {
+                self.release_ipc_wake_split(placement);
                 crate::yarm_log!(
                     "U8_RECV_TIMEOUT_REFUSED_STALE tid={} asid={} wait_generation={} deadline={}",
                     work.tid,
@@ -18313,8 +18411,8 @@ impl SharedKernel {
             if stranded {
                 crate::yarm_log!("SCHED_TIMEOUT_STRANDED_WAITER tid={}", work.tid);
             }
-            // ── (3) rank 1: the wake, last ─────────────────────────────────────────────────
-            self.enqueue_reply_timeout_wake_split(work.tid);
+            // ── (3) rank 1: the wake, last — the promised slot, which cannot be refused ─────
+            self.commit_ipc_wake_split(placement);
             crate::yarm_log!(
                 "U8_RECV_TIMEOUT_SETTLED arch={} tid={} asid={} wait_generation={} deadline={} now={} broad_lock=0 result=ok",
                 crate::kernel::boot::REPLY_TIMEOUT_ARCH,
@@ -18390,49 +18488,72 @@ impl SharedKernel {
         self.drain_recv_timeout_post_work(cpu, send_now);
     }
 
-    /// Stage 200C2B — the OFF-LOCK scheduler enqueue for a timeout-woken caller. Reads
-    /// the task's class (priority) and CPU affinity under SHORT rank-2 task claims, each
-    /// released BEFORE the rank-1 scheduler claim performs the enqueue — so no task lock
-    /// is held while enqueuing, and no broad lock is ever taken. Mirrors
-    /// `KernelState::enqueue_task`'s placement (pinned → its CPU; unpinned → balanced).
-    // CLASSIFICATION (Stage 200D-F0): **production mechanism**. The server-death
-    // completion enqueues its woken caller through this seam on every build.
-    fn enqueue_reply_timeout_wake_split(&self, tid: u64) {
-        use crate::kernel::ipc::ThreadId;
-        use crate::kernel::scheduler::TaskPriority;
-        use crate::kernel::task::TaskClass;
-        let priority = match self.task_class_split_read(tid) {
-            Some(class) => crate::kernel::task_enqueue::priority_for_class(class),
-            // A woken task is already known live, so an absent class is Normal here rather than
-            // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
-            None => TaskPriority::Normal,
+    /// SCHED-TIME-FOUNDATION1 A (IPC-TIMEOUT-CAP1) — promise `tid` a slot on its home run queue
+    /// BEFORE an IPC terminal owner claims it, so the claim can never leave a task `Runnable`
+    /// without a placement.
+    ///
+    /// The four off-lock IPC terminal owners — the reply-receive timeout
+    /// (`complete_reply_timeout_over`), server death (`complete_server_death_over`), the
+    /// blocking-send timeout and the receive timeout — each used to make the task `Runnable` under
+    /// the task lock and only then try an ordinary, refusable enqueue whose `QueueFull` they
+    /// discarded (`is_ok_and`). Now each reserves here first (FUTEX-WAKE-CAP1's order): plan at
+    /// rank 2 — the task's fixed home and its class's priority — then the promise under that
+    /// CPU's 1L only. `None` when the home queue has no room (or the task has no plan): the
+    /// caller then claims NOTHING and keeps its obligation (the armed deadline, or the parked
+    /// death) for a later pass. Every `Some` is consumed by exactly one of
+    /// [`Self::commit_ipc_wake_split`] or [`Self::release_ipc_wake_split`].
+    // CLASSIFICATION (Stage 200D-F0): **production mechanism**. The server-death completion
+    // places its woken caller through this promise on every build (it replaces the Stage 200C2B
+    // enqueue seam that carried this classification).
+    pub(crate) fn reserve_ipc_wake_split(&self, tid: u64, cpu: CpuId) -> Option<IpcWakePlacement> {
+        use crate::kernel::task_enqueue::{self as te, EnqueueTarget};
+        let mut plan = self
+            .with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                te::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)
+            })
+            .ok()?;
+        self.resolve_plan_home_split(&mut plan, cpu);
+        let EnqueueTarget::Pinned(home) = plan.target else {
+            return None;
         };
-        let affinity = self.with_task_tcbs_split_mut(|tcbs| {
-            // SCHED-LOCK1 witness only: the incarnation this owner places, under rank 2.
-            #[cfg(feature = "sched-lock1-witness")]
-            crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid);
-            tcbs.iter()
-                .flatten()
-                .find(|t| t.tid.0 == tid)
-                .and_then(|t| t.cpu_affinity)
+        self.with_cpu_sched_split(home, |c| te::reserve_enqueue_on_cpu_locked(c, &plan))
+            .map_err(crate::kernel::boot::map_scheduler_error)
+            .and_then(|r| r)
+            .ok()
+            .map(|()| IpcWakePlacement { plan, home })
+    }
+
+    /// IPC-TIMEOUT-CAP1 — fill a promise after its owner's claim committed. It cannot be refused
+    /// for capacity; the destination's 1L only, the IPI after its release.
+    pub(crate) fn commit_ipc_wake_split(&self, placement: IpcWakePlacement) {
+        use crate::kernel::task_enqueue::{self as te, ReservedCommit};
+        match self.with_cpu_sched_split(placement.home, |c| {
+            te::commit_reserved_enqueue_on_cpu_locked(c, &placement.plan)
+        }) {
+            Ok(Ok(ReservedCommit::Queued(cpu))) => {
+                #[cfg(feature = "sched-lock1-witness")]
+                crate::kernel::schedlock1_witness::claim(self, cpu, placement.plan.tid);
+                crate::arch::hal::notify_enqueued(cpu);
+            }
+            // Already current or queued there: its existing placement is the one it has.
+            Ok(Ok(ReservedCommit::AlreadyPlaced(_))) => {}
+            other => crate::yarm_log!(
+                "IPC_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} result={:?}",
+                placement.plan.tid,
+                placement.home.0,
+                other
+            ),
+        }
+    }
+
+    /// IPC-TIMEOUT-CAP1 — give back a promise whose claim did not commit.
+    pub(crate) fn release_ipc_wake_split(&self, placement: IpcWakePlacement) {
+        let _ = self.with_cpu_sched_split(placement.home, |c| {
+            crate::kernel::task_enqueue::release_enqueue_reservation_on_cpu_locked(
+                c,
+                &placement.plan,
+            )
         });
-        // AP-SCHED1: the task's home (its affinity, else the balanced choice fixed as its home),
-        // then the remote half of the committed enqueue.
-        let cpu = match affinity {
-            Some(cpu) => cpu,
-            None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),
-        };
-        // SCHED-LOCK1: the destination's 1L only; the IPI after its release.
-        let enqueued = self
-            .with_cpu_sched_split(cpu, |c| c.enqueue_with_priority(ThreadId(tid), priority))
-            .is_ok_and(|r| r.is_ok());
-        #[cfg(feature = "sched-lock1-witness")]
-        if enqueued {
-            crate::kernel::schedlock1_witness::claim(self, cpu, tid);
-        }
-        if enqueued {
-            crate::arch::hal::notify_enqueued(cpu);
-        }
     }
 
     /// Stage 200C1 — the NR7 reply-win deadline-disarm hook. When reply obtains
@@ -20101,6 +20222,10 @@ pub(crate) enum ReplyTimeoutOutcome {
     LostToTerminal,
     /// The token fire claim failed (stale/duplicate/cancelled): nothing was mutated.
     StaleToken,
+    /// SCHED-TIME-FOUNDATION1 A (IPC-TIMEOUT-CAP1): the caller's home run queue had no room, so
+    /// NOTHING was claimed — the deadline (or the parked death) is still the obligation, and a
+    /// later pass retries. A task is never made `Runnable` without its slot.
+    PlacementDeferred,
 }
 
 /// 199G-C4 §2 — a published off-lock transfer envelope and, when the envelope owes one, the
