@@ -1837,6 +1837,9 @@ pub mod wait_witness {
             O::VictimChanged => "victim_changed",
             O::IncarnationMoved => "incarnation_moved",
             O::CapacityExhausted => "capacity_exhausted",
+            // FUTEX-TIME1: a timed wait whose deadline was already reached at admission. The
+            // wait witness issues only untimed waits, so it never logs this.
+            O::TimedOut => "timed_out",
         };
         crate::yarm_log!(
             "FUTEX_WAIT_WITNESS_RESULT wait={} tid={} outcome={}",
