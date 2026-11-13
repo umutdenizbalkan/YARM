@@ -215814,8 +215814,15 @@ mod futex_requeue1 {
         #[test]
         fn t38_x86_64_parked_timeout_return_value() {
             const X86: &str = include_str!("../../arch/x86_64/trap.rs");
+            // FUTEX-TIME1 x86 repair: both consumers encode through ONE helper, which writes the
+            // fields and (timed FutexWait) the continuation's return-lane registers (t42).
             assert_eq!(
                 X86.matches("frame.set_ok(done.success_ret0(), 0, 0);")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                X86.matches("encode_x86_blocked_completion(frame, &done);")
                     .count(),
                 2
             );
@@ -215826,6 +215833,69 @@ mod futex_requeue1 {
             // The shared take every exact-token resume uses takes the FutexWait class.
             const RT: &str = include_str!("../../runtime.rs");
             assert!(RT.contains("if !pending.consumed_with_send() {"));
+        }
+
+        /// 42 — x86_64, the switched resume (live defect found by the FUTEX-TIME1 witness): a
+        /// parked timed wait is resumed on ANOTHER task's trap, where the epilogue restores the
+        /// continuation's registers (RAX, RCX = error, RDX, R8), not the frame's fields. The
+        /// parked snapshot holds the fail-closed provisional and the `syscall`-clobbered RCX; the
+        /// encoded completion must replace exactly those lanes and nothing else.
+        #[test]
+        fn t42_x86_64_switched_resume_carries_the_timed_result_in_registers() {
+            use crate::arch::x86_64::trap::encode_x86_blocked_completion;
+            let parked = || {
+                let mut f = crate::kernel::trapframe::TrapFrame::new(9, [SQ, 5, 2, 1_000, 0, 0]);
+                let mut ctx = f.capture_user_context();
+                let snapshot = [
+                    0x4b_a414,
+                    0xb1,
+                    0x40_15ca,
+                    SyscallError::Internal.code(),
+                    0x5a,
+                    0x5b,
+                    0x5c,
+                    0xdead,
+                    0x58,
+                    0x59,
+                    0x246,
+                    0x61,
+                    0x62,
+                    0x63,
+                    0x64,
+                ];
+                ctx.user_gprs[..snapshot.len()].copy_from_slice(&snapshot);
+                f.apply_user_context(ctx);
+                f
+            };
+            // What the switched epilogue loads: rax, rcx (error), rdx, r8 — the rest verbatim.
+            let lanes = |f: &crate::kernel::trapframe::TrapFrame| {
+                (f.user_gpr(0), f.user_gpr(2), f.user_gpr(3), f.user_gpr(7))
+            };
+            let mut timed = parked();
+            encode_x86_blocked_completion(&mut timed, &ending(FutexWaitEnding::TimedOut));
+            assert_eq!(
+                lanes(&timed),
+                (0, 9, 0, 0),
+                "Err(TimedOut) in RCX, nothing in RAX"
+            );
+            let mut woke = parked();
+            encode_x86_blocked_completion(&mut woke, &ending(FutexWaitEnding::Woken));
+            assert_eq!(lanes(&woke), (1, 0, 0, 0), "Ok(true): RAX = 1, RCX clear");
+            for f in [&timed, &woke] {
+                assert_eq!(
+                    (f.user_gpr(1), f.user_gpr(4), f.user_gpr(10)),
+                    (0xb1, 0x5a, 0x246)
+                );
+            }
+            // The fields agree (a same-task return reads them).
+            assert_eq!((timed.error_code(), woke.ret0()), (Some(9), 1));
+            // A send completion is encoded exactly as before: the fields only.
+            let mut send = parked();
+            let mut s = ending(FutexWaitEnding::Woken);
+            s.syscall_class = BlockedSyscallClass::IpcSend;
+            encode_x86_blocked_completion(&mut send, &s);
+            assert_eq!(lanes(&send), lanes(&parked()));
+            assert_eq!((send.error_code(), send.ret0()), (None, 0));
         }
 
         /// 39 — no duplicate enqueue or completion across every owner in one history: the

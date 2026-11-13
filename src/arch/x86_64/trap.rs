@@ -438,12 +438,7 @@ pub(crate) fn x86_post_lock_resume_marked_incoming(
     // ABI: the same lanes an ordinary `ipc_send` return uses — success is `set_ok(0, 0, 0)`,
     // an error is the canonical code in the error lane. RIP is untouched.
     if let Some(done) = shared.direct_dispatch_take_send_completion_split(token) {
-        if done.result == 0 {
-            // FUTEX-TIME1: `1` for a timed-FutexWait completion a wake won; `0` for a send.
-            frame.set_ok(done.success_ret0(), 0, 0);
-        } else {
-            frame.set_err(done.result as usize);
-        }
+        encode_x86_blocked_completion(frame, &done);
         crate::yarm_log!(
             "X86_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} result=ok",
             incoming,
@@ -465,6 +460,31 @@ pub(crate) fn x86_post_lock_resume_marked_incoming(
         ensure_user_return_cr3_split(shared, cpu, incoming, asid);
     }
     Ok(())
+}
+
+/// U6 §8 / FUTEX-TIME1 — encode a parked completion into the frame of the task it resumes, for
+/// both x86_64 consumers (the exact-token resume and the owner revalidation). Called after
+/// `apply_user_context`, which reloads the pre-block register snapshot and would otherwise restore
+/// over it. Success is `set_ok(success_ret0, 0, 0)` (`0` for a send, `1` for a timed FutexWait a
+/// wake won); an error is the canonical code in the error lane. RIP is untouched.
+///
+/// A timed `FutexWait` completion is also written into the continuation's return-lane REGISTERS
+/// ([`TrapFrame::commit_x86_syscall_returns`]): these consumers resume a task on another task's
+/// trap, where the epilogue restores the continuation's registers rather than the fields, and the
+/// timed wait's parked snapshot holds a provisional, never its result. (An `IpcSend` completion is
+/// encoded exactly as before.)
+pub(crate) fn encode_x86_blocked_completion(
+    frame: &mut TrapFrame,
+    done: &crate::kernel::task::BlockedSyscallCompletion,
+) {
+    if done.result == 0 {
+        frame.set_ok(done.success_ret0(), 0, 0);
+    } else {
+        frame.set_err(done.result as usize);
+    }
+    if done.syscall_class == crate::kernel::task::BlockedSyscallClass::FutexWait {
+        frame.commit_x86_syscall_returns();
+    }
 }
 
 /// U3 (canonical 203C) — the arch half of the owner-revalidation transaction, with NO lock
@@ -520,12 +540,7 @@ pub(crate) fn x86_apply_owner_revalidation_restore(
     // lanes an ordinary `ipc_send` return uses. RIP is untouched. The completion was taken from
     // the same incarnation, in the same acquisition, as the context just applied.
     if let Some(done) = snapshot.send_completion {
-        if done.result == 0 {
-            // FUTEX-TIME1: `1` for a timed-FutexWait completion a wake won; `0` for a send.
-            frame.set_ok(done.success_ret0(), 0, 0);
-        } else {
-            frame.set_err(done.result as usize);
-        }
+        encode_x86_blocked_completion(frame, &done);
         crate::yarm_log!(
             "X86_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} site=owner_revalidation result=ok",
             tid,

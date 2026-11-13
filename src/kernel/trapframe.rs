@@ -200,6 +200,23 @@ impl TrapFrame {
         self.ret1 = self.user_gprs[7];
     }
 
+    /// FUTEX-TIME1 — the inverse of [`Self::adopt_restored_syscall_returns`]: put this frame's
+    /// syscall return FIELDS into the x86_64 return-lane REGISTERS of the continuation it holds
+    /// (RAX = ret0, R8 = ret1, RDX = ret2, RCX = error).
+    ///
+    /// The vector epilogue returns the fields only to the task that trapped; a task resumed on
+    /// ANOTHER task's trap (a switch, an idle-boundary advance) gets its continuation's registers
+    /// verbatim. A completion consumed at that resume must therefore reach the registers too, or
+    /// the task sees whatever its parked snapshot held — for a timed `FutexWait`, the fail-closed
+    /// provisional or the `syscall` instruction's clobbered RCX. Nothing else is touched.
+    #[cfg(any(target_arch = "x86_64", test))]
+    pub(crate) fn commit_x86_syscall_returns(&mut self) {
+        self.user_gprs[0] = self.ret0;
+        self.user_gprs[2] = self.error;
+        self.user_gprs[3] = self.ret2;
+        self.user_gprs[7] = self.ret1;
+    }
+
     /// KTHREAD1 — RISC-V twin of `adopt_restored_syscall_returns`: make this trap's syscall return
     /// the result lanes of the continuation just applied (`a0`, `a1`, `a2`; the publishers put an
     /// error code in `a0`, so no separate error lane is set).
