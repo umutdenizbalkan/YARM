@@ -210,6 +210,9 @@ fn main() {
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
     yarm::arch::boot_entry::prepare_arch_boot(start_info_ptr);
+    // SCHED-TIME-FOUNDATION1 B: the monotonic clock's source and origin, on the bootstrap CPU,
+    // before any user task exists.
+    yarm::kernel::timekeeping::init_boot_clock();
     // The per-architecture choice between calling `run` directly and going through
     // `run_kernel_boot`'s staging pass lives in `arch::boot_entry`, not here: this bin must
     // route ISA details through `src/arch/*`.

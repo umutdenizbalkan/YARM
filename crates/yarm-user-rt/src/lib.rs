@@ -59,6 +59,9 @@ pub mod syscall {
         /// the reply. Must stay numerically identical to `kernel::syscall::SyscallError`
         /// (both are `10`); the Stage 200D ABI guards assert the two enums agree.
         ServerDied = 10,
+        /// SCHED-TIME-FOUNDATION1 (ABI v12) — the clock has no source (`CLOCK_REALTIME` before an
+        /// authorized caller set its epoch). Must match `kernel::syscall::SyscallError` (`11`).
+        Unavailable = 11,
         Internal = 255,
     }
 
@@ -78,6 +81,40 @@ pub mod syscall {
     /// FUTEX-REQUEUE1 (ABI v11): compare-and-requeue (NR 17). Must match
     /// `kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR`.
     pub const SYSCALL_FUTEX_CMP_REQUEUE_NR: usize = 17;
+    /// SCHED-TIME-FOUNDATION1 (ABI v12): `ClockGetTime` (NR 18) and `ClockSetRealtime` (NR 19).
+    /// Must match `kernel::syscall`.
+    pub const SYSCALL_CLOCK_GETTIME_NR: usize = 18;
+    pub const SYSCALL_CLOCK_SET_REALTIME_NR: usize = 19;
+    /// The clock ids (`kernel::timekeeping`).
+    pub const CLOCK_REALTIME: usize = 0;
+    pub const CLOCK_MONOTONIC: usize = 1;
+
+    /// SCHED-TIME-FOUNDATION1 — the kernel's `timespec`: 16 bytes, 8-aligned. A valid value has
+    /// `0 <= nsec < 1_000_000_000`; `sec` is signed.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+    pub struct Timespec {
+        pub sec: i64,
+        pub nsec: i64,
+    }
+
+    impl Timespec {
+        pub const fn from_ns(ns: u64) -> Self {
+            Self {
+                sec: (ns / 1_000_000_000) as i64,
+                nsec: (ns % 1_000_000_000) as i64,
+            }
+        }
+        /// Nanoseconds, for a non-negative normalized value.
+        pub fn as_ns(&self) -> Option<u64> {
+            if self.sec < 0 || self.nsec < 0 || self.nsec >= 1_000_000_000 {
+                return None;
+            }
+            (self.sec as u64)
+                .checked_mul(1_000_000_000)?
+                .checked_add(self.nsec as u64)
+        }
+    }
     /// NR 17 flag bits (argument slot 5). Must match `kernel::syscall::sched`.
     pub const FUTEX_REQUEUE_SOURCE_SHARED: usize = 1 << 0;
     pub const FUTEX_REQUEUE_TARGET_SHARED: usize = 1 << 1;
@@ -259,6 +296,7 @@ pub mod syscall {
             8 => SyscallError::PageFault,
             9 => SyscallError::TimedOut,
             10 => SyscallError::ServerDied,
+            11 => SyscallError::Unavailable,
             // Unknown codes still fall back to `Internal` — unchanged by Stage 200D.
             _ => SyscallError::Internal,
         }
@@ -1814,6 +1852,54 @@ pub mod syscall {
             requeued: ret.ret1 as u32,
             capacity_limited: ret.ret2 & FUTEX_REQUEUE_STATUS_CAPACITY_LIMITED != 0,
         })
+    }
+
+    /// SCHED-TIME-FOUNDATION1 — read `clock` (`CLOCK_MONOTONIC` or `CLOCK_REALTIME`) with NR 18.
+    ///
+    /// `CLOCK_MONOTONIC` is nanoseconds since the kernel's clock origin (set on the bootstrap CPU
+    /// before userspace), never decreasing, advancing while idle. `CLOCK_REALTIME` is UTC and is
+    /// `Err(Unavailable)` until an authorized caller has set it: the kernel never invents an epoch.
+    #[inline]
+    pub fn clock_gettime(clock: usize) -> core::result::Result<Timespec, SyscallError> {
+        let mut ts = Timespec::default();
+        // SAFETY: Uses architecture syscall ABI; the kernel validates that `&mut ts` names 16
+        // writable bytes of the caller and writes them all or nothing.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_CLOCK_GETTIME_NR,
+                [clock, &mut ts as *mut Timespec as usize, 0, 0, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(ts)
+    }
+
+    /// SCHED-TIME-FOUNDATION1 — NR 19: initialize `CLOCK_REALTIME` to `utc` (seconds and
+    /// nanoseconds since the Unix epoch). Authorized control-plane callers only
+    /// (`Err(MissingRight)` otherwise); the caller is the authority for the value.
+    #[inline]
+    pub fn clock_set_realtime(utc: Timespec) -> core::result::Result<(), SyscallError> {
+        // SAFETY: Uses architecture syscall ABI; the kernel reads 16 bytes from `&utc`.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_CLOCK_SET_REALTIME_NR,
+                [&utc as *const Timespec as usize, 0, 0, 0, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
     }
 
     /// Spawn a new user thread in the caller's address space (NR 11). `entry` is the

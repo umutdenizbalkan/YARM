@@ -27699,7 +27699,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -28216,8 +28216,8 @@ mod stage45 {
     use crate::kernel::vm::{Asid, CachePolicy, PageFlags, VirtAddr};
 
     const RECV_V3_VERSION: u32 = 3;
-    // FUTEX-REQUEUE1: the NR 30 record reports the syscall ABI version, now v11.
-    const RECV_V3_ABI_VERSION: u32 = 11;
+    // The NR 30 record reports the syscall ABI version: v12 since SCHED-TIME-FOUNDATION1.
+    const RECV_V3_ABI_VERSION: u32 = 12;
     const RECV_V3_STATUS_OK: u32 = 0;
     const RECV_V3_NO_TRANSFER_CAP: u64 = u64::MAX;
 
@@ -36985,7 +36985,7 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -39073,7 +39073,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39200,7 +39200,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39375,7 +39375,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39532,7 +39532,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39668,7 +39668,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39831,7 +39831,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40013,7 +40013,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40237,7 +40237,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40473,7 +40473,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40605,7 +40605,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40782,7 +40782,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40978,7 +40978,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -41419,7 +41419,7 @@ mod stage148_decomposition_map {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 25,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41863,7 +41863,7 @@ mod stage150_ipc_abi_extraction {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 25,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -42094,7 +42094,7 @@ mod stage151_ipc_abi_boundary_audit {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 25,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -42230,7 +42230,7 @@ mod stage152_syscall_decomposition_completeness_audit {
         );
     }
 
-    // 5. Syscall::VARIANT_COUNT == 23 preserved.
+    // 5. Syscall::VARIANT_COUNT == 25 preserved.
     #[test]
     fn stage152_variant_count_is_23() {
         assert!(
@@ -77471,7 +77471,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -78004,7 +78004,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -78164,7 +78164,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -78234,7 +78234,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -78821,7 +78821,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -79056,7 +79056,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -79361,7 +79361,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -79420,7 +79420,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -79931,7 +79931,7 @@ mod stage197b_nr27_removed_zc_mandatory {
             Err(SyscallError::InvalidNumber)
         ));
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(Syscall::VARIANT_COUNT, 23);
+        assert_eq!(Syscall::VARIANT_COUNT, 25);
         // Needles are split so these assertions do not match themselves via include_str!.
         let variant_decl = concat!("InitramfsRead", "Chunk = ");
         let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
@@ -80391,7 +80391,7 @@ mod stage197b_riscv_typed_idle_outcome {
     #[test]
     fn baseline_and_cohort_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
         assert!(matches!(
             crate::kernel::syscall::Syscall::decode(27),
             Err(crate::kernel::syscall::SyscallError::InvalidNumber)
@@ -100845,8 +100845,13 @@ mod stage200d1_publication_and_guards {
             crate::kernel::syscall::SyscallError::from_code(10),
             crate::kernel::syscall::SyscallError::ServerDied
         );
-        // Unknown codes still fall back to Internal — unchanged by this stage.
-        for code in [0usize, 11, 12, 99, 254, 255, 4096] {
+        // SCHED-TIME-FOUNDATION1 (ABI v12) assigned 11 (`Unavailable`); every other unknown code
+        // still falls back to Internal.
+        assert_eq!(
+            crate::kernel::syscall::SyscallError::from_code(11),
+            crate::kernel::syscall::SyscallError::Unavailable
+        );
+        for code in [0usize, 12, 99, 254, 255, 4096] {
             assert_eq!(
                 crate::kernel::syscall::SyscallError::from_code(code),
                 crate::kernel::syscall::SyscallError::Internal,
@@ -100858,6 +100863,11 @@ mod stage200d1_publication_and_guards {
         assert!(KSYSCALL_SRC.contains("10 => Self::ServerDied,"));
         assert!(USER_RT_SRC.contains("ServerDied = 10,"));
         assert!(USER_RT_SRC.contains("10 => SyscallError::ServerDied,"));
+        // SCHED-TIME-FOUNDATION1: `Unavailable` is 11 on both sides.
+        assert!(KSYSCALL_SRC.contains("Unavailable = 11,"));
+        assert!(KSYSCALL_SRC.contains("11 => Self::Unavailable,"));
+        assert!(USER_RT_SRC.contains("Unavailable = 11,"));
+        assert!(USER_RT_SRC.contains("11 => SyscallError::Unavailable,"));
         assert!(USER_RT_SRC.contains("_ => SyscallError::Internal,"));
     }
 
@@ -102400,8 +102410,9 @@ mod stage200d0a_exit_foundation {
     /// behaviour is unchanged. 26 joins 27 here: U9-ASPACE1 §2 retired it.
     #[test]
     fn d03_nr27_and_free_numbers_remain_unassigned() {
-        // FUTEX-REQUEUE1 (ABI v11) assigned 17, the lowest number of the reserved gap.
-        for free in [18usize, 19, 20, 21, 22, 24, 25, 26, 27] {
+        // FUTEX-REQUEUE1 (ABI v11) assigned 17, the lowest number of the reserved gap;
+        // SCHED-TIME-FOUNDATION1 (ABI v12) the next two, 18 and 19.
+        for free in [20usize, 21, 22, 24, 25, 26, 27] {
             assert!(
                 Syscall::decode(free).is_err(),
                 "number {free} must remain unassigned"
@@ -102425,8 +102436,8 @@ mod stage200d0a_exit_foundation {
     /// enum's own declaration count parsed from source.
     #[test]
     fn d04_variant_list_is_exhaustive_and_derived() {
-        assert_eq!(Syscall::VARIANT_COUNT, 23);
-        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 23);
+        assert_eq!(Syscall::VARIANT_COUNT, 25);
+        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 25);
         assert!(
             SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
         );
@@ -103430,7 +103441,7 @@ mod stage200d0b3_x86_exit_corrected {
         assert!(b.contains("EXIT_TASK_RESTORE_OWNER_PREPARED"));
         assert!(b.contains("EXIT_TASK_ABSENCE_VALIDATED arch=x86_64"));
         // No new task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
     }
 
     // ── feature gating (22) ─────────────────────────────────────────────────────────
@@ -104637,7 +104648,7 @@ mod stage200d0c1_aarch64_exit_prep {
             "offline-CPU refusal is preserved by the transaction"
         );
         // No general-purpose task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
     }
 
     // ── U3 (canonical 203C): the validation reacquisition retirement ────────────────
@@ -105869,7 +105880,7 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(txn.contains("Some(bound) => bound == asid,"));
         assert!(c.contains("identity=tid_asid"));
         assert!(c.contains("frame_source=0"));
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
     }
 
     // ── 29–32: runner static contract and feature-off ───────────────────────────────
@@ -117987,6 +117998,10 @@ mod stage199d_riscv_canonical_admission {
             // (non-switching, same-task ecall writeback); without this line it would take the
             // terminal broad edge on this port alone.
             "SYSCALL_FUTEX_CMP_REQUEUE_NR",
+            // SCHED-TIME-FOUNDATION1 B: NR 18 / 19, admitted from birth (non-switching, NR 10's
+            // shape); without them the clock syscalls would take the terminal broad edge here.
+            "SYSCALL_CLOCK_GETTIME_NR",
+            "SYSCALL_CLOCK_SET_REALTIME_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -117999,8 +118014,9 @@ mod stage199d_riscv_canonical_admission {
         // is what stops a twenty-first arriving without its own justification.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            21,
-            "exactly twenty-one literal NRs (FUTEX-REQUEUE1 added FutexCmpRequeue) plus the gated direct-IPC term: DebugLog, FutexWake, \
+            23,
+            "exactly twenty-three literal NRs (FUTEX-REQUEUE1 added FutexCmpRequeue, \
+             SCHED-TIME-FOUNDATION1 ClockGetTime and ClockSetRealtime) plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, (U9-RECV-FINAL §1) IpcRecv, IpcSend, \
              (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
@@ -214823,7 +214839,8 @@ mod futex_requeue1 {
         use crate::kernel::syscall::{
             SYSCALL_ABI_VERSION, SYSCALL_FUTEX_CMP_REQUEUE_NR, Syscall, SyscallError,
         };
-        assert_eq!(SYSCALL_ABI_VERSION, 11);
+        // SCHED-TIME-FOUNDATION1 moved the ABI to v12 (NR 18 / 19 assigned); NR 17 is unchanged.
+        assert_eq!(SYSCALL_ABI_VERSION, 12);
         assert_eq!(
             Syscall::decode(SYSCALL_FUTEX_CMP_REQUEUE_NR),
             Ok(Syscall::FutexCmpRequeue)
@@ -220408,5 +220425,305 @@ mod sched_time_foundation1_a_ipc {
             assert_eq!(s.enqueue_task(9999).is_err(), true);
             let _ = TaskPriority::Normal;
         });
+    }
+}
+
+/// SCHED-TIME-FOUNDATION1 checkpoint B — NR 18 `ClockGetTime` and NR 19 `ClockSetRealtime`
+/// through the broad dispatcher and the split owners, on a caller with one mapped user page.
+mod sched_time_foundation1_b_clock {
+    use crate::kernel::boot::{Bootstrap, KernelState};
+    use crate::kernel::syscall::{
+        SYSCALL_CLOCK_GETTIME_NR, SYSCALL_CLOCK_SET_REALTIME_NR, SyscallError,
+    };
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::timekeeping::{self as tk, SourceKind, Timespec};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+
+    const VA: usize = 0x0040_0000;
+    const PAGE: usize = crate::kernel::vm::PAGE_SIZE;
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        tk::CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+    fn counter(v: u64) {
+        crate::arch::clock::HOSTED_COUNTER.store(v, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Task 1 of `class`, current, with one writable page at `VA` (the next page unmapped).
+    fn world(class: TaskClass) -> (KernelState, Asid) {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task_with_class(1, class).expect("t1");
+        let (asid, aspace) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(1, asid).expect("bind");
+        s.map_user_page(
+            aspace,
+            VirtAddr(VA as u64),
+            Mapping {
+                phys: PhysAddr(0xC000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map");
+        s.enqueue_current_cpu(1).expect("enqueue");
+        s.dispatch_next_task().expect("dispatch");
+        while s.current_tid() != Some(1) {
+            s.yield_current().expect("switch to t1");
+        }
+        (s, asid)
+    }
+
+    fn call(s: &mut KernelState, nr: usize, args: [usize; 6]) -> Result<(), SyscallError> {
+        let mut f = TrapFrame::new(nr, args);
+        crate::kernel::syscall::dispatch(s, &mut f)?;
+        assert_eq!(
+            (f.ret0, f.ret1, f.ret2, f.error),
+            (0, 0, 0, 0),
+            "success is 0"
+        );
+        Ok(())
+    }
+    fn read_ts(s: &KernelState, asid: Asid, va: usize) -> Timespec {
+        let raw = s
+            .copy_from_user(asid, VirtAddr(va as u64), 16)
+            .expect("read back");
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&raw[..16]);
+        Timespec::from_bytes(&b)
+    }
+    fn poison(s: &mut KernelState, asid: Asid, va: usize) {
+        s.copy_to_user(asid, VirtAddr(va as u64), &[0xA5u8; 16])
+            .expect("poison");
+    }
+    const POISON: Timespec = Timespec {
+        sec: i64::from_le_bytes([0xA5; 8]),
+        nsec: i64::from_le_bytes([0xA5; 8]),
+    };
+
+    #[test]
+    fn s01_monotonic_is_written_once_and_coherently() {
+        let _g = lock();
+        counter(0);
+        tk::force_source_for_test(1_000_000_000, 0, SourceKind::Hosted);
+        let (mut s, asid) = world(TaskClass::App);
+        counter(2_000_000_123);
+        call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [1, VA, 0, 0, 0, 0]).expect("gettime");
+        assert_eq!(read_ts(&s, asid, VA), Timespec { sec: 2, nsec: 123 });
+        counter(2_000_000_124);
+        call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [1, VA + 16, 0, 0, 0, 0]).expect("gettime");
+        assert!(
+            read_ts(&s, asid, VA + 16) >= read_ts(&s, asid, VA),
+            "nondecreasing"
+        );
+    }
+
+    #[test]
+    fn s02_uninitialized_realtime_is_unavailable_and_writes_nothing() {
+        let _g = lock();
+        tk::force_source_for_test(1_000_000_000, 0, SourceKind::Hosted);
+        let (mut s, asid) = world(TaskClass::App);
+        poison(&mut s, asid, VA);
+        assert_eq!(
+            call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [0, VA, 0, 0, 0, 0]),
+            Err(SyscallError::Unavailable)
+        );
+        assert_eq!(SyscallError::Unavailable.code(), 11);
+        assert_eq!(read_ts(&s, asid, VA), POISON, "nothing written");
+    }
+
+    #[test]
+    fn s03_bad_ids_and_pointers_are_refused_with_nothing_written() {
+        let _g = lock();
+        tk::force_source_for_test(1_000_000_000, 0, SourceKind::Hosted);
+        let (mut s, asid) = world(TaskClass::App);
+        poison(&mut s, asid, VA);
+        assert_eq!(
+            call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [2, VA, 0, 0, 0, 0]),
+            Err(SyscallError::InvalidArgs),
+            "clock 2"
+        );
+        assert_eq!(
+            call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [1, 0, 0, 0, 0, 0]),
+            Err(SyscallError::InvalidArgs),
+            "null"
+        );
+        assert_eq!(
+            call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [1, VA + 4, 0, 0, 0, 0]),
+            Err(SyscallError::InvalidArgs),
+            "misaligned"
+        );
+        assert_eq!(
+            call(
+                &mut s,
+                SYSCALL_CLOCK_GETTIME_NR,
+                [1, usize::MAX - 7, 0, 0, 0, 0]
+            ),
+            Err(SyscallError::InvalidArgs),
+            "wraps"
+        );
+        assert_eq!(
+            call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [1, VA + PAGE, 0, 0, 0, 0]),
+            Err(SyscallError::PageFault),
+            "unmapped"
+        );
+        // Straddling the end of the mapped page: the first 8 bytes are writable, the rest not.
+        let edge = VA + PAGE - 8;
+        s.copy_to_user(asid, VirtAddr(edge as u64), &[0x5Au8; 8])
+            .expect("poison the edge");
+        assert_eq!(
+            call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [1, edge, 0, 0, 0, 0]),
+            Err(SyscallError::PageFault)
+        );
+        let raw = s
+            .copy_from_user(asid, VirtAddr(edge as u64), 8)
+            .expect("edge");
+        assert_eq!(
+            &raw[..8],
+            &[0x5Au8; 8],
+            "all or nothing: the mapped half is untouched"
+        );
+        assert_eq!(read_ts(&s, asid, VA), POISON);
+    }
+
+    #[test]
+    fn s04_only_an_authorized_caller_sets_realtime() {
+        let _g = lock();
+        counter(0);
+        tk::force_source_for_test(1_000_000_000, 0, SourceKind::Hosted);
+        let (mut s, asid) = world(TaskClass::App);
+        s.copy_to_user(
+            asid,
+            VirtAddr(VA as u64),
+            &Timespec {
+                sec: 1_763_000_000,
+                nsec: 0,
+            }
+            .to_bytes(),
+        )
+        .expect("arg");
+        assert_eq!(
+            call(&mut s, SYSCALL_CLOCK_SET_REALTIME_NR, [VA, 0, 0, 0, 0, 0]),
+            Err(SyscallError::MissingRight)
+        );
+        assert!(!tk::realtime_initialized(), "nothing changed");
+        assert_eq!(
+            call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [0, VA + 16, 0, 0, 0, 0]),
+            Err(SyscallError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn s05_an_authorized_set_initializes_realtime() {
+        let _g = lock();
+        counter(0);
+        tk::force_source_for_test(1_000_000_000, 0, SourceKind::Hosted);
+        let (mut s, asid) = world(TaskClass::SystemServer);
+        counter(1_000);
+        s.copy_to_user(
+            asid,
+            VirtAddr(VA as u64),
+            &Timespec {
+                sec: 1_763_000_000,
+                nsec: 7,
+            }
+            .to_bytes(),
+        )
+        .expect("arg");
+        call(&mut s, SYSCALL_CLOCK_SET_REALTIME_NR, [VA, 0, 0, 0, 0, 0]).expect("set");
+        counter(1_000 + 3_000_000_000);
+        call(&mut s, SYSCALL_CLOCK_GETTIME_NR, [0, VA + 16, 0, 0, 0, 0]).expect("realtime");
+        assert_eq!(
+            read_ts(&s, asid, VA + 16),
+            Timespec {
+                sec: 1_763_000_003,
+                nsec: 7
+            }
+        );
+        for bad in [
+            Timespec {
+                sec: 1,
+                nsec: 1_000_000_000,
+            },
+            Timespec { sec: 1, nsec: -1 },
+            Timespec { sec: -5, nsec: 0 },
+        ] {
+            s.copy_to_user(asid, VirtAddr(VA as u64), &bad.to_bytes())
+                .expect("arg");
+            assert_eq!(
+                call(&mut s, SYSCALL_CLOCK_SET_REALTIME_NR, [VA, 0, 0, 0, 0, 0]),
+                Err(SyscallError::InvalidArgs),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s06_the_split_owner_answers_exactly_like_the_broad_one() {
+        let _g = lock();
+        counter(0);
+        tk::force_source_for_test(1_000_000_000, 0, SourceKind::Hosted);
+        let (s, asid) = world(TaskClass::App);
+        let k = crate::runtime::SharedKernel::new(s);
+        counter(42_000_000_017);
+        let mut f = TrapFrame::new(SYSCALL_CLOCK_GETTIME_NR, [1, VA, 0, 0, 0, 0]);
+        crate::kernel::syscall::clock::clock_gettime_split(&k, 1, &mut f).expect("split");
+        assert_eq!(
+            k.with(|s| read_ts(s, asid, VA)),
+            Timespec { sec: 42, nsec: 17 }
+        );
+        for (args, err) in [
+            ([2, VA, 0, 0, 0, 0], SyscallError::InvalidArgs),
+            ([1, VA + 4, 0, 0, 0, 0], SyscallError::InvalidArgs),
+            ([1, VA + PAGE, 0, 0, 0, 0], SyscallError::PageFault),
+            ([0, VA, 0, 0, 0, 0], SyscallError::Unavailable),
+        ] {
+            let mut f = TrapFrame::new(SYSCALL_CLOCK_GETTIME_NR, args);
+            assert_eq!(
+                crate::kernel::syscall::clock::clock_gettime_split(&k, 1, &mut f),
+                Err(err),
+                "{args:?}"
+            );
+            let mut g = TrapFrame::new(SYSCALL_CLOCK_GETTIME_NR, args);
+            assert_eq!(
+                k.with(|s| crate::kernel::syscall::dispatch(s, &mut g)),
+                Err(err),
+                "broad {args:?}"
+            );
+        }
+        let mut f = TrapFrame::new(SYSCALL_CLOCK_SET_REALTIME_NR, [VA, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            crate::kernel::syscall::clock::clock_set_realtime_split(&k, 1, &mut f),
+            Err(SyscallError::MissingRight)
+        );
+    }
+
+    #[test]
+    fn s07_the_existing_tick_clocks_are_untouched() {
+        let _g = lock();
+        // Installing and advancing the new clock changes no scheduler tick and no tick-domain
+        // conversion: a FutexWait timeout still converts on the scheduler tick (FUTEX-TIME1).
+        let (s, _asid) = world(TaskClass::App);
+        let before = s.scheduler_tick_now();
+        tk::force_source_for_test(1_000_000_000, 0, SourceKind::Hosted);
+        counter(999_000_000_000);
+        assert_eq!(
+            s.scheduler_tick_now(),
+            before,
+            "the scheduler tick is not the clock"
+        );
+        assert_eq!(
+            crate::kernel::syscall::sched::futex_timeout_ticks(0, 10_000_000),
+            0
+        );
+        assert_eq!(
+            crate::kernel::syscall::sched::futex_timeout_ticks(1, 10_000_000),
+            2
+        );
+        assert_eq!(
+            crate::kernel::syscall::sched::futex_timeout_ticks(10_000_000, 10_000_000),
+            2
+        );
     }
 }

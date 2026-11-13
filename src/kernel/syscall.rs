@@ -10,7 +10,7 @@ use super::vm::{PAGE_SIZE, VirtAddr};
 use crate::arch::syscall_abi;
 use crate::kernel::boot::TrapHandleError;
 
-pub const SYSCALL_ABI_VERSION: u16 = 11;
+pub const SYSCALL_ABI_VERSION: u16 = 12;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
@@ -38,6 +38,13 @@ pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;
 /// FUTEX-REQUEUE1 (ABI v11) — atomic compare-and-requeue: `17`, the lowest number of the reserved
 /// public gap `17..=22`, contiguous with `0..=16`. Assigning it is what makes this ABI v11.
 pub const SYSCALL_FUTEX_CMP_REQUEUE_NR: usize = 17;
+/// SCHED-TIME-FOUNDATION1 (ABI v12) — `ClockGetTime(clock_id, ts_ptr)`: the next number of the
+/// reserved public gap, contiguous with `0..=17`.
+pub const SYSCALL_CLOCK_GETTIME_NR: usize = 18;
+/// SCHED-TIME-FOUNDATION1 (ABI v12) — `ClockSetRealtime(ts_ptr)`: the authorized initialization of
+/// `CLOCK_REALTIME`. A public slot, policy-gated like NR 8 (`SystemServer` only, else
+/// `MissingRight`).
+pub const SYSCALL_CLOCK_SET_REALTIME_NR: usize = 19;
 
 /// Stage 200D-0A — the exit status recorded for a task that ended itself via NR 16.
 ///
@@ -340,6 +347,8 @@ pub(crate) mod ipc_abi;
 pub(crate) mod ipc_recv_core;
 // U9-FORK1 §3/§4: THE fork transaction, over the delivered `SpawnTxnOwners` plus the seven
 // operations a fork needs that a spawn does not.
+/// SCHED-TIME-FOUNDATION1 B — NR 18 `ClockGetTime`, NR 19 `ClockSetRealtime`.
+pub(crate) mod clock;
 pub(crate) mod exit_txn;
 pub(crate) mod fork_txn;
 pub(crate) mod process;
@@ -422,6 +431,10 @@ pub enum Syscall {
     ExitCurrentTask = SYSCALL_EXIT_CURRENT_TASK_NR,
     /// FUTEX-REQUEUE1 (ABI v11): atomic compare, wake and requeue between two futex keys.
     FutexCmpRequeue = SYSCALL_FUTEX_CMP_REQUEUE_NR,
+    /// SCHED-TIME-FOUNDATION1 (ABI v12): read `CLOCK_REALTIME` / `CLOCK_MONOTONIC`.
+    ClockGetTime = SYSCALL_CLOCK_GETTIME_NR,
+    /// SCHED-TIME-FOUNDATION1 (ABI v12): initialize `CLOCK_REALTIME` (authorized callers only).
+    ClockSetRealtime = SYSCALL_CLOCK_SET_REALTIME_NR,
 }
 
 /// Stage 200D-0A — the CANONICAL list of every `Syscall` variant.
@@ -452,6 +465,8 @@ pub const ALL_SYSCALL_VARIANTS: &[Syscall] = &[
     Syscall::DebugLog,
     Syscall::ExitCurrentTask,
     Syscall::FutexCmpRequeue,
+    Syscall::ClockGetTime,
+    Syscall::ClockSetRealtime,
     Syscall::SpawnProcess,
     Syscall::CreateInitramfsFileSliceMo,
     Syscall::SpawnFromMemoryObject,
@@ -493,6 +508,8 @@ impl Syscall {
             SYSCALL_REAP_FAULTED_TASK_NR => Ok(Self::ReapFaultedTask),
             SYSCALL_EXIT_CURRENT_TASK_NR => Ok(Self::ExitCurrentTask),
             SYSCALL_FUTEX_CMP_REQUEUE_NR => Ok(Self::FutexCmpRequeue),
+            SYSCALL_CLOCK_GETTIME_NR => Ok(Self::ClockGetTime),
+            SYSCALL_CLOCK_SET_REALTIME_NR => Ok(Self::ClockSetRealtime),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -525,6 +542,10 @@ pub enum SyscallError {
     /// `10` was audited unused across the whole syscall-error space before being taken
     /// (see the Stage 200D `d0*` guards, which re-derive the used set from source).
     ServerDied = 10,
+    /// SCHED-TIME-FOUNDATION1 (ABI v12) — the requested clock has no source: `CLOCK_REALTIME`
+    /// before an authorized caller set its epoch, or a monotonic clock with no installed counter.
+    /// Distinct from `InvalidArgs` (an unknown clock id): the clock exists and is not available.
+    Unavailable = 11,
     Internal = 255,
 }
 
@@ -545,6 +566,7 @@ impl SyscallError {
             8 => Self::PageFault,
             9 => Self::TimedOut,
             10 => Self::ServerDied,
+            11 => Self::Unavailable,
             // Unknown codes still fall back to `Internal` — unchanged by Stage 200D.
             _ => Self::Internal,
         }
@@ -2541,6 +2563,8 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::RecvSharedV3 => handle_recv_shared_v3(kernel, frame),
         Syscall::ReapFaultedTask => handle_reap_faulted_task(kernel, frame),
         Syscall::ExitCurrentTask => handle_exit_current_task(kernel, frame),
+        Syscall::ClockGetTime => self::clock::handle_clock_gettime(kernel, frame),
+        Syscall::ClockSetRealtime => self::clock::handle_clock_set_realtime(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
@@ -2721,8 +2745,11 @@ mod tests {
     #[test]
     fn syscall_abi_numbers_are_frozen() {
         // FUTEX-REQUEUE1: v11 — NR 17 assigned from the reserved gap (doc/SYSCALL_ABI.md).
-        assert_eq!(SYSCALL_ABI_VERSION, 11);
+        // SCHED-TIME-FOUNDATION1: v12 — NR 18 and NR 19 assigned next.
+        assert_eq!(SYSCALL_ABI_VERSION, 12);
         assert_eq!(SYSCALL_FUTEX_CMP_REQUEUE_NR, 17);
+        assert_eq!(SYSCALL_CLOCK_GETTIME_NR, 18);
+        assert_eq!(SYSCALL_CLOCK_SET_REALTIME_NR, 19);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4);
@@ -5857,7 +5884,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 2 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "D4 step 2 must not change syscall variant count"
         );
         assert!(
@@ -5923,7 +5950,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 3 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "D4 step 3 must not change syscall variant count"
         );
         assert!(
@@ -5992,7 +6019,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 4 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            25,
             "D4 step 4 must not change syscall variant count"
         );
         assert!(

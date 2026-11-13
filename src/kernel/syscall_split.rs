@@ -6168,6 +6168,13 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_futex_cmp_requeue_into_frame(shared, cpu, frame);
     }
 
+    // SCHED-TIME-FOUNDATION1 B: ClockGetTime (NR 18) and ClockSetRealtime (NR 19) — born split,
+    // non-switching. The clock read takes no lock; the copy takes only the caller's VM / memory
+    // seams. Every refusal is settled here, in the broad handler's order.
+    if matches!(syscall, Syscall::ClockGetTime | Syscall::ClockSetRealtime) {
+        return try_split_clock_into_frame(shared, cpu, frame, syscall);
+    }
+
     // U9-IPC-RESIDUAL2 §2: IpcCall (NR 6) is no longer serviced from here. It became a SWITCHING
     // class the moment its full-endpoint arm started parking the caller, so it is tried in
     // `try_split_dispatch_into_frame` alongside the other four, whose contract admits a caller
@@ -6847,6 +6854,51 @@ fn try_split_futex_cmp_requeue_into_frame(
         );
     }
     Some(sc::apply_futex_requeue_result(frame, result).map_err(TrapHandleError::Syscall))
+}
+
+/// SCHED-TIME-FOUNDATION1 B — NR 18 `ClockGetTime` / NR 19 `ClockSetRealtime` off the broad lock.
+/// The decode, the caller resolution and every error are the broad handler's
+/// (`syscall::clock`), so the two routes cannot answer differently.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_clock_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    syscall: Syscall,
+) -> Option<Result<(), TrapHandleError>> {
+    let nr = syscall.number();
+    let tid = match split_caller(shared, cpu) {
+        SplitCaller::Running(tid) => tid,
+        SplitCaller::NoCurrentTask => {
+            crate::yarm_log!(
+                "SYSCALL_SPLIT_NO_CURRENT nr={} cpu={} settlement=task_missing broad_lock=0",
+                nr,
+                cpu.0
+            );
+            return Some(Err(TrapHandleError::Syscall(SyscallError::from(
+                crate::kernel::boot::KernelError::TaskMissing,
+            ))));
+        }
+    };
+    let r = match syscall {
+        Syscall::ClockGetTime => {
+            crate::kernel::syscall::clock::clock_gettime_split(shared, tid, frame)
+        }
+        _ => crate::kernel::syscall::clock::clock_set_realtime_split(shared, tid, frame),
+    };
+    Some(r.map_err(TrapHandleError::Syscall))
+}
+
+/// Hosted-dev: the clock syscalls take the broad path; their owners are arch-neutral and tested
+/// directly.
+#[cfg(feature = "hosted-dev")]
+fn try_split_clock_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+    _syscall: Syscall,
+) -> Option<Result<(), TrapHandleError>> {
+    None
 }
 
 /// Hosted-dev: NR 17 takes the broad path (as NR 10 does); the split owner
@@ -10670,6 +10722,9 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // FUTEX-REQUEUE1: FutexCmpRequeue (NR 17) — split from birth; the caller never
         // task-switches. `try_split_futex_cmp_requeue_into_frame` settles every refusal.
         Syscall::FutexCmpRequeue => Some(syscall),
+        // SCHED-TIME-FOUNDATION1 B: NR 18 / NR 19 — split from birth; the caller never
+        // task-switches. `try_split_clock_into_frame` settles every refusal.
+        Syscall::ClockGetTime | Syscall::ClockSetRealtime => Some(syscall),
         // U9-MO2 §4: CreateInitramfsFileSliceMo (NR 28) — the smallest live production class
         // still reaching a terminal broad acquisition. Its object is BORROWED initrd backing, so
         // its compensation never touches the frame allocator; every owner it needs already exists
@@ -11851,6 +11906,9 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
                 // FUTEX-REQUEUE1: NR 17 `FutexCmpRequeue`, split from birth.
                 || nr == crate::kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR
+                // SCHED-TIME-FOUNDATION1 B: NR 18 / 19, split from birth.
+                || nr == crate::kernel::syscall::SYSCALL_CLOCK_GETTIME_NR
+                || nr == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
                 || nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
                 || nr == SYSCALL_SPAWN_PROCESS_NR

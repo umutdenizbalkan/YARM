@@ -702,7 +702,7 @@ mod tests {
         let mut wire = [0u8; 80];
         wire[0..4].copy_from_slice(&3u32.to_le_bytes()); // RECV_V3_VERSION
         wire[4..8].copy_from_slice(&80u32.to_le_bytes()); // RECV_V3_MIN_OUTPUT_LEN
-        wire[8..12].copy_from_slice(&11u32.to_le_bytes()); // RECV_V3_ABI_VERSION
+        wire[8..12].copy_from_slice(&12u32.to_le_bytes()); // RECV_V3_ABI_VERSION
         wire[12..16].copy_from_slice(&0u32.to_le_bytes()); // RECV_V3_STATUS_OK
         wire[16..24].copy_from_slice(&7u64.to_le_bytes()); // sender_tid = 7
         wire[24..28].copy_from_slice(&5u32.to_le_bytes()); // message_len = 5

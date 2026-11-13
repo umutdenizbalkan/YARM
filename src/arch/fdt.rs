@@ -260,6 +260,89 @@ pub fn cpus_hart_id_bitmap(bytes: &[u8]) -> Option<u64> {
     Some(bitmap)
 }
 
+/// SCHED-TIME-FOUNDATION1 B — the `timebase-frequency` of the `/cpus` node (the rate of the
+/// RISC-V `time` CSR), falling back to the first `/cpus/cpu@*` child that carries it, as the
+/// device-tree specification allows. A 1-cell (u32) or 2-cell (u64) value. `None` if the FDT is
+/// invalid or no such property exists — the caller then installs no clock source rather than
+/// assuming a rate.
+pub fn cpus_timebase_frequency(bytes: &[u8]) -> Option<u64> {
+    if read_be_u32(bytes, 0)? != FDT_MAGIC {
+        return None;
+    }
+    let total_size = read_be_u32(bytes, 4)? as usize;
+    let off_dt_struct = read_be_u32(bytes, 8)? as usize;
+    let off_dt_strings = read_be_u32(bytes, 12)? as usize;
+    let size_dt_strings = read_be_u32(bytes, 32)? as usize;
+    let size_dt_struct = read_be_u32(bytes, 36)? as usize;
+    if total_size > bytes.len()
+        || off_dt_struct.checked_add(size_dt_struct)? > total_size
+        || off_dt_strings.checked_add(size_dt_strings)? > total_size
+    {
+        return None;
+    }
+    let struct_block = &bytes[off_dt_struct..off_dt_struct + size_dt_struct];
+    let strings = &bytes[off_dt_strings..off_dt_strings + size_dt_strings];
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut cpus_depth: Option<usize> = None;
+    let mut in_cpu_child = false;
+    let mut from_child: Option<u64> = None;
+    while cursor + 4 <= struct_block.len() {
+        let token = read_be_u32(struct_block, cursor)?;
+        cursor += 4;
+        match token {
+            FDT_BEGIN_NODE => {
+                let (name, next) = read_cstr(struct_block, cursor)?;
+                cursor = align_up_4(next)?;
+                depth = depth.checked_add(1)?;
+                if depth == 2 && name == b"cpus" {
+                    cpus_depth = Some(depth);
+                }
+                in_cpu_child = cpus_depth.is_some_and(|d| depth == d + 1)
+                    && (name == b"cpu" || name.starts_with(b"cpu@"));
+            }
+            FDT_END_NODE => {
+                if cpus_depth == Some(depth) {
+                    cpus_depth = None;
+                }
+                in_cpu_child = false;
+                depth = depth.checked_sub(1)?;
+            }
+            FDT_PROP => {
+                let prop_len = read_be_u32(struct_block, cursor)? as usize;
+                let name_off = read_be_u32(struct_block, cursor + 4)? as usize;
+                cursor = cursor.checked_add(8)?;
+                let prop_end = cursor.checked_add(prop_len)?;
+                if prop_end > struct_block.len() {
+                    return None;
+                }
+                let data = &struct_block[cursor..prop_end];
+                cursor = align_up_4(prop_end)?;
+                if read_cstr(strings, name_off)?.0 != b"timebase-frequency" {
+                    continue;
+                }
+                let value = match data.len() {
+                    4 => u64::from(read_be_u32(data, 0)?),
+                    8 => {
+                        (u64::from(read_be_u32(data, 0)?) << 32) | u64::from(read_be_u32(data, 4)?)
+                    }
+                    _ => continue,
+                };
+                if cpus_depth == Some(depth) {
+                    return Some(value);
+                }
+                if in_cpu_child && from_child.is_none() {
+                    from_child = Some(value);
+                }
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => return None,
+        }
+    }
+    from_child
+}
+
 fn parse_cpu_unit_addr(name: &[u8]) -> Option<u32> {
     let at = name.iter().position(|&b| b == b'@')?;
     let tail = &name[at + 1..];
@@ -915,6 +998,90 @@ mod tests {
         dtb.extend_from_slice(&structure);
         dtb.extend_from_slice(&strings);
         dtb
+    }
+
+    /// SCHED-TIME-FOUNDATION1 B — `/ { cpus { [timebase-frequency]; cpu@0 { [timebase-frequency] } } }`.
+    fn make_dtb_timebase(on_cpus: Option<&[u8]>, on_cpu0: Option<&[u8]>) -> Vec<u8> {
+        let strings = b"timebase-frequency\0";
+        let mut s = Vec::new();
+        let prop = |s: &mut Vec<u8>, v: &[u8]| {
+            push_u32(s, FDT_PROP);
+            push_u32(s, v.len() as u32);
+            push_u32(s, 0);
+            s.extend_from_slice(v);
+            align(s);
+        };
+        push_u32(&mut s, FDT_BEGIN_NODE);
+        s.push(0);
+        align(&mut s);
+        push_u32(&mut s, FDT_BEGIN_NODE);
+        s.extend_from_slice(b"cpus\0");
+        align(&mut s);
+        if let Some(v) = on_cpus {
+            prop(&mut s, v);
+        }
+        push_u32(&mut s, FDT_BEGIN_NODE);
+        s.extend_from_slice(b"cpu@0\0");
+        align(&mut s);
+        if let Some(v) = on_cpu0 {
+            prop(&mut s, v);
+        }
+        push_u32(&mut s, FDT_END_NODE);
+        push_u32(&mut s, FDT_END_NODE);
+        push_u32(&mut s, FDT_END_NODE);
+        push_u32(&mut s, FDT_END);
+        let header = 40usize;
+        let strings_offset = header + s.len();
+        let total = strings_offset + strings.len();
+        let mut dtb = Vec::new();
+        for value in [
+            FDT_MAGIC,
+            total as u32,
+            header as u32,
+            strings_offset as u32,
+            header as u32,
+            17,
+            16,
+            0,
+            strings.len() as u32,
+            s.len() as u32,
+        ] {
+            push_u32(&mut dtb, value);
+        }
+        dtb.extend_from_slice(&s);
+        dtb.extend_from_slice(strings);
+        dtb
+    }
+
+    #[test]
+    fn stf1_timebase_frequency_is_read_from_the_device_tree() {
+        let qemu = 10_000_000u32.to_be_bytes();
+        assert_eq!(
+            cpus_timebase_frequency(&make_dtb_timebase(Some(&qemu), None)),
+            Some(10_000_000)
+        );
+        let other = 24_000_000u32.to_be_bytes();
+        assert_eq!(
+            cpus_timebase_frequency(&make_dtb_timebase(None, Some(&other))),
+            Some(24_000_000),
+            "a per-cpu property is honoured when /cpus has none"
+        );
+        assert_eq!(
+            cpus_timebase_frequency(&make_dtb_timebase(Some(&qemu), Some(&other))),
+            Some(10_000_000),
+            "/cpus wins"
+        );
+        let wide = 0x0000_0001_0000_0000u64.to_be_bytes();
+        assert_eq!(
+            cpus_timebase_frequency(&make_dtb_timebase(Some(&wide), None)),
+            Some(1 << 32)
+        );
+        assert_eq!(
+            cpus_timebase_frequency(&make_dtb_timebase(None, None)),
+            None,
+            "absent: no guess"
+        );
+        assert_eq!(cpus_timebase_frequency(&[0u8; 8]), None, "not an FDT");
     }
 
     #[test]

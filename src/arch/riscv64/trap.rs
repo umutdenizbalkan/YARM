@@ -1627,6 +1627,10 @@ pub fn handle_riscv_trap_entry_shared(
             // FUTEX-REQUEUE1: FutexCmpRequeue (NR 17), split from birth (non-switching, NR 10's
             // shape). Absent here it would take the terminal broad edge on this port.
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR
+            // SCHED-TIME-FOUNDATION1 B: ClockGetTime / ClockSetRealtime (NR 18 / 19), split from
+            // birth (non-switching, NR 10's shape).
+            || nr == crate::kernel::syscall::SYSCALL_CLOCK_GETTIME_NR
+            || nr == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
             || nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
             // U9-RECV-FINAL §1: IpcRecv (NR 2). It was the ONE recognized IPC syscall this

@@ -73,7 +73,7 @@ pub const RECV_V3_CLEANUP_TOKEN_NONE: u64 = 0;
 
 /// Syscall ABI version written into `RecvSharedV3Output::abi_version`.
 /// (v11 since FUTEX-REQUEUE1, which assigned NR 17.)
-pub const RECV_V3_ABI_VERSION: u32 = 11;
+pub const RECV_V3_ABI_VERSION: u32 = 12;
 
 /// Output status: operation succeeded.
 pub const RECV_V3_STATUS_OK: u32 = 0;

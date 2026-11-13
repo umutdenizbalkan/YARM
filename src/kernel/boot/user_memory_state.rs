@@ -88,6 +88,24 @@ impl KernelState {
         })
     }
 
+    /// SCHED-TIME-FOUNDATION1 B — [`Self::copy_to_user`] that writes NOTHING unless every byte
+    /// of the range is a writable user mapping (a range across two pages is validated on both
+    /// before the first byte is written), so a fault never leaves a torn value behind.
+    pub(crate) fn copy_to_user_all_or_nothing(
+        &mut self,
+        asid: Asid,
+        va: VirtAddr,
+        bytes: &[u8],
+    ) -> Result<(), KernelError> {
+        for i in 0..bytes.len() {
+            let addr = (va.0 as usize)
+                .checked_add(i)
+                .ok_or(KernelError::UserMemoryFault)?;
+            self.validate_user_access_for_asid(asid, addr, true)?;
+        }
+        self.copy_to_user(asid, va, bytes)
+    }
+
     pub fn copy_from_user(
         &self,
         asid: Asid,
@@ -698,6 +716,23 @@ impl crate::runtime::SharedKernel {
             *slot = self.read_user_byte_split(asid, VirtAddr(phys))?;
         }
         Ok(out)
+    }
+
+    /// SCHED-TIME-FOUNDATION1 B — [`Self::copy_to_user_split`] that writes NOTHING unless every
+    /// byte of the range validates as a writable user mapping first.
+    pub(crate) fn copy_to_user_split_all_or_nothing(
+        &self,
+        asid: Asid,
+        va: VirtAddr,
+        bytes: &[u8],
+    ) -> Result<(), KernelError> {
+        for i in 0..bytes.len() {
+            let addr = (va.0 as usize)
+                .checked_add(i)
+                .ok_or(KernelError::UserMemoryFault)?;
+            self.validate_user_access_for_asid_split(asid, addr, true)?;
+        }
+        self.copy_to_user_split(asid, va, bytes)
     }
 
     /// Rank-5/6-seam mirror of `KernelState::copy_to_user`. No IPC/cap/scheduler

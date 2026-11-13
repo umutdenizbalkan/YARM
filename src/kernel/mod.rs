@@ -120,6 +120,8 @@ pub(crate) mod task_enqueue;
 pub(crate) mod task_transition;
 pub mod terminal_ownership;
 pub mod time;
+/// SCHED-TIME-FOUNDATION1 B — CLOCK_MONOTONIC / CLOCK_REALTIME in nanoseconds.
+pub mod timekeeping;
 pub mod topology;
 pub mod trap;
 pub mod trapframe;

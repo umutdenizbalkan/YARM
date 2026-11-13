@@ -47,6 +47,8 @@ pub mod aarch64_cpu_admission;
 #[cfg_attr(not(feature = "x86_64-uart-irq-witness"), allow(dead_code))]
 pub mod acpi_madt_rule;
 pub mod boot_entry;
+/// SCHED-TIME-FOUNDATION1 B — each port's free-running counter and its frequency evidence.
+pub mod clock;
 /// QEMU-IRQ1 §2 — the device-window readiness rule and the idle-origin external admission rule,
 /// arch-neutral so the hosted suite executes the rule the RISC-V port executes.
 pub mod device_window_rule;

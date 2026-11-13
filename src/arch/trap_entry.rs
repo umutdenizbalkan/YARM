@@ -4146,6 +4146,10 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // FUTEX-REQUEUE1: FutexCmpRequeue (NR 17) — non-switching, like NR 10, and split from
         // birth; without its ABI in the frame it would reach the terminal broad dispatcher here.
         || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR
+        // SCHED-TIME-FOUNDATION1 B: ClockGetTime / ClockSetRealtime (NR 18 / 19) — non-switching,
+        // split from birth; their ABI must be in the frame or the broad dispatcher would take them.
+        || raw_nr == crate::kernel::syscall::SYSCALL_CLOCK_GETTIME_NR
+        || raw_nr == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
         // U9-QA §2: FutexWait (NR 9) — the one SWITCHING pre-lock class. Without its ABI in the
         // frame the split dispatcher sees `nr = 0` and declines, which is why AArch64 kept taking
         // the in-lock deferral while x86_64 and RISC-V had moved to the pre-lock route. This is
@@ -4422,6 +4426,8 @@ fn finalize_split_handled_syscall(
     if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_CMP_REQUEUE_NR
+        || frame.syscall_num() == crate::kernel::syscall::SYSCALL_CLOCK_GETTIME_NR
+        || frame.syscall_num() == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         || ((frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
