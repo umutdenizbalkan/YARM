@@ -609,7 +609,9 @@ after its `ecall` (the bridge advances `sepc` once, at trap entry), whichever wa
   exact `{tid, asid, generation}` record the resume consumes. A TIMED `FutexWait` (FUTEX-TIME1) is
   in the second group on every architecture: its result is not known when it parks, so its frame
   carries a fail-closed provisional (`Internal`), and the claim that ends it (wake or timeout)
-  publishes `1` or `TimedOut` as the generation-bearing completion the resume boundary consumes;
+  publishes `1` or `TimedOut` as the generation-bearing completion the resume boundary consumes
+  (on x86_64, where a task resumed on another task's trap returns its continuation's registers,
+  the consumer writes the result into RAX/RCX/RDX/R8 too);
 - **after an asynchronous preemption**: the interrupted register file, verbatim — no syscall result
   is substituted.
 

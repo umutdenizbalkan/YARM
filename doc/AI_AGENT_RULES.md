@@ -1095,6 +1095,18 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   sides in agreement; `ecall_contract::c01` reads the wrapper's operand list and evaluates it
   against every arm's source, and the live witness (`scripts/qemu-riscv-ecall-witness-smoke.sh`)
   reads every register back in ring 3.
+- A timed `FutexWait` has ONE terminal owner (FUTEX-TIME1): a wake, the timeout, or exit, each
+  acting on the exact `{slot, generation}` token under the task lock. Attach the deadline inside the
+  compare-and-register hold, never after it; let a requeue carry it; never cancel or claim a timed
+  wait by bare TID or by its original key. The timeout reserves a run-queue slot before it claims,
+  exactly as a wake does; with no slot it still wins, by moving the record to its private
+  `Expired` key with the task left `Blocked` (never `Runnable` without a slot), and a later
+  collector pass places it. Never skip such an owed placement, and never let the timeout take a
+  waiter on an NR 17 `Pending` key. Its result is published as a `FutexWait` completion and
+  consumed at the resume; the parked frame carries only a fail-closed provisional, never `1`.
+- On x86_64 a task resumed on ANOTHER task's trap returns its continuation's registers, not the
+  frame's return fields: a completion consumed there must be written into RAX/RCX/RDX/R8 as well
+  (`encode_x86_blocked_completion`, FUTEX-TIME1). Test what ring 3 sees after a switched resume.
 - Do not recommend "re-issue FutexWake until it returns 0" as a broadcast: `0` can mean the oldest
   waiter's queue is full. Broadcast with `FutexCmpRequeue` and the contended-mutex protocol
   (`doc/SYSCALL_ABI.md`, *Condition-variable broadcast*).

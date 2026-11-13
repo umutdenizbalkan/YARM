@@ -1947,8 +1947,13 @@ handled via a dedicated helper with clear lock-contract comments.
   - `with_task_then_capability`: task -> capability
   - `with_scheduler_then_ipc`: scheduler -> ipc
   - `with_task_futex_then_vm_memory_mut` / `_split_mut`: task -> vm -> memory — NR 17's commit
-    (FUTEX-REQUEUE-ATOMIC1) and NR 9's compare-and-register (FUTEX-WAIT-ATOMIC1); nothing inside
-    takes a scheduler lock or calls back into the kernel state
+    (FUTEX-REQUEUE-ATOMIC1) and NR 9's compare-and-register (FUTEX-WAIT-ATOMIC1, which since
+    FUTEX-TIME1 also attaches a timed wait's deadline in the same hold); nothing inside takes a
+    scheduler lock or calls back into the kernel state
+  - FUTEX-TIME1's timeout collector (`run_due_futex_timeouts`) is not a multi-lock helper: it
+    alternates single acquisitions — task (scan), task (plan), the home CPU's scheduler lock
+    (reserve), task (claim or expire), the home CPU's scheduler lock (reserved commit) — never
+    nesting two, never task -> scheduler, never all CPUs
 - Hooks remain debug-only/non-enforcing scaffolding; no runtime locking behavior
   change is introduced at this stage.
 
