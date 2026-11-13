@@ -2988,6 +2988,7 @@ mod x86_futex_requeue {
 #[cfg(all(not(feature = "hosted-dev"), feature = "futex-requeue-witness"))]
 #[cfg_attr(
     any(
+        feature = "futex-time-witness",
         feature = "futex-wait-witness",
         all(feature = "riscv-ecall-witness", target_arch = "riscv64")
     ),
@@ -3210,6 +3211,7 @@ mod x86_futex_wait {
     feature = "futex-requeue-witness",
     feature = "futex-wait-witness"
 ))]
+#[cfg_attr(feature = "futex-time-witness", allow(dead_code))]
 fn run_futex_wait_witness(s_tid: u64) {
     use futex_wait_witness as w;
     #[cfg(target_arch = "x86_64")]
@@ -3224,6 +3226,537 @@ fn run_futex_wait_witness(s_tid: u64) {
         w::signaller_body as *const () as usize,
         w::signaller_body as *const () as usize,
     ];
+    let stacks = core::ptr::addr_of_mut!(w::STACKS) as usize;
+    let tls = core::ptr::addr_of_mut!(w::TLS) as usize;
+    let children: [w::Child; w::THREADS] = core::array::from_fn(|i| w::Child {
+        entry: entries[i],
+        stack_top: (stacks + (i + 1) * w::STACK_BYTES) & !0xF,
+        tls_base: tls + i * 256,
+    });
+    w::run_once(s_tid, &children);
+}
+
+/// FUTEX-TIME1 — the live timed-wait witness, selector 18 when init is built with
+/// `futex-time-witness` (it takes precedence over the wait and requeue cells). Threads of init:
+///
+/// | thread | role |
+/// |---|---|
+/// | W | the ONLY thread that issues timed waits; it drives the sequences and reports every result |
+/// | H | the helper: wakes, requeues and (sequence E) spawns the fillers, on W's command |
+/// | S2 | a second signaller, for sequence G only |
+/// | F* | sequence E's fillers: runnable threads that yield until released, then park |
+///
+/// Sequences (in this order; the kernel's markers carry ownership and ordering, this cell reports
+/// what ring 3 saw):
+///
+/// * **A/F** three timed waits that nobody wakes, while H, S2 and init are BLOCKED: the timeout
+///   must come from the kernel's own tick (idle CPUs included), with no user thread polling.
+/// * **B** a timed wait H wakes before its deadline (`Woken`), then a longer timed wait (`TimedOut`)
+///   whose expiry lies past B's deadline: B's cycle must never complete a second time.
+/// * **C** a timed wait H requeues to another word without waking: it must time out (`TimedOut`)
+///   on the word it was moved to; afterwards wakes of both words find nobody.
+/// * **D** a timed wait H requeues and then wakes on the target (`Woken`), then a longer timed wait.
+/// * **G** race cycles (word high half `G_MAGIC`): H and S2 wake the word after an adaptive pause,
+///   so some cycles are won by the wake and some by the timeout; the kernel holds a window after a
+///   G timeout claim while a sibling runs on another CPU, and reports a wake that ran inside it.
+/// * **E** a timed wait whose home run queue is genuinely full when it expires: H spawns fillers
+///   until spawning is refused, watches the wait leave its word without a wake (requeue pings
+///   return 0), wakes both words (0), then releases the fillers; the wait must return `TimedOut`.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness"
+))]
+pub(super) mod futex_time_witness {
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
+    use core::time::Duration;
+    use yarm_user_rt::syscall::{
+        FutexScope, FutexTimedWait, futex_cmp_requeue, futex_wait, futex_wait_timeout, futex_wake,
+        yield_now,
+    };
+
+    const P: FutexScope = FutexScope::Private;
+    /// The kernel's `time_witness::G_MAGIC`.
+    pub(super) const G_MAGIC: u32 = 0xF7B1_0000;
+    pub(super) const G_CYCLES: u32 = 32;
+    pub(super) const STACK_BYTES: usize = 16384;
+    pub(super) const FILLER_STACK_BYTES: usize = 2048;
+    /// Two full user queues (64 each) and slack: spawning stops at the first refusal.
+    pub(super) const FILLERS: usize = 144;
+    /// W, H, S2.
+    pub(super) const THREADS: usize = 3;
+    const BOUND: u32 = 4_000_000;
+
+    #[repr(C, align(16))]
+    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; THREADS]);
+    #[allow(unused)]
+    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; THREADS]);
+    #[allow(unused)]
+    pub(super) static mut TLS: [[u8; 256]; THREADS] = [[0; 256]; THREADS];
+    #[repr(C, align(16))]
+    pub(super) struct FillerStacks(pub(super) [[u8; FILLER_STACK_BYTES]; FILLERS]);
+    #[allow(unused)]
+    pub(super) static mut FILLER_STACKS: FillerStacks =
+        FillerStacks([[0; FILLER_STACK_BYTES]; FILLERS]);
+    /// Filled by `run_once`: the fillers' entry (per architecture).
+    pub(super) static FILLER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+
+    // Words. Each sequence waits on its own; values never change while a wait is in flight.
+    static WA: AtomicU32 = AtomicU32::new(0xA0);
+    static WB: AtomicU32 = AtomicU32::new(0xB0);
+    static WB2: AtomicU32 = AtomicU32::new(0xB2);
+    static QA: AtomicU32 = AtomicU32::new(0xC0);
+    static QB: AtomicU32 = AtomicU32::new(0xC1);
+    static WD2: AtomicU32 = AtomicU32::new(0xD2);
+    static WG: AtomicU32 = AtomicU32::new(G_MAGIC);
+    static E1: AtomicU32 = AtomicU32::new(0xE1);
+    static E2: AtomicU32 = AtomicU32::new(0xE1);
+
+    // Control.
+    static CMD: AtomicU32 = AtomicU32::new(0);
+    static PHASE: AtomicU32 = AtomicU32::new(0);
+    static ACK: AtomicU32 = AtomicU32::new(0);
+    static RELEASE: AtomicU32 = AtomicU32::new(0);
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    static PARK: AtomicU32 = AtomicU32::new(0);
+    static G_PAUSE: AtomicU32 = AtomicU32::new(16);
+    static FAILS: AtomicU32 = AtomicU32::new(0);
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+
+    const PH_B: u32 = 2;
+    const PH_C: u32 = 3;
+    const PH_D: u32 = 4;
+    const PH_G: u32 = 5;
+    const PH_E: u32 = 6;
+    const PH_G_DONE: u32 = 7;
+    const PH_END: u32 = 9;
+
+    fn park() -> ! {
+        loop {
+            let v = PARK.load(SeqCst);
+            let _ = futex_wait(PARK.as_ptr(), v, P);
+        }
+    }
+
+    fn fail(what: &str) {
+        FAILS.fetch_add(1, SeqCst);
+        yarm_user_rt::user_log!("FTW_FAIL what={}", what);
+    }
+
+    fn slug(r: &Result<FutexTimedWait, yarm_user_rt::syscall::SyscallError>) -> &'static str {
+        match r {
+            Ok(FutexTimedWait::TimedOut) => "timed_out",
+            Ok(FutexTimedWait::Woken) => "woken",
+            Ok(FutexTimedWait::ValueChanged) => "value_changed",
+            Err(_) => "error",
+        }
+    }
+
+    /// W's one timed wait: CALL before, RET after, the kernel's REGISTER/DEADLINE in between.
+    fn timed(role: &str, word: &AtomicU32, ns: u64) -> Result<FutexTimedWait, ()> {
+        let n = CALLS.fetch_add(1, SeqCst) + 1;
+        let v = word.load(SeqCst);
+        yarm_user_rt::user_log!(
+            "FTW_CALL role={} n={} ns={} addr=0x{:x} expected=0x{:x}",
+            role,
+            n,
+            ns,
+            word.as_ptr() as usize,
+            v
+        );
+        let r = futex_wait_timeout(word.as_ptr(), v, P, Duration::from_nanos(ns));
+        match &r {
+            Err(e) => {
+                yarm_user_rt::user_log!("FTW_RET role={} n={} result=error err={:?}", role, n, e)
+            }
+            ok => yarm_user_rt::user_log!("FTW_RET role={} n={} result={}", role, n, slug(ok)),
+        }
+        r.map_err(|_| ())
+    }
+
+    fn expect(role: &str, got: Result<FutexTimedWait, ()>, want: FutexTimedWait) {
+        if got != Ok(want) {
+            fail(role);
+        }
+    }
+
+    /// Hand H (and S2) the next phase; they run it when they next look.
+    fn command(phase: u32) {
+        PHASE.store(phase, SeqCst);
+        ACK.store(0, SeqCst);
+        CMD.fetch_add(1, SeqCst);
+        let _ = futex_wake(CMD.as_ptr(), 8, P);
+    }
+
+    /// Wait (blocked, not polling) until H reports its part of the phase done.
+    fn await_ack() {
+        let mut n = 0;
+        while ACK.load(SeqCst) == 0 && n < BOUND {
+            let _ = futex_wait(ACK.as_ptr(), 0, P);
+            n += 1;
+        }
+    }
+
+    fn ack() {
+        ACK.store(1, SeqCst);
+        let _ = futex_wake(ACK.as_ptr(), 1, P);
+    }
+
+    /// Requeue the one waiter of `from` to `to` (no wake) until one moves; the bound fails closed.
+    fn requeue_until_moved(from: &AtomicU32, to: &AtomicU32) -> bool {
+        for _ in 0..BOUND {
+            match futex_cmp_requeue(from.as_ptr(), P, to.as_ptr(), P, from.load(SeqCst), 0, 1) {
+                Ok(o) if o.requeued == 1 => return true,
+                _ => {
+                    let _ = yield_now();
+                }
+            }
+        }
+        false
+    }
+
+    pub(super) extern "C" fn waiter_body() -> ! {
+        const MS: u64 = 1_000_000;
+        // A/F: nobody else runs; only the kernel's clock can end these.
+        for _ in 0..3 {
+            let r = timed("A", &WA, 100 * MS);
+            expect("A", r, FutexTimedWait::TimedOut);
+        }
+        // B: woken before the deadline, then a wait that outlives B's deadline.
+        command(PH_B);
+        let r = timed("B", &WB, 2000 * MS);
+        expect("B", r, FutexTimedWait::Woken);
+        await_ack();
+        let r = timed("B2", &WB2, 4000 * MS);
+        expect("B2", r, FutexTimedWait::TimedOut);
+        // C: requeued, then timed out on the target word.
+        command(PH_C);
+        let r = timed("C", &QA, 1000 * MS);
+        expect("C", r, FutexTimedWait::TimedOut);
+        await_ack();
+        let wa = futex_wake(QA.as_ptr(), 1, P).unwrap_or(u32::MAX);
+        let wb = futex_wake(QB.as_ptr(), 1, P).unwrap_or(u32::MAX);
+        yarm_user_rt::user_log!("FTW_C_AFTER wake_source={} wake_target={}", wa, wb);
+        if wa != 0 || wb != 0 {
+            fail("C_after");
+        }
+        // D: requeued, then woken on the target word; then a wait past D's deadline.
+        command(PH_D);
+        let r = timed("D", &QA, 2000 * MS);
+        expect("D", r, FutexTimedWait::Woken);
+        await_ack();
+        let r = timed("D2", &WD2, 4000 * MS);
+        expect("D2", r, FutexTimedWait::TimedOut);
+        // G: the cross-CPU race. Either end is legal; the kernel's markers say which won.
+        command(PH_G);
+        let (mut woken, mut timed_out) = (0u32, 0u32);
+        for k in 1..=G_CYCLES {
+            WG.store(G_MAGIC | k, SeqCst);
+            match timed("G", &WG, 1) {
+                Ok(FutexTimedWait::Woken) => {
+                    woken += 1;
+                    let p = G_PAUSE.load(SeqCst);
+                    G_PAUSE.store(p.saturating_mul(2).min(1 << 22), SeqCst);
+                }
+                Ok(FutexTimedWait::TimedOut) => {
+                    timed_out += 1;
+                    let p = G_PAUSE.load(SeqCst);
+                    G_PAUSE.store((p / 4 * 3).max(1), SeqCst);
+                }
+                _ => fail("G"),
+            }
+        }
+        yarm_user_rt::user_log!(
+            "FTW_G_SUMMARY cycles={} woken={} timed_out={}",
+            G_CYCLES,
+            woken,
+            timed_out
+        );
+        // Ends the signallers' loops (they then wait for the next command).
+        PHASE.store(PH_G_DONE, SeqCst);
+        // E: the deadline passes while the home queue is full.
+        command(PH_E);
+        let r = timed("E", &E1, 6000 * MS);
+        expect("E", r, FutexTimedWait::TimedOut);
+        await_ack();
+        command(PH_END);
+        yarm_user_rt::user_log!(
+            "FTW_WAITER_DONE calls={} fails={}",
+            CALLS.load(SeqCst),
+            FAILS.load(SeqCst)
+        );
+        DONE.store(1, SeqCst);
+        let _ = futex_wake(DONE.as_ptr(), 1, P);
+        park()
+    }
+
+    /// The G signaller's loop (H and S2): pause, then wake; until W leaves the phase.
+    fn g_signal(who: &str) {
+        let mut attempts = 0u32;
+        let mut hits = 0u32;
+        while PHASE.load(SeqCst) == PH_G {
+            let pause = G_PAUSE.load(SeqCst);
+            let mut i = 0;
+            while i < pause && PHASE.load(SeqCst) == PH_G {
+                let _ = yield_now();
+                i += 1;
+            }
+            attempts += 1;
+            hits += futex_wake(WG.as_ptr(), 1, P).unwrap_or(0);
+        }
+        yarm_user_rt::user_log!(
+            "FTW_G_SIGNALLER who={} attempts={} woke={}",
+            who,
+            attempts,
+            hits
+        );
+    }
+
+    fn helper_phase(phase: u32) {
+        match phase {
+            PH_B => {
+                let mut tries = 0u32;
+                let mut woke = 0;
+                while woke == 0 && tries < BOUND {
+                    woke = futex_wake(WB.as_ptr(), 1, P).unwrap_or(0);
+                    tries += 1;
+                    if woke == 0 {
+                        let _ = yield_now();
+                    }
+                }
+                yarm_user_rt::user_log!("FTW_B_WAKE woke={} tries={}", woke, tries);
+                ack();
+            }
+            PH_C => {
+                let moved = requeue_until_moved(&QA, &QB);
+                yarm_user_rt::user_log!(
+                    "FTW_C_REQUEUE moved={} target=0x{:x}",
+                    u32::from(moved),
+                    QB.as_ptr() as usize
+                );
+                ack();
+            }
+            PH_D => {
+                let moved = requeue_until_moved(&QA, &QB);
+                let woke = futex_wake(QB.as_ptr(), 1, P).unwrap_or(0);
+                yarm_user_rt::user_log!(
+                    "FTW_D_REQUEUE_WAKE moved={} woke={} target=0x{:x}",
+                    u32::from(moved),
+                    woke,
+                    QB.as_ptr() as usize
+                );
+                ack();
+            }
+            PH_G => g_signal("H"),
+            PH_E => helper_saturate(),
+            _ => {}
+        }
+    }
+
+    /// E: confirm W is parked, saturate, watch its wait leave the word with no wake, release.
+    fn helper_saturate() {
+        let mut at_one = !requeue_until_moved(&E1, &E2);
+        if at_one {
+            fail("E_register");
+        }
+        let entry = FILLER_ENTRY.load(SeqCst);
+        let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
+        let mut spawned = 0usize;
+        let mut refused = 0u32;
+        for i in 0..FILLERS {
+            let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
+            // SAFETY: a valid entry; the static stack outlives the thread; no TLS.
+            match unsafe { yarm_user_rt::syscall::spawn_thread(0, top, entry) } {
+                Ok(_) => spawned += 1,
+                Err(_) => {
+                    refused += 1;
+                    break;
+                }
+            }
+        }
+        yarm_user_rt::user_log!(
+            "FTW_E_SATURATED fillers={} spawn_refused={}",
+            spawned,
+            refused
+        );
+        // Ping: move W between E1 and E2 while it is still parked on a user word. The first
+        // ping that moves nobody is W's timeout having won (no wake was issued), under saturation.
+        let mut pings = 0u32;
+        let mut gone = false;
+        while pings < BOUND {
+            let (from, to) = if at_one { (&E1, &E2) } else { (&E2, &E1) };
+            match futex_cmp_requeue(from.as_ptr(), P, to.as_ptr(), P, 0xE1, 0, 1) {
+                Ok(o) if o.requeued == 1 => at_one = !at_one,
+                Ok(_) => {
+                    gone = true;
+                    break;
+                }
+                Err(_) => fail("E_ping"),
+            }
+            pings += 1;
+            let _ = yield_now();
+        }
+        let w1 = futex_wake(E1.as_ptr(), 1, P).unwrap_or(u32::MAX);
+        let w2 = futex_wake(E2.as_ptr(), 1, P).unwrap_or(u32::MAX);
+        yarm_user_rt::user_log!(
+            "FTW_E_EXPIRED_SEEN gone={} pings={} wake1={} wake2={}",
+            u32::from(gone),
+            pings,
+            w1,
+            w2
+        );
+        if !gone || pings == 0 || w1 != 0 || w2 != 0 || refused == 0 {
+            fail("E_saturation");
+        }
+        RELEASE.store(1, SeqCst);
+        ack();
+    }
+
+    pub(super) extern "C" fn helper_body() -> ! {
+        let mut seen = 0;
+        loop {
+            let c = CMD.load(SeqCst);
+            if c == seen {
+                let _ = futex_wait(CMD.as_ptr(), c, P);
+                continue;
+            }
+            seen = c;
+            let phase = PHASE.load(SeqCst);
+            if phase == PH_END {
+                park();
+            }
+            helper_phase(phase);
+        }
+    }
+
+    pub(super) extern "C" fn signaller_body() -> ! {
+        let mut seen = 0;
+        loop {
+            let c = CMD.load(SeqCst);
+            if c == seen {
+                let _ = futex_wait(CMD.as_ptr(), c, P);
+                continue;
+            }
+            seen = c;
+            match PHASE.load(SeqCst) {
+                PH_G => g_signal("S2"),
+                PH_END => park(),
+                _ => {}
+            }
+        }
+    }
+
+    pub(super) extern "C" fn filler_body() -> ! {
+        while RELEASE.load(SeqCst) == 0 {
+            let _ = yield_now();
+        }
+        park()
+    }
+
+    pub(super) struct Child {
+        pub(super) entry: usize,
+        pub(super) stack_top: usize,
+        pub(super) tls_base: usize,
+    }
+
+    pub(super) fn run_once(s_tid: u64, children: &[Child; THREADS]) {
+        yarm_user_rt::user_log!(
+            "FTW_BEGIN s_tid={} g_cycles={} fillers_max={}",
+            s_tid,
+            G_CYCLES,
+            FILLERS
+        );
+        let mut tids = [0u64; THREADS];
+        // The helpers first, so they are parked on CMD before W's first wait.
+        for i in [1, 2, 0] {
+            let c = &children[i];
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+            tids[i] =
+                unsafe { yarm_user_rt::syscall::spawn_thread(c.tls_base, c.stack_top, c.entry) }
+                    .unwrap_or(0);
+        }
+        yarm_user_rt::user_log!(
+            "FTW_THREADS waiter={} helper={} signaller={}",
+            tids[0],
+            tids[1],
+            tids[2]
+        );
+        // Block (not poll) until W is done: init is no running sibling during the sequences.
+        let mut waits = 0;
+        while DONE.load(SeqCst) == 0 && waits < BOUND {
+            let _ = futex_wait(DONE.as_ptr(), 0, P);
+            waits += 1;
+        }
+        let fails = FAILS.load(SeqCst);
+        let ok = tids.iter().all(|&t| t != 0) && DONE.load(SeqCst) == 1 && fails == 0;
+        yarm_user_rt::user_log!(
+            "FTW_DONE waiter={} calls={} fails={} result={}",
+            tids[0],
+            CALLS.load(SeqCst),
+            fails,
+            if ok { "ok" } else { "fail" }
+        );
+    }
+}
+
+/// x86_64 entry trampolines for the timed-wait witness (as for the wait witness's).
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness",
+    target_arch = "x86_64"
+))]
+mod x86_futex_time {
+    #[unsafe(naked)]
+    pub(super) extern "C" fn waiter_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_time_witness::waiter_body)
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn helper_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_time_witness::helper_body)
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn signaller_entry() -> ! {
+        core::arch::naked_asm!(
+            "call {body}",
+            "ud2",
+            body = sym super::futex_time_witness::signaller_body
+        )
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn filler_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_time_witness::filler_body)
+    }
+}
+
+/// FUTEX-TIME1 — resolve this architecture's entries and stacks, and run the timed-wait witness.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness"
+))]
+fn run_futex_time_witness(s_tid: u64) {
+    use core::sync::atomic::Ordering::SeqCst;
+    use futex_time_witness as w;
+    #[cfg(target_arch = "x86_64")]
+    let (entries, filler) = (
+        [
+            x86_futex_time::waiter_entry as *const () as usize,
+            x86_futex_time::helper_entry as *const () as usize,
+            x86_futex_time::signaller_entry as *const () as usize,
+        ],
+        x86_futex_time::filler_entry as *const () as usize,
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let (entries, filler) = (
+        [
+            w::waiter_body as *const () as usize,
+            w::helper_body as *const () as usize,
+            w::signaller_body as *const () as usize,
+        ],
+        w::filler_body as *const () as usize,
+    );
+    w::FILLER_ENTRY.store(filler, SeqCst);
     let stacks = core::ptr::addr_of_mut!(w::STACKS) as usize;
     let tls = core::ptr::addr_of_mut!(w::TLS) as usize;
     let children: [w::Child; w::THREADS] = core::array::from_fn(|i| w::Child {
@@ -8679,14 +9212,23 @@ pub fn run() {
     if futex_requeue_witness::armed(ctx.supervisor_control_recv_ep) {
         // RISCV-ECALL-A7-RET1: built with `riscv-ecall-witness` (RISC-V), the same selector runs
         // the ecall register-contract witness instead.
-        #[cfg(all(feature = "riscv-ecall-witness", target_arch = "riscv64"))]
+        // FUTEX-TIME1: built with `futex-time-witness`, the timed-wait witness, before all three.
+        #[cfg(feature = "futex-time-witness")]
+        run_futex_time_witness(ctx.task_id);
+        #[cfg(all(
+            not(feature = "futex-time-witness"),
+            feature = "riscv-ecall-witness",
+            target_arch = "riscv64"
+        ))]
         riscv_ecall_witness::run_once(ctx.task_id);
         #[cfg(all(
+            not(feature = "futex-time-witness"),
             feature = "futex-wait-witness",
             not(all(feature = "riscv-ecall-witness", target_arch = "riscv64"))
         ))]
         run_futex_wait_witness(ctx.task_id);
         #[cfg(not(any(
+            feature = "futex-time-witness",
             feature = "futex-wait-witness",
             all(feature = "riscv-ecall-witness", target_arch = "riscv64")
         )))]
