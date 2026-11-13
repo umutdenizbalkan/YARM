@@ -6685,7 +6685,11 @@ fn try_split_futex_wake_into_frame(
     let race_window = crate::kernel::boot::futex::race_witness::wake_begin();
     #[cfg(feature = "futex-wait-witness")]
     let wait_window = crate::kernel::boot::futex::wait_witness::wake_begin();
+    #[cfg(feature = "futex-time-witness")]
+    let time_window = crate::kernel::boot::futex::time_witness::wake_begin();
     let woke = shared.futex_wake_key_split(cpu, key, args.value);
+    #[cfg(feature = "futex-time-witness")]
+    crate::kernel::boot::futex::time_witness::wake_end(time_window, cpu.0, tid, woke);
     #[cfg(feature = "futex-requeue-race-witness")]
     crate::kernel::boot::futex::race_witness::wake_end(race_window, cpu.0, tid, woke);
     #[cfg(feature = "futex-wait-witness")]

@@ -307,6 +307,9 @@ struct FutexWaiterRecord {
     /// a new generation and a new record. Written only inside the compare-and-register hold that
     /// published the record (`arm_futex_deadline_locked`).
     deadline: Option<u64>,
+    /// FUTEX-TIME1 live witness only: this timed cycle is a sequence-G race cycle.
+    #[cfg(feature = "futex-time-witness")]
+    g_race: bool,
     next: u16,
 }
 
@@ -639,6 +642,8 @@ pub fn register_futex_waiter_locked(
         tcb: tcb_idx as u16,
         va,
         deadline: None,
+        #[cfg(feature = "futex-time-witness")]
+        g_race: false,
         next: NIL,
     });
     table.link_tail(slot);
@@ -807,6 +812,20 @@ pub fn compare_and_register_futex_waiter_locked(
         undo_futex_registration_locked(tcbs, table, tid, token);
         return Err(Refused::Full);
     }
+    #[cfg(feature = "futex-time-witness")]
+    if let (Some(deadline), FutexWaitTiming::Timed { now, .. }) = (deadline, timing) {
+        let slot = usize::from(token.slot);
+        if let Some(rec) = table.records[slot].as_mut() {
+            rec.g_race = time_witness::g_race(expected);
+        }
+        let generation = tcbs
+            .iter()
+            .flatten()
+            .find(|t| t.tid.0 == tid)
+            .map_or(0, |t| t.futex_wait_generation);
+        let va = table.records[slot].map_or(0, |r| r.va as u64);
+        time_witness::registered(tid, generation, deadline, now(), va);
+    }
     Ok((key, token))
 }
 
@@ -936,6 +955,8 @@ pub fn claim_futex_waiter_locked(
     // (`rec` is the record's value, read before its retirement).
     if rec.deadline.is_some() {
         publish_futex_wait_completion_locked(tcb, FutexWaitEnding::Woken);
+        #[cfg(feature = "futex-time-witness")]
+        time_witness::woken(rec.tid, tcb.futex_wait_generation, rec.va as u64);
     }
     true
 }
@@ -1149,6 +1170,28 @@ fn timeout_claimable(
         && rec.deadline.is_some_and(|d| d <= now)
         && !matches!(rec.key, FutexKey::Pending { .. })
         && table.live(tcbs, slot)
+}
+
+/// FUTEX-TIME1 live witness only — rank 2: `(generation, g_race, va)` of the cycle `candidate`
+/// names.
+#[cfg(feature = "futex-time-witness")]
+pub fn time_witness_facts_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    table: &FutexWaiterTable,
+    candidate: FutexTimeoutCandidate,
+) -> (u64, bool, u64) {
+    let slot = usize::from(candidate.token.slot);
+    let rec = (slot < MAX_FUTEX_WAITERS && table.token(slot) == candidate.token)
+        .then(|| table.records[slot])
+        .flatten();
+    let g = rec.is_some_and(|r| r.g_race);
+    let va = rec.map_or(0, |r| r.va as u64);
+    let generation = tcbs
+        .iter()
+        .flatten()
+        .find(|t| t.tid.0 == candidate.tid)
+        .map_or(0, |t| t.futex_wait_generation);
+    (generation, g, va)
 }
 
 /// FUTEX-TIME1 — rank 2: is `tid`'s cycle `token` on its `Expired` key (timed out, placement
@@ -1829,9 +1872,151 @@ pub mod wait_witness {
 /// committed and before its placement, so a grader can name which owner won each cycle.
 #[cfg(feature = "futex-time-witness")]
 pub mod time_witness {
-    /// The collector committed a timeout and placed the waiter.
-    pub fn timed_out(cpu: u8, tid: u64, now: u64) {
-        crate::yarm_log!("FUTEX_TIME_W_TIMEOUT cpu={} tid={} now={}", cpu, tid, now);
+    use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    /// The high half of a sequence-G (race) word. The collector holds a window open after it
+    /// claims such a cycle's timeout, until a wake that STARTED inside the window has finished,
+    /// but only while a sibling of the waiter is current on another CPU — the only place a
+    /// competing wake can come from while the collecting CPU spins with interrupts masked. With no
+    /// such peer the window is not opened (or ends early), and says so.
+    pub const G_MAGIC: u32 = 0xF7B1_0000;
+    static OPEN: AtomicU64 = AtomicU64::new(0);
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static WAKES: AtomicU64 = AtomicU64::new(0);
+    const SPIN_BOUND: u64 = 400_000_000;
+    const PEER_RECHECK: u64 = 1 << 16;
+    const PEER_MISSES: u32 = 8;
+
+    /// Whether `expected` names a sequence-G cycle (and the witness is armed on this boot).
+    pub fn g_race(expected: u32) -> bool {
+        crate::kernel::boot::futex_requeue_witness_enabled() && expected & 0xFFFF_0000 == G_MAGIC
+    }
+    /// NR 9's ONE deadline computation: the timeout in ns, the tick period it was rounded to,
+    /// the ticks, and the clock reading the deadline is relative to.
+    pub fn deadline(ns: u64, period: u64, ticks: u64, now: u64, deadline: Option<u64>) {
+        crate::yarm_log!(
+            "FUTEX_TIME_W_DEADLINE ns={} period_ns={} ticks={} now={} deadline={}",
+            ns,
+            period,
+            ticks,
+            now,
+            deadline.unwrap_or(u64::MAX)
+        );
+    }
+    /// A timed cycle registered (inside the compare-and-register hold): `gen` is its
+    /// `futex_wait_generation`, the coordinate every terminal marker below names.
+    pub fn registered(tid: u64, generation: u64, deadline: u64, now: u64, va: u64) {
+        crate::yarm_log!(
+            "FUTEX_TIME_W_REGISTER tid={} gen={} deadline={} now={} va=0x{:x}",
+            tid,
+            generation,
+            deadline,
+            now,
+            va
+        );
+    }
+    /// A wake claimed a timed cycle (inside its claim hold); `va` is the word it waited on then.
+    pub fn woken(tid: u64, generation: u64, va: u64) {
+        crate::yarm_log!(
+            "FUTEX_TIME_W_WAKE tid={} gen={} va=0x{:x}",
+            tid,
+            generation,
+            va
+        );
+    }
+    /// The collector claimed a timed cycle's timeout (after its claim hold, before placement).
+    /// `current` is the task current on the collecting CPU (0: idle); `va` the word it waited on.
+    pub fn timed_out(cpu: u8, tid: u64, generation: u64, now: u64, current: u64, va: u64) {
+        crate::yarm_log!(
+            "FUTEX_TIME_W_TIMEOUT cpu={} tid={} gen={} now={} current={} va=0x{:x}",
+            cpu,
+            tid,
+            generation,
+            now,
+            current,
+            va
+        );
+    }
+    /// The collector found a due cycle but another owner claimed it first.
+    pub fn lost(cpu: u8, tid: u64, generation: u64) {
+        crate::yarm_log!(
+            "FUTEX_TIME_W_LOST cpu={} tid={} gen={}",
+            cpu,
+            tid,
+            generation
+        );
+    }
+    /// After a G cycle's timeout claim: hold a window open until a wake that started inside it has
+    /// finished, while `peer()` holds, for at most `SPIN_BOUND` polls. Causal order on the
+    /// console: OPEN before the window is published, the waker's IN_WINDOW_WAKE before it releases
+    /// the window, CLOSE after.
+    pub fn hold_window(cpu: u8, tid: u64, generation: u64, peer: &dyn Fn() -> bool) {
+        if !peer() {
+            crate::yarm_log!(
+                "FUTEX_TIME_W_WINDOW_SKIPPED cpu={} tid={} gen={} reason=no_peer_running",
+                cpu,
+                tid,
+                generation
+            );
+            return;
+        }
+        let id = NEXT.fetch_add(1, SeqCst);
+        let before = WAKES.load(SeqCst);
+        crate::yarm_log!(
+            "FUTEX_TIME_W_WINDOW_OPEN cpu={} window={} tid={} gen={}",
+            cpu,
+            id,
+            tid,
+            generation
+        );
+        OPEN.store(id, SeqCst);
+        let mut spins = 0u64;
+        let mut misses = 0u32;
+        let mut end = "woke";
+        while WAKES.load(SeqCst) == before {
+            if spins >= SPIN_BOUND {
+                end = "bound";
+                break;
+            }
+            if spins % PEER_RECHECK == PEER_RECHECK - 1 {
+                if peer() {
+                    misses = 0;
+                } else {
+                    misses += 1;
+                    if misses >= PEER_MISSES {
+                        end = "no_peer";
+                        break;
+                    }
+                }
+            }
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        OPEN.store(0, SeqCst);
+        crate::yarm_log!(
+            "FUTEX_TIME_W_WINDOW_CLOSE cpu={} window={} gen={} competing_wakes={} end={}",
+            cpu,
+            id,
+            generation,
+            WAKES.load(SeqCst) - before,
+            end
+        );
+    }
+    /// NR 10, before it selects anything: the window open now, if any.
+    pub fn wake_begin() -> u64 {
+        OPEN.load(SeqCst)
+    }
+    /// NR 10, after its wake: report it, and release the window, iff it ran wholly inside one.
+    pub fn wake_end(window: u64, cpu: u8, tid: u64, woke: u32) {
+        if window != 0 && OPEN.load(SeqCst) == window {
+            crate::yarm_log!(
+                "FUTEX_TIME_W_IN_WINDOW_WAKE cpu={} tid={} window={} woke={}",
+                cpu,
+                tid,
+                window,
+                woke
+            );
+            WAKES.fetch_add(1, SeqCst);
+        }
     }
 }
 

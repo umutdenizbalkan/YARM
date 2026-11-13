@@ -111,10 +111,12 @@ pub(crate) const fn futex_timeout_ticks(timeout_ns: u64, period_ns: u64) -> u64 
 /// to run for millennia first). The clock is a non-wrapping monotone `u64` for any physical
 /// uptime, so the collector's plain `now >= deadline` needs no wrapping arithmetic.
 pub(crate) fn futex_wait_deadline(now: u64, timeout_ns: u64) -> Option<u64> {
-    now.checked_add(futex_timeout_ticks(
-        timeout_ns,
-        crate::arch::platform_constants::SCHED_TICK_PERIOD_NS,
-    ))
+    let period = crate::arch::platform_constants::SCHED_TICK_PERIOD_NS;
+    let ticks = futex_timeout_ticks(timeout_ns, period);
+    let deadline = now.checked_add(ticks);
+    #[cfg(feature = "futex-time-witness")]
+    crate::kernel::boot::futex::time_witness::deadline(timeout_ns, period, ticks, now, deadline);
+    deadline
 }
 
 /// THE check of compare-and-park: does the word the KERNEL read still hold `expected`?

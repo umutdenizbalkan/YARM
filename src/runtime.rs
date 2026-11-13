@@ -14252,6 +14252,10 @@ impl SharedKernel {
                 fx::futex_phase_hook::TIMEOUT_AFTER_RESERVE,
                 candidate.tid,
             );
+            #[cfg(feature = "futex-time-witness")]
+            let (w_gen, w_race, w_va) = self.with_task_futex_split_mut(|tcbs, table| {
+                fx::time_witness_facts_locked(tcbs, table, candidate)
+            });
             // (4) rank 2: THE timeout claim of exactly this cycle.
             let claimed = self.with_task_futex_split_mut(|tcbs, table| {
                 fx::claim_futex_timeout_locked(tcbs, table, candidate, now)
@@ -14261,7 +14265,20 @@ impl SharedKernel {
                     te::release_enqueue_reservation_on_cpu_locked(c, &plan)
                 });
                 pass.lost += 1;
+                #[cfg(feature = "futex-time-witness")]
+                fx::time_witness::lost(cpu.0, candidate.tid, w_gen);
                 continue;
+            }
+            #[cfg(feature = "futex-time-witness")]
+            {
+                let current = self.current_tid_split_read(cpu).unwrap_or(0);
+                fx::time_witness::timed_out(cpu.0, candidate.tid, w_gen, now, current, w_va);
+                if w_race {
+                    let asid = self.task_asid_for_tid_split_read(candidate.tid);
+                    let peer =
+                        || self.futex_time_witness_peer_running_split(cpu, candidate.tid, asid);
+                    fx::time_witness::hold_window(cpu.0, candidate.tid, w_gen, &peer);
+                }
             }
             #[cfg(test)]
             fx::futex_phase_hook::run_timeout_step(
@@ -14287,8 +14304,6 @@ impl SharedKernel {
                     other
                 ),
             }
-            #[cfg(feature = "futex-time-witness")]
-            crate::kernel::boot::futex::time_witness::timed_out(cpu.0, candidate.tid, now);
         }
         pass
     }
@@ -19023,6 +19038,16 @@ impl SharedKernel {
             .any(|t| {
                 t != 0 && t != tid && self.task_asid_for_tid_split_read(t) == u64::from(asid.0)
             })
+    }
+
+    /// FUTEX-TIME1 live witness only: whether a sibling of `tid` (same address space `asid`,
+    /// another TID) is current on a CPU other than `cpu`, the collecting CPU.
+    #[cfg(feature = "futex-time-witness")]
+    fn futex_time_witness_peer_running_split(&self, cpu: CpuId, tid: u64, asid: u64) -> bool {
+        (0..crate::kernel::scheduler::MAX_CPUS)
+            .filter(|&c| c != usize::from(cpu.0))
+            .filter_map(|c| self.current_tid_authoritative(CpuId(c as u8)))
+            .any(|t| t != 0 && t != tid && self.task_asid_for_tid_split_read(t) == asid)
     }
 
     /// FUTEX-WAIT-ATOMIC1 live witness only: the word as window B closes, for the grader. It
