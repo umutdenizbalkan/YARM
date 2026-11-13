@@ -119810,6 +119810,9 @@ mod stage199d_runqueue_withdrawal_foundation {
             "src/kernel/boot/scheduler_state.rs",
             "src/kernel/boot/tests.rs",
             "src/kernel/sched_lock1_tests/tests.rs",
+            // SCHED-TIME-FOUNDATION1 A: the full-queue rotation tests withdraw a queued task in the
+            // middle of a full queue (`r15`). Test code only; no oracle or production path.
+            "src/kernel/sched_full_rot1_tests.rs",
             "src/runtime.rs",
             // KTHREAD1-ACCEPTANCE §3: the default-off `riscv64-d2-settle-witness` fixture withdraws
             // the phantom entry it queued itself. Instrumentation only: no oracle, no production
