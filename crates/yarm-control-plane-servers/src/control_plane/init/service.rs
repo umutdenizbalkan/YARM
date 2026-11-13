@@ -3298,6 +3298,9 @@ pub(super) mod futex_time_witness {
     #[allow(unused)]
     pub(super) static mut FILLER_STACKS: FillerStacks =
         FillerStacks([[0; FILLER_STACK_BYTES]; FILLERS]);
+    /// The kernel refuses `tls_base == 0` (NR 11 `WrongObject`), so each filler gets its own.
+    #[allow(unused)]
+    pub(super) static mut FILLER_TLS: [[u8; 64]; FILLERS] = [[0; 64]; FILLERS];
     /// Filled by `run_once`: the fillers' entry (per architecture).
     pub(super) static FILLER_ENTRY: AtomicUsize = AtomicUsize::new(0);
 
@@ -3561,14 +3564,19 @@ pub(super) mod futex_time_witness {
         }
         let entry = FILLER_ENTRY.load(SeqCst);
         let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
         let mut spawned = 0usize;
         let mut refused = 0u32;
         for i in 0..FILLERS {
             let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
-            // SAFETY: a valid entry; the static stack outlives the thread; no TLS.
-            match unsafe { yarm_user_rt::syscall::spawn_thread(0, top, entry) } {
-                Ok(_) => spawned += 1,
-                Err(_) => {
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+            let r = unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) };
+            // On AArch64 and RISC-V the runtime's NR 11 decode reads any non-zero `a0` as a TID,
+            // so a refusal (a small error code) arrives as `Ok(code)`. Every dynamic TID is
+            // >= 10 000; the kernel's SPAWN_THREAD_SPLIT_OK/FAIL markers are the grader's record.
+            match r {
+                Ok(t) if t >= 10_000 => spawned += 1,
+                _ => {
                     refused += 1;
                     break;
                 }

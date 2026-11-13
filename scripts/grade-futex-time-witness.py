@@ -24,8 +24,9 @@ Every call (W's, in order): exactly one DEADLINE and one REGISTER of W between i
 ns equals the call's, period_ns is this ISA's tick period, ticks = 0 if ns == 0 else
 ceil(ns / period) + 1, deadline = now + ticks; REGISTER names the same deadline, the call's word
 (va = addr) and a fresh generation (strictly increasing). The cycle has EXACTLY ONE terminal
-marker in the whole log, a WAKE or a TIMEOUT of its (tid, gen), between REGISTER and RET; a LOST is
-legal only beside a WAKE. RET woken <=> WAKE; RET timed_out <=> TIMEOUT (and its now >= deadline).
+marker in the whole log, a WAKE or a TIMEOUT of its (tid, gen), between REGISTER and RET. A LOST
+(a collector that found the cycle due after another owner — a wake, or the other CPU's collector —
+had claimed it) is legal beside either terminal, between REGISTER and RET; it never ends a cycle. RET woken <=> WAKE; RET timed_out <=> TIMEOUT (and its now >= deadline).
 Any other result fails, and so does any FTW_FAIL.
 
 Sequences:
@@ -44,7 +45,8 @@ Sequences:
        wake from ANOTHER CPU; end=bound fails; end=no_peer is a refusal (no coverage). G's RET
        comes after its CLOSE. Coverage: >= 1 window ended woke, >= 1 G cycle won by a wake, >= 1
        won by the timeout.
-  E    FTW_E_SATURATED fillers >= 64 spawn_refused=1; a FUTEX_TIMEOUT_EXPIRED_UNPLACED of W between
+  E    FTW_E_SATURATED fillers >= 64 spawn_refused=1, matching the kernel: one SPAWN_THREAD_SPLIT_OK
+       per filler and exactly one SPAWN_THREAD_SPLIT_FAIL err=SchedulerFull; a FUTEX_TIMEOUT_EXPIRED_UNPLACED of W between
        E's REGISTER and its final TIMEOUT (now >= deadline); FTW_E_EXPIRED_SEEN gone=1 wake1=0
        wake2=0 (no wake found it after the timeout won); E timed_out.
   FTW_WAITER_DONE fails=0, FTW_DONE result=ok, plus the standard core smoke.
@@ -89,6 +91,10 @@ K = {
                 {"cpu": INT, "tid": INT, "gen": INT, "reason": r"[a-z_]+"}),
     "INWAKE": ("FUTEX_TIME_W_IN_WINDOW_WAKE",
                {"cpu": INT, "tid": INT, "window": INT, "woke": INT}),
+    "SPAWN_OK": ("SPAWN_THREAD_SPLIT_OK",
+                 {"parent_tid": INT, "tid": INT, "entry": HEX, "stack": HEX, "tls": HEX, "result": "ok"}),
+    "SPAWN_FAIL": ("SPAWN_THREAD_SPLIT_FAIL",
+                   {"parent_tid": INT, "tid": INT, "err": r"[A-Za-z]+", "result": "compensated"}),
     "EXPIRED": ("FUTEX_TIMEOUT_EXPIRED_UNPLACED",
                 {"tid": INT, "slot": INT, "generation": INT, "cpu": INT, "home": INT, "now": INT}),
 }
@@ -207,7 +213,9 @@ def grade(lines, arch, smp):
     for e in ev:
         if e["kind"] in ("WAKE", "TIMEOUT"):
             terminals.setdefault((e["tid"], e["gen"]), []).append(e)
-    lost = {(e["tid"], e["gen"]) for e in only("LOST")}
+    lost = {}
+    for e in only("LOST"):
+        lost.setdefault((e["tid"], e["gen"]), []).append(e)
     cycles = []
     last_gen = -1
     for c in calls:
@@ -262,8 +270,9 @@ def grade(lines, arch, smp):
         if t["kind"] == "TIMEOUT":
             if int(t["now"]) < int(rg["deadline"]):
                 fail(f"call {n}: timed out at {t['now']} before its deadline {rg['deadline']}")
-            if (W, rg["gen"]) in lost:
-                fail(f"call {n}: a LOST beside its own TIMEOUT")
+        for x in lost.get((W, rg["gen"]), []):
+            if not rg["at"] < x["at"] < r["at"]:
+                fail(f"call {n}: a LOST of its cycle outside REGISTER..RET")
         exp = ROLES_EXPECT.get(c["role"])
         if exp and r.get("result") != exp:
             fail(f"call {n} ({c['role']}): result {r.get('result')}, sequence requires {exp}")
@@ -405,6 +414,13 @@ def grade(lines, arch, smp):
     es = one("U_E_SATURATED")
     if es and (int(es.get("fillers", 0)) < MIN_FILLERS or es.get("spawn_refused") != "1"):
         fail(f"E: fillers={es.get('fillers')} spawn_refused={es.get('spawn_refused')} — not saturated")
+    h_ok = [e for e in only("SPAWN_OK") if e["parent_tid"] == H]
+    h_fail = [e for e in only("SPAWN_FAIL") if e["parent_tid"] == H]
+    if es and len(h_ok) != int(es.get("fillers", -1)):
+        fail(f"E: the cell counted {es.get('fillers')} fillers, the kernel spawned {len(h_ok)} for H")
+    if len(h_fail) != 1 or h_fail[0]["err"] != "SchedulerFull":
+        fail(f"E: spawning must stop at exactly one SchedulerFull refusal (kernel: {[e['err'] for e in h_fail]})")
+    facts["e_spawn_refusal"] = h_fail[0]["err"] if h_fail else "none"
     ee = one("U_E_EXPIRED_SEEN")
     if ee and (ee.get("gone") != "1" or ee.get("wake1") != "0" or ee.get("wake2") != "0"):
         fail(f"E: {ee}")
@@ -501,7 +517,10 @@ def synth(arch="riscv64"):
             out += call("G", 1, "0x4030", "timed_out", extra_end=tail, current="22")
     out.append(f"USER_LOG tid={W} msg=FTW_G_SUMMARY cycles=32 woken=16 timed_out=16")
     out += call("E", 6_000_000_000, "0x4040", "timed_out", current="21",
-                extra_mid=(f"USER_LOG tid={H} msg=FTW_E_SATURATED fillers=128 spawn_refused=1",
+                extra_mid=tuple(f"SPAWN_THREAD_SPLIT_OK parent_tid={H} tid={30000 + i} entry=0x1 stack=0x10 tls=0x20 result=ok"
+                                for i in range(128))
+                + (f"SPAWN_THREAD_SPLIT_FAIL parent_tid={H} tid=30200 err=SchedulerFull tasks=0 result=compensated",
+                   f"USER_LOG tid={H} msg=FTW_E_SATURATED fillers=128 spawn_refused=1",
                            f"FUTEX_TIMEOUT_EXPIRED_UNPLACED tid={W} slot=3 generation=9 cpu=1 home=0 now={{dl}}",
                            f"USER_LOG tid={H} msg=FTW_E_EXPIRED_SEEN gone=1 pings=40 wake1=0 wake2=0"))
     n = st["n"]
@@ -555,8 +574,10 @@ def self_test():
               "woken reported as timeout", "ring 3 saw")
     must_fail(edit("msg=FTW_RET role=A n=1 result=timed_out", "msg=FTW_RET role=A n=1 result=woken"),
               "timeout reported as woken (the old 1)", "ring 3 saw")
-    must_fail(insert_after("FUTEX_TIME_W_TIMEOUT", "FUTEX_TIME_W_LOST cpu=1 tid=20 gen=1"),
-              "lost beside timeout", "LOST beside")
+    f, _ = grade(insert_after("FUTEX_TIME_W_TIMEOUT", "FUTEX_TIME_W_LOST cpu=1 tid=20 gen=1"), "riscv64", 2)
+    assert not f, ("a second collector losing the race is legal", f)
+    must_fail(insert_after("msg=FTW_BEGIN", "FUTEX_TIME_W_LOST cpu=1 tid=20 gen=1"),
+              "lost before its cycle registered", "outside REGISTER..RET")
     # units and clock
     must_fail(edit("period_ns=10000000", "period_ns=20000000"), "wrong period", "tick period")
     must_fail(edit("ticks=11 ", "ticks=10 "), "wrong ticks", "ticks=")
@@ -591,6 +612,8 @@ def self_test():
     # E
     must_fail(drop("FUTEX_TIMEOUT_EXPIRED_UNPLACED"), "E without saturation", "not full")
     must_fail(edit("fillers=128 spawn_refused=1", "fillers=10 spawn_refused=1"), "too few fillers", "not saturated")
+    must_fail(edit("err=SchedulerFull", "err=WrongObject"), "spawn refused for another reason", "SchedulerFull refusal")
+    must_fail(drop("SPAWN_THREAD_SPLIT_OK parent_tid=21"), "cell overcounts its fillers", "the kernel spawned")
     must_fail(edit("wake1=0", "wake1=1"), "E wake found the expired waiter", "E: {")
     # calls
     must_fail(drop("msg=FTW_RET role=G"), "a G call never returned", "never returned")

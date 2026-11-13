@@ -51,7 +51,7 @@ esac
 FEATURE="$FEATURE,futex-time-witness"
 WITNESS_FEATURE=futex-requeue-witness,futex-time-witness
 LOGDIR=${LOGDIR:-/tmp/futex-time-witness-$ARCH-smp$SMP}
-TIMEOUT_SECS=${TIMEOUT_SECS:-600}
+TIMEOUT_SECS=${TIMEOUT_SECS:-480}
 SMP=${SMP:-2}
 mkdir -p "$LOGDIR"
 BOOT_LOG="$LOGDIR/boot.log"
