@@ -215835,6 +215835,107 @@ mod futex_requeue1 {
             assert!(RT.contains("if !pending.consumed_with_send() {"));
         }
 
+        /// 43 — the in-lock resume take (`take_resume_completion`, the RISC-V and AArch64
+        /// in-lock consumers) delivers a timed-out cycle's result, exactly once.
+        #[test]
+        fn t43_in_lock_resume_take_delivers_the_timed_result_once() {
+            let mut w = world(74100);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            k.with(|s| {
+                let done = s
+                    .take_resume_completion(t)
+                    .expect("the timed cycle's completion");
+                assert_eq!(
+                    (done.syscall_class, done.result, done.result_register()),
+                    (BlockedSyscallClass::FutexWait, TIMED_OUT, 9)
+                );
+                assert_eq!(s.take_resume_completion(t), None, "consumed exactly once");
+            });
+        }
+
+        /// 44 — the thread-restore facts (the post-switch restore and the owner revalidation
+        /// read the completion from them) carry a timed cycle's result, exactly once, and only
+        /// for its own incarnation.
+        #[test]
+        fn t44_thread_restore_facts_carry_the_timed_result_once() {
+            let mut w = world(74200);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let a = w.s.task_asid(t).expect("asid");
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1);
+            let take = |asid: Asid| {
+                k.with(|s| {
+                    s.with_tcbs_mut(|tcbs| {
+                        let mut pending = [None; 4];
+                        crate::kernel::task::take_thread_restore_facts(
+                            tcbs,
+                            &mut pending,
+                            t,
+                            Some(asid),
+                        )
+                        .and_then(|f| f.send_completion)
+                    })
+                })
+            };
+            assert_eq!(
+                take(Asid(a.0.wrapping_add(7))),
+                None,
+                "another incarnation takes nothing"
+            );
+            let done = take(a).expect("the restore carries the completion");
+            assert_eq!(
+                (done.syscall_class, done.result),
+                (BlockedSyscallClass::FutexWait, TIMED_OUT)
+            );
+            assert_eq!(take(a), None, "consumed exactly once");
+        }
+
+        /// 45 — cycle identity: a completion left by an earlier timed cycle (never consumed)
+        /// does not answer the task's NEXT timed cycle. Each cycle advances the wait generation,
+        /// which the completion carries; a TID-and-ASID match alone is not enough.
+        #[test]
+        fn t45_a_stale_cycle_completion_never_answers_a_later_cycle() {
+            let mut w = world(74300);
+            let t = tpark(&mut w, SQ, 5, P, 10);
+            w.back();
+            let a = w.s.task_asid(t).expect("asid");
+            let driver = w.driver;
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).timed_out, 1, "cycle 1 timed out");
+            // The task runs again WITHOUT its completion being consumed, and waits again.
+            k.with(|s| {
+                drain_one(s, t);
+                s.set_task_status_for_test(t, TaskStatus::Runnable);
+                s.enqueue_task(t).expect("queue");
+                run(s, t);
+                assert_eq!(
+                    s.futex_wait_current_timed(SQ, 5, P, Some(1_000)),
+                    Ok(B::Blocked { timed: true }),
+                    "cycle 2 parks"
+                );
+                run(s, driver);
+            });
+            assert_eq!(
+                k.take_futex_wait_completion_split(t, a),
+                None,
+                "cycle 1's TimedOut must not end cycle 2"
+            );
+            assert_eq!(collect(k, 999).timed_out, 0, "cycle 2 is not due");
+            assert_eq!(
+                collect(k, 1_000).timed_out,
+                1,
+                "cycle 2 times out on its own deadline"
+            );
+            let done = k
+                .take_futex_wait_completion_split(t, a)
+                .expect("cycle 2's own result");
+            assert_eq!(done.result, TIMED_OUT);
+        }
+
         /// 42 — x86_64, the switched resume (live defect found by the FUTEX-TIME1 witness): a
         /// parked timed wait is resumed on ANOTHER task's trap, where the epilogue restores the
         /// continuation's registers (RAX, RCX = error, RDX, R8), not the frame's fields. The
