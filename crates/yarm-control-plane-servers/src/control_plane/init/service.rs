@@ -3479,7 +3479,9 @@ pub(super) mod futex_time_witness {
         PHASE.store(PH_G_DONE, SeqCst);
         // E: the deadline passes while the home queue is full.
         command(PH_E);
-        let r = timed("E", &E1, 6000 * MS);
+        // Long enough to cover spawning the fillers (about 13 s of ticks on RISC-V under TCG): the
+        // deadline must pass while the queue is full, which the helper checks (pings > 0).
+        let r = timed("E", &E1, 60_000 * MS);
         expect("E", r, FutexTimedWait::TimedOut);
         await_ack();
         command(PH_END);

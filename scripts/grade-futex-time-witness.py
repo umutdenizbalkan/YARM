@@ -516,7 +516,7 @@ def synth(arch="riscv64"):
                 tail = (f"FUTEX_TIME_W_WINDOW_SKIPPED cpu=0 tid={W} gen={{gen}} reason=no_peer_running",)
             out += call("G", 1, "0x4030", "timed_out", extra_end=tail, current="22")
     out.append(f"USER_LOG tid={W} msg=FTW_G_SUMMARY cycles=32 woken=16 timed_out=16")
-    out += call("E", 6_000_000_000, "0x4040", "timed_out", current="21",
+    out += call("E", 60_000_000_000, "0x4040", "timed_out", current="21",
                 extra_mid=tuple(f"SPAWN_THREAD_SPLIT_OK parent_tid={H} tid={30000 + i} entry=0x1 stack=0x10 tls=0x20 result=ok"
                                 for i in range(128))
                 + (f"SPAWN_THREAD_SPLIT_FAIL parent_tid={H} tid=30200 err=SchedulerFull tasks=0 result=compensated",
