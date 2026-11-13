@@ -3562,6 +3562,13 @@ pub fn handle_trap_entry_shared(
     // be driven from two wrappers.
     #[cfg(not(target_arch = "riscv64"))]
     shared.run_due_ipc_timeout_work(cpu);
+    // FUTEX-TIME1 — THE production futex-timeout entry, right after the IPC pipeline and before
+    // the idle-boundary queue advance below, for the same reason that pipeline sits here: a
+    // timeout that readies a task while this CPU is parked must be dispatchable by THIS trap. On
+    // the clock owner it runs on every timer interrupt, idle included, which is what bounds a
+    // due waiter's retry. Free (one atomic load) when no timed wait exists.
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = shared.run_due_futex_timeouts(cpu);
 
     // Stage 200D-2A: the SERVER-DEATH post-lock drain. Unlike the reply-timeout collector
     // above this is NOT feature-gated — server death is production behaviour on every

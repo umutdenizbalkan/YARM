@@ -5540,8 +5540,10 @@ fn try_split_futex_wait_recognized(
     // (2) ABI — THE decode `handle_futex_wait` uses (FUTEX-FOUND1), and ANSWERED, because
     // `InvalidArgs` is what it produces and no later owner will produce it for us.
     let addr = frame.arg(SYSCALL_ARG_CAP);
-    let args = match crate::kernel::syscall::sched::decode_futex_args(frame) {
-        Ok(args) => args,
+    // FUTEX-TIME1: THE NR 9 decode — the key arguments exactly as before, and `args[3]` as a
+    // relative timeout only when `FUTEX_FLAG_TIMED` is set.
+    let (args, timeout_ns) = match crate::kernel::syscall::sched::decode_futex_wait_args(frame) {
+        Ok(wait) => (wait.key, wait.timeout_ns),
         Err(err) => {
             crate::yarm_log!(
                 "FUTEX_WAIT_SPLIT_DONE tid=0 addr={} result=invalid_args cpu={}",
@@ -5592,6 +5594,27 @@ fn try_split_futex_wait_recognized(
             );
             return D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(err))));
         }
+    };
+    // FUTEX-TIME1: the deadline, converted ONCE, from the clock at admission. Whether it has
+    // already been reached is decided later, inside the compare-and-register hold and after its
+    // comparison, so a word that differs still answers `0` below.
+    let deadline = match timeout_ns {
+        None => None,
+        Some(ns) => match crate::kernel::syscall::sched::futex_wait_deadline(
+            shared.scheduler_clock_now(),
+            ns,
+        ) {
+            Some(deadline) => Some(deadline),
+            None => {
+                crate::yarm_log!(
+                    "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=invalid_timeout cpu={}",
+                    tid,
+                    addr,
+                    cpu.0
+                );
+                return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+            }
+        },
     };
     if matches!(decision, FutexWaitDecision::Proceed) {
         // The futex word already moved. No transition, no switch, no drain — the canonical
@@ -5644,7 +5667,8 @@ fn try_split_futex_wait_recognized(
     // its TCB cannot be reclaimed — so what the transaction authenticates against is the
     // incarnation this trap entered from and not whatever later answers to the number.
     let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
-    let outcome = shared.futex_wait_park_exact_split(cpu, tid, asid, addr, expected, args.kind);
+    let outcome = shared
+        .futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, args.kind, deadline);
     // FUTEX-WAIT-ATOMIC1 live witness (default off): the witness wait's own outcome.
     #[cfg(feature = "futex-wait-witness")]
     if let Some(w) = crate::kernel::boot::futex::wait_witness::current_wait(expected) {
@@ -5669,7 +5693,16 @@ fn try_split_futex_wait_recognized(
             }
             // The syscall's own result, into the outgoing frame, before the switch: the caller
             // observes it when it is later resumed.
-            frame.set_ok(1, 0, 0);
+            //
+            // FUTEX-TIME1: only for an UNTIMED wait, whose one outcome is a wake. A timed wait's
+            // winner is not decided yet, so its frame carries a fail-closed provisional
+            // (`Internal`) — never `1` — and the terminal claim parks the real result as its
+            // `FutexWait` completion, which the resume boundary encodes over this.
+            if deadline.is_some() {
+                frame.set_err(SyscallError::Internal.code());
+            } else {
+                frame.set_ok(1, 0, 0);
+            }
             D::QueueAdvanceCommitted
         }
         // A waker won during publication. The caller is NOT parked, so nothing is owed to a drain
@@ -5680,8 +5713,24 @@ fn try_split_futex_wait_recognized(
             recovered,
         } => {
             crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
-            frame.set_ok(1, 0, 0);
             if recovered.may_resume_entering_frame() {
+                // FUTEX-TIME1: a TIMED cycle's claimer — a wake OR the timeout — parked its result
+                // as the `FutexWait` completion; the caller returns through this frame, so it is
+                // taken HERE (it must not linger for a later resume) and is the answer.
+                match shared.take_futex_wait_completion_split(tid, asid) {
+                    Some(done) if done.result != 0 => {
+                        crate::yarm_log!(
+                            "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=timed_out_during_publish recovery={}",
+                            tid,
+                            addr,
+                            recovered.slug()
+                        );
+                        return D::Complete(Err(TrapHandleError::Syscall(
+                            SyscallError::from_code(done.result as usize),
+                        )));
+                    }
+                    _ => frame.set_ok(1, 0, 0),
+                }
                 crate::yarm_log!(
                     "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=woken_during_publish recovery={}",
                     tid,
@@ -5689,6 +5738,13 @@ fn try_split_futex_wait_recognized(
                     recovered.slug()
                 );
                 return D::Complete(Ok(()));
+            }
+            // FUTEX-TIME1: a timed cycle's completion stays parked for the resume that consumes
+            // it; the captured frame carries the fail-closed provisional, never `1`.
+            if deadline.is_some() {
+                frame.set_err(SyscallError::Internal.code());
+            } else {
+                frame.set_ok(1, 0, 0);
             }
             // The placement could not be restored, so the entering frame is not this task's to
             // return through. The BRIDGE settles it — the same owner the receive family's
@@ -5742,6 +5798,18 @@ fn try_split_futex_wait_recognized(
             D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(
                 crate::kernel::boot::KernelError::TaskTableFull,
             ))))
+        }
+        // FUTEX-TIME1 — pre-mutation: the deadline had been reached when the word matched, so the
+        // timeout won before anything was published; the caller is still current.
+        FutexParkOutcome::TimedOut => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=timed_out_at_admission cpu={}",
+                tid,
+                addr,
+                cpu.0
+            );
+            D::Complete(Err(TrapHandleError::Syscall(SyscallError::TimedOut)))
         }
         FutexParkOutcome::IncarnationMoved => {
             crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);

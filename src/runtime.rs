@@ -856,6 +856,13 @@ impl CpuDispatch {
 /// another class is left untouched for its own consumer; an `IpcSend` entry is TAKEN either way (a
 /// stale one must not linger to be seen by a later block) and RETURNED only on an exact
 /// `{tid, asid, blocked_send_generation}` match, which also clears `ipc_timeout_fired`.
+///
+/// FUTEX-TIME1: a timed-`FutexWait` completion is taken by the same rule (exact on
+/// `futex_wait_generation`), because it is parked for the same resume on every port. Its consumers
+/// encode it with [`BlockedSyscallCompletion::result_register`] — `1` for a won wake, `TimedOut`
+/// for a won timeout — so no boundary can confuse it with a send's `0`.
+///
+/// [`BlockedSyscallCompletion::result_register`]: crate::kernel::task::BlockedSyscallCompletion::result_register
 pub(crate) fn take_parked_send_completion_locked(
     tcbs: &mut [Option<crate::kernel::task::ThreadControlBlock>],
     tid: u64,
@@ -866,7 +873,7 @@ pub(crate) fn take_parked_send_completion_locked(
         .flatten()
         .find(|t| t.tid.0 == tid && t.asid == Some(asid))?;
     let pending = tcb.pending_syscall_completion?;
-    if pending.syscall_class != crate::kernel::task::BlockedSyscallClass::IpcSend {
+    if !pending.consumed_with_send() {
         return None;
     }
     let exact = pending.matches_tcb(tcb);
@@ -902,7 +909,10 @@ pub(crate) fn consume_resume_convention_locked(
 pub(crate) fn note_send_completion_delivered(
     pending: &crate::kernel::task::BlockedSyscallCompletion,
 ) {
-    if pending.result == crate::kernel::boot::KernelState::SEND_COMPLETION_TIMED_OUT {
+    // FUTEX-TIME1: a futex `TimedOut` is not a send timeout, and must not seal the send class.
+    if pending.syscall_class == crate::kernel::task::BlockedSyscallClass::IpcSend
+        && pending.result == crate::kernel::boot::KernelState::SEND_COMPLETION_TIMED_OUT
+    {
         crate::kernel::boot::maybe_emit_send_timeout_class_retired();
     }
 }
@@ -1634,6 +1644,31 @@ impl SharedKernel {
         unsafe {
             core::ptr::addr_of_mut!((*shared).test_exclusive).write(SpinLock::new(()));
         }
+    }
+
+    /// FUTEX-TIME1 — the scheduler tick, read silently: one Acquire load of the domain's atomic,
+    /// no lock and no marker, so it may be read inside a domain hold and on every trap.
+    pub(crate) fn scheduler_clock_now(&self) -> u64 {
+        self.sched_domain().clock_now().0
+    }
+
+    /// FUTEX-TIME1 — rank 2: take `{tid, asid}`'s parked timed-`FutexWait` completion, exactly as
+    /// the resume boundary would (class-scoped, exact on `futex_wait_generation`). For the one
+    /// owner that settles a claimed cycle in place: the park transaction whose read-back found a
+    /// claimer had won during its publication and returns through the entering frame.
+    pub(crate) fn take_futex_wait_completion_split(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::task::take_blocked_syscall_completion_for(
+                tcbs,
+                tid,
+                Some(asid),
+                crate::kernel::task::BlockedSyscallClass::FutexWait,
+            )
+        })
     }
 
     /// # Validation status
@@ -14119,6 +14154,144 @@ impl SharedKernel {
         }
     }
 
+    /// FUTEX-TIME1 — THE production futex-timeout entry: one bounded collector pass at the current
+    /// scheduler tick, called from every port's post-lock timeout area next to
+    /// [`Self::run_due_ipc_timeout_work`]. Free when no timed wait exists anywhere (one atomic
+    /// load, no lock).
+    pub(crate) fn run_due_futex_timeouts(
+        &self,
+        cpu: CpuId,
+    ) -> crate::kernel::boot::futex::FutexTimeoutPass {
+        if !crate::kernel::boot::futex::futex_timed_waits_possible() {
+            return Default::default();
+        }
+        self.run_due_futex_timeouts_at(cpu, self.scheduler_clock_now())
+    }
+
+    /// FUTEX-TIME1 — the clock-injected body of [`Self::run_due_futex_timeouts`].
+    ///
+    /// 1. rank 2 — `collect_due_futex_timeouts_locked`: a window of the waiter table from its
+    ///    cursor, the due live timed waiters in slot order (a committed NR 17 wake is skipped).
+    /// 2. per candidate, THE FUTEX-WAKE-CAP1 protocol keyed by the exact token instead of a key:
+    ///    rank 2 plan → rank 1 reservation on the home CPU → rank 2 `claim_futex_timeout_locked`
+    ///    (`Runnable`, record retired, `TimedOut` completion, one hold) → rank 1 reserved commit →
+    ///    notification. No lock is ever held while another is taken.
+    /// 3. a refused reservation (the home queue is full, or the CPU cannot take work) does NOT
+    ///    lose the timeout and does NOT make the waiter `Runnable`: rank 2
+    ///    `expire_futex_waiter_locked` moves its record to its private `Expired` key — the timeout
+    ///    has won, no wake can claim it now — and a later pass retries the placement from the same
+    ///    record. A claim that loses (a wake, exit or slot reuse took the cycle first) releases
+    ///    its reservation and changes nothing.
+    ///
+    /// Bounded: one window scan (≤ `FUTEX_TIMEOUT_SCAN_WINDOW` slots) and ≤
+    /// `FUTEX_TIMEOUT_DUE_MAX` placements, each O(1) locks; no allocation.
+    pub(crate) fn run_due_futex_timeouts_at(
+        &self,
+        cpu: CpuId,
+        now: u64,
+    ) -> crate::kernel::boot::futex::FutexTimeoutPass {
+        use crate::kernel::boot::futex::{self as fx, FutexTimeoutPass};
+        use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
+        let mut due = [None; fx::FUTEX_TIMEOUT_DUE_MAX];
+        let found = self.with_task_futex_split_mut(|tcbs, table| {
+            fx::collect_due_futex_timeouts_locked(tcbs, table, now, &mut due)
+        });
+        let mut pass = FutexTimeoutPass {
+            due: found as u32,
+            ..FutexTimeoutPass::default()
+        };
+        for candidate in due.iter().take(found).flatten().copied() {
+            #[cfg(test)]
+            fx::futex_phase_hook::run_timeout_step(
+                fx::futex_phase_hook::TIMEOUT_COLLECTED,
+                candidate.tid,
+            );
+            // (1) rank 2: the plan — the waiter's fixed home and its class's priority.
+            let Ok(mut plan) = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                te::plan_balanced_enqueue_locked(tcbs, classes, candidate.tid, cpu)
+            }) else {
+                pass.refused += 1;
+                continue;
+            };
+            self.resolve_plan_home_split(&mut plan, cpu);
+            let EnqueueTarget::Pinned(home) = plan.target else {
+                pass.refused += 1;
+                continue;
+            };
+            // (2) rank 1: the slot, promised before the waiter is touched.
+            let reserved = self
+                .with_cpu_sched_split(home, |c| te::reserve_enqueue_on_cpu_locked(c, &plan))
+                .map_err(crate::kernel::boot::map_scheduler_error)
+                .and_then(|r| r);
+            if reserved.is_err() {
+                // (3) The home queue cannot take it now: the timeout WINS anyway, and the
+                // placement is owed by a later pass. Nothing becomes `Runnable`.
+                let expired = !candidate.expired
+                    && self.with_task_futex_split_mut(|tcbs, table| {
+                        fx::expire_futex_waiter_locked(tcbs, table, candidate, now)
+                    });
+                if expired {
+                    pass.expired += 1;
+                    crate::yarm_log!(
+                        "FUTEX_TIMEOUT_EXPIRED_UNPLACED tid={} slot={} generation={} cpu={} home={} now={}",
+                        candidate.tid,
+                        candidate.token.slot,
+                        candidate.token.generation,
+                        cpu.0,
+                        home.0,
+                        now
+                    );
+                } else {
+                    pass.refused += 1;
+                }
+                continue;
+            }
+            #[cfg(test)]
+            fx::futex_phase_hook::run_timeout_step(
+                fx::futex_phase_hook::TIMEOUT_AFTER_RESERVE,
+                candidate.tid,
+            );
+            // (4) rank 2: THE timeout claim of exactly this cycle.
+            let claimed = self.with_task_futex_split_mut(|tcbs, table| {
+                fx::claim_futex_timeout_locked(tcbs, table, candidate, now)
+            });
+            if !claimed {
+                let _ = self.with_cpu_sched_split(home, |c| {
+                    te::release_enqueue_reservation_on_cpu_locked(c, &plan)
+                });
+                pass.lost += 1;
+                continue;
+            }
+            #[cfg(test)]
+            fx::futex_phase_hook::run_timeout_step(
+                fx::futex_phase_hook::TIMEOUT_AFTER_CLAIM,
+                candidate.tid,
+            );
+            // (5) rank 1: the reserved commit, which cannot be refused for capacity.
+            match self.with_cpu_sched_split(home, |c| {
+                te::commit_reserved_enqueue_on_cpu_locked(c, &plan)
+            }) {
+                Ok(Ok(ReservedCommit::Queued(t))) => {
+                    #[cfg(feature = "sched-lock1-witness")]
+                    crate::kernel::schedlock1_witness::claim(self, t, plan.tid);
+                    crate::arch::hal::notify_enqueued(t);
+                    pass.timed_out += 1;
+                }
+                // Still current mid-publication: its own read-back owns its placement.
+                Ok(Ok(ReservedCommit::AlreadyPlaced(_))) => pass.timed_out += 1,
+                other => crate::yarm_log!(
+                    "FUTEX_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} result={:?} origin=timeout",
+                    candidate.tid,
+                    home.0,
+                    other
+                ),
+            }
+            #[cfg(feature = "futex-time-witness")]
+            crate::kernel::boot::futex::time_witness::timed_out(cpu.0, candidate.tid, now);
+        }
+        pass
+    }
+
     // ── Stage 198E3B2A part 2: shared-region OFF-LOCK seams ─────────────────────────────────────
     //
     // Each seam re-derives its domain pointer from `self.state_ptr()` on EVERY call (no cached
@@ -18653,6 +18826,28 @@ impl SharedKernel {
         expected: u32,
         kind: crate::kernel::boot::futex::FutexKind,
     ) -> crate::kernel::syscall::sched::FutexParkOutcome {
+        self.futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, None)
+    }
+
+    // FUTEX-TIME1 — THE park transaction, timed or not. `deadline` is the absolute
+    // scheduler-tick deadline the route converted once at admission; the hold below reads the
+    // clock itself, after its comparison, to decide whether it has already been reached
+    // (`FutexParkOutcome::TimedOut`, nothing published), and otherwise registers the waiter WITH
+    // that deadline attached to its exact record. Everything after the registration is the
+    // untimed transaction, unchanged: a timeout that claims the waiter between the registration
+    // and the clear is detected by the same read-back as a wake.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn futex_wait_park_exact_timed_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+        addr: usize,
+        expected: u32,
+        kind: crate::kernel::boot::futex::FutexKind,
+        deadline: Option<u64>,
+    ) -> crate::kernel::syscall::sched::FutexParkOutcome {
         use crate::kernel::boot::futex::{self as fx, FutexCompareRegisterRefusal};
         use crate::kernel::syscall::sched::FutexParkOutcome as O;
 
@@ -18683,16 +18878,25 @@ impl SharedKernel {
         // no second read: once this hold has registered the waiter, the wait has happened, and a
         // later change of the word is a later operation — one that wakes, moves or leaves it, as
         // its own sequential step would. Nothing here retracts a registration because of the word.
+        let now = || self.scheduler_clock_now();
+        let timing = match deadline {
+            None => fx::FutexWaitTiming::Untimed,
+            Some(deadline) => fx::FutexWaitTiming::Timed {
+                deadline,
+                now: &now,
+            },
+        };
         let registered = self.with_task_futex_then_vm_memory_split_mut(
             |tcbs, _classes, table, spaces, memory| {
                 fx::compare_and_register_futex_waiter_locked(
-                    tcbs, table, spaces, memory, tid, asid, addr, expected, kind,
+                    tcbs, table, spaces, memory, tid, asid, addr, expected, kind, timing,
                 )
             },
         );
         let token = match registered {
             Ok((_key, token)) => token,
             Err(FutexCompareRegisterRefusal::ValueChanged) => return O::ValueChanged,
+            Err(FutexCompareRegisterRefusal::TimedOut) => return O::TimedOut,
             Err(FutexCompareRegisterRefusal::Word(err)) => return O::WordUnreadable(err),
             Err(FutexCompareRegisterRefusal::IncarnationMoved) => {
                 crate::yarm_log!(

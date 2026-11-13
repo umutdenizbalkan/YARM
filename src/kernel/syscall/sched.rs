@@ -56,6 +56,67 @@ pub(crate) fn decode_futex_args(frame: &TrapFrame) -> Result<FutexArgs, SyscallE
     Ok(FutexArgs { addr, value, kind })
 }
 
+/// FUTEX-TIME1 — the decoded NR 9 arguments: the key arguments, and the relative timeout when
+/// `FUTEX_FLAG_TIMED` is set.
+///
+/// | slot | NR 9 `FutexWait` |
+/// |---|---|
+/// | 0 | word address (4-byte aligned) |
+/// | 1 | `expected` (`u32`) |
+/// | 2 | flags: `FUTEX_FLAG_SHARED` (bit 0), `FUTEX_FLAG_TIMED` (bit 1); every other bit 0 |
+/// | 3 | with `FUTEX_FLAG_TIMED` only: the timeout, a RELATIVE duration in nanoseconds (`u64`) |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FutexWaitArgs {
+    pub(crate) key: FutexArgs,
+    /// `Some(ns)` for a timed wait; `None` without `FUTEX_FLAG_TIMED`, and `args[3]` unread.
+    pub(crate) timeout_ns: Option<u64>,
+}
+
+/// FUTEX-TIME1 — THE NR 9 decode, shared by the broad handler and the split route: the timed flag
+/// is taken out first, then exactly [`decode_futex_args`] (so every key refusal is unchanged and
+/// NR 10, which keeps using that decode, still refuses the timed bit), then `args[3]` only if the
+/// flag was set. Every refusal is `InvalidArgs`.
+pub(crate) fn decode_futex_wait_args(frame: &TrapFrame) -> Result<FutexWaitArgs, SyscallError> {
+    use crate::kernel::boot::futex::{FUTEX_FLAG_TIMED, FUTEX_WAIT_FLAGS_DEFINED};
+    let flags = frame.arg(SYSCALL_ARG_LEN);
+    if flags & !FUTEX_WAIT_FLAGS_DEFINED != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let mut key_frame = frame.clone();
+    key_frame.set_arg(SYSCALL_ARG_LEN, flags & !FUTEX_FLAG_TIMED);
+    let key = decode_futex_args(&key_frame)?;
+    let timeout_ns = (flags & FUTEX_FLAG_TIMED != 0).then(|| frame.arg(3) as u64);
+    Ok(FutexWaitArgs { key, timeout_ns })
+}
+
+/// FUTEX-TIME1 — a relative timeout in nanoseconds as a number of scheduler ticks.
+///
+/// `0` is `0` ticks: the deadline is the admission instant, so a matching word times out at once
+/// and a differing one still answers `0`. Any other duration is `ceil(ns / period) + 1` ticks: the
+/// clock counts SERVICED timer periods, each re-armed from a fresh sample after the previous one,
+/// so `n` increments span at least `n - 1` full periods — the `+ 1` absorbs the partial period the
+/// wait is admitted in, and the wait is guaranteed at least `ns` before it can time out. There is
+/// no upper bound (masked sections delay the tick; dispatch adds latency). Total: every `u64` is a
+/// valid duration and none overflows here (`u64::MAX / period + 2` fits).
+pub(crate) const fn futex_timeout_ticks(timeout_ns: u64, period_ns: u64) -> u64 {
+    if timeout_ns == 0 {
+        0
+    } else {
+        timeout_ns.div_ceil(period_ns) + 1
+    }
+}
+
+/// FUTEX-TIME1 — THE absolute deadline of a timed wait admitted at scheduler tick `now`, or `None`
+/// if `now + ticks` would overflow `u64` (refused `InvalidArgs`; unreachable — the tick would have
+/// to run for millennia first). The clock is a non-wrapping monotone `u64` for any physical
+/// uptime, so the collector's plain `now >= deadline` needs no wrapping arithmetic.
+pub(crate) fn futex_wait_deadline(now: u64, timeout_ns: u64) -> Option<u64> {
+    now.checked_add(futex_timeout_ticks(
+        timeout_ns,
+        crate::arch::platform_constants::SCHED_TICK_PERIOD_NS,
+    ))
+}
+
 /// THE check of compare-and-park: does the word the KERNEL read still hold `expected`?
 ///
 /// The caller's own read is not consulted — it can be stale by the time the kernel parks. The
@@ -216,6 +277,10 @@ pub(crate) enum FutexParkOutcome {
     /// FUTEX-FOUND1 — every waiter slot holds a live record. **Nothing was written** and the
     /// caller is still current. Unreachable in production (one slot per possible task).
     CapacityExhausted,
+    /// FUTEX-TIME1 — the word held `expected` and the deadline had already been reached at the
+    /// compare-and-register: the timeout won before any registration. **Nothing was written**, the
+    /// caller is still current, and the answer is `Err(TimedOut)`.
+    TimedOut,
 }
 
 pub(super) fn handle_yield(
@@ -238,11 +303,33 @@ pub(super) fn handle_futex_wait(
         "FUTEX_WAIT_BROAD_ENTRY nr=9 tid={} result=broad_entry",
         kernel.current_tid().unwrap_or(u64::MAX)
     );
-    let args = decode_futex_args(frame)?;
-    let blocked = kernel
-        .futex_wait_current(args.addr, args.value, args.kind)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(usize::from(blocked), 0, 0);
+    let args = decode_futex_wait_args(frame)?;
+    let deadline = match args.timeout_ns {
+        None => None,
+        Some(ns) => Some(
+            futex_wait_deadline(kernel.scheduler_tick_now(), ns)
+                .ok_or(SyscallError::InvalidArgs)?,
+        ),
+    };
+    match kernel
+        .futex_wait_current_timed(args.key.addr, args.key.value, args.key.kind, deadline)
+        .map_err(SyscallError::from)?
+    {
+        crate::kernel::boot::FutexWaitBroadOutcome::NotBlocked => frame.set_ok(0, 0, 0),
+        // An untimed wait that blocked: its only outcome is a wake.
+        crate::kernel::boot::FutexWaitBroadOutcome::Blocked { timed: false } => {
+            frame.set_ok(1, 0, 0)
+        }
+        // A TIMED wait that blocked: the winner is not known yet. The frame carries a fail-closed
+        // provisional (`Internal`), never `1`; the terminal claim parks the real result as its
+        // `FutexWait` completion, which the resume boundary encodes over this.
+        crate::kernel::boot::FutexWaitBroadOutcome::Blocked { timed: true } => {
+            frame.set_err(SyscallError::Internal.code())
+        }
+        crate::kernel::boot::FutexWaitBroadOutcome::TimedOut => {
+            return Err(SyscallError::TimedOut);
+        }
+    }
     Ok(())
 }
 

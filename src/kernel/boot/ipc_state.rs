@@ -3355,6 +3355,20 @@ impl KernelState {
         })
     }
 
+    /// FUTEX-TIME1 — the in-lock take of the completion a RESUME consumes on every port: a parked
+    /// `IpcSend` completion, else a parked timed-`FutexWait` one (the two never coexist). Each by
+    /// [`Self::take_blocked_syscall_completion_of_class`]'s exact-identity rule.
+    pub(crate) fn take_resume_completion(
+        &mut self,
+        tid: u64,
+    ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        use crate::kernel::task::BlockedSyscallClass;
+        self.take_blocked_syscall_completion_of_class(tid, BlockedSyscallClass::IpcSend)
+            .or_else(|| {
+                self.take_blocked_syscall_completion_of_class(tid, BlockedSyscallClass::FutexWait)
+            })
+    }
+
     /// U6 §2 — PUBLISH the completion of a blocked send, for the exact cycle a
     /// [`SenderWaiter`] was parked with. The single producer for
     /// [`crate::kernel::task::BlockedSyscallClass::IpcSend`].
@@ -3578,6 +3592,9 @@ impl KernelState {
                     }
                     crate::kernel::task::BlockedSyscallClass::IpcSend => {
                         tcb.blocked_send_generation
+                    }
+                    crate::kernel::task::BlockedSyscallClass::FutexWait => {
+                        tcb.futex_wait_generation
                     }
                 };
                 tcb.pending_syscall_completion =

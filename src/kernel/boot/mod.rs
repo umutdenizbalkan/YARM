@@ -189,6 +189,18 @@ pub(crate) const MAX_TASKS: usize = 512;
 const MAX_MEMORY_OBJECTS: usize = 512;
 const MAX_BOOT_MEMORY_REGIONS: usize = 64;
 
+/// FUTEX-TIME1 — what the broad `FutexWait` body achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FutexWaitBroadOutcome {
+    /// The word differed: nothing was published; the answer is `0`.
+    NotBlocked,
+    /// The caller blocked. Untimed: its only outcome is a wake (`1`). Timed: the winner is
+    /// decided later and parked as its `FutexWait` completion.
+    Blocked { timed: bool },
+    /// The deadline had been reached when the word matched: nothing was published.
+    TimedOut,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FaultBookkeepingMode {
     RecordInHandleTrapEvent,

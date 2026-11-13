@@ -973,6 +973,20 @@ impl KernelState {
         expected: u32,
         kind: super::futex::FutexKind,
     ) -> Result<bool, KernelError> {
+        // FUTEX-TIME1: the untimed broad wait — the shared body below with no deadline, so an
+        // untimed NR 9 is exactly the FUTEX-WAIT-ATOMIC1 transaction it was.
+        self.futex_wait_current_inner(addr, expected, kind, None)
+            .map(|outcome| matches!(outcome, super::FutexWaitBroadOutcome::Blocked { .. }))
+    }
+
+    fn futex_wait_current_inner(
+        &mut self,
+        addr: usize,
+        expected: u32,
+        kind: super::futex::FutexKind,
+        deadline: Option<u64>,
+    ) -> Result<super::FutexWaitBroadOutcome, KernelError> {
+        let timed = deadline.is_some();
         // FUTEX-WAIT-ATOMIC1: the key, the word, the comparison and the keyed registration in ONE
         // task -> vm -> memory hold — THE compare-and-register the split route uses. The broad
         // acquisition no longer excludes every waker (FutexWake and FutexCmpRequeue run off it),
@@ -980,6 +994,20 @@ impl KernelState {
         super::futex::futex_word_range_check(addr)?;
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        // FUTEX-TIME1: the broad route reads the (lock-free) clock immediately BEFORE its hold,
+        // because the hold borrows the whole state. A tick between this read and the hold can
+        // only register a wait whose deadline has just passed; the collector's next pass times
+        // it out (`TimedOut`), so the outcome is the same and only its latency differs. The split
+        // route — the production one — reads the clock inside its hold.
+        let at_hold = self.scheduler_tick_now();
+        let now = || at_hold;
+        let timing = match deadline {
+            None => super::futex::FutexWaitTiming::Untimed,
+            Some(deadline) => super::futex::FutexWaitTiming::Timed {
+                deadline,
+                now: &now,
+            },
+        };
         let registered =
             self.with_task_futex_then_vm_memory_mut(|tcbs, _classes, table, spaces, memory| {
                 super::futex::compare_and_register_futex_waiter_locked(
@@ -992,13 +1020,15 @@ impl KernelState {
                     addr,
                     expected,
                     kind,
+                    timing,
                 )
             });
         {
             use super::futex::FutexCompareRegisterRefusal as Refused;
             match registered {
                 Ok(_) => {}
-                Err(Refused::ValueChanged) => return Ok(false),
+                Err(Refused::ValueChanged) => return Ok(super::FutexWaitBroadOutcome::NotBlocked),
+                Err(Refused::TimedOut) => return Ok(super::FutexWaitBroadOutcome::TimedOut),
                 Err(Refused::Word(err)) => return Err(err),
                 Err(Refused::IncarnationMoved) => return Err(KernelError::TaskMissing),
                 Err(Refused::Full) => return Err(KernelError::TaskTableFull),
@@ -1039,7 +1069,7 @@ impl KernelState {
                 );
                 // The out-of-lock trap-entry drain performs the authoritative
                 // queue-advancing dispatch; do NOT dispatch in-lock here.
-                return Ok(true);
+                return Ok(super::FutexWaitBroadOutcome::Blocked { timed });
             }
             crate::yarm_log!(
                 "FUTEX_WAIT_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
@@ -1093,7 +1123,7 @@ impl KernelState {
                 // The AArch64 trap-handler bypass returns cleanly through `with_cpu`; the
                 // trap-entry drain performs the authoritative dispatch (Switch or Idle). Do NOT
                 // dispatch in-lock here.
-                return Ok(true);
+                return Ok(super::FutexWaitBroadOutcome::Blocked { timed });
             }
             crate::yarm_log!(
                 "AARCH64_FUTEX_WAIT_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
@@ -1153,7 +1183,7 @@ impl KernelState {
                     // The RISC-V handler bypass returns cleanly through `with_cpu`; the shared
                     // post-lock drain performs the authoritative dispatch/idle. Do NOT dispatch
                     // in-lock here.
-                    return Ok(true);
+                    return Ok(super::FutexWaitBroadOutcome::Blocked { timed });
                 }
                 crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
                 crate::yarm_log!(
@@ -1163,7 +1193,19 @@ impl KernelState {
             }
         }
         self.dispatch_next_task()?;
-        Ok(true)
+        Ok(super::FutexWaitBroadOutcome::Blocked { timed })
+    }
+
+    /// FUTEX-TIME1 — the broad TIMED wait: the same body, with the absolute scheduler-tick
+    /// `deadline` the handler converted from the caller's relative timeout.
+    pub(crate) fn futex_wait_current_timed(
+        &mut self,
+        addr: usize,
+        expected: u32,
+        kind: super::futex::FutexKind,
+        deadline: Option<u64>,
+    ) -> Result<super::FutexWaitBroadOutcome, KernelError> {
+        self.futex_wait_current_inner(addr, expected, kind, deadline)
     }
 
     pub fn futex_wake(

@@ -209,21 +209,20 @@ fn restore_arch_thread_state(
     // the `ecall` before `handle_trap_entry`, so a woken sender never re-executes its `ecall`
     // and the parked completion is the only thing that can supply its result.
     if let Some(current_tid) = kernel.current_tid()
-        && let Some(done) = kernel.take_blocked_syscall_completion_of_class(
-            current_tid,
-            crate::kernel::task::BlockedSyscallClass::IpcSend,
-        )
+        && let Some(done) = kernel.take_resume_completion(current_tid)
     {
         // RISC-V convention, matching the reply-timeout consumer below: write BOTH lanes so the
         // result survives either resume route (post-switch resume reads a0 directly; a same-task
         // return re-derives a0 from the frame's ERROR lane). A SUCCESS completion clears the
         // error lane instead of setting it, so the export cannot turn a success into an error.
+        // FUTEX-TIME1: a timed-FutexWait completion rides here too; `success_ret0` /
+        // `result_register` give its `1` for a won wake (a send's success is `0`).
         if done.result == 0 {
-            frame.set_ok(0, 0, 0);
+            frame.set_ok(done.success_ret0(), 0, 0);
         } else {
             frame.set_err(done.result as usize);
         }
-        frame.set_user_gpr(10, done.result as usize);
+        frame.set_user_gpr(10, done.result_register());
         frame.set_user_gpr(11, 0);
         crate::yarm_log!(
             "RISCV_BLOCKED_SEND_COMPLETION_DELIVERED tid={} class={} result={} blocked_generation={} sepc=0x{:016x} final_a0={} final_a1={} result=ok",
@@ -376,12 +375,14 @@ fn direct_dispatch_resume_incoming(
     // port: the restored pre-block snapshot must not be able to overwrite the canonical result.
     // `sepc` is untouched — the bridge advanced it past the `ecall` once, at block time.
     if let Some(done) = shared.direct_dispatch_take_send_completion_split(token) {
+        // FUTEX-TIME1: a timed-FutexWait completion rides here too; `success_ret0` /
+        // `result_register` give its `1` for a won wake (a send's success is `0`).
         if done.result == 0 {
-            frame.set_ok(0, 0, 0);
+            frame.set_ok(done.success_ret0(), 0, 0);
         } else {
             frame.set_err(done.result as usize);
         }
-        frame.set_user_gpr(10, done.result as usize);
+        frame.set_user_gpr(10, done.result_register());
         frame.set_user_gpr(11, 0);
         crate::yarm_log!(
             "RISCV_BLOCKED_SEND_COMPLETION_DELIVERED tid={} class={} result={} blocked_generation={} sepc=0x{:016x} final_a0={} final_a1={} origin=post_lock_drain result=ok",
@@ -2302,6 +2303,12 @@ pub fn handle_riscv_trap_entry_shared(
     // in-lock scan. Ungated: U7 removed the oracle feature cfg and the runtime selector that
     // used to decide whether production processed these classes off the broad lock.
     shared.run_due_ipc_timeout_work(cpu);
+    // FUTEX-TIME1 — THE production futex-timeout entry, right after the IPC pipeline and before
+    // the idle-boundary queue advance below, for the same reason that pipeline sits here: a
+    // timeout that readies a task while this CPU is parked must be dispatchable by THIS trap. On
+    // the clock owner it runs on every timer interrupt, idle included, which is what bounds a
+    // due waiter's retry. Free (one atomic load) when no timed wait exists.
+    let _ = shared.run_due_futex_timeouts(cpu);
 
     // Stage 200D-2A: the SERVER-DEATH post-lock drain, ungated (production behaviour on
     // every build). RISC-V drives its own post-lock area, so the drain is wired here for

@@ -447,7 +447,9 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
     // that can supply the result — without it the sender would return the `WouldBlock` its
     // saved frame still carries for a message the receiver already took.
     if let Some(done) = shared.direct_dispatch_take_send_completion_split(token) {
-        encode_blocked_completion_result(frame, done.result);
+        // FUTEX-TIME1: a timed-FutexWait completion rides here too (`result_register`: `1` for a
+        // won wake, the error code otherwise; a send's success is `0`).
+        encode_blocked_completion_result(frame, done.result_register() as u64);
         completion_encoded = true;
         crate::yarm_log!(
             "AARCH64_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} elr=0x{:016x} result=ok",
@@ -572,12 +574,7 @@ pub(crate) fn restore_arch_thread_state(
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
     let send_completion = (!syscall_return)
-        .then(|| {
-            kernel.take_blocked_syscall_completion_of_class(
-                current_tid,
-                crate::kernel::task::BlockedSyscallClass::IpcSend,
-            )
-        })
+        .then(|| kernel.take_resume_completion(current_tid))
         .flatten();
     // 199E-A64RC: production-live, matching the `IpcSend` take above. Class-scoped, so it can
     // never consume the send consumer's entry.
@@ -661,7 +658,7 @@ pub(crate) fn apply_restored_thread_state(
         // class is production-live on every build, and it is class-scoped so it can never
         // consume the reply-timeout consumer's `IpcRecv` entry below.
         if let Some(done) = facts.send_completion {
-            encode_blocked_completion_result(frame, done.result);
+            encode_blocked_completion_result(frame, done.result_register() as u64);
             crate::yarm_log!(
                 "AARCH64_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} elr=0x{:016x} result=ok",
                 current_tid,

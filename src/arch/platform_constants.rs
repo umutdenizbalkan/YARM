@@ -19,6 +19,9 @@ pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 =
 /// BL4b — the scheduling quantum, in timer interrupts (see the selected port's layout). A separate
 /// constant from the hardware deadline: the two are in incompatible units.
 pub const SCHED_QUANTUM_TICKS: u64 = super::platform_layout::SCHED_QUANTUM_TICKS;
+/// FUTEX-TIME1 — one scheduler tick in nanoseconds on the selected port (see its layout).
+pub const SCHED_TICK_PERIOD_NS: u64 = super::platform_layout::SCHED_TICK_PERIOD_NS;
+const _: () = assert!(SCHED_TICK_PERIOD_NS > 0);
 
 pub const KERNEL_BOOTSTRAP_VIRT_BASE: u64 = super::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
 pub const KERNEL_BOOTSTRAP_PHYS_BASE: u64 = super::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;

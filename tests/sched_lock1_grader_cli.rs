@@ -374,6 +374,9 @@ fn producer_facts_the_grader_relies_on() {
     // FUTEX-REQUEUE-ATOMIC1: 6 -> 7. NR 17's wake portion is no longer a FutexWake run afterwards;
     // its placement fills the slots its preflight reserved, a reserved commit of its own, which
     // claims (and stages the exact waiter it claimed) for itself.
-    assert_eq!(claims, 7, "claim sites");
+    // FUTEX-TIME1: 7 -> 8. The futex timeout collector's placement is a reserved commit of its
+    // own (the WAKE-CAP1 protocol keyed by the exact token), which claims for itself; its plan
+    // stages the exact waiter through the shared planner.
+    assert_eq!(claims, 8, "claim sites");
     assert!(staged >= 6, "stage sites: {staged}");
 }

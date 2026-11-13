@@ -30,6 +30,13 @@ pub const BOOTSTRAP_CPU_ID: u8 = 0;
 /// owner (`timer::rearm_periodic_deadline`) programs `timer::DEFAULT_TICK_INTERVAL`, and the two are
 /// held equal at compile time there. Never a scheduling quantum (it was, as `10`, until BL4b).
 pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 100_000;
+/// FUTEX-TIME1 — the frequency [`BOOTSTRAP_TIMER_DEADLINE_TICKS`] counts at: QEMU `virt`'s `timebase-frequency`.
+pub const TIMER_COUNTER_HZ: u64 = 10_000_000;
+/// FUTEX-TIME1 — one scheduler tick, in nanoseconds: the re-armed hardware period above. The
+/// conversion of a user timeout into scheduler ticks (`syscall::sched::futex_timeout_ticks`) is the
+/// only consumer; it is never a scheduling quantum.
+pub const SCHED_TICK_PERIOD_NS: u64 =
+    BOOTSTRAP_TIMER_DEADLINE_TICKS * 1_000_000_000 / TIMER_COUNTER_HZ;
 /// BL4b — the scheduling QUANTUM, in TIMER INTERRUPTS: the number of periodic interrupts a
 /// running task may consume before a tick preempts it (`Timer::new` decrements once per
 /// interrupt). The contract on every port is about 100 ms, and never less than one interrupt: ten

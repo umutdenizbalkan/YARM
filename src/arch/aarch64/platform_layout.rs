@@ -30,6 +30,13 @@ pub const BOOTSTRAP_CPU_ID: u8 = 0;
 /// at 62.5 MHz (`CNTFRQ_EL0`), so one interrupt period is 3_125_000 / 62.5 MHz = 50 ms.
 /// Programmed by the timer route's single re-arm; never a scheduling quantum.
 pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 3_125_000;
+/// FUTEX-TIME1 — the frequency [`BOOTSTRAP_TIMER_DEADLINE_TICKS`] counts at: QEMU `virt`'s generic timer (`CNTFRQ_EL0`).
+pub const TIMER_COUNTER_HZ: u64 = 62_500_000;
+/// FUTEX-TIME1 — one scheduler tick, in nanoseconds: the re-armed hardware period above. The
+/// conversion of a user timeout into scheduler ticks (`syscall::sched::futex_timeout_ticks`) is the
+/// only consumer; it is never a scheduling quantum.
+pub const SCHED_TICK_PERIOD_NS: u64 =
+    BOOTSTRAP_TIMER_DEADLINE_TICKS * 1_000_000_000 / TIMER_COUNTER_HZ;
 /// BL4b — the scheduling QUANTUM, in TIMER INTERRUPTS: the number of periodic interrupts a
 /// running task may consume before a tick preempts it (`Timer::new` decrements once per
 /// interrupt). The contract on every port is about 100 ms, and never less than one interrupt: two

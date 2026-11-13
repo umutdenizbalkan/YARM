@@ -64501,7 +64501,11 @@ mod stage191d_futex_wait_block_publish {
             .expect("the defer-unavailable settlement");
         let park = body
             // BL3b: the park transaction re-checks the word against the caller's `expected`.
-            .find("futex_wait_park_exact_split(cpu, tid, asid, addr, expected, args.kind)")
+            // FUTEX-TIME1 re-derivation: THE park transaction is the timed one, carrying the
+            // deadline the route converted at admission (`None` for an untimed wait).
+            .find(
+                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, args.kind, deadline)",
+            )
             .expect("the park transaction");
         assert!(
             already < unavailable && unavailable < park,
@@ -65071,7 +65075,9 @@ mod stage192a_queue_advancing_dispatch {
     fn futex_wait_defers_dispatch_and_trap_drain_exists() {
         assert!(
             EXEC_SRC.contains("crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid)")
-                && EXEC_SRC.contains("return Ok(true);"),
+                // FUTEX-TIME1 re-derivation: the shared body answers the typed blocked outcome
+                // (`futex_wait_current` maps it to `Ok(true)`), timed or not.
+                && EXEC_SRC.contains("return Ok(super::FutexWaitBroadOutcome::Blocked { timed });"),
             "futex_wait_current must defer the queue-advancing dispatch when eligible"
         );
         // The in-lock fallback (dispatch_next_task) is preserved for ineligible cases.
@@ -104929,8 +104935,11 @@ mod stage200d0c1_aarch64_exit_prep {
         // so require the LAST of them to still precede the argument mirror — otherwise a consumed
         // completion would be overwritten by the receive's own arguments, which is exactly the
         // defect this guard exists to catch.
+        // FUTEX-TIME1 re-derivation: the send-class consumer now encodes `result_register()` (it
+        // also carries a timed FutexWait's `1`), the receive consumer still `result`; both call
+        // the one owner.
         let encodes: alloc::vec::Vec<usize> = writer
-            .match_indices("encode_blocked_completion_result(frame, done.result)")
+            .match_indices("encode_blocked_completion_result(frame, done.result")
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
@@ -122723,7 +122732,8 @@ mod stage199d_wa2a_ownership_boundary {
             //   half this is: one body, two owners, with the rank-1 enqueues left to the caller.
             ("src/kernel/boot/exit_claim.rs", 3),
             // FUTEX-FOUND1: the keyed futex owners (see exec_state.rs above).
-            ("src/kernel/boot/futex.rs", 3),
+            // FUTEX-TIME1: 3 -> 4 — the timeout claim (`claim_futex_timeout_locked`).
+            ("src/kernel/boot/futex.rs", 4),
             // U9-IRQ-UNKNOWN1 §2: 9 -> 8. `signal_notification` and
             // `wake_destroyed_notification_waiter` had a status writer each, applying the same
             // rule twice; both now reach one owner, `wake_notification_waiter_exact`, so the
@@ -122867,8 +122877,11 @@ mod stage199d_wa2a_ownership_boundary {
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
             // FUTEX-FOUND1: 41 -> 39 — five futex writes became the three keyed owners.
-            39,
-            "39 raw writes — U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex \
+            // FUTEX-TIME1: 39 -> 40 — the timeout claim.
+            40,
+            "40 raw writes — FUTEX-TIME1 added the timeout claim `claim_futex_timeout_locked`, \
+             39 -> 40, a new terminal owner of a futex wait cycle — \
+             39 before it — U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex \
              registration, 38 -> 39, so a park transaction whose rank-1 compare-and-clear \
              refuses takes its own registration back instead of leaving a task parked that the \
              scheduler believes is elsewhere — \
@@ -123619,6 +123632,15 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Cannot,
         ),
+        // FUTEX-TIME1: THE timeout claim — `Blocked(Futex(token)) -> Runnable` for the exact
+        // cycle a collector candidate names, behind the same token-exact TCB filter as the wake
+        // claim, so it can never act on a `Blocked(EndpointReceive)` task either.
+        (
+            "src/kernel/boot/futex.rs",
+            "claim_futex_timeout_locked",
+            1,
+            Verdict::Cannot,
+        ),
     ];
 
     /// The eight WA3A-barriered sites: `(file, fn, sites, the typed transitions it uses)`.
@@ -123895,6 +123917,17 @@ mod stage199d_wa2b_wake_owner_census {
             "table.retire(slot);",
         ),
         (
+            // FUTEX-TIME1: the timeout claim, the wake claim's twin for the deadline owner: the
+            // write follows the token-exact TCB match and precedes the record's retirement, and
+            // the `TimedOut` completion is published after both, in the same hold.
+            "src/kernel/boot/futex.rs",
+            "claim_futex_timeout_locked",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "};",
+            "table.retire(slot);",
+        ),
+        (
             "src/kernel/boot/ipc_state.rs",
             "rt_commit_receiver_runnable",
             "tcb.status",
@@ -124051,7 +124084,7 @@ mod stage199d_wa2b_wake_owner_census {
             "src/kernel/task.rs",
             "new",
             "status:",
-            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), user_fpu: crate::kernel::user_fpu::UserFpuState::initial(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, first_resume_consumed: false, blocked_send_generation: 0, pending_syscall_completion: None, async_preempted: None, async_preempt_generation: 0, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
+            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), user_fpu: crate::kernel::user_fpu::UserFpuState::initial(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, first_resume_consumed: false, blocked_send_generation: 0, futex_wait_generation: 0, pending_syscall_completion: None, async_preempted: None, async_preempt_generation: 0, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
             "thread_group_id: ThreadGroupId(tid.0),",
             "asid,",
         ),
@@ -124237,8 +124270,10 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            35,
-            "FUTEX-FOUND1: 37 -> 35 — the five futex writes (two broad, three split) became the \
+            36,
+            "FUTEX-TIME1: 35 -> 36 — the timeout claim `claim_futex_timeout_locked` is a genuinely \
+             new writer: a new terminal owner of a futex wait cycle. \
+             FUTEX-FOUND1: 37 -> 35 — the five futex writes (two broad, three split) became the \
              three keyed owners in futex.rs, one registration, its undo and one wake claim. \
              36 raw writes (U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, \
              36 -> 37; U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
@@ -124326,8 +124361,9 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            45,
-            "FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
+            46,
+            "FUTEX-TIME1: 45 -> 46, the timeout claim is a new CANNOT writer. \
+             FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
              U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex registration, 46 -> 47, \
              so a park transaction whose rank-1 compare-and-clear refuses takes its own \
              registration back rather than leaving a task parked that the scheduler believes is \
@@ -124354,8 +124390,9 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            45,
-            "FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
+            46,
+            "FUTEX-TIME1: 45 -> 46, the timeout claim is a new writer. \
+             FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
              U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, 46 -> 47 — the \
              same shape U9-REAP1 §2 and U9-RESIDUAL1 §3 produced, a transition that gained a \
              named way back rather than multiplying. U9-RESIDUAL1 §3 moved `yield_current`'s \
@@ -124712,9 +124749,10 @@ mod stage199d_wa2b_wake_owner_census {
         // it enters and leaves the futex-waiter state and wakes nobody.
         // FUTEX-FOUND1: 47 -> 45 — CANNOT 19 -> 18 (the two wake copies are one claim) and
         // INTO_BLOCKED 10 -> 9 (the two registrations are one; the undo stays).
+        // FUTEX-TIME1: 45 -> 46 — CANNOT 18 -> 19 (the timeout claim).
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            45,
+            46,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -124781,7 +124819,10 @@ mod stage199d_wa2b_wake_owner_census {
             // FUTEX-FOUND1: CANNOT 19 -> 18 and INTO_BLOCKED 10 -> 9. The broad and split wake
             // copies (both CANNOT) are one keyed claim, and the broad and split registrations
             // (both INTO_BLOCKED) are one keyed registration; the undo is unchanged in class.
-            (15, 18, 9, 2, 1)
+            //
+            // FUTEX-TIME1: CANNOT 18 -> 19. The timeout claim is a new terminal owner of a futex
+            // wait cycle, CANNOT for the same reason as the wake claim (token-exact filter).
+            (15, 19, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -124833,6 +124874,15 @@ mod stage199d_wa2b_wake_owner_census {
                 // and that record's TCB holds exactly its token.
                 "futex.rs",
                 "claim_futex_waiter_locked",
+                "t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))",
+                "table.token(slot) != candidate.token",
+            ),
+            // FUTEX-TIME1: the timeout claim. Same guard; the closure fact is that the candidate's
+            // token was read by the collector from a live timed record, and the claim acts only
+            // when it is still that record's current incarnation.
+            (
+                "futex.rs",
+                "claim_futex_timeout_locked",
                 "t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))",
                 "table.token(slot) != candidate.token",
             ),
@@ -134905,9 +134955,12 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 let before = &src[idx.saturating_sub(1200)..idx];
                 let gate = "#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]";
                 let last_gate = before.rfind(gate);
+                // FUTEX-TIME1 re-derivation: `take_resume_completion` is the in-lock take, scoped to
+                // `IpcSend` and the timed `FutexWait` class that resumes through the same boundary.
                 let last_take = before
                     .rfind("BlockedSyscallClass::IpcSend")
-                    .or_else(|| before.rfind("take_send_completion_split"));
+                    .or_else(|| before.rfind("take_send_completion_split"))
+                    .or_else(|| before.rfind("take_resume_completion("));
                 assert!(
                     last_take.is_some(),
                     "{arch}: the consumer must be class-scoped to IpcSend"
@@ -141797,6 +141850,7 @@ mod u3_post_exit_replacement_restore_transaction {
                 let blocked_generation = match class {
                     BlockedSyscallClass::IpcRecv => t.blocked_recv_generation,
                     BlockedSyscallClass::IpcSend => t.blocked_send_generation,
+                    BlockedSyscallClass::FutexWait => t.futex_wait_generation,
                 };
                 t.pending_syscall_completion = Some(BlockedSyscallCompletion {
                     syscall_class: class,
@@ -149192,10 +149246,12 @@ mod u9qa_split_dispatch_disposition {
         // beside `WokenDuringPublication`, `VictimChanged` and `IncarnationMoved`, and each is a
         // non-parking outcome that must release what it reserved. FUTEX-FOUND1: six — the keyed
         // registration's `CapacityExhausted` refusal is a sixth, decided before any write.
+        // FUTEX-TIME1: seven — `TimedOut` (the deadline reached when the word matched) is a
+        // seventh, decided before any write.
         assert_eq!(
             after.matches("futex_wait_dispatch_clear(cpu_idx)").count(),
-            6,
-            "the six non-parking park outcomes each release the reservation"
+            7,
+            "the seven non-parking park outcomes each release the reservation"
         );
     }
 
@@ -149224,7 +149280,11 @@ mod u9qa_split_dispatch_disposition {
             .expect("the deferral reservation");
         let publish = route
             // BL3b: the park transaction re-checks the word against the caller's `expected`.
-            .find("futex_wait_park_exact_split(cpu, tid, asid, addr, expected, args.kind)")
+            // FUTEX-TIME1 re-derivation: THE park transaction is the timed one, carrying the
+            // deadline the route converted at admission (`None` for an untimed wait).
+            .find(
+                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, args.kind, deadline)",
+            )
             .expect("the park transaction");
         assert!(
             admit < reserve && reserve < publish,
@@ -184778,12 +184838,17 @@ mod u9_ipc_residual3_park_resume {
         );
         let tail = &body[take..];
         assert!(
-            tail.contains("frame.set_user_gpr(10, done.result as usize);")
+            // FUTEX-TIME1 re-derivation: `a0` is the class's result register (`1` for a timed
+            // FutexWait a wake won, the error code otherwise, `0` for a send's success).
+            tail.contains("frame.set_user_gpr(10, done.result_register());")
                 && tail.contains("frame.set_user_gpr(11, 0);"),
             "the a0/a1 mirror is what a post-switch resume reads"
         );
         assert!(
-            tail.contains("frame.set_ok(0, 0, 0);") && tail.contains("frame.set_err("),
+            // FUTEX-TIME1 re-derivation: a success still CLEARS the error lane — `set_ok` with the
+            // class's success `ret0` (`0` for a send, `1` for a timed FutexWait).
+            tail.contains("frame.set_ok(done.success_ret0(), 0, 0);")
+                && tail.contains("frame.set_err("),
             "and the typed result lane is what a same-task return re-derives a0 from; a success \
              must CLEAR the error lane rather than set it"
         );
@@ -194704,9 +194769,9 @@ mod u9closure_switch_owned_elsewhere {
             "src/kernel/boot/exec_state.rs DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store( maybe_switch_kernel_context",
             // A `SharedKernel` transaction with NO production caller — asserted below.
             "src/kernel/boot/exec_state.rs DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store( queue_advance_commit_split",
-            "src/kernel/boot/exec_state.rs futex_wait_dispatch_try_defer( futex_wait_current",
-            "src/kernel/boot/exec_state.rs futex_wait_dispatch_try_defer( futex_wait_current",
-            "src/kernel/boot/exec_state.rs futex_wait_dispatch_try_defer( futex_wait_current",
+            "src/kernel/boot/exec_state.rs futex_wait_dispatch_try_defer( futex_wait_current_inner",
+            "src/kernel/boot/exec_state.rs futex_wait_dispatch_try_defer( futex_wait_current_inner",
+            "src/kernel/boot/exec_state.rs futex_wait_dispatch_try_defer( futex_wait_current_inner",
             "src/kernel/boot/exec_state.rs riscv_queue_switch_foundation_try_defer( yield_current",
             // (a) split owners, drained in their own trap — NR 16's exit owner and
             // `SharedYieldOwners` (NR 0 and the preempting tick) — and, in the same file,
@@ -215540,7 +215605,12 @@ mod futex_requeue1 {
                 .nth(1)
                 .and_then(|s| s.split("D::QueueAdvanceCommitted").next())
                 .expect("the Parked arm");
-            assert!(parked.trim_end().ends_with("frame.set_ok(1, 0, 0);"));
+            // FUTEX-TIME1 re-derivation: `1` is the parked answer of an UNTIMED wait only — its
+            // one outcome is a wake. A TIMED wait parks a fail-closed provisional (`Internal`,
+            // never `1`), and its terminal claim parks the real result as its completion.
+            assert!(parked.trim_end().ends_with(
+                "if deadline.is_some() {\n                frame.set_err(SyscallError::Internal.code());\n            } else {\n                frame.set_ok(1, 0, 0);\n            }"
+            ));
             let y = SPLIT
                 .split("pub(crate) fn split_yield_settle<")
                 .nth(1)

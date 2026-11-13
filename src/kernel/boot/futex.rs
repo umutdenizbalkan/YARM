@@ -63,8 +63,14 @@ use crate::kernel::vm::{AddressSpaceManager, Asid, PAGE_SIZE, VirtAddr};
 
 /// NR 9 / NR 10 flag: resolve a SHARED key (backing object + offset) instead of a private one.
 pub const FUTEX_FLAG_SHARED: usize = 1;
-/// Every flag this ABI defines; any other bit set is `InvalidArgs`.
+/// FUTEX-TIME1 — NR 9 only: the wait is TIMED, and `args[3]` is its relative timeout in
+/// nanoseconds (see `syscall::sched::futex_timeout_ticks`). NR 10 refuses it like any undefined
+/// bit, and `args[3]` is not read without it.
+pub const FUTEX_FLAG_TIMED: usize = 1 << 1;
+/// Every flag the key decode defines (NR 9 and NR 10); any other bit set is `InvalidArgs`.
 pub const FUTEX_FLAGS_DEFINED: usize = FUTEX_FLAG_SHARED;
+/// Every flag NR 9 defines: the key flags and [`FUTEX_FLAG_TIMED`].
+pub const FUTEX_WAIT_FLAGS_DEFINED: usize = FUTEX_FLAGS_DEFINED | FUTEX_FLAG_TIMED;
 
 /// Which namespace a futex word is resolved in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,9 +116,23 @@ pub enum FutexKey {
         cpu: u8,
         priority: u8,
     },
+    /// FUTEX-TIME1 — a timed wait whose TIMEOUT HAS WON but whose home run queue could not take
+    /// it yet. Like `Pending`, no key resolution produces it, so no FutexWait, FutexWake or
+    /// compare-and-requeue can reach the waiter; only the timeout collector's placement retry and
+    /// task exit touch it. The waiter stays `Blocked(Futex(token))` until that placement, so it is
+    /// never `Runnable` without a run-queue slot. `tid` only spreads such records over buckets.
+    Expired {
+        tid: u64,
+    },
 }
 
 impl FutexKey {
+    /// Whether a user word can name this key (a FutexWake, FutexWait or compare-and-requeue key),
+    /// as opposed to an operation-private one (`Pending`, `Expired`).
+    pub fn is_user_key(&self) -> bool {
+        matches!(self, Self::Private { .. } | Self::Shared { .. })
+    }
+
     fn bucket(&self) -> usize {
         let h = match *self {
             Self::Private {
@@ -129,6 +149,7 @@ impl FutexKey {
                     ^ u64::from(priority)
                     ^ 0x5851_F42D_4C95_7F2D
             }
+            Self::Expired { tid } => tid.rotate_left(13) ^ 0xC2B2_AE3D_27D4_EB4F,
         };
         (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % FUTEX_BUCKETS
     }
@@ -280,7 +301,26 @@ struct FutexWaiterRecord {
     tcb: u16,
     /// The VA the waiter named (diagnostics and the overtaken witness's hold; never identity).
     va: u64,
+    /// FUTEX-TIME1 — the wait cycle's absolute deadline in the scheduler-tick domain, or `None`
+    /// for an untimed wait. It belongs to THIS record — this slot in this incarnation — so it
+    /// moves with every rekey (a requeue keeps it), and it dies with the record: a reused slot is
+    /// a new generation and a new record. Written only inside the compare-and-register hold that
+    /// published the record (`arm_futex_deadline_locked`).
+    deadline: Option<u64>,
     next: u16,
+}
+
+/// FUTEX-TIME1 — how many records with a deadline exist across every waiter table, as a
+/// lock-free HINT for the per-trap timeout collector: zero means no timed wait exists anywhere, so
+/// the collector takes no lock at all. It is maintained in the only two places a record is created
+/// and freed (`register_futex_waiter_locked`'s arm and `retire_after`), under the task lock, so it
+/// never under-counts a live table; a table that is dropped with timed records (hosted tests)
+/// leaves it high, which only costs a scan.
+static FUTEX_TIMED_RECORDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// FUTEX-TIME1 — whether any timed futex wait might exist (see [`FUTEX_TIMED_RECORDS`]).
+pub fn futex_timed_waits_possible() -> bool {
+    FUTEX_TIMED_RECORDS.load(core::sync::atomic::Ordering::Acquire) != 0
 }
 
 /// The bounded keyed waiter store. Task domain (rank 2): reached only with the TCB array.
@@ -290,6 +330,11 @@ pub struct FutexWaiterTable {
     generations: [u32; MAX_FUTEX_WAITERS],
     head: [u16; FUTEX_BUCKETS],
     tail: [u16; FUTEX_BUCKETS],
+    /// FUTEX-TIME1 — records holding a deadline, in this table.
+    timed: u16,
+    /// FUTEX-TIME1 — the next slot the timeout collector examines; see
+    /// [`collect_due_futex_timeouts_locked`].
+    timeout_cursor: u16,
     /// Test-only capacity limit, so exhaustion can be exercised without `MAX_TASKS` tasks.
     #[cfg(test)]
     limit: usize,
@@ -317,6 +362,8 @@ impl FutexWaiterTable {
             generations: [0; MAX_FUTEX_WAITERS],
             head: [NIL; FUTEX_BUCKETS],
             tail: [NIL; FUTEX_BUCKETS],
+            timed: 0,
+            timeout_cursor: 0,
             #[cfg(test)]
             limit: MAX_FUTEX_WAITERS,
         }
@@ -384,7 +431,41 @@ impl FutexWaiterTable {
         self.unlink_after(slot, prev);
         self.records[slot] = None;
         self.generations[slot] = self.generations[slot].wrapping_add(1);
+        // FUTEX-TIME1: the deadline dies with its record, here and nowhere else.
+        if rec.deadline.is_some() {
+            self.timed = self.timed.saturating_sub(1);
+            FUTEX_TIMED_RECORDS.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        }
         Some(rec)
+    }
+
+    /// FUTEX-TIME1 — the bucket predecessor of `slot` (`NIL` at the head). One bucket walk.
+    fn prev_of(&self, slot: usize) -> u16 {
+        let Some(rec) = self.records[slot] else {
+            return NIL;
+        };
+        let mut prev = NIL;
+        let mut cur = self.head[rec.key.bucket()];
+        while cur != NIL && cur as usize != slot {
+            prev = cur;
+            cur = self.records[cur as usize].map_or(NIL, |r| r.next);
+        }
+        prev
+    }
+
+    /// FUTEX-TIME1 — the deadline a token's record holds. Test and census use.
+    #[cfg(test)]
+    pub fn deadline_of(&self, token: FutexWaitToken) -> Option<u64> {
+        let slot = usize::from(token.slot);
+        (slot < MAX_FUTEX_WAITERS && self.generations[slot] == token.generation)
+            .then(|| self.records[slot].and_then(|r| r.deadline))
+            .flatten()
+    }
+
+    /// FUTEX-TIME1 — how many records hold a deadline. Test and census use.
+    #[cfg(test)]
+    pub fn timed_records(&self) -> usize {
+        usize::from(self.timed)
     }
 
     /// FUTEX-REQUEUE1 — take `slot` out of its bucket chain (predecessor `prev`, `NIL` at the
@@ -547,6 +628,7 @@ pub fn register_futex_waiter_locked(
         tid,
         tcb: tcb_idx as u16,
         va,
+        deadline: None,
         next: NIL,
     });
     table.link_tail(slot);
@@ -570,6 +652,67 @@ pub enum FutexCompareRegisterRefusal {
     ValueChanged,
     /// The address did not resolve to a readable word (its own error).
     Word(KernelError),
+    /// FUTEX-TIME1 — the word DID hold `expected`, and the wait's deadline had already been
+    /// reached when the hold compared it: the timeout wins before any registration, so nothing
+    /// is published and the wait answers `TimedOut`. Decided after the comparison, so a word that
+    /// differs answers `ValueChanged` whatever the deadline.
+    TimedOut,
+}
+
+/// FUTEX-TIME1 — whether a compare-and-register is timed, and the clock it is judged against.
+#[derive(Clone, Copy)]
+pub enum FutexWaitTiming<'a> {
+    /// An untimed wait: exactly the FUTEX-WAIT-ATOMIC1 transaction.
+    Untimed,
+    /// A timed wait whose absolute scheduler-tick deadline is `deadline`. `now` reads the clock
+    /// INSIDE the hold (a lock-free atomic load), after the comparison: that read is what decides
+    /// "already expired" at the wait's linearization point.
+    Timed {
+        deadline: u64,
+        now: &'a dyn Fn() -> u64,
+    },
+}
+
+impl core::fmt::Debug for FutexWaitTiming<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Untimed => f.write_str("Untimed"),
+            Self::Timed { deadline, .. } => write!(f, "Timed {{ deadline: {deadline} }}"),
+        }
+    }
+}
+
+/// FUTEX-TIME1 — rank 2, inside the compare-and-register hold that just returned `token`: attach
+/// `deadline` to that record and advance the waiter's `futex_wait_generation`, the coordinate its
+/// completion will carry. Called with no release since the registration, so no wake, requeue or
+/// exit can see the record untimed; `false` (and nothing written) only if the token is not the
+/// record this hold registered, which the caller treats as an invariant break.
+fn arm_futex_deadline_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    token: FutexWaitToken,
+    deadline: u64,
+) -> bool {
+    let slot = usize::from(token.slot);
+    if slot >= MAX_FUTEX_WAITERS || table.token(slot) != token {
+        return false;
+    }
+    let Some(rec) = table.records[slot].as_mut() else {
+        return false;
+    };
+    let Some(tcb) = tcbs.get_mut(usize::from(rec.tcb)).and_then(Option::as_mut) else {
+        return false;
+    };
+    // `checked_add` was proved possible before the registration (see the caller), so this
+    // cannot fail here; the value is the one the completion of this cycle names.
+    let Some(next) = tcb.futex_wait_generation.checked_add(1) else {
+        return false;
+    };
+    tcb.futex_wait_generation = next;
+    rec.deadline = Some(deadline);
+    table.timed = table.timed.saturating_add(1);
+    FUTEX_TIMED_RECORDS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    true
 }
 
 /// FUTEX-WAIT-ATOMIC1 — ranks 2 → 5 → 6, ONE hold: THE compare-and-register of `FutexWait`.
@@ -589,6 +732,13 @@ pub enum FutexCompareRegisterRefusal {
 /// store to the word is visible to the load, because that store precedes the waker's release of
 /// the task lock, which precedes this hold's acquisition of it) or entirely after it (and then
 /// finds this waiter). A user store that no futex operation follows is ordered by the load alone.
+///
+/// **FUTEX-TIME1.** A [`FutexWaitTiming::Timed`] wait is decided in the SAME hold, in this order:
+/// the key and the word (their own errors), the comparison (`ValueChanged` — a word that differs
+/// answers `0` whatever the deadline), then the clock, read here: a deadline already reached is
+/// `TimedOut` with nothing published. Otherwise the waiter is registered through the one owner and
+/// its deadline attached to that exact record before the hold ends, so no other operation can ever
+/// observe the cycle untimed. An untimed wait is exactly the FUTEX-WAIT-ATOMIC1 transaction.
 #[allow(clippy::too_many_arguments)]
 pub fn compare_and_register_futex_waiter_locked(
     tcbs: &mut [Option<ThreadControlBlock>],
@@ -600,6 +750,7 @@ pub fn compare_and_register_futex_waiter_locked(
     addr: usize,
     expected: u32,
     kind: FutexKind,
+    timing: FutexWaitTiming<'_>,
 ) -> Result<(FutexKey, FutexWaitToken), FutexCompareRegisterRefusal> {
     use FutexCompareRegisterRefusal as Refused;
     let (key, word) = match resolve_futex_word_locked(spaces, memory, asid, addr, kind) {
@@ -610,12 +761,43 @@ pub fn compare_and_register_futex_waiter_locked(
     if !crate::kernel::syscall::sched::futex_should_park(expected, word) {
         return Err(Refused::ValueChanged);
     }
-    register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)
-        .map(|token| (key, token))
-        .map_err(|refusal| match refusal {
+    let deadline = match timing {
+        FutexWaitTiming::Untimed => None,
+        FutexWaitTiming::Timed { deadline, now } => {
+            if !entering_incarnation(tcbs, tid, asid) {
+                return Err(Refused::IncarnationMoved);
+            }
+            if now() >= deadline {
+                return Err(Refused::TimedOut);
+            }
+            // The generation this cycle's completion will carry must exist BEFORE anything is
+            // written (an exhausted u64 counter is unreachable, and refused rather than wrapped).
+            let advances = tcbs.iter().flatten().any(|t| {
+                t.tid.0 == tid
+                    && t.asid.unwrap_or(Asid(0)) == asid
+                    && t.futex_wait_generation.checked_add(1).is_some()
+            });
+            if !advances {
+                return Err(Refused::Full);
+            }
+            Some(deadline)
+        }
+    };
+    let token = register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64).map_err(
+        |refusal| match refusal {
             FutexRegisterRefusal::IncarnationMoved => Refused::IncarnationMoved,
             FutexRegisterRefusal::Full => Refused::Full,
-        })
+        },
+    )?;
+    if let Some(deadline) = deadline
+        && !arm_futex_deadline_locked(tcbs, table, token, deadline)
+    {
+        // Unreachable (the registration just wrote this record and checked the counter); an
+        // untimed record must never stand in for a timed wait, so the hold undoes it.
+        undo_futex_registration_locked(tcbs, table, tid, token);
+        return Err(Refused::Full);
+    }
+    Ok((key, token))
 }
 
 /// rank 2, read-only — whether `tid` is the `Running` `{tid, asid}` incarnation the registration
@@ -739,7 +921,225 @@ pub fn claim_futex_waiter_locked(
     };
     tcb.status = TaskStatus::Runnable;
     table.retire(slot);
+    // FUTEX-TIME1: a TIMED cycle's result is not in its parked frame (which carries a fail-closed
+    // provisional), so the winning wake publishes it, here, in the hold that made it `Runnable`
+    // (`rec` is the record's value, read before its retirement).
+    if rec.deadline.is_some() {
+        publish_futex_wait_completion_locked(tcb, FutexWaitEnding::Woken);
+    }
     true
+}
+
+/// FUTEX-TIME1 — which terminal owner won a timed wait cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutexWaitEnding {
+    /// A wake (NR 10, the NR 17 wake portion, the robust exit wake): `Ok(true)`, `ret0 = 1`.
+    Woken,
+    /// The deadline: `Err(TimedOut)`.
+    TimedOut,
+}
+
+/// FUTEX-TIME1 — rank 2: park the timed cycle's result on its TCB as the generation-bearing
+/// [`BlockedSyscallCompletion`](crate::kernel::task::BlockedSyscallCompletion) that every resume
+/// boundary consumes exactly once (`BlockedSyscallClass::FutexWait`), named by the cycle's own
+/// `futex_wait_generation`. Called only by a terminal claim, in its hold.
+fn publish_futex_wait_completion_locked(tcb: &mut ThreadControlBlock, ending: FutexWaitEnding) {
+    use crate::kernel::task::{BlockedSyscallClass, BlockedSyscallCompletion};
+    let Some(asid) = tcb.asid else {
+        return;
+    };
+    tcb.pending_syscall_completion = Some(BlockedSyscallCompletion {
+        syscall_class: BlockedSyscallClass::FutexWait,
+        result: match ending {
+            FutexWaitEnding::Woken => 0,
+            FutexWaitEnding::TimedOut => {
+                crate::kernel::syscall::SyscallError::TimedOut.code() as u64
+            }
+        },
+        tid: tcb.tid.0,
+        asid,
+        blocked_generation: tcb.futex_wait_generation,
+    });
+}
+
+/// FUTEX-TIME1 — one due timed waiter the collector found, by exact identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FutexTimeoutCandidate {
+    pub tid: u64,
+    pub token: FutexWaitToken,
+    /// The timeout already WON for it (its record is on its `Expired` key); only its placement
+    /// is outstanding.
+    pub expired: bool,
+}
+
+/// FUTEX-TIME1 — what one collector pass did (counts; telemetry and tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FutexTimeoutPass {
+    /// Due live timed waiters the scan handed out.
+    pub due: u32,
+    /// Timeouts committed and placed (`TimedOut` delivered at the next resume).
+    pub timed_out: u32,
+    /// Timeouts committed WITHOUT a placement (home queue full): moved to `Expired`, owed.
+    pub expired: u32,
+    /// Candidates another owner (a wake, exit, slot reuse) took first: nothing changed.
+    pub lost: u32,
+    /// Candidates whose placement was refused again (already `Expired`, or no plan).
+    pub refused: u32,
+}
+
+/// FUTEX-TIME1 — how many slots one collector pass examines, and how many due waiters it hands
+/// out. Every slot is examined once per `MAX_FUTEX_WAITERS / FUTEX_TIMEOUT_SCAN_WINDOW` passes,
+/// whatever the outcome of the placements it attempted, so no slot can starve.
+pub const FUTEX_TIMEOUT_SCAN_WINDOW: usize = 64;
+pub const FUTEX_TIMEOUT_DUE_MAX: usize = 8;
+
+/// FUTEX-TIME1 — rank 2, read-mostly: one bounded pass of the timeout collector.
+///
+/// Examines at most [`FUTEX_TIMEOUT_SCAN_WINDOW`] slots from the table's cursor and returns the
+/// LIVE timed waiters whose deadline is `<= now` (at most [`FUTEX_TIMEOUT_DUE_MAX`]), in slot
+/// order: each on a user key (the timeout has not been decided) or on its `Expired` key (it has,
+/// and only its placement is owed). A record on an NR 17 `Pending` key is skipped: that wake
+/// portion committed first, and its reserved placement owns the waiter. Decides nothing and
+/// writes nothing but the cursor, which advances to just past the last slot EXAMINED — so a
+/// candidate whose placement is later refused is met again on the next cycle, and the collector
+/// can never stop at a slot it could not settle.
+pub fn collect_due_futex_timeouts_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    now: u64,
+    out: &mut [Option<FutexTimeoutCandidate>; FUTEX_TIMEOUT_DUE_MAX],
+) -> usize {
+    if table.timed == 0 {
+        return 0;
+    }
+    let cap = table.capacity();
+    let start = usize::from(table.timeout_cursor) % cap.max(1);
+    let mut n = 0usize;
+    let mut examined = 0usize;
+    while examined < FUTEX_TIMEOUT_SCAN_WINDOW.min(cap) && n < FUTEX_TIMEOUT_DUE_MAX {
+        let slot = (start + examined) % cap;
+        examined += 1;
+        let Some(rec) = table.records[slot] else {
+            continue;
+        };
+        let Some(deadline) = rec.deadline else {
+            continue;
+        };
+        if deadline > now || matches!(rec.key, FutexKey::Pending { .. }) || !table.live(tcbs, slot)
+        {
+            continue;
+        }
+        out[n] = Some(FutexTimeoutCandidate {
+            tid: rec.tid,
+            token: table.token(slot),
+            expired: matches!(rec.key, FutexKey::Expired { .. }),
+        });
+        n += 1;
+    }
+    table.timeout_cursor = ((start + examined) % cap.max(1)) as u16;
+    n
+}
+
+/// FUTEX-TIME1 — rank 2, THE timeout claim: the exact cycle `candidate` names is made `Runnable`,
+/// its record retired and `TimedOut` published as its completion, in ONE critical section — iff
+/// the record is still that cycle (same slot, same generation, same tid), its TCB still
+/// `Blocked(Futex(token))`, its deadline `<= now`, and it is on a user key or its own `Expired`
+/// key (never an NR 17 `Pending` key). Returns `false` and changes nothing otherwise: a wake, a
+/// committed requeue wake, an exit or a slot reuse took the cycle first, and that owner is
+/// responsible for it.
+///
+/// The caller holds a reserved run-queue slot on the waiter's home CPU, exactly as a wake claim
+/// does, so a `true` here is always followed by a placement that cannot be refused for capacity.
+pub fn claim_futex_timeout_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    candidate: FutexTimeoutCandidate,
+    now: u64,
+) -> bool {
+    if !timeout_claimable(tcbs, table, candidate, now) {
+        return false;
+    }
+    let slot = usize::from(candidate.token.slot);
+    if table.token(slot) != candidate.token {
+        return false;
+    }
+    let Some(rec) = table.records[slot] else {
+        return false;
+    };
+    let token = candidate.token;
+    let Some(tcb) = tcbs
+        .get_mut(usize::from(rec.tcb))
+        .and_then(Option::as_mut)
+        .filter(|t| {
+            t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))
+        })
+    else {
+        return false;
+    };
+    tcb.status = TaskStatus::Runnable;
+    table.retire(slot);
+    publish_futex_wait_completion_locked(tcb, FutexWaitEnding::TimedOut);
+    true
+}
+
+/// FUTEX-TIME1 — rank 2: the timeout WINS a due cycle whose home queue refused its placement.
+/// The record is moved, token unchanged, from its user key to its private `Expired` key, so no
+/// later wake, requeue or wait of any user word can reach it; the TCB stays
+/// `Blocked(Futex(token))` (not `Runnable`: it has no slot), and the collector's later passes
+/// retry the placement. Same claimability as [`claim_futex_timeout_locked`]; `false` (nothing
+/// written) when it is not claimable or is already `Expired`.
+pub fn expire_futex_waiter_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    candidate: FutexTimeoutCandidate,
+    now: u64,
+) -> bool {
+    if !timeout_claimable(tcbs, table, candidate, now) {
+        return false;
+    }
+    let slot = usize::from(candidate.token.slot);
+    if !table.records[slot].is_some_and(|r| r.key.is_user_key()) {
+        return false;
+    }
+    let prev = table.prev_of(slot);
+    rekey(
+        table,
+        slot,
+        prev,
+        FutexKey::Expired { tid: candidate.tid },
+        None,
+    );
+    true
+}
+
+/// FUTEX-TIME1 — rank 2, read-only: is `candidate` still a due cycle a timeout may settle?
+fn timeout_claimable(
+    tcbs: &[Option<ThreadControlBlock>],
+    table: &FutexWaiterTable,
+    candidate: FutexTimeoutCandidate,
+    now: u64,
+) -> bool {
+    let slot = usize::from(candidate.token.slot);
+    if slot >= MAX_FUTEX_WAITERS || table.token(slot) != candidate.token {
+        return false;
+    }
+    let Some(rec) = table.records[slot] else {
+        return false;
+    };
+    rec.tid == candidate.tid
+        && rec.deadline.is_some_and(|d| d <= now)
+        && !matches!(rec.key, FutexKey::Pending { .. })
+        && table.live(tcbs, slot)
+}
+
+/// FUTEX-TIME1 — rank 2: is `tid`'s cycle `token` on its `Expired` key (timed out, placement
+/// owed)? Test and witness use.
+#[cfg(any(test, feature = "futex-time-witness"))]
+pub fn futex_waiter_expired_locked(table: &FutexWaiterTable, token: FutexWaitToken) -> bool {
+    let slot = usize::from(token.slot);
+    slot < MAX_FUTEX_WAITERS
+        && table.token(slot) == token
+        && table.records[slot].is_some_and(|r| matches!(r.key, FutexKey::Expired { .. }))
 }
 
 /// FUTEX-REQUEUE1 — what a wake loop achieved: how many waiters it placed, and whether it stopped
@@ -1404,6 +1804,18 @@ pub mod wait_witness {
     }
 }
 
+/// FUTEX-TIME1 — the live timed-wait witness's kernel half (default off: feature
+/// `futex-time-witness`). Each terminal owner of a TIMED cycle reports itself, in causal order on
+/// one console, from inside the transaction that decided it: the claim is reported after its hold
+/// committed and before its placement, so a grader can name which owner won each cycle.
+#[cfg(feature = "futex-time-witness")]
+pub mod time_witness {
+    /// The collector committed a timeout and placed the waiter.
+    pub fn timed_out(cpu: u8, tid: u64, now: u64) {
+        crate::yarm_log!("FUTEX_TIME_W_TIMEOUT cpu={} tid={} now={}", cpu, tid, now);
+    }
+}
+
 /// rank 2 — claim the oldest waiter still on the pending key `key` (`Runnable`, record retired),
 /// exactly as a wake claims. `None` once no live waiter is left on it (the rest exited, or undid
 /// their own registration in their publication window).
@@ -1527,6 +1939,28 @@ pub(crate) mod futex_phase_hook {
     std::thread_local! {
         static REQUEUE_WINDOW: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
+    /// FUTEX-TIME1 — the timeout collector's own windows, for tests: `TIMEOUT_COLLECTED` after the
+    /// scan handed out a candidate and before its plan; `TIMEOUT_AFTER_RESERVE` after its slot is
+    /// reserved and before the claim; `TIMEOUT_AFTER_CLAIM` after the claim and before the
+    /// reserved commit. The hook sees (step, tid) and returns whether to stay armed.
+    pub(crate) const TIMEOUT_COLLECTED: u8 = 11;
+    pub(crate) const TIMEOUT_AFTER_RESERVE: u8 = 12;
+    pub(crate) const TIMEOUT_AFTER_CLAIM: u8 = 13;
+    std::thread_local! {
+        static TIMEOUT_STEP: RefCell<Option<WakeHook>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn arm_timeout_step(hook: WakeHook) {
+        TIMEOUT_STEP.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    pub(crate) fn run_timeout_step(step: u8, tid: u64) {
+        let hook = TIMEOUT_STEP.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook
+            && hook(step, tid)
+        {
+            TIMEOUT_STEP.with(|h| *h.borrow_mut() = Some(hook));
+        }
+    }
+
     pub(crate) fn arm_requeue_window(hook: Hook) {
         REQUEUE_WINDOW.with(|h| *h.borrow_mut() = Some(hook));
     }

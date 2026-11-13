@@ -951,6 +951,8 @@ impl KThreadPool {
         // interrupts masked, no lock held, the same context the epilogue drives it from. The
         // collector is cursor-bounded, and every settlement is the pipeline's own exact claim.
         shared.run_due_ipc_timeout_work(cpu);
+        // FUTEX-TIME1: the futex-timeout entry, beside the IPC pipeline (see `trap_entry`).
+        let _ = shared.run_due_futex_timeouts(cpu);
         reason
     }
 

@@ -443,6 +443,12 @@ pub struct ThreadControlBlock {
     /// completion could match. At u64 width that is unreachable in practice; refusing is what
     /// makes the identity a proof rather than a probability.
     pub blocked_send_generation: u64,
+    /// FUTEX-TIME1 — a monotonic per-task TIMED-futex-wait generation, the futex sibling of
+    /// [`Self::blocked_send_generation`] and deliberately a separate coordinate: advanced by
+    /// `checked_add` inside the compare-and-register hold that publishes a timed wait cycle, and
+    /// carried by the [`BlockedSyscallClass::FutexWait`] completion its terminal claim parks, so a
+    /// completion can only ever be consumed by the cycle it was published for.
+    pub futex_wait_generation: u64,
     /// Stage 200C2C1B — a generation-bearing PENDING COMPLETION for a blocked syscall that
     /// was completed remotely (off-lock) while its caller was descheduled.
     ///
@@ -531,6 +537,11 @@ pub enum BlockedSyscallClass {
     /// already consumed — a duplicate delivery if the caller retried. The completion is the
     /// only thing that makes the woken sender's result true.
     IpcSend,
+    /// FUTEX-TIME1 — a TIMED `FutexWait` (NR 9 with `FUTEX_FLAG_TIMED`). Production-live on every
+    /// port, like `IpcSend`: a timed wait cannot know its result when it parks, so its parked frame
+    /// carries a fail-closed provisional and the terminal claim — a wake or the timeout — parks the
+    /// real one here. Validated against `futex_wait_generation`.
+    FutexWait,
 }
 
 impl BlockedSyscallClass {
@@ -540,7 +551,42 @@ impl BlockedSyscallClass {
         match self {
             Self::IpcRecv => "ipc_recv",
             Self::IpcSend => "ipc_send",
+            Self::FutexWait => "futex_wait",
         }
+    }
+}
+
+impl BlockedSyscallCompletion {
+    /// FUTEX-TIME1 — the `ret0` a SUCCESSFUL completion of this class returns (`result == 0`):
+    /// `1` for a timed `FutexWait` that a wake won (`Ok(true)`), `0` for a send. An error
+    /// completion returns `result` in the error lane on every class.
+    #[must_use]
+    pub const fn success_ret0(&self) -> usize {
+        match self.syscall_class {
+            BlockedSyscallClass::FutexWait => 1,
+            BlockedSyscallClass::IpcRecv | BlockedSyscallClass::IpcSend => 0,
+        }
+    }
+
+    /// FUTEX-TIME1 — the value the result register (`a0` / `x0` / `rax`) holds after this
+    /// completion is encoded: `success_ret0()` on success, the error code otherwise.
+    #[must_use]
+    pub const fn result_register(&self) -> usize {
+        if self.result == 0 {
+            self.success_ret0()
+        } else {
+            self.result as usize
+        }
+    }
+
+    /// FUTEX-TIME1 — whether the resume boundary that consumes a parked `IpcSend` completion also
+    /// consumes this one: the two classes whose result is parked for the resume on EVERY port.
+    #[must_use]
+    pub const fn consumed_with_send(&self) -> bool {
+        matches!(
+            self.syscall_class,
+            BlockedSyscallClass::IpcSend | BlockedSyscallClass::FutexWait
+        )
     }
 }
 
@@ -766,6 +812,8 @@ pub(crate) fn classify_and_take_async_resume(
 pub(crate) const fn resume_boundary_consumes(class: BlockedSyscallClass) -> bool {
     match class {
         BlockedSyscallClass::IpcSend => true,
+        // FUTEX-TIME1: a timed FutexWait's result is consumed by the same boundaries, everywhere.
+        BlockedSyscallClass::FutexWait => true,
         BlockedSyscallClass::IpcRecv => {
             cfg!(any(
                 feature = "ipc-reply-timeout-oracle-core",
@@ -1026,8 +1074,14 @@ pub(crate) fn take_thread_restore_facts(
         .flatten()
         .find(|t| t.tid.0 == tid && expect_asid.is_none_or(|a| t.asid == Some(a)))
         .and_then(|t| t.asid);
+    // FUTEX-TIME1: the timed-FutexWait completion travels in the same field — the two classes
+    // are consumed by the same boundaries, never coexist (one blocked cycle at a time), and are
+    // encoded by the class's own `result_register`.
     let send_completion =
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcSend);
+    let send_completion = send_completion.or_else(|| {
+        take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::FutexWait)
+    });
     #[cfg(any(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
     let recv_completion =
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcRecv);
@@ -1057,6 +1111,7 @@ impl BlockedSyscallCompletion {
         let live_generation = match self.syscall_class {
             BlockedSyscallClass::IpcRecv => tcb.blocked_recv_generation,
             BlockedSyscallClass::IpcSend => tcb.blocked_send_generation,
+            BlockedSyscallClass::FutexWait => tcb.futex_wait_generation,
         };
         self.tid == tcb.tid.0
             && tcb.asid == Some(self.asid)
@@ -1139,6 +1194,7 @@ impl ThreadControlBlock {
             blocked_recv_generation: 0,
             first_resume_consumed: false,
             blocked_send_generation: 0,
+            futex_wait_generation: 0,
             pending_syscall_completion: None,
             async_preempted: None,
             async_preempt_generation: 0,

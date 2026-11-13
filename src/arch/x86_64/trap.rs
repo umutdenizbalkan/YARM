@@ -439,7 +439,8 @@ pub(crate) fn x86_post_lock_resume_marked_incoming(
     // an error is the canonical code in the error lane. RIP is untouched.
     if let Some(done) = shared.direct_dispatch_take_send_completion_split(token) {
         if done.result == 0 {
-            frame.set_ok(0, 0, 0);
+            // FUTEX-TIME1: `1` for a timed-FutexWait completion a wake won; `0` for a send.
+            frame.set_ok(done.success_ret0(), 0, 0);
         } else {
             frame.set_err(done.result as usize);
         }
@@ -520,7 +521,8 @@ pub(crate) fn x86_apply_owner_revalidation_restore(
     // the same incarnation, in the same acquisition, as the context just applied.
     if let Some(done) = snapshot.send_completion {
         if done.result == 0 {
-            frame.set_ok(0, 0, 0);
+            // FUTEX-TIME1: `1` for a timed-FutexWait completion a wake won; `0` for a send.
+            frame.set_ok(done.success_ret0(), 0, 0);
         } else {
             frame.set_err(done.result as usize);
         }
