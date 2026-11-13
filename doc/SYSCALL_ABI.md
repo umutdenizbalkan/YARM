@@ -25,7 +25,7 @@ kernel-extension slots.
 | `6` | `IpcCall` | public, send with kernel-minted ephemeral reply-cap transfer |
 | `7` | `IpcReply` | public, consumes a reply-cap and sends reply to the bound caller endpoint |
 | `8` | `ControlPlaneSetCnodeSlots` | public control-plane ABI; policy-gated by `control_plane_set_process_cnode_slots`, non-authorized callers receive `MissingRight` |
-| `9` | `FutexWait` | public (`arg0=addr`, 4-byte aligned; `arg1=expected`, `u32`; `arg2=flags`) — FUTEX-FOUND1 |
+| `9` | `FutexWait` | public (`arg0=addr`, 4-byte aligned; `arg1=expected`, `u32`; `arg2=flags`; `arg3=timeout_ns`, read only with `FUTEX_FLAG_TIMED`) — FUTEX-FOUND1, timed form FUTEX-TIME1 |
 | `10` | `FutexWake` | public (`arg0=addr`, 4-byte aligned; `arg1=count`, `u32`; `arg2=flags`) — FUTEX-FOUND1 |
 | `11` | `SpawnThread` | public (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`) |
 | `12` | `Fork` | public, forks current process with CoW and returns child tid in parent |
@@ -207,10 +207,10 @@ reserved holes from implemented privileged paths.
   `addr` must be 4-byte aligned and `expected` / `count` must fit in `u32`. `flags` bit 0 is
   `FUTEX_FLAG_SHARED`; every other bit is reserved and a set reserved bit is `InvalidArgs`. All
   three argument errors are `InvalidArgs` and are answered before the address range or the caller
-  is consulted. Slots 3 and up are not read: a later operation (an absolute deadline, a wake
-  mask) is selected by a flag bit that is reserved today, and that bit is what gives meaning to
-  the further slots. Compare-and-requeue has its own number (NR 17, below). There is no
-  caller-supplied `observed`.
+  is consulted. Further slots are read only when a flag bit gives them meaning: since FUTEX-TIME1,
+  `FutexWait` bit 1 (`FUTEX_FLAG_TIMED`) makes slot 3 a timeout (below); `FutexWake` still treats
+  bit 1 as reserved (`InvalidArgs`). Compare-and-requeue has its own number (NR 17, below). There
+  is no caller-supplied `observed`.
 - **Keys.** A *private* futex (`flags = 0`) is `{address space, its generation, va}`: threads of one
   address space share it, and nothing in another address space — including a later address space
   that reuses the same ASID number — can reach it. A *shared* futex (`flags = FUTEX_FLAG_SHARED`)
@@ -233,6 +233,44 @@ reserved holes from implemented privileged paths.
   their condition. (Before FUTEX-WAIT-ATOMIC1 the word was compared before the registration and
   read again after it; a wake or requeue between the two did not see the waiter, and one after
   the registration could still take it although the word had already moved.)
+- **Timed waits (FUTEX-TIME1).** `FutexWait(addr, expected, flags | FUTEX_FLAG_TIMED, timeout_ns)`.
+  - *Units.* `timeout_ns` is a RELATIVE duration in nanoseconds, a full `u64`, measured from the
+    wait's admission. There is no user-visible clock in ABI v11, and the timeout needs none: the
+    kernel turns the duration into a deadline on its own scheduler tick when the call is admitted.
+    `0` is a deadline at admission (a matching word times out at once; a differing word still
+    answers `0`). Any other value becomes `ceil(timeout_ns / period) + 1` ticks, where `period` is
+    the CPU timer's tick (0.8 s on x86_64, 50 ms on AArch64, 10 ms on RISC-V — each derived from the
+    same constant that programs the timer). The `+ 1` absorbs the partial tick the wait is admitted
+    in, so the timeout is a LOWER bound: the wait never times out before `timeout_ns` has elapsed,
+    and may end later (tick granularity, masked sections, scheduling latency). A deadline that would
+    overflow the tick counter is `InvalidArgs`. The ABI version stays `11`: the bit was reserved,
+    and untimed waits are unchanged (slot 3 is not read without the flag).
+  - *Results.* `0`: the word did not hold `expected` (nothing parked, whatever the timeout).
+    `1` (`Ok(true)`): a wake — `FutexWake`, the wake portion of `FutexCmpRequeue`, or a robust exit
+    wake — claimed this wait. `TimedOut` (code `9`): the deadline claimed it. Exactly one of the two
+    claims a cycle; `1` is never returned because a timed wait merely stopped blocking. On x86_64 the
+    error is in the error lane; on AArch64 and RISC-V `ret0 > 1` is the error code.
+  - *Arbitration.* The deadline is attached to the waiter's record inside the same
+    compare-and-register hold, after the comparison (a differing word wins) and after a clock read
+    (a deadline already reached is `TimedOut` with nothing published). From then on a wake, a
+    requeue, the timeout, exit and teardown all act on the record under the task lock, by its exact
+    `{slot, generation}` token: whichever claims first ends the cycle, and every later claimant
+    finds nothing. A requeue moves the record with its deadline: the wait times out on the target
+    word, or is woken there. A requeue whose wake portion has already committed to the waiter owns
+    it; the timeout skips it.
+  - *Capacity.* A timeout, like a wake, claims only after it has reserved a run-queue slot on the
+    waiter's home CPU. If that queue is full, the timeout still wins: the record moves to a key
+    private to the kernel (no user wake or requeue can reach it), the task stays blocked — never
+    runnable without a queue slot — and a later collector pass places it once room appears; the
+    call then returns `TimedOut`.
+  - *Who ends a wait.* A bounded collector runs on every CPU's trap tail and in the kernel timer
+    thread, including on idle CPUs (each CPU's timer keeps firing while it idles; the scheduler clock
+    is advanced by CPU 0's). It examines at most 64 timed records per pass, resumes from a cursor, and
+    hands out at most 8 due waiters, so every timed wait is examined within a bounded number of
+    passes. No user thread has to run or poll for a timeout to fire.
+  - *Lifetime.* Exit, reap and address-space teardown retire the record with its deadline; a
+    reused slot or TID can never receive another cycle's result (each timed cycle carries its own
+    wait generation).
 - `FutexWake` wakes up to `count` waiters of the key `addr` resolves to in the caller's address
   space, oldest first, and returns how many it woke. `count = 0` wakes nobody.
 - **Every waiter counted is placed (FUTEX-WAKE-CAP1).** A waiter is claimed only after a run-queue
@@ -561,13 +599,17 @@ after its `ecall` (the bridge advances `sepc` once, at trap entry), whichever wa
 
 - **through its own trap** (it never left the CPU): from the frame's return fields;
 - **after it parked** (it left the CPU and a later dispatch resumes its saved context): from that
-  context. A class whose result is final when the caller leaves the CPU — `FutexWait` (`1`: a parked
-  wait is resumed only after a wake, or a requeue and a wake, claimed it) and `Yield` (`0`) — has
+  context. A class whose result is final when the caller leaves the CPU — an untimed `FutexWait`
+  (`1`: a parked wait is resumed only after a wake, or a requeue and a wake, claimed it) and `Yield`
+  (`0`) — has
   its result committed into the frame's `a0..a2` register and argument lanes immediately before the
   park capture (`riscv_commit_final_park_result`), so every resume arm installs it. A blocking IPC
   receive or send is NOT committed at the park: its result belongs to the completion that ends it
   (a delivery, a timeout, a server death), which publishes it into the saved context or parks an
-  exact `{tid, asid, generation}` record the resume consumes;
+  exact `{tid, asid, generation}` record the resume consumes. A TIMED `FutexWait` (FUTEX-TIME1) is
+  in the second group on every architecture: its result is not known when it parks, so its frame
+  carries a fail-closed provisional (`Internal`), and the claim that ends it (wake or timeout)
+  publishes `1` or `TimedOut` as the generation-bearing completion the resume boundary consumes;
 - **after an asynchronous preemption**: the interrupted register file, verbatim — no syscall result
   is substituted.
 
