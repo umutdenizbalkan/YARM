@@ -413,6 +413,26 @@ this clock.
   read takes no lock. The copy uses only the caller's VM and memory seams (ranks 5 and 6). The
   realtime writer claims the sequence with one compare-and-swap; it does not spin.
 
+### Userspace clock fast path (VDSO-TIME1): deferred
+
+Clock reads go through NR 18. A shared-clock page or ELF vDSO would let userspace skip the trap,
+but it is **deferred**, because its prerequisites cannot be proven in this tree (audit:
+SCHED-TIME-FOUNDATION1 D):
+
+| prerequisite | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| user-mode counter read | `rdtsc` is not trapped (`CR4.TSD` clear), but the TSC is not proven synchronized or invariant across CPUs (`qemu64` reports no invariant TSC), and a fast path must not read it directly across CPUs | `CNTKCTL_EL1` is never configured, so `EL0PCTEN`/`EL0VCTEN` keep their reset value and an EL0 read of the counter traps | `scounteren.TM` is never set, so U-mode `rdtime` traps; it also depends on firmware's `mcounteren`, which the kernel cannot establish |
+| kernel-owned read-only page in every address space | no mechanism | no mechanism | no mechanism |
+| discovery of the page by userspace | no auxiliary vector, no startup-argument field | same | same |
+| page lifetime across fork / CoW / teardown and ASID reuse | unproven (the borrowed initramfs MemoryObject never frees its frames on teardown, a partial precedent, but fork and CoW of such a mapping are not covered) | same | same |
+
+The sequence-count publication a fast path would read already exists (the realtime offset
+seqcount, reads bounded at 64 retries). A future implementation needs the rows above
+established per port, a read-only mapping of one kernel page with a documented address
+contract, and a syscall fallback whenever the page's sequence is odd or its source is not
+proven synchronized. That is the only behaviour x86_64 may have until TSC synchronization is
+proven.
+
 ### Sleeping: `ClockNanosleep` (NR 20)
 
 `ClockNanosleep(clock_id, flags, req_ptr, rem_ptr)` blocks the caller until `CLOCK_MONOTONIC`
