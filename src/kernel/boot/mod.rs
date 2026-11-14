@@ -1731,7 +1731,10 @@ pub(crate) fn riscv_commit_final_park_result(
         return false;
     }
     let nr = frame.syscall_num();
-    let final_result = (nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+    // SCHED-TIME-FOUNDATION1 C: NR 20 parks through the same FutexWait deferral, so its parked
+    // provisional is committed to the return lanes exactly as NR 9's (RISCV-PARK-RET1).
+    let final_result = ((nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+        || nr == crate::kernel::syscall::SYSCALL_CLOCK_NANOSLEEP_NR)
         && futex == Some(outgoing))
         || (nr == crate::kernel::syscall::SYSCALL_YIELD_NR
             && futex.is_none()

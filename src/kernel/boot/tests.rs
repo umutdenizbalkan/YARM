@@ -27699,7 +27699,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -36985,7 +36985,7 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -39073,7 +39073,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39200,7 +39200,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39375,7 +39375,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39532,7 +39532,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39668,7 +39668,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39831,7 +39831,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40013,7 +40013,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40237,7 +40237,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40473,7 +40473,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40605,7 +40605,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40782,7 +40782,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40978,7 +40978,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -41419,7 +41419,7 @@ mod stage148_decomposition_map {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 25,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 26,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41863,7 +41863,7 @@ mod stage150_ipc_abi_extraction {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 25,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 26,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -42094,7 +42094,7 @@ mod stage151_ipc_abi_boundary_audit {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 25,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 26,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -42230,7 +42230,7 @@ mod stage152_syscall_decomposition_completeness_audit {
         );
     }
 
-    // 5. Syscall::VARIANT_COUNT == 25 preserved.
+    // 5. Syscall::VARIANT_COUNT == 26 preserved.
     #[test]
     fn stage152_variant_count_is_23() {
         assert!(
@@ -64193,11 +64193,26 @@ mod stage191d_futex_wait_block_publish {
 
         // The route settles `ValueChanged` as the not-blocked answer it is: the deferral it
         // reserved is released and the caller's own frame answers `set_ok(0, 0, 0)`.
-        let body = SPLIT_SRC
-            .split("fn try_split_futex_wait_recognized(")
-            .nth(1)
-            .and_then(|s| s.split("\n}\n").next())
-            .expect("the recognized NR 9 body");
+        // SCHED-TIME-FOUNDATION1 C re-derivation: from admission on, the NR 9 route is THE
+        // FutexWait family's shared park tail (NR 20 `ClockNanosleep` uses it too), to which the
+        // recognized body hands off; the route is the two read together.
+        let body = {
+            let front = SPLIT_SRC
+                .split("fn try_split_futex_wait_recognized(")
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .expect("the recognized NR 9 body");
+            assert!(
+                front.contains("split_futex_park_tail("),
+                "the recognized NR 9 body ends in the shared park tail"
+            );
+            let tail = SPLIT_SRC
+                .split("fn split_futex_park_tail(")
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .expect("the shared park tail");
+            alloc::format!("{front}{tail}")
+        };
         let arm = body
             .split("FutexParkOutcome::ValueChanged => {")
             .nth(1)
@@ -64488,11 +64503,26 @@ mod stage191d_futex_wait_block_publish {
 
         // The route's ORDER is what makes the above the whole story: both refusals precede the
         // park, and both settle rather than hand the trap to the broad dispatcher.
-        let body = SPLIT_SRC
-            .split("fn try_split_futex_wait_recognized(")
-            .nth(1)
-            .and_then(|s| s.split("\n}\n").next())
-            .expect("the recognized NR 9 body");
+        // SCHED-TIME-FOUNDATION1 C re-derivation: from admission on, the NR 9 route is THE
+        // FutexWait family's shared park tail (NR 20 `ClockNanosleep` uses it too), to which the
+        // recognized body hands off; the route is the two read together.
+        let body = {
+            let front = SPLIT_SRC
+                .split("fn try_split_futex_wait_recognized(")
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .expect("the recognized NR 9 body");
+            assert!(
+                front.contains("split_futex_park_tail("),
+                "the recognized NR 9 body ends in the shared park tail"
+            );
+            let tail = SPLIT_SRC
+                .split("fn split_futex_park_tail(")
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .expect("the shared park tail");
+            alloc::format!("{front}{tail}")
+        };
         let already = body
             .find("settle_futex_cannot_park(cpu, tid, \"already_deferred\")")
             .expect("the already-deferred settlement");
@@ -64504,7 +64534,7 @@ mod stage191d_futex_wait_block_publish {
             // FUTEX-TIME1 re-derivation: THE park transaction is the timed one, carrying the
             // deadline the route converted at admission (`None` for an untimed wait).
             .find(
-                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, args.kind, deadline)",
+                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, deadline)",
             )
             .expect("the park transaction");
         assert!(
@@ -64629,11 +64659,26 @@ mod stage191d_futex_wait_block_publish {
 
         // The tolerance is EXACT: only `IncomingUnavailable` is let through; every other refusal
         // is an invariant failure.
-        let body = SPLIT_SRC
-            .split("fn try_split_futex_wait_recognized(")
-            .nth(1)
-            .and_then(|s| s.split("\n}\n").next())
-            .expect("the recognized NR 9 body");
+        // SCHED-TIME-FOUNDATION1 C re-derivation: from admission on, the NR 9 route is THE
+        // FutexWait family's shared park tail (NR 20 `ClockNanosleep` uses it too), to which the
+        // recognized body hands off; the route is the two read together.
+        let body = {
+            let front = SPLIT_SRC
+                .split("fn try_split_futex_wait_recognized(")
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .expect("the recognized NR 9 body");
+            assert!(
+                front.contains("split_futex_park_tail("),
+                "the recognized NR 9 body ends in the shared park tail"
+            );
+            let tail = SPLIT_SRC
+                .split("fn split_futex_park_tail(")
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .expect("the shared park tail");
+            alloc::format!("{front}{tail}")
+        };
         assert!(
             body.contains("QueueAdvanceRefusal::IncomingUnavailable"),
             "the one tolerated refusal is named, not matched by a wildcard"
@@ -77471,7 +77516,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -78004,7 +78049,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -78164,7 +78209,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -78234,7 +78279,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -78821,7 +78866,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -79056,7 +79101,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -79361,7 +79406,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -79420,7 +79465,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -79931,7 +79976,7 @@ mod stage197b_nr27_removed_zc_mandatory {
             Err(SyscallError::InvalidNumber)
         ));
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(Syscall::VARIANT_COUNT, 25);
+        assert_eq!(Syscall::VARIANT_COUNT, 26);
         // Needles are split so these assertions do not match themselves via include_str!.
         let variant_decl = concat!("InitramfsRead", "Chunk = ");
         let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
@@ -80391,7 +80436,7 @@ mod stage197b_riscv_typed_idle_outcome {
     #[test]
     fn baseline_and_cohort_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
         assert!(matches!(
             crate::kernel::syscall::Syscall::decode(27),
             Err(crate::kernel::syscall::SyscallError::InvalidNumber)
@@ -102411,8 +102456,8 @@ mod stage200d0a_exit_foundation {
     #[test]
     fn d03_nr27_and_free_numbers_remain_unassigned() {
         // FUTEX-REQUEUE1 (ABI v11) assigned 17, the lowest number of the reserved gap;
-        // SCHED-TIME-FOUNDATION1 (ABI v12) the next two, 18 and 19.
-        for free in [20usize, 21, 22, 24, 25, 26, 27] {
+        // SCHED-TIME-FOUNDATION1 (ABI v12) the next three, 18, 19 and 20.
+        for free in [21usize, 22, 24, 25, 26, 27] {
             assert!(
                 Syscall::decode(free).is_err(),
                 "number {free} must remain unassigned"
@@ -102436,8 +102481,8 @@ mod stage200d0a_exit_foundation {
     /// enum's own declaration count parsed from source.
     #[test]
     fn d04_variant_list_is_exhaustive_and_derived() {
-        assert_eq!(Syscall::VARIANT_COUNT, 25);
-        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 25);
+        assert_eq!(Syscall::VARIANT_COUNT, 26);
+        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 26);
         assert!(
             SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
         );
@@ -103441,7 +103486,7 @@ mod stage200d0b3_x86_exit_corrected {
         assert!(b.contains("EXIT_TASK_RESTORE_OWNER_PREPARED"));
         assert!(b.contains("EXIT_TASK_ABSENCE_VALIDATED arch=x86_64"));
         // No new task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
     }
 
     // ── feature gating (22) ─────────────────────────────────────────────────────────
@@ -104648,7 +104693,7 @@ mod stage200d0c1_aarch64_exit_prep {
             "offline-CPU refusal is preserved by the transaction"
         );
         // No general-purpose task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
     }
 
     // ── U3 (canonical 203C): the validation reacquisition retirement ────────────────
@@ -105880,7 +105925,7 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(txn.contains("Some(bound) => bound == asid,"));
         assert!(c.contains("identity=tid_asid"));
         assert!(c.contains("frame_source=0"));
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 25);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
     }
 
     // ── 29–32: runner static contract and feature-off ───────────────────────────────
@@ -118002,6 +118047,9 @@ mod stage199d_riscv_canonical_admission {
             // shape); without them the clock syscalls would take the terminal broad edge here.
             "SYSCALL_CLOCK_GETTIME_NR",
             "SYSCALL_CLOCK_SET_REALTIME_NR",
+            // SCHED-TIME-FOUNDATION1 C: NR 20 `ClockNanosleep`, the FutexWait family's second
+            // switching member — NR 9's own park tail and deferral, so NR 9's drain finalizes it.
+            "SYSCALL_CLOCK_NANOSLEEP_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -118014,7 +118062,7 @@ mod stage199d_riscv_canonical_admission {
         // is what stops a twenty-first arriving without its own justification.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            23,
+            24,
             "exactly twenty-three literal NRs (FUTEX-REQUEUE1 added FutexCmpRequeue, \
              SCHED-TIME-FOUNDATION1 ClockGetTime and ClockSetRealtime) plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, (U9-RECV-FINAL §1) IpcRecv, IpcSend, \
@@ -122782,7 +122830,10 @@ mod stage199d_wa2a_ownership_boundary {
             ("src/kernel/boot/exit_claim.rs", 3),
             // FUTEX-FOUND1: the keyed futex owners (see exec_state.rs above).
             // FUTEX-TIME1: 3 -> 4 — the timeout claim (`claim_futex_timeout_locked`).
-            ("src/kernel/boot/futex.rs", 4),
+            // SCHED-TIME-FOUNDATION1 C: 4 -> 5 — `sleep_witness_kill_locked`, the default-off
+            // `sched-time-witness` exit fixture (`Blocked(Futex(token))` on a Sleep record ->
+            // `Dead`); compiled into no production kernel.
+            ("src/kernel/boot/futex.rs", 5),
             // U9-IRQ-UNKNOWN1 §2: 9 -> 8. `signal_notification` and
             // `wake_destroyed_notification_waiter` had a status writer each, applying the same
             // rule twice; both now reach one owner, `wake_notification_waiter_exact`, so the
@@ -122927,7 +122978,8 @@ mod stage199d_wa2a_ownership_boundary {
             found.iter().map(|(_, n)| n).sum::<usize>(),
             // FUTEX-FOUND1: 41 -> 39 — five futex writes became the three keyed owners.
             // FUTEX-TIME1: 39 -> 40 — the timeout claim.
-            40,
+            // SCHED-TIME-FOUNDATION1 C: 40 -> 41 — the sleep witness exit fixture.
+            41,
             "40 raw writes — FUTEX-TIME1 added the timeout claim `claim_futex_timeout_locked`, \
              39 -> 40, a new terminal owner of a futex wait cycle — \
              39 before it — U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex \
@@ -123672,6 +123724,16 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::IntoBlocked,
         ),
+        // SCHED-TIME-FOUNDATION1 C: the sleep witness's exit fixture (`sched-time-witness` only):
+        // `Blocked(Futex(token)) -> Dead` for a TCB whose token names a live `FutexKey::Sleep`
+        // record. Its let-else refuses every other status before any write, so it can never act
+        // on a `Blocked(EndpointReceive)` task.
+        (
+            "src/kernel/boot/futex.rs",
+            "sleep_witness_kill_locked",
+            1,
+            Verdict::Cannot,
+        ),
         // THE wake claim: `Blocked(Futex(token)) -> Runnable`, for a TCB holding exactly the
         // token of a record on the woken key. It can never act on a `Blocked(EndpointReceive)`
         // task (the proof is in `every_cannot_row_pins_its_guard_and_its_caller_closure`).
@@ -123975,6 +124037,15 @@ mod stage199d_wa2b_wake_owner_census {
             "TaskStatus::Runnable",
             "};",
             "table.retire(slot);",
+        ),
+        (
+            // SCHED-TIME-FOUNDATION1 C: the witness exit fixture, after its token-exact guards.
+            "src/kernel/boot/futex.rs",
+            "sleep_witness_kill_locked",
+            "tcb.status",
+            "TaskStatus::Dead",
+            "}",
+            "let generation = tcb.futex_wait_generation;",
         ),
         (
             "src/kernel/boot/ipc_state.rs",
@@ -124319,7 +124390,8 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            36,
+            // SCHED-TIME-FOUNDATION1 C: 36 -> 37 — the sleep witness exit fixture.
+            37,
             "FUTEX-TIME1: 35 -> 36 — the timeout claim `claim_futex_timeout_locked` is a genuinely \
              new writer: a new terminal owner of a futex wait cycle. \
              FUTEX-FOUND1: 37 -> 35 — the five futex writes (two broad, three split) became the \
@@ -124410,7 +124482,8 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            46,
+            // SCHED-TIME-FOUNDATION1 C: 46 -> 47 — a new CANNOT writer, the witness exit fixture.
+            47,
             "FUTEX-TIME1: 45 -> 46, the timeout claim is a new CANNOT writer. \
              FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
              U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex registration, 46 -> 47, \
@@ -124439,7 +124512,8 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            46,
+            // SCHED-TIME-FOUNDATION1 C: 46 -> 47 — the sleep witness exit fixture.
+            47,
             "FUTEX-TIME1: 45 -> 46, the timeout claim is a new writer. \
              FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
              U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, 46 -> 47 — the \
@@ -124801,7 +124875,8 @@ mod stage199d_wa2b_wake_owner_census {
         // FUTEX-TIME1: 45 -> 46 — CANNOT 18 -> 19 (the timeout claim).
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            46,
+            // SCHED-TIME-FOUNDATION1 C: 46 -> 47 — CANNOT +1 (the sleep witness exit fixture).
+            47,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -124871,7 +124946,8 @@ mod stage199d_wa2b_wake_owner_census {
             //
             // FUTEX-TIME1: CANNOT 18 -> 19. The timeout claim is a new terminal owner of a futex
             // wait cycle, CANNOT for the same reason as the wake claim (token-exact filter).
-            (15, 19, 9, 2, 1)
+            // SCHED-TIME-FOUNDATION1 C: CANNOT 19 -> 20 — the sleep witness exit fixture.
+            (15, 20, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -124934,6 +125010,15 @@ mod stage199d_wa2b_wake_owner_census {
                 "claim_futex_timeout_locked",
                 "t.tid.0 == rec.tid && t.status == TaskStatus::Blocked(WaitReason::Futex(token))",
                 "table.token(slot) != candidate.token",
+            ),
+            // SCHED-TIME-FOUNDATION1 C: the sleep witness's exit fixture. Guard: only a
+            // `Blocked(Futex(token))` TCB; closure: the token must be the current incarnation of
+            // a live Sleep record.
+            (
+                "futex.rs",
+                "sleep_witness_kill_locked",
+                "let TaskStatus::Blocked(WaitReason::Futex(token)) = tcb.status else {",
+                "table.token(slot) != token",
             ),
             (
                 "exec_state.rs",
@@ -141900,7 +141985,9 @@ mod u3_post_exit_replacement_restore_transaction {
                 let blocked_generation = match class {
                     BlockedSyscallClass::IpcRecv => t.blocked_recv_generation,
                     BlockedSyscallClass::IpcSend => t.blocked_send_generation,
-                    BlockedSyscallClass::FutexWait => t.futex_wait_generation,
+                    BlockedSyscallClass::FutexWait | BlockedSyscallClass::Sleep => {
+                        t.futex_wait_generation
+                    }
                 };
                 t.pending_syscall_completion = Some(BlockedSyscallCompletion {
                     syscall_class: class,
@@ -149333,7 +149420,7 @@ mod u9qa_split_dispatch_disposition {
             // FUTEX-TIME1 re-derivation: THE park transaction is the timed one, carrying the
             // deadline the route converted at admission (`None` for an untimed wait).
             .find(
-                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, args.kind, deadline)",
+                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, deadline)",
             )
             .expect("the park transaction");
         assert!(
@@ -214933,6 +215020,675 @@ mod futex_requeue1 {
     /// terminal outcome, among the timeout, `FutexWake`, the NR 17 wake portion, task exit and
     /// the waiter's own publication. Every race is driven deterministically through the phase
     /// hooks and an explicit collector clock; nothing sleeps.
+    /// SCHED-TIME-FOUNDATION1 C (SLEEP1) — `ClockNanosleep` (NR 20) as a blocked-task lifecycle on
+    /// the FUTEX-TIME1 waiter table and collector, on its own kernel-private `FutexKey::Sleep`
+    /// key, with a `CLOCK_MONOTONIC` nanosecond deadline. The hosted counter runs at 1 GHz (one
+    /// unit per nanosecond) and every test holds the clock lock.
+    mod sleep1 {
+        use super::*;
+        use crate::kernel::boot::futex::FutexTimeoutPass;
+        use crate::kernel::syscall::SYSCALL_CLOCK_NANOSLEEP_NR as NR;
+        use crate::kernel::syscall::SyscallError;
+        use crate::kernel::task::{BlockedSyscallClass, BlockedSyscallCompletion};
+        use crate::kernel::timekeeping::{self as tk, ClockId, SourceKind, Timespec};
+        use crate::kernel::trapframe::TrapFrame;
+
+        const MONO: usize = 1;
+        const RT: usize = 0;
+        const ABS: usize = 1;
+        /// The request, on A's private page at `SQ`.
+        const REQ: usize = SQ + 0x100;
+        const REM: usize = SQ + 0x200;
+        const INTERNAL: usize = 255;
+
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            tk::CLOCK_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        }
+        fn at(ns: u64) {
+            crate::arch::clock::HOSTED_COUNTER.store(ns, core::sync::atomic::Ordering::Release);
+        }
+        fn clock(ns: u64) -> std::sync::MutexGuard<'static, ()> {
+            let g = lock();
+            at(0);
+            tk::force_source_for_test(1_000_000_000, 0, SourceKind::Hosted);
+            at(ns);
+            g
+        }
+        fn req(s: &mut KernelState, tid: u64, ts: Timespec) {
+            s.write_user_memory(tid, REQ, &ts.to_bytes())
+                .expect("request");
+        }
+        fn ts(ns: u64) -> Timespec {
+            Timespec::from_ns(ns)
+        }
+        /// NR 20 through the broad dispatcher, as `tid` (current). `Ok(frame)` or the error.
+        fn sleep(
+            s: &mut KernelState,
+            clock_id: usize,
+            flags: usize,
+            rem: usize,
+        ) -> Result<TrapFrame, SyscallError> {
+            let mut f = TrapFrame::new(NR, [clock_id, flags, REQ, rem, 0, 0]);
+            crate::kernel::syscall::dispatch(s, &mut f)?;
+            Ok(f)
+        }
+        /// A new task of A, current, that asks to sleep `t` on `clock_id`/`flags`.
+        fn sleeper(w: &mut W, clock_id: usize, flags: usize, t: Timespec) -> (u64, TrapFrame) {
+            let tid = w.next;
+            w.next += 1;
+            task(&mut w.s, tid, w.a);
+            run(&mut w.s, tid);
+            req(&mut w.s, tid, t);
+            let f = sleep(&mut w.s, clock_id, flags, 0).expect("sleep admitted");
+            (tid, f)
+        }
+        fn blocked_provisional(f: &TrapFrame) -> bool {
+            (f.ret0, f.error) == (0, INTERNAL)
+        }
+        fn immediate(f: &TrapFrame) -> bool {
+            (f.ret0, f.ret1, f.ret2, f.error) == (0, 0, 0, 0)
+        }
+        fn completion(s: &KernelState, t: u64) -> Option<BlockedSyscallCompletion> {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|x| x.tid.0 == t)
+                    .and_then(|x| x.pending_syscall_completion)
+            })
+        }
+        /// Placed once, with exactly one `Sleep` completion of success.
+        fn slept(s: &KernelState, t: u64) -> bool {
+            placed(s, t)
+                && completion(s, t).is_some_and(|c| {
+                    c.syscall_class == BlockedSyscallClass::Sleep
+                        && c.result == 0
+                        && c.result_register() == 0
+                })
+        }
+        fn collect(k: &SharedKernel) -> FutexTimeoutPass {
+            k.run_due_futex_timeouts_at(CpuId(0), k.scheduler_clock_now())
+        }
+        fn sleep_key(s: &mut KernelState, t: u64) -> Option<FutexKey> {
+            let token = token_of(s, t)?;
+            s.with_task_futex_mut(|_tcbs, table| table.key_of(token))
+        }
+        fn fill(s: &mut KernelState, a: Asid, base: u64) -> Vec<u64> {
+            let mut fillers = Vec::new();
+            for i in 0..200u64 {
+                let t = base + i;
+                s.register_task(t).expect("task");
+                s.bind_task_asid(t, a).expect("bind");
+                s.set_task_status_for_test(t, TaskStatus::Runnable);
+                s.seed_resumable_user_context_for_test(t);
+                s.set_task_home_cpu(t, CpuId(0)).expect("home");
+                if s.enqueue_task(t).is_err() {
+                    s.set_task_status_for_test(
+                        t,
+                        TaskStatus::Blocked(WaitReason::Join(ThreadId(1))),
+                    );
+                    return fillers;
+                }
+                fillers.push(t);
+            }
+            panic!("the queue never filled");
+        }
+
+        /// 1 — the decode refuses, in order, an unknown clock, an undefined flag, a null or
+        /// misaligned request and a misaligned remaining pointer; `0` and an aligned remaining
+        /// pointer are accepted.
+        #[test]
+        fn c01_decode_refusals() {
+            use crate::kernel::syscall::clock::decode_clock_nanosleep;
+            let f = |a: [usize; 6]| decode_clock_nanosleep(&TrapFrame::new(NR, a));
+            for bad in [
+                [2, 0, REQ, 0, 0, 0],
+                [MONO, 2, REQ, 0, 0, 0],
+                [MONO, 0, 0, 0, 0, 0],
+                [MONO, 0, REQ + 4, 0, 0, 0],
+                [MONO, 0, REQ, REM + 4, 0, 0],
+                [MONO, 0, usize::MAX - 7, 0, 0, 0],
+            ] {
+                assert_eq!(f(bad), Err(SyscallError::InvalidArgs), "{bad:?}");
+            }
+            let ok = f([MONO, ABS, REQ, REM, 0, 0]).expect("valid");
+            assert!(ok.absolute && ok.clock == ClockId::Monotonic && ok.rem == REM);
+            assert!(!f([RT, 0, REQ, 0, 0, 0]).expect("valid").absolute);
+        }
+
+        /// 2 — the check order after the decode, and every refusal publishes nothing: an
+        /// unreadable request is `PageFault`, an unnormalized or negative one `InvalidArgs`, an
+        /// uninitialized realtime clock `Unavailable` (relative and absolute alike).
+        #[test]
+        fn c02_refusals_are_explicit_and_publish_nothing() {
+            let _g = clock(1_000);
+            let mut w = world(80000);
+            let t = w.next;
+            task(&mut w.s, t, w.a);
+            run(&mut w.s, t);
+            let mut f = TrapFrame::new(NR, [MONO, 0, 0x5_0000, 0, 0, 0]);
+            assert_eq!(
+                crate::kernel::syscall::dispatch(&mut w.s, &mut f),
+                Err(SyscallError::PageFault)
+            );
+            for bad in [
+                Timespec {
+                    sec: 0,
+                    nsec: 1_000_000_000,
+                },
+                Timespec { sec: 0, nsec: -1 },
+                Timespec { sec: -1, nsec: 0 },
+            ] {
+                req(&mut w.s, t, bad);
+                assert_eq!(
+                    sleep(&mut w.s, MONO, 0, 0).err(),
+                    Some(SyscallError::InvalidArgs)
+                );
+            }
+            req(&mut w.s, t, ts(10));
+            for flags in [0, ABS] {
+                assert_eq!(
+                    sleep(&mut w.s, RT, flags, 0).err(),
+                    Some(SyscallError::Unavailable),
+                    "no realtime epoch, no realtime sleep"
+                );
+            }
+            assert_eq!(w.s.current_tid(), Some(t));
+            assert_eq!(w.s.task_status(t), Some(TaskStatus::Running));
+            assert_eq!(occupied(&mut w.s), 0, "nothing registered");
+        }
+
+        /// 3 — case 1, a zero-duration sleep, and an absolute deadline already passed: `0` at
+        /// once, nothing parked, the caller still current.
+        #[test]
+        fn c03_zero_and_already_expired_return_at_once() {
+            let _g = clock(5_000);
+            let mut w = world(80100);
+            let (t, f) = sleeper(&mut w, MONO, 0, ts(0));
+            assert!(immediate(&f), "{f:?}");
+            assert_eq!(w.s.current_tid(), Some(t));
+            req(&mut w.s, t, ts(4_999));
+            assert!(immediate(&sleep(&mut w.s, MONO, ABS, 0).expect("past")));
+            req(&mut w.s, t, ts(5_000));
+            assert!(immediate(&sleep(&mut w.s, MONO, ABS, 0).expect("now")));
+            assert_eq!(w.s.task_status(t), Some(TaskStatus::Running));
+            assert_eq!(occupied(&mut w.s), 0);
+        }
+
+        /// 4 — cases 2 and 12: a relative sleep blocks on its own `Sleep` key with the fail-closed
+        /// provisional in its frame; it is NEVER completed before its deadline (one nanosecond
+        /// short), and at the deadline it is placed once with a `Sleep` completion whose result
+        /// register is `0`.
+        #[test]
+        fn c04_relative_sleep_blocks_and_never_ends_early() {
+            let _g = clock(1_000);
+            let mut w = world(80200);
+            let (t, f) = sleeper(&mut w, MONO, 0, ts(500));
+            assert!(blocked_provisional(&f), "{f:?}");
+            assert!(parked(&w.s, t));
+            assert_eq!(sleep_key(&mut w.s, t), Some(FutexKey::Sleep { tid: t }));
+            assert_eq!(placement(&w.s, t), TaskPlacement::Nowhere);
+            let k = leak(w.s);
+            at(1_499);
+            assert_eq!(collect(k).timed_out, 0, "one nanosecond early: never");
+            k.with(|s| assert!(parked(s, t)));
+            at(1_500);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| assert!(slept(s, t), "placed once, success"));
+        }
+
+        /// 5 — cases 3 and 4: a longer relative sleep and an absolute monotonic one each end at
+        /// their own deadline.
+        #[test]
+        fn c05_longer_relative_and_absolute_monotonic() {
+            let _g = clock(10_000);
+            let mut w = world(80300);
+            let (long, _) = sleeper(&mut w, MONO, 0, ts(2_000_000_000));
+            let (abs, _) = sleeper(&mut w, MONO, ABS, ts(50_000));
+            w.back();
+            let k = leak(w.s);
+            at(49_999);
+            assert_eq!(collect(k).timed_out, 0);
+            at(50_000);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| {
+                assert!(slept(s, abs));
+                assert!(parked(s, long));
+            });
+            at(2_000_009_999);
+            assert_eq!(collect(k).timed_out, 0);
+            at(2_000_010_000);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| assert!(slept(s, long)));
+        }
+
+        /// 6 — case 5: two sleepers with different deadlines complete in deadline order, each
+        /// exactly once, whatever their registration order.
+        #[test]
+        fn c06_two_sleepers_different_deadlines() {
+            let _g = clock(0);
+            let mut w = world(80400);
+            let (late, _) = sleeper(&mut w, MONO, 0, ts(3_000));
+            let (early, _) = sleeper(&mut w, MONO, 0, ts(1_000));
+            w.back();
+            let k = leak(w.s);
+            at(1_000);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| {
+                assert!(slept(s, early));
+                assert!(parked(s, late));
+            });
+            at(3_000);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| assert!(slept(s, late)));
+            assert_eq!(collect(k), FutexTimeoutPass::default());
+        }
+
+        /// 7 — case 6: a task exiting before its deadline cancels the sleep; the collector never
+        /// resurrects it.
+        #[test]
+        fn c07_exit_before_deadline_is_never_resurrected() {
+            let _g = clock(0);
+            let mut w = world(80500);
+            let (t, _) = sleeper(&mut w, MONO, 0, ts(100));
+            w.back();
+            w.s.mark_task_dead(t).expect("dead");
+            assert_eq!(occupied(&mut w.s), 0, "the record died with the task");
+            let k = leak(w.s);
+            at(1_000);
+            assert_eq!(collect(k), FutexTimeoutPass::default());
+            k.with(|s| {
+                assert_eq!(s.task_status(t), Some(TaskStatus::Dead));
+                assert_eq!(placement(s, t), TaskPlacement::Nowhere);
+                assert_eq!(completion(s, t), None);
+            });
+        }
+
+        /// 8 — cases 7 and "no double completion": the deadline of a finished cycle cannot end
+        /// the next one (exact token), repeated passes complete a cycle once, and the parked
+        /// completion carries this cycle's generation.
+        #[test]
+        fn c08_stale_generation_and_no_double_completion() {
+            let _g = clock(0);
+            let mut w = world(80600);
+            let (t, _) = sleeper(&mut w, MONO, 0, ts(100));
+            let first = token_of(&w.s, t).expect("cycle 1");
+            w.back();
+            let k = leak(w.s);
+            at(100);
+            assert_eq!(collect(k).timed_out, 1);
+            for _ in 0..3 {
+                assert_eq!(collect(k), FutexTimeoutPass::default(), "never twice");
+            }
+            let done1 = k
+                .with(|s| s.take_resume_completion(t))
+                .expect("cycle 1 result");
+            assert_eq!(done1.syscall_class, BlockedSyscallClass::Sleep);
+            // Cycle 2.
+            k.with(|s| {
+                run(s, t);
+                req(s, t, ts(1_000));
+                assert!(blocked_provisional(&sleep(s, MONO, 0, 0).expect("cycle 2")));
+            });
+            let second = k.with(|s| token_of(s, t)).expect("cycle 2");
+            assert_ne!(first, second, "a new cycle is a new token");
+            assert!(
+                done1.blocked_generation
+                    < k.with(|s| {
+                        s.with_tcbs(|tcbs| {
+                            tcbs.iter()
+                                .flatten()
+                                .find(|x| x.tid.0 == t)
+                                .unwrap()
+                                .futex_wait_generation
+                        })
+                    })
+            );
+            let stale = fx::FutexTimeoutCandidate {
+                tid: t,
+                token: first,
+                expired: true,
+            };
+            let claimed = k.with(|s| {
+                s.with_task_futex_mut(|tcbs, table| {
+                    fx::claim_futex_timeout_locked(tcbs.as_mut_slice(), table, stale, u64::MAX)
+                })
+            });
+            assert!(!claimed, "the stale cycle claims nothing");
+            k.with(|s| assert!(parked(s, t), "cycle 2 still sleeps"));
+            at(1_099);
+            assert_eq!(collect(k).timed_out, 0);
+            at(1_100);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| assert!(slept(s, t)));
+        }
+
+        /// 9 — case 8: a full home run queue. The deadline is reached but nothing can be placed:
+        /// the sleeper stays `Blocked` (never `Runnable` without a slot), nothing is reserved,
+        /// and the first pass with room places it once.
+        #[test]
+        fn c09_full_home_queue_keeps_the_placement_obligation() {
+            let _g = clock(0);
+            let mut w = world(80700);
+            let (t, _) = sleeper(&mut w, MONO, 0, ts(100));
+            w.back();
+            let a = w.a;
+            let fillers = fill(&mut w.s, a, 86000);
+            let k = leak(w.s);
+            at(100);
+            for _ in 0..3 {
+                let pass = collect(k);
+                assert_eq!(
+                    (pass.timed_out, pass.refused, pass.expired),
+                    (0, 1, 0),
+                    "{pass:?}"
+                );
+                k.with(|s| {
+                    assert!(parked(s, t), "still Blocked, still owed");
+                    assert_eq!(placement(s, t), TaskPlacement::Nowhere);
+                    assert_eq!(reserved(s), 0);
+                });
+            }
+            k.with(|s| {
+                assert_eq!(
+                    s.withdraw_queued_tid_on(CpuId(0), fillers[0]),
+                    crate::kernel::scheduler::WithdrawOutcome::Removed
+                );
+                s.set_task_status_for_test(
+                    fillers[0],
+                    TaskStatus::Blocked(WaitReason::Join(ThreadId(1))),
+                );
+            });
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| assert!(slept(s, t)));
+        }
+
+        /// 10 — no futex operation can reach a sleeper: it is on `FutexKey::Sleep`, which no
+        /// word resolves to.
+        #[test]
+        fn c10_futex_operations_never_reach_a_sleeper() {
+            let _g = clock(0);
+            let mut w = world(80800);
+            let (t, _) = sleeper(&mut w, MONO, 0, ts(100));
+            w.back();
+            for va in [SQ, MX, UQ, Y, REQ] {
+                assert_eq!(w.s.futex_wake(va & !3, u32::MAX, P), Ok(0), "{va:#x}");
+            }
+            assert!(parked(&w.s, t));
+            assert!(!FutexKey::Sleep { tid: t }.is_user_key());
+        }
+
+        /// 11 — realtime sleeps exist only after an authorized initialization; a relative
+        /// realtime sleep measures elapsed time, and an absolute one is converted once, at
+        /// admission, from one coherent realtime read.
+        #[test]
+        fn c11_realtime_sleeps_after_initialization() {
+            let _g = clock(1_000);
+            tk::set_realtime(Timespec {
+                sec: 1_700_000_000,
+                nsec: 0,
+            })
+            .expect("epoch");
+            let mut w = world(80900);
+            let (rel, f) = sleeper(&mut w, RT, 0, ts(200));
+            assert!(blocked_provisional(&f));
+            let target = Timespec {
+                sec: 1_700_000_000,
+                nsec: 500,
+            };
+            let (abs, _) = sleeper(&mut w, RT, ABS, target);
+            w.back();
+            let past = Timespec {
+                sec: 1_699_999_999,
+                nsec: 0,
+            };
+            req(&mut w.s, w.driver, past);
+            assert!(immediate(
+                &sleep(&mut w.s, RT, ABS, 0).expect("past realtime")
+            ));
+            let k = leak(w.s);
+            at(1_199);
+            assert_eq!(collect(k).timed_out, 0);
+            at(1_200);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| assert!(slept(s, rel) && parked(s, abs)));
+            at(1_500);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| assert!(slept(s, abs)));
+        }
+
+        /// 12 — deadline overflow: a duration beyond `u64` nanoseconds saturates (the sleep never
+        /// ends on its own) instead of wrapping into an early deadline.
+        #[test]
+        fn c12_deadline_overflow_saturates_never_wraps() {
+            let _g = clock(1_000);
+            let mut w = world(81000);
+            let (t, f) = sleeper(
+                &mut w,
+                MONO,
+                0,
+                Timespec {
+                    sec: i64::MAX,
+                    nsec: 999_999_999,
+                },
+            );
+            assert!(blocked_provisional(&f));
+            w.back();
+            let k = leak(w.s);
+            at(1 << 62);
+            assert_eq!(collect(k).timed_out, 0);
+            k.with(|s| assert!(parked(s, t)));
+        }
+
+        /// 13 — the deadline conversion itself.
+        #[test]
+        fn c13_sleep_deadline_conversion() {
+            use tk::ClockError as E;
+            let _g = clock(0);
+            let m = ClockId::Monotonic;
+            let r = ClockId::Realtime;
+            assert_eq!(tk::sleep_deadline_at(m, false, ts(5), 100), Ok(105));
+            assert_eq!(tk::sleep_deadline_at(m, true, ts(500), 100), Ok(500));
+            assert_eq!(
+                tk::sleep_deadline_at(m, true, ts(50), 100),
+                Ok(100),
+                "past is now"
+            );
+            assert_eq!(
+                tk::sleep_deadline_at(
+                    m,
+                    false,
+                    Timespec {
+                        sec: i64::MAX,
+                        nsec: 0
+                    },
+                    100
+                ),
+                Ok(u64::MAX)
+            );
+            assert_eq!(
+                tk::sleep_deadline_at(r, false, ts(5), 100),
+                Err(E::Unavailable)
+            );
+            assert_eq!(
+                tk::sleep_deadline_at(m, false, Timespec { sec: 0, nsec: -1 }, 100),
+                Err(E::Overflow)
+            );
+            tk::set_realtime_at(Timespec { sec: 10, nsec: 0 }, 100).expect("epoch");
+            assert_eq!(tk::sleep_deadline_at(r, false, ts(5), 200), Ok(205));
+            // Realtime at mono 200 is 10 s + 100 ns; 10 s + 1 µs is 900 ns later.
+            assert_eq!(
+                tk::sleep_deadline_at(
+                    r,
+                    true,
+                    Timespec {
+                        sec: 10,
+                        nsec: 1_000
+                    },
+                    200
+                ),
+                Ok(1_100)
+            );
+        }
+
+        /// 14 — the split park owner (the production route's) with the `Sleep` kind: a reached
+        /// deadline publishes nothing (`TimedOut`, answered `0` by the route); otherwise it parks
+        /// on the `Sleep` key and the collector ends it.
+        #[test]
+        fn c14_split_park_transaction_hosts_a_sleep() {
+            use crate::kernel::syscall::sched::FutexParkOutcome as O;
+            let _g = clock(1_000);
+            let mut w = world(81100);
+            let t = w.next;
+            task(&mut w.s, t, w.a);
+            run(&mut w.s, t);
+            let a = w.a;
+            let k = leak(w.s);
+            assert_eq!(
+                k.futex_wait_park_exact_timed_split(
+                    CpuId(0),
+                    t,
+                    a,
+                    0,
+                    0,
+                    FutexKind::Sleep,
+                    Some(1_000)
+                ),
+                O::TimedOut
+            );
+            k.with(|s| {
+                assert_eq!(s.task_status(t), Some(TaskStatus::Running));
+                assert_eq!(occupied(s), 0);
+            });
+            let o = k.futex_wait_park_exact_timed_split(
+                CpuId(0),
+                t,
+                a,
+                0,
+                0,
+                FutexKind::Sleep,
+                Some(2_000),
+            );
+            assert!(matches!(o, O::Parked { .. }), "{o:?}");
+            k.with(|s| assert_eq!(sleep_key(s, t), Some(FutexKey::Sleep { tid: t })));
+            at(2_000);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| assert!(slept(s, t)));
+        }
+
+        /// 15 — a word wait can never be registered with a nanosecond deadline, nor a sleep
+        /// without one (the registration refuses both and writes nothing).
+        #[test]
+        fn c15_mismatched_timing_is_refused_before_any_write() {
+            use crate::kernel::boot::futex::{
+                FutexCompareRegisterRefusal as Refused, FutexWaitTiming,
+            };
+            let _g = clock(0);
+            let mut w = world(81200);
+            let t = w.next;
+            task(&mut w.s, t, w.a);
+            run(&mut w.s, t);
+            let a = w.a;
+            for (kind, timing) in [
+                (P, FutexWaitTiming::MonotonicNs { deadline_ns: 10 }),
+                (FutexKind::Sleep, FutexWaitTiming::Untimed),
+            ] {
+                let r =
+                    w.s.with_task_futex_then_vm_memory_mut(|tcbs, _c, table, sp, m| {
+                        fx::compare_and_register_futex_waiter_locked(
+                            tcbs.as_mut_slice(),
+                            table,
+                            sp,
+                            m,
+                            t,
+                            a,
+                            SQ,
+                            5,
+                            kind,
+                            timing,
+                        )
+                    });
+                assert!(matches!(r, Err(Refused::Word(_))), "{r:?}");
+            }
+            assert_eq!(w.s.task_status(t), Some(TaskStatus::Running));
+            assert_eq!(occupied(&mut w.s), 0);
+            assert_eq!(
+                w.s.with_vm_then_memory_mut(|sp, m| fx::resolve_futex_key_locked(
+                    sp,
+                    m,
+                    a,
+                    SQ,
+                    FutexKind::Sleep
+                )),
+                Err(KernelError::WrongObject),
+                "a sleep resolves no word"
+            );
+        }
+
+        /// 16 — the remaining-time output is accepted and never written (no signals: nothing
+        /// interrupts a sleep).
+        #[test]
+        fn c16_remaining_output_is_never_written() {
+            let _g = clock(0);
+            let mut w = world(81300);
+            let t = w.next;
+            task(&mut w.s, t, w.a);
+            run(&mut w.s, t);
+            w.s.write_user_memory(t, REM, &[0xA5; 16]).expect("poison");
+            req(&mut w.s, t, ts(0));
+            assert!(immediate(
+                &sleep(&mut w.s, MONO, 0, REM).expect("zero with rem")
+            ));
+            req(&mut w.s, t, ts(10));
+            assert!(blocked_provisional(
+                &sleep(&mut w.s, MONO, 0, REM).expect("blocks")
+            ));
+            let k = leak(w.s);
+            at(10);
+            assert_eq!(collect(k).timed_out, 1);
+            k.with(|s| {
+                assert!(slept(s, t));
+                assert_eq!(
+                    s.read_user_memory(t, REM, 16).expect("rem")[..16],
+                    [0xA5u8; 16]
+                );
+            });
+        }
+
+        /// 17 — the resume boundaries consume a `Sleep` completion exactly as a timed
+        /// `FutexWait` one: once, by the in-lock take, and it encodes `0`.
+        #[test]
+        fn c17_resume_consumes_the_sleep_completion_once() {
+            let _g = clock(0);
+            let mut w = world(81400);
+            let (t, _) = sleeper(&mut w, MONO, 0, ts(10));
+            w.back();
+            let k = leak(w.s);
+            at(10);
+            assert_eq!(collect(k).timed_out, 1);
+            let done = k.with(|s| s.take_resume_completion(t)).expect("consumed");
+            assert_eq!(
+                (
+                    done.syscall_class,
+                    done.result,
+                    done.success_ret0(),
+                    done.result_register()
+                ),
+                (BlockedSyscallClass::Sleep, 0, 0, 0)
+            );
+            assert!(done.consumed_with_send());
+            assert!(crate::kernel::task::resume_boundary_consumes(
+                BlockedSyscallClass::Sleep
+            ));
+            assert_eq!(
+                k.with(|s| s.take_resume_completion(t)),
+                None,
+                "exactly once"
+            );
+        }
+    }
+
     mod time1 {
         use super::*;
         use crate::kernel::boot::FutexWaitBroadOutcome as B;

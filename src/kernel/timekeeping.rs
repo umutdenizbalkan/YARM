@@ -346,6 +346,47 @@ pub fn realtime_initialized() -> bool {
     realtime_offset().is_some_and(|(init, _)| init)
 }
 
+/// SCHED-TIME-FOUNDATION1 C (SLEEP1) — the `CLOCK_MONOTONIC` instant (ns) at which a sleep on
+/// `clock` described by `ts` ends, for a sleep admitted at the monotonic instant `mono`.
+///
+/// * Relative (`absolute == false`): `mono + ts`, on either clock: a relative sleep measures
+///   elapsed time, which a realtime change does not alter.
+/// * Absolute `CLOCK_MONOTONIC`: `ts` itself.
+/// * Absolute `CLOCK_REALTIME`: the monotonic instant at which realtime reaches `ts`, converted
+///   ONCE here from one coherent realtime read at `mono` (`mono + (ts - realtime(mono))`). A later
+///   `ClockSetRealtime` does not move an admitted deadline.
+///
+/// `CLOCK_REALTIME` requires an initialized realtime clock (else `Unavailable`), in both modes, so
+/// a sleep is never measured against an epoch the kernel does not have. `ts` must be normalized
+/// and not negative (`Overflow`, which the syscall reports as `InvalidArgs`). A deadline already
+/// in the past is `mono` (the sleep is due at once); one beyond `u64` nanoseconds saturates to
+/// `u64::MAX` (the sleep never ends on its own — about 584 years).
+pub fn sleep_deadline_at(
+    clock: ClockId,
+    absolute: bool,
+    ts: Timespec,
+    mono: u64,
+) -> Result<u64, ClockError> {
+    if !ts.is_normalized() || ts.sec < 0 {
+        return Err(ClockError::Overflow);
+    }
+    let ts_ns = ts.to_signed_ns().ok_or(ClockError::Overflow)?;
+    let realtime_now = match clock {
+        ClockId::Realtime => Some(
+            realtime_at(mono)?
+                .to_signed_ns()
+                .ok_or(ClockError::Overflow)?,
+        ),
+        ClockId::Monotonic => None,
+    };
+    let target: i128 = match (absolute, realtime_now) {
+        (false, _) => mono as i128 + ts_ns,
+        (true, None) => ts_ns,
+        (true, Some(rt)) => mono as i128 + (ts_ns - rt),
+    };
+    Ok(target.clamp(mono as i128, u64::MAX as i128) as u64)
+}
+
 /// Boot: install the port's counter (BSP, before userspace) and report it.
 pub fn init_boot_clock() {
     match crate::arch::clock::discover_source() {

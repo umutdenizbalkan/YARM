@@ -1632,6 +1632,9 @@ pub fn handle_riscv_trap_entry_shared(
             || nr == crate::kernel::syscall::SYSCALL_CLOCK_GETTIME_NR
             || nr == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+            // SCHED-TIME-FOUNDATION1 C: ClockNanosleep (NR 20), the FutexWait family's second
+            // switching member (same park tail, same deferral).
+            || nr == crate::kernel::syscall::SYSCALL_CLOCK_NANOSLEEP_NR
             || nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
             // U9-RECV-FINAL §1: IpcRecv (NR 2). It was the ONE recognized IPC syscall this
             // whitelist still excluded, and the exclusion was the single largest residual in the

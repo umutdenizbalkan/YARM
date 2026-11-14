@@ -80,6 +80,8 @@ futex-wait-witness = []
 riscv-ecall-witness = []
 # FUTEX-TIME1: init's live timed-wait cell (selector 18, with futex-requeue-witness); inert elsewhere.
 futex-time-witness = []
+# SCHED-TIME-FOUNDATION1 C — the live sleep witness (init cell; see the kernel feature).
+sched-time-witness = []
 riscv-uart-irq-witness = []
 aarch64-pl011-irq-witness = []
 # QEMU-SMP2: kernel-only witness; accepted and inert here so one feature list builds every image.

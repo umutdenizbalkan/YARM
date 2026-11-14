@@ -991,7 +991,10 @@ impl KernelState {
         // task -> vm -> memory hold — THE compare-and-register the split route uses. The broad
         // acquisition no longer excludes every waker (FutexWake and FutexCmpRequeue run off it),
         // so the domain locks are what order this wait against them.
-        super::futex::futex_word_range_check(addr)?;
+        // SCHED-TIME-FOUNDATION1 C: a sleep (`FutexKind::Sleep`, NR 20) names no word.
+        if kind != super::futex::FutexKind::Sleep {
+            super::futex::futex_word_range_check(addr)?;
+        }
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
         // FUTEX-TIME1: the broad route reads the (lock-free) clock immediately BEFORE its hold,
@@ -1001,9 +1004,14 @@ impl KernelState {
         // route — the production one — reads the clock inside its hold.
         let at_hold = self.scheduler_tick_now();
         let now = || at_hold;
-        let timing = match deadline {
-            None => super::futex::FutexWaitTiming::Untimed,
-            Some(deadline) => super::futex::FutexWaitTiming::Timed {
+        let timing = match (kind, deadline) {
+            (_, None) => super::futex::FutexWaitTiming::Untimed,
+            // SCHED-TIME-FOUNDATION1 C: a sleep's deadline is monotonic nanoseconds, and the
+            // registration reads that clock inside its own hold.
+            (super::futex::FutexKind::Sleep, Some(deadline_ns)) => {
+                super::futex::FutexWaitTiming::MonotonicNs { deadline_ns }
+            }
+            (_, Some(deadline)) => super::futex::FutexWaitTiming::Timed {
                 deadline,
                 now: &now,
             },

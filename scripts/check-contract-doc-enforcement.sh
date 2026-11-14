@@ -54,7 +54,7 @@ if (( abi_code >= 11 )); then
   rg -q '^\| `17` \| `FutexCmpRequeue` \| public' doc/SYSCALL_ABI.md
   rg -q 'v10 → v11 \(FUTEX-REQUEUE1\)' doc/SYSCALL_ABI.md
 fi
-# The v12 assignment (SCHED-TIME-FOUNDATION1): NR 18 ClockGetTime / NR 19 ClockSetRealtime in
+# The v12 assignment (SCHED-TIME-FOUNDATION1): NR 18 ClockGetTime / NR 19 ClockSetRealtime / NR 20 ClockNanosleep in
 # the kernel, the user runtime and the documented table; error code 11 Unavailable; the change note.
 if (( abi_code >= 12 )); then
   rg -q '^pub const SYSCALL_CLOCK_GETTIME_NR: usize = 18;$' src/kernel/syscall.rs
@@ -63,6 +63,9 @@ if (( abi_code >= 12 )); then
   rg -q '^    pub const SYSCALL_CLOCK_SET_REALTIME_NR: usize = 19;$' crates/yarm-user-rt/src/lib.rs
   rg -q '^\| `18` \| `ClockGetTime` \| public' doc/SYSCALL_ABI.md
   rg -q '^\| `19` \| `ClockSetRealtime` \| public' doc/SYSCALL_ABI.md
+  rg -q '^pub const SYSCALL_CLOCK_NANOSLEEP_NR: usize = 20;$' src/kernel/syscall.rs
+  rg -q '^    pub const SYSCALL_CLOCK_NANOSLEEP_NR: usize = 20;$' crates/yarm-user-rt/src/lib.rs
+  rg -q '^\| `20` \| `ClockNanosleep` \| public' doc/SYSCALL_ABI.md
   rg -q '^- `11`: `Unavailable`' doc/SYSCALL_ABI.md
   rg -q 'v11 → v12 \(SCHED-TIME-FOUNDATION1\)' doc/SYSCALL_ABI.md
 fi

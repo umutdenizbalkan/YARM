@@ -3438,6 +3438,9 @@ impl KernelState {
             .or_else(|| {
                 self.take_blocked_syscall_completion_of_class(tid, BlockedSyscallClass::FutexWait)
             })
+            .or_else(|| {
+                self.take_blocked_syscall_completion_of_class(tid, BlockedSyscallClass::Sleep)
+            })
     }
 
     /// U6 §2 — PUBLISH the completion of a blocked send, for the exact cycle a
@@ -3664,9 +3667,8 @@ impl KernelState {
                     crate::kernel::task::BlockedSyscallClass::IpcSend => {
                         tcb.blocked_send_generation
                     }
-                    crate::kernel::task::BlockedSyscallClass::FutexWait => {
-                        tcb.futex_wait_generation
-                    }
+                    crate::kernel::task::BlockedSyscallClass::FutexWait
+                    | crate::kernel::task::BlockedSyscallClass::Sleep => tcb.futex_wait_generation,
                 };
                 tcb.pending_syscall_completion =
                     Some(crate::kernel::task::BlockedSyscallCompletion {

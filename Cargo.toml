@@ -245,6 +245,9 @@ futex-wait-witness = []
 riscv-ecall-witness = []
 # FUTEX-TIME1 — the live timed-wait witness (default off; kernel markers + init role).
 futex-time-witness = []
+# SCHED-TIME-FOUNDATION1 C — the live sleep witness (default off; kernel markers, the exit and
+# kernel-thread fixtures of `kernel::sleep_witness`, and init's cell).
+sched-time-witness = []
 # QEMU-IRQ1: the first real external-interrupt witness — RISC-V UART0 -> PLIC -> YARM on QEMU
 # virt. Compiles the kernel-only device window install, the idle-origin supervisor-external
 # admission, the UART setup/drain fixture, the provisioning of init's notification + ring page, the

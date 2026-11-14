@@ -1679,12 +1679,22 @@ impl SharedKernel {
         asid: crate::kernel::vm::Asid,
     ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
         self.with_task_tcbs_split_mut(|tcbs| {
-            crate::kernel::task::take_blocked_syscall_completion_for(
+            use crate::kernel::task::{BlockedSyscallClass, take_blocked_syscall_completion_for};
+            // SCHED-TIME-FOUNDATION1 C: a sleep cycle's completion is the same kind of record.
+            take_blocked_syscall_completion_for(
                 tcbs,
                 tid,
                 Some(asid),
-                crate::kernel::task::BlockedSyscallClass::FutexWait,
+                BlockedSyscallClass::FutexWait,
             )
+            .or_else(|| {
+                take_blocked_syscall_completion_for(
+                    tcbs,
+                    tid,
+                    Some(asid),
+                    BlockedSyscallClass::Sleep,
+                )
+            })
         })
     }
 
@@ -14209,6 +14219,8 @@ impl SharedKernel {
     ) -> crate::kernel::boot::futex::FutexTimeoutPass {
         use crate::kernel::boot::futex::{self as fx, FutexTimeoutPass};
         use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
+        #[cfg(feature = "sched-time-witness")]
+        crate::kernel::sleep_witness::pass(self, cpu);
         let mut due = [None; fx::FUTEX_TIMEOUT_DUE_MAX];
         let (found, examined) = self.with_task_futex_split_mut(|tcbs, table| {
             fx::collect_due_futex_timeouts_locked(tcbs, table, now, &mut due)
@@ -14241,7 +14253,22 @@ impl SharedKernel {
                 .with_cpu_sched_split(home, |c| te::reserve_enqueue_on_cpu_locked(c, &plan))
                 .map_err(crate::kernel::boot::map_scheduler_error)
                 .and_then(|r| r);
+            #[cfg(feature = "sched-time-witness")]
+            let w_sleep = self.with_task_futex_split_mut(|tcbs, table| {
+                fx::sleep_witness_facts_locked(tcbs, table, candidate)
+            });
             if reserved.is_err() {
+                #[cfg(feature = "sched-time-witness")]
+                if let Some((g, d)) = w_sleep {
+                    crate::kernel::sleep_witness::refused(
+                        cpu.0,
+                        home.0,
+                        candidate.tid,
+                        g,
+                        d,
+                        crate::kernel::timekeeping::monotonic_ns().unwrap_or(0),
+                    );
+                }
                 // (3) The home queue cannot take it now: the timeout WINS anyway, and the
                 // placement is owed by a later pass. Nothing becomes `Runnable`.
                 let expired = !candidate.expired
@@ -14285,6 +14312,18 @@ impl SharedKernel {
                 #[cfg(feature = "futex-time-witness")]
                 fx::time_witness::lost(cpu.0, candidate.tid, w_gen);
                 continue;
+            }
+            #[cfg(feature = "sched-time-witness")]
+            if let Some((g, d)) = w_sleep {
+                crate::kernel::sleep_witness::done(
+                    cpu.0,
+                    home.0,
+                    candidate.tid,
+                    g,
+                    d,
+                    crate::kernel::timekeeping::monotonic_ns().unwrap_or(0),
+                    self.current_tid_split_read(cpu).unwrap_or(0),
+                );
             }
             #[cfg(feature = "futex-time-witness")]
             {
@@ -19016,9 +19055,13 @@ impl SharedKernel {
         // later change of the word is a later operation — one that wakes, moves or leaves it, as
         // its own sequential step would. Nothing here retracts a registration because of the word.
         let now = || self.scheduler_clock_now();
-        let timing = match deadline {
-            None => fx::FutexWaitTiming::Untimed,
-            Some(deadline) => fx::FutexWaitTiming::Timed {
+        let timing = match (kind, deadline) {
+            (_, None) => fx::FutexWaitTiming::Untimed,
+            // SCHED-TIME-FOUNDATION1 C: a sleep (NR 20) — monotonic nanoseconds, read in the hold.
+            (fx::FutexKind::Sleep, Some(deadline_ns)) => {
+                fx::FutexWaitTiming::MonotonicNs { deadline_ns }
+            }
+            (_, Some(deadline)) => fx::FutexWaitTiming::Timed {
                 deadline,
                 now: &now,
             },

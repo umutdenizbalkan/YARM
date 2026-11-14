@@ -542,6 +542,12 @@ pub enum BlockedSyscallClass {
     /// carries a fail-closed provisional and the terminal claim — a wake or the timeout — parks the
     /// real one here. Validated against `futex_wait_generation`.
     FutexWait,
+    /// SCHED-TIME-FOUNDATION1 C — a `ClockNanosleep` (NR 20) cycle. Like a timed `FutexWait` its
+    /// parked frame carries a fail-closed provisional, and its one terminal owner (the deadline)
+    /// parks the result here: success, `ret0 = 0`. It shares the futex waiter table, so it is
+    /// validated against the same `futex_wait_generation`, and it is consumed by every boundary
+    /// that consumes a `FutexWait` completion (one blocked cycle at a time: never both).
+    Sleep,
 }
 
 impl BlockedSyscallClass {
@@ -552,6 +558,7 @@ impl BlockedSyscallClass {
             Self::IpcRecv => "ipc_recv",
             Self::IpcSend => "ipc_send",
             Self::FutexWait => "futex_wait",
+            Self::Sleep => "sleep",
         }
     }
 }
@@ -564,7 +571,9 @@ impl BlockedSyscallCompletion {
     pub const fn success_ret0(&self) -> usize {
         match self.syscall_class {
             BlockedSyscallClass::FutexWait => 1,
-            BlockedSyscallClass::IpcRecv | BlockedSyscallClass::IpcSend => 0,
+            BlockedSyscallClass::IpcRecv
+            | BlockedSyscallClass::IpcSend
+            | BlockedSyscallClass::Sleep => 0,
         }
     }
 
@@ -585,7 +594,9 @@ impl BlockedSyscallCompletion {
     pub const fn consumed_with_send(&self) -> bool {
         matches!(
             self.syscall_class,
-            BlockedSyscallClass::IpcSend | BlockedSyscallClass::FutexWait
+            BlockedSyscallClass::IpcSend
+                | BlockedSyscallClass::FutexWait
+                | BlockedSyscallClass::Sleep
         )
     }
 }
@@ -814,6 +825,8 @@ pub(crate) const fn resume_boundary_consumes(class: BlockedSyscallClass) -> bool
         BlockedSyscallClass::IpcSend => true,
         // FUTEX-TIME1: a timed FutexWait's result is consumed by the same boundaries, everywhere.
         BlockedSyscallClass::FutexWait => true,
+        // SCHED-TIME-FOUNDATION1 C: a sleep's result is consumed exactly where a timed wait's is.
+        BlockedSyscallClass::Sleep => true,
         BlockedSyscallClass::IpcRecv => {
             cfg!(any(
                 feature = "ipc-reply-timeout-oracle-core",
@@ -1079,9 +1092,18 @@ pub(crate) fn take_thread_restore_facts(
     // encoded by the class's own `result_register`.
     let send_completion =
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcSend);
-    let send_completion = send_completion.or_else(|| {
-        take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::FutexWait)
-    });
+    let send_completion = send_completion
+        .or_else(|| {
+            take_blocked_syscall_completion_for(
+                tcbs,
+                tid,
+                expect_asid,
+                BlockedSyscallClass::FutexWait,
+            )
+        })
+        .or_else(|| {
+            take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::Sleep)
+        });
     #[cfg(any(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
     let recv_completion =
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcRecv);
@@ -1111,7 +1133,9 @@ impl BlockedSyscallCompletion {
         let live_generation = match self.syscall_class {
             BlockedSyscallClass::IpcRecv => tcb.blocked_recv_generation,
             BlockedSyscallClass::IpcSend => tcb.blocked_send_generation,
-            BlockedSyscallClass::FutexWait => tcb.futex_wait_generation,
+            BlockedSyscallClass::FutexWait | BlockedSyscallClass::Sleep => {
+                tcb.futex_wait_generation
+            }
         };
         self.tid == tcb.tid.0
             && tcb.asid == Some(self.asid)

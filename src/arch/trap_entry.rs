@@ -4159,6 +4159,8 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // exact parked completion), and its Stage 195E drain has driven it live for that class
         // since it landed.
         || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+        // SCHED-TIME-FOUNDATION1 C: ClockNanosleep (NR 20) parks through NR 9's own route.
+        || raw_nr == crate::kernel::syscall::SYSCALL_CLOCK_NANOSLEEP_NR
         // U9-RX4 — IpcRecv (NR 2), admitted for exactly the reason NR 9 was, once the blocker
         // U9-RX3 recorded here was actually fixed rather than worked around.
         //
@@ -4429,6 +4431,8 @@ fn finalize_split_handled_syscall(
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_CLOCK_GETTIME_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+        // SCHED-TIME-FOUNDATION1 C: NR 20 parks through the FutexWait family.
+        || frame.syscall_num() == crate::kernel::syscall::SYSCALL_CLOCK_NANOSLEEP_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         || ((frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
             || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)

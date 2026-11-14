@@ -482,7 +482,13 @@ pub(crate) fn encode_x86_blocked_completion(
     } else {
         frame.set_err(done.result as usize);
     }
-    if done.syscall_class == crate::kernel::task::BlockedSyscallClass::FutexWait {
+    // SCHED-TIME-FOUNDATION1 C: a sleep completion resumes on the same boundaries, from the
+    // same provisional snapshot, so its result goes into the registers too.
+    if matches!(
+        done.syscall_class,
+        crate::kernel::task::BlockedSyscallClass::FutexWait
+            | crate::kernel::task::BlockedSyscallClass::Sleep
+    ) {
         frame.commit_x86_syscall_returns();
     }
 }

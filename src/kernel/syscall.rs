@@ -45,6 +45,9 @@ pub const SYSCALL_CLOCK_GETTIME_NR: usize = 18;
 /// `CLOCK_REALTIME`. A public slot, policy-gated like NR 8 (`SystemServer` only, else
 /// `MissingRight`).
 pub const SYSCALL_CLOCK_SET_REALTIME_NR: usize = 19;
+/// SCHED-TIME-FOUNDATION1 (ABI v12) — `ClockNanosleep(clock_id, flags, req_ptr, rem_ptr)` (checkpoint C):
+/// block until a `CLOCK_MONOTONIC` deadline. A SWITCHING class, parked like NR 9.
+pub const SYSCALL_CLOCK_NANOSLEEP_NR: usize = 20;
 
 /// Stage 200D-0A — the exit status recorded for a task that ended itself via NR 16.
 ///
@@ -435,6 +438,8 @@ pub enum Syscall {
     ClockGetTime = SYSCALL_CLOCK_GETTIME_NR,
     /// SCHED-TIME-FOUNDATION1 (ABI v12): initialize `CLOCK_REALTIME` (authorized callers only).
     ClockSetRealtime = SYSCALL_CLOCK_SET_REALTIME_NR,
+    /// SCHED-TIME-FOUNDATION1 (ABI v12): sleep until a relative or absolute clock deadline.
+    ClockNanosleep = SYSCALL_CLOCK_NANOSLEEP_NR,
 }
 
 /// Stage 200D-0A — the CANONICAL list of every `Syscall` variant.
@@ -467,6 +472,7 @@ pub const ALL_SYSCALL_VARIANTS: &[Syscall] = &[
     Syscall::FutexCmpRequeue,
     Syscall::ClockGetTime,
     Syscall::ClockSetRealtime,
+    Syscall::ClockNanosleep,
     Syscall::SpawnProcess,
     Syscall::CreateInitramfsFileSliceMo,
     Syscall::SpawnFromMemoryObject,
@@ -510,6 +516,7 @@ impl Syscall {
             SYSCALL_FUTEX_CMP_REQUEUE_NR => Ok(Self::FutexCmpRequeue),
             SYSCALL_CLOCK_GETTIME_NR => Ok(Self::ClockGetTime),
             SYSCALL_CLOCK_SET_REALTIME_NR => Ok(Self::ClockSetRealtime),
+            SYSCALL_CLOCK_NANOSLEEP_NR => Ok(Self::ClockNanosleep),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -2565,6 +2572,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::ExitCurrentTask => handle_exit_current_task(kernel, frame),
         Syscall::ClockGetTime => self::clock::handle_clock_gettime(kernel, frame),
         Syscall::ClockSetRealtime => self::clock::handle_clock_set_realtime(kernel, frame),
+        Syscall::ClockNanosleep => self::clock::handle_clock_nanosleep(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
@@ -2745,11 +2753,12 @@ mod tests {
     #[test]
     fn syscall_abi_numbers_are_frozen() {
         // FUTEX-REQUEUE1: v11 — NR 17 assigned from the reserved gap (doc/SYSCALL_ABI.md).
-        // SCHED-TIME-FOUNDATION1: v12 — NR 18 and NR 19 assigned next.
+        // SCHED-TIME-FOUNDATION1: v12 — NR 18, NR 19 and NR 20 assigned next.
         assert_eq!(SYSCALL_ABI_VERSION, 12);
         assert_eq!(SYSCALL_FUTEX_CMP_REQUEUE_NR, 17);
         assert_eq!(SYSCALL_CLOCK_GETTIME_NR, 18);
         assert_eq!(SYSCALL_CLOCK_SET_REALTIME_NR, 19);
+        assert_eq!(SYSCALL_CLOCK_NANOSLEEP_NR, 20);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4);
@@ -5884,7 +5893,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 2 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "D4 step 2 must not change syscall variant count"
         );
         assert!(
@@ -5950,7 +5959,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 3 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "D4 step 3 must not change syscall variant count"
         );
         assert!(
@@ -6019,7 +6028,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 4 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            25,
+            26,
             "D4 step 4 must not change syscall variant count"
         );
         assert!(

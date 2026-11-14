@@ -3777,6 +3777,525 @@ fn run_futex_time_witness(s_tid: u64) {
     w::run_once(s_tid, &children);
 }
 
+/// SCHED-TIME-FOUNDATION1 C — the live sleep / clock / rotation witness, selector 18 when init is
+/// built with `sched-time-witness` (it takes precedence over every other selector-18 cell). The
+/// kernel half is `kernel::sleep_witness` (markers, the exit fixture, the kernel-thread fixture);
+/// `scripts/grade-sched-time-witness.py` holds the rules. Threads of init:
+///
+/// | thread | role |
+/// |---|---|
+/// | W | the driver: issues every graded sleep and reports what ring 3 saw |
+/// | H | the helper: the concurrent sleep of case 5, the saturation of case 8, the release |
+/// | X | case 6's victim: one sleep the kernel fixture ends with the task |
+/// | F* | case 8's fillers: runnable threads that yield until released, then park |
+///
+/// Every sleep is bracketed by `CLOCK_MONOTONIC` reads in ring 3: `t0` before the call, `t1` after
+/// it returns. The deadline the kernel fixes is at least `t0 + req` (relative) or `req` (absolute),
+/// so a return with `t1` below that bound is a sleep that ended early, and the grader fails it.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "sched-time-witness"
+))]
+pub(super) mod sched_time_witness {
+    use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::SeqCst};
+    use yarm_user_rt::syscall::{
+        CLOCK_MONOTONIC, CLOCK_REALTIME, FutexScope, SyscallError, TIMER_ABSTIME, Timespec,
+        clock_gettime, clock_nanosleep, clock_set_realtime, futex_wait, futex_wake, yield_now,
+    };
+
+    const P: FutexScope = FutexScope::Private;
+    const MS: u64 = 1_000_000;
+    pub(super) const STACK_BYTES: usize = 16384;
+    pub(super) const FILLER_STACK_BYTES: usize = 2048;
+    /// Two full user queues (64 each), the top-up and slack: spawning stops at a refusal.
+    pub(super) const FILLERS: usize = 176;
+    /// W, H, X.
+    pub(super) const THREADS: usize = 3;
+    const BOUND: u32 = 4_000_000;
+    /// Case 6: longer than `sleep_witness::KILL_THRESHOLD_NS` (one hour).
+    const KILL_SLEEP_NS: u64 = 7_200_000_000_000;
+    /// Case 8: long enough for H to saturate every queue on the slowest port before it ends.
+    const Q_NS: u64 = 20_000 * MS;
+
+    #[repr(C, align(16))]
+    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; THREADS]);
+    #[allow(unused)]
+    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; THREADS]);
+    #[allow(unused)]
+    pub(super) static mut TLS: [[u8; 256]; THREADS] = [[0; 256]; THREADS];
+    #[repr(C, align(16))]
+    pub(super) struct FillerStacks(pub(super) [[u8; FILLER_STACK_BYTES]; FILLERS]);
+    #[allow(unused)]
+    pub(super) static mut FILLER_STACKS: FillerStacks =
+        FillerStacks([[0; FILLER_STACK_BYTES]; FILLERS]);
+    #[allow(unused)]
+    pub(super) static mut FILLER_TLS: [[u8; 64]; FILLERS] = [[0; 64]; FILLERS];
+    pub(super) static FILLER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+
+    static CMD: AtomicU32 = AtomicU32::new(0);
+    static PHASE: AtomicU32 = AtomicU32::new(0);
+    static ACK: AtomicU32 = AtomicU32::new(0);
+    static RELEASE: AtomicU32 = AtomicU32::new(0);
+    static PARKED: AtomicU32 = AtomicU32::new(0);
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    static PARK: AtomicU32 = AtomicU32::new(0);
+    static FAILS: AtomicU32 = AtomicU32::new(0);
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    static X_RETURNED: AtomicU32 = AtomicU32::new(0);
+    static Q_DEADLINE: AtomicU64 = AtomicU64::new(0);
+
+    const PH_TWO: u32 = 2;
+    const PH_KILL: u32 = 3;
+    const PH_SAT: u32 = 4;
+    const PH_END: u32 = 9;
+
+    fn park() -> ! {
+        loop {
+            let v = PARK.load(SeqCst);
+            let _ = futex_wait(PARK.as_ptr(), v, P);
+        }
+    }
+    fn fail(what: &str) {
+        FAILS.fetch_add(1, SeqCst);
+        yarm_user_rt::user_log!("STW_FAIL what={}", what);
+    }
+    fn mono() -> u64 {
+        clock_gettime(CLOCK_MONOTONIC)
+            .ok()
+            .and_then(|t| t.as_ns())
+            .unwrap_or(0)
+    }
+    fn now_on(clock: usize) -> u64 {
+        clock_gettime(clock)
+            .ok()
+            .and_then(|t| t.as_ns())
+            .unwrap_or(0)
+    }
+    fn code(r: Result<(), SyscallError>) -> u32 {
+        match r {
+            Ok(()) => 0,
+            Err(e) => e as u32,
+        }
+    }
+
+    /// One graded sleep. `req` is a duration (relative) or a time on `clock` (absolute). Logs the
+    /// call, then the return with both bracket reads on `clock` and the lower bound the kernel
+    /// must have honoured.
+    fn sl(case: &str, clock: usize, flags: usize, req: u64) -> bool {
+        let n = CALLS.fetch_add(1, SeqCst) + 1;
+        let t0 = now_on(clock);
+        let bound = if flags & TIMER_ABSTIME != 0 {
+            req
+        } else {
+            t0.saturating_add(req)
+        };
+        yarm_user_rt::user_log!(
+            "STW_CALL case={} n={} clock={} flags={} req={} t0={} bound={}",
+            case,
+            n,
+            clock,
+            flags,
+            req,
+            t0,
+            bound
+        );
+        let r = clock_nanosleep(clock, flags, &Timespec::from_ns(req), None);
+        let t1 = now_on(clock);
+        yarm_user_rt::user_log!(
+            "STW_RET case={} n={} code={} t0={} t1={} bound={} late_ns={}",
+            case,
+            n,
+            code(r),
+            t0,
+            t1,
+            bound,
+            t1.saturating_sub(bound)
+        );
+        let ok = r.is_ok() && t1 >= bound;
+        if !ok {
+            fail(case);
+        }
+        ok
+    }
+
+    fn expect_err(case: &str, clock: usize, flags: usize, ts: Timespec, want: SyscallError) {
+        let r = clock_nanosleep(clock, flags, &ts, None);
+        yarm_user_rt::user_log!(
+            "STW_ERR case={} code={} want={}",
+            case,
+            code(r),
+            want as u32
+        );
+        if r != Err(want) {
+            fail(case);
+        }
+    }
+
+    fn command(phase: u32) {
+        PHASE.store(phase, SeqCst);
+        ACK.store(0, SeqCst);
+        CMD.fetch_add(1, SeqCst);
+        let _ = futex_wake(CMD.as_ptr(), 8, P);
+    }
+    fn await_ack() {
+        let mut n = 0;
+        while ACK.load(SeqCst) == 0 && n < BOUND {
+            let _ = futex_wait(ACK.as_ptr(), 0, P);
+            n += 1;
+        }
+    }
+    fn ack() {
+        ACK.store(1, SeqCst);
+        let _ = futex_wake(ACK.as_ptr(), 1, P);
+    }
+
+    pub(super) extern "C" fn waiter_body() -> ! {
+        // S0 / case 12 — the clocks and the error lanes, before realtime exists.
+        let rt_before = clock_gettime(CLOCK_REALTIME);
+        yarm_user_rt::user_log!(
+            "STW_CLOCK rt_before={}",
+            match rt_before {
+                Ok(_) => 0,
+                Err(e) => e as u32,
+            }
+        );
+        if rt_before != Err(SyscallError::Unavailable) {
+            fail("rt_before");
+        }
+        let one_ms = Timespec::from_ns(MS);
+        expect_err(
+            "rt_uninit_rel",
+            CLOCK_REALTIME,
+            0,
+            one_ms,
+            SyscallError::Unavailable,
+        );
+        expect_err(
+            "rt_uninit_abs",
+            CLOCK_REALTIME,
+            TIMER_ABSTIME,
+            one_ms,
+            SyscallError::Unavailable,
+        );
+        expect_err("bad_clock", 7, 0, one_ms, SyscallError::InvalidArgs);
+        expect_err(
+            "bad_flags",
+            CLOCK_MONOTONIC,
+            2,
+            one_ms,
+            SyscallError::InvalidArgs,
+        );
+        expect_err(
+            "bad_nsec",
+            CLOCK_MONOTONIC,
+            0,
+            Timespec {
+                sec: 0,
+                nsec: 1_000_000_000,
+            },
+            SyscallError::InvalidArgs,
+        );
+        let (m0, m1) = (mono(), mono());
+        yarm_user_rt::user_log!("STW_MONO m0={} m1={}", m0, m1);
+        if m0 == 0 || m1 < m0 {
+            fail("mono");
+        }
+        // Case 1 — zero; case 2 — short; case 3 — longer; case 4 — absolute monotonic (and a
+        // past absolute deadline).
+        sl("zero", CLOCK_MONOTONIC, 0, 0);
+        for _ in 0..3 {
+            sl("short", CLOCK_MONOTONIC, 0, MS);
+        }
+        sl("long", CLOCK_MONOTONIC, 0, 300 * MS);
+        sl("abs", CLOCK_MONOTONIC, TIMER_ABSTIME, mono() + 50 * MS);
+        sl(
+            "abs_past",
+            CLOCK_MONOTONIC,
+            TIMER_ABSTIME,
+            mono().saturating_sub(MS),
+        );
+        // Case 9 — H, X and init are blocked: only the kernel's clock ends these.
+        for _ in 0..3 {
+            sl("idle", CLOCK_MONOTONIC, 0, 100 * MS);
+        }
+        // Case 7 — back-to-back cycles: each a new generation, each completed exactly once.
+        for _ in 0..16 {
+            sl("cycle", CLOCK_MONOTONIC, 0, MS);
+        }
+        // Case 5 — two tasks, different deadlines (H's ends first).
+        command(PH_TWO);
+        sl("two_w", CLOCK_MONOTONIC, 0, 1800 * MS);
+        await_ack();
+        // Case 6 — X sleeps two hours; the kernel fixture ends X; W checks it never returns.
+        command(PH_KILL);
+        sl("kill_wait", CLOCK_MONOTONIC, 0, 500 * MS);
+        let xr = X_RETURNED.load(SeqCst);
+        yarm_user_rt::user_log!("STW_KILL_CHECK x_returned={}", xr);
+        if xr != 0 {
+            fail("kill");
+        }
+        // Realtime: initialize it (init is the control plane), then sleep on it.
+        let set = clock_set_realtime(Timespec {
+            sec: 1_700_000_000,
+            nsec: 0,
+        });
+        yarm_user_rt::user_log!("STW_RT_SET code={}", code(set));
+        if set.is_ok() {
+            sl("rt_rel", CLOCK_REALTIME, 0, 20 * MS);
+            sl(
+                "rt_abs",
+                CLOCK_REALTIME,
+                TIMER_ABSTIME,
+                now_on(CLOCK_REALTIME) + 30 * MS,
+            );
+        } else {
+            fail("rt_set");
+        }
+        // Case 8 — the home queue is full at the deadline; then every filler must get the CPU.
+        Q_DEADLINE.store(mono() + Q_NS, SeqCst);
+        command(PH_SAT);
+        sl("full", CLOCK_MONOTONIC, 0, Q_NS);
+        await_ack();
+        command(PH_END);
+        yarm_user_rt::user_log!(
+            "STW_WAITER_DONE calls={} fails={}",
+            CALLS.load(SeqCst),
+            FAILS.load(SeqCst)
+        );
+        DONE.store(1, SeqCst);
+        let _ = futex_wake(DONE.as_ptr(), 1, P);
+        park()
+    }
+
+    /// Case 8 for H: saturate (spawn until refused), top up after W has left its CPU, hold the
+    /// queues full past W's deadline, release, and wait until every filler has run again.
+    fn helper_saturate() {
+        let entry = FILLER_ENTRY.load(SeqCst);
+        let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
+        let mut spawned = 0usize;
+        let mut refusals = 0u32;
+        let spawn_until_refused = |spawned: &mut usize, refusals: &mut u32| {
+            while *spawned < FILLERS {
+                let i = *spawned;
+                let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
+                // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+                match unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) } {
+                    Ok(t) if t >= 10_000 => *spawned += 1,
+                    _ => {
+                        *refusals += 1;
+                        return;
+                    }
+                }
+            }
+        };
+        spawn_until_refused(&mut spawned, &mut refusals);
+        let first = spawned;
+        // Top up: W's sleep freed its slot; take it (and any other) back.
+        for _ in 0..64 {
+            let _ = yield_now();
+        }
+        spawn_until_refused(&mut spawned, &mut refusals);
+        let full_at = mono();
+        let deadline = Q_DEADLINE.load(SeqCst);
+        yarm_user_rt::user_log!(
+            "STW_SATURATED fillers={} first={} refusals={} full_at={} w_deadline={} early={}",
+            spawned,
+            first,
+            refusals,
+            full_at,
+            deadline,
+            u32::from(full_at < deadline)
+        );
+        if refusals < 2 || full_at >= deadline {
+            fail("saturate");
+        }
+        // Hold: stay runnable (rotation is what lets H run at all) until past W's deadline.
+        let mut n = 0u32;
+        while mono() < deadline + 2_000 * MS && n < BOUND {
+            let _ = yield_now();
+            n += 1;
+        }
+        RELEASE.store(1, SeqCst);
+        let mut waits = 0u32;
+        while (PARKED.load(SeqCst) as usize) < spawned && waits < BOUND {
+            let _ = yield_now();
+            waits += 1;
+        }
+        let parked = PARKED.load(SeqCst);
+        yarm_user_rt::user_log!(
+            "STW_ROTATION fillers={} parked={} holds={} waits={}",
+            spawned,
+            parked,
+            n,
+            waits
+        );
+        if (parked as usize) != spawned {
+            fail("rotation");
+        }
+        ack();
+    }
+
+    fn helper_phase(phase: u32) {
+        match phase {
+            PH_TWO => {
+                sl("two_h", CLOCK_MONOTONIC, 0, 100 * MS);
+                ack();
+            }
+            PH_SAT => helper_saturate(),
+            _ => {}
+        }
+    }
+
+    fn follower(on: impl Fn(u32)) -> ! {
+        let mut seen = 0;
+        loop {
+            let c = CMD.load(SeqCst);
+            if c == seen {
+                let _ = futex_wait(CMD.as_ptr(), c, P);
+                continue;
+            }
+            seen = c;
+            let phase = PHASE.load(SeqCst);
+            if phase == PH_END {
+                park();
+            }
+            on(phase);
+        }
+    }
+
+    pub(super) extern "C" fn helper_body() -> ! {
+        follower(helper_phase)
+    }
+
+    pub(super) extern "C" fn victim_body() -> ! {
+        follower(|phase| {
+            if phase == PH_KILL {
+                yarm_user_rt::user_log!("STW_X_SLEEP req={}", KILL_SLEEP_NS);
+                let r =
+                    clock_nanosleep(CLOCK_MONOTONIC, 0, &Timespec::from_ns(KILL_SLEEP_NS), None);
+                X_RETURNED.store(1, SeqCst);
+                yarm_user_rt::user_log!("STW_X_RETURNED code={}", code(r));
+            }
+        })
+    }
+
+    pub(super) extern "C" fn filler_body() -> ! {
+        while RELEASE.load(SeqCst) == 0 {
+            let _ = yield_now();
+        }
+        PARKED.fetch_add(1, SeqCst);
+        park()
+    }
+
+    pub(super) struct Child {
+        pub(super) entry: usize,
+        pub(super) stack_top: usize,
+        pub(super) tls_base: usize,
+    }
+
+    pub(super) fn run_once(s_tid: u64, children: &[Child; THREADS]) {
+        yarm_user_rt::user_log!("STW_BEGIN s_tid={} fillers_max={}", s_tid, FILLERS);
+        let mut tids = [0u64; THREADS];
+        // H and X first, so they are blocked on CMD before W's first sleep.
+        for i in [1, 2, 0] {
+            let c = &children[i];
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+            tids[i] =
+                unsafe { yarm_user_rt::syscall::spawn_thread(c.tls_base, c.stack_top, c.entry) }
+                    .unwrap_or(0);
+        }
+        yarm_user_rt::user_log!(
+            "STW_THREADS waiter={} helper={} victim={}",
+            tids[0],
+            tids[1],
+            tids[2]
+        );
+        let mut waits = 0;
+        while DONE.load(SeqCst) == 0 && waits < BOUND {
+            let _ = futex_wait(DONE.as_ptr(), 0, P);
+            waits += 1;
+        }
+        let fails = FAILS.load(SeqCst);
+        let ok = tids.iter().all(|&t| t != 0) && DONE.load(SeqCst) == 1 && fails == 0;
+        yarm_user_rt::user_log!(
+            "STW_DONE waiter={} helper={} victim={} calls={} fails={} result={}",
+            tids[0],
+            tids[1],
+            tids[2],
+            CALLS.load(SeqCst),
+            fails,
+            if ok { "ok" } else { "fail" }
+        );
+    }
+}
+
+/// x86_64 entry trampolines for the sleep witness (as for the timed-wait witness's).
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "sched-time-witness",
+    target_arch = "x86_64"
+))]
+mod x86_sched_time {
+    #[unsafe(naked)]
+    pub(super) extern "C" fn waiter_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::sched_time_witness::waiter_body)
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn helper_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::sched_time_witness::helper_body)
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn victim_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::sched_time_witness::victim_body)
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn filler_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::sched_time_witness::filler_body)
+    }
+}
+
+/// SCHED-TIME-FOUNDATION1 C — resolve this architecture's entries and stacks, and run the sleep
+/// witness.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "sched-time-witness"
+))]
+fn run_sched_time_witness(s_tid: u64) {
+    use core::sync::atomic::Ordering::SeqCst;
+    use sched_time_witness as w;
+    #[cfg(target_arch = "x86_64")]
+    let (entries, filler) = (
+        [
+            x86_sched_time::waiter_entry as *const () as usize,
+            x86_sched_time::helper_entry as *const () as usize,
+            x86_sched_time::victim_entry as *const () as usize,
+        ],
+        x86_sched_time::filler_entry as *const () as usize,
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let (entries, filler) = (
+        [
+            w::waiter_body as *const () as usize,
+            w::helper_body as *const () as usize,
+            w::victim_body as *const () as usize,
+        ],
+        w::filler_body as *const () as usize,
+    );
+    w::FILLER_ENTRY.store(filler, SeqCst);
+    let stacks = core::ptr::addr_of_mut!(w::STACKS) as usize;
+    let tls = core::ptr::addr_of_mut!(w::TLS) as usize;
+    let children: [w::Child; w::THREADS] = core::array::from_fn(|i| w::Child {
+        entry: entries[i],
+        stack_top: (stacks + (i + 1) * w::STACK_BYTES) & !0xF,
+        tls_base: tls + i * 256,
+    });
+    w::run_once(s_tid, &children);
+}
+
 /// RISCV-ECALL-A7-RET1 — the live RISC-V `ecall` register-contract witness, selector 18 when init
 /// is built with `riscv-ecall-witness` (RISC-V only; the kernel built with the same feature prints
 /// one `RISCV_ECALL_WITNESS_RESUME` marker per keyed write-back).
@@ -9223,21 +9742,27 @@ pub fn run() {
         // RISCV-ECALL-A7-RET1: built with `riscv-ecall-witness` (RISC-V), the same selector runs
         // the ecall register-contract witness instead.
         // FUTEX-TIME1: built with `futex-time-witness`, the timed-wait witness, before all three.
-        #[cfg(feature = "futex-time-witness")]
+        // SCHED-TIME-FOUNDATION1: built with `sched-time-witness`, the sleep witness, before all.
+        #[cfg(feature = "sched-time-witness")]
+        run_sched_time_witness(ctx.task_id);
+        #[cfg(all(not(feature = "sched-time-witness"), feature = "futex-time-witness"))]
         run_futex_time_witness(ctx.task_id);
         #[cfg(all(
+            not(feature = "sched-time-witness"),
             not(feature = "futex-time-witness"),
             feature = "riscv-ecall-witness",
             target_arch = "riscv64"
         ))]
         riscv_ecall_witness::run_once(ctx.task_id);
         #[cfg(all(
+            not(feature = "sched-time-witness"),
             not(feature = "futex-time-witness"),
             feature = "futex-wait-witness",
             not(all(feature = "riscv-ecall-witness", target_arch = "riscv64"))
         ))]
         run_futex_wait_witness(ctx.task_id);
         #[cfg(not(any(
+            feature = "sched-time-witness",
             feature = "futex-time-witness",
             feature = "futex-wait-witness",
             all(feature = "riscv-ecall-witness", target_arch = "riscv64")

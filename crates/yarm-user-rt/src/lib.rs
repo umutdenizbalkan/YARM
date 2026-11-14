@@ -85,6 +85,10 @@ pub mod syscall {
     /// Must match `kernel::syscall`.
     pub const SYSCALL_CLOCK_GETTIME_NR: usize = 18;
     pub const SYSCALL_CLOCK_SET_REALTIME_NR: usize = 19;
+    /// SCHED-TIME-FOUNDATION1 (ABI v12): `ClockNanosleep` (NR 20). Must match `kernel::syscall`.
+    pub const SYSCALL_CLOCK_NANOSLEEP_NR: usize = 20;
+    /// NR 20 flag: the request is an absolute time on its clock (`kernel::syscall::clock`).
+    pub const TIMER_ABSTIME: usize = 1;
     /// The clock ids (`kernel::timekeeping`).
     pub const CLOCK_REALTIME: usize = 0;
     pub const CLOCK_MONOTONIC: usize = 1;
@@ -1900,6 +1904,49 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
+    }
+
+    /// SCHED-TIME-FOUNDATION1 — NR 20: block until `CLOCK_MONOTONIC` reaches the deadline `req`
+    /// describes on `clock` — a duration by default, an absolute time with [`TIMER_ABSTIME`].
+    /// `CLOCK_REALTIME` requires an initialized realtime clock (`Err(Unavailable)` otherwise); an
+    /// absolute realtime deadline is converted once, at the call. `Ok(())` means the deadline has
+    /// been reached — never earlier. `rem` is the POSIX remaining-time output, written only when
+    /// a sleep is interrupted; the kernel has no signals, so nothing interrupts a sleep, `rem` is
+    /// never written and there is no `EINTR`.
+    #[inline]
+    pub fn clock_nanosleep(
+        clock: usize,
+        flags: usize,
+        req: &Timespec,
+        rem: Option<&mut Timespec>,
+    ) -> core::result::Result<(), SyscallError> {
+        let rem = rem.map_or(0, |r| r as *mut Timespec as usize);
+        // SAFETY: Uses architecture syscall ABI; the kernel reads 16 bytes from `req` and checks
+        // only the alignment of `rem`.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_CLOCK_NANOSLEEP_NR,
+                [clock, flags, req as *const Timespec as usize, rem, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
+    }
+
+    /// SCHED-TIME-FOUNDATION1 — sleep for the duration `req` (`clock_nanosleep` on
+    /// `CLOCK_MONOTONIC`, relative).
+    #[inline]
+    pub fn nanosleep(
+        req: &Timespec,
+        rem: Option<&mut Timespec>,
+    ) -> core::result::Result<(), SyscallError> {
+        clock_nanosleep(CLOCK_MONOTONIC, 0, req, rem)
     }
 
     /// Spawn a new user thread in the caller's address space (NR 11). `entry` is the

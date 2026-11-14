@@ -6,7 +6,14 @@ use crate::kernel::lock::SpinLockIrq;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 
-pub const PRB_SLOTS: usize = 128;
+/// The ring's record capacity. SCHED-TIME-FOUNDATION1: 128 -> 1024. The full-queue rotation
+/// repair lets a yield storm on a saturated CPU actually switch (each committed yield is a burst of
+/// about 25 records on RISC-V), and with 128 slots a burst on one CPU lapped the ring while the
+/// other CPU held the console drain: records were genuinely lost (announced by
+/// `PRINTK_RECORDS_LOST`), and the core smoke's one-to-one marker reconciliation — whose premise is
+/// a lossless stream — failed on a correct kernel. 1024 slots (about 200 KB of `.bss`) absorb those
+/// bursts; a lost record is still announced at the place it was lost.
+pub const PRB_SLOTS: usize = 1024;
 pub const PRB_MSG_MAX: usize = 192;
 const _: () = assert!(
     PRB_SLOTS.is_power_of_two(),
