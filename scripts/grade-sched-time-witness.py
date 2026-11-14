@@ -16,7 +16,9 @@ Markers fail closed: a damaged or unknown STW line fails the boot; nothing is re
 
 Rules (the brief's twelve cases):
   every call   code=0 and t1 >= bound (a sleep never ends early); a call with a future deadline
-               has exactly one REGISTER of its tid between CALL and RET, a generation strictly
+               (every case but zero / abs_past, and a `short` 1 ms call the kernel may already find
+               due, which then registers nothing) has exactly one REGISTER of its tid between CALL
+               and RET, a generation strictly
                above that tid's previous one, and exactly ONE DONE of (tid, gen) in the whole log,
                between REGISTER and RET, with now >= deadline; a zero / past call registers nothing.
   1 zero, 2 short x3, 3 long, 4 abs (and abs_past): present, as above.
@@ -27,7 +29,8 @@ Rules (the brief's twelve cases):
   8 full queue  at least one STW_SLEEP_REFUSED of the `full` cycle (its home queue refused a due
                placement), then its one DONE; STW_SATURATED early=1; STW_ROTATION parked=fillers.
   9 all blocked three `idle` calls during which no other thread of the cell logs anything.
-  10 cross-CPU  at least one DONE with cpu != home.
+  10 cross-CPU  eight `cross` sleeps while two spinner threads trap on (balanced placement
+               spreads them); at least one DONE in the whole log with cpu != home.
   11 kthreads   STW_KTHREAD_START ok, >= 2 beats, and at least one DONE between the first and the
                last beat.
   12 registers  every STW_ERR code == want (Unavailable before realtime, InvalidArgs for a bad clock,
@@ -64,10 +67,14 @@ U = {
     "WAITER_DONE": dict(calls=N, fails=N),
     "DONE": dict(waiter=N, helper=N, victim=N, calls=N, fails=N, result=r"ok|fail"),
     "FAIL": dict(what=r"\w+"),
+    "SPINNER": dict(tid=N),
 }
-COUNTS = dict(zero=1, short=3, long=1, abs=1, abs_past=1, idle=3, cycle=16, two_w=1, two_h=1,
+COUNTS = dict(zero=1, short=3, long=1, abs=1, abs_past=1, idle=3, cycle=16, cross=8, two_w=1, two_h=1,
               kill_wait=1, rt_rel=1, rt_abs=1, full=1)
 NO_REGISTER = {"zero", "abs_past"}
+# A 1 ms request may already be due when the kernel registers it (the registration reads the clock
+# inside its hold): a legal immediate return, with no registration and no completion.
+MAY_BE_DUE = {"short"}
 FATAL = ("KERNEL PANIC", "panicked at", "KTHREAD_STACK_OVERFLOW")
 
 
@@ -164,6 +171,9 @@ def grade(lines):
         if c["case"] in NO_REGISTER:
             if regs:
                 fail(f"call {c['n']} ({c['case']}): a due-at-once sleep registered")
+            graded.append(dict(c=c, r=r, g=None))
+            continue
+        if not regs and c["case"] in MAY_BE_DUE:
             graded.append(dict(c=c, r=r, g=None))
             continue
         if len(regs) != 1:
@@ -331,6 +341,10 @@ def synth():
         sleep(W, "idle", 100)
     for _ in range(16):
         sleep(W, "cycle", 10)
+    u(W, "STW_SPINNER tid=10013")
+    u(W, "STW_SPINNER tid=10014")
+    for _ in range(8):
+        sleep(W, "cross", 30)
     sleep(H, "two_h", 10)
     sleep(W, "two_w", 100)
     u(X, "STW_X_SLEEP req=7200000000000")

@@ -3815,8 +3815,11 @@ pub(super) mod sched_time_witness {
     const BOUND: u32 = 4_000_000;
     /// Case 6: longer than `sleep_witness::KILL_THRESHOLD_NS` (one hour).
     const KILL_SLEEP_NS: u64 = 7_200_000_000_000;
-    /// Case 8: long enough for H to saturate every queue on the slowest port before it ends.
-    const Q_NS: u64 = 20_000 * MS;
+    /// Case 8: long enough for H to saturate every queue on the slowest port before it ends. H
+    /// gets the CPU once per rotation through every yielding filler, so spawning ~130 of them takes
+    /// tens of seconds under RISC-V TCG (a 20 s deadline passed before the queues were full in a
+    /// development run); 120 s leaves margin on every port.
+    const Q_NS: u64 = 120_000 * MS;
 
     #[repr(C, align(16))]
     pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; THREADS]);
@@ -3838,12 +3841,20 @@ pub(super) mod sched_time_witness {
     static ACK: AtomicU32 = AtomicU32::new(0);
     static RELEASE: AtomicU32 = AtomicU32::new(0);
     static PARKED: AtomicU32 = AtomicU32::new(0);
+    /// Case 10's spinner entry (per architecture).
+    pub(super) static SPINNER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+    /// Case 10: two spinners, on the last two filler stacks (case 8 never reaches them).
+    const SPINNERS: usize = 2;
+    static SPIN_STOP: AtomicU32 = AtomicU32::new(0);
+    static SPINNING: AtomicU32 = AtomicU32::new(0);
     static DONE: AtomicU32 = AtomicU32::new(0);
     static PARK: AtomicU32 = AtomicU32::new(0);
     static FAILS: AtomicU32 = AtomicU32::new(0);
     static CALLS: AtomicU32 = AtomicU32::new(0);
     static X_RETURNED: AtomicU32 = AtomicU32::new(0);
     static Q_DEADLINE: AtomicU64 = AtomicU64::new(0);
+    /// Case 8: W is about to enter its sleep (H tops up only after this).
+    static Q_ENTERING: AtomicU32 = AtomicU32::new(0);
 
     const PH_TWO: u32 = 2;
     const PH_KILL: u32 = 3;
@@ -4019,10 +4030,34 @@ pub(super) mod sched_time_witness {
         for _ in 0..3 {
             sl("idle", CLOCK_MONOTONIC, 0, 100 * MS);
         }
-        // Case 7 — back-to-back cycles: each a new generation, each completed exactly once.
+        // Case 7 — back-to-back cycles: each a new generation, each completed exactly once. 20 ms
+        // so every one genuinely registers on the slowest port (a 1 ms request can be due before
+        // the kernel registers it, which is a legal immediate return).
         for _ in 0..16 {
-            sl("cycle", CLOCK_MONOTONIC, 0, MS);
+            sl("cycle", CLOCK_MONOTONIC, 0, 20 * MS);
         }
+        // Case 10 — cross-CPU placement: two spinners (balanced placement spreads them) keep
+        // trapping (every trap tail runs the collector) while W sleeps, so collectors on more
+        // than one CPU meet W's due cycles; the kernel's DONE markers record which CPU placed it.
+        let entry = SPINNER_ENTRY.load(SeqCst);
+        let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
+        for k in 0..SPINNERS {
+            let i = FILLERS - 1 - k;
+            let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+            let t = unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) };
+            yarm_user_rt::user_log!("STW_SPINNER tid={}", t.unwrap_or(0));
+        }
+        let mut n = 0u32;
+        while (SPINNING.load(SeqCst) as usize) < SPINNERS && n < BOUND {
+            let _ = yield_now();
+            n += 1;
+        }
+        for _ in 0..8 {
+            sl("cross", CLOCK_MONOTONIC, 0, 30 * MS);
+        }
+        SPIN_STOP.store(1, SeqCst);
         // Case 5 — two tasks, different deadlines (H's ends first).
         command(PH_TWO);
         sl("two_w", CLOCK_MONOTONIC, 0, 1800 * MS);
@@ -4055,6 +4090,7 @@ pub(super) mod sched_time_witness {
         // Case 8 — the home queue is full at the deadline; then every filler must get the CPU.
         Q_DEADLINE.store(mono() + Q_NS, SeqCst);
         command(PH_SAT);
+        Q_ENTERING.store(1, SeqCst);
         sl("full", CLOCK_MONOTONIC, 0, Q_NS);
         await_ack();
         command(PH_END);
@@ -4092,8 +4128,14 @@ pub(super) mod sched_time_witness {
         };
         spawn_until_refused(&mut spawned, &mut refusals);
         let first = spawned;
-        // Top up: W's sleep freed its slot; take it (and any other) back.
-        for _ in 0..64 {
+        // Top up: W's sleep freed its slot; take it (and any other) back, once W has entered its
+        // sleep (a couple of yields lets its park complete).
+        let mut n0 = 0u32;
+        while Q_ENTERING.load(SeqCst) == 0 && n0 < BOUND {
+            let _ = yield_now();
+            n0 += 1;
+        }
+        for _ in 0..2 {
             let _ = yield_now();
         }
         spawn_until_refused(&mut spawned, &mut refusals);
@@ -4181,6 +4223,14 @@ pub(super) mod sched_time_witness {
         })
     }
 
+    pub(super) extern "C" fn spinner_body() -> ! {
+        SPINNING.fetch_add(1, SeqCst);
+        while SPIN_STOP.load(SeqCst) == 0 {
+            let _ = mono();
+        }
+        park()
+    }
+
     pub(super) extern "C" fn filler_body() -> ! {
         while RELEASE.load(SeqCst) == 0 {
             let _ = yield_now();
@@ -4255,6 +4305,10 @@ mod x86_sched_time {
     pub(super) extern "C" fn filler_entry() -> ! {
         core::arch::naked_asm!("call {body}", "ud2", body = sym super::sched_time_witness::filler_body)
     }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn spinner_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::sched_time_witness::spinner_body)
+    }
 }
 
 /// SCHED-TIME-FOUNDATION1 C — resolve this architecture's entries and stacks, and run the sleep
@@ -4268,24 +4322,27 @@ fn run_sched_time_witness(s_tid: u64) {
     use core::sync::atomic::Ordering::SeqCst;
     use sched_time_witness as w;
     #[cfg(target_arch = "x86_64")]
-    let (entries, filler) = (
+    let (entries, filler, spinner) = (
         [
             x86_sched_time::waiter_entry as *const () as usize,
             x86_sched_time::helper_entry as *const () as usize,
             x86_sched_time::victim_entry as *const () as usize,
         ],
         x86_sched_time::filler_entry as *const () as usize,
+        x86_sched_time::spinner_entry as *const () as usize,
     );
     #[cfg(not(target_arch = "x86_64"))]
-    let (entries, filler) = (
+    let (entries, filler, spinner) = (
         [
             w::waiter_body as *const () as usize,
             w::helper_body as *const () as usize,
             w::victim_body as *const () as usize,
         ],
         w::filler_body as *const () as usize,
+        w::spinner_body as *const () as usize,
     );
     w::FILLER_ENTRY.store(filler, SeqCst);
+    w::SPINNER_ENTRY.store(spinner, SeqCst);
     let stacks = core::ptr::addr_of_mut!(w::STACKS) as usize;
     let tls = core::ptr::addr_of_mut!(w::TLS) as usize;
     let children: [w::Child; w::THREADS] = core::array::from_fn(|i| w::Child {
