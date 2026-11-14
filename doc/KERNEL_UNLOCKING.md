@@ -36390,3 +36390,76 @@ a CPU that activates A between the two). The witness grades the target decision,
 the remaining-hold observation; reclaim-after-ACK ordering is a source-and-hosted-test fact. Stale
 retention is QEMU's TLB model. One observer and one mutator in one address space; no new VM
 mechanism.
+
+#### SCHED-TIME-FOUNDATION1 (from delivered `8062c216`)
+
+One integrated stage in five checkpoints: two scheduler-capacity repairs that FUTEX-TIME1 had
+recorded as baseline debt, a nanosecond clock, sleeping syscalls and a proof-gated userspace clock
+fast path. Commits `SCHED-TIME-FOUNDATION1-A` … `-D` and `-QUAL` on `wip/sched-time-foundation1`.
+
+**A — SCHED-FULL-ROT1 (full-queue rotation).** On `8062c216` a CPU whose user queue at the current
+task's priority was full could not rotate: the three rotation owners
+(`PriorityScheduler::on_preempt_selection`, `preempt_reenqueue_only`,
+`on_preempt_prefer_selection`) re-enqueued the outgoing current through ordinary admission
+(`len + reserved < MAX_RUN_QUEUE`), the push was refused, and the current kept running while every
+queued task starved (reproduced: `sched_full_rot1_tests` r01–r14, 10 of 14 failing on the base, and
+`sfr1_k01` — one ordinary wake into the last slot stops rotation for good). The returning occupant
+already owns its CPU's room — it was dequeued to run and is counted in no queue while current — so
+the owners now return it through `requeue_current_with_priority`: `AlreadyQueued` and the ring's
+physical bound only. The bound per priority is `MAX_QUEUED_PER_PRIORITY = MAX_RUN_QUEUE +
+ROTATION_SLOTS (1) + KTHREAD_CAPACITY (32) = 97` (128 ring slots): user queued + reserved + the
+one user current at that priority never exceeds 65. Every other push (wake, spawn, placement) keeps
+its admission, so usable capacity and FUTEX-WAKE-CAP1's reservations are unchanged; nothing is
+nested, no all-CPU lock is taken, no retry added.
+
+**A — IPC-TIMEOUT-CAP1 (IPC timeout placement).** On `8062c216` the off-lock IPC timeout owners
+made the timed-out task `Runnable` under the task lock, then tried an ordinary enqueue and discarded
+a `QueueFull` — a `Runnable` task neither queued nor current (reproduced: `sched_time_foundation1_a_ipc`
+i01–i04, "Runnable but placed 0 times"). The four owners — the receive drain, the send drain,
+`complete_reply_timeout_over` and `complete_server_death_over` — now follow FUTEX-WAKE-CAP1's order:
+reserve the home slot (`reserve_ipc_wake_split`: plan, home, reservation), then claim, then commit
+the reserved slot (`commit_ipc_wake_split`); a refused reservation claims nothing
+(`ReplyTimeoutOutcome::PlacementDeferred`; markers `IPC_REPLY_TIMEOUT_PLACEMENT_DEFERRED`,
+`U7_SEND_TIMEOUT_PLACEMENT_DEFERRED`, `U8_RECV_TIMEOUT_PLACEMENT_DEFERRED`,
+`IPC_SERVER_DEATH_PLACEMENT_DEFERRED`), the deadline stays armed, and a later collector pass
+retries; a parked server death is re-parked claimable. Every non-claiming exit releases its
+reservation. `sr_wake_receiver_split` (shared-region delivery, not a timeout owner) has the same
+discard and is recorded as a deferred defect.
+
+**B — TIMEKEEP1.** `kernel::timekeeping`: `CLOCK_MONOTONIC` in nanoseconds from an origin sampled
+on the bootstrap CPU, separate from the scheduler tick (FutexWait / IPC / reply deadlines and quanta
+are unchanged); `CLOCK_REALTIME` an offset published under a sequence count, `Unavailable` until an
+authorized `ClockSetRealtime` (the kernel never invents an epoch). Sources by evidence, never a
+hard-coded rate (`arch::clock`): x86_64 TSC calibrated against the 8254 PIT (three 10 ms windows,
+median) and — not proven synchronized — clamped nondecreasing through one global `fetch_max`;
+AArch64 `CNTPCT_EL0` at `CNTFRQ_EL0`; RISC-V `time` at the device tree's
+`/cpus/timebase-frequency`. ABI v12: NR 18 `ClockGetTime`, NR 19 `ClockSetRealtime` (SystemServer
+only), error 11 `Unavailable`; both split from birth on every port; the user copy validates all 16
+bytes before writing one.
+
+**C — SLEEP1.** NR 20 `ClockNanosleep(clock_id, flags, req, rem)` (relative, `TIMER_ABSTIME`
+monotonic, realtime once initialized; `rem` never written — no signals, no `EINTR`). A sleep is its
+own cycle on the FUTEX-TIME1 waiter table: a kernel-private `FutexKey::Sleep { tid }` no word
+resolves to, `Blocked(Futex(token))`, `futex_wait_generation` advanced in the registration hold, a
+nanosecond `CLOCK_MONOTONIC` deadline read INSIDE every claim (never early), NR 9's park tail on
+both routes, reserve-before-claim placement (a refused one changes nothing and stays owed), and a
+`BlockedSyscallClass::Sleep` completion (`ret0 = 0`) every resume boundary consumes, including the
+x86_64 completion registers and RISCV-PARK-RET1's parked-return commit. Latency is bounded by the
+next collector pass (every trap tail, every kernel-thread return): at worst one period (x86_64
+0.8 s); finer x86_64 programming would break the tick-counted lower bounds and is documented as
+the integration point, not done. The printk ring grows 128 → 1024 records: the rotation repair
+lets a saturated yield storm actually switch, and the 128-slot ring lapped.
+
+**D — VDSO-TIME1: deferred** (proof gate; table in `SYSCALL_ABI.md`): no user-mode counter access
+is enabled on AArch64 or RISC-V, the x86_64 TSC is not proven synchronized, and there is no
+kernel-owned read-only page, discovery mechanism or fork/teardown lifetime for one. Only the vDSO is
+deferred; the syscall clock is the delivered implementation.
+
+**Evidence.** Baseline reproducers `stf-evidence/A/repro_*_baseline.log`; hosted tests
+`sched_full_rot1_tests` r01–r15, `futex_requeue1::sfr1_k01/k02`, `sched_time_foundation1_a_ipc`
+i01–i09, `timekeeping` b01–b12, `sched_time_foundation1_b_clock` s01–s07,
+`futex_requeue1::sleep1` c01–c17; negative controls ncA1–ncA10, ncB1–ncB7, ncC1–ncC10 (hosted) and
+ncL1–ncL2 (live); the live sched-time witness (`scripts/qemu-sched-time-witness-smoke.sh`, grader
+`scripts/grade-sched-time-witness.py`) covering the twelve sleep cases, the clock and error lanes,
+full-queue rotation and an IPC timeout deferral on all three ISAs. The frozen qualification and its
+results are recorded below once run.

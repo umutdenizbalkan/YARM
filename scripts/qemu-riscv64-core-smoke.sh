@@ -857,6 +857,18 @@ fi
 # switching class would mean returning through the parked caller's own frame.
 riscv_split_nr9_committed=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 .*result=queue_advance_committed" "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr9_committed=${riscv_split_nr9_committed:-0}
+# SCHED-TIME-FOUNDATION1 C: NR 20 (`ClockNanosleep`) is the FutexWait family's second switching
+# member — it parks through NR 9's own tail and drain, so the bridge prints the same committed
+# disposition for it (its parked provisional `a0` is `Internal`). The sum below is widened by exactly
+# this one term, and every NR 20 line must be a committed queue advance, exactly as NR 9's.
+riscv_split_nr20=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=20 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr20=${riscv_split_nr20:-0}
+riscv_split_nr20_committed=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=20 .*result=queue_advance_committed" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr20_committed=${riscv_split_nr20_committed:-0}
+if (( riscv_split_nr20 != riscv_split_nr20_committed )); then
+  echo "[fail] RISC-V ClockNanosleep split did not commit a queue advance (nr20=${riscv_split_nr20} committed=${riscv_split_nr20_committed})"
+  failures=$((failures + 1))
+fi
 if (( riscv_split_nr9 != riscv_split_nr9_committed )); then
   echo "[fail] RISC-V FutexWait split did not commit a queue advance (nr9=${riscv_split_nr9} committed=${riscv_split_nr9_committed})"
   failures=$((failures + 1))
@@ -976,8 +988,8 @@ if (( riscv_split_nr0 != riscv_yield_committed || riscv_split_nr0_unpaired != 0 
   failures=$((failures + 1))
 fi
 echo "[info] RISC-V NR 0 (Yield) split dispatches: ${riscv_split_nr0}, each paired with its committed yield"
-if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 + riscv_split_nr2 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 + riscv_split_nr0 )); then
-  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5} nr2=${riscv_split_nr2} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29} nr0=${riscv_split_nr0})"
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr20 + riscv_split_nr5 + riscv_split_nr2 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 + riscv_split_nr0 )); then
+  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr20=${riscv_split_nr20} nr5=${riscv_split_nr5} nr2=${riscv_split_nr2} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29} nr0=${riscv_split_nr0})"
   failures=$((failures + 1))
 fi
 rm -f "$LOGFILE"

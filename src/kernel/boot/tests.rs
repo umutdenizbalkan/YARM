@@ -215345,6 +215345,14 @@ mod futex_requeue1 {
                         })
                     })
             );
+            assert_eq!(
+                first.slot, second.slot,
+                "the new cycle reuses the slot (a new generation)"
+            );
+            at(1_099);
+            assert_eq!(collect(k).timed_out, 0);
+            // The NEW cycle is due now: only the token's generation can refuse the stale claim.
+            at(1_100);
             let stale = fx::FutexTimeoutCandidate {
                 tid: t,
                 token: first,
@@ -215355,11 +215363,11 @@ mod futex_requeue1 {
                     fx::claim_futex_timeout_locked(tcbs.as_mut_slice(), table, stale, u64::MAX)
                 })
             });
-            assert!(!claimed, "the stale cycle claims nothing");
+            assert!(
+                !claimed,
+                "the stale cycle claims nothing, even when its slot's cycle is due"
+            );
             k.with(|s| assert!(parked(s, t), "cycle 2 still sleeps"));
-            at(1_099);
-            assert_eq!(collect(k).timed_out, 0);
-            at(1_100);
             assert_eq!(collect(k).timed_out, 1);
             k.with(|s| assert!(slept(s, t)));
         }

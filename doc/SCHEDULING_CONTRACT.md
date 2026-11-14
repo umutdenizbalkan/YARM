@@ -83,6 +83,22 @@ They are never alternate dispatchers:
   FUTEX-REQUEUE1: a compare-and-requeue's MOVE needs no queue room at all — a moved waiter stays
   blocked and is placed only when a later wake of its new key reaches it, through the same
   reservation; only its wake portion can meet a full queue, and it reports that stop.
+  SCHED-TIME-FOUNDATION1 (SCHED-FULL-ROT1): a full user queue no longer stops ROTATION. The three
+  rotation owners (`on_preempt_selection`, `preempt_reenqueue_only`, `on_preempt_prefer_selection`)
+  return the outgoing current through `requeue_current_with_priority`, which bypasses ADMISSION
+  (`len + reserved < MAX_RUN_QUEUE`) — only `AlreadyQueued` and the ring's physical bound apply —
+  because the returning occupant already owns its CPU's room: it was dequeued to run, so it is
+  counted in no queue while current. The physical bound per priority is
+  `MAX_QUEUED_PER_PRIORITY = MAX_RUN_QUEUE + ROTATION_SLOTS (1) + KTHREAD_CAPACITY (32) = 97`
+  (ring slots 128): user queued + reserved + the one user current at that priority never exceeds
+  65. Admission of every OTHER push (wakes, spawns, placements) is unchanged, so usable capacity
+  and FUTEX-WAKE-CAP1's reservations are exactly as before. tid 0 (the AP idle, installed
+  directly) is the one occupant that may be absent from every queue's accounting.
+  SCHED-TIME-FOUNDATION1 (IPC-TIMEOUT-CAP1): the four off-lock IPC timeout owners — receive drain,
+  send drain, `complete_reply_timeout_over`, `complete_server_death_over` — RESERVE their task's
+  home slot before they claim (FUTEX-WAKE-CAP1's order). A refused reservation claims nothing: the
+  deadline stays armed (a parked server death is re-parked claimable) and a later collector pass
+  retries, so a committed IPC timeout is never `Runnable` without a slot.
 * **CPU authority.** Every production drain authenticates against a `DispatchAuthority`
   (`src/runtime.rs`), minted only by `arch::trap_entry::TrapPathWindow::establish` from the
   hardware-identified CPU (x86_64 per-CPU record, AArch64 `MPIDR_EL1`, RISC-V hart id). It carries
