@@ -1,0 +1,9 @@
+[sched-time-witness] building base x86_64 artifacts with futex-requeue-witness,sched-time-witness
+[sched-time-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle,sched-time-witness
+[sched-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[sched-time-witness][fail] cell reported STW_FAIL what=saturate
+[sched-time-witness][fail] 8: saturation completed after the deadline
+[sched-time-witness][fail] 10: no sleep was placed from another CPU
+[sched-time-witness][fail] W reported 1 failures
+[sched-time-witness][fail] STW_DONE result=fail
+SCHED_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=fail full_refusals=5938 fillers=129 idle_current0=3 cross_cpu=0 kthread_beats=15 done_during_kthread=29 ipc_deferrals=3214 late_max_ns=79962969118 late_median_ns=16449643 calls=32

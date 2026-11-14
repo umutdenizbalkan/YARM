@@ -1,0 +1,14 @@
+applied ncB3
+diff --git a/src/kernel/timekeeping.rs b/src/kernel/timekeeping.rs
+index 35d758d6..0afa05fa 100644
+--- a/src/kernel/timekeeping.rs
++++ b/src/kernel/timekeeping.rs
+@@ -205,7 +205,7 @@ pub fn counter_delta_to_ns(delta: u64, freq_hz: u64) -> Option<u64> {
+     if freq_hz == 0 {
+         return None;
+     }
+-    u64::try_from(delta as u128 * NSEC_PER_SEC as u128 / freq_hz as u128).ok()
++    Some((delta as u128 * NSEC_PER_SEC as u128 / freq_hz as u128) as u64)
+ }
+ 
+ /// `ceil(1e9 / freq)`: the smallest nonzero step the clock can report.

@@ -1,0 +1,29 @@
+applied ncC5
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 146749cb..f305e257 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1219,13 +1219,10 @@ pub fn claim_futex_timeout_locked(
+         return false;
+     }
+     let slot = usize::from(candidate.token.slot);
+-    if table.token(slot) != candidate.token {
+-        return false;
+-    }
+     let Some(rec) = table.records[slot] else {
+         return false;
+     };
+-    let token = candidate.token;
++    let token = table.token(slot);
+     let Some(tcb) = tcbs
+         .get_mut(usize::from(rec.tcb))
+         .and_then(Option::as_mut)
+@@ -1284,7 +1281,7 @@ fn timeout_claimable(
+     now: u64,
+ ) -> bool {
+     let slot = usize::from(candidate.token.slot);
+-    if slot >= MAX_FUTEX_WAITERS || table.token(slot) != candidate.token {
++    if slot >= MAX_FUTEX_WAITERS {
+         return false;
+     }
+     let Some(rec) = table.records[slot] else {

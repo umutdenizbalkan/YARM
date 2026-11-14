@@ -1,0 +1,30 @@
+applied ncA8
+diff --git a/src/kernel/boot/ipc_state.rs b/src/kernel/boot/ipc_state.rs
+index 0c6f2431..6a3d51a4 100644
+--- a/src/kernel/boot/ipc_state.rs
++++ b/src/kernel/boot/ipc_state.rs
+@@ -546,10 +546,20 @@ pub(crate) fn complete_reply_timeout_over<D: ReplyTimeoutDomains>(
+         return ReplyTimeoutOutcome::StaleToken;
+     };
+     // (2) Claim Timeout terminal ownership. Reply/peer/exit/endpoint may have won.
+-    let Some(terminal_owner) = rt_try_claim_timeout_terminal(d, record_index, &identity) else {
+-        rt_disarm_deadline_fire(d, token_index, &fire_owner);
+-        d.rtd_release(placement);
+-        return ReplyTimeoutOutcome::LostToTerminal;
++    let terminal_owner = match rt_try_claim_timeout_terminal(d, record_index, &identity) {
++        Some(owner) => owner,
++        None => {
++            let _ = &fire_owner;
++            let _ = rt_prepare_timeout_result(d, identity.caller_tid.0, identity.caller_asid);
++            let _ = rt_commit_receiver_runnable(
++                d,
++                identity.caller_tid.0,
++                identity.caller_asid,
++                crate::kernel::syscall::SyscallError::TimedOut as u64,
++            );
++            d.rtd_enqueue_reserved(placement);
++            return ReplyTimeoutOutcome::LostToTerminal;
++        }
+     };
+     // (3–5) Revalidate exact caller / endpoint gen / blocked-recv gen; claim waiter.
+     let caller = ReceiverWaiterIdentity::new(identity.caller_tid, identity.caller_asid);

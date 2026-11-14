@@ -1,0 +1,1 @@
+SCHED_TIME_WITNESS_SEAL arch=aarch64 smp=2 result=ok full_refusals=1608 fillers=128 idle_current0=3 cross_cpu=29 kthread_beats=16 done_during_kthread=37 ipc_deferrals=99 late_max_ns=2273420704 late_median_ns=5719040 calls=40

@@ -1,0 +1,15 @@
+applied ncC3
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 51826059..30821478 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -14271,6 +14271,9 @@ impl SharedKernel {
+                 }
+                 // (3) The home queue cannot take it now: the timeout WINS anyway, and the
+                 // placement is owed by a later pass. Nothing becomes `Runnable`.
++                let _ = self.with_task_futex_split_mut(|tcbs, table| {
++                    fx::claim_futex_timeout_locked(tcbs, table, candidate, now)
++                });
+                 let expired = !candidate.expired
+                     && self.with_task_futex_split_mut(|tcbs, table| {
+                         fx::expire_futex_waiter_locked(tcbs, table, candidate, now)

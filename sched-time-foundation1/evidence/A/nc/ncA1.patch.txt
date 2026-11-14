@@ -1,0 +1,14 @@
+applied ncA1
+diff --git a/src/kernel/scheduler.rs b/src/kernel/scheduler.rs
+index 47758bc6..fd57995c 100644
+--- a/src/kernel/scheduler.rs
++++ b/src/kernel/scheduler.rs
+@@ -492,7 +492,7 @@ impl PriorityScheduler {
+         if self.contains_tid(tid) {
+             return Err(SchedulerError::AlreadyQueued);
+         }
+-        let pushed = self.push_unchecked_capacity(tid, priority);
++        let pushed = self.enqueue_with_priority(tid, priority);
+         // The one current that is installed rather than admitted is an AP's idle (tid 0,
+         // `install_ap_idle_current`), so the bound does not cover it; at the physical bound its
+         // push is refused and the caller keeps it current, exactly the pre-repair behaviour.

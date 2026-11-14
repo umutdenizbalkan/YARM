@@ -1,0 +1,14 @@
+F: warning: `yarm` (lib) generated 427 warnings (run `cargo clippy --fix --lib -p yarm -- ` to apply 101 suggestions)
+B: warning: `yarm` (lib) generated 425 warnings (run `cargo clippy --fix --lib -p yarm -- ` to apply 102 suggestions)
+14c14
+<     139 warning: function `_` is never used
+---
+>     137 warning: function `_` is never used
+19c19
+<      15 warning: method `_` is never used
+---
+>      14 warning: method `_` is never used
+46c46
+<      22 warning: unused import: `_`
+---
+>      23 warning: unused import: `_`

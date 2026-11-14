@@ -1,0 +1,16 @@
+applied ncB7
+diff --git a/src/kernel/syscall/clock.rs b/src/kernel/syscall/clock.rs
+index 5c0e80e9..80090f82 100644
+--- a/src/kernel/syscall/clock.rs
++++ b/src/kernel/syscall/clock.rs
+@@ -198,9 +198,7 @@ pub(crate) fn handle_clock_set_realtime(
+     let tid = kernel.current_tid().ok_or(SyscallError::from(
+         crate::kernel::boot::KernelError::TaskMissing,
+     ))?;
+-    if kernel.task_class(tid) != Some(crate::kernel::task::TaskClass::SystemServer) {
+-        return Err(SyscallError::MissingRight);
+-    }
++    let _ = kernel.task_class(tid);
+     let asid = kernel.task_asid(tid).ok_or(SyscallError::from(
+         crate::kernel::boot::KernelError::UserMemoryFault,
+     ))?;

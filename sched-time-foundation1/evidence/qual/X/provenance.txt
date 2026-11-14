@@ -1,0 +1,14 @@
+side F c4c209a9a099 porcelain=0
+build x86_64 F rc=0
+build aarch64 F rc=0
+build riscv64 F rc=0
+7c066a82f3f52f429daef6a1c042a6cb46c721611de6c629d5349027392023aa  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/qual/X/aarch64_F.elf
+0bc70730bb7d44d77774cd40b3a23d60d858f9263b2bd95f2aeadd32a443f259  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/qual/X/riscv64_F.elf
+f626944020f68b4d1e94ee15d4056186996587399a040005d7a0cb8fcb301a10  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/qual/X/x86_64_F.elf
+side B 8062c216ac70 porcelain=0
+build x86_64 B rc=0
+build aarch64 B rc=0
+build riscv64 B rc=0
+7b68c4e3dfc070f0c1b15484f04e7bcc0284215fb20600908728761017d7eccf  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/qual/X/aarch64_B.elf
+e57f94baca8eca11b65b07f1e71f20c9c88ae89e55a9268268ddb808783038b0  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/qual/X/riscv64_B.elf
+a179cbc289e528ab5a1bd14323a97b1e38a829c401a93ae1c52d398fc011ed3e  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/qual/X/x86_64_B.elf

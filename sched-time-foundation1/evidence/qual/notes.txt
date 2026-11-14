@@ -1,0 +1,59 @@
+--- recorded 2026-11-14T10:51:36Z (matrix running; no runner change, nothing rerun)
+P0_provenance: the runner's "test $(git rev-parse --short=8 HEAD) = <full F>" compares an 8-char
+  prefix with the 40-char SHA, so HEAD_IS_F is never printed (runner defect, cosmetic). The same log's
+  first line is the full HEAD, c4c209a9a0992a0d4ea3869afdb23fe47147e761 = F, and porcelain = 0; every
+  step header also carries [c4c209a9a099 porcelain=0]. Provenance is established by those lines.
+--- recorded 2026-11-14T10:58:22Z
+H2b_clippy_classes_B rc=1 — warning-class delta F vs B (427 vs 425 warnings; H2 clippy on F rc=0, no
+  errors). Item diff (H2b_items_{F,B}.txt): F adds three dead-code warnings in the hosted-dev lib
+  build — clock::clock_gettime_split, clock::clock_set_realtime_split (src/kernel/syscall/clock.rs)
+  and UserMemoryState::copy_to_user_split_all_or_nothing (src/kernel/boot/user_memory_state.rs) —
+  whose only production caller, syscall_split::try_split_clock_into_frame, is
+  #[cfg(not(feature = "hosted-dev"))]; target builds use them and the hosted tests call them
+  directly (tests.rs:221435..221461). The baseline carries the same class for its own target-only
+  split helpers (137 "function is never used"). F removes one unused import (runtime.rs TaskClass).
+  Classification: NEW CODE-QUALITY OBSERVATION (lint-only, hosted-dev profile), not a test or build
+  failure and not a correctness defect; remedy for a later stage: cfg_attr(hosted-dev,
+  allow(dead_code)) on the three helpers as their neighbours do, or gate them like their caller.
+  (correction 2026-11-14T10:58:27Z: "as their neighbours do" above is unverified and withdrawn — the baseline's 137 warnings show most target-only helpers carry no such allow.)
+--- recorded 2026-11-14T11:25:15Z (FB1 on B not yet run)
+FX1_first_cohort_seal rc=1 — FIRST_COHORT_LIVE_MATRIX live_cells=12 result=ok; the single failure is
+  "[seal][fail] riscv64 FutexWait idle oracle proof missing". Recorded baseline debt class: the
+  inherited idle-oracle variance (doc/KERNEL_UNLOCKING.md: the same riscv64 line appeared at one
+  revision and not the other on BIT-IDENTICAL RISC-V binaries — "run-to-run variance"; FUTEX-TIME1's
+  FX1 and FB1 both failed with the aarch64 variant of the same line). To be compared with FB1 at B.
+S7_ci_timer_grep rc=1 — YARM_TIMER_IRQ_DELIVERED/EOI_DONE/SCHED_TICK all 0 in S2's x86_64 core log;
+  identical to FUTEX-TIME1's S7 (rc=1, same three zeros) — recorded baseline debt, unchanged.
+--- recorded 2026-11-14T12:48:15Z
+FB1_first_cohort_seal_B rc=1 — IDENTICAL to FX1 on F: live_cells=12 result=ok, the single failure
+  "riscv64 FutexWait idle oracle proof missing" on both trees in the same run. FX1 classified BASELINE DEBT
+  (same failure on B), the inherited idle-oracle variance.
+--- recorded 2026-11-14T13:39:37Z
+C2_ci_profiles_F rc=1 / C4_ci_profiles_B rc=1 — profile tables IDENTICAL on F and B (sender-wake PASS,
+  d2-send FAIL, smp2-core PASS, smp4-core PASS, smp2-sender-wake FAIL, smp4-sender-wake FAIL,
+  sched-timeout FAIL) and identical to FUTEX-TIME1's C2/C4. BASELINE DEBT, unchanged.
+C5a_reply_timeout_matrix_F rc=1 — "[x86_64/off] feature-OFF image contains live literal:
+  class=IpcReplyTimeout", feature_off_clean=0, result=fail: the same line as FUTEX-TIME1's C5a (and
+  C5b on its B). Compared with C5b on 8062c216 below.
+C5b_reply_timeout_matrix_B rc=1 — IDENTICAL failure line on 8062c216: C5a is BASELINE DEBT, unchanged. (2026-11-14T13:40:03Z)
+C5c_smp_request_F rc=2 — scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh line 67 'syntax error near unexpected token fi' (script unchanged 8062c216..F); identical to FUTEX-TIME1's C5c/C5d: BASELINE DEBT. (2026-11-14T13:40:35Z)
+--- recorded 2026-11-14T13:41:15Z
+C5d_smp_request_B rc=2 — same line-67 syntax error on 8062c216: C5c BASELINE DEBT confirmed.
+AP_marker_integrity rc=1 — the ONLY flagged log is UN/x86_damaged.log (split=1): the UN control's
+  deliberately damaged copy, which the scan's F glob does not exclude (scan-scope defect, identical
+  to FUTEX-TIME1's AP_marker_integrity, same single file). Every genuine F log: split=0,
+  rust_ladder_on_com1=0 (x86) and raw_ttbr_bytes=0 (aarch64); every B log likewise 0. AP marker
+  integrity of F HOLDS; the rc=1 is the control artifact, not a finding.
+--- recorded 2026-11-14T13:42:06Z — E4 performance / footprint (X_sections_and_FP rc=0)
+Sections F vs B (X_sections.log; FP_footprint.log): .text +17,600 (x86_64) / +15,380 (aarch64) /
+  +16,608 (riscv64) bytes; .rodata +760 / +840 / +1,272; .data +186,380 / +186,368 / +186,368; .bss
+  -4,112 / +3,207 / +2,529; boot sections and .bss.bootstack identical in size. The RISC-V trap bridge
+  write-back instruction count is unchanged (0 = same as B).
+CORRECTION to the schedule's E4 expectation ("the printk ring's +~170 KB .bss"): the growth is in
+  .data, not .bss. PrintkRing::new() is const with non-zero fields (next_seq = 1, reader_seq = 1,
+  console_loglevel = Info), so the whole static — its 1024 x 208-byte slots included — is emitted
+  initialized: (1024 - 128) x 208 = 186,368 bytes, exactly the measured .data delta on aarch64 and
+  riscv64 (x86_64 +12 more from other code). Effect: each kernel IMAGE grows by ~182 KiB of loaded
+  bytes (not only RAM). Every boot and smoke in this matrix passed with it. Remedy for a later
+  stage (not applied; F is frozen): make the ring zero-initializable (e.g. store seq - 1 and level
+  offsets) so it lands in .bss, or size the ring at boot.

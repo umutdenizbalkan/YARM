@@ -1,0 +1,61 @@
+--- recorded 2026-11-14T08:00:47Z (while the chain continues; no rerun, no change to any runner)
+LST-riscv64-1 rc=1 — WITNESS PREMISE NOT ESTABLISHED (IPC lane), not a correctness failure.
+  The only failed rule: "IPC: no receive timeout was due on a full queue". Every other rule held
+  (12 sleep cases, rotation parked=fillers=127, kthread beats 19, cross_cpu 21, printk_lost 0).
+  The IPC deferral lane is incidental: the cell never drives it; it relies on tid 2's periodic timed
+  receive coming due while tid 2's home queue is full. In this run H reached 127 fillers (dev runs:
+  128) and inside the STW_SATURATED..STW_ROTATION window tid 2's receive timeout settled 7 times,
+  each U8_RECV_TIMEOUT_SETTLED result=ok with zero deferrals (C_live2/LC-riscv64 at ae5e538c: 8
+  settled, 124 deferred) — i.e. its home queue had room and the timeout was placed at once, which is
+  the correct outcome for a non-full queue. No timeout was lost or left unsettled (34164 settled).
+  The deferral contract is covered deterministically by the hosted tests
+  sched_time_foundation1_a_ipc::i01..i05 and controls ncA6..ncA10 (all caught at F).
+  Same class as the FUTEX-TIME1 x86 E premise limitation (KERNEL_UNLOCK_DEFERRED_DEFECTS.md).
+--- recorded 2026-11-14T08:38:56Z (chain continues; no rerun, no runner change)
+LST-riscv64-2 rc=1 — WITNESS PREMISE NOT ESTABLISHED (case 8 saturation), not a correctness failure.
+  The only failed rule: "8: the full-queue sleep was never refused a placement". W's 120 s sleep
+  returned once, code=0, 5.24 s after its deadline (t1=142441228500 > bound=137203764600);
+  REGISTER 39 = DONE 38 + KILLED 1; rotation parked=fillers=127; 2 IPC deferrals, each settled.
+  Zero STW_SLEEP_REFUSED: W's home queue had a free slot when its deadline came, so the sleep was
+  placed at once — the correct outcome for a non-full queue.
+  Root cause (shared with LST-riscv64-1): H saturates once and tops up once after W enters its sleep
+  (first=126, final 127; ae5e538c dev runs reached 128), and does not keep topping up during the
+  hold; on RISC-V TCG the number of other queued tasks at that priority varies run to run, so one
+  slot can stay free. F vs ae5e538c: kernel and cell sources identical (diff touches only docs,
+  scripts/qemu-riscv64-core-smoke.sh and the hosted c08 test), so the 127-vs-128 difference is run
+  variation, not a change. aarch64-1 and x86_64-1 (129 fillers) sealed. The full-queue sleep
+  placement is covered deterministically by hosted c09 and controls ncC3 (caught at F).
+  Witness remedy (NOT applied to F; F stays frozen): keep spawn_until_refused in H's hold loop.
+--- recorded 2026-11-14T09:13:40Z
+LST-riscv64-3 rc=0 sealed: fillers=128, full_refusals=548, ipc_deferrals=7 — the same frozen image
+  establishes both premises when H reaches 128, consistent with the classification of runs 1-2.
+  Sched-time witness at F: aarch64 3 scheduled runs, x86_64 3, riscv64 1 of 3 sealed (2 premise-not-established).
+  (erratum 2026-11-14T09:13:46Z: the line above was written before aarch64-3 / x86_64-3 finished; their results are in summary.txt and the final tally is recorded after them.)
+--- final sched-time tally recorded 2026-11-14T09:34:08Z: aarch64 3/3 sealed, x86_64 3/3 sealed, riscv64 1/3 sealed (runs 1-2: witness premise not established, classified above).
+--- recorded 2026-11-14T10:16:41Z
+LT-riscv64 rc=1 — the documented OPEN LIMITATION of FUTEX-TIME1's sequence E (doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md,
+  "FUTEX-TIME1's sequence E assumes spawning refused => every user queue is full"), not a correctness failure.
+  FTW_E_SATURATED fillers=126 spawn_refused=1 (< 2 x 64): the first refusal came from one full target CPU
+  while the other had room; FTW_E_EXPIRED_SEEN gone=1 — the waiter's timeout expired and it was placed
+  (no unplaced obligation was needed). Only failed rule: "E: no FUTEX_TIMEOUT_EXPIRED_UNPLACED". Every
+  other FT1 rule held (G windows 8 woke / 0 refused, A idle, calls=cycles=41, printk_lost=0). Same
+  failure as FT1's own LT-x86_64-1 at 04a09b2b and SCHED-TIME-FOUNDATION1 B LB-x86_64. FT1 grader unchanged.
+--- recorded 2026-11-14T14:16:28Z — Addendum A result (stf-evidence/addA/summary.txt)
+LW-riscv64 (scheduled, F) rc=1 — PLACEMENT VARIANCE, not a regression; it stays recorded as failed.
+  Addendum A, interleaved: LWA-B-1/2/3 on 8062c216 sealed (windows 15/16/14), LWA-F-1/2/3 on F sealed
+  (windows 15/15/8); every one of the six placed signaller 10010 on cpu 0 and the waiter on cpu 1.
+  The scheduled run is the only one with all three witness threads on cpu 1 (no peer ever running,
+  so every wait was SKIPPED reason=no_peer_running); it still had calls=returns=32, mismatch=0,
+  parked_ok=32, dup_or_missing=0. Balanced placement (task_enqueue.rs) is unchanged 8062c216..F.
+  Reading declared in Addendum A: F seals as often as B (3/3 each) => placement variance.
+--- recorded 2026-11-14T14:55:38Z — Addendum B result (stf-evidence/addB/summary.txt)
+LE (scheduled, F) rc=1 — COVERAGE VARIANCE PRESENT ON THE BASELINE, not a regression; stays recorded as failed.
+  Addendum B, interleaved: 8062c216 LEB-B-1 ok (wait_early=10), LEB-B-2 FAIL (wait_parked=36 wait_own=12
+  wait_early=0 — the scheduled LE's exact counts), LEB-B-3 ok (8); F LEB-F-1 ok (16), LEB-F-2 ok (13),
+  LEB-F-3 FAIL (36/12/0). Same spread on both trees (2/3 sealed each). In all seven runs lost_a3 =
+  lost_a7 = lost_other = 0: the RISCV-ECALL-A7-RET1 contract held every time; only the early-wake
+  coverage lane is timing-dependent.
+--- final live tally at F: LST aarch64 3/3, x86_64 3/3, riscv64 1/3 (2 premise-not-established);
+  L-ncL1, L-ncL2 caught; LT aarch64/x86_64 ok, riscv64 documented E-premise limitation; LW aarch64/x86_64
+  ok, riscv64 placement variance (Addendum A: F 3/3 = B 3/3); LE coverage variance (Addendum B: F 2/3 =
+  B 2/3, contract held 7/7); LS x3 ok.

@@ -1,0 +1,2 @@
+[sched-time-witness][fail] core smoke not clean (rc=0): ['[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=15136 nr15=1 nr10=1 nr9=141 nr5=11841 nr2=112 nr1=1 nr23=3 nr29=5 nr0=2992)']
+SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=227 fillers=128 idle_current0=2 cross_cpu=9 kthread_beats=18 done_during_kthread=35 ipc_deferrals=124 late_max_ns=8444116700 late_median_ns=37643500 calls=40

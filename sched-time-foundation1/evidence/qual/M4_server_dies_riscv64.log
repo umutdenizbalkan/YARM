@@ -1,0 +1,10 @@
+[serverdies:riscv64] exact commit sha=c4c209a9a0992a0d4ea3869afdb23fe47147e761 tree=f41dfd432a8478fce8bc12cd9e9bc84edeea2bc0 (clean)
+[serverdies:riscv64] RUN_A feature-off binary audit
+[serverdies:riscv64] RUN_A oracle_literals_present=0 production_literals_missing=0
+[serverdies:riscv64] RUN_B feature-on live cell (selector=server-dies)
+[serverdies:riscv64] staged image=build-riscv64/yarm-riscv64.bin initrd=build-riscv64/initramfs-core.cpio sha256=1b11be237728d864 initrd_sha256=32a08478ba270c51
+ARTIFACT_BINDING arch=riscv64 kernel=build-riscv64/yarm-riscv64.bin kernel_sha256=1b11be237728d86490a9cc2b2dcdb8a4cdee40d35d416b1f092973470d944c4c kernel_features=riscv64-ipc-reply-timeout-oracle kernel_resolved_features=ipc-reply-timeout-oracle-core,riscv64-ipc-reply-timeout-oracle kernel_nofp=pass initramfs=build-riscv64/initramfs-core.cpio initramfs_sha256=32a08478ba270c511e4904d5a7bf424d79dbf81eac5c04bbae08f25aace59bb9 initramfs_features=none initramfs_compile_env=none source=clean:f41dfd432a8478fce8bc12cd9e9bc84edeea2bc0 required=kernel=riscv64-ipc-reply-timeout-oracle,initramfs=none result=ok
+[serverdies:riscv64] boot cmdline: yarm.riscv_ipc_reply_timeout_oracle=server-dies
+[serverdies:riscv64] RUN_B witnessed scenario: server={10008,1} caller={1,1} record={1,17}
+[serverdies:riscv64] RUN_B caller_wakes=1 peer_death_winners=1
+STAGE_200D2B1C_RISCV64_SERVER_DIES_SEAL arch=riscv64 sha=c4c209a9a0992a0d4ea3869afdb23fe47147e761 tree=f41dfd432a8478fce8bc12cd9e9bc84edeea2bc0 live_cells=1 caller_wakes=1 peer_death_winners=1 exit_returns=0 feature_off_oracle_literals=0 result=ok

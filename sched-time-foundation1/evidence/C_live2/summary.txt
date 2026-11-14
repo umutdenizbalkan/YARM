@@ -1,0 +1,9 @@
+liveC2 start 2026-11-14T04:32:03Z head=ae5e538c637f3eadf6f71a06307856710b5318e8 porcelain=0
+restart 2026-11-14T04:42:24Z: worker restart killed LC-riscv64 (no rc; partial kept .interrupted) and the BC NC run after ncB4; rerun once per the interrupted-step rule, sequentially (live, then NC)
+liveC2 start 2026-11-14T04:42:25Z head=ae5e538c637f3eadf6f71a06307856710b5318e8 porcelain=0
+LC-riscv64 rc=1 SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=227 fillers=128 idle_current0=2 cross_cpu=9 kthread_beats=18 done_during_kthread=35 ipc_deferrals=124 late_max_ns=8444116700 late_median_ns=37643500 calls=40 printk_lost=0
+          1 [sched-time-witness][fail] core smoke not clean (rc=0): ['[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=15136 nr15=1 nr10=1 nr9=141 nr5=11841 nr2=112 nr1=1 nr23=3 nr29=5 nr0=2992)']
+LC-aarch64 rc=0 SCHED_TIME_WITNESS_SEAL arch=aarch64 smp=2 result=ok full_refusals=2227 fillers=129 idle_current0=3 cross_cpu=29 kthread_beats=16 done_during_kthread=37 ipc_deferrals=58442 late_max_ns=2217145360 late_median_ns=6068736 calls=40 printk_lost=0
+LC-x86_64 rc=0 SCHED_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=ok full_refusals=282 fillers=128 idle_current0=3 cross_cpu=8 kthread_beats=17 done_during_kthread=37 ipc_deferrals=16 late_max_ns=4463263667 late_median_ns=19435111 calls=40 printk_lost=0
+liveC2 end 2026-11-14T05:18:44Z
+LIVEC2_DONE

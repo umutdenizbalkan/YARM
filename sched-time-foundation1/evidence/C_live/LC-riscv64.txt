@@ -1,0 +1,22 @@
+[sched-time-witness] building base riscv64 artifacts with futex-requeue-witness,sched-time-witness
+[sched-time-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,sched-time-witness
+[sched-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[sched-time-witness][fail] cell reported STW_FAIL what=saturate
+[sched-time-witness][fail] call 2 (short): 0 registrations
+[sched-time-witness][fail] call 3 (short): 0 registrations
+[sched-time-witness][fail] call 4 (short): 0 registrations
+[sched-time-witness][fail] call 13 (cycle): 0 registrations
+[sched-time-witness][fail] call 16 (cycle): 0 registrations
+[sched-time-witness][fail] call 18 (cycle): 0 registrations
+[sched-time-witness][fail] call 21 (cycle): 0 registrations
+[sched-time-witness][fail] call 22 (cycle): 0 registrations
+[sched-time-witness][fail] call 23 (cycle): 0 registrations
+[sched-time-witness][fail] call 24 (cycle): 0 registrations
+[sched-time-witness][fail] call 25 (cycle): 0 registrations
+[sched-time-witness][fail] call 26 (cycle): 0 registrations
+[sched-time-witness][fail] 8: the full-queue sleep was never refused a placement (queue not full when due)
+[sched-time-witness][fail] 8: saturation completed after the deadline
+[sched-time-witness][fail] W reported 1 failures
+[sched-time-witness][fail] STW_DONE result=fail
+[sched-time-witness][fail] core smoke not clean (rc=0): ['[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=16076 nr15=1 nr10=1 nr9=139 nr5=6414 nr2=112 nr1=1 nr23=3 nr29=5 nr0=9381)']
+SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=0 fillers=128 idle_current0=3 cross_cpu=3 kthread_beats=14 done_during_kthread=18 ipc_deferrals=31 late_max_ns=2510259700 late_median_ns=72164700 calls=20

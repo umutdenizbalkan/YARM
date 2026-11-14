@@ -1,0 +1,94 @@
+ Cargo.toml                                         |    3 +
+ crates/yarm-control-plane-servers/Cargo.toml       |    2 +
+ .../src/control_plane/init/service.rs              |  584 ++++++-
+ crates/yarm-driver-servers/Cargo.toml              |    2 +
+ crates/yarm-fs-servers/Cargo.toml                  |    2 +
+ crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs      |    2 +-
+ crates/yarm-user-rt/src/lib.rs                     |  133 ++
+ crates/yarm-user-rt/src/syscall/recv_v3.rs         |    2 +-
+ doc/KERNEL_UNLOCKING.md                            |   73 +
+ doc/KERNEL_UNLOCK_DEFERRED_DEFECTS.md              |    9 +
+ doc/SCHEDULING_CONTRACT.md                         |   16 +
+ doc/SYSCALL_ABI.md                                 |  244 ++-
+ scripts/check-contract-doc-enforcement.sh          |   15 +
+ scripts/grade-sched-time-witness.py                |  443 +++++
+ scripts/qemu-riscv64-core-smoke.sh                 |   16 +-
+ scripts/qemu-sched-time-witness-smoke.sh           |  108 ++
+ src/arch/clock.rs                                  |  183 ++
+ src/arch/fdt.rs                                    |  167 ++
+ src/arch/mod.rs                                    |    2 +
+ src/arch/riscv64/trap.rs                           |    7 +
+ src/arch/trap_entry.rs                             |   10 +
+ src/arch/x86_64/trap.rs                            |    8 +-
+ src/bin/kernel_boot.rs                             |    3 +
+ src/kernel/boot/exec_state.rs                      |   16 +-
+ src/kernel/boot/futex.rs                           |  190 ++-
+ src/kernel/boot/ipc_state.rs                       |   93 +-
+ src/kernel/boot/mod.rs                             |    5 +-
+ src/kernel/boot/tests.rs                           | 1797 +++++++++++++++++++-
+ src/kernel/boot/user_memory_state.rs               |   35 +
+ src/kernel/kthread_tests.rs                        |    4 +-
+ src/kernel/mod.rs                                  |    4 +
+ src/kernel/printk.rs                               |    9 +-
+ src/kernel/sched_full_rot1_tests.rs                |  415 +++++
+ src/kernel/scheduler.rs                            |   60 +-
+ src/kernel/sleep_witness.rs                        |  149 ++
+ src/kernel/syscall.rs                              |   46 +-
+ src/kernel/syscall/clock.rs                        |  281 +++
+ src/kernel/syscall_split.rs                        |  190 ++-
+ src/kernel/task.rs                                 |   36 +-
+ src/kernel/timekeeping.rs                          |  444 +++++
+ src/kernel/timekeeping_tests.rs                    |  283 +++
+ src/runtime.rs                                     |  272 ++-
+ 42 files changed, 6135 insertions(+), 228 deletions(-)
+ crates/yarm-control-plane-servers/Cargo.toml       |   2 +
+ .../src/control_plane/init/service.rs              | 584 ++++++++++++++++++++-
+ crates/yarm-driver-servers/Cargo.toml              |   2 +
+ crates/yarm-fs-servers/Cargo.toml                  |   2 +
+ crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs      |   2 +-
+ crates/yarm-user-rt/src/lib.rs                     | 133 +++++
+ crates/yarm-user-rt/src/syscall/recv_v3.rs         |   2 +-
+ src/arch/clock.rs                                  | 183 +++++++
+ src/arch/fdt.rs                                    | 167 ++++++
+ src/arch/mod.rs                                    |   2 +
+ src/arch/riscv64/trap.rs                           |   7 +
+ src/arch/trap_entry.rs                             |  10 +
+ src/arch/x86_64/trap.rs                            |   8 +-
+ src/bin/kernel_boot.rs                             |   3 +
+ src/kernel/boot/exec_state.rs                      |  16 +-
+ src/kernel/boot/futex.rs                           | 190 ++++++-
+ src/kernel/boot/ipc_state.rs                       |  93 +++-
+ src/kernel/boot/mod.rs                             |   5 +-
+ src/kernel/boot/user_memory_state.rs               |  35 ++
+ src/kernel/kthread_tests.rs                        |   4 +-
+ src/kernel/mod.rs                                  |   4 +
+ src/kernel/printk.rs                               |   9 +-
+ src/kernel/sched_full_rot1_tests.rs                | 415 +++++++++++++++
+ src/kernel/scheduler.rs                            |  60 ++-
+ src/kernel/sleep_witness.rs                        | 149 ++++++
+ src/kernel/syscall.rs                              |  46 +-
+ src/kernel/syscall/clock.rs                        | 281 ++++++++++
+ src/kernel/syscall_split.rs                        | 190 ++++++-
+ src/kernel/task.rs                                 |  36 +-
+ src/kernel/timekeeping.rs                          | 444 ++++++++++++++++
+ src/kernel/timekeeping_tests.rs                    | 283 ++++++++++
+ src/runtime.rs                                     | 272 ++++++++--
+ 32 files changed, 3535 insertions(+), 104 deletions(-)
+c4c209a9 SCHED-TIME-FOUNDATION1-QUAL: stage docs, RISC-V smoke NR 20 term, stale-token test
+ae5e538c SCHED-TIME-FOUNDATION1-C: harden the sleep witness from its first development runs
+84dfa607 SCHED-TIME-FOUNDATION1-D: VDSO-TIME1 proof audit — the userspace fast path is deferred
+1dee980a SCHED-TIME-FOUNDATION1-C: clock_nanosleep / nanosleep as a blocked-task lifecycle
+dc61a01c SCHED-TIME-FOUNDATION1-B: nanosecond timekeeping and clock_gettime (ABI v12)
+1218d51c SCHED-TIME-FOUNDATION1-A: register the rotation tests as a withdrawal-seam owner
+f7df3839 SCHED-TIME-FOUNDATION1-A: full-queue rotation and IPC timeout placement
+487:    fn requeue_current_with_priority(
+43:pub const SYSCALL_CLOCK_GETTIME_NR: usize = 18;
+47:pub const SYSCALL_CLOCK_SET_REALTIME_NR: usize = 19;
+50:pub const SYSCALL_CLOCK_NANOSLEEP_NR: usize = 20;
+438:    ClockGetTime = SYSCALL_CLOCK_GETTIME_NR,
+440:    ClockSetRealtime = SYSCALL_CLOCK_SET_REALTIME_NR,
+442:    ClockNanosleep = SYSCALL_CLOCK_NANOSLEEP_NR,
+517:            SYSCALL_CLOCK_GETTIME_NR => Ok(Self::ClockGetTime),
+518:            SYSCALL_CLOCK_SET_REALTIME_NR => Ok(Self::ClockSetRealtime),
+519:            SYSCALL_CLOCK_NANOSLEEP_NR => Ok(Self::ClockNanosleep),
+2759:        assert_eq!(SYSCALL_CLOCK_GETTIME_NR, 18);

@@ -1,0 +1,14 @@
+applied ncA4
+diff --git a/src/kernel/scheduler.rs b/src/kernel/scheduler.rs
+index 47758bc6..54a7cd14 100644
+--- a/src/kernel/scheduler.rs
++++ b/src/kernel/scheduler.rs
+@@ -755,7 +755,7 @@ impl PriorityScheduler {
+         if !self.membership_tracking_exhausted {
+             self.membership_remove(running.tid);
+         }
+-        if let Err(_err) = self.requeue_current_with_priority(running.tid, running.priority) {
++        if let Err(_err) = Ok::<(), SchedulerError>(()) {
+             // Re-enqueue failed (`AlreadyQueued` only: SCHED-FULL-ROT1 removed the capacity
+             // refusal) — restore as current and signal the caller to fall back.
+             if !self.membership_tracking_exhausted {

@@ -1,0 +1,22 @@
+applied ncB6
+diff --git a/src/kernel/boot/user_memory_state.rs b/src/kernel/boot/user_memory_state.rs
+index 92b3624f..79312566 100644
+--- a/src/kernel/boot/user_memory_state.rs
++++ b/src/kernel/boot/user_memory_state.rs
+@@ -97,13 +97,13 @@ impl KernelState {
+         va: VirtAddr,
+         bytes: &[u8],
+     ) -> Result<(), KernelError> {
+-        for i in 0..bytes.len() {
++        for (i, b) in bytes.iter().enumerate() {
+             let addr = (va.0 as usize)
+                 .checked_add(i)
+                 .ok_or(KernelError::UserMemoryFault)?;
+-            self.validate_user_access_for_asid(asid, addr, true)?;
++            self.copy_to_user(asid, VirtAddr(addr as u64), core::slice::from_ref(b))?;
+         }
+-        self.copy_to_user(asid, va, bytes)
++        Ok(())
+     }
+ 
+     pub fn copy_from_user(

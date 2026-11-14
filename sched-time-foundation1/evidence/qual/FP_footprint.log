@@ -1,0 +1,54 @@
+== riscv64 F: write-back instruction counts
+yarm_riscv64_trap_bridge instructions: 0
+0000000000000fae T yarm_riscv64_trap_bridge
+== riscv64 B: write-back instruction counts
+yarm_riscv64_trap_bridge instructions: 0
+0000000000000fae T yarm_riscv64_trap_bridge
+== x86_64 F sizes
+.text.boot32                379                1048608
+.text.boot64_thunk           20                1048992
+.data.boot                28720                1052672
+.bss.bootstack         16777216                1081392
+.text.boot                  185   18446744071579926576
+.text                   1293102   18446744071579926768
+.rodata                  190392   18446744071581219872
+.data                    390488   18446744071581410304
+.bss                   24571904   18446744071581802496
+== x86_64 B sizes
+.text.boot32                379                1048608
+.text.boot64_thunk           20                1048992
+.data.boot                28720                1052672
+.bss.bootstack         16777216                1081392
+.text.boot                  185   18446744071579926576
+.text                   1275502   18446744071579926768
+.rodata                  189632   18446744071581202272
+.data                    204108   18446744071581391936
+.bss                   24576016   18446744071581597696
+== aarch64 F sizes
+.text.boot             4856   1074266112
+.text                974760   1074272256
+.rodata              148384   1075247024
+.data                374984   1075396608
+.bss.bootstack     31522816   1075773440
+.bss               75432344   1107296256
+== aarch64 B sizes
+.text.boot             4856   1074266112
+.text                959380   1074272256
+.rodata              147544   1075231648
+.data                188616   1075380224
+.bss.bootstack     31522816   1075576832
+.bss               75429137   1107099648
+== riscv64 F sizes
+.text.boot              148   2149580800
+.text                739108   2149580960
+.rodata              157787   2150320080
+.data                372752   2150481920
+.bss.bootstack     16777216   2150891520
+.bss               92120754   2167668736
+== riscv64 B sizes
+.text.boot              148   2149580800
+.text                722500   2149580960
+.rodata              156515   2150303472
+.data                186384   2150461440
+.bss.bootstack     16777216   2150694912
+.bss               92118225   2167472128

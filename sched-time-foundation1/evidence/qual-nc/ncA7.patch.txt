@@ -1,0 +1,44 @@
+applied ncA7
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 51826059..e4b31a05 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18208,7 +18208,8 @@ impl SharedKernel {
+             // ── (0) rank 1: IPC-TIMEOUT-CAP1 — the slot, promised before anything is touched ──
+             // No room: nothing is withdrawn or claimed; the deadline stays armed and due, and the
+             // collector publishes this cycle again on a later pass.
+-            let Some(placement) = self.reserve_ipc_wake_split(work.tid, cpu) else {
++            let placement = self.reserve_ipc_wake_split(work.tid, cpu);
++            let Some(placement) = Some(placement) else {
+                 crate::yarm_log!(
+                     "U7_SEND_TIMEOUT_PLACEMENT_DEFERRED tid={} send_generation={} cpu={}",
+                     work.tid,
+@@ -18249,7 +18250,9 @@ impl SharedKernel {
+                 Some(owed)
+             });
+             let Some(envelope) = withdrawn else {
+-                self.release_ipc_wake_split(placement);
++                if let Some(p) = placement {
++                    self.release_ipc_wake_split(p);
++                }
+                 crate::yarm_log!(
+                     "U7_SEND_TIMEOUT_REFUSED_NO_WAITER tid={} asid={} send_generation={} deadline={}",
+                     work.tid,
+@@ -18301,11 +18304,15 @@ impl SharedKernel {
+                 );
+             }
+             if !claimed {
+-                self.release_ipc_wake_split(placement);
++                if let Some(p) = placement {
++                    self.release_ipc_wake_split(p);
++                }
+                 continue;
+             }
+             // ── (4) rank 1: the wake, last — the promised slot, which cannot be refused ─────
+-            self.commit_ipc_wake_split(placement);
++            if let Some(p) = placement {
++                self.commit_ipc_wake_split(p);
++            }
+             crate::yarm_log!(
+                 "U7_SEND_TIMEOUT_SETTLED arch={} tid={} asid={} send_generation={} deadline={} now={} broad_lock=0 result=ok",
+                 crate::kernel::boot::REPLY_TIMEOUT_ARCH,

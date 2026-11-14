@@ -1,0 +1,5 @@
+[ipc-residual1-witness] building base riscv64 artifacts
+[ipc-residual1-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle
+[ipc-residual1-witness] booting QEMU -smp 1 with yarm.ipc_residual1_queued_cap_witness=1
+[ipc-residual1-witness] a cap-bearing reply to an unblocked caller was queued and its capability delivered
+IPC_RESIDUAL1_QUEUED_CAP_SEAL arch=riscv64 buffered_call=1 queued_cap_reply=1 broad_entries=0 result=ok

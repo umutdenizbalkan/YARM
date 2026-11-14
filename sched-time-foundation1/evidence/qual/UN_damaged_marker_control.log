@@ -1,0 +1,5 @@
+aarch64 damaged marker: AARCH64_SPLIT_FINALIZE_OK nr=15 (all occurrences)
+x86_verbatim rc=0 
+x86_damaged rc=1 [error] SMP-LIVE: AP admission/prereq marker missing: X86_AP_KERNEL_CR3_BEGIN 
+a64_verbatim rc=0 
+a64_damaged rc=1 [error] aarch64 Stage 195A split-dispatch markers missing 

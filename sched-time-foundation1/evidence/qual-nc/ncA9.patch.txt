@@ -1,0 +1,27 @@
+applied ncA9
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 51826059..959b9687 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18376,9 +18376,7 @@ impl SharedKernel {
+                 else {
+                     return false;
+                 };
+-                if tcb.blocked_recv_generation != work.wait_generation {
+-                    return false;
+-                }
++                let _ = work.wait_generation;
+                 if !matches!(
+                     tcb.status,
+                     TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+@@ -18393,9 +18391,7 @@ impl SharedKernel {
+                 let Some(deadline) = tcb.ipc_timeout_deadline else {
+                     return false;
+                 };
+-                if deadline != work.deadline || now < deadline {
+-                    return false;
+-                }
++                let _ = deadline;
+                 // Stage 199G-B §A — PUBLISH `TimedOut` INTO THE SAVED INCOMING CONTEXT, in this
+                 // same acquisition, BEFORE the task becomes `Runnable`.
+                 //

@@ -1,0 +1,17 @@
+applied ncC8
+diff --git a/src/kernel/timekeeping.rs b/src/kernel/timekeeping.rs
+index 35d758d6..ccab70fa 100644
+--- a/src/kernel/timekeeping.rs
++++ b/src/kernel/timekeeping.rs
+@@ -373,9 +373,8 @@ pub fn sleep_deadline_at(
+     let ts_ns = ts.to_signed_ns().ok_or(ClockError::Overflow)?;
+     let realtime_now = match clock {
+         ClockId::Realtime => Some(
+-            realtime_at(mono)?
+-                .to_signed_ns()
+-                .ok_or(ClockError::Overflow)?,
++            realtime_at(mono)
++                .map_or(0, |t| t.to_signed_ns().unwrap_or(0)),
+         ),
+         ClockId::Monotonic => None,
+     };

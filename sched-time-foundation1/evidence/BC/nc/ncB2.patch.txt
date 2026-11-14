@@ -1,0 +1,16 @@
+applied ncB2
+diff --git a/src/kernel/timekeeping.rs b/src/kernel/timekeeping.rs
+index 35d758d6..6daa4cdf 100644
+--- a/src/kernel/timekeeping.rs
++++ b/src/kernel/timekeeping.rs
+@@ -252,8 +252,8 @@ pub fn monotonic_ns_at(counter: u64) -> Result<u64, ClockError> {
+     } else {
+         // Nondecreasing across CPUs by construction: the result is never below a value any CPU
+         // already returned.
+-        let prev = LAST_MONOTONIC.fetch_max(ns, Ordering::AcqRel);
+-        Ok(ns.max(prev))
++        let _ = LAST_MONOTONIC.fetch_max(ns, Ordering::AcqRel);
++        Ok(ns)
+     }
+ }
+ 

@@ -1,0 +1,16 @@
+applied ncB4
+diff --git a/src/kernel/timekeeping.rs b/src/kernel/timekeeping.rs
+index 35d758d6..4b14d22f 100644
+--- a/src/kernel/timekeeping.rs
++++ b/src/kernel/timekeeping.rs
+@@ -297,7 +297,9 @@ pub fn realtime_at(mono: u64) -> Result<Timespec, ClockError> {
+         Some((true, off)) => {
+             Timespec::from_signed_ns(mono as i128 + off as i128).ok_or(ClockError::Overflow)
+         }
+-        Some((false, _)) => Err(ClockError::Unavailable),
++        Some((false, off)) => {
++            Timespec::from_signed_ns(mono as i128 + off as i128).ok_or(ClockError::Overflow)
++        }
+         // A writer held the sequence through every bounded retry: report unavailable rather than
+         // spin; the caller may retry.
+         None => Err(ClockError::Unavailable),

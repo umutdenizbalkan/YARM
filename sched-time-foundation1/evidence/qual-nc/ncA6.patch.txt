@@ -1,0 +1,37 @@
+applied ncA6
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 51826059..3ce33f09 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18358,7 +18358,8 @@ impl SharedKernel {
+             // ── (0) rank 1: IPC-TIMEOUT-CAP1 — the slot, promised before the claim ──────────
+             // No room: nothing is claimed; the deadline stays armed and due, and the collector
+             // publishes this cycle again on a later pass.
+-            let Some(placement) = self.reserve_ipc_wake_split(work.tid, cpu) else {
++            let placement = self.reserve_ipc_wake_split(work.tid, cpu);
++            let Some(placement) = Some(placement) else {
+                 crate::yarm_log!(
+                     "U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid={} wait_generation={} cpu={}",
+                     work.tid,
+@@ -18426,7 +18427,9 @@ impl SharedKernel {
+                 true
+             });
+             if !claimed {
+-                self.release_ipc_wake_split(placement);
++                if let Some(p) = placement {
++                    self.release_ipc_wake_split(p);
++                }
+                 crate::yarm_log!(
+                     "U8_RECV_TIMEOUT_REFUSED_STALE tid={} asid={} wait_generation={} deadline={}",
+                     work.tid,
+@@ -18451,7 +18454,9 @@ impl SharedKernel {
+                 crate::yarm_log!("SCHED_TIMEOUT_STRANDED_WAITER tid={}", work.tid);
+             }
+             // ── (3) rank 1: the wake, last — the promised slot, which cannot be refused ─────
+-            self.commit_ipc_wake_split(placement);
++            if let Some(p) = placement {
++                self.commit_ipc_wake_split(p);
++            }
+             crate::yarm_log!(
+                 "U8_RECV_TIMEOUT_SETTLED arch={} tid={} asid={} wait_generation={} deadline={} now={} broad_lock=0 result=ok",
+                 crate::kernel::boot::REPLY_TIMEOUT_ARCH,

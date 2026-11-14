@@ -1,0 +1,5 @@
+[matrix] exact commit sha=c4c209a9a0992a0d4ea3869afdb23fe47147e761 tree=f41dfd432a8478fce8bc12cd9e9bc84edeea2bc0 (clean)
+[matrix] building x86_64 artifacts (servers + initramfs + feature-on/off kernels)
+[matrix][fail] [x86_64/off] feature-OFF image contains live literal: class=IpcReplyTimeout
+[matrix] [x86_64/off] feature-off retirement literals=1 causal-gate literals=0
+STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL arches=3 total_live_cells=0 timeout_wins=0 reply_wins=0 feature_off_clean=0 result=fail

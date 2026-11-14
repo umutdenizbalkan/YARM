@@ -1,0 +1,3 @@
+6c83237e05032d102e4f9acd4f0e4b298327cd89771a79d8aea0dfc3f5ff6627  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/qual-live/LW-x86_64/boot.log
+21f1eda62ce651d5e9d9593431ab3ef492808ede87e6b0850e25a0a019167211  build-x86_64/kernel_boot.elf
+a3eed09c183424b29900bcf85735a88a55077dd412dcdc4354ea55d931f2fb03  build-x86_64/initramfs-core.cpio

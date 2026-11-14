@@ -1,0 +1,20 @@
+applied ncA10
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 51826059..d144c1a0 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -15687,13 +15687,7 @@ impl SharedKernel {
+                 let reparked = self.with_ipc_split_mut(|ipc| {
+                     match ipc.reply_death_unclaimed.get_mut(work.reply_record_index) {
+                         Some(slot @ None) => {
+-                            *slot = Some(crate::kernel::boot::ParkedServerDeath {
+-                                work,
+-                                claimable: true,
+-                            });
+-                            crate::kernel::boot::server_death_claimable_note(
+-                                work.reply_record_index,
+-                            );
++                            let _ = slot;
+                             true
+                         }
+                         _ => false,

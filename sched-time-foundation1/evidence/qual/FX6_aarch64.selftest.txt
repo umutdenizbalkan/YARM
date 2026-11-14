@@ -1,0 +1,10 @@
+[ok] valid trace                              SL1W_GRADE result=pass ncpu=2 | SYNCHRONIZED holds: 2/2 rounds credited over 2 valid attempts (0 uncredited), directions [(0, 1), (1, 0)], 0 late observer records not counted | EXECUTION: 3 installations (3 observed by a RUN, 0 ended unobserved, 2 in force at the census), 3 runs (3 from user mode, 0 from kernel mode), 2 progress records, each checked against the installation in force | CLAIMS: 1 claims bound to their commits, 1 incarnations confirmed by a later run, 0 unconfirmed (still queued 0, withdrawn 0, installed, never entered 0, entered only from kernel mode 0), 0 claiming no address space | NATURAL trace: 7 sections (1 remote adds, 1 notifications, 0 restores) replayed SNAP→CENSUS exactly; cells 0:0x80001000 1:0x80002000
+[ok] section names a third lock instance      lock-instance: section seq 8 on cpu 1 names lock instance 0x7e570000; cpu 1's cell is 0x80002000
+[ok] claim incarnation substituted            claim-incarnation: CLAIM seq 17 placed tid 200 with incarnation code 79; when it next ran (RUN seq 33) cpu 1 had code 11 active (stale or substituted incarnation)
+[ok] claim names another commit               claim-commit: CLAIM seq 17 (cpu 0 → cpu 1 tid 200) names commit seq 15 gen 9, which did not add tid 200 to cpu 1 on cpu 0 (dropped publication, or substituted destination, task or commit)
+[ok] claim of no address space, user-mode entry claim-incarnation: CLAIM seq 17 placed tid 200 as a task with no address space; its wake was consumed by installation seq 29, whose first kernel entry (RUN seq 33) came from user mode with ASID code 11 active
+[ok] an installation's end reports it unobserved run: RUN seq 12 observed installation seq 10, whose end (seq 29) reports it never observed
+[ok] holder without its lock                  attempt: round 0 attempt seq 7: the holder's lock was not held at begin and end
+[ok] overflow                                 validity: the record ring overflowed
+[ok] window not closed                        validity: the window never closed (phase=1)
+SL1W self-test: 9 cases, 1 accepted, 8 rejected, 0 wrong

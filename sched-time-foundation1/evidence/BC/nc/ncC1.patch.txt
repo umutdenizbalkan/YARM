@@ -1,0 +1,14 @@
+applied ncC1
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 146749cb..6adadb79 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -864,7 +864,7 @@ pub fn compare_and_register_futex_waiter_locked(
+ /// `CLOCK_MONOTONIC`. A clock that cannot be read (no source) answers `false`: a sleep is never
+ /// ended EARLY because a clock is missing. Lock-free (the counter and one atomic).
+ pub fn sleep_deadline_reached(deadline_ns: u64) -> bool {
+-    crate::kernel::timekeeping::monotonic_ns().is_ok_and(|now| now >= deadline_ns)
++    crate::kernel::timekeeping::monotonic_ns().is_ok_and(|now| now + 1_000 >= deadline_ns)
+ }
+ 
+ /// FUTEX-TIME1 / SCHED-TIME-FOUNDATION1 C — whether `rec`'s deadline has been reached, in the

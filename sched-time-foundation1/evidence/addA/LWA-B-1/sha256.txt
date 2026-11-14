@@ -1,0 +1,3 @@
+960ba6ba0ddbdcd7ff9813d4cbb7455675ed31653d9cba3d8e8d5f364ea4005d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/addA/LWA-B-1/boot.log
+cb07a9638686f25333927e2cf8507b63250fa8e357513d6840043b0453c6e88d  build-riscv64/yarm-riscv64.bin
+bde8cc65155a3b33f5a0886687d5341bd201c7f99b108572145a938c93f48c1e  build-riscv64/initramfs-core.cpio

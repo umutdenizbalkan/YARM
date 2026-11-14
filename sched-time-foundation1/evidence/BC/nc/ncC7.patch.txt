@@ -1,0 +1,14 @@
+applied ncC7
+diff --git a/src/kernel/timekeeping.rs b/src/kernel/timekeeping.rs
+index 35d758d6..6e63d647 100644
+--- a/src/kernel/timekeeping.rs
++++ b/src/kernel/timekeeping.rs
+@@ -384,7 +384,7 @@ pub fn sleep_deadline_at(
+         (true, None) => ts_ns,
+         (true, Some(rt)) => mono as i128 + (ts_ns - rt),
+     };
+-    Ok(target.clamp(mono as i128, u64::MAX as i128) as u64)
++    Ok(target.max(mono as i128) as u64)
+ }
+ 
+ /// Boot: install the port's counter (BSP, before userspace) and report it.

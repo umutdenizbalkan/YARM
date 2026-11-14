@@ -1,0 +1,5 @@
+[sched-time-witness] building base riscv64 artifacts with futex-requeue-witness,sched-time-witness
+[sched-time-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,sched-time-witness
+[sched-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[sched-time-witness][fail] IPC: no receive timeout was due on a full queue (no placement deferral observed)
+SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=510 fillers=127 idle_current0=3 cross_cpu=21 kthread_beats=19 done_during_kthread=35 ipc_deferrals=0 late_max_ns=13027819500 late_median_ns=62835000 calls=40

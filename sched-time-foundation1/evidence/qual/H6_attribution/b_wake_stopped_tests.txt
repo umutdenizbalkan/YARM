@@ -1,0 +1,10 @@
+kernel::boot::tests::futex_requeue1::wait_atomic1::w20_a_full_run_queue
+kernel::boot::tests::futex_wake_cap1::c1_sixty_five_waiters_one_cpu_none_stranded_and_count_exact
+kernel::boot::tests::futex_wake_cap1::c2_a_partly_filled_queue_places_fewer_and_strands_none
+kernel::boot::tests::futex_wake_cap1::c3_repeated_wakes_never_double_place
+kernel::boot::tests::futex_wake_cap1::c4_shared_key_none_stranded
+kernel::boot::tests::futex_wake_cap1::c5_broad_and_split_wakes_agree
+kernel::boot::tests::futex_wake_cap1::c9_a_refused_placement_claims_nothing
+kernel::boot::tests::futex_wake_cap1_baseline::w1_sixty_five_waiters_on_one_cpu_are_all_placed
+kernel::boot::tests::futex_wake_cap1_baseline::w2_a_partly_filled_queue_strands_no_waiter
+kernel::boot::tests::futex_wake_cap1_baseline::w3_the_split_wake_strands_no_waiter

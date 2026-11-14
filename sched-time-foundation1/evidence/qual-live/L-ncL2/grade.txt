@@ -1,0 +1,27 @@
+[sched-time-witness][fail] cell reported STW_FAIL what=short
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=two_w
+[sched-time-witness][fail] cell reported STW_FAIL what=kill_wait
+[sched-time-witness][fail] cell reported STW_FAIL what=full
+[sched-time-witness][fail] call 2 (short): code 255
+[sched-time-witness][fail] call 27 (cross): code 255
+[sched-time-witness][fail] call 28 (cross): code 255
+[sched-time-witness][fail] call 29 (cross): code 255
+[sched-time-witness][fail] call 30 (cross): code 255
+[sched-time-witness][fail] call 31 (cross): code 255
+[sched-time-witness][fail] call 32 (cross): code 255
+[sched-time-witness][fail] call 33 (cross): code 255
+[sched-time-witness][fail] call 34 (cross): code 255
+[sched-time-witness][fail] call 35 (two_w): code 255
+[sched-time-witness][fail] call 37 (kill_wait): code 255
+[sched-time-witness][fail] call 40 (full): code 255
+[sched-time-witness][fail] W reported 12 failures
+[sched-time-witness][fail] STW_DONE result=fail
+SCHED_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=fail full_refusals=249 fillers=129 idle_current0=3 cross_cpu=7 kthread_beats=17 done_during_kthread=37 ipc_deferrals=4659 late_max_ns=5071804507 late_median_ns=16323889 calls=40

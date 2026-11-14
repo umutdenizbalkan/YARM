@@ -1,0 +1,179 @@
+warning: function `ap_probe_stub_bytes` is never used	   --> src/kernel/boot/exec_state.rs
+warning: function `apic_of` is never used	   --> src/arch/x86_64/smp.rs
+warning: function `apply_boot_option_knobs` is never used	   --> src/kernel/boot_command_line.rs
+warning: function `blocked_syscall_idle_provenance_take` is never used	    --> src/kernel/boot/mod.rs
+warning: function `boot_command_line` is never used	   --> src/kernel/boot_command_line.rs
+warning: function `bound_apic_id` is never used	   --> src/arch/x86_64/smp.rs
+warning: function `c2c_send_reschedule_ipi_to` is never used	    --> src/arch/x86_64/smp.rs
+warning: function `cancel_async_resume` is never used	   --> src/kernel/task.rs
+warning: function `claim_direct_reply_terminal_locked` is never used	    --> src/kernel/boot/ipc_state.rs
+warning: function `classify_and_take_async_resume` is never used	   --> src/kernel/task.rs
+warning: function `classify_direct_reply_terminal_locked` is never used	    --> src/kernel/boot/ipc_state.rs
+warning: function `commit_queued_reply_locked` is never used	    --> src/kernel/boot/ipc_state.rs
+warning: function `current_arch_tag` is never used	    --> src/kernel/boot/mod.rs
+warning: function `emit_ipccall_direct_request_live_markers` is never used	    --> src/kernel/boot/mod.rs
+warning: function `emit_ipcreply_direct_live_markers` is never used	    --> src/kernel/boot/mod.rs
+warning: function `execute_user_asid_plain_writeback` is never used	   --> src/kernel/recv_core.rs
+warning: function `fallback_kernel_stack_bounds` is never used	   --> src/arch/x86_64/trap.rs
+warning: function `find_kernel_stack_bounds_containing_rsp_split` is never used	   --> src/arch/x86_64/trap.rs
+warning: function `frame_call_request_message` is never used	  --> src/kernel/syscall/ipc_abi.rs
+warning: function `frame_reply_message_with_cap` is never used	  --> src/kernel/syscall/ipc_abi.rs
+warning: function `handle_trap_entry_with_fault_bookkeeping_mode` is never used	  --> src/arch/trap_entry.rs
+warning: function `ipc_reply_timeout_rw_deadline` is never used	    --> src/kernel/boot/mod.rs
+warning: function `ipc_reply_timeout_rw_late_scan_once` is never used	    --> src/kernel/boot/mod.rs
+warning: function `ipccall_direct_smp_request_note_delivered` is never used	    --> src/kernel/boot/mod.rs
+warning: function `ipccall_direct_smp_request_note_early_wouldblock` is never used	    --> src/kernel/boot/mod.rs
+warning: function `ipcreply_direct_smp_note_duplicate_refused` is never used	    --> src/kernel/boot/mod.rs
+warning: function `ipcreply_direct_smp_reply_note_delivered` is never used	    --> src/kernel/boot/mod.rs
+warning: function `ipcreply_direct_smp_reply_note_early_wouldblock` is never used	    --> src/kernel/boot/mod.rs
+warning: function `kernel_stack_bounds_if_containing` is never used	   --> src/arch/x86_64/trap.rs
+warning: function `lapic_mmio_base` is never used	   --> src/arch/x86_64/smp.rs
+warning: function `maybe_echo_smp_oracle_block` is never used	    --> src/kernel/boot/mod.rs
+warning: function `maybe_emit_server_dies_link_balance` is never used	    --> src/kernel/boot/mod.rs
+warning: function `maybe_log_futex_wait_default_on` is never used	    --> src/kernel/boot/mod.rs
+warning: function `maybe_log_riscv_futex_wait_retire_default_on` is never used	    --> src/kernel/boot/mod.rs
+warning: function `maybe_log_riscv_yield_retire_default_on` is never used	    --> src/kernel/boot/mod.rs
+warning: function `maybe_log_shared_region_cancel_fuse_set` is never used	    --> src/kernel/boot/mod.rs
+warning: function `maybe_log_yield_default_on` is never used	    --> src/kernel/boot/mod.rs
+warning: function `note_recv_broad_entry` is never used	    --> src/kernel/boot/mod.rs
+warning: function `observe_user_marker` is never used	   --> src/kernel/boot/smp_request_txn.rs
+warning: function `parse_bool_knob` is never used	    --> src/kernel/boot_command_line.rs
+warning: function `parse_boot_phase` is never used	    --> src/kernel/boot_command_line.rs
+warning: function `parse_loglevel_value` is never used	    --> src/kernel/boot_command_line.rs
+warning: function `parse_platform_option` is never used	    --> src/kernel/boot_command_line.rs
+warning: function `parse_positive_usize` is never used	    --> src/kernel/boot_command_line.rs
+warning: function `parse_yarm_boot_options` is never used	    --> src/kernel/boot_command_line.rs
+warning: function `peek_recv_core_user_plain` is never used	   --> src/kernel/recv_core.rs
+warning: function `planned_secondaries_bitmap` is never used	   --> src/arch/x86_64/smp.rs
+warning: function `produce_queued_shared_region_delivery` is never used	    --> src/kernel/syscall.rs
+warning: function `publish_async_preempt_snapshot` is never used	   --> src/kernel/task.rs
+warning: function `publish` is never used	    --> src/kernel/boot/mod.rs
+warning: function `publish` is never used	    --> src/kernel/boot/mod.rs
+warning: function `read_boot_tss_rsp0` is never used	    --> src/arch/x86_64/descriptor_tables.rs
+warning: function `reserve_direct_reply_record_locked` is never used	    --> src/kernel/boot/ipc_state.rs
+warning: function `resume_boundary_consumes` is never used	   --> src/kernel/task.rs
+warning: function `riscv_async_resume_clear` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_async_resume_publish` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_async_resume_take` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_queue_switch_foundation_armed` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_queue_switch_foundation_clear` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_queue_switch_foundation_is_deferred` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_queue_switch_foundation_outgoing` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_queue_switch_foundation_try_defer` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_syscall_continuation_clear` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_syscall_continuation_publish` is never used	    --> src/kernel/boot/mod.rs
+warning: function `riscv_syscall_continuation_take` is never used	    --> src/kernel/boot/mod.rs
+warning: function `send_reschedule_ipi_to` is never used	    --> src/arch/x86_64/smp.rs
+warning: function `server_death_work_clear` is never used	    --> src/kernel/boot/mod.rs
+warning: function `server_death_work_drained_count` is never used	    --> src/kernel/boot/mod.rs
+warning: function `server_death_work_len` is never used	    --> src/kernel/boot/mod.rs
+warning: function `server_death_work_published_count` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_aarch64_futex_wait_idle_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_aarch64_futex_wait_retire_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_aarch64_futex_wake_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_aarch64_ipccall_direct_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_aarch64_shared_region_direct_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_aarch64_terminal_fault_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_aarch64_yield_lone_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_aarch64_yield_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_cap_cnode_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_cross_arch_d6_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_d3_full_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_d6_controlled_switch_proof_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_d6_switch_a_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_fault_delivery_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_force_init_zc_load_fail` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_futex_requeue_witness_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_global_state_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_displace1_witness_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_recv_oracle_proof_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_recv_proof_sender_wake_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_reply_timeout_oracle_reply_endpoint` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_reply_timeout_rw_deadline` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_residual1_queued_cap_witness_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_residual2_park_witness_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_send_cap_enqueue_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_send_cap_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_send_enqueue_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_send_final_fault_witness_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_send_plain_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipc_send_reply_cap_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_ipccall_direct_proof_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_irq1_hosted_bridge_injection` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_raw_cmdline_from_bytes_monotonic` is never used	   --> src/kernel/boot_command_line.rs
+warning: function `set_raw_cmdline_from_bytes` is never used	   --> src/kernel/boot_command_line.rs
+warning: function `set_riscv_futex_wait_idle_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_riscv_futex_wait_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_riscv_futex_wake_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_riscv_ipccall_direct_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_riscv_post_lock_foundation_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_riscv_queue_switch_foundation_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_riscv_shared_region_direct_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_riscv_typed_outcome_internal_error_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_riscv_yield_lone_task_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_riscv_yield_two_task_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_sched_timeout_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_spawn_lifecycle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_terminal_fault_fetch_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_terminal_fault_illegal_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_terminal_fault_portio_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_terminal_fault_waiter_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_timer5_idle_return_witness_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_vm_cow_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_x86_futex_wake_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_x86_ipc_reply_timeout_oracle_mode` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_x86_ipccall_direct_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_x86_ipccall_direct_smp_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_x86_ipccall_direct_smp_recv_v2_server_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_x86_ipccall_direct_smp_reply_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_x86_ipccall_direct_smp_request_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_x86_shared_region_direct_oracle_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `set_xfer2_grant_witness_enabled` is never used	    --> src/kernel/boot/mod.rs
+warning: function `shared_region_oracle_pattern_byte` is never used	    --> src/kernel/boot/mod.rs
+warning: function `transfer_cap_arg_value` is never used	  --> src/kernel/syscall/ipc_abi.rs
+warning: function `try_split_blocking_ipc_recv_into_frame` is never used	    --> src/kernel/syscall_split.rs
+warning: function `valid_manifest_path` is never used	    --> src/kernel/boot_command_line.rs
+warning: function `write_v3_output_to_user` is never used	   --> src/kernel/syscall/recv_shared_v3.rs
+warning: function `x86_smp_unlock_audit_claimed` is never used	  --> src/kernel/boot/orchestrator_state.rs
+warning: method `as_mut_slice` is never used	   --> src/kernel/syscall/process.rs
+warning: method `disposition` is never used	   --> src/runtime.rs
+warning: method `find_current_task_cap_for_memory_object_phys` is never used	   --> src/kernel/boot/capability_lifecycle_state.rs
+warning: method `into_legacy_option` is never used	    --> src/kernel/syscall.rs
+warning: method `is_committed` is never used	   --> src/kernel/ipccall_direct.rs
+warning: method `len` is never used	   --> src/kernel/syscall/spawn_image_txn.rs
+warning: method `marker` is never used	   --> src/runtime.rs
+warning: method `provenance` is never used	    --> src/runtime.rs
+warning: method `queue_advance_admit_with_authority_split` is never used	    --> src/kernel/boot/exec_state.rs
+warning: method `read_user` is never used	  --> src/kernel/syscall/recv_v3_txn.rs
+warning: method `remove_endpoint_waiter_exact` is never used	   --> src/kernel/boot/ipc_state.rs
+warning: method `resolved_cap_object_split` is never used	    --> src/kernel/boot/capability_lifecycle_state.rs
+warning: method `restores_verbatim` is never used	   --> src/kernel/task.rs
+warning: method `slot` is never used	    --> src/kernel/boot/mod.rs
+warning: unused import: `CapObject`	  --> src/kernel/recv_waiter_split.rs
+warning: unused import: `CapRights`	  --> src/kernel/syscall/recv_shared_v3.rs
+warning: unused import: `PAGE_SIZE`	  --> src/kernel/syscall/vm.rs
+warning: unused import: `PAGE_SIZE`	 --> src/kernel/syscall.rs
+warning: unused import: `SYSCALL_NO_TRANSFER_CAP`	  --> src/kernel/syscall/recv_shared_v3.rs
+warning: unused import: `TaskClass`	     --> src/runtime.rs
+warning: unused import: `TaskClass`	    --> src/runtime.rs
+warning: unused import: `TaskClass`	  --> src/kernel/boot/scheduler_state.rs
+warning: unused import: `TaskClass`	 --> src/kernel/boot/thread_state.rs
+warning: unused import: `crate::kernel::ipc::Message`	  --> src/kernel/syscall/recv_shared_v3.rs
+warning: unused import: `crate::kernel::ipc::ThreadId`	     --> src/runtime.rs
+warning: unused import: `crate::kernel::ipc::ThreadId`	 --> src/kernel/boot/task_policy_state.rs
+warning: unused import: `crate::kernel::task::TaskClass`	     --> src/runtime.rs
+warning: unused import: `crate::kernel::task::TaskClass`	     --> src/runtime.rs
+warning: unused import: `crate::kernel::task::TaskClass`	     --> src/runtime.rs
+warning: unused import: `crate::kernel::task::TaskClass`	    --> src/runtime.rs
+warning: unused import: `crate::kernel::task::TaskClass`	    --> src/runtime.rs
+warning: unused import: `crate::kernel::vm::Asid`	  --> src/kernel/boot/thread_state.rs
+warning: unused import: `ipc::REPLY_CAP_QUEUEING_SUPPORTED`	   --> src/kernel/syscall.rs
+warning: unused import: `ipc::split_inline_payload_from_frame`	   --> src/kernel/syscall.rs
+warning: unused import: `ipc_state::rt_detach_server_link`	    --> src/kernel/boot/mod.rs
+warning: unused import: `orchestrator_state::x86_smp_unlock_audit_claimed`	  --> src/kernel/boot/mod.rs
+warning: unused import: `self::ipc_abi::transfer_cap_arg_present`	   --> src/kernel/syscall.rs
+warning: unused imports: `CachePolicy`, `Mapping`, `PAGE_SIZE`, `PageFlags`, `PhysAddr`, and `VirtAddr`	  --> src/kernel/syscall/recv_shared_v3.rs
+warning: unused imports: `DetachOutcome` and `enqueue_reply_into_endpoint_locked`	  --> src/kernel/boot/mod.rs
+warning: unused imports: `IpcSendPayloadShape`, `classify_ipc_send_payload_shape`, and `frame_ipc_send_message`	   --> src/kernel/syscall.rs
+warning: unused imports: `QueueAdvanceOutcome` and `QueueAdvanceRefusal`	  --> src/kernel/boot/mod.rs
+warning: unused imports: `SYSCALL_ARG_CAP`, `SYSCALL_ARG_LEN`, and `SYSCALL_ARG_PTR`	    --> src/runtime.rs

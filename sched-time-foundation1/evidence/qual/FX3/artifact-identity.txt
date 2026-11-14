@@ -1,0 +1,4 @@
+tree=f41dfd432a8478fce8bc12cd9e9bc84edeea2bc0 head=c4c209a9a0992a0d4ea3869afdb23fe47147e761 dirty=0 features=aarch64-overtaken-witness cmdline=yarm.ap_user_dispatch=1
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=virt cpu=cortex-a72 smp=2
+3e4d22b161b1a2141381cb52c8a73bd0cee36b2d8928c51c4fa302ac3d06ecbc  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/qual/FX3/build/yarm-aarch64.bin
+ec1448970c4b6e9471e2e70ac40d94bbb44fda5eb32fb2d405c3aadd7b89f972  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf-evidence/qual/FX3/build/initramfs-core.cpio

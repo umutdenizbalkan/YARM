@@ -1,0 +1,15 @@
+applied ncC9
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 146749cb..7f34998d 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -902,9 +902,6 @@ fn register_sleep_waiter_locked(
+     if !entering_incarnation(tcbs, tid, asid) {
+         return Err(Refused::IncarnationMoved);
+     }
+-    if sleep_deadline_reached(deadline_ns) {
+-        return Err(Refused::TimedOut);
+-    }
+     let advances = tcbs.iter().flatten().any(|t| {
+         t.tid.0 == tid
+             && t.asid.unwrap_or(Asid(0)) == asid

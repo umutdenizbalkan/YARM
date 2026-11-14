@@ -1,0 +1,1 @@
+FUTEX_REQUEUE_WITNESS_SEAL arch=aarch64 smp=2 rounds=3 broadcasts=3 census_calls=6 parks=40 park_cpus=0,1 requeuer_cpus=0 mutex_wakes=9,9,9 cross_cpu=yes witness=ok core_smoke=ok result=ok

@@ -1,0 +1,18 @@
+applied ncC6
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 146749cb..1fdaa502 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1236,7 +1236,11 @@ pub fn claim_futex_timeout_locked(
+         return false;
+     };
+     tcb.status = TaskStatus::Runnable;
+-    table.retire(slot);
++    if !matches!(rec.key, FutexKey::Sleep { .. }) {
++        table.retire(slot);
++    } else {
++        tcb.status = TaskStatus::Blocked(WaitReason::Futex(token));
++    }
+     let ending = if matches!(rec.key, FutexKey::Sleep { .. }) {
+         FutexWaitEnding::SleepDone
+     } else {

@@ -1,0 +1,20 @@
+liveC start 2026-11-14T03:46:26Z head=1dee980a0367bb7161636a13a32ded404cc0668a porcelain=0
+LC-riscv64 rc=1 SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=0 fillers=128 idle_current0=3 cross_cpu=3 kthread_beats=14 done_during_kthread=18 ipc_deferrals=31 late_max_ns=2510259700 late_median_ns=72164700 calls=20 printk_lost=0
+          1 [sched-time-witness][fail] 8: saturation completed after the deadline
+          1 [sched-time-witness][fail] 8: the full-queue sleep was never refused a placement (queue not full when due)
+          1 [sched-time-witness][fail] STW_DONE result=fail
+          1 [sched-time-witness][fail] W reported 1 failures
+          1 [sched-time-witness][fail] call 13 (cycle): 0 registrations
+          1 [sched-time-witness][fail] call 16 (cycle): 0 registrations
+          1 [sched-time-witness][fail] call 18 (cycle): 0 registrations
+          1 [sched-time-witness][fail] call 2 (short): 0 registrations
+LC-aarch64 rc=0 SCHED_TIME_WITNESS_SEAL arch=aarch64 smp=2 result=ok full_refusals=1422 fillers=128 idle_current0=3 cross_cpu=30 kthread_beats=23 done_during_kthread=29 ipc_deferrals=3 late_max_ns=2229981760 late_median_ns=6008128 calls=32 printk_lost=0
+LC-x86_64 rc=1 SCHED_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=fail full_refusals=5938 fillers=129 idle_current0=3 cross_cpu=0 kthread_beats=15 done_during_kthread=29 ipc_deferrals=3214 late_max_ns=79962969118 late_median_ns=16449643 calls=32 printk_lost=0
+          1 [sched-time-witness][fail] 10: no sleep was placed from another CPU
+          1 [sched-time-witness][fail] 8: saturation completed after the deadline
+          1 [sched-time-witness][fail] STW_DONE result=fail
+          1 [sched-time-witness][fail] W reported 1 failures
+          1 [sched-time-witness][fail] cell reported STW_FAIL what=saturate
+LCF-riscv64 rc=0 FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=ok a_idle_collections=3 g_woken=9 g_timed_out=23 g_windows_woke=14 g_windows_refused=0 g_skipped=9 in_window_wakes=14 e_spawn_refusal=SchedulerFull e_fillers=128 e_pings=62 calls=41 cycles=41 printk_lost=0 commits=9815
+liveC end 2026-11-14T04:31:20Z
+LIVEC_DONE

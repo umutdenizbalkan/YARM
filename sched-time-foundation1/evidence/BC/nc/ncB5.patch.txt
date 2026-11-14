@@ -1,0 +1,17 @@
+applied ncB5
+diff --git a/src/kernel/timekeeping.rs b/src/kernel/timekeeping.rs
+index 35d758d6..90829216 100644
+--- a/src/kernel/timekeeping.rs
++++ b/src/kernel/timekeeping.rs
+@@ -278,10 +278,7 @@ const RT_READ_RETRIES: usize = 64;
+ fn realtime_offset() -> Option<(bool, i64)> {
+     for _ in 0..RT_READ_RETRIES {
+         let s0 = RT_SEQ.load(Ordering::Acquire);
+-        if s0 & 1 == 1 {
+-            core::hint::spin_loop();
+-            continue;
+-        }
++        let _ = s0;
+         let init = RT_INIT.load(Ordering::Acquire);
+         let off = RT_OFFSET_NS.load(Ordering::Acquire);
+         if RT_SEQ.load(Ordering::Acquire) == s0 {

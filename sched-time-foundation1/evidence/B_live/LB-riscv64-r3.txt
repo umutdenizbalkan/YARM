@@ -1,0 +1,5 @@
+[futex-time-witness] building base riscv64 artifacts with futex-requeue-witness,futex-time-witness
+[futex-time-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,futex-time-witness
+[futex-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-time-witness][fail] core smoke not clean (rc=0): ['[fail] RISC-V Yield split dispatch is not reconciled with its committed yield transactions (nr0=9631 committed=9632 unpaired_or_wrong_disposition=1)']
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail a_idle_collections=2 g_woken=9 g_timed_out=23 g_windows_woke=16 g_windows_refused=0 g_skipped=7 in_window_wakes=16 e_spawn_refusal=SchedulerFull e_fillers=128 e_pings=62 calls=41 cycles=41

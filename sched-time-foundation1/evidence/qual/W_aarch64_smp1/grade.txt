@@ -1,0 +1,1 @@
+IPC_DISPLACE1_WITNESS_SEAL arch=aarch64 smp=1 rounds=16 r1=10009 r2=10008 s=1 endpoint=6/1 blocks=16 refusals=16 deliveries_r1=16 wakes_r1=16 r1_wake_cpus=0 r1_cpus=0 r2_cpus=0 cross_cpu_rounds=0 witness=ok core_smoke=ok result=ok

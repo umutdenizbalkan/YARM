@@ -1,0 +1,14 @@
+applied ncC2
+diff --git a/src/kernel/boot/futex.rs b/src/kernel/boot/futex.rs
+index 146749cb..1f295dc7 100644
+--- a/src/kernel/boot/futex.rs
++++ b/src/kernel/boot/futex.rs
+@@ -1237,7 +1237,7 @@ pub fn claim_futex_timeout_locked(
+     };
+     tcb.status = TaskStatus::Runnable;
+     table.retire(slot);
+-    let ending = if matches!(rec.key, FutexKey::Sleep { .. }) {
++    let ending = if false {
+         FutexWaitEnding::SleepDone
+     } else {
+         FutexWaitEnding::TimedOut

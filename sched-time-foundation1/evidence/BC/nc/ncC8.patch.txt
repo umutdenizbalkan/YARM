@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf_nc.py", line 374, in <module>
+    CONTROLS[which]()
+  File "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf_nc.py", line 333, in ncC8
+    patch(TK, """        ClockId::Realtime => Some(realtime_at(mono)?.to_signed_ns().ok_or(ClockError::Overflow)?),""",
+  File "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/stf_nc.py", line 18, in patch
+    assert s.count(old) == count, (rel, old[:100], s.count(old))
+           ^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ('src/kernel/timekeeping.rs', '        ClockId::Realtime => Some(realtime_at(mono)?.to_signed_ns().ok_or(ClockError::Overflow)?),', 0)

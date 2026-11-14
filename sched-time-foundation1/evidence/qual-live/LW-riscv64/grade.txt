@@ -1,0 +1,3 @@
+[futex-wait-grade][fail] coverage: 0 B windows saw a store (need 2)
+[futex-wait-grade][fail] coverage: 0 A windows (need 2)
+FUTEX_WAIT_WITNESS_SEAL arch=riscv64 smp=2 waits=0 skipped=32 windows=0 refused=0 b_changed=0 a=0 in_window_wakes=0 waiter_cpus=none waker_cpus=none calls=32 returns=32 blocked=32 mismatch=0 during_publication=0 parked=32 parked_ok=32 parked_err=0 dup_or_missing=0 witness=fail core_smoke=ok result=fail

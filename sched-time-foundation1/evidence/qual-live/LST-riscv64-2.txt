@@ -1,0 +1,5 @@
+[sched-time-witness] building base riscv64 artifacts with futex-requeue-witness,sched-time-witness
+[sched-time-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,sched-time-witness
+[sched-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[sched-time-witness][fail] 8: the full-queue sleep was never refused a placement (queue not full when due)
+SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=0 fillers=127 idle_current0=3 cross_cpu=7 kthread_beats=19 done_during_kthread=35 ipc_deferrals=2 late_max_ns=5237463900 late_median_ns=37596100 calls=40

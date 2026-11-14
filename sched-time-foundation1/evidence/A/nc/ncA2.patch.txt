@@ -1,0 +1,16 @@
+applied ncA2
+diff --git a/src/kernel/scheduler.rs b/src/kernel/scheduler.rs
+index 47758bc6..61975ee7 100644
+--- a/src/kernel/scheduler.rs
++++ b/src/kernel/scheduler.rs
+@@ -489,9 +489,7 @@ impl PriorityScheduler {
+         tid: ThreadId,
+         priority: TaskPriority,
+     ) -> Result<(), SchedulerError> {
+-        if self.contains_tid(tid) {
+-            return Err(SchedulerError::AlreadyQueued);
+-        }
++        let _ = self.push_unchecked_capacity(tid, priority);
+         let pushed = self.push_unchecked_capacity(tid, priority);
+         // The one current that is installed rather than admitted is an AP's idle (tid 0,
+         // `install_ap_idle_current`), so the bound does not cover it; at the physical bound its

@@ -1,0 +1,17 @@
+applied ncC4
+diff --git a/src/kernel/boot/restart_state.rs b/src/kernel/boot/restart_state.rs
+index d269630a..77fa2e22 100644
+--- a/src/kernel/boot/restart_state.rs
++++ b/src/kernel/boot/restart_state.rs
+@@ -391,10 +391,7 @@ impl KernelState {
+             tcb.restart.token = None;
+             Ok::<_, KernelError>(())
+         })?;
+-        // FUTEX-FOUND1: a dead task waits on nothing; retire any futex record naming it.
+-        self.with_task_futex_mut(|_tcbs, table| {
+-            super::futex::retire_futex_waiters_for_task_locked(table, tid)
+-        });
++        // (control) no retirement
+         // Stage 199A2B1: authoritative-identity reply-record cleanup at task death.
+         let dead_identity = crate::kernel::boot::ReceiverWaiterIdentity::new(
+             crate::kernel::ipc::ThreadId(tid),

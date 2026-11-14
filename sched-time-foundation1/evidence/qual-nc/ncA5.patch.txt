@@ -1,0 +1,14 @@
+applied ncA5
+diff --git a/src/kernel/scheduler.rs b/src/kernel/scheduler.rs
+index 47758bc6..519b9b14 100644
+--- a/src/kernel/scheduler.rs
++++ b/src/kernel/scheduler.rs
+@@ -506,7 +506,7 @@ impl PriorityScheduler {
+     /// FUTEX-WAKE-CAP1 — whether one more user entry fits at `priority`, counting reservations.
+     fn user_room(&self, priority: TaskPriority) -> bool {
+         let p = Self::priority_index(priority);
+-        self.queues[p].len + self.reserved[p] < MAX_RUN_QUEUE
++        self.queues[p].len < MAX_RUN_QUEUE
+     }
+ 
+     /// FUTEX-WAKE-CAP1 — promise one user slot at `priority`. Refused (`QueueFull`) exactly when

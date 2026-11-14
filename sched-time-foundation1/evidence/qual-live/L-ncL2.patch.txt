@@ -1,0 +1,13 @@
+applied ncL2
+diff --git a/src/arch/x86_64/trap.rs b/src/arch/x86_64/trap.rs
+index b0e5ddf6..a7f0e71b 100644
+--- a/src/arch/x86_64/trap.rs
++++ b/src/arch/x86_64/trap.rs
+@@ -487,7 +487,6 @@ pub(crate) fn encode_x86_blocked_completion(
+     if matches!(
+         done.syscall_class,
+         crate::kernel::task::BlockedSyscallClass::FutexWait
+-            | crate::kernel::task::BlockedSyscallClass::Sleep
+     ) {
+         frame.commit_x86_syscall_returns();
+     }

@@ -1,0 +1,75 @@
+[sched-time-witness][fail] cell reported STW_FAIL what=long
+[sched-time-witness][fail] cell reported STW_FAIL what=abs
+[sched-time-witness][fail] cell reported STW_FAIL what=cycle
+[sched-time-witness][fail] cell reported STW_FAIL what=cycle
+[sched-time-witness][fail] cell reported STW_FAIL what=cycle
+[sched-time-witness][fail] cell reported STW_FAIL what=cycle
+[sched-time-witness][fail] cell reported STW_FAIL what=cycle
+[sched-time-witness][fail] cell reported STW_FAIL what=cycle
+[sched-time-witness][fail] cell reported STW_FAIL what=cycle
+[sched-time-witness][fail] cell reported STW_FAIL what=cycle
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=cross
+[sched-time-witness][fail] cell reported STW_FAIL what=kill_wait
+[sched-time-witness][fail] cell reported STW_FAIL what=rt_rel
+[sched-time-witness][fail] call 5 (long): returned EARLY, t1 10321880200 < bound 10322908500
+[sched-time-witness][fail] call 5: kernel completed at 10283268700 before deadline 10325733400
+[sched-time-witness][fail] call 6 (abs): returned EARLY, t1 10351988300 < bound 10384286400
+[sched-time-witness][fail] call 6 (abs): 0 registrations
+[sched-time-witness][fail] call 8: kernel completed at 10456370700 before deadline 10496604500
+[sched-time-witness][fail] call 9: kernel completed at 10628456900 before deadline 10671133900
+[sched-time-witness][fail] call 10: kernel completed at 10796512500 before deadline 10845358700
+[sched-time-witness][fail] call 11 (cycle): 0 registrations
+[sched-time-witness][fail] call 12 (cycle): 0 registrations
+[sched-time-witness][fail] call 13 (cycle): returned EARLY, t1 10971125100 < bound 10975426000
+[sched-time-witness][fail] call 13 (cycle): 0 registrations
+[sched-time-witness][fail] call 14 (cycle): 0 registrations
+[sched-time-witness][fail] call 15 (cycle): returned EARLY, t1 11180527700 < bound 11186612900
+[sched-time-witness][fail] call 15 (cycle): 0 registrations
+[sched-time-witness][fail] call 16 (cycle): 0 registrations
+[sched-time-witness][fail] call 17 (cycle): returned EARLY, t1 11416239300 < bound 11417643800
+[sched-time-witness][fail] call 17 (cycle): 0 registrations
+[sched-time-witness][fail] call 18 (cycle): 0 registrations
+[sched-time-witness][fail] call 19 (cycle): returned EARLY, t1 11631313300 < bound 11640283700
+[sched-time-witness][fail] call 19 (cycle): 0 registrations
+[sched-time-witness][fail] call 20 (cycle): 0 registrations
+[sched-time-witness][fail] call 21 (cycle): 0 registrations
+[sched-time-witness][fail] call 22 (cycle): 0 registrations
+[sched-time-witness][fail] call 23 (cycle): returned EARLY, t1 11846898900 < bound 11858141000
+[sched-time-witness][fail] call 23 (cycle): 0 registrations
+[sched-time-witness][fail] call 24 (cycle): returned EARLY, t1 11865996000 < bound 11869937000
+[sched-time-witness][fail] call 24 (cycle): 0 registrations
+[sched-time-witness][fail] call 25 (cycle): returned EARLY, t1 11926127400 < bound 11942402300
+[sched-time-witness][fail] call 25 (cycle): 0 registrations
+[sched-time-witness][fail] call 26 (cycle): returned EARLY, t1 11948615700 < bound 11955240400
+[sched-time-witness][fail] call 26 (cycle): 0 registrations
+[sched-time-witness][fail] call 27 (cross): returned EARLY, t1 12105864900 < bound 12133175100
+[sched-time-witness][fail] call 27 (cross): 0 registrations
+[sched-time-witness][fail] call 28 (cross): returned EARLY, t1 12118354200 < bound 12138476300
+[sched-time-witness][fail] call 28 (cross): 0 registrations
+[sched-time-witness][fail] call 29 (cross): returned EARLY, t1 12131596100 < bound 12152041600
+[sched-time-witness][fail] call 29 (cross): 0 registrations
+[sched-time-witness][fail] call 30 (cross): returned EARLY, t1 12156600100 < bound 12164186000
+[sched-time-witness][fail] call 30 (cross): 0 registrations
+[sched-time-witness][fail] call 31 (cross): returned EARLY, t1 12171249500 < bound 12197348900
+[sched-time-witness][fail] call 31 (cross): 0 registrations
+[sched-time-witness][fail] call 32 (cross): returned EARLY, t1 12185305800 < bound 12210967700
+[sched-time-witness][fail] call 32 (cross): 0 registrations
+[sched-time-witness][fail] call 33 (cross): 0 registrations
+[sched-time-witness][fail] call 34 (cross): returned EARLY, t1 12564649800 < bound 12578082300
+[sched-time-witness][fail] call 34 (cross): 0 registrations
+[sched-time-witness][fail] call 35: kernel completed at 12857966500 before deadline 12889338800
+[sched-time-witness][fail] call 36: kernel completed at 14729260700 before deadline 14768826300
+[sched-time-witness][fail] call 37 (kill_wait): returned EARLY, t1 15299288100 < bound 15305639600
+[sched-time-witness][fail] call 37: kernel completed at 15268668400 before deadline 15317919500
+[sched-time-witness][fail] call 38 (rt_rel): returned EARLY, t1 1700000000016595100 < bound 1700000000028516000
+[sched-time-witness][fail] call 38 (rt_rel): 0 registrations
+[sched-time-witness][fail] call 39 (rt_abs): 0 registrations
+[sched-time-witness][fail] W reported 19 failures
+[sched-time-witness][fail] STW_DONE result=fail
+SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=734 fillers=128 idle_current0=1 cross_cpu=6 kthread_beats=19 done_during_kthread=8 ipc_deferrals=2 late_max_ns=17830578000 late_median_ns=37843200 calls=13
