@@ -36462,4 +36462,29 @@ i01–i09, `timekeeping` b01–b12, `sched_time_foundation1_b_clock` s01–s07,
 ncL1–ncL2 (live); the live sched-time witness (`scripts/qemu-sched-time-witness-smoke.sh`, grader
 `scripts/grade-sched-time-witness.py`) covering the twelve sleep cases, the clock and error lanes,
 full-queue rotation and an IPC timeout deferral on all three ISAs. The frozen qualification and its
-results are recorded below once run.
+results are recorded below.
+
+**Qualification (E).** One frozen candidate, F = `c4c209a9`, against B = `8062c216`, on a schedule
+and runners hashed before the first run (`predeclared.sha`; Addenda A and B declared and hashed
+before they ran). Nothing was rerun in place and nothing substituted; evidence on the orphan branch
+`wip/sched-time-foundation1-evidence`.
+
+| phase | result at F |
+|---|---|
+| hosted negative controls | 27/27 caught (ncA2, ncA3 also hit the 1200 s timeout after failing — counted as declared); unmodified control 6668 passed, 0 failed |
+| hosted matrix | H1 fmt, H2 clippy, H3 lib (`--test-threads=1`), H4 integration, every H5 subset (each ran > 0 tests), H6 lock-order attribution, G1/G2 contract gate on F and B, G3/G4 marker-scan and grader self-tests (incl. the sched-time grader): all pass |
+| builds and smokes | D1–D3, S1–S6 strict builds and core smokes, O1–O3 recv-v2 oracles, UN damaged-marker control, W IPC-DISPLACE1, FX2–FX8 (overtaken, AP scheduling, KTHREAD1, SCHED-LOCK1, FUTEX-REQUEUE1 / race), R1–R3, FB0/FB2/FB3, U1–U3, M1–M4, C1/C3, X, Z: all pass. FUTEX-TIME1's `FX6_schedlock1_riscv64` failure does not recur |
+| sched-time witness | aarch64 3/3, x86_64 3/3 sealed; riscv64 1/3 — runs 1–2 saturated with 127 fillers, so the case-8 / IPC full-queue premise was not established (every sleep, the rotation and every timeout still completed correctly); live controls L-ncL1, L-ncL2 caught |
+| regression witnesses | FUTEX-TIME1 aarch64/x86_64 sealed, riscv64 the documented sequence-E premise limitation (126 fillers); futex-wait aarch64/x86_64 sealed, riscv64 0 windows — Addendum A: B 3/3 and F 3/3 sealed, the scheduled run alone placed all three witness threads on one CPU (placement variance); RISC-V ecall: coverage-only miss — Addendum B: B 2/3, F 2/3, the failing run identical on both, `lost_a3 = lost_a7 = lost_other = 0` in all seven runs; IRQ saturation 3/3 |
+
+Non-zero matrix steps, each classified: FX1 / FB1, C2 / C4, C5a / C5b, C5c / C5d fail identically on
+F and B (baseline debt, all recorded at FUTEX-TIME1); S7 identical to FUTEX-TIME1; AP marker
+integrity flags only the UN control's deliberately damaged log (all genuine F and B logs clean);
+H2b is the one F-only delta — three hosted-dev dead-code lints on the target-only NR 18/19 split
+helpers (lint only). **E4:** `.text` +15.4 to +17.6 KB per ISA; `.data` +186 KB on each — the
+printk ring (1024 × 208-byte records) is emitted initialized because `PrintkRing::new()` has
+non-zero fields, so it costs image bytes, not only `.bss` (the predeclared expectation said `.bss`;
+corrected here); `.bss` and the boot sections unchanged. Verdict:
+**SCHED_TIME_FOUNDATION1_ACCEPTED_VDSO_DEFERRED** (the inherited baseline debt above is unchanged
+and classified; nothing new is classified as debt). Follow-ups recorded in
+`KERNEL_UNLOCK_DEFERRED_DEFECTS.md`.
