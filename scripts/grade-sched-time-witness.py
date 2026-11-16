@@ -89,6 +89,7 @@ U = {
     "RECV_CAL": dict(ticks=N, elapsed=N, tick_est=N, outcome=r"none|msg|err"),
     "RECV_CALL": dict(ticks=N, t0=N, earliest=N, due_by=N, sat_ready=r"[01]"),
     "SAT_RECV": dict(r_deadline=N, full_at=N, early=r"[01]"),
+    "RECV_TOPUP": dict(filled=r"[01]"),
     "RECV_RET": dict(outcome=r"none|msg|err", t0=N, t1=N, due_by=N),
     "HOLD_END": dict(end=N, w_deadline=N, r_due_by=N, fillers=N, topups=N, refusals=N, holds=N,
                      bounded=r"[01]"),
@@ -354,6 +355,8 @@ def grade(lines):
             elif any(e["at"] > settles[0]["at"] for e in sat):
                 fail("IPC: a refusal of R's receive after it settled")
             facts["ipc_proving"] = len(good)
+            tu = only("U_RECV_TOPUP")
+            facts["ipc_topup"] = tu[0]["filled"] if tu else "none"
             facts["ipc_deferrals"] = len(defers)
         if rr["outcome"] != "none":
             fail(f"IPC: R's graded receive returned {rr['outcome']}, not its timeout")
@@ -451,6 +454,7 @@ def synth():
     u(H, "STW_SATURATED fillers=130 first=128 refusals=2 full_at=1 w_deadline=9 early=1")
     u(R, "STW_RECV_CALL ticks=20 t0=5000 earliest=8000 due_by=9000 sat_ready=1")
     u(H, "STW_SAT_RECV r_deadline=8000 full_at=1 early=1")
+    u(R, "STW_RECV_TOPUP filled=1")
     L.append(f"U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid={R} wait_generation=2 cpu=1")
     L.append(f"SATW_REFUSED class=recv cpu=1 home=1 tid={R} gen=2 n=1 prio=1 queued=64 reserved=0 cap=64 full=1 deadline=300 now=300 facts=ok")
     st["holdmark"] = len(L)

@@ -3852,9 +3852,15 @@ pub(super) mod sched_time_witness {
     /// RUNNABLE until then (it yield-polls `SAT_READY` in the rotation, as H does), because a
     /// blocked task cannot be woken onto a full queue. A deadline fixed before saturation cannot be
     /// aligned with the hold: scheduler ticks slow down in wall time under a saturated TCG guest.
-    const R_TICKS: u64 = 20;
+    /// About this long in wall time, by the calibrated tick (at least 3 ticks).
+    const R_TARGET_NS: u64 = 2_000 * MS;
     /// H's hold covers R's deadline with this factor on the calibrated tick (slowdown margin).
-    const R_TICK_SLACK: u64 = 10;
+    const R_TICK_SLACK: u64 = 4;
+    /// The filler stack R uses for its own top-up (H's fillers stop below it; the spinners use the
+    /// last two).
+    const R_FILLER: usize = FILLERS - 3;
+    /// R's top-up: 1 = its filler was spawned (and will park on release), 2 = refused.
+    static R_FILLED: AtomicU32 = AtomicU32::new(0);
     /// H re-tops-up the queues this often while it holds them full.
     const TOPUP_EVERY_NS: u64 = 500 * MS;
     /// H holds this long past the later of W's and R's deadlines.
@@ -4143,12 +4149,14 @@ pub(super) mod sched_time_witness {
         });
         yarm_user_rt::user_log!("STW_RT_SET code={}", code(set));
         if set.is_ok() {
-            sl("rt_rel", CLOCK_REALTIME, 0, 20 * MS);
+            // 100 / 300 ms: long enough that the kernel never finds them due at registration on
+            // a loaded host (as for case 4).
+            sl("rt_rel", CLOCK_REALTIME, 0, 100 * MS);
             sl(
                 "rt_abs",
                 CLOCK_REALTIME,
                 TIMER_ABSTIME,
-                now_on(CLOCK_REALTIME) + 30 * MS,
+                now_on(CLOCK_REALTIME) + 300 * MS,
             );
         } else {
             fail("rt_set");
@@ -4182,7 +4190,7 @@ pub(super) mod sched_time_witness {
         let mut spawned = 0usize;
         let mut refusals = 0u32;
         let spawn_until_refused = |spawned: &mut usize, refusals: &mut u32| {
-            while *spawned < FILLERS {
+            while *spawned < R_FILLER {
                 let i = *spawned;
                 let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
                 // SAFETY: a valid entry; the static stack and TLS outlive the thread.
@@ -4268,7 +4276,13 @@ pub(super) mod sched_time_witness {
             if r_due != 0 && now >= deadline.max(r_due) + HOLD_MARGIN_NS {
                 break;
             }
-            if now >= deadline + HOLD_CAP_NS || n >= BOUND {
+            // Bounded past the later deadline (or W's alone while R has not published its own).
+            let cap_from = if r_due == 0 {
+                deadline
+            } else {
+                deadline.max(r_due)
+            };
+            if now >= cap_from + HOLD_CAP_NS || n >= BOUND {
                 bounded = true;
                 break;
             }
@@ -4291,7 +4305,9 @@ pub(super) mod sched_time_witness {
         }
         RELEASE.store(1, SeqCst);
         let mut waits = 0u32;
-        while (PARKED.load(SeqCst) as usize) < spawned && waits < BOUND {
+        // R's own filler parks too.
+        let expect = spawned + usize::from(R_FILLED.load(SeqCst) == 1);
+        while (PARKED.load(SeqCst) as usize) < expect && waits < BOUND {
             let _ = yield_now();
             waits += 1;
         }
@@ -4303,7 +4319,7 @@ pub(super) mod sched_time_witness {
             n,
             waits
         );
-        if (parked as usize) != spawned {
+        if (parked as usize) != expect {
             fail("rotation");
         }
         // R's deferred timeout is placed once the queues have room: bounded wait for its return.
@@ -4365,7 +4381,7 @@ pub(super) mod sched_time_witness {
             n += 1;
         }
         let tick = R_TICK_NS.load(SeqCst).max(MS);
-        let ticks = R_TICKS;
+        let ticks = (R_TARGET_NS / tick).max(3);
         let t0 = mono();
         // The kernel's deadline is `ticks` ticks after the tick it registers on: not before
         // `t0 + (ticks - 1) * tick`; H holds until `due_by`, the slack factor over the calibration.
@@ -4379,6 +4395,23 @@ pub(super) mod sched_time_witness {
             due_by,
             SAT_READY.load(SeqCst)
         );
+        // R's own top-up: while R runs, its home queue has one task fewer than when R was
+        // queued, and once R blocks nothing would refill that slot before R's deadline (H gets
+        // the CPU only once per rotation). The balanced placement puts this filler on the least
+        // loaded CPU — R's, by that one task — so R leaves its home full behind it.
+        let top = (core::ptr::addr_of_mut!(FILLER_STACKS) as usize
+            + (R_FILLER + 1) * FILLER_STACK_BYTES)
+            & !0xF;
+        let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize + R_FILLER * 64;
+        // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+        let filled = match unsafe {
+            yarm_user_rt::syscall::spawn_thread(tls, top, FILLER_ENTRY.load(SeqCst))
+        } {
+            Ok(t) if t >= 10_000 => 1,
+            _ => 2,
+        };
+        R_FILLED.store(filled, SeqCst);
+        yarm_user_rt::user_log!("STW_RECV_TOPUP filled={}", u32::from(filled == 1));
         R_DUE_BY.store(due_by, SeqCst);
         R_ENTERING.store(1, SeqCst);
         R_DEADLINE.store(earliest, SeqCst);
