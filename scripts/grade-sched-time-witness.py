@@ -10,7 +10,10 @@ bound late_ns` (t0/t1: ring-3 reads of the sleep's clock around the call; bound:
 kernel must honour). The kernel (`kernel::sleep_witness`) logs `STW_SLEEP_REGISTER tid gen
 deadline now`, `STW_SLEEP_DONE cpu home tid gen deadline now current`, `STW_SLEEP_REFUSED cpu home
 tid gen deadline now`, `STW_SLEEP_KILLED tid gen`, `STW_KTHREAD_START`, `STW_KTHREAD_BEAT ... n
-mono`, `STW_KTHREAD_DONE`.
+mono`, `STW_KTHREAD_DONE`. SCHED-SAT-EVIDENCE1: every refused placement of a sleep or a receive
+timeout also logs `SATW_REFUSED class cpu home tid gen prio queued reserved cap full deadline now
+facts` (`kernel::sat_witness`): the home queue's entries and promised slots at the waiter's
+priority, captured under that CPU's lock BY the refusal; `full=1` iff queued + reserved >= cap.
 
 Markers fail closed: a damaged or unknown STW line fails the boot; nothing is repaired.
 
@@ -26,8 +29,12 @@ Rules (the brief's twelve cases):
   6 exit        STW_SLEEP_KILLED of the victim's registered generation; no DONE of the victim ever;
                STW_KILL_CHECK x_returned=0 and no STW_X_RETURNED.
   7 generations 16 `cycle` calls, each its own fresh generation and single DONE (the every-call rule).
-  8 full queue  at least one STW_SLEEP_REFUSED of the `full` cycle (its home queue refused a due
-               placement), then its one DONE; STW_SATURATED early=1; STW_ROTATION parked=fillers.
+  8 full queue  W's `full` cycle: at least one SATW_REFUSED class=sleep of its (tid, gen) with
+               facts=ok, full=1, home = its DONE's home and now >= its deadline, logged before H's
+               STW_HOLD_END (the hold was still in force: H topped up all through it) and before
+               the DONE; every refusal of the cycle precedes its one DONE; STW_HOLD_END bounded=0;
+               STW_SATURATED early=1; STW_ROTATION parked=fillers. Spawn refusals and filler
+               counts are diagnostics only: they earn nothing.
   9 all blocked three `idle` calls during which no other thread of the cell logs anything.
   10 cross-CPU  eight `cross` sleeps while two spinner threads trap on (balanced placement
                spreads them); at least one DONE in the whole log with cpu != home.
@@ -35,8 +42,15 @@ Rules (the brief's twelve cases):
                last beat.
   12 registers  every STW_ERR code == want (Unavailable before realtime, InvalidArgs for a bad clock,
                flag or nsec); every graded call returned code=0 through its resume boundary.
-  IPC capacity at least one U8_RECV_TIMEOUT_PLACEMENT_DEFERRED (a receive timeout due while its
-               home queue was full kept its obligation) and a U8_RECV_TIMEOUT_SETTLED after it.
+  IPC capacity R's graded timed receive (STW_RECV_CALL .. STW_RECV_RET), entered while the queues
+               still have room (a blocked task cannot be woken onto a full queue) with a deadline
+               H's saturation precedes (STW_SAT_RECV early=1): at least one SATW_REFUSED
+               class=recv of R between them, due (now >= deadline), with facts=ok, full=1, before
+               STW_HOLD_END; a U8_RECV_TIMEOUT_PLACEMENT_DEFERRED of R for the same
+               wait generation; then EXACTLY ONE U8_RECV_TIMEOUT_SETTLED of (R, that generation),
+               after the first proving refusal and before R's return; R returns outcome=none (its
+               timeout) exactly once. R's unsaturated calibration receive returns outcome=none. Any
+               other thread's deferral (periodic service traffic) earns nothing.
   STW_WAITER_DONE fails=0, STW_DONE result=ok, no STW_FAIL, plus the standard core smoke.
 
 Exit status 0 = sealed, 1 = not sealed.
@@ -54,9 +68,12 @@ K = {
     "KSTART": ("STW_KTHREAD_START", dict(kthread=r"0x[0-9a-f]+", cpu=N)),
     "BEAT": ("STW_KTHREAD_BEAT", dict(kthread=r"0x[0-9a-f]+", cpu=N, n=N, mono=N)),
     "KDONE": ("STW_KTHREAD_DONE", dict(kthread=r"0x[0-9a-f]+", cpu=N, beats=N)),
+    "SATW": ("SATW_REFUSED", {"class": r"sleep|futex|recv", "cpu": N, "home": N, "tid": N, "gen": N, "n": N,
+                              "prio": N, "queued": N, "reserved": N, "cap": N, "full": r"[01]",
+                              "deadline": N, "now": N, "facts": r"ok|lost"}),
 }
 U = {
-    "BEGIN": dict(s_tid=N), "THREADS": dict(waiter=N, helper=N, victim=N),
+    "BEGIN": dict(s_tid=N), "THREADS": dict(waiter=N, helper=N, victim=N, receiver=N),
     "CLOCK": dict(rt_before=N), "ERR": dict(case=r"\w+", code=N, want=N), "MONO": dict(m0=N, m1=N),
     "CALL": dict(case=r"\w+", n=N, clock=N, flags=N, req=N, t0=N, bound=N),
     "RET": dict(case=r"\w+", n=N, code=N, t0=N, t1=N, bound=N, late_ns=N),
@@ -68,6 +85,12 @@ U = {
     "DONE": dict(waiter=N, helper=N, victim=N, calls=N, fails=N, result=r"ok|fail"),
     "FAIL": dict(what=r"\w+"),
     "SPINNER": dict(tid=N),
+    "RECV_CAL": dict(ticks=N, elapsed=N, tick_est=N, outcome=r"none|msg|err"),
+    "RECV_CALL": dict(ticks=N, t0=N, earliest=N, due_by=N),
+    "SAT_RECV": dict(r_deadline=N, full_at=N, early=r"[01]"),
+    "RECV_RET": dict(outcome=r"none|msg|err", t0=N, t1=N, due_by=N),
+    "HOLD_END": dict(end=N, w_deadline=N, r_due_by=N, fillers=N, topups=N, refusals=N, holds=N,
+                     bounded=r"[01]"),
 }
 COUNTS = dict(zero=1, short=3, long=1, abs=1, abs_past=1, idle=3, cycle=16, cross=8, two_w=1, two_h=1,
               kill_wait=1, rt_rel=1, rt_abs=1, full=1)
@@ -145,8 +168,8 @@ def grade(lines):
     th = one("U_THREADS")
     if th is None:
         return fails, facts
-    W, H, X = th["waiter"], th["helper"], th["victim"]
-    cell = {W, H, X}
+    W, H, X, R = th["waiter"], th["helper"], th["victim"], th["receiver"]
+    cell = {W, H, X, R}
 
     # every call
     calls = only("U_CALL")
@@ -212,15 +235,47 @@ def grade(lines):
     if (kc and kc["x_returned"] != "0") or only("U_X_RETURNED"):
         fail("6: the victim returned from its sleep")
     # 8
+    hold = one("U_HOLD_END")
+    if hold and hold["bounded"] != "0":
+        fail("8: H's hold hit its bound (R never published its deadline, or the hold never ended)")
+    hold_at = hold["at"] if hold else -1
+
+    def proving(sat, home):
+        """The refusals that prove a full home queue while H still held it, and why others don't."""
+        ok, why = [], []
+        for e in sat:
+            room = int(e["queued"]) + int(e["reserved"]) < int(e["cap"])
+            if e["facts"] != "ok":
+                why.append("facts lost")
+            elif (e["full"] == "1") == room:
+                why.append("inconsistent facts")
+            elif e["full"] != "1":
+                why.append(f"room left ({e['queued']}+{e['reserved']}<{e['cap']})")
+            elif home is not None and e["home"] != home:
+                why.append(f"home {e['home']} != {home}")
+            elif not e["at"] < hold_at:
+                why.append("after the hold ended")
+            else:
+                ok.append(e)
+        return ok, why
+
     full = by("full")
     if full and full[0].get("g"):
-        fg = full[0]["g"]
+        fg, fd = full[0]["g"], full[0]["d"]
         refs = [e for e in only("REFUSED") if e["tid"] == fg["tid"] and e["gen"] == fg["gen"]]
+        sat = [e for e in only("SATW")
+               if e["class"] == "sleep" and e["tid"] == fg["tid"] and e["gen"] == fg["gen"]]
+        sat_due = [e for e in sat if int(e["now"]) >= int(fg["deadline"])]
+        good, why = proving(sat_due, fd["home"])
+        if not good:
+            fail(f"8: no refusal proves W's home queue (cpu {fd['home']}) full at its deadline while "
+                 f"held: {len(sat)} refusals, {len(sat_due)} at/after the deadline, rejected: {sorted(set(why))}")
         if not refs:
             fail("8: the full-queue sleep was never refused a placement (queue not full when due)")
-        elif not all(e["at"] < full[0]["d"]["at"] for e in refs):
+        elif not all(e["at"] < fd["at"] for e in refs + sat):
             fail("8: a refusal after the completion")
         facts["full_refusals"] = len(refs)
+        facts["full_proving"] = len(good)
     sat = one("U_SATURATED")
     if sat and sat["early"] != "1":
         fail("8: saturation completed after the deadline")
@@ -264,13 +319,43 @@ def grade(lines):
     rs = one("U_RT_SET")
     if rs and rs["code"] != "0":
         fail(f"realtime set refused: code {rs['code']}")
-    # IPC timeout capacity
-    defers = only("IPC_DEFER")
-    if not defers:
-        fail("IPC: no receive timeout was due on a full queue (no placement deferral observed)")
-    elif not any(e["at"] > defers[0]["at"] for e in only("IPC_SETTLED")):
-        fail("IPC: a deferred receive timeout never settled")
-    facts["ipc_deferrals"] = len(defers)
+    # IPC timeout capacity — R's own graded receive, nothing incidental
+    cal = one("U_RECV_CAL")
+    if cal and cal["outcome"] != "none":
+        fail(f"IPC: R's calibration receive returned {cal['outcome']}, not its timeout")
+    rc, rr = one("U_RECV_CALL"), one("U_RECV_RET")
+    if rc and rr:
+        if rc["utid"] != R or rr["utid"] != R:
+            fail("IPC: the graded receive was not R's")
+        sr = one("U_SAT_RECV")
+        if sr and sr["early"] != "1":
+            fail("IPC: the queues were not full before R's receive could fall due")
+        sat = [e for e in only("SATW") if e["class"] == "recv" and e["tid"] == R
+               and rc["at"] < e["at"] < rr["at"] and int(e["now"]) >= int(e["deadline"])]
+        good, why = proving(sat, None)
+        if not good:
+            fail(f"IPC: no refusal proves R's home queue full when its receive timeout was due while "
+                 f"held: {len(sat)} refusals, rejected: {sorted(set(why))}")
+        else:
+            g, first = good[0]["gen"], good[0]
+            if any(e["gen"] != g for e in sat):
+                fail("IPC: R's refusals name more than one wait generation")
+            defers = [e for e in only("IPC_DEFER") if e.get("tid") == R and e.get("wait_generation") == g]
+            if not defers:
+                fail("IPC: no U8_RECV_TIMEOUT_PLACEMENT_DEFERRED of R's graded receive")
+            settles = [e for e in only("IPC_SETTLED") if e.get("tid") == R and e.get("wait_generation") == g]
+            if len(settles) != 1:
+                fail(f"IPC: {len(settles)} settlements of R's graded receive timeout (gen {g}), expected exactly one")
+            elif not first["at"] < settles[0]["at"] < rr["at"]:
+                fail("IPC: R's timeout settled outside refusal..return")
+            elif any(e["at"] > settles[0]["at"] for e in sat):
+                fail("IPC: a refusal of R's receive after it settled")
+            facts["ipc_proving"] = len(good)
+            facts["ipc_deferrals"] = len(defers)
+        if rr["outcome"] != "none":
+            fail(f"IPC: R's graded receive returned {rr['outcome']}, not its timeout")
+    else:
+        fail("IPC: R's graded receive did not run")
     # end
     wd = one("U_WAITER_DONE")
     if wd and wd["fails"] != "0":
@@ -306,9 +391,9 @@ def core_verdict(core_rc, core_logs):
 def synth():
     L = []
     u = lambda t, s: L.append(f"USER_LOG tid={t} msg={s}")
-    W, H, X = 10010, 10011, 10012
+    W, H, X, R = 10010, 10011, 10012, 10015
     u(1, "STW_BEGIN s_tid=1 fillers_max=176")
-    u(1, f"STW_THREADS waiter={W} helper={H} victim={X}")
+    u(1, f"STW_THREADS waiter={W} helper={H} victim={X} receiver={R}")
     u(W, "STW_CLOCK rt_before=11")
     for c, w in [("rt_uninit_rel", 11), ("rt_uninit_abs", 11), ("bad_clock", 2), ("bad_flags", 2), ("bad_nsec", 2)]:
         u(W, f"STW_ERR case={c} code={w} want={w}")
@@ -355,10 +440,23 @@ def synth():
     u(W, "STW_RT_SET code=0")
     sleep(W, "rt_rel", 20)
     sleep(W, "rt_abs", 30)
-    L.append("U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid=2")
-    L.append("U8_RECV_TIMEOUT_SETTLED arch=riscv64 tid=2")
-    sleep(W, "full", 2000, mid=("STW_SLEEP_REFUSED cpu=0 home=0 tid={tid} gen={gen} deadline={d} now={d}",))
+    u(R, "STW_RECV_CAL ticks=4 elapsed=30000000 tick_est=10000000 outcome=none")
+    L.append(f"U8_RECV_TIMEOUT_SETTLED arch=riscv64 tid={R} asid=3 wait_generation=1 deadline=4 now=4 broad_lock=0 result=ok")
+    # an unrelated service's deferral: earns nothing
+    L.append("U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid=2 wait_generation=7 cpu=0")
+    L.append("U8_RECV_TIMEOUT_SETTLED arch=riscv64 tid=2 asid=1 wait_generation=7 deadline=1 now=2 broad_lock=0 result=ok")
     u(H, "STW_SATURATED fillers=130 first=128 refusals=2 full_at=1 w_deadline=9 early=1")
+    u(R, "STW_RECV_CALL ticks=200 t0=5000 earliest=8000 due_by=9000")
+    u(H, "STW_SAT_RECV r_deadline=8000 full_at=1 early=1")
+    L.append(f"U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid={R} wait_generation=2 cpu=1")
+    L.append(f"SATW_REFUSED class=recv cpu=1 home=1 tid={R} gen=2 n=1 prio=1 queued=64 reserved=0 cap=64 full=1 deadline=300 now=300 facts=ok")
+    st["holdmark"] = len(L)
+    sleep(W, "full", 2000, mid=(
+        "STW_SLEEP_REFUSED cpu=0 home=0 tid={tid} gen={gen} deadline={d} now={d}",
+        "SATW_REFUSED class=sleep cpu=0 home=0 tid={tid} gen={gen} n=1 prio=1 queued=63 reserved=1 cap=64 full=1 deadline={d} now={d} facts=ok",
+        f"USER_LOG tid={H} msg=STW_HOLD_END end=99 w_deadline=9 r_due_by=9000 fillers=130 topups=3 refusals=5 holds=9 bounded=0"))
+    L.append(f"U8_RECV_TIMEOUT_SETTLED arch=riscv64 tid={R} asid=3 wait_generation=2 deadline=300 now=900 broad_lock=0 result=ok")
+    u(R, "STW_RECV_RET outcome=none t0=5000 t1=9500 due_by=9000")
     u(H, "STW_ROTATION fillers=130 parked=130 holds=5 waits=5")
     L.append("STW_KTHREAD_BEAT kthread=0x1 cpu=0 n=2 mono=2 yields=9")
     L.append("STW_KTHREAD_DONE kthread=0x1 cpu=0 beats=2")
@@ -407,6 +505,34 @@ def self_test():
     must_fail(edit("STW_SLEEP_DONE cpu=0", "STW_SLEEP_DONE cpu=x"), "malformed")
     # rotation incomplete
     must_fail(edit("parked=130", "parked=129"), "fillers ran")
+    # SCHED-SAT-EVIDENCE1 — W's home queue
+    no_sleep_sat = [l for l in good if not l.startswith("SATW_REFUSED class=sleep")]
+    must_fail(no_sleep_sat, "no refusal proves W's home queue")
+    must_fail(edit("queued=63 reserved=1 cap=64 full=1", "queued=62 reserved=1 cap=64 full=0"), "room left")
+    must_fail(edit("queued=63 reserved=1 cap=64 full=1", "queued=62 reserved=1 cap=64 full=1"), "inconsistent facts")
+    must_fail(edit("class=sleep cpu=0 home=0", "class=sleep cpu=0 home=1"), "home 1 != 0")
+    i = next(i for i, l in enumerate(good) if l.startswith("SATW_REFUSED class=sleep"))
+    lost = good[:i] + [good[i].replace("facts=ok", "facts=lost")] + good[i + 1:]
+    must_fail(lost, "facts lost")
+    h = next(i for i, l in enumerate(good) if "STW_HOLD_END" in l)
+    after_hold = good[:i] + [good[h], good[i]] + [l for k, l in enumerate(good) if k > i and k != h]
+    must_fail(after_hold, "after the hold ended")
+    must_fail(edit("bounded=0", "bounded=1"), "hold hit its bound")
+    # R's receive
+    must_fail([l for l in good if not l.startswith("SATW_REFUSED class=recv")], "no refusal proves R's home queue")
+    must_fail(edit("queued=64 reserved=0 cap=64 full=1", "queued=63 reserved=0 cap=64 full=0"), "IPC: no refusal")
+    must_fail([l for l in good if not l.startswith("U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid=10015")], "PLACEMENT_DEFERRED of R")
+    st_r = next(i for i, l in enumerate(good) if l.startswith("U8_RECV_TIMEOUT_SETTLED") and "tid=10015" in l and "wait_generation=2" in l)
+    must_fail(good[:st_r + 1] + [good[st_r]] + good[st_r + 1:], "2 settlements")
+    must_fail(good[:st_r] + good[st_r + 1:], "0 settlements")
+    must_fail(edit("STW_RECV_RET outcome=none", "STW_RECV_RET outcome=msg"), "not its timeout")
+    must_fail(edit("full_at=1 early=1", "full_at=9999 early=0"), "not full before R's receive")
+    must_fail(edit("deadline=300 now=300 facts=ok", "deadline=300 now=299 facts=ok"), "IPC: no refusal")
+    # only an unrelated thread's deferral: earns nothing
+    only_other = [l for l in good if not (l.startswith("SATW_REFUSED class=recv")
+                                          or l.startswith("U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid=10015"))]
+    must_fail(only_other, "IPC: no refusal")
+    must_fail([l for l in good if "STW_RECV_CALL" not in l], "did not run")
 
 
 def main():

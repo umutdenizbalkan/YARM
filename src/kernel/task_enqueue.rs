@@ -262,14 +262,33 @@ pub(crate) fn reserve_enqueue_on_cpu_locked(
     view: &mut CpuView<'_>,
     plan: &EnqueuePlan,
 ) -> Result<(), KernelError> {
-    match plan.target {
+    let reserved = match plan.target {
         EnqueueTarget::Pinned(target) if target == view.cpu() => view
             .reserve_user_slot(plan.priority)
             .map_err(map_scheduler_error),
         _ => Err(map_scheduler_error(
             crate::kernel::scheduler::SchedulerError::CpuOffline,
         )),
+    };
+    // SCHED-SAT-EVIDENCE1 (witness only): the occupancy this refusal saw, under this 1L.
+    #[cfg(any(test, feature = "sched-time-witness", feature = "futex-time-witness"))]
+    if let Err(err) = &reserved {
+        let (queued, promised) = view.witness_occupancy(plan.priority);
+        let reason = if matches!(err, KernelError::SchedulerFull) {
+            crate::kernel::sat_witness::REASON_QUEUE_FULL
+        } else {
+            crate::kernel::sat_witness::REASON_OTHER
+        };
+        crate::kernel::sat_witness::record(
+            view.cpu().0 as usize,
+            plan.tid,
+            plan.priority as u64,
+            queued,
+            promised,
+            reason,
+        );
     }
+    reserved
 }
 
 /// rank 1L — FUTEX-WAKE-CAP1: release a promise made by [`reserve_enqueue_on_cpu_locked`] that

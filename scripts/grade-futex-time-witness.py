@@ -16,6 +16,10 @@ The kernel, from inside the deciding transactions, logs:
   FUTEX_TIME_W_LOST      cpu tid gen                       the collector found it due, lost it
   FUTEX_TIME_W_WINDOW_OPEN / _CLOSE / _SKIPPED, FUTEX_TIME_W_IN_WINDOW_WAKE   (sequence G)
   FUTEX_TIMEOUT_EXPIRED_UNPLACED tid slot generation cpu home now   (the timeout won, queue full)
+  SATW_REFUSED class=futex cpu home tid gen prio queued reserved cap full deadline now facts
+      (SCHED-SAT-EVIDENCE1, `kernel::sat_witness`: the refused home queue's entries and promised
+      slots at the waiter's priority, captured under that CPU's lock BY the refusal; `full=1` iff
+      queued + reserved >= cap; gen is the cycle's wait generation)
 
 Markers fail closed: a marker whose prefix or fields are damaged fails the boot; nothing is
 skipped and nothing is repaired.
@@ -45,10 +49,15 @@ Sequences:
        wake from ANOTHER CPU; end=bound fails; end=no_peer is a refusal (no coverage). G's RET
        comes after its CLOSE. Coverage: >= 1 window ended woke, >= 1 G cycle won by a wake, >= 1
        won by the timeout.
-  E    FTW_E_SATURATED fillers >= 64 spawn_refused=1, matching the kernel: one SPAWN_THREAD_SPLIT_OK
-       per filler and exactly one SPAWN_THREAD_SPLIT_FAIL err=SchedulerFull; a FUTEX_TIMEOUT_EXPIRED_UNPLACED of W between
-       E's REGISTER and its final TIMEOUT (now >= deadline); FTW_E_EXPIRED_SEEN gone=1 wake1=0
-       wake2=0 (no wake found it after the timeout won); E timed_out.
+  E    SCHED-SAT-EVIDENCE1 — W's own home queue, not spawn counts: at least one SATW_REFUSED
+       class=futex of W's E cycle (tid, gen) with facts=ok, full=1 (consistent with its numbers),
+       home = the EXPIRED marker's home, between E's REGISTER and its EXPIRED, and before H's
+       FTW_E_EXPIRED_SEEN (H was still topping up and holding: it releases only after that line);
+       exactly one FUTEX_TIMEOUT_EXPIRED_UNPLACED of W between E's REGISTER and its one final
+       TIMEOUT (now >= deadline) — the later, exactly-once placement; FTW_E_EXPIRED_SEEN gone=1
+       wake1=0 wake2=0 (no wake found it after the timeout won); E timed_out. Diagnostics, which
+       earn nothing: FTW_E_HOLD_END fillers = H's SPAWN_THREAD_SPLIT_OK count, its spawn_refused =
+       H's SPAWN_THREAD_SPLIT_FAIL count (>= 1, each err=SchedulerFull).
   FTW_WAITER_DONE fails=0, FTW_DONE result=ok, plus the standard core smoke.
 
 Exit status 0 = sealed, 1 = not sealed.
@@ -97,6 +106,9 @@ K = {
                    {"parent_tid": INT, "tid": INT, "err": r"[A-Za-z]+", "result": "compensated"}),
     "EXPIRED": ("FUTEX_TIMEOUT_EXPIRED_UNPLACED",
                 {"tid": INT, "slot": INT, "generation": INT, "cpu": INT, "home": INT, "now": INT}),
+    "SATW": ("SATW_REFUSED", {"class": r"sleep|futex|recv", "cpu": INT, "home": INT, "tid": INT,
+                              "gen": INT, "n": INT, "prio": INT, "queued": INT, "reserved": INT, "cap": INT,
+                              "full": r"[01]", "deadline": INT, "now": INT, "facts": r"ok|lost"}),
 }
 U = {
     "CALL": {"role": r"[A-Z][0-9]?", "n": INT, "ns": INT, "addr": HEX, "expected": HEX},
@@ -110,13 +122,14 @@ U = {
     "G_SIGNALLER": {"who": r"H|S2", "attempts": INT, "woke": INT},
     "E_SATURATED": {"fillers": INT, "spawn_refused": INT},
     "E_EXPIRED_SEEN": {"gone": INT, "pings": INT, "wake1": INT, "wake2": INT},
+    "E_HOLD_END": {"fillers": INT, "topups": INT, "spawn_refused": INT},
     "WAITER_DONE": {"calls": INT, "fails": INT},
     "DONE": {"waiter": INT, "calls": INT, "fails": INT, "result": "ok|fail"},
     "BEGIN": {"s_tid": INT, "g_cycles": INT, "fillers_max": INT},
     "FAIL": {"what": r"\S+"},
 }
 FRAGMENTS = ("FUTEX_TIME", "UTEX_TIME_W", "TIME_W_", "_W_WINDOW", "IN_WINDOW_WAKE", "EXPIRED_UNPLACED", "msg=FTW_",
-             "FTW_CALL", "FTW_RET", "FTW_DONE")
+             "FTW_CALL", "FTW_RET", "FTW_DONE", "SATW_")
 
 
 def kv(line):
@@ -410,17 +423,17 @@ def grade(lines, arch, smp):
                  g_windows_refused=refused, g_skipped=len(only("SKIPPED")),
                  in_window_wakes=len(inw))
 
-    # ── E: genuine saturation ──
-    es = one("U_E_SATURATED")
-    if es and (int(es.get("fillers", 0)) < MIN_FILLERS or es.get("spawn_refused") != "1"):
-        fail(f"E: fillers={es.get('fillers')} spawn_refused={es.get('spawn_refused')} — not saturated")
+    # ── E: W's home queue held full through its refusal (SCHED-SAT-EVIDENCE1) ──
+    es, eh = one("U_E_SATURATED"), one("U_E_HOLD_END")
     h_ok = [e for e in only("SPAWN_OK") if e["parent_tid"] == H]
     h_fail = [e for e in only("SPAWN_FAIL") if e["parent_tid"] == H]
-    if es and len(h_ok) != int(es.get("fillers", -1)):
-        fail(f"E: the cell counted {es.get('fillers')} fillers, the kernel spawned {len(h_ok)} for H")
-    if len(h_fail) != 1 or h_fail[0]["err"] != "SchedulerFull":
-        fail(f"E: spawning must stop at exactly one SchedulerFull refusal (kernel: {[e['err'] for e in h_fail]})")
-    facts["e_spawn_refusal"] = h_fail[0]["err"] if h_fail else "none"
+    if eh and len(h_ok) != int(eh.get("fillers", -1)):
+        fail(f"E: the cell counted {eh.get('fillers')} fillers, the kernel spawned {len(h_ok)} for H")
+    if eh and len(h_fail) != int(eh.get("spawn_refused", -1)):
+        fail(f"E: the cell counted {eh.get('spawn_refused')} spawn refusals, the kernel {len(h_fail)}")
+    if not h_fail or any(e["err"] != "SchedulerFull" for e in h_fail):
+        fail(f"E: H's spawning must end in SchedulerFull refusals only (kernel: {sorted({e['err'] for e in h_fail})})")
+    facts["e_spawn_refusals"] = len(h_fail)
     ee = one("U_E_EXPIRED_SEEN")
     if ee and (ee.get("gone") != "1" or ee.get("wake1") != "0" or ee.get("wake2") != "0"):
         fail(f"E: {ee}")
@@ -436,7 +449,30 @@ def grade(lines, arch, smp):
             fail("E: the timeout was placed before it was recorded as expired-unplaced")
         if int(x["now"]) < int(cy["rg"]["deadline"]):
             fail("E: expired before its deadline")
-        facts.update(e_fillers=es.get("fillers"), e_pings=ee.get("pings"))
+        sat = [e for e in only("SATW") if e["class"] == "futex" and e["tid"] == W
+               and e["gen"] == cy["rg"]["gen"]]
+        good, why = [], []
+        for e in sat:
+            room = int(e["queued"]) + int(e["reserved"]) < int(e["cap"])
+            if e["facts"] != "ok":
+                why.append("facts lost")
+            elif (e["full"] == "1") == room:
+                why.append("inconsistent facts")
+            elif e["full"] != "1":
+                why.append(f"room left ({e['queued']}+{e['reserved']}<{e['cap']})")
+            elif e["home"] != x["home"]:
+                why.append(f"home {e['home']} != {x['home']}")
+            elif not cy["rg"]["at"] < e["at"] < x["at"]:
+                why.append("outside REGISTER..EXPIRED")
+            elif not ee or not e["at"] < ee["at"]:
+                why.append("after H stopped holding")
+            else:
+                good.append(e)
+        if not good:
+            fail(f"E: no refusal proves W's home queue (cpu {x['home']}) full when its timeout won: "
+                 f"{len(sat)} refusals, rejected: {sorted(set(why))}")
+        facts.update(e_fillers=eh.get("fillers"), e_topups=eh.get("topups"), e_pings=ee.get("pings"),
+                     e_proving=len(good))
     for x in only("EXPIRED"):
         if x["tid"] != W or not by_role.get("E") or x["at"] < by_role["E"][0]["rg"]["at"]:
             fail(f"an expired-unplaced timeout outside sequence E: tid {x['tid']}")
@@ -521,8 +557,12 @@ def synth(arch="riscv64"):
                                 for i in range(128))
                 + (f"SPAWN_THREAD_SPLIT_FAIL parent_tid={H} tid=30200 err=SchedulerFull tasks=0 result=compensated",
                    f"USER_LOG tid={H} msg=FTW_E_SATURATED fillers=128 spawn_refused=1",
-                           f"FUTEX_TIMEOUT_EXPIRED_UNPLACED tid={W} slot=3 generation=9 cpu=1 home=0 now={{dl}}",
-                           f"USER_LOG tid={H} msg=FTW_E_EXPIRED_SEEN gone=1 pings=40 wake1=0 wake2=0"))
+                   f"SPAWN_THREAD_SPLIT_OK parent_tid={H} tid=30300 entry=0x1 stack=0x10 tls=0x20 result=ok",
+                   f"SPAWN_THREAD_SPLIT_FAIL parent_tid={H} tid=30301 err=SchedulerFull tasks=0 result=compensated",
+                   f"SATW_REFUSED class=futex cpu=1 home=0 tid={W} gen={{gen}} n=1 prio=1 queued=64 reserved=0 cap=64 full=1 deadline=0 now={{dl}} facts=ok",
+                   f"FUTEX_TIMEOUT_EXPIRED_UNPLACED tid={W} slot=3 generation=9 cpu=1 home=0 now={{dl}}",
+                   f"USER_LOG tid={H} msg=FTW_E_EXPIRED_SEEN gone=1 pings=40 wake1=0 wake2=0",
+                   f"USER_LOG tid={H} msg=FTW_E_HOLD_END fillers=129 topups=1 spawn_refused=2"))
     n = st["n"]
     out += [f"USER_LOG tid={W} msg=FTW_WAITER_DONE calls={n} fails=0",
             f"USER_LOG tid=1 msg=FTW_DONE waiter={W} calls={n} fails=0 result=ok"]
@@ -611,9 +651,23 @@ def self_test():
     must_fail([l.replace("end=woke", "end=no_peer") for l in good], "no woken window", "G coverage")
     # E
     must_fail(drop("FUTEX_TIMEOUT_EXPIRED_UNPLACED"), "E without saturation", "not full")
-    must_fail(edit("fillers=128 spawn_refused=1", "fillers=10 spawn_refused=1"), "too few fillers", "not saturated")
-    must_fail(edit("err=SchedulerFull", "err=WrongObject"), "spawn refused for another reason", "SchedulerFull refusal")
-    must_fail(drop("SPAWN_THREAD_SPLIT_OK parent_tid=21"), "cell overcounts its fillers", "the kernel spawned")
+    must_fail(edit("err=SchedulerFull", "err=WrongObject"), "spawn refused for another reason", "SchedulerFull refusals only")
+    # SCHED-SAT-EVIDENCE1: spawn counts earn nothing; W's home queue must be proved full
+    must_fail(drop("SATW_REFUSED class=futex"), "no home-queue proof", "no refusal proves W's home queue")
+    must_fail(edit("queued=64 reserved=0 cap=64 full=1", "queued=63 reserved=0 cap=64 full=0"), "room left", "room left")
+    must_fail(edit("queued=64 reserved=0 cap=64 full=1", "queued=63 reserved=0 cap=64 full=1"), "lying full", "inconsistent")
+    must_fail(edit("class=futex cpu=1 home=0", "class=futex cpu=1 home=1"), "another CPU's queue", "home 1 != 0")
+    must_fail(edit("full=1 deadline=0", "full=1 deadline=0", 0) and
+              [l.replace("facts=ok", "facts=lost") if l.startswith("SATW_REFUSED") else l for l in good],
+              "facts lost", "facts lost")
+    i_sat = next(i for i, l in enumerate(good) if l.startswith("SATW_REFUSED class=futex"))
+    i_seen = next(i for i, l in enumerate(good) if "FTW_E_EXPIRED_SEEN" in l)
+    late = [l for k, l in enumerate(good) if k != i_sat]
+    late.insert(i_seen, good[i_sat])
+    must_fail(late, "refusal after the hold", "outside REGISTER..EXPIRED")
+    must_fail(edit("fillers=129 topups=1", "fillers=130 topups=1"), "cell overcounts its fillers", "the kernel spawned")
+    must_fail(edit("topups=1 spawn_refused=2", "topups=1 spawn_refused=3"), "refusal count", "spawn refusals")
+
     must_fail(edit("wake1=0", "wake1=1"), "E wake found the expired waiter", "E: {")
     # calls
     must_fail(drop("msg=FTW_RET role=G"), "a G call never returned", "never returned")

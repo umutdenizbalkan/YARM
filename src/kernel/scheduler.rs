@@ -535,6 +535,14 @@ impl PriorityScheduler {
         self.reserved[Self::priority_index(priority)]
     }
 
+    /// SCHED-SAT-EVIDENCE1 (witness only) — the queue's entries and promised slots at `priority`,
+    /// the two numbers [`Self::reserve_user_slot`]'s refusal compares with [`MAX_RUN_QUEUE`].
+    #[cfg(any(test, feature = "sched-time-witness", feature = "futex-time-witness"))]
+    pub(crate) fn witness_occupancy(&self, priority: TaskPriority) -> (usize, usize) {
+        let p = Self::priority_index(priority);
+        (self.queues[p].len, self.reserved[p])
+    }
+
     /// FUTEX-WAKE-CAP1 — fill a promised slot. The reservation is consumed whatever the outcome;
     /// the only refusal is `AlreadyQueued` (the task is already placed here). Capacity cannot
     /// refuse: at the reservation `len + reserved < MAX_RUN_QUEUE`, every later user push keeps
@@ -1475,6 +1483,12 @@ impl CpuView<'_> {
     #[cfg(test)]
     pub(crate) fn reserved_user_slots(&self, priority: TaskPriority) -> usize {
         self.sched.rq.reserved_user_slots(priority)
+    }
+
+    /// SCHED-SAT-EVIDENCE1 (witness only) — this CPU's queue occupancy at `priority`.
+    #[cfg(any(test, feature = "sched-time-witness", feature = "futex-time-witness"))]
+    pub(crate) fn witness_occupancy(&self, priority: TaskPriority) -> (usize, usize) {
+        self.sched.rq.witness_occupancy(priority)
     }
 
     /// FUTEX-WAKE-CAP1 — fill a slot promised by [`Self::reserve_user_slot`] on this CPU. The CPU

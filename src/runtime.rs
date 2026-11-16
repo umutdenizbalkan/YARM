@@ -14271,14 +14271,19 @@ impl SharedKernel {
             if reserved.is_err() {
                 #[cfg(feature = "sched-time-witness")]
                 if let Some((g, d)) = w_sleep {
-                    crate::kernel::sleep_witness::refused(
-                        cpu.0,
-                        home.0,
-                        candidate.tid,
-                        g,
-                        d,
-                        crate::kernel::timekeeping::monotonic_ns().unwrap_or(0),
-                    );
+                    let mono = crate::kernel::timekeeping::monotonic_ns().unwrap_or(0);
+                    crate::kernel::sleep_witness::refused(cpu.0, home.0, candidate.tid, g, d, mono);
+                    // SCHED-SAT-EVIDENCE1: the home queue as this refusal saw it.
+                    crate::kernel::sat_witness::emit("sleep", cpu.0, candidate.tid, g, d, mono);
+                }
+                // SCHED-SAT-EVIDENCE1 (FUTEX-TIME1 E): the home queue as this refusal saw it; the
+                // cycle is named by its wait generation, its deadline by its REGISTER.
+                #[cfg(feature = "futex-time-witness")]
+                {
+                    let (g, _, _) = self.with_task_futex_split_mut(|tcbs, table| {
+                        fx::time_witness_facts_locked(tcbs, table, candidate)
+                    });
+                    crate::kernel::sat_witness::emit("futex", cpu.0, candidate.tid, g, 0, now);
                 }
                 // (3) The home queue cannot take it now: the timeout WINS anyway, and the
                 // placement is owed by a later pass. Nothing becomes `Runnable`.
@@ -18471,6 +18476,16 @@ impl SharedKernel {
                     work.tid,
                     work.wait_generation,
                     cpu_idx
+                );
+                // SCHED-SAT-EVIDENCE1: the home queue as this refusal saw it.
+                #[cfg(feature = "sched-time-witness")]
+                crate::kernel::sat_witness::emit(
+                    "recv",
+                    cpu.0,
+                    work.tid,
+                    work.wait_generation,
+                    work.deadline,
+                    now,
                 );
                 continue;
             };

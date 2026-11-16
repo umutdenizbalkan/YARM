@@ -53,6 +53,8 @@ pub mod kthread;
 pub mod kthread_witness;
 #[cfg(feature = "sched-time-witness")]
 pub mod sleep_witness;
+#[cfg(any(test, feature = "sched-time-witness", feature = "futex-time-witness"))]
+pub(crate) mod sat_witness;
 
 /// The selection owner's hook for [`kirq_witness`]: compiled with the feature, and a no-op unless
 /// the port's device-interrupt witness is compiled too.

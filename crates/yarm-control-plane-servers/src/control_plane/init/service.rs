@@ -3271,18 +3271,20 @@ pub(super) mod futex_time_witness {
     use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
     use core::time::Duration;
     use yarm_user_rt::syscall::{
-        FutexScope, FutexTimedWait, futex_cmp_requeue, futex_wait, futex_wait_timeout, futex_wake,
-        yield_now,
+        CLOCK_MONOTONIC, FutexScope, FutexTimedWait, clock_gettime, futex_cmp_requeue, futex_wait,
+        futex_wait_timeout, futex_wake, yield_now,
     };
 
     const P: FutexScope = FutexScope::Private;
+    /// SCHED-SAT-EVIDENCE1 — H re-tops-up the queues this often while it holds them full.
+    const TOPUP_EVERY_NS: u64 = 500_000_000;
     /// The kernel's `time_witness::G_MAGIC`.
     pub(super) const G_MAGIC: u32 = 0xF7B1_0000;
     pub(super) const G_CYCLES: u32 = 32;
     pub(super) const STACK_BYTES: usize = 16384;
     pub(super) const FILLER_STACK_BYTES: usize = 2048;
-    /// Two full user queues (64 each) and slack: spawning stops at the first refusal.
-    pub(super) const FILLERS: usize = 144;
+    /// Two full user queues (64 each, 65 while their owner yields) and slack for the top-ups.
+    pub(super) const FILLERS: usize = 176;
     /// W, H, S2.
     pub(super) const THREADS: usize = 3;
     const BOUND: u32 = 4_000_000;
@@ -3558,7 +3560,18 @@ pub(super) mod futex_time_witness {
         }
     }
 
+    fn mono() -> u64 {
+        clock_gettime(CLOCK_MONOTONIC)
+            .ok()
+            .and_then(|t| t.as_ns())
+            .unwrap_or(0)
+    }
+
     /// E: confirm W is parked, saturate, watch its wait leave the word with no wake, release.
+    /// SCHED-SAT-EVIDENCE1: the queues are topped up all through the hold (a spawn refusal names
+    /// its own target CPU only, and a task that blocks frees a slot), and the hold lasts until
+    /// W's timeout has won. Saturation of W's home queue is proved by the kernel (`SATW_REFUSED
+    /// class=futex`), never by these counts.
     fn helper_saturate() {
         let mut at_one = !requeue_until_moved(&E1, &E2);
         if at_one {
@@ -3569,21 +3582,25 @@ pub(super) mod futex_time_witness {
         let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
         let mut spawned = 0usize;
         let mut refused = 0u32;
-        for i in 0..FILLERS {
-            let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
-            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
-            let r = unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) };
-            // On AArch64 and RISC-V the runtime's NR 11 decode reads any non-zero `a0` as a TID,
-            // so a refusal (a small error code) arrives as `Ok(code)`. Every dynamic TID is
-            // >= 10 000; the kernel's SPAWN_THREAD_SPLIT_OK/FAIL markers are the grader's record.
-            match r {
-                Ok(t) if t >= 10_000 => spawned += 1,
-                _ => {
-                    refused += 1;
-                    break;
+        let spawn_until_refused = |spawned: &mut usize, refused: &mut u32| {
+            while *spawned < FILLERS {
+                let i = *spawned;
+                let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
+                // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+                let r = unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) };
+                // On AArch64 and RISC-V the runtime's NR 11 decode reads any non-zero `a0` as a
+                // TID, so a refusal (a small error code) arrives as `Ok(code)`. Every dynamic TID
+                // is >= 10 000; the kernel's SPAWN_THREAD_SPLIT_OK/FAIL markers are the record.
+                match r {
+                    Ok(t) if t >= 10_000 => *spawned += 1,
+                    _ => {
+                        *refused += 1;
+                        return;
+                    }
                 }
             }
-        }
+        };
+        spawn_until_refused(&mut spawned, &mut refused);
         yarm_user_rt::user_log!(
             "FTW_E_SATURATED fillers={} spawn_refused={}",
             spawned,
@@ -3593,6 +3610,8 @@ pub(super) mod futex_time_witness {
         // ping that moves nobody is W's timeout having won (no wake was issued), under saturation.
         let mut pings = 0u32;
         let mut gone = false;
+        let mut topups = 0u32;
+        let mut last_top = mono();
         while pings < BOUND {
             let (from, to) = if at_one { (&E1, &E2) } else { (&E2, &E1) };
             match futex_cmp_requeue(from.as_ptr(), P, to.as_ptr(), P, 0xE1, 0, 1) {
@@ -3604,6 +3623,11 @@ pub(super) mod futex_time_witness {
                 Err(_) => fail("E_ping"),
             }
             pings += 1;
+            if mono().saturating_sub(last_top) >= TOPUP_EVERY_NS {
+                spawn_until_refused(&mut spawned, &mut refused);
+                topups += 1;
+                last_top = mono();
+            }
             let _ = yield_now();
         }
         let w1 = futex_wake(E1.as_ptr(), 1, P).unwrap_or(u32::MAX);
@@ -3614,6 +3638,12 @@ pub(super) mod futex_time_witness {
             pings,
             w1,
             w2
+        );
+        yarm_user_rt::user_log!(
+            "FTW_E_HOLD_END fillers={} topups={} spawn_refused={}",
+            spawned,
+            topups,
+            refused
         );
         if !gone || pings == 0 || w1 != 0 || w2 != 0 || refused == 0 {
             fail("E_saturation");
@@ -3787,6 +3817,7 @@ fn run_futex_time_witness(s_tid: u64) {
 /// | W | the driver: issues every graded sleep and reports what ring 3 saw |
 /// | H | the helper: the concurrent sleep of case 5, the saturation of case 8, the release |
 /// | X | case 6's victim: one sleep the kernel fixture ends with the task |
+/// | R | case 8's timed IPC receive: due while its home queue is held full (SCHED-SAT-EVIDENCE1) |
 /// | F* | case 8's fillers: runnable threads that yield until released, then park |
 ///
 /// Every sleep is bracketed by `CLOCK_MONOTONIC` reads in ring 3: `t0` before the call, `t1` after
@@ -3810,9 +3841,23 @@ pub(super) mod sched_time_witness {
     pub(super) const FILLER_STACK_BYTES: usize = 2048;
     /// Two full user queues (64 each), the top-up and slack: spawning stops at a refusal.
     pub(super) const FILLERS: usize = 176;
-    /// W, H, X.
-    pub(super) const THREADS: usize = 3;
+    /// W, H, X, R.
+    pub(super) const THREADS: usize = 4;
     const BOUND: u32 = 4_000_000;
+    /// SCHED-SAT-EVIDENCE1 — R's calibration receive, in scheduler ticks (unsaturated; nobody
+    /// sends): its elapsed time bounds this port's tick, so R's graded deadline and H's hold
+    /// follow the port's real tick rather than an assumed one.
+    const CAL_TICKS: u64 = 4;
+    /// R's graded receive is entered when phase SAT starts — BEFORE the queues fill, because a
+    /// blocked task cannot be woken onto a full queue — and lasts about this long: past the slowest
+    /// port's saturation, inside H's hold (which outlasts W's `Q_NS` sleep).
+    const R_TARGET_NS: u64 = Q_NS - 10_000 * MS;
+    /// H re-tops-up the queues this often while it holds them full.
+    const TOPUP_EVERY_NS: u64 = 500 * MS;
+    /// H holds this long past the later of W's and R's deadlines.
+    const HOLD_MARGIN_NS: u64 = 2_000 * MS;
+    /// The hold's bound past W's deadline: R never published its deadline (fails closed).
+    const HOLD_CAP_NS: u64 = 60_000 * MS;
     /// Case 6: longer than `sleep_witness::KILL_THRESHOLD_NS` (one hour).
     const KILL_SLEEP_NS: u64 = 7_200_000_000_000;
     /// Case 8: long enough for H to saturate every queue on the slowest port before it ends. H
@@ -3855,10 +3900,24 @@ pub(super) mod sched_time_witness {
     static Q_DEADLINE: AtomicU64 = AtomicU64::new(0);
     /// Case 8: W is about to enter its sleep (H tops up only after this).
     static Q_ENTERING: AtomicU32 = AtomicU32::new(0);
+    /// SCHED-SAT-EVIDENCE1 — the endpoint R receives on (init's PM reply receive endpoint, idle
+    /// while the witness runs: nobody sends to it, so every receive ends by its deadline).
+    pub(super) static R_EP: AtomicU32 = AtomicU32::new(0);
+    /// R's calibrated tick estimate (ns).
+    static R_TICK_NS: AtomicU64 = AtomicU64::new(0);
+    /// R: about to enter its graded receive (H tops up R's freed slot after this).
+    static R_ENTERING: AtomicU32 = AtomicU32::new(0);
+    /// R: the earliest monotonic time its graded receive can be due (0 until published).
+    static R_DEADLINE: AtomicU64 = AtomicU64::new(0);
+    /// R: a monotonic time by which its graded receive is surely due (0 until published).
+    static R_DUE_BY: AtomicU64 = AtomicU64::new(0);
+    /// R: its graded receive returned.
+    static R_DONE: AtomicU32 = AtomicU32::new(0);
 
     const PH_TWO: u32 = 2;
     const PH_KILL: u32 = 3;
     const PH_SAT: u32 = 4;
+    const PH_CAL: u32 = 5;
     const PH_END: u32 = 9;
 
     fn park() -> ! {
@@ -4087,7 +4146,10 @@ pub(super) mod sched_time_witness {
         } else {
             fail("rt_set");
         }
-        // Case 8 — the home queue is full at the deadline; then every filler must get the CPU.
+        // Case 8 — first R calibrates its tick (unsaturated); then the home queues are held full
+        // through W's sleep deadline AND R's receive deadline; then every filler gets the CPU.
+        command(PH_CAL);
+        await_ack();
         Q_DEADLINE.store(mono() + Q_NS, SeqCst);
         command(PH_SAT);
         Q_ENTERING.store(1, SeqCst);
@@ -4153,11 +4215,65 @@ pub(super) mod sched_time_witness {
         if refusals < 2 || full_at >= deadline {
             fail("saturate");
         }
-        // Hold: stay runnable (rotation is what lets H run at all) until past W's deadline.
+        // R's receive must still be pending: its deadline lies after saturation is complete.
+        let r_deadline = R_DEADLINE.load(SeqCst);
+        yarm_user_rt::user_log!(
+            "STW_SAT_RECV r_deadline={} full_at={} early={}",
+            r_deadline,
+            full_at,
+            u32::from(r_deadline != 0 && full_at < r_deadline)
+        );
+        if r_deadline == 0 || full_at >= r_deadline {
+            fail("saturate_recv");
+        }
+        // Hold: stay runnable (rotation is what lets H run at all) until past both W's and R's
+        // deadlines, TOPPING UP all along (SCHED-SAT-EVIDENCE1): R's receive frees its slot, and
+        // any other task that blocks frees one, so a single top-up cannot keep a home queue full.
+        // The kernel's SATW_REFUSED lines are the proof the waiters' home queues were full.
         let mut n = 0u32;
-        while mono() < deadline + 2_000 * MS && n < BOUND {
+        let mut topups = 0u32;
+        let mut r_topped = false;
+        let mut last_top = mono();
+        let mut bounded = false;
+        loop {
+            let now = mono();
+            if !r_topped && R_ENTERING.load(SeqCst) != 0 {
+                r_topped = true;
+                for _ in 0..2 {
+                    let _ = yield_now();
+                }
+                spawn_until_refused(&mut spawned, &mut refusals);
+                topups += 1;
+                last_top = mono();
+            } else if now.saturating_sub(last_top) >= TOPUP_EVERY_NS {
+                spawn_until_refused(&mut spawned, &mut refusals);
+                topups += 1;
+                last_top = mono();
+            }
+            let r_due = R_DUE_BY.load(SeqCst);
+            if r_due != 0 && now >= deadline.max(r_due) + HOLD_MARGIN_NS {
+                break;
+            }
+            if now >= deadline + HOLD_CAP_NS || n >= BOUND {
+                bounded = true;
+                break;
+            }
             let _ = yield_now();
             n += 1;
+        }
+        yarm_user_rt::user_log!(
+            "STW_HOLD_END end={} w_deadline={} r_due_by={} fillers={} topups={} refusals={} holds={} bounded={}",
+            mono(),
+            deadline,
+            R_DUE_BY.load(SeqCst),
+            spawned,
+            topups,
+            refusals,
+            n,
+            u32::from(bounded)
+        );
+        if bounded {
+            fail("hold_bound");
         }
         RELEASE.store(1, SeqCst);
         let mut waits = 0u32;
@@ -4176,39 +4292,104 @@ pub(super) mod sched_time_witness {
         if (parked as usize) != spawned {
             fail("rotation");
         }
+        // R's deferred timeout is placed once the queues have room: bounded wait for its return.
+        let mut rw = 0u32;
+        while R_DONE.load(SeqCst) == 0 && rw < BOUND {
+            let _ = futex_wait(R_DONE.as_ptr(), 0, P);
+            rw += 1;
+        }
+        if R_DONE.load(SeqCst) == 0 {
+            fail("recv_never_returned");
+        }
         ack();
     }
 
-    fn helper_phase(phase: u32) {
-        match phase {
-            PH_TWO => {
-                sl("two_h", CLOCK_MONOTONIC, 0, 100 * MS);
-                ack();
-            }
-            PH_SAT => helper_saturate(),
+    fn recv_outcome(
+        r: &Result<Option<yarm_user_rt::ipc::Message>, SyscallError>,
+    ) -> &'static str {
+        match r {
+            Ok(None) => "none",
+            Ok(Some(_)) => "msg",
+            Err(_) => "err",
+        }
+    }
+
+    /// SCHED-SAT-EVIDENCE1 — R's calibration (phase CAL, unsaturated): one timed receive of
+    /// `CAL_TICKS` ticks on an endpoint nobody sends to.
+    fn receiver_calibrate() {
+        let ep = R_EP.load(SeqCst);
+        if ep == 0 {
+            fail("recv_cap");
+            ack();
+            return;
+        }
+        let c0 = mono();
+        // SAFETY: an ordinary deadline receive on init's idle PM reply endpoint.
+        let r = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(ep, CAL_TICKS) };
+        let c1 = mono();
+        let tick = (c1.saturating_sub(c0) / (CAL_TICKS - 1)).max(MS);
+        R_TICK_NS.store(tick, SeqCst);
+        yarm_user_rt::user_log!(
+            "STW_RECV_CAL ticks={} elapsed={} tick_est={} outcome={}",
+            CAL_TICKS,
+            c1.saturating_sub(c0),
+            tick,
+            recv_outcome(&r)
+        );
+        if !matches!(r, Ok(None)) {
+            fail("recv_cal");
+        }
+        ack();
+    }
+
+    /// SCHED-SAT-EVIDENCE1 — R's graded receive (phase SAT): entered at once, while the queues
+    /// still have room, with a deadline after H's saturation and inside its hold — so it falls due
+    /// while R's home queue is held full, and only its placement waits for the release.
+    fn receiver_saturated() {
+        let ep = R_EP.load(SeqCst);
+        let tick = R_TICK_NS.load(SeqCst).max(MS);
+        let ticks = (R_TARGET_NS / tick).max(3);
+        let t0 = mono();
+        // The kernel's deadline is `ticks` ticks after the tick it registers on: not before
+        // `t0 + (ticks - 1) * tick`, surely by `t0 + (ticks + 2) * tick`.
+        let earliest = t0 + (ticks - 1) * tick;
+        let due_by = t0 + (ticks + 2) * tick;
+        yarm_user_rt::user_log!(
+            "STW_RECV_CALL ticks={} t0={} earliest={} due_by={}",
+            ticks,
+            t0,
+            earliest,
+            due_by
+        );
+        R_DEADLINE.store(earliest, SeqCst);
+        R_DUE_BY.store(due_by, SeqCst);
+        R_ENTERING.store(1, SeqCst);
+        if ep == 0 {
+            fail("recv_cap");
+        }
+        // SAFETY: an ordinary deadline receive on init's idle PM reply endpoint.
+        let r = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(ep, ticks) };
+        let t1 = mono();
+        yarm_user_rt::user_log!(
+            "STW_RECV_RET outcome={} t0={} t1={} due_by={}",
+            recv_outcome(&r),
+            t0,
+            t1,
+            due_by
+        );
+        if !matches!(r, Ok(None)) {
+            fail("recv_outcome");
+        }
+        R_DONE.store(1, SeqCst);
+        let _ = futex_wake(R_DONE.as_ptr(), 1, P);
+    }
+
+    pub(super) extern "C" fn receiver_body() -> ! {
+        follower(|phase| match phase {
+            PH_CAL => receiver_calibrate(),
+            PH_SAT => receiver_saturated(),
             _ => {}
-        }
-    }
-
-    fn follower(on: impl Fn(u32)) -> ! {
-        let mut seen = 0;
-        loop {
-            let c = CMD.load(SeqCst);
-            if c == seen {
-                let _ = futex_wait(CMD.as_ptr(), c, P);
-                continue;
-            }
-            seen = c;
-            let phase = PHASE.load(SeqCst);
-            if phase == PH_END {
-                park();
-            }
-            on(phase);
-        }
-    }
-
-    pub(super) extern "C" fn helper_body() -> ! {
-        follower(helper_phase)
+        })
     }
 
     pub(super) extern "C" fn victim_body() -> ! {
@@ -4248,8 +4429,8 @@ pub(super) mod sched_time_witness {
     pub(super) fn run_once(s_tid: u64, children: &[Child; THREADS]) {
         yarm_user_rt::user_log!("STW_BEGIN s_tid={} fillers_max={}", s_tid, FILLERS);
         let mut tids = [0u64; THREADS];
-        // H and X first, so they are blocked on CMD before W's first sleep.
-        for i in [1, 2, 0] {
+        // H, X and R first, so they are blocked on CMD before W's first sleep.
+        for i in [1, 2, 3, 0] {
             let c = &children[i];
             // SAFETY: a valid entry; the static stack and TLS outlive the thread.
             tids[i] =
@@ -4257,10 +4438,11 @@ pub(super) mod sched_time_witness {
                     .unwrap_or(0);
         }
         yarm_user_rt::user_log!(
-            "STW_THREADS waiter={} helper={} victim={}",
+            "STW_THREADS waiter={} helper={} victim={} receiver={}",
             tids[0],
             tids[1],
-            tids[2]
+            tids[2],
+            tids[3]
         );
         let mut waits = 0;
         while DONE.load(SeqCst) == 0 && waits < BOUND {
@@ -4302,6 +4484,10 @@ mod x86_sched_time {
         core::arch::naked_asm!("call {body}", "ud2", body = sym super::sched_time_witness::victim_body)
     }
     #[unsafe(naked)]
+    pub(super) extern "C" fn receiver_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::sched_time_witness::receiver_body)
+    }
+    #[unsafe(naked)]
     pub(super) extern "C" fn filler_entry() -> ! {
         core::arch::naked_asm!("call {body}", "ud2", body = sym super::sched_time_witness::filler_body)
     }
@@ -4318,15 +4504,17 @@ mod x86_sched_time {
     feature = "futex-requeue-witness",
     feature = "sched-time-witness"
 ))]
-fn run_sched_time_witness(s_tid: u64) {
+fn run_sched_time_witness(s_tid: u64, recv_ep: Option<u32>) {
     use core::sync::atomic::Ordering::SeqCst;
     use sched_time_witness as w;
+    w::R_EP.store(recv_ep.unwrap_or(0), SeqCst);
     #[cfg(target_arch = "x86_64")]
     let (entries, filler, spinner) = (
         [
             x86_sched_time::waiter_entry as *const () as usize,
             x86_sched_time::helper_entry as *const () as usize,
             x86_sched_time::victim_entry as *const () as usize,
+            x86_sched_time::receiver_entry as *const () as usize,
         ],
         x86_sched_time::filler_entry as *const () as usize,
         x86_sched_time::spinner_entry as *const () as usize,
@@ -4337,6 +4525,7 @@ fn run_sched_time_witness(s_tid: u64) {
             w::waiter_body as *const () as usize,
             w::helper_body as *const () as usize,
             w::victim_body as *const () as usize,
+            w::receiver_body as *const () as usize,
         ],
         w::filler_body as *const () as usize,
         w::spinner_body as *const () as usize,
@@ -9801,7 +9990,7 @@ pub fn run() {
         // FUTEX-TIME1: built with `futex-time-witness`, the timed-wait witness, before all three.
         // SCHED-TIME-FOUNDATION1: built with `sched-time-witness`, the sleep witness, before all.
         #[cfg(feature = "sched-time-witness")]
-        run_sched_time_witness(ctx.task_id);
+        run_sched_time_witness(ctx.task_id, ctx.process_manager_reply_recv_cap);
         #[cfg(all(not(feature = "sched-time-witness"), feature = "futex-time-witness"))]
         run_futex_time_witness(ctx.task_id);
         #[cfg(all(
