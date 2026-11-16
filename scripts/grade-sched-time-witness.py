@@ -35,7 +35,10 @@ Rules (the brief's twelve cases):
                thread ended the hold; the cell topped up all through it) and before the DONE;
                every refusal of the cycle precedes its one DONE; STW_HOLD_END bounded=0;
                STW_SATURATED early=1; STW_ROTATION parked=fillers. Spawn refusals and filler
-               counts are diagnostics only: they earn nothing.
+               counts are diagnostics only: they earn nothing. SCHED-SAT-HANDOFF1: W arms its
+               sleep only after H verified saturation (exactly one STW_SAT_READY, before W's `full`
+               call, whose t0 is not earlier than its full_at), and STW_SATURATED names the deadline
+               W slept to (its `full` call's bound). STW_SPARES and STW_HANDOFF are diagnostics.
   9 all blocked three `idle` calls during which no other thread of the cell logs anything.
   10 cross-CPU  eight `cross` sleeps while two spinner threads trap on (balanced placement
                spreads them); at least one DONE in the whole log with cpu != home.
@@ -46,7 +49,7 @@ Rules (the brief's twelve cases):
   IPC capacity R's graded timed receive (STW_RECV_CALL .. STW_RECV_RET), entered only after H
                reported every queue full (sat_ready=1; R stayed runnable until then, since a
                blocked task cannot be woken onto a full queue), so saturation precedes its
-               deadline (STW_SAT_RECV early=1): at least one SATW_REFUSED
+               deadline (STW_SAT_RECV early=1; R's call follows STW_SAT_READY): at least one SATW_REFUSED
                class=recv of R between them, due (now >= deadline), with facts=ok, full=1, before
                STW_HOLD_RELEASED; a U8_RECV_TIMEOUT_PLACEMENT_DEFERRED of R for the same
                wait generation; then EXACTLY ONE U8_RECV_TIMEOUT_SETTLED of (R, that generation),
@@ -82,6 +85,9 @@ U = {
     "KILL_CHECK": dict(x_returned=N), "X_SLEEP": dict(req=N), "X_RETURNED": dict(code=N),
     "RT_SET": dict(code=N),
     "SATURATED": dict(fillers=N, first=N, refusals=N, full_at=N, w_deadline=N, early=N),
+    "SAT_READY": dict(full_at=N, fillers=N, refusals=N, spares_placed=N),
+    "SPARES": dict(spawned=N, parking=N),
+    "HANDOFF": dict(at=N, w_deadline=N, r_earliest=N, spares_placed=N, early=r"[01]"),
     "ROTATION": dict(fillers=N, parked=N, holds=N, waits=N),
     "WAITER_DONE": dict(calls=N, fails=N),
     "DONE": dict(waiter=N, helper=N, victim=N, calls=N, fails=N, result=r"ok|fail"),
@@ -286,6 +292,14 @@ def grade(lines):
     sat = one("U_SATURATED")
     if sat and sat["early"] != "1":
         fail("8: saturation completed after the deadline")
+    # SCHED-SAT-HANDOFF1 — the deadlines are derived from the verified saturation, not fixed before it.
+    ready = one("U_SAT_READY")
+    if ready and full:
+        fc = full[0]["c"]
+        if not (ready["at"] < fc["at"] and int(fc["t0"]) >= int(ready["full_at"])):
+            fail("8: W armed its full-queue sleep before H verified saturation")
+        if sat and sat["w_deadline"] != fc["bound"]:
+            fail(f"8: STW_SATURATED w_deadline {sat['w_deadline']} is not the deadline W slept to ({fc['bound']})")
     rot = one("U_ROTATION")
     if rot and rot["parked"] != rot["fillers"]:
         fail(f"8: only {rot['parked']} of {rot['fillers']} fillers ran after the release")
@@ -334,7 +348,8 @@ def grade(lines):
     if rc and rr:
         if rc["utid"] != R or rr["utid"] != R:
             fail("IPC: the graded receive was not R's")
-        if rc["sat_ready"] != "1":
+        if rc["sat_ready"] != "1" or (ready and not (ready["at"] < rc["at"]
+                                                     and int(rc["t0"]) >= int(ready["full_at"]))):
             fail("IPC: R entered its graded receive before H reported saturation")
         sr = one("U_SAT_RECV")
         if sr and sr["early"] != "1":
@@ -456,11 +471,14 @@ def synth():
     # an unrelated service's deferral: earns nothing
     L.append("U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid=2 wait_generation=7 cpu=0")
     L.append("U8_RECV_TIMEOUT_SETTLED arch=riscv64 tid=2 asid=1 wait_generation=7 deadline=1 now=2 broad_lock=0 result=ok")
-    u(H, "STW_SATURATED fillers=130 first=128 refusals=2 full_at=1 w_deadline=9 early=1")
+    u(H, "STW_SPARES spawned=24 parking=24")
+    u(H, "STW_SAT_READY full_at=1 fillers=130 refusals=2 spares_placed=1")
+    u(H, f"STW_SATURATED fillers=130 first=128 refusals=2 full_at=1 w_deadline={st['t'] + 2000} early=1")
     u(R, "STW_RECV_CALL ticks=20 t0=5000 earliest=8000 due_by=9000 sat_ready=1")
     u(H, "STW_SAT_RECV r_deadline=8000 full_at=1 early=1")
     L.append(f"U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid={R} wait_generation=2 cpu=1")
     L.append(f"SATW_REFUSED class=recv cpu=1 home=1 tid={R} gen=2 n=1 prio=1 queued=64 reserved=0 cap=64 full=1 deadline=300 now=300 facts=ok")
+    u(H, f"STW_HANDOFF at=4000 w_deadline={st['t'] + 2000} r_earliest=8000 spares_placed=3 early=1")
     st["holdmark"] = len(L)
     sleep(W, "full", 2000, mid=(
         "STW_SLEEP_REFUSED cpu=0 home=0 tid={tid} gen={gen} deadline={d} now={d}",
@@ -546,6 +564,20 @@ def self_test():
                                           or l.startswith("U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid=10015"))]
     must_fail(only_other, "IPC: no refusal")
     must_fail([l for l in good if "STW_RECV_CALL" not in l], "did not run")
+    # SCHED-SAT-HANDOFF1 — W's deadline derived from the verified saturation
+    rd = next(i for i, l in enumerate(good) if "STW_SAT_READY" in l)
+    fc = next(i for i, l in enumerate(good) if "STW_CALL case=full" in l)
+    moved = [l for k, l in enumerate(good) if k != rd]
+    moved.insert(fc, good[rd])  # SAT_READY now right after W's full call
+    must_fail(moved, "W armed its full-queue sleep before H verified saturation")
+    must_fail(edit("STW_SAT_READY full_at=1", "STW_SAT_READY full_at=99999999"), "before H verified saturation")
+    must_fail(edit("STW_SATURATED fillers=130 first=128 refusals=2 full_at=1 w_deadline=",
+                   "STW_SATURATED fillers=130 first=128 refusals=2 full_at=1 w_deadline=1"), "not the deadline W slept to")
+    must_fail([l for l in good if "STW_SAT_READY" not in l], "expected exactly one U_SAT_READY")
+    rc_i = next(i for i, l in enumerate(good) if "STW_RECV_CALL" in l)
+    late_ready = [l for k, l in enumerate(good) if k != rd]
+    late_ready.insert(rc_i, good[rd])
+    must_fail(late_ready, "before H reported saturation")
 
 
 def main():
