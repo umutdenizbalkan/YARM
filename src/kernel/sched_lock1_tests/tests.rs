@@ -112,14 +112,23 @@ fn sl1_unauthorized_cpu_access_is_refused_before_mutation() {
     }
     assert!(!d3.exclusive().tid_present_anywhere(t(1)));
     // A plan for CPU 0 handed to CPU 1's commit is refused, and CPU 1 is unchanged.
+    // SCHED-LOCK2A: the task is homed on CPU 0, so CPU 1's commit is refused by the home
+    // admission as well as by the plan's target.
+    let mut homed = crate::kernel::task::ThreadControlBlock::new(t(9), None);
+    homed.cpu_affinity = Some(CpuId(0));
+    let incarnation = homed.incarnation;
+    let tcbs = [Some(homed)];
     let plan = crate::kernel::task_enqueue::EnqueuePlan {
         tid: 9,
         priority: TaskPriority::Normal,
         target: crate::kernel::task_enqueue::EnqueueTarget::Pinned(CpuId(0)),
+        incarnation,
     };
     let mut g1 = d.lock_cpu(CpuId(1)).expect("cpu1");
     let mut v1 = g1.view();
-    assert!(crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(&mut v1, &plan).is_err());
+    assert!(
+        crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(&mut v1, &plan, &tcbs).is_err()
+    );
     assert_eq!(v1.runnable_count(), 0);
     assert!(!v1.contains_or_current(t(9)));
 }

@@ -546,7 +546,7 @@ fn overtaken_drain_selects_the_queue_head_and_leaves_the_woken_task_queued() {
 fn overtaken_waiter_queued_elsewhere_leaves_this_cpu_idle() {
     let fx = fixture();
     futex_wait_commit(&fx);
-    fx.k.with(|s| s.set_task_home_cpu(W, CPU1).expect("home 1"));
+    fx.k.with(|s| s.rehome_unplaced_task_for_test(W, CPU1).expect("home 1"));
     remote_futex_wake(&fx);
     crate::kernel::boot::futex_wait_dispatch_clear(0);
     let frame = owned_entry_frame(W, fx.w_asid);
@@ -573,10 +573,10 @@ fn no_acceptable_incoming_settles_idle_under_its_own_reason() {
         let (c, _) = s.create_user_address_space().expect("r asid");
         s.bind_task_asid(R, c).expect("bind r");
         s.set_task_status_for_test(R, TaskStatus::Runnable);
-        s.set_task_home_cpu(R, CPU0).expect("home");
+        s.rehome_unplaced_task_for_test(R, CPU0).expect("home");
     });
     futex_wait_commit(&fx);
-    fx.k.with(|s| s.set_task_home_cpu(W, CPU1).expect("home 1"));
+    fx.k.with(|s| s.rehome_unplaced_task_for_test(W, CPU1).expect("home 1"));
     fx.k.with(|s| s.enqueue_task(R).expect("r queued"));
     remote_futex_wake(&fx);
     crate::kernel::boot::futex_wait_dispatch_clear(0);

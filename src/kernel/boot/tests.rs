@@ -63033,7 +63033,7 @@ mod stage191b_futex_wake_retire {
                 )
                 // SCHED-LOCK1: THE split commit is `commit_enqueue_split`, which reaches the per-CPU
                 // commit owner under the target CPU's own 1L.
-                && RUNTIME_SRC.contains("crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(c, &pinned)")
+                && RUNTIME_SRC.contains("crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(c, &pinned, tcbs)")
                 && OWNER_SRC.contains(".enqueue_with_priority(ThreadId(plan.tid), plan.priority)")
                 && OWNER_SRC.contains("enqueue_balanced(ThreadId(plan.tid), plan.priority)"),
             "the split wake must use the task + scheduler split-mut seams and the same enqueue"
@@ -83266,7 +83266,7 @@ mod stage199a2b2d_direct_request_txn {
         fx.k.with(|s| {
             s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
             s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
-            s.set_task_home_cpu(2, CpuId(1))
+            s.rehome_unplaced_task_for_test(2, CpuId(1))
                 .expect("pin the server to cpu 1");
         });
         let snap = snapshot_for(&fx, b"request!");
@@ -83366,17 +83366,17 @@ mod stage199a2b2d_direct_request_txn {
                     k.with(|s| {
                         s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
                         s.bring_up_cpu(CpuId(1)).expect("online");
-                        s.set_task_home_cpu(2, CpuId(1)).expect("pin");
+                        s.rehome_unplaced_task_for_test(2, CpuId(1)).expect("pin");
                     })
                 }) as fn(&SharedKernel),
             ),
             (SchedulerError::CpuOffline, |k: &SharedKernel| {
                 // CPU 1 present but never brought online.
-                k.with(|s| s.set_task_home_cpu(2, CpuId(1)).expect("pin"));
+                k.with(|s| s.rehome_unplaced_task_for_test(2, CpuId(1)).expect("pin"));
             }),
             (SchedulerError::InvalidCpu, |k: &SharedKernel| {
                 let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8);
-                k.with(|s| s.set_task_home_cpu(2, bogus).expect("pin"));
+                k.with(|s| s.rehome_unplaced_task_for_test(2, bogus).expect("pin"));
             }),
             (SchedulerError::QueueFull, |k: &SharedKernel| {
                 // Fill the local queue the unpinned enqueue would use.
@@ -84586,7 +84586,7 @@ mod stage199a2b3_direct_reply_txn {
         fx.k.with(|s| {
             s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
             s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
-            s.set_task_home_cpu(1, CpuId(1))
+            s.rehome_unplaced_task_for_test(1, CpuId(1))
                 .expect("pin the caller to cpu 1");
         });
         let snap = snapshot_for(&fx, b"replyOK!");
@@ -84750,16 +84750,16 @@ mod stage199a2b3_direct_reply_txn {
                     k.with(|s| {
                         s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
                         s.bring_up_cpu(CpuId(1)).expect("online");
-                        s.set_task_home_cpu(1, CpuId(1)).expect("pin");
+                        s.rehome_unplaced_task_for_test(1, CpuId(1)).expect("pin");
                     })
                 }) as fn(&SharedKernel),
             ),
             (SchedulerError::CpuOffline, |k: &SharedKernel| {
-                k.with(|s| s.set_task_home_cpu(1, CpuId(1)).expect("pin"));
+                k.with(|s| s.rehome_unplaced_task_for_test(1, CpuId(1)).expect("pin"));
             }),
             (SchedulerError::InvalidCpu, |k: &SharedKernel| {
                 let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8);
-                k.with(|s| s.set_task_home_cpu(1, bogus).expect("pin"));
+                k.with(|s| s.rehome_unplaced_task_for_test(1, bogus).expect("pin"));
             }),
             (SchedulerError::QueueFull, |k: &SharedKernel| {
                 let here = k.current_cpu_split_read();
@@ -91763,16 +91763,20 @@ mod stage199a2d2a_smp_request {
     #[test]
     fn u3_home_cpu_split_assign_preserves_both_outcomes() {
         let fx = smp_server_fixture();
-        // Present TID: assigns the exact CPU and reports success.
-        assert!(fx.k.smp_assign_task_home_cpu(2, CPU0));
-        assert_eq!(fx.k.smp_request_wake_target_split_read(2), Some(CPU0));
+        // SCHED-LOCK2A: the fixture already homed the server on CPU 1. Re-assigning that same
+        // home is accepted and changes nothing.
+        assert_eq!(fx.k.smp_request_wake_target_split_read(2), Some(CPU1));
+        assert!(fx.k.smp_assign_task_home_cpu(2, CPU1));
         assert_eq!(
             fx.k.with(|s| s.task_home_cpu(2)),
-            Some(CPU0),
-            "the seam write is visible through KernelState::task_home_cpu"
+            Some(CPU1),
+            "the seam's view is KernelState::task_home_cpu's"
         );
-        // Reassignment is idempotent in shape and overwrites exactly.
-        assert!(fx.k.smp_assign_task_home_cpu(2, CPU1));
+        // A different home is a migration: refused, and nothing is written.
+        assert!(
+            !fx.k.smp_assign_task_home_cpu(2, CPU0),
+            "an existing home is never overwritten"
+        );
         assert_eq!(fx.k.smp_request_wake_target_split_read(2), Some(CPU1));
         // Missing TID: no panic, no mutation elsewhere, reports failure.
         assert!(
@@ -96104,7 +96108,11 @@ mod stage200c_reply_timeout_transaction {
             !read.contains("cpu_affinity ="),
             "the split read must not mutate"
         );
-        assert!(body_of("fn smp_assign_task_home_cpu").contains("tcb.cpu_affinity = Some(cpu)"));
+        // SCHED-LOCK2A: the assignment writes through THE binding (initial home only).
+        assert!(
+            body_of("fn smp_assign_task_home_cpu")
+                .contains("crate::kernel::task_enqueue::bind_home_locked(tcbs, tid, cpu)")
+        );
 
         // C. The disarm takes rank 2 BEFORE rank 3 and does not nest them: the rank-2 seam
         // call closes (`});`) before the rank-3 seam call begins.
@@ -119081,8 +119089,10 @@ mod stage199d_riscv_remote_wake_readiness {
             "AP-SCHED1: the ambient fallback is gone"
         );
         assert!(
+            // SCHED-LOCK2A: the captured affinity (else the executing CPU) goes through THE
+            // binding, which records it as the home or refuses a different existing one.
             probe(
-                "None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),",
+                "affinity.unwrap_or_else(|| self.executing_cpu_split()),",
                 RUNTIME
             ),
             "the enqueue target is the captured affinity, else the executing CPU fixed as the home"
@@ -120286,6 +120296,9 @@ mod stage199d_runqueue_withdrawal_foundation {
             // SCHED-TIME-FOUNDATION1 A: the full-queue rotation tests withdraw a queued task in the
             // middle of a full queue (`r15`). Test code only; no oracle or production path.
             "src/kernel/sched_full_rot1_tests.rs",
+            // SCHED-LOCK2A: the home-placement regressions withdraw each round's entry so the
+            // 64-slot queues never fill, and plant a stale entry. Test code only.
+            "src/kernel/sched_lock2a_tests/tests.rs",
             "src/runtime.rs",
             // KTHREAD1-ACCEPTANCE §3: the default-off `riscv64-d2-settle-witness` fixture withdraws
             // the phantom entry it queued itself. Instrumentation only: no oracle, no production
@@ -121051,8 +121064,10 @@ mod stage199d_receiver_enqueue_outcome {
         {
             let k = fixture(2, 1);
             let here = k.current_cpu_split_read();
-            // Force the pathological duplicate: queued on BOTH CPUs (per-CPU membership makes
-            // this reachable, which is precisely why the reconciliation must fail closed).
+            // Force the pathological duplicate: queued on BOTH CPUs. SCHED-LOCK2A makes it
+            // unreachable through the seam (the second, off-home placement is refused), so the
+            // fixture plants it with the raw scheduler primitive — the reconciliation must still
+            // fail closed against such an entry (an exited one, say), whoever wrote it.
             assert!(matches!(
                 k.sr_enqueue_committed_receiver_split(1, Some(here)),
                 ReceiverEnqueue::Enqueued { .. }
@@ -121060,8 +121075,17 @@ mod stage199d_receiver_enqueue_outcome {
             let other = CpuId(1);
             assert!(matches!(
                 k.sr_enqueue_committed_receiver_split(1, Some(other)),
-                ReceiverEnqueue::Enqueued { .. }
+                ReceiverEnqueue::Rejected {
+                    error: SchedulerError::CpuOffline,
+                    reconciled: None,
+                    ..
+                }
             ));
+            k.with_cpu_sched_split(other, |c| {
+                c.enqueue_with_priority(ThreadId(1), crate::kernel::scheduler::TaskPriority::Normal)
+            })
+            .expect("cpu1")
+            .expect("planted duplicate");
             // A third attempt on `here` collides with `here`'s own entry.
             let outcome = enqueue_reconciled(&k, 1, Some(here));
             assert_eq!(
@@ -121140,7 +121164,7 @@ mod stage199d_receiver_enqueue_outcome {
             .expect("the shared enqueue body");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
         let open = body
-            .find(".with_cpu_sched_split(cpu, |sm| {")
+            .find(".with_cpu_sched_and_tcbs_split(cpu, |sm, tcbs| {")
             .expect("acquisition");
         let detect = body
             .find("Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued)")
@@ -121153,8 +121177,11 @@ mod stage199d_receiver_enqueue_outcome {
             "detection and reconciliation must both sit inside the one acquisition"
         );
         // Exactly one acquisition in the whole seam: a second one would BE the window.
+        // SCHED-LOCK2A: that one acquisition is `cpu`'s 1L with the task table nested in it (the
+        // home admission), so it is counted under its own name.
+        assert_eq!(body.matches("_sched_split(").count(), 0);
         assert_eq!(
-            body.matches("_sched_split(").count(),
+            body.matches("_sched_and_tcbs_split(").count(),
             1,
             "a second acquisition is exactly the unlock/relock window this forbids"
         );
@@ -121389,7 +121416,7 @@ mod stage199d_shared_region_enqueue_rejection {
         fx.k.with(|s| {
             s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
             s.bring_up_cpu(CpuId(1)).expect("online");
-            s.set_task_home_cpu(2, CpuId(1)).expect("pin");
+            s.rehome_unplaced_task_for_test(2, CpuId(1)).expect("pin");
         });
         assert_eq!(
             fx.k.sr_finalize_blocked_receiver_and_wake_split(
@@ -121490,10 +121517,17 @@ mod stage199d_shared_region_enqueue_rejection {
                 fx.k.sr_enqueue_committed_receiver_split(2, Some(here)),
                 ReceiverEnqueue::Enqueued { .. }
             ));
+            // SCHED-LOCK2A: the off-home second placement is refused by the seam; the fixture
+            // plants the duplicate with the raw primitive to keep testing the finalizer against it.
             assert!(matches!(
                 fx.k.sr_enqueue_committed_receiver_split(2, Some(CpuId(1))),
-                ReceiverEnqueue::Enqueued { .. }
+                ReceiverEnqueue::Rejected { .. }
             ));
+            fx.k.with_cpu_sched_split(CpuId(1), |c| {
+                c.enqueue_with_priority(ThreadId(2), crate::kernel::scheduler::TaskPriority::Normal)
+            })
+            .expect("cpu1")
+            .expect("planted duplicate");
             assert_eq!(
                 fx.k.sr_finalize_blocked_receiver_and_wake_split(
                     &mut fx.snap.clone(),
@@ -161870,7 +161904,7 @@ mod u9spawn1_one_enqueue_owner {
         // SCHED-LOCK1: THE commit is the per-CPU one; the whole-domain form (boot / tests)
         // delegates a pinned plan to it and a balanced plan to the coherent balanced placement.
         assert!(
-            body.contains("commit_enqueue_on_cpu_locked(&mut view, plan)")
+            body.contains("commit_enqueue_on_cpu_locked(&mut view, plan, tcbs)")
                 && body.contains("enqueue_balanced(ThreadId(plan.tid), plan.priority)"),
             "the whole-domain commit delegates to THE per-CPU commit unchanged"
         );
@@ -161882,6 +161916,12 @@ mod u9spawn1_one_enqueue_owner {
         assert!(
             per_cpu.contains(".enqueue_with_priority(ThreadId(plan.tid), plan.priority)"),
             "the per-CPU commit delegates to the scheduler primitive unchanged"
+        );
+        // SCHED-LOCK2A: the one rule it applies is THE home admission, owned at rank 2 and
+        // invoked — not restated — before the queue is touched.
+        assert!(
+            per_cpu.contains("admit_home_locked(tcbs, plan.tid, plan.incarnation, cpu)?;"),
+            "the per-CPU commit admits the plan's incarnation on its home first"
         );
         for forbidden in [
             "TaskClass",
@@ -196091,6 +196131,9 @@ mod qemu_context1_user_fpu_ownership {
                 let _ = s.withdraw_queued_tid_on(CpuId(c as u8), other);
             }
         }
+        // SCHED-LOCK2A: a fixture that runs `tid` on `cpu` models a task whose first placement
+        // was there — the home is assigned before the placement, never overridden by it.
+        s.rehome_unplaced_task_for_test(tid, cpu).expect("rehome");
         s.enqueue_on_cpu(cpu, tid).expect("enqueue");
         assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
     }
@@ -196344,6 +196387,9 @@ mod qemu_context1_user_fpu_ownership {
                     let _ = s.withdraw_queued_tid_on(CpuId(c as u8), other);
                 }
             }
+            // SCHED-LOCK2A: the incoming task's home is `cpu`, assigned before its placement.
+            s.rehome_unplaced_task_for_test(incoming, cpu)
+                .expect("rehome");
             s.enqueue_on_cpu(cpu, incoming).expect("enqueue");
         });
         let dispatch =
@@ -202006,6 +202052,12 @@ mod vm_invalidation1 {
         let (k, asid) = fork_fixture();
         k.with(|s| {
             let _ = s.bring_up_cpu(CPU1);
+            // SCHED-LOCK2A: the parent's home is CPU 1, assigned before its placement there.
+            for c in 0..crate::kernel::scheduler::MAX_CPUS {
+                let _ = s.withdraw_queued_tid_on(CpuId(c as u8), PARENT);
+            }
+            s.rehome_unplaced_task_for_test(PARENT, CPU1)
+                .expect("rehome");
             s.enqueue_on_cpu(CPU1, PARENT).expect("enqueue");
             assert_eq!(s.dispatch_next_on_cpu(CPU1), Some(PARENT));
         });
@@ -202985,7 +203037,7 @@ mod ap_sched1 {
             for pat in [
                 ".commit_enqueue_split(&plan)",
                 ".enqueue_with_priority(",
-                "te::commit_reserved_enqueue_on_cpu_locked(c, &plan)",
+                "te::commit_reserved_enqueue_on_cpu_locked(c, &plan, tcbs)",
             ] {
                 for (i, _) in src.match_indices(pat) {
                     let head = &src[..i];

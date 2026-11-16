@@ -371,7 +371,18 @@ pub struct ThreadControlBlock {
     pub restart: RestartState,
     pub kernel_context: KernelExecutionContext,
     /// If set, scheduler enqueues this task only on the selected CPU.
+    ///
+    /// SCHED-LOCK2A: this is the incarnation's HOME. It is written once, at the first placement
+    /// (`task_enqueue::bind_home_locked` / `fix_home_locked`, under rank 2), and from then on
+    /// only this CPU may reserve, commit or restore the incarnation's placement
+    /// (`task_enqueue::admit_home_locked`).
     pub cpu_affinity: Option<CpuId>,
+    /// SCHED-LOCK2A — this incarnation's placement identity: unique for the life of the kernel,
+    /// assigned when the TCB is constructed and never rewritten. A TID (even with the same ASID:
+    /// sibling threads share it) can be reused by a later incarnation; this cannot, so a
+    /// placement planned under rank 2 and committed after the lock was dropped is bound to the
+    /// incarnation it was planned for.
+    pub incarnation: u64,
     /// Absolute scheduler tick at which an IPC wait should timeout.
     pub ipc_timeout_deadline: Option<u64>,
     /// Set when a blocked IPC wait is resumed due to timeout expiry.
@@ -1143,6 +1154,14 @@ impl BlockedSyscallCompletion {
     }
 }
 
+/// SCHED-LOCK2A — the next incarnation stamp. Starts at 1: 0 is the "no incarnation" of TID 0
+/// (the idle/supervisor sentinel, which has no TCB) and of anonymous reservations.
+static NEXT_INCARNATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn next_incarnation() -> u64 {
+    NEXT_INCARNATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 impl ThreadControlBlock {
     /// Stage 200C2C2C-R2A — the CANONICAL publication of a completed blocked syscall's user-visible
     /// return registers into this task's saved continuation (RISC-V).
@@ -1195,6 +1214,7 @@ impl ThreadControlBlock {
 
     pub fn new(tid: ThreadId, asid: Option<Asid>) -> Self {
         Self {
+            incarnation: next_incarnation(),
             tid,
             thread_group_id: ThreadGroupId(tid.0),
             status: TaskStatus::Runnable,

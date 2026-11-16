@@ -57,6 +57,125 @@ pub(crate) struct EnqueuePlan {
     pub(crate) tid: u64,
     pub(crate) priority: TaskPriority,
     pub(crate) target: EnqueueTarget,
+    /// SCHED-LOCK2A — the incarnation this plan is for (`ThreadControlBlock::incarnation`), read
+    /// under the same rank-2 acquisition that produced the plan. `0` = TID 0 or an anonymous
+    /// reservation; otherwise every 1L step re-checks it ([`admit_home_locked`]), so a plan whose
+    /// TID was reused after rank 2 was dropped places nothing.
+    pub(crate) incarnation: u64,
+}
+
+/// SCHED-LOCK2A — the incarnation stamp of `tid`'s live TCB, `0` for TID 0 or no TCB.
+pub(crate) fn incarnation_of_locked(tcbs: &[Option<ThreadControlBlock>], tid: u64) -> u64 {
+    if tid == 0 {
+        return 0;
+    }
+    tcbs.iter()
+        .flatten()
+        .find(|t| t.tid.0 == tid)
+        .map_or(0, |t| t.incarnation)
+}
+
+/// SCHED-LOCK2A — why a placement was refused for its home. Every refusal maps to the error a
+/// commit onto a CPU that cannot take the task already returns (`WrongObject`, from
+/// `SchedulerError::CpuOffline`), so no caller and no syscall ABI sees a new error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomeRefusal {
+    /// The incarnation has a home and the target is another CPU.
+    OffHome,
+    /// The TID now names a different incarnation (or none): the plan is stale.
+    Stale,
+    /// The incarnation has no home at a 1L step: its first placement never recorded one.
+    Homeless,
+}
+
+impl HomeRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            HomeRefusal::OffHome => "off_home",
+            HomeRefusal::Stale => "stale",
+            HomeRefusal::Homeless => "homeless",
+        }
+    }
+}
+
+fn refuse_home(tid: u64, cpu: CpuId, home: Option<CpuId>, why: HomeRefusal) -> KernelError {
+    crate::yarm_log!(
+        "SCHED_HOME_REFUSED tid={} cpu={} home={} reason={}",
+        tid,
+        cpu.0,
+        home.map_or(-1, |h| h.0 as i32),
+        why.reason()
+    );
+    map_scheduler_error(crate::kernel::scheduler::SchedulerError::CpuOffline)
+}
+
+/// SCHED-LOCK2A — rank 2: THE home binding of an explicit placement of `tid` on `cpu`.
+///
+/// * The incarnation has a home: `cpu` must be it, or the placement is refused (`OffHome`) with
+///   NOTHING written. This is SC-CPU-2's structural half — a Pinned plan for a homed task names
+///   that home or fails closed; it never silently overrides it.
+/// * It has none: `cpu` is recorded as its home in this same acquisition, so of two CPUs racing
+///   to place it first, exactly one records its CPU and the other then sees that home (and is
+///   refused if it named a different CPU).
+/// * TID 0 (no TCB, no home) and a TID with no TCB bind nothing.
+///
+/// Returns the incarnation the binding is for (`0` for TID 0 / no TCB).
+pub(crate) fn bind_home_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+    cpu: CpuId,
+) -> Result<u64, KernelError> {
+    if tid == 0 {
+        return Ok(0);
+    }
+    let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) else {
+        return Ok(0);
+    };
+    match tcb.cpu_affinity {
+        Some(home) if home != cpu => Err(refuse_home(tid, cpu, Some(home), HomeRefusal::OffHome)),
+        Some(_) => Ok(tcb.incarnation),
+        None => {
+            tcb.cpu_affinity = Some(cpu);
+            Ok(tcb.incarnation)
+        }
+    }
+}
+
+/// SCHED-LOCK2A — rank 2, read-only, run INSIDE the 1L of `cpu` (ascending 1 → 2): may `cpu`
+/// reserve, commit or restore the placement of `tid`'s incarnation `incarnation`?
+///
+/// Bound to the authority that commits — the CPU whose lock is held — and to the incarnation the
+/// plan was made for, so it holds across every dropped lock between planning and this step:
+///
+/// * TID 0 is always admitted (the sentinel has no TCB and no home);
+/// * the TID must still name the same incarnation (`incarnation == 0` admits whichever one it
+///   names: an anonymous plan, or a caller with no captured stamp) — else `Stale`, which covers
+///   exit-and-reap and TID reuse, including reuse inside the same address space;
+/// * that incarnation's home must be `cpu` — `OffHome` if it is another CPU, `Homeless` if the
+///   first placement recorded none.
+///
+/// An exited but unreaped incarnation is still that incarnation and still has its home: it is
+/// admitted there only, so an exited entry that is still queued is always queued on its home.
+pub(crate) fn admit_home_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    tid: u64,
+    incarnation: u64,
+    cpu: CpuId,
+) -> Result<(), KernelError> {
+    if tid == 0 {
+        return Ok(());
+    }
+    let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == tid) else {
+        return Err(refuse_home(tid, cpu, None, HomeRefusal::Stale));
+    };
+    if incarnation != 0 && tcb.incarnation != incarnation {
+        return Err(refuse_home(tid, cpu, tcb.cpu_affinity, HomeRefusal::Stale));
+    }
+    match tcb.cpu_affinity {
+        Some(home) if home == cpu => Ok(()),
+        Some(home) => Err(refuse_home(tid, cpu, Some(home), HomeRefusal::OffHome)),
+        None => Err(refuse_home(tid, cpu, None, HomeRefusal::Homeless)),
+    }
 }
 
 /// THE class → priority rule.
@@ -102,13 +221,16 @@ pub(crate) fn refuse_reservation_locked(
     Ok(Some(idx))
 }
 
-/// rank 2 — the policy `KernelState::enqueue_on_cpu` reads: refusal, then priority.
+/// rank 2 — the policy `KernelState::enqueue_on_cpu` reads: refusal, then priority, then the
+/// home binding.
 ///
-/// Deliberately does **not** pin driver affinity and does **not** read `cpu_affinity`: a pinned
-/// enqueue names its CPU, and the broad twin has never consulted affinity on this path. TID 0 is
-/// `Normal` without requiring a TCB or a class; any other TID needs both.
+/// Deliberately does **not** pin driver affinity: a pinned enqueue names its CPU. SCHED-LOCK2A:
+/// it does read `cpu_affinity` now, as the HOME — the named CPU must be the incarnation's home
+/// (or becomes it, for a task with none), else the plan is refused before anything is written
+/// ([`bind_home_locked`]). TID 0 is `Normal` without requiring a TCB or a class; any other TID
+/// needs both.
 pub(crate) fn plan_pinned_enqueue_locked(
-    tcbs: &[Option<ThreadControlBlock>],
+    tcbs: &mut [Option<ThreadControlBlock>],
     classes: &[Option<TaskClass>],
     tid: u64,
     cpu: CpuId,
@@ -125,10 +247,13 @@ pub(crate) fn plan_pinned_enqueue_locked(
                 .ok_or(KernelError::TaskMissing)?,
         )
     };
+    // Every refusal above wrote nothing; the binding is the plan's only write, and it is last.
+    let incarnation = bind_home_locked(tcbs, tid, cpu)?;
     Ok(EnqueuePlan {
         tid,
         priority,
         target: EnqueueTarget::Pinned(cpu),
+        incarnation,
     })
 }
 
@@ -153,6 +278,7 @@ pub(crate) fn plan_balanced_enqueue_locked(
             tid,
             priority: TaskPriority::Normal,
             target: EnqueueTarget::Balanced,
+            incarnation: 0,
         });
     }
     let idx = idx.ok_or(KernelError::TaskMissing)?;
@@ -172,6 +298,7 @@ pub(crate) fn plan_balanced_enqueue_locked(
             Some(cpu) => EnqueueTarget::Pinned(cpu),
             None => EnqueueTarget::Balanced,
         },
+        incarnation: tcb.incarnation,
     })
 }
 
@@ -228,11 +355,16 @@ pub(crate) fn homed_wake_placement_locked(
 /// a balanced plan is resolved to a CPU before any 1L is taken (`resolve_plan_home_split`), so a
 /// plan for another CPU is refused (`CpuOffline`, the error a commit onto a CPU that cannot take
 /// it already returns) with nothing mutated.
+///
+/// SCHED-LOCK2A: `tcbs` is the task table read under rank 2 nested inside this 1L; the home
+/// admission ([`admit_home_locked`]) runs before the queue is touched.
 pub(crate) fn commit_enqueue_on_cpu_locked(
     view: &mut CpuView<'_>,
     plan: &EnqueuePlan,
+    tcbs: &[Option<ThreadControlBlock>],
 ) -> Result<CpuId, KernelError> {
     let cpu = view.cpu();
+    admit_home_locked(tcbs, plan.tid, plan.incarnation, cpu)?;
     match plan.target {
         EnqueueTarget::Pinned(target) if target == cpu => view
             .enqueue_with_priority(ThreadId(plan.tid), plan.priority)
@@ -252,16 +384,24 @@ pub(crate) enum ReservedCommit {
     /// The task was already placed on this CPU — its current task, mid-publication of a wait whose
     /// own read-back owns its placement, or already queued. The reservation is released.
     AlreadyPlaced(CpuId),
+    /// SCHED-LOCK2A — the home admission refused the commit (the TID now names another
+    /// incarnation, or none): nothing was queued, and the reservation was released here, so the
+    /// slot is settled exactly once.
+    Refused(CpuId),
 }
 
 /// rank 1L — FUTEX-WAKE-CAP1: promise `plan` a user slot on this CPU, BEFORE the caller mutates
 /// the task. The plan must name exactly this CPU. Refused — with nothing mutated — for a full
 /// queue, an offline or wake-only CPU, or a plan for another CPU: the same refusals the commit
 /// would make, moved ahead of the irreversible step.
+///
+/// SCHED-LOCK2A: the home admission runs first, so an off-home or stale plan reserves nothing.
 pub(crate) fn reserve_enqueue_on_cpu_locked(
     view: &mut CpuView<'_>,
     plan: &EnqueuePlan,
+    tcbs: &[Option<ThreadControlBlock>],
 ) -> Result<(), KernelError> {
+    admit_home_locked(tcbs, plan.tid, plan.incarnation, view.cpu())?;
     let reserved = match plan.target {
         EnqueueTarget::Pinned(target) if target == view.cpu() => view
             .reserve_user_slot(plan.priority)
@@ -303,11 +443,20 @@ pub(crate) fn release_enqueue_reservation_on_cpu_locked(
 /// rank 1L — FUTEX-WAKE-CAP1: THE commit of a reserved enqueue. It cannot be refused for capacity
 /// (the slot was promised); `AlreadyQueued` is reported as `AlreadyPlaced`. Anything else is an
 /// invariant break and is returned as the error.
+///
+/// SCHED-LOCK2A: the home admission is re-checked — the task lock was dropped between the
+/// reservation, the claim and this commit — and a refused commit releases the reservation
+/// itself (`Refused`), queueing nothing.
 pub(crate) fn commit_reserved_enqueue_on_cpu_locked(
     view: &mut CpuView<'_>,
     plan: &EnqueuePlan,
+    tcbs: &[Option<ThreadControlBlock>],
 ) -> Result<ReservedCommit, KernelError> {
     let cpu = view.cpu();
+    if admit_home_locked(tcbs, plan.tid, plan.incarnation, cpu).is_err() {
+        view.release_user_slot(plan.priority);
+        return Ok(ReservedCommit::Refused(cpu));
+    }
     match view.enqueue_reserved_with_priority(ThreadId(plan.tid), plan.priority) {
         Ok(()) => Ok(ReservedCommit::Queued(cpu)),
         Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued) => {
@@ -318,10 +467,13 @@ pub(crate) fn commit_reserved_enqueue_on_cpu_locked(
 }
 
 /// The whole-domain commit (boot and hosted tests, under every 1L and 1G): a pinned plan is THE
-/// per-CPU commit above on its CPU; a balanced plan takes the coherent balanced choice.
+/// per-CPU commit above on its CPU. SCHED-LOCK2A: a balanced plan reaches here only for TID 0
+/// (every caller resolves a live task's balanced plan to its recorded home first); for any other
+/// TID it is refused, because a balanced commit would place the task without recording a home.
 pub(crate) fn commit_enqueue_locked(
     scheduler: &mut SchedAll<'_>,
     plan: &EnqueuePlan,
+    tcbs: &[Option<ThreadControlBlock>],
 ) -> Result<CpuId, KernelError> {
     match plan.target {
         EnqueueTarget::Pinned(cpu) => {
@@ -329,11 +481,14 @@ pub(crate) fn commit_enqueue_locked(
                 .validate_online_cpu(cpu)
                 .map_err(map_scheduler_error)?;
             let mut view = scheduler.cpu(cpu).map_err(map_scheduler_error)?;
-            commit_enqueue_on_cpu_locked(&mut view, plan)
+            commit_enqueue_on_cpu_locked(&mut view, plan, tcbs)
         }
-        EnqueueTarget::Balanced => scheduler
+        EnqueueTarget::Balanced if plan.tid == 0 => scheduler
             .enqueue_balanced(ThreadId(plan.tid), plan.priority)
             .map_err(map_scheduler_error),
+        EnqueueTarget::Balanced => {
+            Err(refuse_home(plan.tid, CpuId(0), None, HomeRefusal::Homeless))
+        }
     }
 }
 
@@ -356,7 +511,7 @@ mod tests {
         let mut tcbs = [Some(tcb(7, None, TaskStatus::Reserved))];
         let classes = [Some(TaskClass::App)];
         assert_eq!(
-            plan_pinned_enqueue_locked(&tcbs, &classes, 7, CpuId(0)).unwrap_err(),
+            plan_pinned_enqueue_locked(&mut tcbs, &classes, 7, CpuId(0)).unwrap_err(),
             KernelError::WrongObject
         );
         assert_eq!(
@@ -372,7 +527,8 @@ mod tests {
     fn tid_zero_is_normal_without_a_class() {
         let mut tcbs: [Option<ThreadControlBlock>; 0] = [];
         let classes: [Option<TaskClass>; 0] = [];
-        let pinned = plan_pinned_enqueue_locked(&tcbs, &classes, 0, CpuId(1)).expect("sentinel");
+        let pinned =
+            plan_pinned_enqueue_locked(&mut tcbs, &classes, 0, CpuId(1)).expect("sentinel");
         assert_eq!(pinned.priority, TaskPriority::Normal);
         assert_eq!(pinned.target, EnqueueTarget::Pinned(CpuId(1)));
         let balanced =
@@ -387,7 +543,7 @@ mod tests {
         let mut tcbs = [Some(tcb(7, None, TaskStatus::Runnable))];
         let classes = [None];
         assert_eq!(
-            plan_pinned_enqueue_locked(&tcbs, &classes, 7, CpuId(0)).unwrap_err(),
+            plan_pinned_enqueue_locked(&mut tcbs, &classes, 7, CpuId(0)).unwrap_err(),
             KernelError::TaskMissing
         );
         assert_eq!(
@@ -440,13 +596,23 @@ mod tests {
         assert_eq!(plan.priority, TaskPriority::High);
     }
 
-    /// The pinned planner ignores affinity entirely — it enqueues where it is told.
+    /// SCHED-LOCK2A (SC-CPU-2) — replaces `the_pinned_planner_names_its_own_cpu_regardless_of_affinity`,
+    /// which documented the defect: the pinned planner placed a homed task wherever it was told.
+    /// Now a pinned plan for a homed task must name the home or is refused, with nothing
+    /// written; on the home it succeeds and names it.
     #[test]
-    fn the_pinned_planner_names_its_own_cpu_regardless_of_affinity() {
-        let tcbs = [Some(tcb(9, Some(CpuId(1)), TaskStatus::Runnable))];
+    fn sl2a_a_pinned_plan_off_the_home_is_refused_with_nothing_written() {
+        let mut tcbs = [Some(tcb(9, Some(CpuId(1)), TaskStatus::Runnable))];
         let classes = [Some(TaskClass::Driver)];
-        let plan = plan_pinned_enqueue_locked(&tcbs, &classes, 9, CpuId(0)).expect("plan");
-        assert_eq!(plan.target, EnqueueTarget::Pinned(CpuId(0)));
+        let before = tcbs.clone();
+        assert_eq!(
+            plan_pinned_enqueue_locked(&mut tcbs, &classes, 9, CpuId(0)).unwrap_err(),
+            KernelError::WrongObject
+        );
+        assert_eq!(tcbs, before, "a refused plan writes nothing");
+        let plan = plan_pinned_enqueue_locked(&mut tcbs, &classes, 9, CpuId(1)).expect("home");
+        assert_eq!(plan.target, EnqueueTarget::Pinned(CpuId(1)));
+        assert_eq!(plan.incarnation, tcbs[0].as_ref().unwrap().incarnation);
     }
 
     /// The class→priority rule has exactly one definition, and it is this one.

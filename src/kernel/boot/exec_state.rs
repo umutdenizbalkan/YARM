@@ -1356,7 +1356,9 @@ impl KernelState {
                 let mut guard = self.scheduler_state();
                 let mut all = guard.view();
                 match all.cpu(home) {
-                    Ok(mut view) => te::reserve_enqueue_on_cpu_locked(&mut view, &plan),
+                    Ok(mut view) => self.with_tcbs(|tcbs| {
+                        te::reserve_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+                    }),
                     Err(err) => Err(super::map_scheduler_error(err)),
                 }
             };
@@ -1400,8 +1402,11 @@ impl KernelState {
                 priority: priority as u8,
             };
             for _ in 0..count {
-                let Some(tid) = self.with_task_futex_mut(|tcbs, table| {
-                    fx::claim_pending_futex_waiter_locked(tcbs.as_mut_slice(), table, key)
+                let Some((tid, incarnation)) = self.with_task_futex_mut(|tcbs, table| {
+                    let tid =
+                        fx::claim_pending_futex_waiter_locked(tcbs.as_mut_slice(), table, key)?;
+                    // SCHED-LOCK2A: the claimed incarnation, in the claim's own acquisition.
+                    Some((tid, te::incarnation_of_locked(tcbs.as_slice(), tid)))
                 }) else {
                     break;
                 };
@@ -1413,11 +1418,14 @@ impl KernelState {
                     tid,
                     priority,
                     target: EnqueueTarget::Pinned(home),
+                    incarnation,
                 };
                 let mut guard = self.scheduler_state();
                 let mut all = guard.view();
                 let committed = match all.cpu(home) {
-                    Ok(mut view) => te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan),
+                    Ok(mut view) => self.with_tcbs(|tcbs| {
+                        te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+                    }),
                     Err(err) => Err(super::map_scheduler_error(err)),
                 };
                 if let Err(err) = committed {
@@ -1440,6 +1448,7 @@ impl KernelState {
                 tid: 0,
                 priority,
                 target: EnqueueTarget::Pinned(home),
+                incarnation: 0,
             };
             let mut guard = self.scheduler_state();
             let mut all = guard.view();
@@ -1551,7 +1560,9 @@ impl KernelState {
                 let mut guard = self.scheduler_state();
                 let mut all = guard.view();
                 match all.cpu(target) {
-                    Ok(mut view) => te::reserve_enqueue_on_cpu_locked(&mut view, &plan),
+                    Ok(mut view) => self.with_tcbs(|tcbs| {
+                        te::reserve_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+                    }),
                     Err(err) => Err(super::map_scheduler_error(err)),
                 }
             };
@@ -1590,8 +1601,13 @@ impl KernelState {
                 te::release_enqueue_reservation_on_cpu_locked(&mut view, &plan);
                 continue;
             }
-            match te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan) {
+            match self.with_tcbs(|tcbs| {
+                te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+            }) {
                 Ok(ReservedCommit::Queued(_) | ReservedCommit::AlreadyPlaced(_)) => woke += 1,
+                // SCHED-LOCK2A: the home admission refused (stale incarnation); the slot was
+                // released by the commit itself, and nothing was queued.
+                Ok(ReservedCommit::Refused(_)) => {}
                 Err(err) => crate::yarm_log!(
                     "FUTEX_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} err={:?}",
                     candidate.tid,

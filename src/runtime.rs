@@ -2357,6 +2357,21 @@ impl SharedKernel {
         Ok(f(&mut view))
     }
 
+    /// SCHED-LOCK2A — `cpu`'s 1L with the task table (rank 2) nested inside it, ascending 1 → 2:
+    /// the placement steps whose home admission (`task_enqueue::admit_home_locked`) must read the
+    /// incarnation under the SAME lock that reserves, commits or restores on `cpu`. Nothing inside
+    /// may call back into `SharedKernel`.
+    pub(crate) fn with_cpu_sched_and_tcbs_split<R>(
+        &self,
+        cpu: CpuId,
+        f: impl FnOnce(
+            &mut crate::kernel::scheduler::CpuView<'_>,
+            &[Option<crate::kernel::task::ThreadControlBlock>],
+        ) -> R,
+    ) -> Result<R, crate::kernel::scheduler::SchedulerError> {
+        self.with_cpu_sched_split(cpu, |c| self.with_task_tcbs_split_mut(|tcbs| f(c, tcbs)))
+    }
+
     /// SCHED-LOCK1 — rank 1G then `cpu`'s 1L: an admission transition of `cpu`.
     pub(crate) fn with_cpu_admission_split<R>(
         &self,
@@ -3409,9 +3424,10 @@ impl SharedKernel {
         tid: u64,
         priority: crate::kernel::scheduler::TaskPriority,
     ) -> bool {
-        // SCHED-LOCK1: `cpu`'s own 1L.
-        self.with_cpu_sched_split(cpu, |c| {
-            c.restore_exact_current(crate::kernel::ipc::ThreadId(tid), priority)
+        // SCHED-LOCK1: `cpu`'s own 1L. SCHED-LOCK2A: only the incarnation's home restores it.
+        self.with_cpu_sched_and_tcbs_split(cpu, |c, tcbs| {
+            crate::kernel::task_enqueue::admit_home_locked(tcbs, tid, 0, cpu).is_ok()
+                && c.restore_exact_current(crate::kernel::ipc::ThreadId(tid), priority)
         })
         .unwrap_or(false)
     }
@@ -4291,8 +4307,8 @@ impl SharedKernel {
             ..*plan
         };
         let committed = self
-            .with_cpu_sched_split(cpu, |c| {
-                crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(c, &pinned)
+            .with_cpu_sched_and_tcbs_split(cpu, |c, tcbs| {
+                crate::kernel::task_enqueue::commit_enqueue_on_cpu_locked(c, &pinned, tcbs)
             })
             .map_err(map_scheduler_error)?;
         #[cfg(feature = "sched-lock1-witness")]
@@ -6394,6 +6410,8 @@ impl SharedKernel {
             affinity: Option<CpuId>,
             priority: TaskPriority,
             reserved: bool,
+            /// SCHED-LOCK2A: the incarnation this claim woke, for the commit's home admission.
+            incarnation: u64,
         }
         let state = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
             let idx = tcbs
@@ -6428,6 +6446,7 @@ impl SharedKernel {
             // release runs after this section drops, never nested inside it.
             let retire = tcb.reply_timeout_token.take();
             let affinity = tcb.cpu_affinity;
+            let incarnation = tcb.incarnation;
             // U9-SPAWN1 SP-1: the refusal comes from THE owner, evaluated here under rank 2
             // like every other caller's. It is unreachable on this path — a `Reserved` TCB is
             // not `Blocked|Runnable|Running`, so the status gate above has already returned —
@@ -6449,6 +6468,7 @@ impl SharedKernel {
                     affinity,
                     priority,
                     reserved,
+                    incarnation,
                 },
                 retire,
             ))
@@ -6519,13 +6539,20 @@ impl SharedKernel {
             }
             // The commit: the destination's 1L only. Capacity / admission / duplicate refusals
             // happen before any mutation (the queue is the reservation).
+            // SCHED-LOCK2A: the woken incarnation's home admission under the destination's 1L.
             let queue_len = self
-                .with_cpu_sched_split(target, |c| {
+                .with_cpu_sched_and_tcbs_split(target, |c, tcbs| {
+                    crate::kernel::task_enqueue::admit_home_locked(
+                        tcbs,
+                        tid.0,
+                        state.incarnation,
+                        target,
+                    )?;
                     c.enqueue_with_priority(tid, state.priority)
                         .map(|()| c.runnable_count())
+                        .map_err(map_scheduler_error)
                 })
-                .map_err(map_scheduler_error)?
-                .map_err(map_scheduler_error)?;
+                .map_err(map_scheduler_error)??;
             if tid.0 == BOOTSTRAP_FIRST_USER_TID && cfg!(not(feature = "hosted-dev")) {
                 // Diagnostic only: each CPU's queue length under its own 1L, one at a time.
                 let q = |c: u8| {
@@ -13953,7 +13980,9 @@ impl SharedKernel {
             };
             // rank 1: the slot, promised before anything is decided about the waiter.
             let reserved = self
-                .with_cpu_sched_split(home, |c| te::reserve_enqueue_on_cpu_locked(c, &plan))
+                .with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+                    te::reserve_enqueue_on_cpu_locked(c, &plan, tcbs)
+                })
                 .map_err(crate::kernel::boot::map_scheduler_error)
                 .and_then(|r| r);
             if let Err(err) = reserved {
@@ -14001,13 +14030,14 @@ impl SharedKernel {
                 priority: priority as u8,
             };
             for _ in 0..count {
-                let Some(tid) = self.with_task_futex_split_mut(|tcbs, table| {
+                let Some((tid, incarnation)) = self.with_task_futex_split_mut(|tcbs, table| {
                     let tid = fx::claim_pending_futex_waiter_locked(tcbs, table, key)?;
                     // SCHED-LOCK1 witness only: the incarnation this owner places — exactly the
                     // waiter it claimed, which may differ from the one its preflight planned for.
                     #[cfg(feature = "sched-lock1-witness")]
                     crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid);
-                    Some(tid)
+                    // SCHED-LOCK2A: the claimed incarnation, in the claim's own acquisition.
+                    Some((tid, te::incarnation_of_locked(tcbs, tid)))
                 }) else {
                     break;
                 };
@@ -14020,9 +14050,10 @@ impl SharedKernel {
                     tid,
                     priority,
                     target: EnqueueTarget::Pinned(home),
+                    incarnation,
                 };
-                match self.with_cpu_sched_split(home, |c| {
-                    te::commit_reserved_enqueue_on_cpu_locked(c, &plan)
+                match self.with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+                    te::commit_reserved_enqueue_on_cpu_locked(c, &plan, tcbs)
                 }) {
                     Ok(Ok(ReservedCommit::Queued(t))) => {
                         #[cfg(feature = "sched-lock1-witness")]
@@ -14053,6 +14084,7 @@ impl SharedKernel {
                 tid: 0,
                 priority,
                 target: EnqueueTarget::Pinned(home),
+                incarnation: 0,
             };
             let _ = self.with_cpu_sched_split(home, |c| {
                 for _ in 0..count {
@@ -14133,7 +14165,9 @@ impl SharedKernel {
             };
             // (2) rank 1: the placement, promised before the waiter is touched.
             let reserved = self
-                .with_cpu_sched_split(target, |c| te::reserve_enqueue_on_cpu_locked(c, &plan))
+                .with_cpu_sched_and_tcbs_split(target, |c, tcbs| {
+                    te::reserve_enqueue_on_cpu_locked(c, &plan, tcbs)
+                })
                 .map_err(crate::kernel::boot::map_scheduler_error)
                 .and_then(|r| r);
             if let Err(err) = reserved {
@@ -14168,8 +14202,8 @@ impl SharedKernel {
                 candidate.tid,
             );
             // (4) rank 1: the reserved commit.
-            match self.with_cpu_sched_split(target, |c| {
-                te::commit_reserved_enqueue_on_cpu_locked(c, &plan)
+            match self.with_cpu_sched_and_tcbs_split(target, |c, tcbs| {
+                te::commit_reserved_enqueue_on_cpu_locked(c, &plan, tcbs)
             }) {
                 Ok(Ok(ReservedCommit::Queued(t))) => {
                     #[cfg(feature = "sched-lock1-witness")]
@@ -14261,7 +14295,9 @@ impl SharedKernel {
             };
             // (2) rank 1: the slot, promised before the waiter is touched.
             let reserved = self
-                .with_cpu_sched_split(home, |c| te::reserve_enqueue_on_cpu_locked(c, &plan))
+                .with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+                    te::reserve_enqueue_on_cpu_locked(c, &plan, tcbs)
+                })
                 .map_err(crate::kernel::boot::map_scheduler_error)
                 .and_then(|r| r);
             #[cfg(feature = "sched-time-witness")]
@@ -14358,8 +14394,8 @@ impl SharedKernel {
                 candidate.tid,
             );
             // (5) rank 1: the reserved commit, which cannot be refused for capacity.
-            match self.with_cpu_sched_split(home, |c| {
-                te::commit_reserved_enqueue_on_cpu_locked(c, &plan)
+            match self.with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+                te::commit_reserved_enqueue_on_cpu_locked(c, &plan, tcbs)
             }) {
                 Ok(Ok(ReservedCommit::Queued(t))) => {
                     #[cfg(feature = "sched-lock1-witness")]
@@ -16808,8 +16844,8 @@ impl SharedKernel {
         let Some(promise) = snap.placement.take().and_then(IpcWakePlacement::from_plan) else {
             return SrPlacementCommit::Refused;
         };
-        match self.with_cpu_sched_split(promise.home, |c| {
-            te::commit_reserved_enqueue_on_cpu_locked(c, &promise.plan)
+        match self.with_cpu_sched_and_tcbs_split(promise.home, |c, tcbs| {
+            te::commit_reserved_enqueue_on_cpu_locked(c, &promise.plan, tcbs)
         }) {
             Ok(Ok(ReservedCommit::Queued(cpu))) => {
                 #[cfg(feature = "sched-lock1-witness")]
@@ -17273,14 +17309,41 @@ impl SharedKernel {
         reconcile: bool,
     ) -> ReceiverEnqueue {
         use crate::kernel::ipc::ThreadId;
-        // AP-SCHED1: the task's home, never the ambient `sched.current_cpu`.
-        let cpu = match affinity {
-            Some(cpu) => cpu,
-            None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),
-        };
+        // AP-SCHED1: the task's home, never the ambient `sched.current_cpu`. SCHED-LOCK2A: a
+        // caller-named CPU is this task's home if it has none yet (recorded at rank 2, so a racing
+        // first placement sees it); if the task already has a different home the placement is
+        // refused here, before any lock of the named CPU is taken.
+        let home =
+            self.fix_home_cpu_split(tid, affinity.unwrap_or_else(|| self.executing_cpu_split()));
+        if let Some(named) = affinity
+            && named != home
+            && tid != 0
+        {
+            crate::yarm_log!(
+                "SCHED_HOME_REFUSED tid={} cpu={} home={} reason=off_home",
+                tid,
+                named.0,
+                home.0
+            );
+            return ReceiverEnqueue::Rejected {
+                cpu: named,
+                error: crate::kernel::scheduler::SchedulerError::CpuOffline,
+                reconciled: None,
+            };
+        }
+        let cpu = affinity.unwrap_or(home);
         // SCHED-LOCK1: the destination's 1L for the enqueue AND the reconciling withdrawal.
+        // SCHED-LOCK2A: the home admission under that same 1L (rank 2 nested, ascending) — the
+        // committed receiver is placed on its home or nowhere; a refusal touches nothing.
         let outcome = self
-            .with_cpu_sched_split(cpu, |sm| {
+            .with_cpu_sched_and_tcbs_split(cpu, |sm, tcbs| {
+                if crate::kernel::task_enqueue::admit_home_locked(tcbs, tid, 0, cpu).is_err() {
+                    return ReceiverEnqueue::Rejected {
+                        cpu,
+                        error: crate::kernel::scheduler::SchedulerError::CpuOffline,
+                        reconciled: None,
+                    };
+                }
                 match sm.enqueue_with_priority(ThreadId(tid), priority) {
                     Ok(()) => ReceiverEnqueue::Enqueued { cpu },
                     // Pre-existing membership. When the caller owns a rollback that can complete it,
@@ -18677,19 +18740,21 @@ impl SharedKernel {
         let EnqueueTarget::Pinned(home) = plan.target else {
             return None;
         };
-        self.with_cpu_sched_split(home, |c| te::reserve_enqueue_on_cpu_locked(c, &plan))
-            .map_err(crate::kernel::boot::map_scheduler_error)
-            .and_then(|r| r)
-            .ok()
-            .map(|()| IpcWakePlacement { plan, home })
+        self.with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+            te::reserve_enqueue_on_cpu_locked(c, &plan, tcbs)
+        })
+        .map_err(crate::kernel::boot::map_scheduler_error)
+        .and_then(|r| r)
+        .ok()
+        .map(|()| IpcWakePlacement { plan, home })
     }
 
     /// IPC-TIMEOUT-CAP1 — fill a promise after its owner's claim committed. It cannot be refused
     /// for capacity; the destination's 1L only, the IPI after its release.
     pub(crate) fn commit_ipc_wake_split(&self, placement: IpcWakePlacement) {
         use crate::kernel::task_enqueue::{self as te, ReservedCommit};
-        match self.with_cpu_sched_split(placement.home, |c| {
-            te::commit_reserved_enqueue_on_cpu_locked(c, &placement.plan)
+        match self.with_cpu_sched_and_tcbs_split(placement.home, |c, tcbs| {
+            te::commit_reserved_enqueue_on_cpu_locked(c, &placement.plan, tcbs)
         }) {
             Ok(Ok(ReservedCommit::Queued(cpu))) => {
                 #[cfg(feature = "sched-lock1-witness")]
@@ -18765,15 +18830,13 @@ impl SharedKernel {
     /// report success only when the TCB exists (`Err(TaskMissing)` → `false`). No online-CPU
     /// validation is added, the placement policy is unchanged, the scheduler lock is not taken,
     /// and there is no broad fallback.
+    ///
+    /// SCHED-LOCK2A: an INITIAL assignment through THE binding, like its broad twin: a different
+    /// existing home is refused (`false`) and nothing is written.
     pub(crate) fn smp_assign_task_home_cpu(&self, tid: u64, cpu: CpuId) -> bool {
         self.with_task_tcbs_split_mut(|tcbs| {
-            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
-                Some(tcb) => {
-                    tcb.cpu_affinity = Some(cpu);
-                    true
-                }
-                None => false,
-            }
+            tcbs.iter().flatten().any(|t| t.tid.0 == tid)
+                && crate::kernel::task_enqueue::bind_home_locked(tcbs, tid, cpu).is_ok()
         })
     }
 

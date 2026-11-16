@@ -581,12 +581,18 @@ impl KernelState {
         })
     }
 
-    /// Stage 199A2D2A: assign a task's authoritative HOME/target CPU. INTERNAL placement only — NOT
-    /// a public affinity syscall. Used by the x86_64 SMP cross-CPU request oracle to bind its server
-    /// task to CPU 1 before it blocks in recv-v2, so the accepted NR6 transaction's captured-affinity
-    /// enqueue (`sr_enqueue_committed_receiver_split`) places the woken server on CPU 1's run queue —
-    /// never migrating it to the BSP. `TaskMissing` for an unknown tid.
-    pub(crate) fn set_task_home_cpu(&mut self, tid: u64, cpu: CpuId) -> Result<(), KernelError> {
+    /// SCHED-LOCK2A — hosted-test FIXTURE only: give an UNPLACED task a different home, modelling
+    /// "this task's first placement was on `cpu`". Refused (`WrongObject`) while the task is queued
+    /// or current anywhere, so a fixture can never move a placed task; production has no rehome.
+    #[cfg(test)]
+    pub(crate) fn rehome_unplaced_task_for_test(
+        &mut self,
+        tid: u64,
+        cpu: CpuId,
+    ) -> Result<(), KernelError> {
+        if self.task_present_in_any_runqueue(tid) {
+            return Err(KernelError::WrongObject);
+        }
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
@@ -594,6 +600,27 @@ impl KernelState {
                 .find(|t| t.tid.0 == tid)
                 .ok_or(KernelError::TaskMissing)?;
             tcb.cpu_affinity = Some(cpu);
+            Ok(())
+        })
+    }
+
+    /// Stage 199A2D2A: assign a task's authoritative HOME/target CPU. INTERNAL placement only — NOT
+    /// a public affinity syscall. Used by the x86_64 SMP cross-CPU request oracle to bind its server
+    /// task to CPU 1 before it blocks in recv-v2, so the accepted NR6 transaction's captured-affinity
+    /// enqueue (`sr_enqueue_committed_receiver_split`) places the woken server on CPU 1's run queue —
+    /// never migrating it to the BSP. `TaskMissing` for an unknown tid.
+    ///
+    /// SCHED-LOCK2A: this is an INITIAL assignment, through THE binding
+    /// (`task_enqueue::bind_home_locked`): it records `cpu` for a task with no home, accepts the
+    /// home it already has, and refuses (`WrongObject`, nothing written) a different one — a
+    /// home is never rewritten, so no setup can move a task its first placement already homed.
+    /// Every witness and oracle setup that calls this assigns before the task's first placement.
+    pub(crate) fn set_task_home_cpu(&mut self, tid: u64, cpu: CpuId) -> Result<(), KernelError> {
+        self.with_tcbs_mut(|tcbs| {
+            if !tcbs.iter().flatten().any(|t| t.tid.0 == tid) {
+                return Err(KernelError::TaskMissing);
+            }
+            crate::kernel::task_enqueue::bind_home_locked(tcbs.as_mut_slice(), tid, cpu)?;
             Ok(())
         })
     }
@@ -635,7 +662,9 @@ impl KernelState {
         self.fix_plan_home(&mut plan, current_cpu);
         let mut sched_guard = self.scheduler_state();
         let mut sched = sched_guard.view();
-        let cpu = crate::kernel::task_enqueue::commit_enqueue_locked(&mut sched, &plan)?;
+        let cpu = self.with_tcbs(|tcbs| {
+            crate::kernel::task_enqueue::commit_enqueue_locked(&mut sched, &plan, tcbs.as_slice())
+        })?;
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
         }
@@ -720,7 +749,9 @@ impl KernelState {
         }
         let mut sched_guard = self.scheduler_state();
         let mut sched = sched_guard.view();
-        crate::kernel::task_enqueue::commit_enqueue_locked(&mut sched, &plan)?;
+        self.with_tcbs(|tcbs| {
+            crate::kernel::task_enqueue::commit_enqueue_locked(&mut sched, &plan, tcbs.as_slice())
+        })?;
         if tid == BOOTSTRAP_FIRST_USER_TID && cfg!(not(feature = "hosted-dev")) {
             let queue0 = sched.runnable_count_on(CpuId(0));
             let queue1 = sched.runnable_count_on(CpuId(1));

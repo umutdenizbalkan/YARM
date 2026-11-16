@@ -137,7 +137,8 @@ impl ReplyTimeoutDomains for KernelState {
         let mut guard = self.scheduler_state();
         let mut all = guard.view();
         let mut view = all.cpu(home).ok()?;
-        te::reserve_enqueue_on_cpu_locked(&mut view, &plan).ok()?;
+        self.with_tcbs(|tcbs| te::reserve_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice()))
+            .ok()?;
         Some(plan)
     }
     fn rtd_enqueue_reserved(&mut self, plan: Self::Placement) {
@@ -148,7 +149,9 @@ impl ReplyTimeoutDomains for KernelState {
         let mut guard = self.scheduler_state();
         let mut all = guard.view();
         if let Ok(mut view) = all.cpu(home)
-            && let Err(err) = te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan)
+            && let Err(err) = self.with_tcbs(|tcbs| {
+                te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+            })
         {
             crate::yarm_log!(
                 "IPC_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} err={:?}",
