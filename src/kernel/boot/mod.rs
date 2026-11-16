@@ -7887,6 +7887,17 @@ fn maybe_emit_ipccall_direct_smp_server_blocked(
     );
 }
 
+/// SCHED-LOCK2A — collect an oracle's facts only when the oracle is armed.
+///
+/// `collect` runs (and takes whatever locks its reads need) iff `armed`; otherwise nothing is
+/// read and `None` is returned. When armed, the facts are exactly what `collect` read — the
+/// helper adds and drops nothing — so an armed oracle receives the same authoritative facts it
+/// received before the gate. Always compiled, so the gate itself is testable on the host.
+#[inline]
+pub(crate) fn oracle_gated_facts<T>(armed: bool, collect: impl FnOnce() -> T) -> Option<T> {
+    if armed { Some(collect()) } else { None }
+}
+
 /// U9-RECV-BLOCK1 §2 — the five authoritative facts the SMP blocked-server marker re-verifies,
 /// each read by whichever caller can perform it.
 ///

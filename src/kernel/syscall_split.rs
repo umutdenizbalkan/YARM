@@ -4816,22 +4816,36 @@ fn try_split_blocking_ipc_recv_into_frame(
         // those five as facts is what lets the route publish the evidence instead of yielding the
         // whole receive to produce it. Every condition, its conjunction, the one-shot fuse and
         // the marker text are the body's, unchanged — this side only answers the reads.
+        //
+        // SCHED-LOCK2A: the facts are collected only when the SMP oracle is armed. Disarmed — every
+        // ordinary boot — the route reads nothing for the marker: no rank-2 task read, no IPC
+        // waiter read, and no CPU-by-CPU run-queue scan (up to `MAX_CPUS` 1L acquisitions), which
+        // the body then discarded because its first check is the same predicate. Armed, the body
+        // receives exactly the facts it received before.
         #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-        if let Some((ack_index, ack_generation, ack_seq)) = server_ack {
-            let (saved_frame, home_cpu) = shared.smp_blocked_server_task_facts_split_read(tid);
+        if let Some((ack_index, ack_generation, ack_seq)) = server_ack
+            && let Some(facts) = crate::kernel::boot::oracle_gated_facts(
+                crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled(),
+                || {
+                    let (saved_frame, home_cpu) =
+                        shared.smp_blocked_server_task_facts_split_read(tid);
+                    crate::kernel::boot::SmpServerBlockedFacts {
+                        saved_frame,
+                        present_in_any_runqueue: shared
+                            .receiver_has_scheduler_membership_split_read(tid),
+                        home_cpu,
+                        asid,
+                        waiter: live_waiter(ack_index),
+                    }
+                },
+            )
+        {
             crate::kernel::boot::emit_ipccall_direct_smp_server_blocked_with(
                 tid,
                 ack_index,
                 ack_generation,
                 ack_seq,
-                crate::kernel::boot::SmpServerBlockedFacts {
-                    saved_frame,
-                    present_in_any_runqueue: shared
-                        .receiver_has_scheduler_membership_split_read(tid),
-                    home_cpu,
-                    asid,
-                    waiter: live_waiter(ack_index),
-                },
+                facts,
             );
         }
         let _ = server_ack;
