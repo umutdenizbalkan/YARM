@@ -3853,7 +3853,7 @@ pub(super) mod sched_time_witness {
     /// blocked task cannot be woken onto a full queue. A deadline fixed before saturation cannot be
     /// aligned with the hold: scheduler ticks slow down in wall time under a saturated TCG guest.
     /// About this long in wall time, by the calibrated tick (at least 3 ticks).
-    const R_TARGET_NS: u64 = 2_000 * MS;
+    const R_TARGET_NS: u64 = 4_000 * MS;
     /// H's hold covers R's deadline with this factor on the calibrated tick (slowdown margin).
     const R_TICK_SLACK: u64 = 4;
     /// Fillers use stacks `0..FILLER_LIMIT`; the case-10 spinners use the last two.
@@ -4517,13 +4517,10 @@ pub(super) mod sched_time_witness {
     }
 
     pub(super) extern "C" fn filler_body() -> ! {
-        let mut k = 0u32;
         while RELEASE.load(SeqCst) == 0 {
-            // Every 16th turn (a clock read per turn would double the storm's syscalls).
-            k = k.wrapping_add(1);
-            if k % 16 == 0 {
-                maybe_topup();
-            }
+            // Every turn: under RISC-V TCG saturation a yield takes ~20 ms, so the whole cell
+            // gets only ~50 turns a second; a sparser check missed R's window.
+            maybe_topup();
             let _ = yield_now();
         }
         PARKED.fetch_add(1, SeqCst);
