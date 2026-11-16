@@ -3573,6 +3573,866 @@ pub(super) mod futex_time_witness {
     /// W's timeout has won. Saturation of W's home queue is proved by the kernel (`SATW_REFUSED
     /// class=futex`), never by these counts.
     fn helper_saturate() {
+        let mut at_one = !requeue_until_moved(&E1, &E2);
+        if at_one {
+            fail("E_register");
+        }
+        let entry = FILLER_ENTRY.load(SeqCst);
+        let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
+        let mut spawned = 0usize;
+        let mut refused = 0u32;
+        let spawn_until_refused = |spawned: &mut usize, refused: &mut u32| {
+            while *spawned < FILLERS {
+                let i = *spawned;
+                let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
+                // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+                let r = unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) };
+                // On AArch64 and RISC-V the runtime's NR 11 decode reads any non-zero `a0` as a
+                // TID, so a refusal (a small error code) arrives as `Ok(code)`. Every dynamic TID
+                // is >= 10 000; the kernel's SPAWN_THREAD_SPLIT_OK/FAIL markers are the record.
+                match r {
+                    Ok(t) if t >= 10_000 => *spawned += 1,
+                    _ => {
+                        *refused += 1;
+                        return;
+                    }
+                }
+            }
+        };
+        spawn_until_refused(&mut spawned, &mut refused);
+        yarm_user_rt::user_log!(
+            "FTW_E_SATURATED fillers={} spawn_refused={}",
+            spawned,
+            refused
+        );
+        // Ping: move W between E1 and E2 while it is still parked on a user word. The first
+        // ping that moves nobody is W's timeout having won (no wake was issued), under saturation.
+        let mut pings = 0u32;
+        let mut gone = false;
+        let mut topups = 0u32;
+        let mut last_top = mono();
+        while pings < BOUND {
+            let (from, to) = if at_one { (&E1, &E2) } else { (&E2, &E1) };
+            match futex_cmp_requeue(from.as_ptr(), P, to.as_ptr(), P, 0xE1, 0, 1) {
+                Ok(o) if o.requeued == 1 => at_one = !at_one,
+                Ok(_) => {
+                    gone = true;
+                    break;
+                }
+                Err(_) => fail("E_ping"),
+            }
+            pings += 1;
+            if mono().saturating_sub(last_top) >= TOPUP_EVERY_NS {
+                spawn_until_refused(&mut spawned, &mut refused);
+                topups += 1;
+                last_top = mono();
+            }
+            let _ = yield_now();
+        }
+        let w1 = futex_wake(E1.as_ptr(), 1, P).unwrap_or(u32::MAX);
+        let w2 = futex_wake(E2.as_ptr(), 1, P).unwrap_or(u32::MAX);
+        yarm_user_rt::user_log!(
+            "FTW_E_EXPIRED_SEEN gone={} pings={} wake1={} wake2={}",
+            u32::from(gone),
+            pings,
+            w1,
+            w2
+        );
+        yarm_user_rt::user_log!(
+            "FTW_E_HOLD_END fillers={} topups={} spawn_refused={}",
+            spawned,
+            topups,
+            refused
+        );
+        if !gone || pings == 0 || w1 != 0 || w2 != 0 || refused == 0 {
+            fail("E_saturation");
+        }
+        RELEASE.store(1, SeqCst);
+        ack();
+    }
+
+    pub(super) extern "C" fn helper_body() -> ! {
+        let mut seen = 0;
+        loop {
+            let c = CMD.load(SeqCst);
+            if c == seen {
+                let _ = futex_wait(CMD.as_ptr(), c, P);
+                continue;
+            }
+            seen = c;
+            let phase = PHASE.load(SeqCst);
+            if phase == PH_END {
+                park();
+            }
+            helper_phase(phase);
+        }
+    }
+
+    pub(super) extern "C" fn signaller_body() -> ! {
+        let mut seen = 0;
+        loop {
+            let c = CMD.load(SeqCst);
+            if c == seen {
+                let _ = futex_wait(CMD.as_ptr(), c, P);
+                continue;
+            }
+            seen = c;
+            match PHASE.load(SeqCst) {
+                PH_G => g_signal("S2"),
+                PH_END => park(),
+                _ => {}
+            }
+        }
+    }
+
+    pub(super) extern "C" fn filler_body() -> ! {
+        while RELEASE.load(SeqCst) == 0 {
+            let _ = yield_now();
+        }
+        park()
+    }
+
+    pub(super) struct Child {
+        pub(super) entry: usize,
+        pub(super) stack_top: usize,
+        pub(super) tls_base: usize,
+    }
+
+    pub(super) fn run_once(s_tid: u64, children: &[Child; THREADS]) {
+        yarm_user_rt::user_log!(
+            "FTW_BEGIN s_tid={} g_cycles={} fillers_max={}",
+            s_tid,
+            G_CYCLES,
+            FILLERS
+        );
+        let mut tids = [0u64; THREADS];
+        // The helpers first, so they are parked on CMD before W's first wait.
+        for i in [1, 2, 0] {
+            let c = &children[i];
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+            tids[i] =
+                unsafe { yarm_user_rt::syscall::spawn_thread(c.tls_base, c.stack_top, c.entry) }
+                    .unwrap_or(0);
+        }
+        yarm_user_rt::user_log!(
+            "FTW_THREADS waiter={} helper={} signaller={}",
+            tids[0],
+            tids[1],
+            tids[2]
+        );
+        // Block (not poll) until W is done: init is no running sibling during the sequences.
+        let mut waits = 0;
+        while DONE.load(SeqCst) == 0 && waits < BOUND {
+            let _ = futex_wait(DONE.as_ptr(), 0, P);
+            waits += 1;
+        }
+        let fails = FAILS.load(SeqCst);
+        let ok = tids.iter().all(|&t| t != 0) && DONE.load(SeqCst) == 1 && fails == 0;
+        yarm_user_rt::user_log!(
+            "FTW_DONE waiter={} calls={} fails={} result={}",
+            tids[0],
+            CALLS.load(SeqCst),
+            fails,
+            if ok { "ok" } else { "fail" }
+        );
+    }
+}
+
+/// x86_64 entry trampolines for the timed-wait witness (as for the wait witness's).
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness",
+    target_arch = "x86_64"
+))]
+mod x86_futex_time {
+    #[unsafe(naked)]
+    pub(super) extern "C" fn waiter_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_time_witness::waiter_body)
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn helper_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_time_witness::helper_body)
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn signaller_entry() -> ! {
+        core::arch::naked_asm!(
+            "call {body}",
+            "ud2",
+            body = sym super::futex_time_witness::signaller_body
+        )
+    }
+    #[unsafe(naked)]
+    pub(super) extern "C" fn filler_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_time_witness::filler_body)
+    }
+}
+
+/// FUTEX-TIME1 — resolve this architecture's entries and stacks, and run the timed-wait witness.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness"
+))]
+fn run_futex_time_witness(s_tid: u64) {
+    use core::sync::atomic::Ordering::SeqCst;
+    use futex_time_witness as w;
+    #[cfg(target_arch = "x86_64")]
+    let (entries, filler) = (
+        [
+            x86_futex_time::waiter_entry as *const () as usize,
+            x86_futex_time::helper_entry as *const () as usize,
+            x86_futex_time::signaller_entry as *const () as usize,
+        ],
+        x86_futex_time::filler_entry as *const () as usize,
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let (entries, filler) = (
+        [
+            w::waiter_body as *const () as usize,
+            w::helper_body as *const () as usize,
+            w::signaller_body as *const () as usize,
+        ],
+        w::filler_body as *const () as usize,
+    );
+    w::FILLER_ENTRY.store(filler, SeqCst);
+    let stacks = core::ptr::addr_of_mut!(w::STACKS) as usize;
+    let tls = core::ptr::addr_of_mut!(w::TLS) as usize;
+    let children: [w::Child; w::THREADS] = core::array::from_fn(|i| w::Child {
+        entry: entries[i],
+        stack_top: (stacks + (i + 1) * w::STACK_BYTES) & !0xF,
+        tls_base: tls + i * 256,
+    });
+    w::run_once(s_tid, &children);
+}
+
+/// SCHED-TIME-FOUNDATION1 C — the live sleep / clock / rotation witness, selector 18 when init is
+/// built with `sched-time-witness` (it takes precedence over every other selector-18 cell). The
+/// kernel half is `kernel::sleep_witness` (markers, the exit fixture, the kernel-thread fixture);
+/// `scripts/grade-sched-time-witness.py` holds the rules. Threads of init:
+///
+/// | thread | role |
+/// |---|---|
+/// | W | the driver: issues every graded sleep and reports what ring 3 saw |
+/// | H | the helper: the concurrent sleep of case 5, the saturation of case 8, the release |
+/// | X | case 6's victim: one sleep the kernel fixture ends with the task |
+/// | R | case 8's timed IPC receive: due while its home queue is held full (SCHED-SAT-EVIDENCE1) |
+/// | F* | case 8's fillers: runnable threads that yield until released, then park |
+///
+/// Every sleep is bracketed by `CLOCK_MONOTONIC` reads in ring 3: `t0` before the call, `t1` after
+/// it returns. The deadline the kernel fixes is at least `t0 + req` (relative) or `req` (absolute),
+/// so a return with `t1` below that bound is a sleep that ended early, and the grader fails it.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "sched-time-witness"
+))]
+pub(super) mod sched_time_witness {
+    use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::SeqCst};
+    use yarm_user_rt::syscall::{
+        CLOCK_MONOTONIC, CLOCK_REALTIME, FutexScope, SyscallError, TIMER_ABSTIME, Timespec,
+        clock_gettime, clock_nanosleep, clock_set_realtime, futex_wait, futex_wake, yield_now,
+    };
+
+    const P: FutexScope = FutexScope::Private;
+    const MS: u64 = 1_000_000;
+    pub(super) const STACK_BYTES: usize = 16384;
+    pub(super) const FILLER_STACK_BYTES: usize = 2048;
+    /// Two full user queues (64 each), the top-up and slack: spawning stops at a refusal.
+    pub(super) const FILLERS: usize = 176;
+    /// W, H, X, R.
+    pub(super) const THREADS: usize = 4;
+    const BOUND: u32 = 4_000_000;
+    /// SCHED-SAT-EVIDENCE1 — R's calibration receive, in scheduler ticks (unsaturated; nobody
+    /// sends): its elapsed time bounds this port's tick, so R's graded deadline and H's hold
+    /// follow the port's real tick rather than an assumed one.
+    const CAL_TICKS: u64 = 4;
+    /// R's graded receive, in ticks: short, entered only once H reports every queue full. R stays
+    /// RUNNABLE until then (it yield-polls `SAT_READY` in the rotation, as H does), because a
+    /// blocked task cannot be woken onto a full queue. A deadline fixed before saturation cannot be
+    /// aligned with the hold: scheduler ticks slow down in wall time under a saturated TCG guest.
+    /// About this long in wall time, by the calibrated tick (at least 3 ticks). Long enough that
+    /// the slots W's and R's waits open are refilled before either falls due (SCHED-SAT-HANDOFF1).
+    const R_TARGET_NS: u64 = 10_000 * MS;
+    /// H's hold covers R's deadline with this factor on the calibrated tick (slowdown margin).
+    const R_TICK_SLACK: u64 = 4;
+    /// Fillers use stacks `0..SPAWN_LIMIT`, the spares `SPAWN_LIMIT..FILLER_LIMIT`; the case-10
+    /// spinners use the last two.
+    const FILLER_LIMIT: usize = FILLERS - 2;
+    /// SCHED-SAT-HANDOFF1 — spare fillers, spawned while the queues are still empty and parked
+    /// each on its own futex word. A balanced spawn cannot choose its CPU (the load mirrors count
+    /// user threads, admission counts every queue entry, so a full CPU can look lighter), which is
+    /// why a spawn top-up could leave one slot of a waiter's home queue open (W3b: 63 of 64 at R's
+    /// deadline, every top-up refused). A futex wake places its waiter on the waiter's HOME CPU
+    /// and is refused, leaving it parked, when that home is full (FUTEX-WAKE-CAP1): waking every
+    /// spare in turn fills exactly the homes that have room.
+    const SPARES: usize = 24;
+    const SPAWN_LIMIT: usize = FILLER_LIMIT - SPARES;
+    /// The spare pass's period once a pass placed nothing (it is a syscall per spare).
+    const SPARE_IDLE_EVERY_NS: u64 = 1_000 * MS;
+    /// The handoff line is logged once both waiters armed this long ago (their park completes).
+    const HANDOFF_SETTLE_NS: u64 = 500 * MS;
+    /// The one spawn pool (SCHED-SAT-EVIDENCE1): H and the fillers both spawn fillers, one at a
+    /// time under `SPAWN_LOCK`; `NEXT_FILLER` counts the fillers spawned (the next free stack).
+    static SPAWN_LOCK: AtomicU32 = AtomicU32::new(0);
+    static NEXT_FILLER: AtomicUsize = AtomicUsize::new(0);
+    static SPAWN_REFUSALS: AtomicU32 = AtomicU32::new(0);
+    /// While H holds: any runnable cell thread (in practice a filler — they run every quantum on
+    /// every CPU, H only once per rotation) runs a top-up round every `TOPUP_EVERY_NS`.
+    static TOPUP_ON: AtomicU32 = AtomicU32::new(0);
+    static LAST_TOP: AtomicU64 = AtomicU64::new(0);
+    static TOPUPS: AtomicU32 = AtomicU32::new(0);
+    /// The hold ends at this monotonic time (0 until H publishes it). Whichever cell thread passes
+    /// it first ends the top-ups and releases: H itself may get the CPU only every tens of seconds
+    /// under RISC-V saturation, so the release must not wait for H's turn.
+    static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
+    /// The monotonic time the hold was released (by whichever thread released it).
+    static RELEASED_AT: AtomicU64 = AtomicU64::new(0);
+    /// The queues are re-topped-up this often while H holds them full.
+    const TOPUP_EVERY_NS: u64 = 250 * MS;
+    /// H holds this long past the later of W's and R's deadlines.
+    const HOLD_MARGIN_NS: u64 = 2_000 * MS;
+    /// The hold's bound past W's deadline: R never published its deadline (fails closed).
+    const HOLD_CAP_NS: u64 = 60_000 * MS;
+    /// Case 6: longer than `sleep_witness::KILL_THRESHOLD_NS` (one hour).
+    const KILL_SLEEP_NS: u64 = 7_200_000_000_000;
+    /// Case 8 (SCHED-SAT-HANDOFF1): W's sleep is armed only once H has VERIFIED saturation, and
+    /// falls due this long after W saw it. A deadline fixed before saturation cannot be aligned:
+    /// saturating took 56 s to 175 s on one RISC-V TCG image, and a fixed 120 s deadline passed
+    /// first twice (W3, W3b). The span covers the handoff — W's and R's slots refilled by the
+    /// spare pass — with margin.
+    const W_SLEEP_NS: u64 = 10_000 * MS;
+
+    #[repr(C, align(16))]
+    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; THREADS]);
+    #[allow(unused)]
+    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; THREADS]);
+    #[allow(unused)]
+    pub(super) static mut TLS: [[u8; 256]; THREADS] = [[0; 256]; THREADS];
+    #[repr(C, align(16))]
+    pub(super) struct FillerStacks(pub(super) [[u8; FILLER_STACK_BYTES]; FILLERS]);
+    #[allow(unused)]
+    pub(super) static mut FILLER_STACKS: FillerStacks =
+        FillerStacks([[0; FILLER_STACK_BYTES]; FILLERS]);
+    #[allow(unused)]
+    pub(super) static mut FILLER_TLS: [[u8; 64]; FILLERS] = [[0; 64]; FILLERS];
+    pub(super) static FILLER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+
+    static CMD: AtomicU32 = AtomicU32::new(0);
+    static PHASE: AtomicU32 = AtomicU32::new(0);
+    static ACK: AtomicU32 = AtomicU32::new(0);
+    static RELEASE: AtomicU32 = AtomicU32::new(0);
+    static PARKED: AtomicU32 = AtomicU32::new(0);
+    /// Case 10's spinner entry (per architecture).
+    pub(super) static SPINNER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+    /// Case 10: two spinners, on the last two filler stacks (case 8 never reaches them).
+    const SPINNERS: usize = 2;
+    static SPIN_STOP: AtomicU32 = AtomicU32::new(0);
+    static SPINNING: AtomicU32 = AtomicU32::new(0);
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    static PARK: AtomicU32 = AtomicU32::new(0);
+    static FAILS: AtomicU32 = AtomicU32::new(0);
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    static X_RETURNED: AtomicU32 = AtomicU32::new(0);
+    /// Case 8: W's absolute sleep deadline (0 until W arms it, after saturation).
+    static Q_DEADLINE: AtomicU64 = AtomicU64::new(0);
+    /// When W and R armed their waits (0 until then).
+    static W_ARM_AT: AtomicU64 = AtomicU64::new(0);
+    static R_ARM_AT: AtomicU64 = AtomicU64::new(0);
+    static HANDOFF_LOGGED: AtomicU32 = AtomicU32::new(0);
+    /// Spares: set while H spawns them (a filler starting then is a spare), the next spare index,
+    /// how many reached their park, per spare its word (1 = go) and state (0 parked, 1 placed,
+    /// 2 a wake in flight), and how many were placed.
+    static SPARE_MODE: AtomicU32 = AtomicU32::new(0);
+    static SPARE_NEXT: AtomicUsize = AtomicUsize::new(0);
+    static SPARES_PARKING: AtomicU32 = AtomicU32::new(0);
+    static SPARE_GO: [AtomicU32; SPARES] = [const { AtomicU32::new(0) }; SPARES];
+    static SPARE_STATE: [AtomicU32; SPARES] = [const { AtomicU32::new(0) }; SPARES];
+    static SPARES_PLACED: AtomicU32 = AtomicU32::new(0);
+    static LAST_SPARE_PASS: AtomicU64 = AtomicU64::new(0);
+    static SPARE_PASS_IDLE: AtomicU32 = AtomicU32::new(0);
+    /// SCHED-SAT-EVIDENCE1 — the endpoint R receives on (init's PM reply receive endpoint, idle
+    /// while the witness runs: nobody sends to it, so every receive ends by its deadline).
+    pub(super) static R_EP: AtomicU32 = AtomicU32::new(0);
+    /// R's calibrated tick estimate (ns).
+    static R_TICK_NS: AtomicU64 = AtomicU64::new(0);
+    /// H: every queue is full and W has left its CPU — R may enter its graded receive.
+    static SAT_READY: AtomicU32 = AtomicU32::new(0);
+    /// R: the earliest monotonic time its graded receive can be due (0 until published).
+    static R_DEADLINE: AtomicU64 = AtomicU64::new(0);
+    /// R: a monotonic time by which its graded receive is surely due (0 until published).
+    static R_DUE_BY: AtomicU64 = AtomicU64::new(0);
+    /// R: its graded receive returned.
+    static R_DONE: AtomicU32 = AtomicU32::new(0);
+
+    const PH_TWO: u32 = 2;
+    const PH_KILL: u32 = 3;
+    const PH_SAT: u32 = 4;
+    const PH_CAL: u32 = 5;
+    const PH_END: u32 = 9;
+
+    fn park() -> ! {
+        loop {
+            let v = PARK.load(SeqCst);
+            let _ = futex_wait(PARK.as_ptr(), v, P);
+        }
+    }
+    fn fail(what: &str) {
+        FAILS.fetch_add(1, SeqCst);
+        yarm_user_rt::user_log!("STW_FAIL what={}", what);
+    }
+    fn mono() -> u64 {
+        clock_gettime(CLOCK_MONOTONIC)
+            .ok()
+            .and_then(|t| t.as_ns())
+            .unwrap_or(0)
+    }
+    fn now_on(clock: usize) -> u64 {
+        clock_gettime(clock)
+            .ok()
+            .and_then(|t| t.as_ns())
+            .unwrap_or(0)
+    }
+    fn code(r: Result<(), SyscallError>) -> u32 {
+        match r {
+            Ok(()) => 0,
+            Err(e) => e as u32,
+        }
+    }
+
+    /// One graded sleep. `req` is a duration (relative) or a time on `clock` (absolute). Logs the
+    /// call, then the return with both bracket reads on `clock` and the lower bound the kernel
+    /// must have honoured.
+    fn sl(case: &str, clock: usize, flags: usize, req: u64) -> bool {
+        let n = CALLS.fetch_add(1, SeqCst) + 1;
+        let t0 = now_on(clock);
+        let bound = if flags & TIMER_ABSTIME != 0 {
+            req
+        } else {
+            t0.saturating_add(req)
+        };
+        yarm_user_rt::user_log!(
+            "STW_CALL case={} n={} clock={} flags={} req={} t0={} bound={}",
+            case,
+            n,
+            clock,
+            flags,
+            req,
+            t0,
+            bound
+        );
+        let r = clock_nanosleep(clock, flags, &Timespec::from_ns(req), None);
+        let t1 = now_on(clock);
+        yarm_user_rt::user_log!(
+            "STW_RET case={} n={} code={} t0={} t1={} bound={} late_ns={}",
+            case,
+            n,
+            code(r),
+            t0,
+            t1,
+            bound,
+            t1.saturating_sub(bound)
+        );
+        let ok = r.is_ok() && t1 >= bound;
+        if !ok {
+            fail(case);
+        }
+        ok
+    }
+
+    fn expect_err(case: &str, clock: usize, flags: usize, ts: Timespec, want: SyscallError) {
+        let r = clock_nanosleep(clock, flags, &ts, None);
+        yarm_user_rt::user_log!(
+            "STW_ERR case={} code={} want={}",
+            case,
+            code(r),
+            want as u32
+        );
+        if r != Err(want) {
+            fail(case);
+        }
+    }
+
+    fn command(phase: u32) {
+        PHASE.store(phase, SeqCst);
+        ACK.store(0, SeqCst);
+        CMD.fetch_add(1, SeqCst);
+        let _ = futex_wake(CMD.as_ptr(), 8, P);
+    }
+    fn await_ack() {
+        let mut n = 0;
+        while ACK.load(SeqCst) == 0 && n < BOUND {
+            let _ = futex_wait(ACK.as_ptr(), 0, P);
+            n += 1;
+        }
+    }
+    fn ack() {
+        ACK.store(1, SeqCst);
+        let _ = futex_wake(ACK.as_ptr(), 1, P);
+    }
+
+    pub(super) extern "C" fn waiter_body() -> ! {
+        // S0 / case 12 — the clocks and the error lanes, before realtime exists.
+        let rt_before = clock_gettime(CLOCK_REALTIME);
+        yarm_user_rt::user_log!(
+            "STW_CLOCK rt_before={}",
+            match rt_before {
+                Ok(_) => 0,
+                Err(e) => e as u32,
+            }
+        );
+        if rt_before != Err(SyscallError::Unavailable) {
+            fail("rt_before");
+        }
+        let one_ms = Timespec::from_ns(MS);
+        expect_err(
+            "rt_uninit_rel",
+            CLOCK_REALTIME,
+            0,
+            one_ms,
+            SyscallError::Unavailable,
+        );
+        expect_err(
+            "rt_uninit_abs",
+            CLOCK_REALTIME,
+            TIMER_ABSTIME,
+            one_ms,
+            SyscallError::Unavailable,
+        );
+        expect_err("bad_clock", 7, 0, one_ms, SyscallError::InvalidArgs);
+        expect_err(
+            "bad_flags",
+            CLOCK_MONOTONIC,
+            2,
+            one_ms,
+            SyscallError::InvalidArgs,
+        );
+        expect_err(
+            "bad_nsec",
+            CLOCK_MONOTONIC,
+            0,
+            Timespec {
+                sec: 0,
+                nsec: 1_000_000_000,
+            },
+            SyscallError::InvalidArgs,
+        );
+        let (m0, m1) = (mono(), mono());
+        yarm_user_rt::user_log!("STW_MONO m0={} m1={}", m0, m1);
+        if m0 == 0 || m1 < m0 {
+            fail("mono");
+        }
+        // Case 1 — zero; case 2 — short; case 3 — longer; case 4 — absolute monotonic (and a
+        // past absolute deadline).
+        sl("zero", CLOCK_MONOTONIC, 0, 0);
+        for _ in 0..3 {
+            sl("short", CLOCK_MONOTONIC, 0, MS);
+        }
+        sl("long", CLOCK_MONOTONIC, 0, 300 * MS);
+        // 300 ms: a 50 ms absolute deadline could already be due when the kernel registered it
+        // on a loaded host (a legal immediate return, which registers nothing).
+        sl("abs", CLOCK_MONOTONIC, TIMER_ABSTIME, mono() + 300 * MS);
+        sl(
+            "abs_past",
+            CLOCK_MONOTONIC,
+            TIMER_ABSTIME,
+            mono().saturating_sub(MS),
+        );
+        // Case 9 — H, X and init are blocked: only the kernel's clock ends these.
+        for _ in 0..3 {
+            sl("idle", CLOCK_MONOTONIC, 0, 100 * MS);
+        }
+        // Case 7 — back-to-back cycles: each a new generation, each completed exactly once. 20 ms
+        // so every one genuinely registers on the slowest port (a 1 ms request can be due before
+        // the kernel registers it, which is a legal immediate return).
+        for _ in 0..16 {
+            sl("cycle", CLOCK_MONOTONIC, 0, 20 * MS);
+        }
+        // Case 10 — cross-CPU placement: two spinners (balanced placement spreads them) keep
+        // trapping (every trap tail runs the collector) while W sleeps, so collectors on more
+        // than one CPU meet W's due cycles; the kernel's DONE markers record which CPU placed it.
+        let entry = SPINNER_ENTRY.load(SeqCst);
+        let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
+        for k in 0..SPINNERS {
+            let i = FILLERS - 1 - k;
+            let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+            let t = unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) };
+            yarm_user_rt::user_log!("STW_SPINNER tid={}", t.unwrap_or(0));
+        }
+        let mut n = 0u32;
+        while (SPINNING.load(SeqCst) as usize) < SPINNERS && n < BOUND {
+            let _ = yield_now();
+            n += 1;
+        }
+        for _ in 0..8 {
+            sl("cross", CLOCK_MONOTONIC, 0, 30 * MS);
+        }
+        SPIN_STOP.store(1, SeqCst);
+        // Case 5 — two tasks, different deadlines (H's ends first).
+        command(PH_TWO);
+        sl("two_w", CLOCK_MONOTONIC, 0, 1800 * MS);
+        await_ack();
+        // Case 6 — X sleeps two hours; the kernel fixture ends X; W checks it never returns.
+        command(PH_KILL);
+        sl("kill_wait", CLOCK_MONOTONIC, 0, 500 * MS);
+        let xr = X_RETURNED.load(SeqCst);
+        yarm_user_rt::user_log!("STW_KILL_CHECK x_returned={}", xr);
+        if xr != 0 {
+            fail("kill");
+        }
+        // Realtime: initialize it (init is the control plane), then sleep on it.
+        let set = clock_set_realtime(Timespec {
+            sec: 1_700_000_000,
+            nsec: 0,
+        });
+        yarm_user_rt::user_log!("STW_RT_SET code={}", code(set));
+        if set.is_ok() {
+            // 100 / 300 ms: long enough that the kernel never finds them due at registration on
+            // a loaded host (as for case 4).
+            sl("rt_rel", CLOCK_REALTIME, 0, 100 * MS);
+            sl(
+                "rt_abs",
+                CLOCK_REALTIME,
+                TIMER_ABSTIME,
+                now_on(CLOCK_REALTIME) + 300 * MS,
+            );
+        } else {
+            fail("rt_set");
+        }
+        // Case 8 — first R calibrates its tick (unsaturated); then the home queues are held full
+        // through W's sleep deadline AND R's receive deadline; then every filler gets the CPU.
+        command(PH_CAL);
+        await_ack();
+        // SCHED-SAT-HANDOFF1: W stays runnable (yield-polling in the rotation, as R does) until H
+        // has verified saturation, then arms its sleep with a deadline derived from that moment.
+        command(PH_SAT);
+        let mut nw = 0u32;
+        while SAT_READY.load(SeqCst) == 0 && nw < BOUND {
+            let _ = yield_now();
+            nw += 1;
+        }
+        if SAT_READY.load(SeqCst) == 0 {
+            fail("w_not_saturated");
+        }
+        let deadline = mono() + W_SLEEP_NS;
+        Q_DEADLINE.store(deadline, SeqCst);
+        W_ARM_AT.store(mono(), SeqCst);
+        sl("full", CLOCK_MONOTONIC, TIMER_ABSTIME, deadline);
+        await_ack();
+        command(PH_END);
+        yarm_user_rt::user_log!(
+            "STW_WAITER_DONE calls={} fails={}",
+            CALLS.load(SeqCst),
+            FAILS.load(SeqCst)
+        );
+        DONE.store(1, SeqCst);
+        let _ = futex_wake(DONE.as_ptr(), 1, P);
+        park()
+    }
+
+    /// Case 8 for H: saturate (spawn until refused), top up after W has left its CPU, hold the
+    /// queues full past W's deadline, release, and wait until every filler has run again.
+    /// One top-up round, if the pool is free (`wait` = take it even if busy): spawn fillers until
+    /// two consecutive refusals — the balanced placement's starting CPU rotates, so a refusal on
+    /// one CPU is retried on the next — or the stacks run out.
+    fn spawn_round(wait: bool) -> u32 {
+        while SPAWN_LOCK.swap(1, SeqCst) != 0 {
+            if !wait {
+                return 0;
+            }
+            let _ = yield_now();
+        }
+        let entry = FILLER_ENTRY.load(SeqCst);
+        let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
+        // A round that was waiting for the pool when the hold ended spawns nothing.
+        if !wait && TOPUP_ON.load(SeqCst) == 0 {
+            SPAWN_LOCK.store(0, SeqCst);
+            return 0;
+        }
+        let (mut made, mut refused_in_row) = (0u32, 0u32);
+        while refused_in_row < 2 {
+            let i = NEXT_FILLER.load(SeqCst);
+            if i >= SPAWN_LIMIT {
+                break;
+            }
+            let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread, and the stack
+            // index is claimed under SPAWN_LOCK.
+            match unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) } {
+                Ok(t) if t >= 10_000 => {
+                    NEXT_FILLER.store(i + 1, SeqCst);
+                    made += 1;
+                    refused_in_row = 0;
+                }
+                _ => {
+                    SPAWN_REFUSALS.fetch_add(1, SeqCst);
+                    refused_in_row += 1;
+                }
+            }
+        }
+        SPAWN_LOCK.store(0, SeqCst);
+        made
+    }
+
+    /// End the hold once: stop the top-ups with the pool held (no round in flight), then release.
+    fn end_hold() {
+        while SPAWN_LOCK.swap(1, SeqCst) != 0 {
+            let _ = yield_now();
+        }
+        if TOPUP_ON.swap(0, SeqCst) != 0 {
+            let at = mono();
+            RELEASED_AT.store(at, SeqCst);
+            // Logged BEFORE the release: whatever the log shows after it may postdate the hold.
+            yarm_user_rt::user_log!(
+                "STW_HOLD_RELEASED at={} until={}",
+                at,
+                HOLD_UNTIL.load(SeqCst)
+            );
+            RELEASE.store(1, SeqCst);
+        }
+        SPAWN_LOCK.store(0, SeqCst);
+    }
+
+    /// The hold's periodic top-up, run by whichever cell thread gets here first after the period;
+    /// also the hold's end, once `HOLD_UNTIL` has passed.
+    fn maybe_topup() {
+        if TOPUP_ON.load(SeqCst) == 0 {
+            return;
+        }
+        let now = mono();
+        let mut until = HOLD_UNTIL.load(SeqCst);
+        if until == 0 {
+            // Both waits armed: hold past the later of W's deadline and R's due-by time.
+            let (wd, rd) = (Q_DEADLINE.load(SeqCst), R_DUE_BY.load(SeqCst));
+            if wd != 0 && rd != 0 {
+                let u = wd.max(rd) + HOLD_MARGIN_NS;
+                let _ = HOLD_UNTIL.compare_exchange(0, u, SeqCst, SeqCst);
+                until = HOLD_UNTIL.load(SeqCst);
+            }
+        }
+        if until != 0 && now >= until {
+            end_hold();
+            return;
+        }
+        maybe_spare_pass(now);
+        let last = LAST_TOP.load(SeqCst);
+        if now.saturating_sub(last) < TOPUP_EVERY_NS
+            || LAST_TOP
+                .compare_exchange(last, now, SeqCst, SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        spawn_round(false);
+        TOPUPS.fetch_add(1, SeqCst);
+    }
+
+    /// SCHED-SAT-HANDOFF1 — one pass over the parked spares: wake each in turn; a wake places the
+    /// spare on its home CPU (filling a slot there) or is refused because that home is full (the
+    /// spare stays parked). Returns how many were placed.
+    fn spare_pass() -> u32 {
+        let mut placed = 0;
+        for k in 0..SPARES {
+            if SPARE_STATE[k]
+                .compare_exchange(0, 2, SeqCst, SeqCst)
+                .is_err()
+            {
+                continue;
+            }
+            SPARE_GO[k].store(1, SeqCst);
+            match futex_wake(SPARE_GO[k].as_ptr(), 1, P) {
+                Ok(n) if n >= 1 => {
+                    SPARE_STATE[k].store(1, SeqCst);
+                    SPARES_PLACED.fetch_add(1, SeqCst);
+                    placed += 1;
+                }
+                _ => SPARE_STATE[k].store(0, SeqCst),
+            }
+        }
+        placed
+    }
+
+    /// The hold's spare pass, at most every `TOPUP_EVERY_NS` (every `SPARE_IDLE_EVERY_NS` after a
+    /// pass that placed nothing), and the handoff line once both waiters have armed.
+    fn maybe_spare_pass(now: u64) {
+        let last = LAST_SPARE_PASS.load(SeqCst);
+        let every = if SPARE_PASS_IDLE.load(SeqCst) != 0 {
+            SPARE_IDLE_EVERY_NS
+        } else {
+            TOPUP_EVERY_NS
+        };
+        let (wa, ra) = (W_ARM_AT.load(SeqCst), R_ARM_AT.load(SeqCst));
+        let armed = wa != 0 && ra != 0;
+        // Right after both waiters armed, pass at once: their own slots have just opened.
+        let fresh = armed && last < wa.max(ra);
+        if (!fresh && now.saturating_sub(last) < every)
+            || LAST_SPARE_PASS
+                .compare_exchange(last, now, SeqCst, SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        let placed = spare_pass();
+        SPARE_PASS_IDLE.store(u32::from(placed == 0), SeqCst);
+        if armed && now >= wa.max(ra) + HANDOFF_SETTLE_NS && HANDOFF_LOGGED.swap(1, SeqCst) == 0 {
+            let (wd, re) = (Q_DEADLINE.load(SeqCst), R_DEADLINE.load(SeqCst));
+            let at = mono();
+            yarm_user_rt::user_log!(
+                "STW_HANDOFF at={} w_deadline={} r_earliest={} spares_placed={} early={}",
+                at,
+                wd,
+                re,
+                SPARES_PLACED.load(SeqCst),
+                u32::from(at < wd.min(re))
+            );
+        }
+    }
+
+    /// Spawn the spares while the queues are still empty, and wait (bounded) for each to park.
+    fn spawn_spares() {
+        let entry = FILLER_ENTRY.load(SeqCst);
+        let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
+        SPARE_MODE.store(1, SeqCst);
+        let mut spawned = 0u32;
+        for k in 0..SPARES {
+            let i = SPAWN_LIMIT + k;
+            let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+            if let Ok(t) = unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) }
+                && t >= 10_000
+            {
+                spawned += 1;
+            }
+        }
+        let mut n = 0u32;
+        while SPARES_PARKING.load(SeqCst) < spawned && n < BOUND {
+            let _ = yield_now();
+            n += 1;
+        }
+        // Let the last of them complete its park before anything can be woken.
+        for _ in 0..4 {
+            let _ = yield_now();
+        }
+        SPARE_MODE.store(0, SeqCst);
+        yarm_user_rt::user_log!(
+            "STW_SPARES spawned={} parking={}",
+            spawned,
+            SPARES_PARKING.load(SeqCst)
+        );
+        if spawned as usize != SPARES || SPARES_PARKING.load(SeqCst) != spawned {
+            fail("spares");
+        }
+    }
+
+    /// Case 8 for H: saturate, top up once W has left its CPU, hand R its turn, then hold the
+    /// queues full past both W's and R's deadlines while the fillers keep them topped up; release
+    /// and wait until every filler has run again.
+    fn helper_saturate() {
         spawn_spares();
         spawn_round(true);
         let first = NEXT_FILLER.load(SeqCst);
