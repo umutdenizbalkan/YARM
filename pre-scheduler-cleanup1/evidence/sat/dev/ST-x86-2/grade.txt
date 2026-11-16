@@ -1,0 +1,5 @@
+[sched-time-witness][fail] cell reported STW_FAIL what=hold_bound
+[sched-time-witness][fail] 8: H's hold hit its bound (R never published its deadline, or the hold never ended)
+[sched-time-witness][fail] W reported 1 failures
+[sched-time-witness][fail] STW_DONE result=fail
+SCHED_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=fail full_refusals=9689 full_proving=2 fillers=128 idle_current0=3 cross_cpu=10 kthread_beats=30 done_during_kthread=37 ipc_proving=4 ipc_deferrals=13474 late_max_ns=61203848127 late_median_ns=2726282 calls=40

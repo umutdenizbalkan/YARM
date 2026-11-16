@@ -1,0 +1,3 @@
+bff6752a00bf8f3c369e196f767ab528299251d290e32600c394e2d5948a9d77  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/sat/dev/ST-x86-2/boot.log
+69ab9a66e93a21d9e0617a1dacedee0f049b6342feef672c2bd2bf5d6185a03a  build-x86_64/kernel_boot.elf
+fc6b01e39a29b927f82ce6a616f3d7fbfb3217ffa29db101240dcb8e3ae50b81  build-x86_64/initramfs-core.cpio

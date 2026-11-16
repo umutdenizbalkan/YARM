@@ -1,0 +1,4 @@
+  data section in executable segment (not decoded, not executed as code by design): .rodata 157963 bytes
+  accounted: executable=739928 decoded_code=739928 data=0 user_program=0 unaccounted=0
+  population: classified=0 in_exceptions=0 ordinary=0
+NOFP_CHECK arch=riscv64 image_sha256=8839459abd61ac2d005f9e12288686d177bd07d7d595c844d00c08686a199b42 features=- toolchain="5b7b37aefcb5b2fba3c2392bc9065b9e4602d494 1.102.0-nightly" disassembler="Ubuntu LLVM version 18.1.3" disassembler_path="/usr/bin/llvm-objdump" failures=0 ordinary_fp=0 obligations=- result=pass

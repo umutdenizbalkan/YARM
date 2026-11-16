@@ -1,0 +1,3 @@
+[sched-time-witness][fail] call 38 (rt_rel): 0 registrations
+[sched-time-witness][fail] IPC: no refusal proves R's home queue full when its receive timeout was due while held: 0 refusals, rejected: []
+SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=613 full_proving=4 fillers=127 idle_current0=3 cross_cpu=27 kthread_beats=19 done_during_kthread=35 late_max_ns=12834117300 late_median_ns=71330800 calls=39

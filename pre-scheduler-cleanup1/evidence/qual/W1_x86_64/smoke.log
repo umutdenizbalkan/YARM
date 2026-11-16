@@ -1,0 +1,116 @@
++ scripts/qemu-x86_64-core-smoke.sh:17: KERNEL_IMAGE=build-x86_64/kernel_boot.elf
++ scripts/qemu-x86_64-core-smoke.sh:18: KERNEL_DEBUG_ELF=build-x86_64/kernel_boot.elf
++ scripts/qemu-x86_64-core-smoke.sh:19: INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio
++ scripts/qemu-x86_64-core-smoke.sh:20: TIMEOUT_SECS=120
++ scripts/qemu-x86_64-core-smoke.sh:21: QEMU_SMOKE_STRICT=0
++ scripts/qemu-x86_64-core-smoke.sh:22: QEMU_MACHINE=q35
++ scripts/qemu-x86_64-core-smoke.sh:23: QEMU_CPU=qemu64
++ scripts/qemu-x86_64-core-smoke.sh:24: QEMU_MEMORY=512M
++ scripts/qemu-x86_64-core-smoke.sh:32: QEMU_SMP=1
++ scripts/qemu-x86_64-core-smoke.sh:33: DEFAULT_KERNEL_CMDLINE='console=ttyS0 rdinit=/init'
++ scripts/qemu-x86_64-core-smoke.sh:34: KERNEL_CMDLINE='console=ttyS0 rdinit=/init yarm.x86_64_shared_region_direct_oracle=1'
++ scripts/qemu-x86_64-core-smoke.sh:44: D6_SWITCH_PROOF=0
++ scripts/qemu-x86_64-core-smoke.sh:45: D6_SWITCH_A=0
++ scripts/qemu-x86_64-core-smoke.sh:46: D6_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:47: D2_RECV_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:48: D2_SEND_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:52: SCHED_TIMEOUT=0
++ scripts/qemu-x86_64-core-smoke.sh:53: VM_COW=0
++ scripts/qemu-x86_64-core-smoke.sh:54: CAP_CNODE=0
++ scripts/qemu-x86_64-core-smoke.sh:55: TERMINAL_FAULT_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:56: TERMINAL_FAULT_FETCH_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:57: TERMINAL_FAULT_WAITER_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:59: TERMINAL_FAULT_PORTIO_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:60: FAULT_DELIVERY=0
++ scripts/qemu-x86_64-core-smoke.sh:61: SPAWN_LIFECYCLE=0
++ scripts/qemu-x86_64-core-smoke.sh:62: GLOBAL_STATE=0
++ scripts/qemu-x86_64-core-smoke.sh:63: SMP_READY=0
++ scripts/qemu-x86_64-core-smoke.sh:64: CROSS_ARCH_D6=0
++ scripts/qemu-x86_64-core-smoke.sh:65: D3_FULL=0
++ scripts/qemu-x86_64-core-smoke.sh:69: UNLOCK_GRADUATED=
++ scripts/qemu-x86_64-core-smoke.sh:70: YARM_MODE_ISOLATION=0
++ scripts/qemu-x86_64-core-smoke.sh:71: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:88: echo '[info] mode isolation: D6_SWITCH_PROOF=0 D6_SWITCH_A=0 D6_GENUINE=0 D2_RECV_GENUINE=0 D2_SEND_GENUINE=0 SCHED_TIMEOUT=0 VM_COW=0 CAP_CNODE=0 FAULT_DELIVERY=0 SPAWN_LIFECYCLE=0 GLOBAL_STATE=0 SMP_READY=0 CROSS_ARCH_D6=0 D3_FULL=0 UNLOCK_GRADUATED=<default>'
++ scripts/qemu-x86_64-core-smoke.sh:93: SMP_READY_CPUS=2
++ scripts/qemu-x86_64-core-smoke.sh:94: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:98: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:103: D6_SWITCH_A=0
++ scripts/qemu-x86_64-core-smoke.sh:110: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:118: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:127: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:132: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:135: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:145: D6_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:146: D2_RECV_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:151: D2_SEND_GENUINE=0
++ scripts/qemu-x86_64-core-smoke.sh:152: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:160: SCHED_TIMEOUT=0
++ scripts/qemu-x86_64-core-smoke.sh:161: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:172: VM_COW=0
++ scripts/qemu-x86_64-core-smoke.sh:173: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:187: CAP_CNODE=0
++ scripts/qemu-x86_64-core-smoke.sh:188: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:198: FAULT_DELIVERY=0
++ scripts/qemu-x86_64-core-smoke.sh:199: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:209: SPAWN_LIFECYCLE=0
++ scripts/qemu-x86_64-core-smoke.sh:210: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:218: GLOBAL_STATE=0
++ scripts/qemu-x86_64-core-smoke.sh:219: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:226: SMP_READY=0
++ scripts/qemu-x86_64-core-smoke.sh:227: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:235: CROSS_ARCH_D6=0
++ scripts/qemu-x86_64-core-smoke.sh:236: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:243: D3_FULL=0
++ scripts/qemu-x86_64-core-smoke.sh:244: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:254: UNLOCK_GRADUATED=
++ scripts/qemu-x86_64-core-smoke.sh:255: [[ -n '' ]]
++ scripts/qemu-x86_64-core-smoke.sh:261: IPC_RECV_PROOF=0
++ scripts/qemu-x86_64-core-smoke.sh:262: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:267: IPC_RECV_PROOF_SENDER_WAKE=0
++ scripts/qemu-x86_64-core-smoke.sh:268: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:274: IPC_SEND_PLAIN_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:275: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:281: IPC_SEND_CAP_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:282: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:289: IPC_SEND_REPLY_CAP_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:290: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:296: IPC_SEND_ENQUEUE_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:297: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:303: IPC_SEND_CAP_ENQUEUE_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:304: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:311: X86_FUTEX_WAKE_ORACLE=0
++ scripts/qemu-x86_64-core-smoke.sh:312: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:316: [[ console=ttyS0 rdinit=/init yarm.x86_64_shared_region_direct_oracle=1 != *\c\o\n\s\o\l\e\=* ]]
++ scripts/qemu-x86_64-core-smoke.sh:316: [[ 68 -lt 12 ]]
++ scripts/qemu-x86_64-core-smoke.sh:326: [[ ! -f build-x86_64/kernel_boot.elf ]]
++ scripts/qemu-x86_64-core-smoke.sh:333: [[ ! -f build-x86_64/initramfs-core.cpio ]]
++ scripts/qemu-x86_64-core-smoke.sh:340: command -v qemu-system-x86_64
+++ scripts/qemu-x86_64-core-smoke.sh:351: dirname scripts/qemu-x86_64-core-smoke.sh
++ scripts/qemu-x86_64-core-smoke.sh:351: source scripts/lib/artifact-binding.sh
+++ scripts/lib/artifact-binding.sh:50: [[ '' != \2\1\4\3\5 ]]
++++ scripts/lib/artifact-binding.sh:51: mktemp /tmp/yarm-cargo-ledger.XXXXXX
+++ scripts/lib/artifact-binding.sh:51: ARTIFACT_CARGO_LEDGER=/tmp/yarm-cargo-ledger.JXbC87
+++ scripts/lib/artifact-binding.sh:52: _AB_LEDGER_OWNER=21435
++ scripts/qemu-x86_64-core-smoke.sh:352: artifact_required=()
++ scripts/qemu-x86_64-core-smoke.sh:353: [[ 0 == \1 ]]
++ scripts/qemu-x86_64-core-smoke.sh:359: artifact_required+=(${ARTIFACT_REQUIRE:-})
++ scripts/qemu-x86_64-core-smoke.sh:360: artifact_binding_check x86_64 0 build-x86_64/kernel_boot.elf build-x86_64/initramfs-core.cpio kernel=x86-shared-region-direct-oracle initramfs:shared-region-offset-witness
++ scripts/lib/artifact-binding.sh:214: local arch=x86_64 _strict=0 kernel=build-x86_64/kernel_boot.elf initramfs=build-x86_64/initramfs-core.cpio
++ scripts/lib/artifact-binding.sh:215: shift 4
++ scripts/lib/artifact-binding.sh:216: artifact_boot_guard x86_64 build-x86_64/kernel_boot.elf build-x86_64/initramfs-core.cpio kernel=x86-shared-region-direct-oracle initramfs:shared-region-offset-witness
++ scripts/lib/artifact-binding.sh:205: local arch=x86_64 kernel=build-x86_64/kernel_boot.elf initramfs=build-x86_64/initramfs-core.cpio
++ scripts/lib/artifact-binding.sh:206: shift 3
++ scripts/lib/artifact-binding.sh:207: req=()
++ scripts/lib/artifact-binding.sh:207: local -a req
++ scripts/lib/artifact-binding.sh:208: local r
++ scripts/lib/artifact-binding.sh:209: for r in "$@"
++ scripts/lib/artifact-binding.sh:209: req+=(--require "$r")
++ scripts/lib/artifact-binding.sh:209: for r in "$@"
++ scripts/lib/artifact-binding.sh:209: req+=(--require "$r")
++ scripts/lib/artifact-binding.sh:210: _ab_py verify --arch x86_64 --kernel build-x86_64/kernel_boot.elf --initramfs build-x86_64/initramfs-core.cpio --require kernel=x86-shared-region-direct-oracle --require initramfs:shared-region-offset-witness
+++ scripts/lib/artifact-binding.sh:45: _ab_repo
++++ scripts/lib/artifact-binding.sh:44: dirname scripts/lib/artifact-binding.sh
+++ scripts/lib/artifact-binding.sh:44: cd scripts/lib/../..
+++ scripts/lib/artifact-binding.sh:44: pwd
++ scripts/lib/artifact-binding.sh:45: python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-q-wt/scripts/artifact-provenance.py verify --arch x86_64 --kernel build-x86_64/kernel_boot.elf --initramfs build-x86_64/initramfs-core.cpio --require kernel=x86-shared-region-direct-oracle --require initramfs:shared-region-offset-witness
++ scripts/qemu-x86_64-core-smoke.sh:360: exit 1

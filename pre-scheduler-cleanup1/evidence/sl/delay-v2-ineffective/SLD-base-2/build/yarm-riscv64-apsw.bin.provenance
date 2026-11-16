@@ -1,0 +1,26 @@
+yarm_provenance=1
+role=kernel
+arch=riscv64
+target=riscv64gc-unknown-none-elf
+profile=release
+cargo_feature_args=--no-default-features --features riscv64-sched-lock1-witness
+default_features=0
+features=riscv64-sched-lock1-witness
+compile_env=none
+built_by=qemu-riscv64-apsched-witness-smoke.sh
+commit=2866be8326ef39b0f8fe7df628075bd9397f6531
+tree=bc75c1abd66cec1f16221b8b202d8838ef440270
+tracked_dirty=1
+source_state=dirty:bc75c1abd66cec1f16221b8b202d8838ef440270:28c2e64ff653ec8abb121f9a
+resolved_features=apsched-witness,riscv64-apsched-witness,riscv64-sched-lock1-witness,sched-lock1-witness
+artifact=yarm-riscv64-apsw.bin
+format=raw
+sha256=9a3f36096980411207b2adb0939019bda5f911b22baee4cf453db16184ed652e
+elf=yarm-riscv64-apsw.elf
+elf_sha256=ba3c43d6d201c1841c2f3837429986648f9819f0c4993de544f72e75060e390d
+nofp_result=pass
+nofp_image_sha256=ba3c43d6d201c1841c2f3837429986648f9819f0c4993de544f72e75060e390d
+nofp_obligations=-
+nofp_line=NOFP_CHECK arch=riscv64 image_sha256=ba3c43d6d201c1841c2f3837429986648f9819f0c4993de544f72e75060e390d features=apsched-witness,riscv64-apsched-witness,riscv64-sched-lock1-witness,sched-lock1-witness toolchain="5b7b37aefcb5b2fba3c2392bc9065b9e4602d494 1.102.0-nightly" disassembler="Ubuntu LLVM version 18.1.3" disassembler_path="/usr/bin/llvm-objdump" failures=0 ordinary_fp=0 obligations=- result=pass
+nofp_report=yarm-riscv64-apsw.elf.nofp.txt
+nofp_report_sha256=2ba67dc1cd5b5848fa75df855795ce175c62b00755ab8a22eb00cfca1f261185

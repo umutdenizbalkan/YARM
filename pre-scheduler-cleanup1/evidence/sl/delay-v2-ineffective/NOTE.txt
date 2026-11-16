@@ -1,0 +1,1 @@
+v2 (wait for any hold on the static OBSERVER, initially CPU0 = round 0's holder): hits=0 in 4 runs; stopped, superseded by v3

@@ -1,0 +1,22 @@
+  exception A64_CPTR_EL2_WRITE       0x400800cc..0x400800d0 (4 bytes) in yarm_aarch64_enter_el1_if_needed+0x18
+  exception A64_CPACR_WRITE          0x400800ec..0x400800f0 (4 bytes) in yarm_aarch64_enter_el1_if_needed+0x38
+  exception A64_CPACR_WRITE          0x40080124..0x40080128 (4 bytes) in yarm_aarch64_secondary_entry+0x4
+  exception A64_FIRST_ENTRY_INIT     0x400801ec..0x40080274 (136 bytes) in yarm_aarch64_enter_user_mode_eret+0x80
+  exception A64_VECTOR_CAPTURE       0x40081178..0x400811d4 (92 bytes) in yarm_aarch64_vector_dispatch+0x78
+  exception A64_VECTOR_RESTORE       0x40081228..0x40081278 (80 bytes) in yarm_aarch64_vector_dispatch+0x128
+  exception A64_CPACR_WRITE          0x4015ae34..0x4015ae38 (4 bytes) in yarm_aarch64_enable_fp_simd+0x8
+  exception A64_SWITCH_SAVE          0x401671b0..0x401671c0 (16 bytes) in yarm_aarch64_switch_frame+0x14
+  exception A64_SWITCH_RESTORE       0x401671fc..0x4016720c (16 bytes) in yarm_aarch64_switch_frame+0x60
+  exclusion USER_PROGRAM apsched_witness 0x401175a0..0x40119f20 (10624 bytes) user anchored owner=src/arch/aarch64/apsched_witness.S
+  literal-pool data .word 0x400812f0 (4 bytes) [yarm_aarch64_marker_before_rust+0x8]
+  literal-pool data .word 0x400812f4 (4 bytes) [yarm_aarch64_marker_before_rust+0xc]
+  data section in executable segment (not decoded, not executed as code by design): .rodata 157248 bytes
+  accounted: executable=998012 decoded_code=987380 data=8 user_program=10624 unaccounted=0
+  population: classified=83 in_exceptions=83 ordinary=0
+         32 fp:movi
+         20 fp:stp
+         20 fp:ldp
+          5 fp:msr
+          4 enable:msr
+          2 fp:mrs
+NOFP_CHECK arch=aarch64 image_sha256=387b9a25403e0526a0dde6181aa84f9996d9df7574eec4134ff4050384c600fe features=aarch64-apsched-witness,aarch64-sched-lock1-witness,apsched-witness,printk-witness-ring,sched-lock1-witness toolchain="5b7b37aefcb5b2fba3c2392bc9065b9e4602d494 1.102.0-nightly" disassembler="Ubuntu LLVM version 18.1.3" disassembler_path="/usr/bin/llvm-objdump" failures=0 ordinary_fp=0 obligations=- result=pass

@@ -1,0 +1,5 @@
+[sched-time-witness] building base riscv64 artifacts with futex-requeue-witness,sched-time-witness
+[sched-time-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,sched-time-witness
+[sched-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=ok full_refusals=45529 full_proving=3 fillers=127 idle_current0=3 cross_cpu=12 kthread_beats=21 done_during_kthread=35 ipc_proving=3 ipc_topup=none ipc_deferrals=107 late_max_ns=720201328900 late_median_ns=49546900 calls=40
+rc=0

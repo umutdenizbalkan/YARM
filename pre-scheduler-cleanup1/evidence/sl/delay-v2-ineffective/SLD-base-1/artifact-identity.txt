@@ -1,0 +1,8 @@
+tree=bc75c1abd66cec1f16221b8b202d8838ef440270 head=2866be8326ef39b0f8fe7df628075bd9397f6531 dirty=1 kernel_features=--no-default-features --features riscv64-sched-lock1-witness userspace_features=--no-default-features
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=virt cpu=rv64 cmdline=console=ttyS0 rdinit=/init
+firmware_path=/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin firmware_banner=OpenSBI v1.3
+9a3f36096980411207b2adb0939019bda5f911b22baee4cf453db16184ed652e  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/sl/delay2/SLD-base-1/build/yarm-riscv64-apsw.bin
+ba3c43d6d201c1841c2f3837429986648f9819f0c4993de544f72e75060e390d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/sl/delay2/SLD-base-1/build/yarm-riscv64-apsw.elf
+32a08478ba270c511e4904d5a7bf424d79dbf81eac5c04bbae08f25aace59bb9  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/sl/delay2/SLD-base-1/build/initramfs-core.cpio
+171a91cceeb419d5cf238008c77641a13c4783d2540fec9294b1ba969bfa095d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/sl/delay2/SLD-base-1/build/opensbi-fw_dynamic.bin
+boot smp=2

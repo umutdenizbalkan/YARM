@@ -1,0 +1,138 @@
+===== x86_64 8062c216 -> 2866be83
+text-symbol total delta +20284 over 230 symbols (new 35, gone 23)
+top growth:
+    +5918       0->   5918 yarm::kernel::syscall_split::split_futex_park_tail
+    +4879   51002->  55881 yarm::arch::trap_entry::handle_trap_entry_shared
+    +2036   14222->  16258 <yarm::runtime::SharedKernel>::run_due_ipc_timeout_work
+    +1334       0->   1334 <yarm::kernel::capabilities::CapabilitySpace>::revoke_reporting::<yarm::kernel::boot::provisional_cap::remove_delegated_child_locked::{closure#3}>
+    +1334       0->   1334 <yarm::kernel::capabilities::CapabilitySpace>::revoke_reporting::<yarm::kernel::boot::provisional_cap::release_provisional_cap_locked::{closure#4}::{c
+    +1325       0->   1325 yarm::kernel::syscall::clock::clock_set_realtime_split
+    +1091    8536->   9627 yarm::kernel::syscall::reap_txn::run_reap_transaction::<yarm::kernel::syscall::reap_txn::SharedReapOwners>
+    +1028       0->   1028 yarm::kernel::timekeeping::init_boot_clock
+     +988       0->    988 yarm::arch::clock::imp::discover_source
+     +922   40222->  41144 yarm::kernel::syscall_split::try_split_dispatch_nonswitching_into_frame
+     +782       0->    782 yarm::kernel::syscall::clock::clock_gettime_split
+     +700       0->    700 <yarm::runtime::SharedKernel>::commit_ipc_wake_split
+     +696       0->    696 yarm::kernel::boot::futex::register_futex_waiter_locked
+     +695       0->    695 yarm::kernel::syscall::clock::nanosleep_deadline
+     +687    4797->   5484 <yarm::runtime::SharedKernel>::drain_server_death_post_work
+     +581       0->    581 yarm::kernel::boot::futex::claim_futex_timeout_locked
+     +482       0->    482 yarm::kernel::spawn_reservation::claim_for_spawn
+     +457       0->    457 yarm::kernel::boot::ipc_state::rt_invalidate_reply_record::<yarm::runtime::OffLockReplyTimeout>
+     +450       0->    450 yarm::kernel::syscall_split::try_split_clock_nanosleep_recognized::{closure#0}
+     +449       0->    449 <yarm::runtime::SharedKernel>::reserve_ipc_wake_split
+     +406    1624->   2030 <u64 as core::fmt::Debug>::fmt
+     +404       0->    404 <yarm::runtime::SharedKernel>::copy_to_user_split_all_or_nothing
+     +309       0->    309 <yarm::kernel::scheduler::PriorityScheduler>::requeue_current_with_priority
+     +308     685->    993 yarm::kernel::boot::process_cnode_txn::release_process_cnode_grant_locked
+     +304    1409->   1713 yarm::kernel::syscall::spawn_txn::release_provisional_capability::<yarm::kernel::syscall::spawn_txn::SharedSpawnOwners>
+     +304       0->    304 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_tcbs::<core::option::Option<core::option::Option<yarm_
+     +286       0->    286 yarm::kernel::spawn_reservation::validate_cancellable
+     +286    1622->   1908 yarm::kernel::boot::process_cnode_txn::provision_process_cnode_locked
+     +276       0->    276 <core::fmt::builders::DebugInner>::entry
+     +272    1088->   1360 <yarm::kernel::task::TaskStatus as core::fmt::Debug>::fmt
+top shrink:
+    -1923    3505->   1582 yarm::kernel::boot::provisional_cap::release_provisional_cap_locked
+    -1856   30524->  28668 yarm::kernel::syscall_split::try_split_dispatch_into_frame
+    -1492    4879->   3387 <yarm::kernel::boot::defs::IpcSubsystem>::publish_endpoint_waiter
+     -734     734->      0 <yarm::runtime::SharedKernel>::enqueue_reply_timeout_wake_split
+     -620    4580->   3960 yarm::kernel::boot::ipc_state::complete_server_death_over::<yarm::runtime::OffLockReplyTimeout>
+     -583    2007->   1424 yarm::kernel::boot::futex::compare_and_register_futex_waiter_locked
+     -547     547->      0 <core::fmt::builders::DebugList>::entries::<&u8, core::slice::iter::Iter<u8>>
+     -503     503->      0 yarm::kernel::boot::futex::rekey
+     -462     462->      0 yarm::arch::trap_entry::handle_trap_entry_shared::{closure#5}
+     -447     447->      0 <yarm::kernel::boot::waiter_ownership::WaiterOwnershipTable>::claim
+     -434     434->      0 yarm::kernel::syscall_split::settle_futex_cannot_park
+     -424    8980->   8556 yarm::kernel::syscall::fork_txn::fork_process_cow::<yarm::kernel::syscall::spawn_txn::SharedSpawnOwners>
+===== aarch64 8062c216 -> 2866be83
+text-symbol total delta +16092 over 97 symbols (new 32, gone 8)
+top growth:
+    +4656       0->   4656 yarm::kernel::syscall_split::split_futex_park_tail
+    +3120   10516->  13636 <yarm::runtime::SharedKernel>::run_due_ipc_timeout_work
+    +1372       0->   1372 <yarm::runtime::SharedKernel>::commit_ipc_wake_split
+    +1364       0->   1364 yarm::kernel::syscall::clock::clock_set_realtime_split
+    +1292       0->   1292 <yarm::runtime::SharedKernel>::reserve_ipc_wake_split
+     +948       0->    948 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_release
+     +780       0->    780 compiler_builtins::int::specialized_div_rem::u128_div_rem
+     +764       0->    764 yarm::kernel::syscall::clock::clock_gettime_split
+     +728       0->    728 yarm::kernel::syscall::clock::nanosleep_deadline
+     +624       0->    624 yarm::kernel::timekeeping::init_boot_clock
+     +600    2856->   3456 <yarm::runtime::SharedKernel>::drain_server_death_post_work
+     +596       0->    596 yarm::kernel::boot::ipc_state::rt_invalidate_reply_record::<yarm::runtime::OffLockReplyTimeout>
+     +572       0->    572 yarm::kernel::boot::futex::register_futex_waiter_locked
+     +568       0->    568 yarm::kernel::boot::futex::claim_futex_timeout_locked
+     +496       0->    496 <yarm::runtime::SharedKernel>::copy_to_user_split_all_or_nothing
+     +492   29576->  30068 yarm::kernel::syscall_split::try_split_dispatch_nonswitching_into_frame
+     +380       0->    380 <yarm::runtime::SharedKernel>::copy_from_user_split
+     +340       0->    340 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_tcbs::<core::option::Option<core::option::Option<yarm_
+     +320       0->    320 yarm::kernel::syscall_split::try_split_clock_nanosleep_recognized::{closure#0}
+     +296       0->    296 yarm::kernel::boot::reap_claim::collect_process_asids_locked
+     +272    1520->   1792 yarm::kernel::task::take_thread_restore_facts
+     +264     344->    608 yarm::kernel::boot::futex::collect_due_futex_timeouts_locked
+     +252       0->    252 <yarm::kernel::scheduler::PriorityScheduler>::requeue_current_with_priority
+     +236       0->    236 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_tcbs::<bool, yarm::kernel::boot::ipc_state::rt_prepare
+     +224       0->    224 yarm::kernel::boot::reap_claim::claim_faulted_task_for_reap_locked
+     +220       0->    220 yarm::kernel::boot::futex::undo_futex_registration_locked
+     +212       0->    212 yarm::kernel::timekeeping::monotonic_ns
+     +212       0->    212 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_ipc::<bool, yarm::kernel::boot::ipc_state::rt_commit_r
+     +208       0->    208 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_ipc::<bool, yarm::kernel::boot::ipc_state::rt_complete
+     +200     512->    712 yarm::kernel::boot::futex::expire_futex_waiter_locked
+top shrink:
+    -1816    1816->      0 <yarm::arch::gicv2_sgi::TargetTable<64>>::cpu_of_interface
+    -1636    1636->      0 <yarm::runtime::SharedKernel>::enqueue_reply_timeout_wake_split
+     -984    3412->   2428 yarm::kernel::boot::ipc_state::complete_reply_timeout_over::<yarm::runtime::OffLockReplyTimeout>
+     -784     784->      0 yarm::kernel::boot::reap_claim::clear_ipc_waiters_for_identity_locked
+     -476    1024->    548 yarm::kernel::boot::cow_clone::rollback_cow_clone_locked
+     -468    4184->   3716 yarm::kernel::boot::ipc_state::complete_server_death_over::<yarm::runtime::OffLockReplyTimeout>
+     -444     444->      0 <yarm::runtime::SharedKernel>::with_task_tcbs_split_mut::<usize, <yarm::kernel::syscall::reap_txn::SharedReapOwners as yarm::kernel::syscall::reap_txn
+     -304     304->      0 yarm::kernel::syscall_split::settle_futex_cannot_park
+     -300    2932->   2632 <yarm::runtime::SharedKernel>::run_due_futex_timeouts
+     -216    4904->   4688 yarm::kernel::syscall::vm_txn::run_vm_map_transaction::<yarm::kernel::syscall::vm_split::SplitVmOwners>
+     -164    7660->   7496 yarm::kernel::syscall::reap_txn::run_reap_transaction::<yarm::kernel::syscall::reap_txn::SharedReapOwners>
+     -132     132->      0 yarm::arch::aarch64::smp::park_ap_timer_for_idle
+===== riscv64 8062c216 -> 2866be83
+text-symbol total delta +16512 over 281 symbols (new 26, gone 5)
+top growth:
+    +4216       0->   4216 yarm::kernel::syscall_split::split_futex_park_tail
+    +1644       0->   1644 compiler_builtins::int::specialized_div_rem::u128_div_rem
+    +1428       0->   1428 yarm::arch::fdt::cpus_timebase_frequency
+    +1294    9242->  10536 <yarm::runtime::SharedKernel>::run_due_ipc_timeout_work
+    +1272       0->   1272 yarm::kernel::syscall::clock::clock_set_realtime_split
+     +672       0->    672 yarm::kernel::syscall::clock::nanosleep_deadline
+     +654       0->    654 yarm::kernel::syscall::clock::clock_gettime_split
+     +608       0->    608 yarm::kernel::timekeeping::init_boot_clock
+     +550       0->    550 yarm::kernel::boot::ipc_state::rt_invalidate_reply_record::<yarm::runtime::OffLockReplyTimeout>
+     +544       0->    544 <yarm::runtime::SharedKernel>::commit_ipc_wake_split
+     +510   25854->  26364 yarm::kernel::syscall_split::try_split_dispatch_nonswitching_into_frame
+     +510       0->    510 <yarm::runtime::SharedKernel>::copy_to_user_split_all_or_nothing
+     +486       0->    486 yarm::kernel::boot::futex::register_futex_waiter_locked
+     +476    2696->   3172 <yarm::runtime::SharedKernel>::drain_server_death_post_work
+     +456       0->    456 <yarm::runtime::SharedKernel>::reserve_ipc_wake_split
+     +280       0->    280 yarm::kernel::syscall_split::try_split_clock_nanosleep_recognized::{closure#0}
+     +228       0->    228 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_tcbs::<core::option::Option<core::option::Option<yarm_
+     +192       0->    192 <yarm::kernel::scheduler::PriorityScheduler>::requeue_current_with_priority
+     +188       0->    188 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_tcbs::<bool, yarm::kernel::boot::ipc_state::rt_prepare
+     +182     324->    506 yarm::kernel::boot::futex::collect_due_futex_timeouts_locked
+     +180     422->    602 yarm::kernel::boot::futex::expire_futex_waiter_locked
+     +180     264->    444 yarm::kernel::boot::futex::claim_futex_timeout_locked
+     +164       0->    164 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_ipc::<bool, yarm::kernel::boot::ipc_state::rt_commit_r
+     +160       0->    160 yarm::kernel::boot::futex::undo_futex_registration_locked
+     +158       0->    158 yarm::kernel::timekeeping::monotonic_ns
+     +154       0->    154 <yarm::runtime::OffLockReplyTimeout as yarm::kernel::boot::ipc_state::ReplyTimeoutDomains>::rtd_ipc::<bool, yarm::kernel::boot::ipc_state::rt_complete
+     +132       0->    132 yarm::kernel::boot::futex::arm_futex_deadline_locked
+     +126       0->    126 __divti3
+     +104       0->    104 <core::iter::adapters::fuse::Fuse<core::slice::iter::Iter<core::option::Option<yarm::kernel::task::ThreadControlBlock>>> as core::iter::adapters::fuse
+      +80     130->    210 <yarm::runtime::SharedKernel>::take_futex_wait_completion_split
+top shrink:
+     -764     764->      0 <yarm::runtime::SharedKernel>::enqueue_reply_timeout_wake_split
+     -334   17434->  17100 yarm::kernel::syscall_split::try_split_dispatch_into_frame
+     -314    2652->   2338 yarm::kernel::boot::ipc_state::complete_reply_timeout_over::<yarm::runtime::OffLockReplyTimeout>
+     -262     262->      0 yarm::kernel::syscall_split::settle_futex_cannot_park
+     -194    3510->   3316 yarm::kernel::boot::ipc_state::complete_server_death_over::<yarm::runtime::OffLockReplyTimeout>
+      -94    1184->   1090 yarm::kernel::boot::futex::compare_and_register_futex_waiter_locked
+      -56      56->      0 <yarm::kernel::lock::SpinLockIrq<yarm::kernel::frame_allocator::PhysicalFrameAllocator>>::lock
+      -56      56->      0 <yarm::kernel::lock::SpinLockIrq<yarm::kernel::kthread::FreeList>>::lock
+      -56      56->      0 <yarm::kernel::lock::SpinLockIrq<yarm::kernel::kthread::KWaitInner>>::lock
+      -44     370->    326 yarm::arch::riscv64::page_table::map_kernel_shared_into_asid
+      -34     470->    436 yarm::arch::riscv64::page_table::resolve_page
+      -32    2440->   2408 <yarm::kernel::vm::AddressSpaceManager>::create_user_space

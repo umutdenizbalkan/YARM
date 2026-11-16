@@ -1,0 +1,5 @@
+[sched-time-witness] building base x86_64 artifacts with futex-requeue-witness,sched-time-witness
+[sched-time-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle,sched-time-witness
+[sched-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+SCHED_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=ok full_refusals=459 full_proving=3 fillers=128 idle_current0=3 cross_cpu=5 kthread_beats=30 done_during_kthread=37 ipc_proving=4 ipc_topup=none ipc_deferrals=10696 late_max_ns=2925581230 late_median_ns=2876780 calls=40
+rc=0

@@ -1,0 +1,1 @@
+v1 delay (200k spins while no hold open) did not provoke the race: SLD-base-1 passed; runs stopped, superseded by v2 (wait until a hold opens)

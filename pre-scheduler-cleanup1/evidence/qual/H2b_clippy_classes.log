@@ -1,0 +1,14 @@
+F: warning: `yarm` (lib) generated 424 warnings (run `cargo clippy --fix --lib -p yarm -- ` to apply 100 suggestions)
+B: warning: `yarm` (lib) generated 427 warnings (run `cargo clippy --fix --lib -p yarm -- ` to apply 101 suggestions)
+9c9
+<      20 warning: doc list item without indentation
+---
+>      23 warning: doc list item without indentation
+12c12
+<      13 warning: enum `_` is never used
+---
+>      12 warning: enum `_` is never used
+46c46
+<      21 warning: unused import: `_`
+---
+>      22 warning: unused import: `_`

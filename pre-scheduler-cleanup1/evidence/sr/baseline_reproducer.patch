@@ -1,0 +1,194 @@
+diff --git a/src/kernel/boot/tests.rs b/src/kernel/boot/tests.rs
+index c7fb33ef..d7ed2ffb 100644
+--- a/src/kernel/boot/tests.rs
++++ b/src/kernel/boot/tests.rs
+@@ -72735,6 +72735,189 @@ mod stage198e3b2b_drain_switch {
+         );
+         reset_globals();
+     }
++
++    /// SR-PLACE1 — shared-region receiver placement on a full home queue, driven through the
++    /// REAL producers and the REAL post-work drain (`drain_dispatch_post_work` →
++    /// `SharedRegionOffLockCtx` → `run_shared_region_txn`). The invariant every test checks:
++    /// a `Runnable` receiver is placed exactly once, and a delivery the sender was told
++    /// succeeded is delivered exactly once.
++    mod sr_place1 {
++        use super::*;
++        use std::vec::Vec;
++
++        fn queue(s: &KernelState) -> Vec<u64> {
++            let mut q = Vec::new();
++            s.for_each_queued_on_for_test(CPU0, |_, t| q.push(t.0));
++            q
++        }
++        fn placed(s: &KernelState, tid: u64) -> usize {
++            queue(s).iter().filter(|&&t| t == tid).count()
++                + usize::from(s.current_tid() == Some(tid))
++        }
++        fn reserved(s: &KernelState) -> usize {
++            s.with_scheduler_state(|all| all.reserved_user_slots_on(CPU0))
++        }
++        /// Fill CPU 0's user queue with runnable fillers until a push is refused.
++        fn fill(s: &mut KernelState, base: u64) -> Vec<u64> {
++            let mut v = Vec::new();
++            loop {
++                let t = base + v.len() as u64;
++                s.register_task(t).expect("filler");
++                s.set_task_status_for_test(t, TaskStatus::Runnable);
++                s.set_task_home_cpu(t, CPU0).expect("home");
++                if s.enqueue_task(t).is_err() {
++                    s.exit_task(t, 0).expect("retire the refused filler");
++                    return v;
++                }
++                v.push(t);
++            }
++        }
++
++        /// The QUEUED-origin producer (receiver-side dequeue) for task 2 on a one-page object.
++        /// `current`: task 2 is the CPU's running task (the origin's real shape); otherwise it is
++        /// left blocked off every queue (the shape the plain finalize branch must still handle).
++        fn build_queued(current: bool) -> Drn {
++            reset_globals();
++            crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
++            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
++            let mut s = Bootstrap::init().expect("init");
++            s.register_task(2).expect("task2");
++            s.set_task_home_cpu(2, CPU0).expect("home");
++            let (eidx, send_cap, _recv) = s.create_endpoint(4).expect("endpoint");
++            let endpoint = s.current_task_capability(send_cap).expect("send").object;
++            let (_id, mem_cap0) = s
++                .alloc_anonymous_memory_object_with_len(PAGE_SIZE)
++                .expect("mem");
++            let source_obj = s.current_task_capability(mem_cap0).expect("obj").object;
++            let phys0 = s
++                .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, source_obj))
++                .expect("phys")
++                .0;
++            let src_cap = s
++                .mint_capability_for_current_context(Capability::new(
++                    source_obj,
++                    CapRights::READ | CapRights::MAP,
++                ))
++                .expect("mint");
++            let (asid, aspace) = s.create_user_address_space().expect("asid");
++            s.bind_task_asid(2, asid).expect("bind");
++            s.map_user_page(
++                aspace,
++                VirtAddr(META_PTR),
++                Mapping {
++                    phys: PhysAddr(0x7000_0000),
++                    flags: PageFlags::USER_RW,
++                },
++            )
++            .expect("meta");
++            if current {
++                s.enqueue_current_cpu(2).expect("enqueue");
++                s.dispatch_next_task().expect("dispatch");
++                assert_eq!(s.current_tid(), Some(2), "fixture: task 2 is current");
++            } else {
++                s.with_tcb_mut(2, |tcb| {
++                    tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(send_cap));
++                });
++            }
++            let region = TransferSharedRegion {
++                offset: 0,
++                len: PAGE_SIZE as u64,
++            };
++            let handle = s
++                .stash_transfer_envelope(
++                    ThreadId(0),
++                    src_cap,
++                    endpoint,
++                    Some(ThreadId(2)),
++                    Some(region),
++                )
++                .expect("stash");
++            let msg = Message::with_header(
++                0,
++                OPCODE_SHARED_MEM,
++                Message::FLAG_CAP_TRANSFER,
++                Some(handle),
++                b"sr",
++            )
++            .expect("msg");
++            let produced = crate::kernel::syscall::produce_queued_shared_region_delivery(
++                &mut s, 2, eidx, endpoint, MAP_VA, META_PTR, false, &msg,
++            )
++            .expect("producer");
++            assert!(produced, "queued producer must publish post-work");
++            Drn {
++                shared: SharedKernel::new(s),
++                eidx,
++                phys0,
++                asid,
++            }
++        }
++
++        /// R1 (baseline reproducer) — the DIRECT delivery is committed to the sender (its send
++        /// returned success when the producer stashed the post-work); the receiver's home queue
++        /// fills before the drain. The delivery must still land exactly once.
++        #[test]
++        fn r1_direct_delivery_whose_home_queue_fills_after_commit_is_delivered_once() {
++            let d = build_blocked(2, Some(2));
++            d.shared.with(|s| s.set_task_home_cpu(2, CPU0).expect("home"));
++            d.shared.with(|s| fill(s, 9000));
++            let drained = drain(&d);
++            d.shared.with(|s| {
++                assert!(
++                    drained.is_ok(),
++                    "a committed delivery may not be rolled back for capacity: {drained:?}"
++                );
++                assert_eq!(s.task_status(2), Some(TaskStatus::Runnable), "receiver woken");
++                assert_eq!(placed(s, 2), 1, "receiver placed exactly once");
++                assert_eq!(reserved(s), 0, "no promise left behind");
++            });
++            assert_eq!(waiter(&d), None, "endpoint waiter consumed");
++            assert_eq!(active_mappings(&d), 1, "the region is mapped once");
++            reset_globals();
++        }
++
++        /// R2 (baseline reproducer) — the plain finalize branch on a full home queue: the receiver
++        /// may never be left `Runnable` but neither queued nor current.
++        #[test]
++        fn r2_plain_wake_on_a_full_home_queue_never_strands_the_receiver() {
++            let d = build_queued(false);
++            d.shared.with(|s| fill(s, 9000));
++            let drained = drain(&d);
++            d.shared.with(|s| {
++                if s.task_status(2) == Some(TaskStatus::Runnable) {
++                    assert_eq!(placed(s, 2), 1, "Runnable receiver is placed exactly once");
++                } else {
++                    assert!(drained.is_err(), "an unplaced receiver means nothing was published");
++                    assert_eq!(placed(s, 2), 0);
++                }
++                assert_eq!(reserved(s), 0, "no promise left behind");
++            });
++            if drained.is_err() {
++                assert_eq!(active_mappings(&d), 0, "a refused delivery maps nothing");
++            }
++            reset_globals();
++        }
++
++        /// R3 (baseline reproducer) — the queued origin's real shape: the receiver is the CPU's
++        /// running task. Its delivery must not place it a second time.
++        #[test]
++        fn r3_plain_wake_of_the_running_receiver_places_it_once() {
++            let d = build_queued(true);
++            assert!(drain(&d).is_ok(), "the queued delivery lands");
++            d.shared.with(|s| {
++                assert_eq!(s.current_tid(), Some(2), "still the running task");
++                assert_eq!(
++                    s.task_status(2),
++                    Some(TaskStatus::Running),
++                    "the running receiver keeps its status"
++                );
++                assert_eq!(placed(s, 2), 1, "running receiver placed exactly once");
++                assert_eq!(reserved(s), 0);
++            });
++            assert_eq!(active_mappings(&d), 1);
++            reset_globals();
++        }
++    }
+ }
+ 
+ // Stage 198E3B2B2 — GENERATION-BEARING ENDPOINT WAITER IDENTITY (hosted proof).

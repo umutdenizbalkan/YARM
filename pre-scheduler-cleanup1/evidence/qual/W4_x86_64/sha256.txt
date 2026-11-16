@@ -1,0 +1,3 @@
+0f2c750a4b34cf013ff548c3d91e24af8d9abef7911c0c23a287f3200fc5969c  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/W4_x86_64/boot.log
+8e79ec874057bcbf03edb1122c945ec78cb0f3e068fd98f55e619895fe036c63  build-x86_64/kernel_boot.elf
+89df75c202dda9f691e83651f377d43cf8b25e72d2a1d5e9630c5c8b2755762d  build-x86_64/initramfs-core.cpio

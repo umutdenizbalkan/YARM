@@ -1,0 +1,29 @@
+base=2866be8326ef cand=da7bb3791060 cand_porcelain=0 2026-11-16T13:07:14Z
+isa      item                     base         cand      delta
+x86_64   .text                 1293102      1297086      +3984
+x86_64   .rodata                190392       190544       +152
+x86_64   .data                  390488       177472    -213016
+x86_64   .bss                 24571904     24585016     +13112
+x86_64   boot_image            2147928      1939528    -208400
+x86_64   load_filesz           1903300      1694420    -208880
+x86_64   load_memsz           43254124     43058380    -195744
+  sha256 f626944020f68b4d /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-base-wt/build-x86_64/kernel_boot.elf
+  sha256 e2c170985a0dfd75 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-q-wt/build-x86_64/kernel_boot.elf
+aarch64  .text                  974760       980456      +5696
+aarch64  .rodata                148384       148568       +184
+aarch64  .data                  374984       162000    -212984
+aarch64  .bss                 75432344     75444632     +12288
+aarch64  boot_image            1505480      1300688    -204792
+aarch64  load_filesz           1504280      1297176    -207104
+aarch64  load_memsz          108461288    108274656    -186632
+  sha256 7c066a82f3f52f42 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-base-wt/build-aarch64/yarm-aarch64.elf
+  sha256 c5e873e93f11fe71 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-q-wt/build-aarch64/yarm-aarch64.elf
+riscv64  .text                  739108       738138       -970
+riscv64  .rodata                157787       157971       +184
+riscv64  .data                  372752       159768    -212984
+riscv64  .bss                 92120754     92134032     +13278
+riscv64  boot_image            1273872      1056792    -217080
+riscv64  load_filesz           1269819      1056043    -213776
+riscv64  load_memsz          110204637    110024611    -180026
+  sha256 0bc70730bb7d44d7 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-base-wt/build-riscv64/yarm-riscv64.elf
+  sha256 97550b9529827fab /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-q-wt/build-riscv64/yarm-riscv64.elf

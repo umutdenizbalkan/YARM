@@ -1,0 +1,26 @@
+yarm_provenance=1
+role=kernel
+arch=riscv64
+target=riscv64gc-unknown-none-elf
+profile=release
+cargo_feature_args=--no-default-features
+default_features=0
+features=none
+compile_env=none
+built_by=build-qemu-riscv64-artifacts.sh
+commit=b066b2616778c5a041a37e103169caf691bcf268
+tree=97a83e3eb49aa7212a8de4a5165e8ad67c42a7dd
+tracked_dirty=3
+source_state=dirty:97a83e3eb49aa7212a8de4a5165e8ad67c42a7dd:ce009ebad67d848266406c9f
+resolved_features=none
+artifact=yarm-riscv64.bin
+format=raw
+sha256=72525221c5cbfa634b2548a56caf963c9d05a29a9607cc299127567f02a71f38
+elf=yarm-riscv64.elf
+elf_sha256=8839459abd61ac2d005f9e12288686d177bd07d7d595c844d00c08686a199b42
+nofp_result=pass
+nofp_image_sha256=8839459abd61ac2d005f9e12288686d177bd07d7d595c844d00c08686a199b42
+nofp_obligations=-
+nofp_line=NOFP_CHECK arch=riscv64 image_sha256=8839459abd61ac2d005f9e12288686d177bd07d7d595c844d00c08686a199b42 features=- toolchain="5b7b37aefcb5b2fba3c2392bc9065b9e4602d494 1.102.0-nightly" disassembler="Ubuntu LLVM version 18.1.3" disassembler_path="/usr/bin/llvm-objdump" failures=0 ordinary_fp=0 obligations=- result=pass
+nofp_report=yarm-riscv64.elf.nofp.txt
+nofp_report_sha256=35879d8c3ed570458ca57890135ecf4b794e380865d9a1a73dfd56b6e91f19e0

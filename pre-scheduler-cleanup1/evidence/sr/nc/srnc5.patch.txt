@@ -1,0 +1,16 @@
+srnc5: patched src/runtime.rs
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 705eadde..ba5675c1 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -16804,7 +16804,9 @@ impl SharedKernel {
+             return SrPlacementCommit::Refused;
+         };
+         match self.with_cpu_sched_split(promise.home, |c| {
+-            te::commit_reserved_enqueue_on_cpu_locked(c, &promise.plan)
++            c.enqueue_with_priority(crate::kernel::ipc::ThreadId(promise.plan.tid), promise.plan.priority)
++                .map(|()| ReservedCommit::Queued(c.cpu()))
++                .map_err(crate::kernel::boot::map_scheduler_error)
+         }) {
+             Ok(Ok(ReservedCommit::Queued(cpu))) => {
+                 #[cfg(feature = "sched-lock1-witness")]

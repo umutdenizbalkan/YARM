@@ -1,0 +1,14 @@
+srnc3: patched src/kernel/boot/shared_region_txn.rs
+diff --git a/src/kernel/boot/shared_region_txn.rs b/src/kernel/boot/shared_region_txn.rs
+index 6aec66bc..8f12b578 100644
+--- a/src/kernel/boot/shared_region_txn.rs
++++ b/src/kernel/boot/shared_region_txn.rs
+@@ -930,7 +930,7 @@ pub(crate) fn rollback_shared_region_txn<C: SharedRegionExecCtx>(
+     // (1) Publication/wake is simply never performed on this path. SR-PLACE1: the receiver's
+     // home-slot promise, if one is still held, is given back (once — guarded by take()).
+     if let Some(plan) = txn.snapshot.placement.take() {
+-        ctx.ctx_release_placement(plan);
++        let _ = plan;
+     }
+     // (2) Unmap EXACTLY the successfully-mapped page prefix (two-phase; the shootdown completes
+     // before frames are freed). Does not depend on reaching the terminal `Mapped` state.

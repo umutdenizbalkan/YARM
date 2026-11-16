@@ -1,0 +1,19 @@
+--- 2026-11-16T06:20:25Z head=b066b2616778 porcelain=2 slots=pub const PRB_SLOTS_DEFAULT: usize = 128;
+build_default_x86_64 rc=0 printk_lost=0
+build_default_aarch64 rc=0 printk_lost=0
+build_default_riscv64 rc=0 printk_lost=0
+x86_smp1 rc=0 printk_lost=0
+x86_smp2 rc=0 printk_lost=0
+x86_smp4 rc=0 printk_lost=0
+a64_smp2 rc=0 printk_lost=0
+rv_smp1 rc=0 printk_lost=0
+rv_smp2 rc=0 printk_lost=0
+rv_smp4 rc=0 printk_lost=0
+build_strict_x86_64 rc=0 printk_lost=0
+x86_strict rc=0 printk_lost=0
+build_strict_aarch64 rc=0 printk_lost=0
+a64_strict rc=0 printk_lost=0
+build_strict_riscv64 rc=0 printk_lost=0
+rv_strict rc=0 printk_lost=0
+rv_strict_smp2 rc=0 printk_lost=0
+DONE

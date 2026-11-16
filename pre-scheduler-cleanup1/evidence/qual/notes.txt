@@ -1,0 +1,44 @@
+H2b_clippy_classes rc=1 (classes not identical; the step's rc is the class diff). F 424 warnings, B 427.
+  - "doc list item without indentation" 23 -> 20, "unused import" 22 -> 21: reductions.
+  - "enum `_` is never used" 12 -> 13: `ReceiverEnqueue` (src/runtime.rs:20274 at F). SR-PLACE1 replaced the
+    shared-region finalizer's match on it (B src/runtime.rs:18724) with `SrPlacementCommit`; that match was the
+    last production consumer of the `apply_split_receiver_wake_plan` helpers, which the hosted tests still
+    exercise (39 references in tests.rs). Lint only (hosted-dev profile); no behaviour. Classified, not repaired.
+H6_lockorder_attr rc=0. The tracker (kernel/boot/orchestrator_state.rs debug_lock_order_note) logs DESCENDING
+  SEQUENTIAL domain pairs (the last rank taken, held or not), not nesting. F and B have the SAME set of 30 pair
+  types (no new ordering). 172 (test, pair) count deltas, net +1434:
+  - 9 new tests (sr_place1 r1-r9): all their pairs are new rows (B has no such tests).
+  - existing tests: only the shared-region modules (stage198e2a/e2a1/e2b/e3/e3b2b, shared_region_offset1,
+    stage199d_shared_region_enqueue_rejection) change, by the reserve-before-claim steps SR-PLACE1 adds
+    (`scheduler` after `task` 38 rows, `scheduler` after `ipc` 1; `task` after `ipc` -2 in one test) —
+    the documented non-nested "rank 2 -> rank 1" order the receiver wake already used;
+  - stage199d_waiter_census -1/-1 (reductions); stage200c c09_reply_vs_timeout_terminal_cas_race -5/+5/-25
+    (a multi-threaded race test; its counts follow the interleaving).
+  No nested acquisition is introduced: every new 1L acquisition (reserve, commit, release) is taken with no
+  other domain guard held (source: sr_ensure_receiver_placement_*, sr_commit_receiver_placement_split,
+  release_ipc_wake_split / rtd_* ).
+W1_shared_region_* rc=1 (runner configuration error, not the candidate): the boot guard refused before QEMU —
+  "this run requires the initramfs built with `shared-region-offset-witness`; it was built with features=none".
+  All three qemu-shared-region-direct-<arch>-smoke.sh scripts pass ARTIFACT_REQUIRE="... initramfs:shared-region-
+  offset-witness" unconditionally (since 15114160; the scripts are unchanged 2866be83..F), so their default
+  OFFSET_SELECTION=0 cannot boot on any commit. Addendum A (psc_addA.sh, hashed in predeclared.sha before it ran)
+  reruns them with OFFSET_SELECTION=1 as W1b_*; W1 stays recorded.
+W3_sched_time_riscv64 rc=1 (witness premise guard, timing): STW_FAIL what=saturate — STW_SATURATED full_at=153.6 s
+  > w_deadline=149.6 s (early=0): H needed ~124 s to spawn 127 fillers (dev runs at this design: 56–80 s; the
+  120 s Q_NS margin dates from SCHED-TIME-FOUNDATION1). Host load average ~1.7 (the matrix alone; the gzip of dev
+  logs had finished an hour earlier). The kernel-side proofs held in this very run: W's sleep full_proving=4
+  (SATW_REFUSED home queue full at/after its deadline, inside the hold) and R's receive ipc_proving=4 (home 1,
+  queued 64–65 of 64) with exactly one U8_RECV_TIMEOUT_SETTLED and R returning its timeout. Not a kernel defect;
+  recorded as an open limitation (the saturation margin on RISC-V TCG). Addendum B reruns the step once.
+[2026-11-16T14:53:26Z] Addendum A: W1b_shared_region_{x86_64,aarch64,riscv64} rc=0 — SHARED_REGION_OFFSET_SEAL
+  installs=2 misplaced=0 result=ok and SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL fuse_trips=0 result=ok on each.
+W3b_sched_time_riscv64 rc=1 (Addendum B; witness premise not reached again): STW_SATURATED full_at=175.5 s >
+  w_deadline=145.8 s, so W's sleep was never refused (full_refusals=0). R's home queue (cpu 0) held 63 of 64 at R's
+  deadline, so R's timeout was SETTLED at once; the only SATW recv refusal (cpu 1, queued=63 reserved=1) was a
+  duplicate publication of the same wait drained on the other CPU while cpu 0's promise was outstanding, logged after
+  the settlement, and the grader rejected it ("settled outside refusal..return"). Completion conservation held: one W
+  DONE (gen 36) with one return; one U8_RECV_TIMEOUT_SETTLED of R gen 2 with one return (outcome=none). The baseline has
+  no saturation-proving cell, so no baseline rerun resolves attribution. Classification: witness cell margin (fixed
+  W deadline vs saturation time of 56–175 s), OPEN LIMITATION; fails closed; not a kernel defect. The RISC-V sched-time
+  witness condition was not reached in qualification, so F is NOT QUALIFIED as delivered and the dev branch is not
+  fast-forwarded.

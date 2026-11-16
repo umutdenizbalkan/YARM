@@ -1,0 +1,8 @@
+[sched-time-witness] building base riscv64 artifacts with futex-requeue-witness,sched-time-witness
+[sched-time-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,sched-time-witness
+[sched-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[sched-time-witness][fail] cell reported STW_FAIL what=saturate
+[sched-time-witness][fail] 8: saturation completed after the deadline
+[sched-time-witness][fail] W reported 1 failures
+[sched-time-witness][fail] STW_DONE result=fail
+SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=2771 full_proving=4 fillers=127 idle_current0=3 cross_cpu=28 kthread_beats=24 done_during_kthread=36 ipc_proving=4 ipc_topup=none ipc_deferrals=97 late_max_ns=49875152200 late_median_ns=109869500 calls=40

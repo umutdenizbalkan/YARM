@@ -1,0 +1,14 @@
+srnc2: patched src/kernel/syscall.rs
+diff --git a/src/kernel/syscall.rs b/src/kernel/syscall.rs
+index cde4339d..147e3a8e 100644
+--- a/src/kernel/syscall.rs
++++ b/src/kernel/syscall.rs
+@@ -1400,7 +1400,7 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
+     // marker).
+     snapshot.blocked_endpoint_waiter = true;
+     // SR-PLACE1: the promise travels with the delivery to its single settling owner.
+-    snapshot.placement = Some(plan);
++    kernel.rtd_release(plan);
+     stash_shared_region_delivery(
+         cpu_idx,
+         snapshot,

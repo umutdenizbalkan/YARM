@@ -1,0 +1,12 @@
+SLD-base-1 disagreements=0 | hold@10 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2; hold@18 obs=0 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2
+SLD-base-2 disagreements=0 | hold@10 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2; hold@18 obs=0 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2
+SLD-base-3 disagreements=0 | hold@13 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2; hold@21 obs=0 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2
+SLD-base-4 disagreements=2 | hold@9 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=0 B_COMMITS=0; hold@18 obs=1 pre_hold_obs_SEC=[16] in_hold_SEC=1 B_COMMITS=2; hold@26 obs=0 pre_hold_obs_SEC=[24] in_hold_SEC=1 B_COMMITS=2
+SLD-base-5 disagreements=1 | hold@10 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2; hold@20 obs=0 pre_hold_obs_SEC=[18] in_hold_SEC=1 B_COMMITS=2
+SLD-base-6 disagreements=0 | hold@9 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=0 B_COMMITS=0; hold@16 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2; hold@24 obs=0 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2
+SLD-fix-1 disagreements=0 | hold@10 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2; hold@18 obs=0 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2
+SLD-fix-2 disagreements=0 | hold@17 obs=1 pre_hold_obs_SEC=[15] in_hold_SEC=2 B_COMMITS=2; hold@40 obs=0 pre_hold_obs_SEC=[37] in_hold_SEC=2 B_COMMITS=2
+SLD-fix-3 disagreements=0 | hold@11 obs=1 pre_hold_obs_SEC=[9] in_hold_SEC=0 B_COMMITS=0; hold@20 obs=1 pre_hold_obs_SEC=[18] in_hold_SEC=2 B_COMMITS=2; hold@30 obs=0 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2
+SLD-fix-4 disagreements=0 | hold@8 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=0 B_COMMITS=0; hold@17 obs=1 pre_hold_obs_SEC=[15] in_hold_SEC=2 B_COMMITS=2; hold@38 obs=0 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2
+SLD-fix-5 disagreements=0 | hold@9 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=0 B_COMMITS=0; hold@21 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2; hold@29 obs=0 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2
+SLD-fix-6 disagreements=0 | hold@9 obs=1 pre_hold_obs_SEC=[] in_hold_SEC=0 B_COMMITS=0; hold@18 obs=1 pre_hold_obs_SEC=[16] in_hold_SEC=2 B_COMMITS=2; hold@39 obs=0 pre_hold_obs_SEC=[] in_hold_SEC=2 B_COMMITS=2

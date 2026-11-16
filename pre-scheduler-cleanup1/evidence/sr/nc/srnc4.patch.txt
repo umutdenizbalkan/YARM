@@ -1,0 +1,14 @@
+srnc4: patched src/runtime.rs
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 705eadde..5fe81e01 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -16734,7 +16734,7 @@ impl SharedKernel {
+                 .map(|t| t.status)
+         })?;
+         match status {
+-            TaskStatus::Running => {
++            TaskStatus::Running if false => {
+                 if let Some(promise) = snap.placement.take().and_then(IpcWakePlacement::from_plan) {
+                     self.release_ipc_wake_split(promise);
+                 }

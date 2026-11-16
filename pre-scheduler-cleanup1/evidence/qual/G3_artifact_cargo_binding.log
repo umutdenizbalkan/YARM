@@ -1,0 +1,17 @@
+[ok] stale binary planted at /tmp/yarm-cargo-bind-test.CWOTJX/probe/target/debug/probe
+[ok] 1: the reported executable is in the alternate target dir (/tmp/yarm-cargo-bind-test.CWOTJX/alt/debug/probe)
+[ok] 1: it is the fresh build
+[ok] 1: its bytes differ from the stale binary
+[ok] 1: ledger records it
+[ok] 1: the old path still holds the stale binary (the trap is armed)
+[ok] 2: the stale binary is not bound
+[ok] 2: the fresh output is bound
+[ok] 2: publish refused the stale binary
+[ok] 2: nothing is published and the previous artifact is gone
+[ok] 2: an output modified after its build is not bound
+[ok] 3: the standard path is used and holds the rebuilt binary
+[ok] 4: an initramfs packing the stale binary is refused
+[ok] 4: an initramfs with no member from this build is refused
+[ok] 4: the fresh initramfs is recorded with its bound member
+[ok] 5: a kernel record without a Cargo binding is refused at boot
+ARTIFACT_CARGO_BIND_TEST result=ok

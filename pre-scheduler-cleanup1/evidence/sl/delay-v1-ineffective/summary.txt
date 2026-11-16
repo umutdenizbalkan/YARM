@@ -1,0 +1,1 @@
+SLD-base-1 [2866be83+1dirty] rc=0 SL1W_GRADE result=pass ncpu=2 | SYNCHRONIZED holds: 2/2 rounds credited over 2 valid attempts (0 uncredited), directions [(0, 1), (1, 0)], 0 late observer records not counted | EXECUTION: 97 installations (97 observed by

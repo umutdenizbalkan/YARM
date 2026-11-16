@@ -1,0 +1,16 @@
+srnc1: patched src/runtime.rs
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 705eadde..b35d0761 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -14972,7 +14972,9 @@ impl SharedKernel {
+         snapshot.blocked_endpoint_waiter = true;
+         // SR-PLACE1: the promise travels with the delivery; its single owner from here is the
+         // drain's transaction (commit at finalize, or release in the rollback).
+-        snapshot.placement = Some(plan);
++        if let Some(p) = IpcWakePlacement::from_plan(plan) {
++            self.release_ipc_wake_split(p);
++        }
+         stash_shared_region_delivery(
+             cpu_idx,
+             snapshot,

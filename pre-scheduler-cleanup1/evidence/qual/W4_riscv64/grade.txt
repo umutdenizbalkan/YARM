@@ -1,0 +1,1 @@
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=ok a_idle_collections=2 g_woken=4 g_timed_out=28 g_windows_woke=15 g_windows_refused=0 g_skipped=13 in_window_wakes=15 e_spawn_refusals=15 e_fillers=128 e_topups=14 e_pings=15 e_proving=1 calls=41 cycles=41

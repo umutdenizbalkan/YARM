@@ -1,0 +1,7 @@
+[sched-time-witness] building base riscv64 artifacts with futex-requeue-witness,sched-time-witness
+[sched-time-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,sched-time-witness
+[sched-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[sched-time-witness][fail] call 6 (abs): 0 registrations
+[sched-time-witness][fail] IPC: no refusal proves R's home queue full when its receive timeout was due while held: 0 refusals, rejected: []
+SCHED_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail full_refusals=430 full_proving=4 fillers=127 idle_current0=2 cross_cpu=31 kthread_beats=22 done_during_kthread=36 late_max_ns=9012016400 late_median_ns=61535900 calls=39
+rc=1

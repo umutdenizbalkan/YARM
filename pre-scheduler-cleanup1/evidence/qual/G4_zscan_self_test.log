@@ -1,0 +1,11 @@
+[zscan-self-test] ok   hit:  [futex-requeue-grade][fail] race: window 2 never closed
+[zscan-self-test] ok   hit:  [futex-requeue-grade][fail] race: a wake INSIDE the window took a waiter the commit had decided: {'woke': '1'}
+[zscan-self-test] ok   hit:  race: 3 held windows for 2 broadcasts
+[zscan-self-test] ok   hit:  FUTEX_REQUEUE_RACE_IN_WINDOW_WAKE cpu=1 tid=10018 window=1 woke=1
+[zscan-self-test] ok   hit:  FUTEX_WAIT_WITNESS_SEAL arch=x86_64 smp=2 result=fail
+[zscan-self-test] ok   hit:  SL1W_SEAL arch=x86_64 smp=2 host=idle result=fail
+[zscan-self-test] ok   miss: SL1W_GRADE result=pass ncpu=2 | NATURAL trace: 145 sections (20 remote adds) replayed SNAP->CENSUS exactly
+[zscan-self-test] ok   miss: embrace: nothing
+[zscan-self-test] ok   miss: FUTEX_REQUEUE_RACE_IN_WINDOW_WAKE cpu=1 tid=10018 window=1 woke=0
+[zscan-self-test] ok   miss: FUTEX_WAIT_WITNESS_SEAL arch=x86_64 smp=2 result=ok
+[zscan-self-test] all cases hold

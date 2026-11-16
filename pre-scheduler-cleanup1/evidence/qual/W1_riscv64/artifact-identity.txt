@@ -1,0 +1,3 @@
+tree=ad25e7e961380846ab56a6a0a615f82ce006484d head=da7bb37910603733210a89b0bf1cab1125ad69bf dirty=0 kernel_feature=riscv-shared-region-direct-oracle server_features=--no-default-features
+46da598dfbcf44bb714c82757b5742dfe04ff29e6c5a44c65f07750b9a9ef089  build-riscv64/yarm-riscv64.bin
+32a08478ba270c511e4904d5a7bf424d79dbf81eac5c04bbae08f25aace59bb9  build-riscv64/initramfs-core.cpio

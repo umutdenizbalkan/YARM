@@ -1,0 +1,5 @@
+[shared-region-direct-smoke] building base x86_64 artifacts (servers + initramfs)
+[shared-region-direct-smoke] rebuilding kernel_boot with --features x86-shared-region-direct-oracle
+[shared-region-direct-smoke] booting QEMU -smp 1 with yarm.x86_64_shared_region_direct_oracle=1
+[shared-region-direct-smoke][fail] no boot log produced
+SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=x86_64 classes=1 result=fail reason=no_boot_log

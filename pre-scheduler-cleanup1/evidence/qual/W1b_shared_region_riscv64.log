@@ -1,0 +1,6 @@
+[shared-region-direct-riscv64-smoke] building base riscv64 artifacts (servers + initramfs)
+[shared-region-direct-riscv64-smoke] rebuilding kernel_boot with --features riscv-shared-region-direct-oracle
+[shared-region-direct-riscv64-smoke] booting QEMU-virt -smp 1 with yarm.riscv_shared_region_direct_oracle=1
+SHARED_REGION_OFFSET_SEAL arch=riscv64 cell=direct object_offset=4096 installs=2 misplaced=0 result=ok
+[shared-region-direct-riscv64-smoke] all direct-class kernel markers + userspace completion present exactly once; no fuse/enqueue/fault
+SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=riscv64 classes=1 live_cells=1 fuse_trips=0 result=ok

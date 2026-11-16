@@ -1,0 +1,37 @@
+da7bb379 SCHED-SAT-EVIDENCE1: any cell thread ends the hold at its published time
+2e7cf986 SCHED-SAT-EVIDENCE1: fillers check for a top-up every turn
+6b0e4b8a SCHED-SAT-EVIDENCE1: the fillers keep the queues topped up during the hold
+84ebf2e2 SCHED-SAT-EVIDENCE1: R refills its own home slot; hold bounded from R's deadline
+48d640bd SCHED-SAT-EVIDENCE1: R enters its receive after saturation; rustfmt
+b5976270 SCHED-SAT-EVIDENCE1: restore the sched-time cell's phase dispatch
+c027c5ef SCHED-SAT-EVIDENCE1: prove the waiter's own home queue full, then one recovery
+c96c2a25 ARTIFACT-CARGO-BIND1: publish exactly what the current cargo build produced
+156af003 SCHED-LOCK1-ORDER1: credit a hold only for sections recorded after its begin
+5dfac72c printk: zero-initialized slot backing and a 64-record default ring
+b066b261 SR-PLACE1: reserve the shared-region receiver's home slot before delivery
+ Cargo.toml                                         |  15 +-
+ .../src/control_plane/init/service.rs              | 419 +++++++++++++++--
+ scripts/artifact-provenance.py                     |  99 +++-
+ scripts/build-qemu-aarch64-artifacts.sh            |  85 ++--
+ scripts/build-qemu-riscv64-artifacts.sh            |  84 ++--
+ scripts/build-qemu-x86_64-artifacts.sh             | 133 +++---
+ scripts/cargo-artifact.py                          | 100 ++++
+ scripts/grade-futex-time-witness.py                |  94 +++-
+ scripts/grade-sched-lock1-witness.py               |  16 +
+ scripts/grade-sched-time-witness.py                | 183 +++++++-
+ scripts/lib/artifact-binding.sh                    |  81 +++-
+ scripts/test-artifact-cargo-binding.sh             | 161 +++++++
+ src/kernel/boot/shared_region_txn.rs               | 109 ++++-
+ src/kernel/boot/tests.rs                           | 520 +++++++++++++++++++--
+ src/kernel/mod.rs                                  |   6 +
+ src/kernel/printk.rs                               |  91 +++-
+ src/kernel/sat_witness.rs                          | 209 +++++++++
+ src/kernel/schedlock1_hold_order.rs                |  53 +++
+ src/kernel/schedlock1_witness.rs                   |  53 ++-
+ src/kernel/scheduler.rs                            |  14 +
+ src/kernel/syscall.rs                              |  41 +-
+ src/kernel/task_enqueue.rs                         |  21 +-
+ src/runtime.rs                                     | 365 ++++++++++-----
+ tests/artifact_binding_scope.rs                    |  91 +++-
+ 24 files changed, 2588 insertions(+), 455 deletions(-)
+0

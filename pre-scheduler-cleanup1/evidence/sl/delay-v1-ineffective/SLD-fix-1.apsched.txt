@@ -1,0 +1,2 @@
+APSW_GRADER_SELF_TEST arch=riscv64 cases=53 result=ok
+[apsched-witness] building riscv64 artifacts, then the kernel with riscv64-sched-lock1-witness, into /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/sl/delay/SLD-fix-1/build

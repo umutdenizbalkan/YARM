@@ -1,0 +1,10 @@
+1f54acfd0a0525da4e75d95576d84de569a1a2ea2890db858fc837b15d989c0c  psc_matrix.sh
+c20b1867882fa9c060a77c67dfee31c033b47f7ed70fc312a97cbc3333d06864  psc_clipcmp.sh
+c04fc7114e394b7ffed3c2f8f05d90953c900e88bd57b6e30610424b1b38555f  psc_lockattr.sh
+7e2387c8203e234349af4a350993d17128e28510c538ff64f9ea232b8c2ab326  psc_fp.sh
+b917dd60618e168203f9618fbbefefdbe319ae2b0cf34f0ba4a9e5fe046c472d  fwa_zscan.sh
+F=da7bb379 B=2866be83 frozen 2026-11-16T12:46:54Z
+bf74c23fb3e602b6514bdb551c88093ea6200000c3a4e1c28f7a61ab31adab26  psc_addA.sh
+addendum A declared 2026-11-16T13:11:23Z after W1_shared_region_x86_64 rc=1, before it ran
+0536fc2306000510934bfa89731c1c0c3e50be56711a5424f2761ed8be160139  psc_addB.sh
+addendum B declared 2026-11-16T14:06:20Z after W3_sched_time_riscv64 rc=1, before it ran

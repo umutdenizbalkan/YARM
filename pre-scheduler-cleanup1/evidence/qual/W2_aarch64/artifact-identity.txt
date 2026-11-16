@@ -1,0 +1,6 @@
+tree=ad25e7e961380846ab56a6a0a615f82ce006484d head=da7bb37910603733210a89b0bf1cab1125ad69bf dirty=0 kernel_features=--no-default-features --features aarch64-sched-lock1-witness
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18) machine=virt,gic-version=2 cpu=cortex-a72 append=(none)
+d77ae12b27bb3659c74d2aa164bb6b79016632ea92eaba41522bbffab0c9602c  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/W2_aarch64/build/yarm-aarch64.bin
+387b9a25403e0526a0dde6181aa84f9996d9df7574eec4134ff4050384c600fe  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/W2_aarch64/build/yarm-aarch64.elf
+6a535fe91890dd2f875439256e51964c9a4299242d17f72ab79b2ee5148102fe  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/W2_aarch64/build/initramfs-core.cpio
+boot smp=2

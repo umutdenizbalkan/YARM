@@ -1,0 +1,3 @@
+ea00bcc77900e49969926cd220b50a00dbb0648cebeed907f5aa79c039f57b5b  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/sat/dev/ST-rv-1/boot.log
+0e5eb34a2436f4420a08c0ac3313aa8ff54f8beaa3b1b1e8fa48ee1f50275544  build-riscv64/yarm-riscv64.bin
+3c2102f0c63daf89b4200fa8644c9dded9c4201ca6940505704690b199a4deee  build-riscv64/initramfs-core.cpio

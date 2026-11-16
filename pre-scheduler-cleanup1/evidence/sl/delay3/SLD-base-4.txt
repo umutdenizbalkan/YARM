@@ -1,0 +1,7 @@
+SL1W self-test: 9 cases, 1 accepted, 8 rejected, 0 wrong
+ARTIFACT_BINDING arch=riscv64 kernel=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/sl/delay3/SLD-base-4/build/yarm-riscv64-apsw.bin kernel_sha256=8a4381363ef07d6637f4672c8c016e82a912e30bf33e5e921800557a8cb256e7 kernel_features=riscv64-sched-lock1-witness kernel_resolved_features=apsched-witness,riscv64-apsched-witness,riscv64-sched-lock1-witness,sched-lock1-witness kernel_nofp=pass initramfs=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/sl/delay3/SLD-base-4/build/initramfs-core.cpio initramfs_sha256=32a08478ba270c511e4904d5a7bf424d79dbf81eac5c04bbae08f25aace59bb9 initramfs_features=none initramfs_compile_env=none source=dirty:bc75c1abd66cec1f16221b8b202d8838ef440270:4ceaedb977f07d9cd9f1c8ac required=kernel=riscv64-sched-lock1-witness,initramfs=none result=ok
+[apsched-witness] booting -smp 2 with no diagnostic knob
+[apsched-witness] boot dumped after 13.2s
+APSW_WITNESS_SEAL arch=riscv64 cpus=2 admission=production per_cpu_work=threads,forks preempt_recorded=6,8 preempt_counted=6,8,0,0,0,0,0,0 registers=intact deadlines=timed_out dtick=dirq0/own:1:57=57/76 idle_wakes=3_ipi ipc=4 churn=4_reaped_quarantined=0 records=104 result=ok
+SL1W_GRADE result=fail reason=coverage: rounds [0, 1] were never credited (schedule [(0, 1), (1, 0)])
+SL1W_SEAL arch=riscv64 smp=2 host=idle result=fail reason=grade

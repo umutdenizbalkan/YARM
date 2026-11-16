@@ -1,0 +1,17 @@
+yarm_provenance=1
+role=initramfs
+arch=riscv64
+target=targets/riscv64-yarm-user-none.json
+profile=release
+cargo_feature_args=--no-default-features
+default_features=0
+features=none
+compile_env=none
+built_by=build-qemu-riscv64-artifacts.sh
+commit=b066b2616778c5a041a37e103169caf691bcf268
+tree=97a83e3eb49aa7212a8de4a5165e8ad67c42a7dd
+tracked_dirty=3
+source_state=dirty:97a83e3eb49aa7212a8de4a5165e8ad67c42a7dd:d46e82990bce110055ec7b28
+artifact=initramfs-core.cpio
+format=cpio
+sha256=32a08478ba270c511e4904d5a7bf424d79dbf81eac5c04bbae08f25aace59bb9

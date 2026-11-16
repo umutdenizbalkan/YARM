@@ -1,0 +1,14 @@
+srnc6: patched src/runtime.rs
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 705eadde..23ac2421 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -18830,7 +18830,7 @@ impl SharedKernel {
+                     crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, snap.receiver_tid)
+                 });
+                 let placed = self.sr_commit_receiver_placement_split(snap);
+-                if matches!(placed, SrPlacementCommit::Queued) {
++                if !matches!(placed, SrPlacementCommit::Refused) {
+                     // Stage 199D-WA3C2: the receiver is placed and will run — the claimed
+                     // incarnation is DELIVERED. Consume + retire, so the endpoint's ownership
+                     // slot returns to `Vacant` and the next receiver may publish.
