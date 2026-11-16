@@ -2885,6 +2885,13 @@ saturate both queues varied from 56 s to 175 s between runs of the same RISC-V T
 deadline that must fall inside saturation has to be measured from the saturation report, not fixed
 before it (ledger, PRE-SCHEDULER-CLEANUP1).
 
+Third, for placement policy: a balanced spawn cannot be aimed at a home queue. It chooses by the
+user-load mirrors (user threads queued plus current), while admission refuses on the queue length,
+which includes kernel threads. A CPU carrying a kernel thread can therefore look lighter and be chosen
+repeatedly while it is full, even when another CPU has room (W3b). A futex wake does respect the
+waiter's home, and refuses without loss when that home is full (FUTEX-WAKE-CAP1). A scheduler that
+balances by mirror must decide whether the mirror and admission should count the same population.
+
 ### 19.5 Scheduler ticks are not wall time under saturation (QEMU TCG)
 
 Tick-denominated deadlines (IPC receive timeouts, FutexWait's tick bound) advanced about 1.4× slower

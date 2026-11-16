@@ -36599,8 +36599,111 @@ baseline has no saturation-proving cell, so a baseline rerun would not resolve a
 run. The cause is the cell's fixed W deadline against a variable saturation time under RISC-V TCG
 (ledger, OPEN LIMITATION); the remedy would change the frozen candidate and was not applied.
 
-**Verdict: NOT QUALIFIED as delivered** — every kernel, build, footprint, binding and witness check
+**Verdict at F: NOT QUALIFIED as delivered** (superseded: see addendum Q2 below, which repairs both open items and corrects a false AArch64 PASS in the table above) — every kernel, build, footprint, binding and witness check
 passed on all three ports except the RISC-V sched-time witness, whose saturation-at-deadline condition
 was reached in development (ST-rv-6) but in neither qualification run. The work branch carries F and
 this record; `claude/yarm-kernel-unlock-u0-f2zh8p` stays at `2866be83` (not fast-forwarded). Scheduler
 design inputs from this stage are in `SCHEDULING_CONTRACT.md` §19.
+
+##### Qualification addendum Q2 — the two open qualification items (from `93edaac9`)
+
+Scope: only the two items the verdict above left open, plus one false pass found while reviewing
+them. The candidate is C2 = `1eb75614`: code commits `cd59ac47` (BOOT-COMPLETE1), `1e4e88be` and
+`1eb75614` (SCHED-SAT-HANDOFF1) on `93edaac9`. The kernel is unchanged from F = `da7bb379`. Coverage
+from the original matrix is reused for everything these commits do not touch. The runner
+(`psc_q2.sh`, sha256 `fa2a4b24…`) was hashed before its first step; every log is kept.
+
+**Correction to the table above.** "builds and smokes — … default … SMP 2 core smokes … all pass" is
+wrong for AArch64. D2s's PASS was false: the runner stopped QEMU 2 s after the first
+`SCHED_ENTER_IDLE_HLT`. That marker precedes the supervisor's first userspace log, and the stop came
+while RAMFS's ELF was loading (`RAMFS_MOUNT_READY=0`, `EXT4_SRV_READY=0`). S4 (strict), booting
+byte-identical artifacts, completed both mounts only because it finished inside the grace window.
+
+**BOOT-COMPLETE1.** The AArch64 default profile now stops, and passes, only on an ordered sequence
+(`scripts/check-aarch64-boot-completion.py`), each stage matched at its first occurrence after the
+previous one:
+1. the core services start (supervisor, PM, init, initramfs, devfs, VFS);
+2. RAMFS is spawned, its `/ram` mount is ready, and `/ram` is registered;
+3. EXT4 is spawned and ready, and `/ext4` is registered;
+4. init reaches its terminal park (`INIT_IDLE_PARK_BEGIN`, `INIT_IDLE_PARK_FUTEX_BEGIN`, the kernel's
+   `FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid=1`);
+5. then `SCHED_ENTER_IDLE_HLT`, with init still parked.
+
+The wait stays bounded (`IDLE_MAX_SECS`), an incomplete sequence fails in every mode, and the blocker
+checks are unchanged. The default profile is identified by kernel and initramfs provenance with no
+features, no kernel command line and no caller-set `TERMINAL_IDLE_MARKER`. Every witness and oracle
+profile keeps its own stop marker unchanged.
+
+**SCHED-SAT-HANDOFF1.**
+- W now stays runnable until H reports verified saturation (`STW_SAT_READY`), then arms an absolute
+  sleep 10 s after that point. R's timed receive (target 10 s) also starts after it.
+- W3b showed that a spawn top-up cannot refill a given home queue. Balanced placement chooses by
+  user-load mirrors while admission counts every queue entry, so every top-up there was refused while
+  R's home held 63 of 64.
+- So the cell spawns 24 spare fillers while the queues are empty, each parked on its own futex word. A
+  futex wake places its waiter on the waiter's home CPU, or is refused (leaving it parked) when that
+  home is full (FUTEX-WAKE-CAP1). Waking every spare in turn therefore fills exactly the homes that
+  have room.
+- H runs a spare pass after saturating. Any cell thread runs one as soon as both waiters arm, then
+  every 250 ms through both deadlines, ahead of the spawn top-up. The released queues then let both
+  waiters recover.
+- The grader's full-queue and exactly-once rules are unchanged. It now also requires exactly one
+  `STW_SAT_READY`, W's `full` call and R's graded receive after it (t0 not before its full_at), and
+  `STW_SATURATED w_deadline` equal to the deadline W slept to.
+- `1e4e88be` did not compile: its scripted edit replaced a span anchored on the first
+  `fn helper_saturate`, which belongs to `futex_time_witness`, deleting that module's tail and the
+  sched-time module's head. Its qualification build failed at L2; the run is preserved
+  (`q2/C1_1e4e88be/`). `1eb75614` rebuilt the file from `93edaac9` with every edit confined to the
+  module, compile-checked on all three targets before the rerun.
+
+| step | command (in a clean checkout of C2) | result |
+|---|---|---|
+| C1 | `bash -n` on both smoke scripts, `py_compile` on both Python files, `rustfmt --check` on the cell | ok |
+| C2 | `check-aarch64-boot-completion.py self-test` | 13 cases ok |
+| C3 | `… replay qual/D2s.boot.log qual/S4.boot.log` | D2s incomplete (missing `ramfs_mount_ready` after line 23207); S4 complete; S4 cut before its post-park idle (line 30899) incomplete although its early idle at line 1333 remains |
+| C4 | sched-time, FUTEX-TIME1 and SCHED-LOCK1 grader self-tests | ok |
+| C5, C6 | sched-time grader on the preserved W3 and W3b logs | both still fail. W3: saturation after the deadline, no `STW_SAT_READY`. W3b: 0 refusals of W, R settled outside refusal..return, no `STW_SAT_READY` |
+| L1 | `build-qemu-aarch64-artifacts.sh`; `QEMU_SMP=2 qemu-aarch64-core-smoke.sh` | PASS, completion condition `full`. Kernel `de3d6b73…` and initramfs `6a535fe9…` (the artifacts D2s and S4 booted), binding `result=ok` |
+| L2 | `SMP=2 qemu-sched-time-witness-smoke.sh riscv64` | sealed. Kernel `0e5eb34a…`, initramfs `23b4408a…` |
+| L3, L4 | the same on x86_64 and AArch64 (the cell is shared by every port's sched-time profile) | sealed. x86_64 kernel `69ab9a66…`, initramfs `f1a4e02a…`; AArch64 kernel `0f14d9af…`, initramfs `da02da7d…` |
+
+L1 ordered markers (boot log line numbers):
+
+| stage | line | marker |
+|---|---|---|
+| core services | 1409–7375 | `SUP_RUN_ENTER`, `PM_RECV_LOOP_START`, `INIT_BIN_ENTRY_START`, initramfs, devfs and VFS receive loops |
+| RAMFS spawn | 23035 | `INIT_RAMFS_SPAWN_BEGIN` |
+| RAMFS ready | 26677 | `RAMFS_MOUNT_READY prefix=/ram` |
+| `/ram` registered | 27543 | `VFS_MOUNT_REGISTER_RAMFS_OK prefix=/ram` |
+| EXT4 ready | 30689 | `EXT4_SRV_READY` |
+| `/ext4` registered | 31229 | `VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4` |
+| init park | 31269, 31321 | `INIT_IDLE_PARK_BEGIN`, `INIT_IDLE_PARK_FUTEX_BEGIN` |
+| init parked | 31343 | `FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid=1` |
+| idle path | 31381 | `AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0` |
+| idle | 31383 | `SCHED_ENTER_IDLE_HLT` |
+
+The first `SCHED_ENTER_IDLE_HLT` (line 1335) did not stop the run.
+
+L2 live markers (RISC-V SMP 2; monotonic ns, R in ticks):
+
+| event | marker |
+|---|---|
+| spares parked | `STW_SPARES spawned=24 parking=24` |
+| saturation verified | `STW_SAT_READY full_at=220509020300 refusals=4` |
+| R arms | `STW_RECV_CALL ticks=112 earliest=230437980826 sat_ready=1` |
+| W arms | `STW_CALL case=full flags=1 bound=230670675100`, its REGISTER at gen 36 |
+| W refused at expiry | `SATW_REFUSED class=sleep home=1 tid=10011 gen=36 queued=64 reserved=0 full=1 deadline=230670675100 now=230672137800 facts=ok` |
+| R refused at expiry | `SATW_REFUSED class=recv home=1 tid=10010 gen=2 queued=64 full=1 deadline=4636 now=4636 facts=ok` |
+| R deferred | 2,013 `U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid=10010 wait_generation=2` |
+| hold released | `STW_HOLD_RELEASED at=270530002500` |
+| W completes | exactly one `STW_SLEEP_DONE tid=10011 gen=36 now=313858185800`, then `STW_RET case=full code=0` |
+| R settles | exactly one `U8_RECV_TIMEOUT_SETTLED tid=10010 wait_generation=2 now=7040`, then `STW_RECV_RET outcome=none` |
+| rotation | `STW_ROTATION fillers=151 parked=151` (127 fillers plus 24 spares) |
+
+The diagnostic `STW_HANDOFF` line was logged late (at 239.3 s, `early=0`), because the thread that
+logs it ran late. It is not proof; the kernel refusals above are.
+
+**Verdict (final): QUALIFIED.**
+- The two items are repaired, and their evidence passed on the live cells.
+- The false AArch64 default-profile pass is corrected and requalified.
+- The kernel, and every other result in the matrix above, is unchanged from F.
