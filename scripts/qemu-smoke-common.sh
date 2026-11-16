@@ -85,6 +85,49 @@ run_qemu_until_idle_or_timeout() {
   return "$status"
 }
 
+# BOOT-COMPLETE1: like run_qemu_until_idle_or_timeout, but QEMU is stopped only once COMPLETION_CMD
+# (run with the log path appended) succeeds — an ordered completion sequence, not the first
+# occurrence of a marker. Returns 0 when complete, 3 when QEMU exited before completion, 124 when
+# max_secs passed without completion. Usage:
+#   run_qemu_until_complete_or_timeout MAX_SECS LOGFILE "COMPLETION_CMD" QEMU_BIN ARGS...
+run_qemu_until_complete_or_timeout() {
+  local max_secs="$1"
+  local logfile="$2"
+  local completion_cmd="$3"
+  shift 3
+  rm -f "$logfile"
+  : >"$logfile"
+  set +e
+  "$@" >"$logfile" 2>&1 &
+  local qpid=$!
+  local waited=0
+  local status=124
+  while :; do
+    if $completion_cmd "$logfile" >/dev/null 2>&1; then
+      # Complete — one second for trailing serial, then stop QEMU.
+      sleep 1
+      status=0
+      break
+    fi
+    if ! kill -0 "$qpid" 2>/dev/null; then
+      $completion_cmd "$logfile" >/dev/null 2>&1 && status=0 || status=3
+      break
+    fi
+    if [[ "$waited" -ge "$max_secs" ]]; then
+      status=124
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  kill "$qpid" 2>/dev/null
+  sleep 1
+  kill -9 "$qpid" 2>/dev/null
+  wait "$qpid" 2>/dev/null
+  set -e
+  return "$status"
+}
+
 check_common_boot_markers() {
   local logfile="$1"
   local marker_regex="$2"

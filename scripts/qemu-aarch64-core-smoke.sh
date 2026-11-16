@@ -217,8 +217,42 @@ SPAWN_IPC_SEQUENCE=(
 # fails. IDLE_MAX_SECS bounds a genuine hang. Set QEMU_EXPECT_TERMINAL_IDLE=0 for the legacy run.
 QEMU_EXPECT_TERMINAL_IDLE="${QEMU_EXPECT_TERMINAL_IDLE:-1}"
 IDLE_MAX_SECS="${IDLE_MAX_SECS:-180}"
+TERMINAL_IDLE_MARKER_EXPLICIT=0
+[[ -n "${TERMINAL_IDLE_MARKER:-}" ]] && TERMINAL_IDLE_MARKER_EXPLICIT=1
 TERMINAL_IDLE_MARKER="${TERMINAL_IDLE_MARKER:-SCHED_ENTER_IDLE_HLT}"
-if [[ "$QEMU_EXPECT_TERMINAL_IDLE" == "1" ]]; then
+# BOOT-COMPLETE1: the default profile's completion condition. The first SCHED_ENTER_IDLE_HLT of an
+# AArch64 boot precedes the supervisor's first userspace log, so stopping on it (plus a grace
+# period) could cut a boot off during RAMFS's ELF load and still PASS. The default profile — kernel
+# and initramfs built with no features, no kernel command line, no caller-chosen terminal marker —
+# now stops, and passes, only on the ordered sequence in scripts/check-aarch64-boot-completion.py:
+# core services started, RAMFS ready and `/ram` registered, EXT4 ready and `/ext4` registered,
+# init's terminal park, then the scheduler's idle. Witness and oracle profiles keep their own stop
+# marker unchanged. BOOT_COMPLETION=auto (default) | full | idle overrides the choice.
+BOOT_COMPLETION="${BOOT_COMPLETION:-auto}"
+BOOT_COMPLETION_CHECK="python3 -I $(dirname "$0")/check-aarch64-boot-completion.py check"
+if [[ "$BOOT_COMPLETION" == "auto" ]]; then
+  BOOT_COMPLETION=idle
+  bc_prov="python3 -I $(dirname "$0")/artifact-provenance.py show"
+  bc_kfeat="$($bc_prov "$KERNEL_IMAGE" 2>/dev/null | sed -n 's/^features=//p' | head -n1)"
+  bc_ifeat="$($bc_prov "$INITRAMFS_IMAGE" 2>/dev/null | sed -n 's/^features=//p' | head -n1)"
+  bc_ienv="$($bc_prov "$INITRAMFS_IMAGE" 2>/dev/null | sed -n 's/^compile_env=//p' | head -n1)"
+  if [[ "$QEMU_EXPECT_TERMINAL_IDLE" == "1" && "$TERMINAL_IDLE_MARKER_EXPLICIT" == "0" \
+    && -z "$KERNEL_CMDLINE" && "$TERMINAL_FAULT_ORACLE" != "1" \
+    && "$bc_kfeat" == "none" && "$bc_ifeat" == "none" && "$bc_ienv" == "none" ]]; then
+    BOOT_COMPLETION=full
+  fi
+fi
+echo "[info] aarch64 core: completion condition: $BOOT_COMPLETION"
+if [[ "$QEMU_EXPECT_TERMINAL_IDLE" == "1" && "$BOOT_COMPLETION" == "full" ]]; then
+  if run_qemu_until_complete_or_timeout "$IDLE_MAX_SECS" "$LOGFILE" "$BOOT_COMPLETION_CHECK" \
+    "$QEMU_BIN" "${QEMU_ARGS[@]}"; then
+    QEMU_STATUS=0
+    echo "[ok] aarch64 core: boot completion sequence reached — QEMU stopped intentionally"
+  else
+    QEMU_STATUS=$?
+    echo "[err] aarch64 core: boot completion sequence not reached (status=$QEMU_STATUS; 3 = QEMU exited, 124 = ${IDLE_MAX_SECS}s bound)"
+  fi
+elif [[ "$QEMU_EXPECT_TERMINAL_IDLE" == "1" ]]; then
   if run_qemu_until_idle_or_timeout "$IDLE_MAX_SECS" "$LOGFILE" "$TERMINAL_IDLE_MARKER" \
     "$QEMU_BIN" "${QEMU_ARGS[@]}"; then
     QEMU_STATUS=0
@@ -1300,6 +1334,17 @@ fi
 
 if [[ "$TERMINAL_ACQUISITION_FAIL" == "1" ]]; then
   echo "[error] aarch64 core smoke FAILED: a trap reached the bridge unsettled"
+  exit 1
+fi
+
+# BOOT-COMPLETE1: the default profile's verdict is the ordered completion sequence, and a missing
+# stage fails in every mode (the first idle marker alone proves nothing).
+if [[ "$QEMU_EXPECT_TERMINAL_IDLE" == "1" && "$BOOT_COMPLETION" == "full" ]]; then
+  if $BOOT_COMPLETION_CHECK "$LOGFILE"; then
+    echo "[ok] aarch64 core: core services, /ram, /ext4, init's terminal park, then idle — in order — PASS"
+    exit 0
+  fi
+  echo "[error] aarch64 core smoke FAILED: the default-profile boot completion sequence is incomplete"
   exit 1
 fi
 
