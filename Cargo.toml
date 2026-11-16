@@ -27,6 +27,11 @@ resolver = "2"
 
 [features]
 default = ["hosted-dev"]
+# PRINTK-FOOTPRINT1: the marker-heavy witnesses' printk ring (`kernel::printk::PRB_SLOTS_WITNESS`,
+# 1024 records) instead of the default ring (`PRB_SLOTS_DEFAULT`). Their saturation workloads emit
+# yield-storm bursts that lap a small ring while another CPU holds the console drain; a default or
+# strict boot does not. Implied by each such witness feature; never needed on its own.
+printk-witness-ring = []
 hosted-dev = []
 posix-compat = []
 linux-compat = ["posix-compat"]
@@ -139,7 +144,7 @@ x86-sched-lock1-witness = ["x86-apsched-witness", "sched-lock1-witness"]
 aarch64-sched-lock1-witness = ["aarch64-apsched-witness", "sched-lock1-witness"]
 riscv64-sched-lock1-witness = ["riscv64-apsched-witness", "sched-lock1-witness"]
 # The port-neutral half (`kernel::schedlock1_witness`): never enabled on its own.
-sched-lock1-witness = []
+sched-lock1-witness = ["printk-witness-ring"]
 # QEMU-LOCK1: real subdomain-lock contention on the production VM address-space lock
 # (`vm_state_lock`, rank 5), driven by the SMP3 two-hart VM/IPI workload (which it co-enables). It
 # instruments the chosen lock's atomic acquire/release, a default-off bounded hold hook that makes a
@@ -239,15 +244,15 @@ futex-requeue-witness = []
 # issue those wakes. Default off; no production path changes with it off.
 futex-requeue-race-witness = []
 # FUTEX-WAIT-ATOMIC1: the live wait witness (windows B and A of a witness FutexWait).
-futex-wait-witness = []
+futex-wait-witness = ["printk-witness-ring"]
 # RISCV-ECALL-A7-RET1: the live RISC-V ecall register-contract witness (kernel half: one marker
 # per keyed write-back naming the arm that resumed the continuation and the registers it wrote).
-riscv-ecall-witness = []
+riscv-ecall-witness = ["printk-witness-ring"]
 # FUTEX-TIME1 — the live timed-wait witness (default off; kernel markers + init role).
-futex-time-witness = []
+futex-time-witness = ["printk-witness-ring"]
 # SCHED-TIME-FOUNDATION1 C — the live sleep witness (default off; kernel markers, the exit and
 # kernel-thread fixtures of `kernel::sleep_witness`, and init's cell).
-sched-time-witness = []
+sched-time-witness = ["printk-witness-ring"]
 # QEMU-IRQ1: the first real external-interrupt witness — RISC-V UART0 -> PLIC -> YARM on QEMU
 # virt. Compiles the kernel-only device window install, the idle-origin supervisor-external
 # admission, the UART setup/drain fixture, the provisioning of init's notification + ring page, the

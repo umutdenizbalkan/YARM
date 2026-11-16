@@ -6,18 +6,39 @@ use crate::kernel::lock::SpinLockIrq;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 
-/// The ring's record capacity. SCHED-TIME-FOUNDATION1: 128 -> 1024. The full-queue rotation
-/// repair lets a yield storm on a saturated CPU actually switch (each committed yield is a burst of
-/// about 25 records on RISC-V), and with 128 slots a burst on one CPU lapped the ring while the
-/// other CPU held the console drain: records were genuinely lost (announced by
-/// `PRINTK_RECORDS_LOST`), and the core smoke's one-to-one marker reconciliation — whose premise is
-/// a lossless stream — failed on a correct kernel. 1024 slots (about 200 KB of `.bss`) absorb those
-/// bursts; a lost record is still announced at the place it was lost.
-pub const PRB_SLOTS: usize = 1024;
+/// The ring's record capacity.
+///
+/// SCHED-TIME-FOUNDATION1 raised it 128 -> 1024 for the marker-heavy witnesses: the full-queue
+/// rotation repair lets a yield storm on a saturated CPU actually switch (each committed yield is
+/// a burst of about 25 records on RISC-V), and with 128 slots a burst on one CPU lapped the ring
+/// while the other CPU held the console drain, so the witness's one-to-one marker reconciliation —
+/// whose premise is a lossless stream — failed on a correct kernel.
+///
+/// PRINTK-FOOTPRINT1: those bursts come from the witnesses' saturation workloads, not from a
+/// default boot. The default ring is [`PRB_SLOTS_DEFAULT`]; a build with `printk-witness-ring` —
+/// implied by every marker-heavy witness feature — keeps [`PRB_SLOTS_WITNESS`]. Either way a lost
+/// record is announced at the place it was lost (`PRINTK_RECORDS_LOST`).
+///
+/// The default is 64: 128, 64 and 32 slots were each measured lossless on the default and strict
+/// core smokes (x86_64 SMP 1/2/4, AArch64 SMP 2, RISC-V SMP 1/2/4, strict on all three ports), and
+/// 64 is the structural floor: every port admits [`MAX_CPUS`](crate::kernel::topology::MAX_CPUS)
+/// = 64 CPUs, and a ring smaller than that can lap a record one CPU still holds in flight when
+/// every CPU logs at once — the held-not-skipped guarantee (BL5d) would become a loss.
+pub const PRB_SLOTS_DEFAULT: usize = 64;
+/// The marker-heavy witness builds' capacity (see [`PRB_SLOTS`]).
+pub const PRB_SLOTS_WITNESS: usize = 1024;
+#[cfg(not(feature = "printk-witness-ring"))]
+pub const PRB_SLOTS: usize = PRB_SLOTS_DEFAULT;
+#[cfg(feature = "printk-witness-ring")]
+pub const PRB_SLOTS: usize = PRB_SLOTS_WITNESS;
 pub const PRB_MSG_MAX: usize = 192;
 const _: () = assert!(
     PRB_SLOTS.is_power_of_two(),
     "PRB_SLOTS must be a power of two"
+);
+const _: () = assert!(
+    PRB_SLOTS_DEFAULT >= crate::kernel::topology::MAX_CPUS,
+    "the default ring must hold one in-flight record per CPU"
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,11 +128,16 @@ struct PrbSlot {
 }
 
 impl PrbSlot {
+    /// PRINTK-FOOTPRINT1: ALL-ZERO, so the slot backing is zero-initialized storage (`.bss`) and
+    /// costs no image bytes. Every field of an unwritten slot is zero; `level` used to start at
+    /// `Debug` (7), which alone forced the whole array into `.data`. An uncommitted slot's level is
+    /// never read (`read_if_seq` refuses a slot that is not `committed`), so its initial value has
+    /// no observable meaning; `context` was already `Normal` = 0.
     const fn new() -> Self {
         Self {
             seq: AtomicU64::new(0),
             len: AtomicU16::new(0),
-            level: AtomicU8::new(LogLevel::Debug as u8),
+            level: AtomicU8::new(0),
             context: AtomicU8::new(PrintkContext::Normal as u8),
             committed: AtomicBool::new(false),
             bytes: [const { AtomicU8::new(0) }; PRB_MSG_MAX],
@@ -160,22 +186,35 @@ impl PrbSlot {
     }
 }
 
+/// PRINTK-FOOTPRINT1: the slot backing, a separate all-zero object (see [`PrbSlot::new`]).
+struct PrbSlots([PrbSlot; PRB_SLOTS]);
+
+impl PrbSlots {
+    const fn new() -> Self {
+        Self([const { PrbSlot::new() }; PRB_SLOTS])
+    }
+}
+
+/// The ring header: sequence counters, loss accounting and the console threshold — unchanged in
+/// meaning and initial value (`next_seq` and `reader_seq` start at 1, the threshold at `Info`).
+/// It holds the slot backing by reference, so the few non-zero header initializers no longer
+/// force the slot array into initialized data.
 struct PrintkRing {
     next_seq: AtomicU64,
     dropped: AtomicU64,
     truncated: AtomicU64,
-    slots: [PrbSlot; PRB_SLOTS],
+    slots: &'static PrbSlots,
     console_loglevel: AtomicU8,
     reader_seq: AtomicU64,
 }
 
 impl PrintkRing {
-    const fn new() -> Self {
+    const fn new(slots: &'static PrbSlots) -> Self {
         Self {
             next_seq: AtomicU64::new(1),
             dropped: AtomicU64::new(0),
             truncated: AtomicU64::new(0),
-            slots: [const { PrbSlot::new() }; PRB_SLOTS],
+            slots,
             console_loglevel: AtomicU8::new(LogLevel::Info as u8),
             reader_seq: AtomicU64::new(1),
         }
@@ -187,7 +226,7 @@ impl PrintkRing {
         if msg.len() > PRB_MSG_MAX {
             self.truncated.fetch_add(1, Ordering::Relaxed);
         }
-        self.slots[idx].write(seq, level, context, msg);
+        self.slots.0[idx].write(seq, level, context, msg);
     }
 
     fn snapshot_latest(&self, out: &mut [PrintkRecord]) -> usize {
@@ -200,7 +239,7 @@ impl PrintkRing {
         let mut seq = start;
         while seq <= last && written < out.len() {
             let idx = (seq as usize) & (PRB_SLOTS - 1);
-            if let Some(rec) = self.slots[idx].read_if_seq(seq) {
+            if let Some(rec) = self.slots.0[idx].read_if_seq(seq) {
                 out[written] = rec;
                 written += 1;
             }
@@ -233,7 +272,7 @@ impl PrintkRing {
         let mut lost: Option<(u64, u64)> = None;
         while seq <= last {
             let idx = (seq as usize) & (PRB_SLOTS - 1);
-            if let Some(rec) = self.slots[idx].read_if_seq(seq) {
+            if let Some(rec) = self.slots.0[idx].read_if_seq(seq) {
                 self.announce_lost(&mut lost, &mut sink);
                 if (rec.level as u8) <= threshold {
                     sink(rec.level, rec.context, rec.as_str());
@@ -242,7 +281,7 @@ impl PrintkRing {
                 seq = seq.saturating_add(1);
                 continue;
             }
-            let held = self.slots[idx].seq.load(Ordering::Acquire);
+            let held = self.slots.0[idx].seq.load(Ordering::Acquire);
             let lapped =
                 self.next_seq.load(Ordering::Acquire).saturating_sub(seq) > PRB_SLOTS as u64;
             if held > seq || lapped {
@@ -285,7 +324,8 @@ impl PrintkRing {
     }
 }
 
-static PRINTK: PrintkRing = PrintkRing::new();
+static PRINTK_SLOTS: PrbSlots = PrbSlots::new();
+static PRINTK: PrintkRing = PrintkRing::new(&PRINTK_SLOTS);
 #[cfg(not(feature = "hosted-dev"))]
 static PRINTK_DRAIN_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 
@@ -479,6 +519,11 @@ mod tests {
         set_console_loglevel(LogLevel::Info);
     }
 
+    /// A fresh, private slot backing for a test ring (leaked: tests are short-lived).
+    fn test_slots() -> &'static PrbSlots {
+        std::boxed::Box::leak(std::boxed::Box::new(PrbSlots::new()))
+    }
+
     // BL5d — the drain holds an in-flight record and announces a lost one.
     fn drain_all(ring: &PrintkRing) -> Vec<String> {
         let mut out = Vec::<String>::new();
@@ -492,7 +537,7 @@ mod tests {
 
     #[test]
     fn bl5d_an_uncommitted_record_is_held_not_skipped() {
-        let ring = std::boxed::Box::new(PrintkRing::new());
+        let ring = std::boxed::Box::new(PrintkRing::new(test_slots()));
         push(&ring, "A");
         // Another CPU reserves the next sequence number and is still copying its bytes.
         let s = ring.next_seq.fetch_add(1, Ordering::AcqRel);
@@ -504,7 +549,7 @@ mod tests {
         );
         assert_eq!(ring.reader_seq.load(Ordering::Acquire), s);
         // The writer commits; its own flush then emits it and what queued behind it, in order.
-        ring.slots[(s as usize) & (PRB_SLOTS - 1)].write(
+        ring.slots.0[(s as usize) & (PRB_SLOTS - 1)].write(
             s,
             LogLevel::Info,
             PrintkContext::Normal,
@@ -517,7 +562,7 @@ mod tests {
 
     #[test]
     fn bl5d_an_overwritten_record_is_counted_and_announced_where_it_was_lost() {
-        let ring = std::boxed::Box::new(PrintkRing::new());
+        let ring = std::boxed::Box::new(PrintkRing::new(test_slots()));
         for i in 1..=(PRB_SLOTS + 2) {
             push(&ring, &std::format!("m{i}"));
         }
@@ -533,7 +578,7 @@ mod tests {
 
     #[test]
     fn bl5d_an_in_flight_record_the_ring_has_lapped_is_lost_not_waited_on() {
-        let ring = std::boxed::Box::new(PrintkRing::new());
+        let ring = std::boxed::Box::new(PrintkRing::new(test_slots()));
         let s = ring.next_seq.fetch_add(1, Ordering::AcqRel);
         for i in 0..PRB_SLOTS {
             push(&ring, &std::format!("n{i}"));
@@ -553,9 +598,9 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool as StdBool;
         const WRITERS: usize = 4;
-        const EACH: usize = 30; // 120 < PRB_SLOTS: the ring never laps
+        const EACH: usize = PRB_SLOTS / WRITERS - 1; // fewer than PRB_SLOTS: the ring never laps
         for _round in 0..200 {
-            let ring = Arc::new(PrintkRing::new());
+            let ring = Arc::new(PrintkRing::new(test_slots()));
             let done = Arc::new(StdBool::new(false));
             let drainer = {
                 let (ring, done) = (Arc::clone(&ring), Arc::clone(&done));
