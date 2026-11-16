@@ -1,0 +1,5 @@
+[ipccall-reply-direct-smp] building base x86_64 artifacts (servers + initramfs)
+[ipccall-reply-direct-smp] rebuilding kernel_boot with --features x86-ipccall-direct-oracle
+[ipccall-reply-direct-smp] booting QEMU -smp 2 with yarm.x86_64_ipccall_direct_oracle=1
+[ipccall-reply-direct-smp] SMP=2 boot clean; BSP direct round trip intact; NO cross-CPU IPC markers (oracle not wired)
+STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 pairs=1 cross_cpu_request=0 cross_cpu_reply=0 result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired

@@ -1,0 +1,259 @@
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/boot/exec_state.rs:1356:
+                 let mut guard = self.scheduler_state();
+                 let mut all = guard.view();
+                 match all.cpu(home) {
+[31m-                    Ok(mut view) => self.with_tcbs(|tcbs| te::reserve_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())),
+[m[32m+                    Ok(mut view) => self.with_tcbs(|tcbs| {
+[m[32m+                        te::reserve_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+[m[32m+                    }),
+[m                     Err(err) => Err(super::map_scheduler_error(err)),
+                 }
+             };
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/boot/exec_state.rs:1421:
+                 let mut guard = self.scheduler_state();
+                 let mut all = guard.view();
+                 let committed = match all.cpu(home) {
+[31m-                    Ok(mut view) => self.with_tcbs(|tcbs| te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())),
+[m[32m+                    Ok(mut view) => self.with_tcbs(|tcbs| {
+[m[32m+                        te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+[m[32m+                    }),
+[m                     Err(err) => Err(super::map_scheduler_error(err)),
+                 };
+                 if let Err(err) = committed {
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/boot/exec_state.rs:1556:
+                 let mut guard = self.scheduler_state();
+                 let mut all = guard.view();
+                 match all.cpu(target) {
+[31m-                    Ok(mut view) => self.with_tcbs(|tcbs| te::reserve_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())),
+[m[32m+                    Ok(mut view) => self.with_tcbs(|tcbs| {
+[m[32m+                        te::reserve_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+[m[32m+                    }),
+[m                     Err(err) => Err(super::map_scheduler_error(err)),
+                 }
+             };
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/boot/exec_state.rs:1595:
+                 te::release_enqueue_reservation_on_cpu_locked(&mut view, &plan);
+                 continue;
+             }
+[31m-            match self.with_tcbs(|tcbs| te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())) {
+[m[32m+            match self.with_tcbs(|tcbs| {
+[m[32m+                te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+[m[32m+            }) {
+[m                 Ok(ReservedCommit::Queued(_) | ReservedCommit::AlreadyPlaced(_)) => woke += 1,
+                 // SCHED-LOCK2A: the home admission refused (stale incarnation); the slot was
+                 // released by the commit itself, and nothing was queued.
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/boot/ipc_state.rs:137:
+         let mut guard = self.scheduler_state();
+         let mut all = guard.view();
+         let mut view = all.cpu(home).ok()?;
+[31m-        self.with_tcbs(|tcbs| te::reserve_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())).ok()?;
+[m[32m+        self.with_tcbs(|tcbs| te::reserve_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice()))
+[m[32m+            .ok()?;
+[m         Some(plan)
+     }
+     fn rtd_enqueue_reserved(&mut self, plan: Self::Placement) {
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/boot/ipc_state.rs:148:
+         let mut guard = self.scheduler_state();
+         let mut all = guard.view();
+         if let Ok(mut view) = all.cpu(home)
+[31m-            && let Err(err) = self.with_tcbs(|tcbs| te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice()))
+[m[32m+            && let Err(err) = self.with_tcbs(|tcbs| {
+[m[32m+                te::commit_reserved_enqueue_on_cpu_locked(&mut view, &plan, tcbs.as_slice())
+[m[32m+            })
+[m         {
+             crate::yarm_log!(
+                 "IPC_WAKE_RESERVED_COMMIT_REFUSED tid={} cpu={} err={:?}",
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/boot/tests.rs:196388:
+                 }
+             }
+             // SCHED-LOCK2A: the incoming task's home is `cpu`, assigned before its placement.
+[31m-            s.rehome_unplaced_task_for_test(incoming, cpu).expect("rehome");
+[m[32m+            s.rehome_unplaced_task_for_test(incoming, cpu)
+[m[32m+                .expect("rehome");
+[m             s.enqueue_on_cpu(cpu, incoming).expect("enqueue");
+         });
+         let dispatch =
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/boot/tests.rs:202055:
+             for c in 0..crate::kernel::scheduler::MAX_CPUS {
+                 let _ = s.withdraw_queued_tid_on(CpuId(c as u8), PARENT);
+             }
+[31m-            s.rehome_unplaced_task_for_test(PARENT, CPU1).expect("rehome");
+[m[32m+            s.rehome_unplaced_task_for_test(PARENT, CPU1)
+[m[32m+                .expect("rehome");
+[m             s.enqueue_on_cpu(CPU1, PARENT).expect("enqueue");
+             assert_eq!(s.dispatch_next_on_cpu(CPU1), Some(PARENT));
+         });
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/sched_lock2a_tests/tests.rs:99:
+     assert_eq!(k.runnable_count_on_cpu_split_read(CpuId(1)), cpu1_before);
+     assert!(!queued_on(&k, CpuId(0), 91_001));
+     assert!(queued_on(&k, CpuId(1), 91_001));
+[31m-    assert_eq!(home(&k, 91_001), Some(CpuId(1)), "the home record is unchanged");
+[m[32m+    assert_eq!(
+[m[32m+        home(&k, 91_001),
+[m[32m+        Some(CpuId(1)),
+[m[32m+        "the home record is unchanged"
+[m[32m+    );
+[m }
+ 
+ /// Two CPUs racing to place a homeless task FIRST, on different CPUs: exactly one wins, its CPU
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/sched_lock2a_tests/tests.rs:257:
+         te::commit_reserved_enqueue_on_cpu_locked(&mut v, &plan, &[Some(b)]),
+         Ok(ReservedCommit::Refused(CpuId(1)))
+     );
+[31m-    assert_eq!(v.witness_occupancy(TaskPriority::Normal), (0, 0), "promise released");
+[m[32m+    assert_eq!(
+[m[32m+        v.witness_occupancy(TaskPriority::Normal),
+[m[32m+        (0, 0),
+[m[32m+        "promise released"
+[m[32m+    );
+[m     assert!(!v.contains_or_current(ThreadId(31)));
+ }
+ 
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/sched_lock2a_tests/tests.rs:340:
+     let _ = k.with_cpu_sched_split(CpuId(1), |c| c.withdraw_queued_tid(ThreadId(94_001)));
+     for cpu in [CpuId(0), CpuId(1)] {
+         let _ = k.with_cpu_sched_split(cpu, |c| c.block_current());
+[31m-        assert_eq!(k.with_cpu_sched_split(cpu, |c| c.current_tid()).unwrap(), None);
+[m[32m+        assert_eq!(
+[m[32m+            k.with_cpu_sched_split(cpu, |c| c.current_tid()).unwrap(),
+[m[32m+            None
+[m[32m+        );
+[m     }
+     assert!(!k.restore_current_exact_split(CpuId(0), 94_001, TaskPriority::Normal));
+     assert_eq!(
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/sched_lock2a_tests/tests.rs:347:
+[31m-        k.with_cpu_sched_split(CpuId(0), |c| c.current_tid()).unwrap(),
+[m[32m+        k.with_cpu_sched_split(CpuId(0), |c| c.current_tid())
+[m[32m+            .unwrap(),
+[m         None,
+         "CPU 0's current slot is untouched"
+     );
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/sched_lock2a_tests/tests.rs:351:
+     assert!(k.restore_current_exact_split(CpuId(1), 94_001, TaskPriority::Normal));
+     assert_eq!(
+[31m-        k.with_cpu_sched_split(CpuId(1), |c| c.current_tid()).unwrap(),
+[m[32m+        k.with_cpu_sched_split(CpuId(1), |c| c.current_tid())
+[m[32m+            .unwrap(),
+[m         Some(ThreadId(94_001))
+     );
+ }
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/sched_lock2a_tests/tests.rs:379:
+         runs.set(runs.get() + 1);
+         (true, false, Some(CpuId(1)))
+     };
+[31m-    assert_eq!(crate::kernel::boot::oracle_gated_facts(false, collect), None);
+[m[32m+    assert_eq!(
+[m[32m+        crate::kernel::boot::oracle_gated_facts(false, collect),
+[m[32m+        None
+[m[32m+    );
+[m     assert_eq!(runs.get(), 0, "disarmed: no read at all");
+     assert_eq!(
+         crate::kernel::boot::oracle_gated_facts(true, collect),
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/sched_lock2a_tests/tests.rs:386:
+         Some((true, false, Some(CpuId(1))))
+     );
+[31m-    assert_eq!(runs.get(), 1, "armed: exactly one collection, its facts unchanged");
+[m[32m+    assert_eq!(
+[m[32m+        runs.get(),
+[m[32m+        1,
+[m[32m+        "armed: exactly one collection, its facts unchanged"
+[m[32m+    );
+[m }
+ 
+ /// Source guard for the gate's one production call site: the x86_64 split blocked-server marker
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/sched_lock2a_tests/tests.rs:410:
+         .expect("the task facts are inside the block");
+     assert!(gate < facts && gate < scan, "every read follows the gate");
+     // The scan appears exactly once in the file's marker route: inside the gate.
+[31m-    let route_start = SRC.find("U9-RECV-BLOCK1 §2 — the AUTHORITATIVE cross-CPU blocked-server marker").unwrap();
+[m[32m+    let route_start = SRC
+[m[32m+        .find("U9-RECV-BLOCK1 §2 — the AUTHORITATIVE cross-CPU blocked-server marker")
+[m[32m+        .unwrap();
+[m     let route = &SRC[route_start..end];
+[31m-    assert_eq!(route.matches("receiver_has_scheduler_membership_split_read").count(), 1);
+[m[32m+    assert_eq!(
+[m[32m+        route
+[m[32m+            .matches("receiver_has_scheduler_membership_split_read")
+[m[32m+            .count(),
+[m[32m+        1
+[m[32m+    );
+[m }
+ 
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/kernel/task_enqueue.rs:486:
+         EnqueueTarget::Balanced if plan.tid == 0 => scheduler
+             .enqueue_balanced(ThreadId(plan.tid), plan.priority)
+             .map_err(map_scheduler_error),
+[31m-        EnqueueTarget::Balanced => Err(refuse_home(
+[m[31m-            plan.tid,
+[m[31m-            CpuId(0),
+[m[31m-            None,
+[m[31m-            HomeRefusal::Homeless,
+[m[31m-        )),
+[m[32m+        EnqueueTarget::Balanced => {
+[m[32m+            Err(refuse_home(plan.tid, CpuId(0), None, HomeRefusal::Homeless))
+[m[32m+        }
+[m     }
+ }
+ 
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/runtime.rs:13979:
+                 break;
+             };
+             // rank 1: the slot, promised before anything is decided about the waiter.
+[31m-            let reserved = self.with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+[m[32m+            let reserved = self
+[m[32m+                .with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+[m                     te::reserve_enqueue_on_cpu_locked(c, &plan, tcbs)
+                 })
+                 .map_err(crate::kernel::boot::map_scheduler_error)
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/runtime.rs:14163:
+                 break;
+             };
+             // (2) rank 1: the placement, promised before the waiter is touched.
+[31m-            let reserved = self.with_cpu_sched_and_tcbs_split(target, |c, tcbs| {
+[m[32m+            let reserved = self
+[m[32m+                .with_cpu_sched_and_tcbs_split(target, |c, tcbs| {
+[m                     te::reserve_enqueue_on_cpu_locked(c, &plan, tcbs)
+                 })
+                 .map_err(crate::kernel::boot::map_scheduler_error)
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/runtime.rs:14292:
+                 continue;
+             };
+             // (2) rank 1: the slot, promised before the waiter is touched.
+[31m-            let reserved = self.with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+[m[32m+            let reserved = self
+[m[32m+                .with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+[m                     te::reserve_enqueue_on_cpu_locked(c, &plan, tcbs)
+                 })
+                 .map_err(crate::kernel::boot::map_scheduler_error)
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/runtime.rs:17310:
+         // caller-named CPU is this task's home if it has none yet (recorded at rank 2, so a racing
+         // first placement sees it); if the task already has a different home the placement is
+         // refused here, before any lock of the named CPU is taken.
+[31m-        let home = self.fix_home_cpu_split(
+[m[31m-            tid,
+[m[31m-            affinity.unwrap_or_else(|| self.executing_cpu_split()),
+[m[31m-        );
+[m[32m+        let home =
+[m[32m+            self.fix_home_cpu_split(tid, affinity.unwrap_or_else(|| self.executing_cpu_split()));
+[m         if let Some(named) = affinity
+             && named != home
+             && tid != 0
+Diff in /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-wt/src/runtime.rs:18740:
+             return None;
+         };
+         self.with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+[31m-                    te::reserve_enqueue_on_cpu_locked(c, &plan, tcbs)
+[m[31m-                })
+[m[31m-            .map_err(crate::kernel::boot::map_scheduler_error)
+[m[31m-            .and_then(|r| r)
+[m[31m-            .ok()
+[m[31m-            .map(|()| IpcWakePlacement { plan, home })
+[m[32m+            te::reserve_enqueue_on_cpu_locked(c, &plan, tcbs)
+[m[32m+        })
+[m[32m+        .map_err(crate::kernel::boot::map_scheduler_error)
+[m[32m+        .and_then(|r| r)
+[m[32m+        .ok()
+[m[32m+        .map(|()| IpcWakePlacement { plan, home })
+[m     }
+ 
+     /// IPC-TIMEOUT-CAP1 — fill a promise after its owner's claim committed. It cannot be refused

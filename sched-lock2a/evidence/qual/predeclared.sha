@@ -1,0 +1,6 @@
+135738ca3aa8ed9adb1085eb9e0b88dbfa7a54519d5b1b37621a7f1c5fa30792  sl2_qual.sh
+candidate C=189a890d baseline=a1b06b2c declared 2026-11-16T18:45:59Z
+22db8d351b51dc5581a8677bbd8224bc473b80ed3337d31318dc9b9afeab7644  sl2_addA.sh
+addendum A declared 2026-11-16T19:05:55Z: main run Z rc=1 (scan matched kernel images), L2 rc=2 (script syntax error, pre-existing), L1 seal result=blocked to attribute
+4352eeebbc89e47079134cd05e2fc735bfbfc5c9cffad56a7a98179675baa02d  sl2_addB.sh
+addendum B declared 2026-11-16T19:19:26Z

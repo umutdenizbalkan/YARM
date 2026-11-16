@@ -1,0 +1,5 @@
+[ipccall-direct-smp-request] building base x86_64 artifacts (servers + initramfs)
+[ipccall-direct-smp-request] rebuilding kernel_boot with --features x86-ipccall-direct-smp-oracle
+[ipccall-direct-smp-request] booting QEMU -smp 2 with yarm.x86_64_ipccall_direct_smp_oracle=1
+[ipccall-direct-smp-request] SMP=2 boot clean; both CPUs online; NO cross-CPU NR6 markers (AP resume path not wired)
+STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 pairs=1 sender_cpu=0 receiver_cpu=1 cross_cpu=0 duplicate_deliveries=0 duplicate_wakes=0 wrong_waiter_mutations=0 result=blocked reason=ap_saved_frame_restore_and_recv_v2_server_not_wired

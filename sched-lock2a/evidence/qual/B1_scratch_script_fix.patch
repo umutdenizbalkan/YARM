@@ -1,0 +1,29 @@
+commit cabe3cccffae908984bf4a5ea56d1e25685f1127
+Author: Claude <noreply@anthropic.com>
+Date:   Mon Nov 16 19:00:44 2026 +0000
+
+    qemu-ipccall-direct-x86_64-smp-request-smoke: remove an empty if-block
+    
+    The script has carried an empty `if (( ! fail )); then` / `fi` block
+    since it was added (15114160), which bash rejects as a syntax error at
+    line 67. So the only live cell that grades IPCCALL_DIRECT_SMP_SERVER_BLOCKED
+    (the x86_64 SMP oracle whose fact collection SCHED-LOCK2A gates) could not
+    run on the baseline. The block did nothing; removing it is the whole
+    repair.
+    
+    Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01QLpmtT4bLN2gX3DCKAXYp8
+
+diff --git a/scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh b/scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh
+index 816e0b6d..83a507d7 100755
+--- a/scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh
++++ b/scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh
+@@ -63,8 +63,6 @@ if (( ! fail )); then
+     >"$LOGDIR/kbuild.log" 2>&1 \
+     || die "feature kernel_boot build failed (see $LOGDIR/kbuild.log)"
+ fi
+-if (( ! fail )); then
+-fi
+ 
+ if (( fail )); then
+   echo "STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 result=fail reason=build"

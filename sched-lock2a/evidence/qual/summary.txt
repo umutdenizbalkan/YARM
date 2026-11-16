@@ -1,0 +1,87 @@
+sl2a qual start 2026-11-16T18:46:00Z C=189a890dbd271003d712a6a0b31ec3771ad5cc63 sha=135738ca3aa8ed9a
+=== H1_fmt [189a890dbd27 porcelain=0]: cargo fmt --all -- --check (start 18:46:00)
+H1_fmt rc=0 secs=10
+=== H2_hosted_lib [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 18:46:10)
+H2_hosted_lib rc=0 secs=204
+=== H3_integration [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 18:49:34)
+H3_integration rc=0 secs=250
+=== H4_subset_sl2a_ [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl2a_ (start 18:53:44)
+H4_subset_sl2a_ rc=0 secs=0
+=== H4_subset_task_enqueue [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 task_enqueue (start 18:53:44)
+H4_subset_task_enqueue rc=0 secs=0
+=== H4_subset_sl1_ [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl1_ (start 18:53:44)
+H4_subset_sl1_ rc=0 secs=2
+=== H4_subset_sched_lock1 [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sched_lock1 (start 18:53:46)
+H4_subset_sched_lock1 rc=0 secs=2
+=== H4_subset_lock_order [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 lock_order (start 18:53:48)
+H4_subset_lock_order rc=0 secs=1
+=== H4_subset_abi [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 abi (start 18:53:49)
+H4_subset_abi rc=0 secs=2
+=== H4_subset_syscall_abi [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 syscall_abi (start 18:53:51)
+H4_subset_syscall_abi rc=0 secs=0
+=== H4_subset_u9exit [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u9exit (start 18:53:51)
+H4_subset_u9exit rc=0 secs=1
+=== H4_subset_reap [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 reap (start 18:53:52)
+H4_subset_reap rc=0 secs=0
+=== H4_subset_futex_wake_cap1 [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 futex_wake_cap1 (start 18:53:52)
+H4_subset_futex_wake_cap1 rc=0 secs=1
+=== H4_subset_ipc_timeout [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 ipc_timeout (start 18:53:53)
+H4_subset_ipc_timeout rc=0 secs=0
+=== H4_subset_sr_place1 [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sr_place1 (start 18:53:53)
+H4_subset_sr_place1 rc=0 secs=0
+=== H4_subset_census [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 census (start 18:53:53)
+H4_subset_census rc=0 secs=2
+=== H4_subset_stage199d [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 stage199d (start 18:53:55)
+H4_subset_stage199d rc=0 secs=24
+=== H4_subset_overtaken [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 overtaken (start 18:54:19)
+H4_subset_overtaken rc=0 secs=0
+=== H4_subset_qemu_context1 [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 qemu_context1 (start 18:54:19)
+H4_subset_qemu_context1 rc=0 secs=0
+=== H4_subset_ap_sched1 [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 ap_sched1 (start 18:54:19)
+H4_subset_ap_sched1 rc=0 secs=1
+=== H4_subset_u9spawn1 [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u9spawn1 (start 18:54:20)
+H4_subset_u9spawn1 rc=0 secs=0
+=== G1_contract_gate [189a890dbd27 porcelain=0]: bash scripts/check-current-contracts.sh (start 18:54:20)
+G1_contract_gate rc=0 secs=13
+=== G2_doc_enforcement [189a890dbd27 porcelain=0]: bash scripts/check-contract-doc-enforcement.sh (start 18:54:33)
+G2_doc_enforcement rc=0 secs=1
+=== B1_build_x86_64 [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 18:54:34)
+B1_build_x86_64 rc=0 secs=42
+=== L5_x86_64_smp2_ordinary_oracle_off [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L5.boot.log scripts/qemu-x86_64-core-smoke.sh (start 18:55:16)
+L5_x86_64_smp2_ordinary_oracle_off rc=0 secs=61
+=== L1_x86_64_smp2_direct_request_reply [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L1 scripts/qemu-ipccall-reply-direct-x86_64-smp-smoke.sh (start 18:56:17)
+L1_x86_64_smp2_direct_request_reply rc=0 secs=181
+=== L2_x86_64_smp2_direct_request_oracle_armed [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L2 scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh (start 18:59:18)
+L2_x86_64_smp2_direct_request_oracle_armed rc=2 secs=30
+=== B2_build_aarch64 [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 18:59:48)
+B2_build_aarch64 rc=0 secs=33
+=== L3_aarch64_direct_ipc [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L3 scripts/qemu-ipccall-reply-direct-aarch64-smoke.sh (start 19:00:21)
+L3_aarch64_direct_ipc rc=0 secs=47
+=== B3_build_riscv64 [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 19:01:08)
+B3_build_riscv64 rc=0 secs=40
+=== L4_riscv64_direct_ipc [189a890dbd27 porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L4 scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh (start 19:01:48)
+L4_riscv64_direct_ipc rc=0 secs=209
+=== Z_home_refusal_scan [189a890dbd27 porcelain=0]: bash -c grep -arc 'SCHED_HOME_REFUSED' /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L5.boot.log /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L2 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L4 2>/dev/null | grep -v ':0$' && exit 1 || echo NO_HOME_REFUSAL_IN_ANY_LIVE_LOG (start 19:05:17)
+Z_home_refusal_scan rc=1 secs=0
+sl2a qual end 2026-11-16T19:05:17Z
+SL2A_QUAL_DONE
+addendum A start 2026-11-16T19:05:55Z sha=22db8d351b51dc55
+=== A1_L2_x86_64_smp2_direct_request_oracle_armed [cabe3cccffae porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A1_L2 scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh (start 19:05:55)
+A1_L2_x86_64_smp2_direct_request_oracle_armed rc=0 secs=162
+=== A2_L1_on_baseline [a1b06b2c5564 porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A2_L1_base scripts/qemu-ipccall-reply-direct-x86_64-smp-smoke.sh (start 19:08:37)
+A2_L1_on_baseline rc=0 secs=261
+=== A3_home_refusal_scan_logs [cabe3cccffae porcelain=0]: bash -c n=$(grep -arc 'SCHED_HOME_REFUSED' --include='*.log' /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L4 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A1_L2 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/L5.boot.log | grep -v ':0$' | wc -l); echo files_with_refusals=$n; test $n -eq 0 && echo NO_HOME_REFUSAL_IN_ANY_LIVE_LOG (start 19:12:58)
+A3_home_refusal_scan_logs rc=0 secs=0
+=== A4_lockorder_C [cabe3cccffae porcelain=0]: bash -c env -u CARGO_TARGET_DIR cargo test --lib -- --test-threads=1 --nocapture 2>&1 | awk '{ if (match($0, /^test [^ ]+ \.\.\. /)) { cur=$2 } while (match($0, /YARM_LOCK_ORDER_WARN current=[a-z_]+ previous=[0-9]+/)) { w=substr($0, RSTART, RLENGTH); split(w, a, " "); c[a[2]" "a[3]]++; $0=substr($0, RSTART+RLENGTH) } } END { for (k in c) print k, c[k] }' | sort > /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_pairs_C.txt; wc -l < /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_pairs_C.txt (start 19:12:58)
+A4_lockorder_C rc=0 secs=147
+=== A4_lockorder_B [a1b06b2c5564 porcelain=0]: bash -c env -u CARGO_TARGET_DIR cargo test --lib -- --test-threads=1 --nocapture 2>&1 | awk '{ if (match($0, /^test [^ ]+ \.\.\. /)) { cur=$2 } while (match($0, /YARM_LOCK_ORDER_WARN current=[a-z_]+ previous=[0-9]+/)) { w=substr($0, RSTART, RLENGTH); split(w, a, " "); c[a[2]" "a[3]]++; $0=substr($0, RSTART+RLENGTH) } } END { for (k in c) print k, c[k] }' | sort > /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_pairs_B.txt; wc -l < /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_pairs_B.txt (start 19:15:25)
+A4_lockorder_B rc=0 secs=201
+=== A4_pair_types_compare [cabe3cccffae porcelain=0]: bash -c cut -d' ' -f1,2 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_pairs_C.txt > /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_C.txt; cut -d' ' -f1,2 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_pairs_B.txt > /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_B.txt; echo C_types=$(wc -l < /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_C.txt) B_types=$(wc -l < /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_B.txt); echo 'only in C:'; comm -23 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_C.txt /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_B.txt; echo 'only in B:'; comm -13 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_C.txt /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_B.txt; test -z "$(comm -23 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_C.txt /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2-evidence/qual/A4_types_B.txt)" && echo NO_NEW_DESCENDING_PAIR_TYPE (start 19:18:46)
+A4_pair_types_compare rc=0 secs=0
+addendum A end 2026-11-16T19:18:46Z
+ADDENDUM_A_DONE
+addendum B start 2026-11-16T19:19:26Z sha=4352eeebbc89e470
+=== B1_L2_on_baseline_with_script_fix [a1b06b2c5564 porcelain=1 (the script patch only)] (start 19:19:26)
+B1_L2_on_baseline_with_script_fix rc=0 secs=182
+B2 compare: C server_blocked=0 base server_blocked=0
+ADDENDUM_B_DONE
