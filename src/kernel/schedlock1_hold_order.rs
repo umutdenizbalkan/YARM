@@ -30,14 +30,23 @@ mod tests {
         // FUTEX-TIME1's failing trace: observer SEC 18 / REM 19, HOLD_BEGIN 20.
         assert!(!credited_in_hold(18, 20));
         assert!(!credited_in_hold(19, 20));
-        assert!(!credited_in_hold(20, 20), "a record cannot be its own hold's begin");
-        assert!(credited_in_hold(21, 20), "the first record after the begin is in the hold");
+        assert!(
+            !credited_in_hold(20, 20),
+            "a record cannot be its own hold's begin"
+        );
+        assert!(
+            credited_in_hold(21, 20),
+            "the first record after the begin is in the hold"
+        );
         assert!(credited_in_hold(22, 20));
     }
 
     #[test]
     fn unknown_begin_or_unrecorded_section_credits_nothing() {
-        assert!(!credited_in_hold(0, 20), "a section with no records is not in the trace");
+        assert!(
+            !credited_in_hold(0, 20),
+            "a section with no records is not in the trace"
+        );
         assert!(!credited_in_hold(25, u64::MAX), "no known begin, no credit");
         assert!(!credited_in_hold(u64::MAX, u64::MAX));
     }

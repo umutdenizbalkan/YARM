@@ -3848,10 +3848,13 @@ pub(super) mod sched_time_witness {
     /// sends): its elapsed time bounds this port's tick, so R's graded deadline and H's hold
     /// follow the port's real tick rather than an assumed one.
     const CAL_TICKS: u64 = 4;
-    /// R's graded receive is entered when phase SAT starts — BEFORE the queues fill, because a
-    /// blocked task cannot be woken onto a full queue — and lasts about this long: past the slowest
-    /// port's saturation, inside H's hold (which outlasts W's `Q_NS` sleep).
-    const R_TARGET_NS: u64 = Q_NS - 10_000 * MS;
+    /// R's graded receive, in ticks: short, entered only once H reports every queue full. R stays
+    /// RUNNABLE until then (it yield-polls `SAT_READY` in the rotation, as H does), because a
+    /// blocked task cannot be woken onto a full queue. A deadline fixed before saturation cannot be
+    /// aligned with the hold: scheduler ticks slow down in wall time under a saturated TCG guest.
+    const R_TICKS: u64 = 20;
+    /// H's hold covers R's deadline with this factor on the calibrated tick (slowdown margin).
+    const R_TICK_SLACK: u64 = 10;
     /// H re-tops-up the queues this often while it holds them full.
     const TOPUP_EVERY_NS: u64 = 500 * MS;
     /// H holds this long past the later of W's and R's deadlines.
@@ -3905,6 +3908,8 @@ pub(super) mod sched_time_witness {
     pub(super) static R_EP: AtomicU32 = AtomicU32::new(0);
     /// R's calibrated tick estimate (ns).
     static R_TICK_NS: AtomicU64 = AtomicU64::new(0);
+    /// H: every queue is full and W has left its CPU — R may enter its graded receive.
+    static SAT_READY: AtomicU32 = AtomicU32::new(0);
     /// R: about to enter its graded receive (H tops up R's freed slot after this).
     static R_ENTERING: AtomicU32 = AtomicU32::new(0);
     /// R: the earliest monotonic time its graded receive can be due (0 until published).
@@ -4078,7 +4083,9 @@ pub(super) mod sched_time_witness {
             sl("short", CLOCK_MONOTONIC, 0, MS);
         }
         sl("long", CLOCK_MONOTONIC, 0, 300 * MS);
-        sl("abs", CLOCK_MONOTONIC, TIMER_ABSTIME, mono() + 50 * MS);
+        // 300 ms: a 50 ms absolute deadline could already be due when the kernel registered it
+        // on a loaded host (a legal immediate return, which registers nothing).
+        sl("abs", CLOCK_MONOTONIC, TIMER_ABSTIME, mono() + 300 * MS);
         sl(
             "abs_past",
             CLOCK_MONOTONIC,
@@ -4215,6 +4222,13 @@ pub(super) mod sched_time_witness {
         if refusals < 2 || full_at >= deadline {
             fail("saturate");
         }
+        SAT_READY.store(1, SeqCst);
+        // R enters its receive only now: wait (bounded, staying in the rotation) for its deadline.
+        let mut nr = 0u32;
+        while R_DEADLINE.load(SeqCst) == 0 && nr < BOUND {
+            let _ = yield_now();
+            nr += 1;
+        }
         // R's receive must still be pending: its deadline lies after saturation is complete.
         let r_deadline = R_DEADLINE.load(SeqCst);
         yarm_user_rt::user_log!(
@@ -4304,9 +4318,7 @@ pub(super) mod sched_time_witness {
         ack();
     }
 
-    fn recv_outcome(
-        r: &Result<Option<yarm_user_rt::ipc::Message>, SyscallError>,
-    ) -> &'static str {
+    fn recv_outcome(r: &Result<Option<yarm_user_rt::ipc::Message>, SyscallError>) -> &'static str {
         match r {
             Ok(None) => "none",
             Ok(Some(_)) => "msg",
@@ -4342,30 +4354,36 @@ pub(super) mod sched_time_witness {
         ack();
     }
 
-    /// SCHED-SAT-EVIDENCE1 — R's graded receive (phase SAT): entered at once, while the queues
-    /// still have room, with a deadline after H's saturation and inside its hold — so it falls due
-    /// while R's home queue is held full, and only its placement waits for the release.
+    /// SCHED-SAT-EVIDENCE1 — R's graded receive (phase SAT). R stays runnable — yield-polling
+    /// `SAT_READY` in the rotation — until H reports every queue full, then enters a short timed
+    /// receive: it falls due while R's home queue is held full, and only its placement waits.
     fn receiver_saturated() {
         let ep = R_EP.load(SeqCst);
+        let mut n = 0u32;
+        while SAT_READY.load(SeqCst) == 0 && n < BOUND {
+            let _ = yield_now();
+            n += 1;
+        }
         let tick = R_TICK_NS.load(SeqCst).max(MS);
-        let ticks = (R_TARGET_NS / tick).max(3);
+        let ticks = R_TICKS;
         let t0 = mono();
         // The kernel's deadline is `ticks` ticks after the tick it registers on: not before
-        // `t0 + (ticks - 1) * tick`, surely by `t0 + (ticks + 2) * tick`.
+        // `t0 + (ticks - 1) * tick`; H holds until `due_by`, the slack factor over the calibration.
         let earliest = t0 + (ticks - 1) * tick;
-        let due_by = t0 + (ticks + 2) * tick;
+        let due_by = t0 + (ticks + 2) * tick * R_TICK_SLACK;
         yarm_user_rt::user_log!(
-            "STW_RECV_CALL ticks={} t0={} earliest={} due_by={}",
+            "STW_RECV_CALL ticks={} t0={} earliest={} due_by={} sat_ready={}",
             ticks,
             t0,
             earliest,
-            due_by
+            due_by,
+            SAT_READY.load(SeqCst)
         );
-        R_DEADLINE.store(earliest, SeqCst);
         R_DUE_BY.store(due_by, SeqCst);
         R_ENTERING.store(1, SeqCst);
-        if ep == 0 {
-            fail("recv_cap");
+        R_DEADLINE.store(earliest, SeqCst);
+        if ep == 0 || SAT_READY.load(SeqCst) == 0 {
+            fail("recv_not_saturated");
         }
         // SAFETY: an ordinary deadline receive on init's idle PM reply endpoint.
         let r = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(ep, ticks) };

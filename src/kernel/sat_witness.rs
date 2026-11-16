@@ -51,7 +51,14 @@ impl Refusal {
 }
 
 /// rank 1L (the home's, held by the caller) — publish a refusal of `tid` on `home`.
-pub(crate) fn record(home: usize, tid: u64, priority: u64, queued: usize, reserved: usize, reason: u64) {
+pub(crate) fn record(
+    home: usize,
+    tid: u64,
+    priority: u64,
+    queued: usize,
+    reserved: usize,
+    reason: u64,
+) {
     let Some(slot) = FACTS.get(home) else { return };
     slot[0].store(EMPTY, Ordering::Release);
     slot[1].store(priority, Ordering::Relaxed);

@@ -42,9 +42,10 @@ Rules (the brief's twelve cases):
                last beat.
   12 registers  every STW_ERR code == want (Unavailable before realtime, InvalidArgs for a bad clock,
                flag or nsec); every graded call returned code=0 through its resume boundary.
-  IPC capacity R's graded timed receive (STW_RECV_CALL .. STW_RECV_RET), entered while the queues
-               still have room (a blocked task cannot be woken onto a full queue) with a deadline
-               H's saturation precedes (STW_SAT_RECV early=1): at least one SATW_REFUSED
+  IPC capacity R's graded timed receive (STW_RECV_CALL .. STW_RECV_RET), entered only after H
+               reported every queue full (sat_ready=1; R stayed runnable until then, since a
+               blocked task cannot be woken onto a full queue), so saturation precedes its
+               deadline (STW_SAT_RECV early=1): at least one SATW_REFUSED
                class=recv of R between them, due (now >= deadline), with facts=ok, full=1, before
                STW_HOLD_END; a U8_RECV_TIMEOUT_PLACEMENT_DEFERRED of R for the same
                wait generation; then EXACTLY ONE U8_RECV_TIMEOUT_SETTLED of (R, that generation),
@@ -86,7 +87,7 @@ U = {
     "FAIL": dict(what=r"\w+"),
     "SPINNER": dict(tid=N),
     "RECV_CAL": dict(ticks=N, elapsed=N, tick_est=N, outcome=r"none|msg|err"),
-    "RECV_CALL": dict(ticks=N, t0=N, earliest=N, due_by=N),
+    "RECV_CALL": dict(ticks=N, t0=N, earliest=N, due_by=N, sat_ready=r"[01]"),
     "SAT_RECV": dict(r_deadline=N, full_at=N, early=r"[01]"),
     "RECV_RET": dict(outcome=r"none|msg|err", t0=N, t1=N, due_by=N),
     "HOLD_END": dict(end=N, w_deadline=N, r_due_by=N, fillers=N, topups=N, refusals=N, holds=N,
@@ -327,6 +328,8 @@ def grade(lines):
     if rc and rr:
         if rc["utid"] != R or rr["utid"] != R:
             fail("IPC: the graded receive was not R's")
+        if rc["sat_ready"] != "1":
+            fail("IPC: R entered its graded receive before H reported saturation")
         sr = one("U_SAT_RECV")
         if sr and sr["early"] != "1":
             fail("IPC: the queues were not full before R's receive could fall due")
@@ -446,7 +449,7 @@ def synth():
     L.append("U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid=2 wait_generation=7 cpu=0")
     L.append("U8_RECV_TIMEOUT_SETTLED arch=riscv64 tid=2 asid=1 wait_generation=7 deadline=1 now=2 broad_lock=0 result=ok")
     u(H, "STW_SATURATED fillers=130 first=128 refusals=2 full_at=1 w_deadline=9 early=1")
-    u(R, "STW_RECV_CALL ticks=200 t0=5000 earliest=8000 due_by=9000")
+    u(R, "STW_RECV_CALL ticks=20 t0=5000 earliest=8000 due_by=9000 sat_ready=1")
     u(H, "STW_SAT_RECV r_deadline=8000 full_at=1 early=1")
     L.append(f"U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid={R} wait_generation=2 cpu=1")
     L.append(f"SATW_REFUSED class=recv cpu=1 home=1 tid={R} gen=2 n=1 prio=1 queued=64 reserved=0 cap=64 full=1 deadline=300 now=300 facts=ok")
@@ -527,6 +530,7 @@ def self_test():
     must_fail(good[:st_r] + good[st_r + 1:], "0 settlements")
     must_fail(edit("STW_RECV_RET outcome=none", "STW_RECV_RET outcome=msg"), "not its timeout")
     must_fail(edit("full_at=1 early=1", "full_at=9999 early=0"), "not full before R's receive")
+    must_fail(edit("sat_ready=1", "sat_ready=0"), "before H reported saturation")
     must_fail(edit("deadline=300 now=300 facts=ok", "deadline=300 now=299 facts=ok"), "IPC: no refusal")
     # only an unrelated thread's deferral: earns nothing
     only_other = [l for l in good if not (l.startswith("SATW_REFUSED class=recv")

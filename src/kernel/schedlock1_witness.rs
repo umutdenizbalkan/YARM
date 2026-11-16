@@ -823,7 +823,10 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
             ],
         );
     }
-    HOLD_BEGIN_SEQ.store(begin.map_or(u64::MAX, |slot| slot as u64 + 1), Ordering::Release);
+    HOLD_BEGIN_SEQ.store(
+        begin.map_or(u64::MAX, |slot| slot as u64 + 1),
+        Ordering::Release,
+    );
     let token = hold_token(round, ATTEMPT.load(Ordering::Acquire));
     HOLD_ACTIVE.store(token, Ordering::SeqCst);
     let mut spins = 0u64;

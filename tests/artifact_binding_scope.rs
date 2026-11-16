@@ -281,7 +281,10 @@ grep -h "differ" "$d/badcpio.log" | sed 's/^/  [badcpio] /'
     );
     assert!(text.contains("PUBLISH_mutated=1"), "{text}");
     assert!(text.contains("RECORD_badcpio=1"), "{text}");
-    assert!(text.contains("[badcpio] [provenance]") && text.contains("packed members differ"), "{text}");
+    assert!(
+        text.contains("[badcpio] [provenance]") && text.contains("packed members differ"),
+        "{text}"
+    );
 }
 
 /// ARTIFACT-CARGO-BIND1 end to end: a real `cargo build` into an alternate `CARGO_TARGET_DIR`,
@@ -300,7 +303,10 @@ fn the_published_bytes_are_the_current_cargo_invocations_output() {
         String::from_utf8_lossy(&st.stderr)
     );
     assert!(st.status.success(), "{text}");
-    assert!(text.contains("ARTIFACT_CARGO_BIND_TEST result=ok"), "{text}");
+    assert!(
+        text.contains("ARTIFACT_CARGO_BIND_TEST result=ok"),
+        "{text}"
+    );
     for check in [
         "1: the reported executable is in the alternate target dir",
         "1: the old path still holds the stale binary",
