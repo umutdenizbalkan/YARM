@@ -63,8 +63,6 @@ if (( ! fail )); then
     >"$LOGDIR/kbuild.log" 2>&1 \
     || die "feature kernel_boot build failed (see $LOGDIR/kbuild.log)"
 fi
-if (( ! fail )); then
-fi
 
 if (( fail )); then
   echo "STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 result=fail reason=build"
