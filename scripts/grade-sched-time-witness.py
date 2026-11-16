@@ -30,9 +30,10 @@ Rules (the brief's twelve cases):
                STW_KILL_CHECK x_returned=0 and no STW_X_RETURNED.
   7 generations 16 `cycle` calls, each its own fresh generation and single DONE (the every-call rule).
   8 full queue  W's `full` cycle: at least one SATW_REFUSED class=sleep of its (tid, gen) with
-               facts=ok, full=1, home = its DONE's home and now >= its deadline, logged before H's
-               STW_HOLD_END (the hold was still in force: H topped up all through it) and before
-               the DONE; every refusal of the cycle precedes its one DONE; STW_HOLD_END bounded=0;
+               facts=ok, full=1, home = its DONE's home and now >= its deadline, logged before
+               STW_HOLD_RELEASED (the release line, logged before the release by whichever cell
+               thread ended the hold; the cell topped up all through it) and before the DONE;
+               every refusal of the cycle precedes its one DONE; STW_HOLD_END bounded=0;
                STW_SATURATED early=1; STW_ROTATION parked=fillers. Spawn refusals and filler
                counts are diagnostics only: they earn nothing.
   9 all blocked three `idle` calls during which no other thread of the cell logs anything.
@@ -47,7 +48,7 @@ Rules (the brief's twelve cases):
                blocked task cannot be woken onto a full queue), so saturation precedes its
                deadline (STW_SAT_RECV early=1): at least one SATW_REFUSED
                class=recv of R between them, due (now >= deadline), with facts=ok, full=1, before
-               STW_HOLD_END; a U8_RECV_TIMEOUT_PLACEMENT_DEFERRED of R for the same
+               STW_HOLD_RELEASED; a U8_RECV_TIMEOUT_PLACEMENT_DEFERRED of R for the same
                wait generation; then EXACTLY ONE U8_RECV_TIMEOUT_SETTLED of (R, that generation),
                after the first proving refusal and before R's return; R returns outcome=none (its
                timeout) exactly once. R's unsaturated calibration receive returns outcome=none. Any
@@ -91,6 +92,7 @@ U = {
     "SAT_RECV": dict(r_deadline=N, full_at=N, early=r"[01]"),
     "RECV_TOPUP": dict(filled=r"[01]"),
     "RECV_RET": dict(outcome=r"none|msg|err", t0=N, t1=N, due_by=N),
+    "HOLD_RELEASED": dict(at=N, until=N),
     "HOLD_END": dict(end=N, w_deadline=N, r_due_by=N, fillers=N, topups=N, refusals=N, holds=N,
                      bounded=r"[01]"),
 }
@@ -240,7 +242,10 @@ def grade(lines):
     hold = one("U_HOLD_END")
     if hold and hold["bounded"] != "0":
         fail("8: H's hold hit its bound (R never published its deadline, or the hold never ended)")
-    hold_at = hold["at"] if hold else -1
+    # The hold's end is the release line, logged by whichever cell thread released it BEFORE the
+    # release; H's STW_HOLD_END comes later and may follow refusals of the released queues.
+    rel = one("U_HOLD_RELEASED")
+    hold_at = rel["at"] if rel else -1
 
     def proving(sat, home):
         """The refusals that prove a full home queue while H still held it, and why others don't."""
@@ -460,6 +465,7 @@ def synth():
     sleep(W, "full", 2000, mid=(
         "STW_SLEEP_REFUSED cpu=0 home=0 tid={tid} gen={gen} deadline={d} now={d}",
         "SATW_REFUSED class=sleep cpu=0 home=0 tid={tid} gen={gen} n=1 prio=1 queued=63 reserved=1 cap=64 full=1 deadline={d} now={d} facts=ok",
+        f"USER_LOG tid=10200 msg=STW_HOLD_RELEASED at=99 until=99",
         f"USER_LOG tid={H} msg=STW_HOLD_END end=99 w_deadline=9 r_due_by=9000 fillers=130 topups=3 refusals=5 holds=9 bounded=0"))
     L.append(f"U8_RECV_TIMEOUT_SETTLED arch=riscv64 tid={R} asid=3 wait_generation=2 deadline=300 now=900 broad_lock=0 result=ok")
     u(R, "STW_RECV_RET outcome=none t0=5000 t1=9500 due_by=9000")
@@ -520,7 +526,7 @@ def self_test():
     i = next(i for i, l in enumerate(good) if l.startswith("SATW_REFUSED class=sleep"))
     lost = good[:i] + [good[i].replace("facts=ok", "facts=lost")] + good[i + 1:]
     must_fail(lost, "facts lost")
-    h = next(i for i, l in enumerate(good) if "STW_HOLD_END" in l)
+    h = next(i for i, l in enumerate(good) if "STW_HOLD_RELEASED" in l)
     after_hold = good[:i] + [good[h], good[i]] + [l for k, l in enumerate(good) if k > i and k != h]
     must_fail(after_hold, "after the hold ended")
     must_fail(edit("bounded=0", "bounded=1"), "hold hit its bound")

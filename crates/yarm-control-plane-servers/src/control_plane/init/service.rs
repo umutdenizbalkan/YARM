@@ -3868,6 +3868,12 @@ pub(super) mod sched_time_witness {
     static TOPUP_ON: AtomicU32 = AtomicU32::new(0);
     static LAST_TOP: AtomicU64 = AtomicU64::new(0);
     static TOPUPS: AtomicU32 = AtomicU32::new(0);
+    /// The hold ends at this monotonic time (0 until H publishes it). Whichever cell thread passes
+    /// it first ends the top-ups and releases: H itself may get the CPU only every tens of seconds
+    /// under RISC-V saturation, so the release must not wait for H's turn.
+    static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
+    /// The monotonic time the hold was released (by whichever thread released it).
+    static RELEASED_AT: AtomicU64 = AtomicU64::new(0);
     /// The queues are re-topped-up this often while H holds them full.
     const TOPUP_EVERY_NS: u64 = 250 * MS;
     /// H holds this long past the later of W's and R's deadlines.
@@ -4201,6 +4207,11 @@ pub(super) mod sched_time_witness {
         let entry = FILLER_ENTRY.load(SeqCst);
         let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
         let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
+        // A round that was waiting for the pool when the hold ended spawns nothing.
+        if !wait && TOPUP_ON.load(SeqCst) == 0 {
+            SPAWN_LOCK.store(0, SeqCst);
+            return 0;
+        }
         let (mut made, mut refused_in_row) = (0u32, 0u32);
         while refused_in_row < 2 {
             let i = NEXT_FILLER.load(SeqCst);
@@ -4226,12 +4237,37 @@ pub(super) mod sched_time_witness {
         made
     }
 
-    /// The hold's periodic top-up, run by whichever cell thread gets here first after the period.
+    /// End the hold once: stop the top-ups with the pool held (no round in flight), then release.
+    fn end_hold() {
+        while SPAWN_LOCK.swap(1, SeqCst) != 0 {
+            let _ = yield_now();
+        }
+        if TOPUP_ON.swap(0, SeqCst) != 0 {
+            let at = mono();
+            RELEASED_AT.store(at, SeqCst);
+            // Logged BEFORE the release: whatever the log shows after it may postdate the hold.
+            yarm_user_rt::user_log!(
+                "STW_HOLD_RELEASED at={} until={}",
+                at,
+                HOLD_UNTIL.load(SeqCst)
+            );
+            RELEASE.store(1, SeqCst);
+        }
+        SPAWN_LOCK.store(0, SeqCst);
+    }
+
+    /// The hold's periodic top-up, run by whichever cell thread gets here first after the period;
+    /// also the hold's end, once `HOLD_UNTIL` has passed.
     fn maybe_topup() {
         if TOPUP_ON.load(SeqCst) == 0 {
             return;
         }
         let now = mono();
+        let until = HOLD_UNTIL.load(SeqCst);
+        if until != 0 && now >= until {
+            end_hold();
+            return;
+        }
         let last = LAST_TOP.load(SeqCst);
         if now.saturating_sub(last) < TOPUP_EVERY_NS
             || LAST_TOP
@@ -4299,40 +4335,26 @@ pub(super) mod sched_time_witness {
         if r_deadline == 0 || full_at >= r_deadline {
             fail("saturate_recv");
         }
-        // Hold: stay runnable (rotation is what lets H run at all) until past both W's and R's
-        // deadlines.
+        // Hold until past both W's and R's deadlines (published, so any cell thread can end it).
+        let until = deadline.max(R_DUE_BY.load(SeqCst)) + HOLD_MARGIN_NS;
+        HOLD_UNTIL.store(until, SeqCst);
         let mut n = 0u32;
         let mut bounded = false;
-        loop {
-            let now = mono();
+        while RELEASE.load(SeqCst) == 0 {
             maybe_topup();
-            let r_due = R_DUE_BY.load(SeqCst);
-            if r_due != 0 && now >= deadline.max(r_due) + HOLD_MARGIN_NS {
-                break;
-            }
-            // Bounded past the later deadline (or W's alone while R has not published its own).
-            let cap_from = if r_due == 0 {
-                deadline
-            } else {
-                deadline.max(r_due)
-            };
-            if now >= cap_from + HOLD_CAP_NS || n >= BOUND {
+            if mono() >= until + HOLD_CAP_NS || n >= BOUND {
                 bounded = true;
+                end_hold();
                 break;
             }
             let _ = yield_now();
             n += 1;
         }
-        // End the top-ups: take the pool (no round in flight), stop, count.
-        while SPAWN_LOCK.swap(1, SeqCst) != 0 {
-            let _ = yield_now();
-        }
-        TOPUP_ON.store(0, SeqCst);
+        // The pool is closed (TOPUP_ON is 0 and no round is in flight): the count is final.
         let spawned = NEXT_FILLER.load(SeqCst);
-        SPAWN_LOCK.store(0, SeqCst);
         yarm_user_rt::user_log!(
             "STW_HOLD_END end={} w_deadline={} r_due_by={} fillers={} topups={} refusals={} holds={} bounded={}",
-            mono(),
+            RELEASED_AT.load(SeqCst),
             deadline,
             R_DUE_BY.load(SeqCst),
             spawned,
@@ -4344,7 +4366,6 @@ pub(super) mod sched_time_witness {
         if bounded {
             fail("hold_bound");
         }
-        RELEASE.store(1, SeqCst);
         let mut waits = 0u32;
         while (PARKED.load(SeqCst) as usize) < spawned && waits < BOUND {
             let _ = yield_now();
