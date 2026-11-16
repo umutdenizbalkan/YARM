@@ -119092,7 +119092,7 @@ mod stage199d_riscv_remote_wake_readiness {
             // SCHED-LOCK2A: the captured affinity (else the executing CPU) goes through THE
             // binding, which records it as the home or refuses a different existing one.
             probe(
-                "affinity.unwrap_or_else(|| self.executing_cpu_split()),",
+                "affinity.unwrap_or_else(|| self.executing_cpu_split())",
                 RUNTIME
             ),
             "the enqueue target is the captured affinity, else the executing CPU fixed as the home"
