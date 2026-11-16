@@ -6,17 +6,28 @@
 # One implementation (`scripts/artifact-provenance.py`) records what each artifact is and verifies
 # a boot set; this library is the shell surface every build and every QEMU launcher uses:
 #
+#   artifact_cargo_build_bin OUTVAR BIN LOG CARGO_BUILD_CMD...
+#       ARTIFACT-CARGO-BIND1: runs ONE `cargo build` (the full command, naming `--bin BIN`) with
+#       `--message-format=json-render-diagnostics`, and sets OUTVAR to the executable THAT
+#       invocation reported for BIN (`scripts/cargo-artifact.py`), wherever its target directory
+#       is: `CARGO_TARGET_DIR`, a config `build.target-dir`, or the standard `./target`. Appends
+#       `BIN PATH FRESH SHA256` to this process's Cargo ledger. Diagnostics go to stderr (and LOG
+#       when non-empty). Fails closed if the build fails or reports no such executable.
 #   artifact_build_kernel   ARCH "FEATURE_ARGS" OUT_ELF [OUT_BOOT]
 #       Runs THE kernel build (`cargo build -p yarm --bin kernel_boot` for the port's kernel
-#       target and profile, with FEATURE_ARGS verbatim), then `artifact_publish_kernel`.
+#       target and profile, with FEATURE_ARGS verbatim), then `artifact_publish_kernel` of the
+#       executable that build reported.
 #   artifact_publish_kernel ARCH LINKED_ELF "FEATURE_ARGS" OUT_ELF [OUT_BOOT]
+#       Refuses unless LINKED_ELF is, byte for byte, an executable this process's own Cargo
+#       builds reported (the ledger): a binary that merely sits at a path is never published.
 #       Stages a copy of the linked ELF (and its raw boot image, via objcopy, when OUT_BOOT is
 #       given), runs the no-FP check on exactly those staged bytes, and only on a pass publishes
-#       them atomically with a provenance record derived from FEATURE_ARGS. On any failure the
-#       destination and its record are REMOVED, so no stale image stays bootable.
+#       them atomically with a provenance record derived from FEATURE_ARGS and the Cargo binding.
+#       On any failure the destination and its record are REMOVED, so no stale image stays
+#       bootable.
 #   artifact_record_initramfs ARCH CPIO "FEATURE_ARGS" TARGET PROFILE
 #       Records an initramfs the caller just packed, with the feature arguments its servers were
-#       built with.
+#       built with; every packed member named like a binary in the ledger must be that output.
 #   artifact_boot_guard ARCH KERNEL INITRAMFS [REQ ...]
 #       Verifies the set before QEMU starts and refuses (non-zero) on any mismatch: an artifact
 #       without a record, a replaced/stale/swapped image, another arch or source state, a missing
@@ -32,6 +43,43 @@
 
 _ab_repo() { (cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd); }
 _ab_py() { python3 -I "$(_ab_repo)/scripts/artifact-provenance.py" "$@"; }
+_ab_cargo() { python3 -I "$(_ab_repo)/scripts/cargo-artifact.py" "$@"; }
+
+# ARTIFACT-CARGO-BIND1 — this process's Cargo ledger: one line per executable its builds reported.
+# Per process (not exported): a publish binds only outputs of builds this script ran.
+if [[ "${_AB_LEDGER_OWNER:-}" != "$$" ]]; then
+  ARTIFACT_CARGO_LEDGER="$(mktemp "${TMPDIR:-/tmp}/yarm-cargo-ledger.XXXXXX")"
+  _AB_LEDGER_OWNER=$$
+fi
+
+artifact_cargo_build_bin() {
+  local __out="$1" bin="$2" log="$3"
+  shift 3
+  local msgs line rc=0 path fresh sha
+  msgs="$(mktemp "${TMPDIR:-/tmp}/yarm-cargo-msgs.XXXXXX")"
+  if [[ -n "$log" ]]; then
+    "$@" --message-format=json-render-diagnostics >"$msgs" 2> >(tee -a "$log" >&2) || rc=$?
+  else
+    "$@" --message-format=json-render-diagnostics >"$msgs" || rc=$?
+  fi
+  if (( rc != 0 )); then
+    echo "[error] ARTIFACT-CARGO: cargo build for $bin failed (rc=$rc)" >&2
+    rm -f "$msgs"
+    return 1
+  fi
+  if ! line="$(_ab_cargo executable --bin "$bin" --messages "$msgs")"; then
+    rm -f "$msgs"
+    return 1
+  fi
+  rm -f "$msgs"
+  read -r path fresh sha <<<"$line"
+  echo "$bin $path $fresh $sha" >>"$ARTIFACT_CARGO_LEDGER"
+  echo "ARTIFACT_CARGO_OUTPUT bin=$bin path=$path fresh=$fresh sha256=$sha" >&2
+  if [[ -n "$log" ]]; then
+    echo "ARTIFACT_CARGO_OUTPUT bin=$bin path=$path fresh=$fresh sha256=$sha" >>"$log"
+  fi
+  printf -v "$__out" '%s' "$path"
+}
 
 # artifact_features_record ARGS... — `default_features=<0|1> features=<a,b,…|none|all>`.
 artifact_features_record() { _ab_py features --feature-args="$*"; }
@@ -80,6 +128,11 @@ artifact_publish_kernel() {
     echo "[error] ARTIFACT-PUBLISH: the linked kernel $linked does not exist"
     return 1
   fi
+  local binding
+  if ! binding="$(_ab_cargo ledger-check --ledger "$ARTIFACT_CARGO_LEDGER" --path "$linked")"; then
+    echo "[error] ARTIFACT-PUBLISH: $linked is not an executable this build's cargo invocation produced (ARTIFACT-CARGO-BIND1: a binary that merely sits at a path is not published); nothing was published"
+    return 1
+  fi
   mkdir -p "$(dirname "$out_elf")"
   if [[ -n "$out_boot" ]]; then mkdir -p "$(dirname "$out_boot")"; fi
   stage_elf="${out_elf}.staging.$$"
@@ -106,7 +159,7 @@ artifact_publish_kernel() {
   mv -f "$report" "${out_elf}.nofp.txt"
   if ! _ab_py record-kernel --arch "$arch" --elf "$out_elf" ${out_boot:+--boot "$out_boot"} \
       --feature-args="$fargs" --target "$target" --profile "$profile" \
-      --nofp-report "${out_elf}.nofp.txt" --built-by "$by"; then
+      --nofp-report "${out_elf}.nofp.txt" --built-by "$by" --cargo-binding "$binding"; then
     _ab_invalidate "$out_elf" "$out_boot"
     return 1
   fi
@@ -121,21 +174,31 @@ artifact_build_kernel() {
   read -r target profile tdir json <<<"$spec"
   local -a z=(-Z "build-std=core,alloc,compiler_builtins,panic_abort")
   if [[ "$json" == 1 ]]; then z+=(-Z json-target-spec); fi
+  # The build names its own output (ARTIFACT-CARGO-BIND1); the triple's directory ($tdir) under
+  # some target directory is never assumed.
+  local linked="" here rc=0
+  here="$(pwd)"
+  cd "$repo" || return 1
   # shellcheck disable=SC2086
-  if ! (cd "$repo" && cargo build "${z[@]}" --target "$target" --profile "$profile" \
-        $fargs -p yarm --bin kernel_boot); then
+  artifact_cargo_build_bin linked kernel_boot "" \
+    cargo build "${z[@]}" --target "$target" --profile "$profile" $fargs -p yarm --bin kernel_boot \
+    || rc=$?
+  cd "$here" || return 1
+  if (( rc != 0 )); then
     echo "[error] ARTIFACT-BUILD: the $arch kernel build failed ($fargs)"
     _ab_invalidate "$out_elf" "$out_boot"
     return 1
   fi
+  : "$tdir"
   ARTIFACT_KERNEL_TARGET="$target" ARTIFACT_KERNEL_PROFILE="$profile" \
-    artifact_publish_kernel "$arch" "$repo/target/$tdir/$profile/kernel_boot" "$fargs" "$out_elf" "$out_boot"
+    artifact_publish_kernel "$arch" "$linked" "$fargs" "$out_elf" "$out_boot"
 }
 
 artifact_record_initramfs() {
   local arch="$1" cpio="$2" fargs="$3" target="$4" profile="$5"
   _ab_py record-initramfs --arch "$arch" --cpio "$cpio" --feature-args="$fargs" \
-    --target "$target" --profile "$profile" --built-by "${ARTIFACT_BUILT_BY:-$(basename "$0")}"
+    --target "$target" --profile "$profile" --built-by "${ARTIFACT_BUILT_BY:-$(basename "$0")}" \
+    --cargo-ledger "$ARTIFACT_CARGO_LEDGER"
 }
 
 artifact_boot_guard() {

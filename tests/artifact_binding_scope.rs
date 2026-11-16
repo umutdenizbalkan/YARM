@@ -12,6 +12,13 @@
 //! These are behavioural controls: they run the REAL library, the REAL no-FP checker on synthetic
 //! kernels from `tests/fixtures/nofp/mkfixture.py`, and REAL smoke scripts against a stub QEMU that
 //! records whether it was ever started. Each refusal must happen before the stub runs.
+//!
+//! ARTIFACT-CARGO-BIND1: a publish binds only a Cargo output of the publishing process (its
+//! ledger). The fixtures stand in for that build: the helpers enter each fixture in the ledger
+//! exactly as `artifact_cargo_build_bin` records an executable a `cargo build` reported, and pack
+//! a real newc initramfs whose member is such an output. The hermetic end-to-end control with a
+//! real `cargo build`, an alternate `CARGO_TARGET_DIR` and a stale binary at the old path is
+//! `scripts/test-artifact-cargo-binding.sh` (run below).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,13 +85,20 @@ set -uo pipefail
 source scripts/lib/artifact-binding.sh
 d="$1"; fx="$d/fx"
 export ARTIFACT_BUILT_BY=artifact_binding_scope
+bound() { # BIN FILE — enter FILE in the ledger as this build's Cargo output for BIN
+  local p; p="$(realpath "$2")"
+  echo "$1 $p 0 $(sha256sum "$p" | cut -d' ' -f1)" >>"$ARTIFACT_CARGO_LEDGER"
+}
 pubk() { # FIXTURE DIR FEATURE_ARGS
   mkdir -p "$2"
+  bound kernel_boot "$fx/$1.elf"
   artifact_publish_kernel x86_64 "$fx/$1.elf" "$3" "$2/kernel_boot.elf" >"$2/publish.log" 2>&1
 }
-initrd() { # DIR FEATURE_ARGS
-  mkdir -p "$1"
-  printf 'cpio %s\n' "$2" >"$1/initramfs-core.cpio"
+initrd() { # DIR FEATURE_ARGS — a newc archive packing one bound server output
+  mkdir -p "$1/root/sbin"
+  printf 'init_server built with %s for %s\n' "$2" "$1" >"$1/root/sbin/init_server"
+  bound init_server "$1/root/sbin/init_server"
+  (cd "$1/root" && echo sbin/init_server | cpio -o -H newc --quiet >../initramfs-core.cpio)
   artifact_record_initramfs x86_64 "$1/initramfs-core.cpio" "$2" x86_64-yarm-user-none release >/dev/null
 }
 guard() { # LABEL DIR [REQ...]
@@ -162,6 +176,24 @@ cp -r "$d/plain" "$d/over"
 pubk x86_ordinary_fninit "$d/over" "--no-default-features"; echo "PUBLISH_over=$?"
 [[ -e "$d/over/kernel_boot.elf" || -e "$d/over/kernel_boot.elf.provenance" ]] && echo OVER_IMAGE=present || echo OVER_IMAGE=absent
 guard over "$d/over"
+# ARTIFACT-CARGO-BIND1: a binary no Cargo build of this process reported is never published, nor
+# one whose bytes changed after its build reported it; a record without its binding is refused.
+mkdir -p "$d/unbound"; cp "$fx/x86_baseline.elf" "$d/unbound/stale.elf"
+artifact_publish_kernel x86_64 "$d/unbound/stale.elf" "--no-default-features" "$d/unbound/kernel_boot.elf" >"$d/unbound.log" 2>&1; echo "PUBLISH_unbound=$?"
+grep -h "ARTIFACT-PUBLISH" "$d/unbound.log" | sed 's/^/  [unbound] /'
+[[ -e "$d/unbound/kernel_boot.elf" ]] && echo UNBOUND_IMAGE=present || echo UNBOUND_IMAGE=absent
+cp "$fx/x86_baseline.elf" "$d/unbound/mutated.elf"; bound kernel_boot "$d/unbound/mutated.elf"; printf '\0' >>"$d/unbound/mutated.elf"
+artifact_publish_kernel x86_64 "$d/unbound/mutated.elf" "--no-default-features" "$d/unbound/kernel_boot.elf" >/dev/null 2>&1; echo "PUBLISH_mutated=$?"
+mkdir -p "$d/nobind"; cp "$d/plain/"* "$d/nobind/" 2>/dev/null; sed -i '/^cargo_executable_sha256=/d' "$d/nobind/kernel_boot.elf.provenance"
+guard no_cargo_binding "$d/nobind"
+mkdir -p "$d/noinputs"; cp "$d/plain/"* "$d/noinputs/" 2>/dev/null; sed -i '/^cargo_inputs=/d' "$d/noinputs/initramfs-core.cpio.provenance"
+guard no_cargo_inputs "$d/noinputs"
+mkdir -p "$d/v1"; cp "$d/plain/"* "$d/v1/" 2>/dev/null; sed -i 's/^yarm_provenance=2$/yarm_provenance=1/' "$d/v1/kernel_boot.elf.provenance"
+guard version1_record "$d/v1"
+mkdir -p "$d/badcpio/root/sbin"; printf 'other bytes\n' >"$d/badcpio/root/sbin/init_server"
+(cd "$d/badcpio/root" && echo sbin/init_server | cpio -o -H newc --quiet >../initramfs-core.cpio)
+artifact_record_initramfs x86_64 "$d/badcpio/initramfs-core.cpio" "--no-default-features" x86_64-yarm-user-none release >"$d/badcpio.log" 2>&1; echo "RECORD_badcpio=$?"
+grep -h "differ" "$d/badcpio.log" | sed 's/^/  [badcpio] /'
 "#
     );
     let (_, text) = bash(&script, &[t.s()], None);
@@ -169,7 +201,9 @@ guard over "$d/over"
     assert!(text.contains("PUBLISH_plain=0"), "{text}");
     assert!(text.contains("PUBLISH_wit=0"), "{text}");
     for field in [
-        "yarm_provenance=1\n",
+        "yarm_provenance=2\n",
+        "cargo_bin=kernel_boot\n",
+        "cargo_fresh=0\n",
         "role=kernel\n",
         "arch=x86_64\n",
         "cargo_feature_args=--no-default-features --features x86-vmi2-witness\n",
@@ -219,6 +253,9 @@ guard over "$d/over"
         ),
         ("other_source", "a cached artifact from another source"),
         ("over", "does not exist"),
+        ("no_cargo_binding", "is not bound to a Cargo output"),
+        ("no_cargo_inputs", "records no Cargo-output members"),
+        ("version1_record", "is malformed or of another version"),
     ] {
         assert_eq!(verdict(&text, label), "refuse", "{label}:\n{text}");
         assert!(
@@ -235,6 +272,46 @@ guard over "$d/over"
     assert!(text.contains("PUBLISH_nofeat=1"), "{text}");
     assert!(text.contains("PUBLISH_over=1"), "{text}");
     assert!(text.contains("OVER_IMAGE=absent"), "{text}");
+    assert!(text.contains("PUBLISH_unbound=1"), "{text}");
+    assert!(text.contains("UNBOUND_IMAGE=absent"), "{text}");
+    assert!(
+        text.contains("[unbound] [error] ARTIFACT-PUBLISH:")
+            && text.contains("is not an executable this build's cargo invocation produced"),
+        "{text}"
+    );
+    assert!(text.contains("PUBLISH_mutated=1"), "{text}");
+    assert!(text.contains("RECORD_badcpio=1"), "{text}");
+    assert!(text.contains("[badcpio] [provenance]") && text.contains("packed members differ"), "{text}");
+}
+
+/// ARTIFACT-CARGO-BIND1 end to end: a real `cargo build` into an alternate `CARGO_TARGET_DIR`,
+/// with a stale binary at the standard path, publishes the fresh output and never the stale one.
+#[test]
+fn the_published_bytes_are_the_current_cargo_invocations_output() {
+    let st = Command::new("bash")
+        .arg("scripts/test-artifact-cargo-binding.sh")
+        .current_dir(repo())
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("bash");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&st.stdout),
+        String::from_utf8_lossy(&st.stderr)
+    );
+    assert!(st.status.success(), "{text}");
+    assert!(text.contains("ARTIFACT_CARGO_BIND_TEST result=ok"), "{text}");
+    for check in [
+        "1: the reported executable is in the alternate target dir",
+        "1: the old path still holds the stale binary",
+        "2: publish refused the stale binary",
+        "2: nothing is published and the previous artifact is gone",
+        "3: the standard path is used and holds the rebuilt binary",
+        "4: an initramfs packing the stale binary is refused",
+        "5: a kernel record without a Cargo binding is refused at boot",
+    ] {
+        assert!(text.contains(&format!("[ok] {check}")), "{check}:\n{text}");
+    }
 }
 
 /// A stub QEMU on PATH that records every start. A positive control shows the stub is reached

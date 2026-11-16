@@ -7,8 +7,10 @@ initramfs is, and that verifies a boot set before QEMU starts.
     artifact-provenance.py features   --feature-args ARGS
     artifact-provenance.py record-kernel    --arch A --elf ELF [--boot BIN] --feature-args ARGS
                                             --target T --profile P --nofp-report R --built-by S
+                                            --cargo-binding "BIN PATH FRESH SHA256"
     artifact-provenance.py record-initramfs --arch A --cpio CPIO --feature-args ARGS
                                             --target T --profile P --built-by S
+                                            --cargo-ledger LEDGER
     artifact-provenance.py verify  --arch A --kernel K --initramfs I [--require REQ ...]
     artifact-provenance.py show    ARTIFACT
 
@@ -22,7 +24,13 @@ command that produced it, from the arguments that command actually used:
     files are clean, otherwise a digest of `git diff HEAD`);
   * its SHA-256 (and, for a raw boot image, the ELF it was converted from);
   * for a kernel, the no-FP result of `scripts/check-kernel-nofp.sh` on that exact ELF (and boot
-    image): the checker's own `NOFP_CHECK` line, bound to the image hash, and the report's hash.
+    image): the checker's own `NOFP_CHECK` line, bound to the image hash, and the report's hash;
+  * ARTIFACT-CARGO-BIND1 — the Cargo output it is: for a kernel, the executable the publishing
+    build's own `cargo build` reported (`scripts/cargo-artifact.py`; its path, whether Cargo found
+    it fresh, and its hash, which must equal the published ELF's); for an initramfs, every packed
+    member named like a binary that build produced, each checked byte-for-byte against that
+    output when the record is written (a member that differs is refused, and so is a cpio with
+    no such member).
 
 `verify` refuses — non-zero, before any boot — unless the kernel and initramfs are exactly the
 recorded artifacts (hash), for this arch, built from the current source state, the kernel's
@@ -44,7 +52,9 @@ import sys
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 SUFFIX = ".provenance"
-VERSION = "1"
+# 2: ARTIFACT-CARGO-BIND1 — records carry their Cargo-output binding; a version-1 record (published
+# from a fixed `./target` path, whatever that held) is refused, so the artifact is rebuilt.
+VERSION = "2"
 # Compile-time environment read with `option_env!` — build configuration that is not a Cargo
 # feature — per artifact role: the kernel crate (`src/`) reads none; the server crates packed into
 # the initramfs (`crates/`) read these. A hosted test pins both lists against every `option_env!`
@@ -161,11 +171,77 @@ def common(arch, role, feature_args, target, profile, built_by):
                 features=feats, compile_env=compile_env(role), built_by=built_by, **source_state())
 
 
+def cargo_binding(line):
+    """`BIN PATH FRESH SHA256` (one `cargo-artifact.py` ledger line) as record fields."""
+    parts = (line or "").split()
+    if len(parts) != 4 or parts[2] not in ("0", "1") or not re.fullmatch(r"[0-9a-f]{64}", parts[3]):
+        raise SystemExit(f"[provenance] malformed Cargo binding `{line}`: refusing to record an "
+                         f"artifact whose Cargo output is unknown")
+    return dict(cargo_bin=parts[0], cargo_executable=parts[1], cargo_fresh=parts[2],
+                cargo_executable_sha256=parts[3])
+
+
+def cpio_members(path):
+    """{name: sha256} of the regular files in a newc cpio archive."""
+    out = {}
+    with open(path, "rb") as f:
+        data = f.read()
+    off = 0
+    while off + 110 <= len(data):
+        if data[off:off + 6] not in (b"070701", b"070702"):
+            raise SystemExit(f"[provenance] {path}: not a newc cpio at offset {off}")
+        fld = lambda i: int(data[off + 6 + 8 * i:off + 14 + 8 * i], 16)
+        mode, fsize, nsize = fld(1), fld(6), fld(11)
+        name_at = off + 110
+        name = data[name_at:name_at + nsize - 1].decode("utf-8", "replace")
+        body = (name_at + nsize + 3) & ~3
+        end = body + fsize
+        if name == "TRAILER!!!":
+            break
+        if mode & 0o170000 == 0o100000:
+            out[name[2:] if name.startswith("./") else name] = hashlib.sha256(data[body:end]).hexdigest()
+        off = (end + 3) & ~3
+    return out
+
+
+def initramfs_cargo_inputs(cpio, ledger):
+    """The packed members that are this build's Cargo outputs, each checked; refuses otherwise."""
+    latest = {}
+    try:
+        with open(ledger) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 4:
+                    latest[parts[0]] = parts
+    except OSError:
+        raise SystemExit(f"[provenance] no Cargo ledger {ledger}: the initramfs inputs cannot be "
+                         f"bound to the build that produced them")
+    bound, bad = [], []
+    for name, digest in sorted(cpio_members(cpio).items()):
+        entry = latest.get(os.path.basename(name))
+        if entry is None:
+            continue
+        if digest != entry[3]:
+            bad.append(f"{name} (packed {digest[:16]}, built {entry[3][:16]} at {entry[1]})")
+        else:
+            bound.append(f"{name}:{digest}:{entry[2]}")
+    if bad:
+        raise SystemExit(f"[provenance] {cpio}: packed members differ from this build's Cargo "
+                         f"outputs: {'; '.join(bad)}")
+    if not bound:
+        raise SystemExit(f"[provenance] {cpio}: no packed member is an output of this build")
+    return ",".join(bound)
+
+
 def cmd_record_kernel(a):
     base = common(a.arch, "kernel", a.feature_args, a.target, a.profile, a.built_by)
     base["resolved_features"] = resolved_features(a.feature_args)
+    base.update(cargo_binding(a.cargo_binding))
     nofp = nofp_from_report(a.nofp_report)
     elf_sha = sha256(a.elf)
+    if base["cargo_executable_sha256"] != elf_sha:
+        raise SystemExit(f"[provenance] the published ELF {elf_sha} is not the Cargo output "
+                         f"{base['cargo_executable']} ({base['cargo_executable_sha256']})")
     if nofp["nofp_image_sha256"] != elf_sha:
         raise SystemExit(f"[provenance] the no-FP report checked {nofp['nofp_image_sha256']}, "
                          f"not this ELF {elf_sha}")
@@ -184,7 +260,8 @@ def cmd_record_kernel(a):
 
 def cmd_record_initramfs(a):
     rec = common(a.arch, "initramfs", a.feature_args, a.target, a.profile, a.built_by)
-    rec.update(artifact=os.path.basename(a.cpio), format="cpio", sha256=sha256(a.cpio))
+    rec.update(artifact=os.path.basename(a.cpio), format="cpio", sha256=sha256(a.cpio),
+               cargo_inputs=initramfs_cargo_inputs(a.cpio, a.cargo_ledger))
     write_record(a.cpio, rec)
     return 0
 
@@ -219,6 +296,14 @@ def verify(arch, kernel, initramfs, requires):
         if rec.get("source_state") != now:
             problems.append(f"{role} {path} was built from source {rec.get('source_state')}, the "
                             f"checkout is {now}: a cached artifact from another source")
+        # ARTIFACT-CARGO-BIND1: what Cargo output this artifact is.
+        if role == "kernel" and (not rec.get("cargo_executable_sha256")
+                                 or rec.get("cargo_executable_sha256") != rec.get("elf_sha256")):
+            problems.append(f"kernel {path} is not bound to a Cargo output (cargo_executable_sha256="
+                            f"{rec.get('cargo_executable_sha256') or 'missing'}, elf_sha256="
+                            f"{rec.get('elf_sha256')})")
+        if role == "initramfs" and not rec.get("cargo_inputs"):
+            problems.append(f"initramfs {path} records no Cargo-output members")
         if role == "kernel":
             here = os.path.dirname(os.path.abspath(path))
             elf = os.path.join(here, rec.get("elf", "")) if rec.get("elf") else ""
@@ -324,7 +409,9 @@ def cmd_verify(a):
     print(f"ARTIFACT_BINDING arch={a.arch} kernel={a.kernel} kernel_sha256={k.get('sha256', 'none')} "
           f"kernel_features={k.get('features', 'none')} "
           f"kernel_resolved_features={k.get('resolved_features', 'none')} "
-          f"kernel_nofp={k.get('nofp_result', 'none')} initramfs={a.initramfs} "
+          f"kernel_nofp={k.get('nofp_result', 'none')} "
+          f"kernel_cargo={k.get('cargo_executable', 'none')}:fresh={k.get('cargo_fresh', '?')} "
+          f"initramfs={a.initramfs} "
           f"initramfs_sha256={i.get('sha256', 'none')} initramfs_features={i.get('features', 'none')} "
           f"initramfs_compile_env={i.get('compile_env', 'none')} "
           f"source={k.get('source_state', 'none')} required={','.join(a.require) or 'none'} "
@@ -348,8 +435,10 @@ def main():
               "--built-by"):
         rk.add_argument(k, required=True)
     rk.add_argument("--boot")
+    rk.add_argument("--cargo-binding", required=True)
     ri = sub.add_parser("record-initramfs")
-    for k in ("--arch", "--cpio", "--feature-args", "--target", "--profile", "--built-by"):
+    for k in ("--arch", "--cpio", "--feature-args", "--target", "--profile", "--built-by",
+              "--cargo-ledger"):
         ri.add_argument(k, required=True)
     v = sub.add_parser("verify")
     for k in ("--arch", "--kernel", "--initramfs"):
