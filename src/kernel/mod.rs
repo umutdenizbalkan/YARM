@@ -85,6 +85,10 @@ pub mod lock;
     )
 ))]
 pub mod schedlock1_witness;
+// SCHED-LOCK1-ORDER1: the witness's in-hold membership rule, a pure function of record order —
+// compiled with the witness and into the hosted tests, which pin its boundary deterministically.
+#[cfg(any(test, feature = "sched-lock1-witness"))]
+pub(crate) mod schedlock1_hold_order;
 // QEMU-LOCK1: the real subdomain-lock contention / interrupt-progress witness. Default off.
 #[cfg(feature = "riscv64-lock1-witness")]
 pub mod lock1_witness;

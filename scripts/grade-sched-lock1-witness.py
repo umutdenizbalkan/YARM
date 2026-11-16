@@ -655,6 +655,18 @@ def good():
     return ev
 
 
+def pre_hold_commit():
+    """`good()` with round 0's observer sections — its requeue (gen 8) and the installing commit
+    "i300" (gen 9), in their own order — moved to just before that round's HOLD_BEGIN, while the
+    HOLD_END still reports them and PROGRESS still names "i300": the FUTEX-TIME1 failing shape
+    (observer SEC/REM before HOLD_BEGIN, PROGRESS naming that SEC)."""
+    ev = good()
+    hb = [i for i, e in enumerate(ev) if e[0] == "HOLD_BEGIN"][0]
+    first, last = hb + 1, hb + 5  # SEC gen 8, ADD, SEC gen 9 ("i300"), REM
+    assert ev[first][0] == "SEC" and ev[last - 1][0] == "REM"
+    return ev[:hb] + ev[first:last] + [ev[hb]] + ev[last:]
+
+
 def self_test():
     g = good()
 
@@ -673,6 +685,10 @@ def self_test():
               "claim-incarnation:"),
              ("an installation's end reports it unobserved", build(sub("UNINSTALL", 0, 3, 0)), "run:"),
              ("holder without its lock", build(sub("HOLD_BEGIN", 0, 5, 0)), "attempt:"),
+             # SCHED-LOCK1-ORDER1: the defect's exact shape — the observer's installing commit
+             # (SEC/REM) lands just BEFORE the hold's HOLD_BEGIN, yet the hold credits it and its
+             # PROGRESS names it. The producer no longer emits this; the grader still refuses it.
+             ("pre-hold commit credited to the hold", build(pre_hold_commit()), "progress:"),
              ("overflow", build(g, overflow=1), "validity:"),
              ("window not closed", build(g, phase=1), "validity:")]
     bad = 0

@@ -183,6 +183,11 @@ static ROUNDS_OK: AtomicU64 = AtomicU64::new(0);
 /// while open; set exactly once by [`close_hold`]. 0 when no hold is in progress.
 static HOLD_ACTIVE: AtomicU64 = AtomicU64::new(0);
 const OUTCOME_SHIFT: u32 = 62;
+/// SCHED-LOCK1-ORDER1: the record number (1-based) of the open hold's `HOLD_BEGIN`, published
+/// BEFORE the hold opens ([`HOLD_ACTIVE`]). An observer section earns in-hold credit only when its
+/// own records follow it ([`crate::kernel::schedlock1_hold_order::credited_in_hold`]); `u64::MAX`
+/// (no hold, or a `HOLD_BEGIN` that could not be recorded) credits nothing.
+static HOLD_BEGIN_SEQ: AtomicU64 = AtomicU64::new(u64::MAX);
 const OUT_SUCCESS: u64 = 1;
 const OUT_RELATED: u64 = 2;
 const OUT_BOUND: u64 = 3;
@@ -585,10 +590,18 @@ pub(crate) fn before_release(idx: usize, instance: usize, sched: &CpuSched) {
         slot[1].store(acq_gen, Ordering::Release);
         slot[3].store(sec_seq << 2, Ordering::Release);
     }
-    // An OWNER COMMIT by the observer on its own CPU, during an open hold.
+    // An OWNER COMMIT by the observer on its own CPU, during an open hold — decided by RECORD
+    // ORDER (SCHED-LOCK1-ORDER1). This section's records were reserved above, before the hold
+    // check: a hold opened in between has a LATER `HOLD_BEGIN`, so these records precede it and
+    // the grader places the section before the hold. It earns no in-hold credit here either, so
+    // the producer's counts and installations agree with the record order the grader reads.
     if let Some(token) = open_hold()
         && exec == idx
         && idx == OBSERVER.load(Ordering::Acquire) as usize
+        && crate::kernel::schedlock1_hold_order::credited_in_hold(
+            sec_seq,
+            HOLD_BEGIN_SEQ.load(Ordering::Acquire),
+        )
     {
         if after_cur != 0 && after_cur != before_cur {
             let i = B_INSTALLED_N.fetch_add(1, Ordering::AcqRel);
@@ -789,20 +802,28 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
     OBSERVER.store(b as u8, Ordering::Release);
     let acq_gen = ACQ_GEN[a].load(Ordering::Acquire);
     let held_at_begin = held_flag();
-    record(
-        K_HOLD_BEGIN,
-        a,
-        [
-            round,
-            b as u64,
-            instance as u64,
-            acq_gen,
-            HELD_1L[a].load(Ordering::Acquire) | (HELD_1G[a].load(Ordering::Acquire) << 32),
-            u64::from(held_at_begin)
-                | (u64::from(irqs_enabled()) << 1)
-                | (ATTEMPT.load(Ordering::Acquire) << 8),
-        ],
-    );
+    // SCHED-LOCK1-ORDER1: reserve `HOLD_BEGIN` and publish its record number BEFORE the hold
+    // opens, so every observer section that sees the hold open can place itself against it.
+    let begin = reserve(1);
+    if let Some(slot) = begin {
+        write(
+            slot,
+            K_HOLD_BEGIN,
+            a,
+            exec_cpu(),
+            [
+                round,
+                b as u64,
+                instance as u64,
+                acq_gen,
+                HELD_1L[a].load(Ordering::Acquire) | (HELD_1G[a].load(Ordering::Acquire) << 32),
+                u64::from(held_at_begin)
+                    | (u64::from(irqs_enabled()) << 1)
+                    | (ATTEMPT.load(Ordering::Acquire) << 8),
+            ],
+        );
+    }
+    HOLD_BEGIN_SEQ.store(begin.map_or(u64::MAX, |slot| slot as u64 + 1), Ordering::Release);
     let token = hold_token(round, ATTEMPT.load(Ordering::Acquire));
     HOLD_ACTIVE.store(token, Ordering::SeqCst);
     let mut spins = 0u64;
@@ -841,6 +862,7 @@ pub(crate) fn on_tick(cpu: CpuId, instance: usize, held_flag: impl Fn() -> bool,
         ],
     );
     HOLD_ACTIVE.store(0, Ordering::SeqCst);
+    HOLD_BEGIN_SEQ.store(u64::MAX, Ordering::Release);
     if ok {
         ROUNDS_OK.fetch_add(1, Ordering::AcqRel);
         ATTEMPT.store(0, Ordering::Release);
