@@ -4384,6 +4384,38 @@ pub(super) mod sched_time_witness {
         let _ = futex_wake(R_DONE.as_ptr(), 1, P);
     }
 
+    fn helper_phase(phase: u32) {
+        match phase {
+            PH_TWO => {
+                sl("two_h", CLOCK_MONOTONIC, 0, 100 * MS);
+                ack();
+            }
+            PH_SAT => helper_saturate(),
+            _ => {}
+        }
+    }
+
+    fn follower(on: impl Fn(u32)) -> ! {
+        let mut seen = 0;
+        loop {
+            let c = CMD.load(SeqCst);
+            if c == seen {
+                let _ = futex_wait(CMD.as_ptr(), c, P);
+                continue;
+            }
+            seen = c;
+            let phase = PHASE.load(SeqCst);
+            if phase == PH_END {
+                park();
+            }
+            on(phase);
+        }
+    }
+
+    pub(super) extern "C" fn helper_body() -> ! {
+        follower(helper_phase)
+    }
+
     pub(super) extern "C" fn receiver_body() -> ! {
         follower(|phase| match phase {
             PH_CAL => receiver_calibrate(),
