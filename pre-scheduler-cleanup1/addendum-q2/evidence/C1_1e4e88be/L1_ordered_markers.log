@@ -1,0 +1,20 @@
+BOOT_COMPLETION stage=supervisor line=1409 text=USER_LOG tid=2 msg=SUP_RUN_ENTER
+BOOT_COMPLETION stage=process_manager line=1741 text=USER_LOG tid=3 msg=PM_RECV_LOOP_START recv_cap=65536
+BOOT_COMPLETION stage=init line=2279 text=USER_LOG tid=1 msg=INIT_BIN_ENTRY_START
+BOOT_COMPLETION stage=initramfs_srv line=4899 text=USER_LOG tid=10000 msg=INITRAMFS_SRV_BLOCKING_RECV_LOOP
+BOOT_COMPLETION stage=devfs_srv line=6093 text=USER_LOG tid=10001 msg=DEVFS_SRV_BLOCKING_RECV_LOOP
+BOOT_COMPLETION stage=vfs_srv line=7375 text=USER_LOG tid=10002 msg=VFS_SRV_BLOCKING_RECV_LOOP
+BOOT_COMPLETION stage=ramfs_spawn line=23035 text=USER_LOG tid=1 msg=INIT_RAMFS_SPAWN_BEGIN
+BOOT_COMPLETION stage=ramfs_mount_ready line=26677 text=USER_LOG tid=10006 msg=RAMFS_MOUNT_READY prefix=/ram fd=101 read_len=32 write_len=64 handled=6
+BOOT_COMPLETION stage=ramfs_spawn_ok line=27253 text=USER_LOG tid=1 msg=INIT_RAMFS_SPAWN_OK child_tid=10006 send_cap=65551 prefix=/ram
+BOOT_COMPLETION stage=ram_registered line=27543 text=USER_LOG tid=1 msg=VFS_MOUNT_REGISTER_RAMFS_OK prefix=/ram
+BOOT_COMPLETION stage=ext4_spawn line=27583 text=USER_LOG tid=1 msg=INIT_EXT4_SPAWN_BEGIN
+BOOT_COMPLETION stage=ext4_ready line=30689 text=USER_LOG tid=10007 msg=EXT4_SRV_READY
+BOOT_COMPLETION stage=ext4_spawn_ok line=30919 text=USER_LOG tid=1 msg=INIT_EXT4_SPAWN_OK child_tid=10007 send_cap=65552
+BOOT_COMPLETION stage=ext4_registered line=31229 text=USER_LOG tid=1 msg=VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4
+BOOT_COMPLETION stage=init_park line=31269 text=USER_LOG tid=1 msg=INIT_IDLE_PARK_BEGIN
+BOOT_COMPLETION stage=init_park_futex line=31321 text=USER_LOG tid=1 msg=INIT_IDLE_PARK_FUTEX_BEGIN
+BOOT_COMPLETION stage=init_parked line=31343 text=FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid=1 addr=4296704 priority=exact
+BOOT_COMPLETION stage=idle_path line=31381 text=AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0
+BOOT_COMPLETION stage=idle_after_park line=31383 text=SCHED_ENTER_IDLE_HLT
+BOOT_COMPLETION result=complete reason=complete

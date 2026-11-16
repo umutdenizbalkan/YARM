@@ -1,0 +1,23 @@
+q2 start 2026-11-16T15:58:18Z C=1e4e88be488197e857636c88ba807202f00e5969 sha=fa2a4b24bdef7365
+=== C1_syntax [1e4e88be4881 porcelain=0]: bash -c set -e; bash -n scripts/qemu-aarch64-core-smoke.sh; bash -n scripts/qemu-smoke-common.sh; python3 -I -m py_compile scripts/check-aarch64-boot-completion.py scripts/grade-sched-time-witness.py; rustfmt --edition 2024 --check crates/yarm-control-plane-servers/src/control_plane/init/service.rs; echo SYNTAX_FMT_OK (start 15:58:19)
+C1_syntax rc=0 secs=0
+=== C2_completion_self_test [1e4e88be4881 porcelain=0]: python3 -I scripts/check-aarch64-boot-completion.py self-test (start 15:58:19)
+C2_completion_self_test rc=0 secs=0
+=== C3_completion_replay [1e4e88be4881 porcelain=0]: python3 -I scripts/check-aarch64-boot-completion.py replay /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/D2s.boot.log /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/S4.boot.log (start 15:58:19)
+C3_completion_replay rc=0 secs=0
+=== C4_grader_self_tests [1e4e88be4881 porcelain=0]: bash -c set -e; for g in scripts/grade-sched-time-witness.py scripts/grade-futex-time-witness.py scripts/grade-sched-lock1-witness.py; do echo "== $g"; python3 -I $g --self-test; done (start 15:58:19)
+C4_grader_self_tests rc=0 secs=1
+=== C5_replay_W3 [1e4e88be4881 porcelain=0]: bash -c d=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/W3_riscv64; python3 -I scripts/grade-sched-time-witness.py --arch riscv64 --smp 2 --core-rc $(cat $d/core-smoke.rc) --core-log $d/core-smoke.log $d/boot.log; rc=$?; echo grader_rc=$rc; test $rc -ne 0 (start 15:58:20)
+C5_replay_W3 rc=0 secs=4
+=== C6_replay_W3b [1e4e88be4881 porcelain=0]: bash -c d=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/W3b_riscv64; python3 -I scripts/grade-sched-time-witness.py --arch riscv64 --smp 2 --core-rc $(cat $d/core-smoke.rc) --core-log $d/core-smoke.log $d/boot.log; rc=$?; echo grader_rc=$rc; test $rc -ne 0 (start 15:58:24)
+C6_replay_W3b rc=0 secs=6
+=== L1_build_aarch64_default [1e4e88be4881 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 15:58:30)
+L1_build_aarch64_default rc=0 secs=21
+=== L1_core_aarch64_smp2 [1e4e88be4881 porcelain=0]: env -u CARGO_TARGET_DIR QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/q2/L1.boot.log scripts/qemu-aarch64-core-smoke.sh (start 15:58:51)
+L1_core_aarch64_smp2 rc=0 secs=16
+=== L1_ordered_markers [1e4e88be4881 porcelain=0]: python3 -I scripts/check-aarch64-boot-completion.py check /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/q2/L1.boot.log (start 15:59:07)
+L1_ordered_markers rc=0 secs=0
+=== L2_sched_time_riscv64 [1e4e88be4881 porcelain=0]: env -u CARGO_TARGET_DIR SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/q2/L2_riscv64 timeout 3600 scripts/qemu-sched-time-witness-smoke.sh riscv64 (start 15:59:07)
+L2_sched_time_riscv64 rc=1 secs=10
+=== L3_sched_time_x86_64 [1e4e88be4881 porcelain=0]: env -u CARGO_TARGET_DIR SMP=2 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/q2/L3_x86_64 timeout 3600 scripts/qemu-sched-time-witness-smoke.sh x86_64 (start 15:59:17)
+q2 STOPPED 2026-11-16T15:59:55Z: candidate C=1e4e88be failed L2 at build (E0432: the cell edit deleted the end of futex_time_witness and the start of sched_time_witness — a span replacement anchored on the first 'fn helper_saturate', which is futex_time_witness's). L3/L4 not run on C (same tree). Superseded by C2.

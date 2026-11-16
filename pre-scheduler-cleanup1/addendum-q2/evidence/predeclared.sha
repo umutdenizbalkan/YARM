@@ -1,0 +1,3 @@
+fa2a4b24bdef7365136a9701e3b4508c5e3c4cd29dd332db76cf452fc196bcbf  psc_q2.sh
+candidate C=1e4e88be F=da7bb379 B=2866be83 declared 2026-11-16T15:58:11Z
+candidate C2=1eb75614 (C=1e4e88be failed L2 at build; its outputs in C1_1e4e88be/) runner unchanged sha=fa2a4b24bdef7365 declared 2026-11-16T16:03:27Z

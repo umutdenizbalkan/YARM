@@ -1,0 +1,4 @@
+[ok] /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/D2s.boot.log: must be incomplete: missing ramfs_mount_ready after line 23207
+[ok] /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/S4.boot.log: must be complete: complete
+[ok] /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/psc-evidence/qual/S4.boot.log cut before line 30899 (early idle markers kept at lines [1333]): must be incomplete: missing idle_after_park after line 30859
+BOOT_COMPLETION replay passed

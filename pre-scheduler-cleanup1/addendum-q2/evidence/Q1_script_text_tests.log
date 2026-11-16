@@ -1,0 +1,24 @@
+== x86_64_ap_env_scope
+running 25 tests
+.........................
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+== aarch64_reply_grader
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.77s
+
+== artifact_binding_scope
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.12s
+
+== lib subsets
+-- stage159bcd
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 6673 filtered out; finished in 0.02s
+-- stage178
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 6670 filtered out; finished in 0.02s
+-- stage179
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 6677 filtered out; finished in 0.01s
+-- finalize_split_handled_syscall
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6686 filtered out; finished in 0.00s
