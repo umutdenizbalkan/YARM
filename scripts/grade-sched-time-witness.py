@@ -454,7 +454,6 @@ def synth():
     u(H, "STW_SATURATED fillers=130 first=128 refusals=2 full_at=1 w_deadline=9 early=1")
     u(R, "STW_RECV_CALL ticks=20 t0=5000 earliest=8000 due_by=9000 sat_ready=1")
     u(H, "STW_SAT_RECV r_deadline=8000 full_at=1 early=1")
-    u(R, "STW_RECV_TOPUP filled=1")
     L.append(f"U8_RECV_TIMEOUT_PLACEMENT_DEFERRED tid={R} wait_generation=2 cpu=1")
     L.append(f"SATW_REFUSED class=recv cpu=1 home=1 tid={R} gen=2 n=1 prio=1 queued=64 reserved=0 cap=64 full=1 deadline=300 now=300 facts=ok")
     st["holdmark"] = len(L)

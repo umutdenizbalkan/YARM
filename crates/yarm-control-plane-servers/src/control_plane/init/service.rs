@@ -3856,13 +3856,20 @@ pub(super) mod sched_time_witness {
     const R_TARGET_NS: u64 = 2_000 * MS;
     /// H's hold covers R's deadline with this factor on the calibrated tick (slowdown margin).
     const R_TICK_SLACK: u64 = 4;
-    /// The filler stack R uses for its own top-up (H's fillers stop below it; the spinners use the
-    /// last two).
-    const R_FILLER: usize = FILLERS - 3;
-    /// R's top-up: 1 = its filler was spawned (and will park on release), 2 = refused.
-    static R_FILLED: AtomicU32 = AtomicU32::new(0);
-    /// H re-tops-up the queues this often while it holds them full.
-    const TOPUP_EVERY_NS: u64 = 500 * MS;
+    /// Fillers use stacks `0..FILLER_LIMIT`; the case-10 spinners use the last two.
+    const FILLER_LIMIT: usize = FILLERS - 2;
+    /// The one spawn pool (SCHED-SAT-EVIDENCE1): H and the fillers both spawn fillers, one at a
+    /// time under `SPAWN_LOCK`; `NEXT_FILLER` counts the fillers spawned (the next free stack).
+    static SPAWN_LOCK: AtomicU32 = AtomicU32::new(0);
+    static NEXT_FILLER: AtomicUsize = AtomicUsize::new(0);
+    static SPAWN_REFUSALS: AtomicU32 = AtomicU32::new(0);
+    /// While H holds: any runnable cell thread (in practice a filler — they run every quantum on
+    /// every CPU, H only once per rotation) runs a top-up round every `TOPUP_EVERY_NS`.
+    static TOPUP_ON: AtomicU32 = AtomicU32::new(0);
+    static LAST_TOP: AtomicU64 = AtomicU64::new(0);
+    static TOPUPS: AtomicU32 = AtomicU32::new(0);
+    /// The queues are re-topped-up this often while H holds them full.
+    const TOPUP_EVERY_NS: u64 = 250 * MS;
     /// H holds this long past the later of W's and R's deadlines.
     const HOLD_MARGIN_NS: u64 = 2_000 * MS;
     /// The hold's bound past W's deadline: R never published its deadline (fails closed).
@@ -3916,8 +3923,6 @@ pub(super) mod sched_time_witness {
     static R_TICK_NS: AtomicU64 = AtomicU64::new(0);
     /// H: every queue is full and W has left its CPU — R may enter its graded receive.
     static SAT_READY: AtomicU32 = AtomicU32::new(0);
-    /// R: about to enter its graded receive (H tops up R's freed slot after this).
-    static R_ENTERING: AtomicU32 = AtomicU32::new(0);
     /// R: the earliest monotonic time its graded receive can be due (0 until published).
     static R_DEADLINE: AtomicU64 = AtomicU64::new(0);
     /// R: a monotonic time by which its graded receive is surely due (0 until published).
@@ -4183,28 +4188,68 @@ pub(super) mod sched_time_witness {
 
     /// Case 8 for H: saturate (spawn until refused), top up after W has left its CPU, hold the
     /// queues full past W's deadline, release, and wait until every filler has run again.
-    fn helper_saturate() {
+    /// One top-up round, if the pool is free (`wait` = take it even if busy): spawn fillers until
+    /// two consecutive refusals — the balanced placement's starting CPU rotates, so a refusal on
+    /// one CPU is retried on the next — or the stacks run out.
+    fn spawn_round(wait: bool) -> u32 {
+        while SPAWN_LOCK.swap(1, SeqCst) != 0 {
+            if !wait {
+                return 0;
+            }
+            let _ = yield_now();
+        }
         let entry = FILLER_ENTRY.load(SeqCst);
         let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
         let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
-        let mut spawned = 0usize;
-        let mut refusals = 0u32;
-        let spawn_until_refused = |spawned: &mut usize, refusals: &mut u32| {
-            while *spawned < R_FILLER {
-                let i = *spawned;
-                let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
-                // SAFETY: a valid entry; the static stack and TLS outlive the thread.
-                match unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) } {
-                    Ok(t) if t >= 10_000 => *spawned += 1,
-                    _ => {
-                        *refusals += 1;
-                        return;
-                    }
+        let (mut made, mut refused_in_row) = (0u32, 0u32);
+        while refused_in_row < 2 {
+            let i = NEXT_FILLER.load(SeqCst);
+            if i >= FILLER_LIMIT {
+                break;
+            }
+            let top = (stacks + (i + 1) * FILLER_STACK_BYTES) & !0xF;
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread, and the stack
+            // index is claimed under SPAWN_LOCK.
+            match unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 64, top, entry) } {
+                Ok(t) if t >= 10_000 => {
+                    NEXT_FILLER.store(i + 1, SeqCst);
+                    made += 1;
+                    refused_in_row = 0;
+                }
+                _ => {
+                    SPAWN_REFUSALS.fetch_add(1, SeqCst);
+                    refused_in_row += 1;
                 }
             }
-        };
-        spawn_until_refused(&mut spawned, &mut refusals);
-        let first = spawned;
+        }
+        SPAWN_LOCK.store(0, SeqCst);
+        made
+    }
+
+    /// The hold's periodic top-up, run by whichever cell thread gets here first after the period.
+    fn maybe_topup() {
+        if TOPUP_ON.load(SeqCst) == 0 {
+            return;
+        }
+        let now = mono();
+        let last = LAST_TOP.load(SeqCst);
+        if now.saturating_sub(last) < TOPUP_EVERY_NS
+            || LAST_TOP
+                .compare_exchange(last, now, SeqCst, SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        spawn_round(false);
+        TOPUPS.fetch_add(1, SeqCst);
+    }
+
+    /// Case 8 for H: saturate, top up once W has left its CPU, hand R its turn, then hold the
+    /// queues full past both W's and R's deadlines while the fillers keep them topped up; release
+    /// and wait until every filler has run again.
+    fn helper_saturate() {
+        spawn_round(true);
+        let first = NEXT_FILLER.load(SeqCst);
         // Top up: W's sleep freed its slot; take it (and any other) back, once W has entered its
         // sleep (a couple of yields lets its park complete).
         let mut n0 = 0u32;
@@ -4215,12 +4260,13 @@ pub(super) mod sched_time_witness {
         for _ in 0..2 {
             let _ = yield_now();
         }
-        spawn_until_refused(&mut spawned, &mut refusals);
+        spawn_round(true);
         let full_at = mono();
         let deadline = Q_DEADLINE.load(SeqCst);
+        let refusals = SPAWN_REFUSALS.load(SeqCst);
         yarm_user_rt::user_log!(
             "STW_SATURATED fillers={} first={} refusals={} full_at={} w_deadline={} early={}",
-            spawned,
+            NEXT_FILLER.load(SeqCst),
             first,
             refusals,
             full_at,
@@ -4230,6 +4276,11 @@ pub(super) mod sched_time_witness {
         if refusals < 2 || full_at >= deadline {
             fail("saturate");
         }
+        // From here every runnable cell thread tops up (SCHED-SAT-EVIDENCE1): R's receive frees
+        // its slot on its home, and H — which gets the CPU only once per rotation — could not
+        // refill it before R's deadline. The kernel's SATW_REFUSED lines are the proof.
+        LAST_TOP.store(mono(), SeqCst);
+        TOPUP_ON.store(1, SeqCst);
         SAT_READY.store(1, SeqCst);
         // R enters its receive only now: wait (bounded, staying in the rotation) for its deadline.
         let mut nr = 0u32;
@@ -4249,29 +4300,12 @@ pub(super) mod sched_time_witness {
             fail("saturate_recv");
         }
         // Hold: stay runnable (rotation is what lets H run at all) until past both W's and R's
-        // deadlines, TOPPING UP all along (SCHED-SAT-EVIDENCE1): R's receive frees its slot, and
-        // any other task that blocks frees one, so a single top-up cannot keep a home queue full.
-        // The kernel's SATW_REFUSED lines are the proof the waiters' home queues were full.
+        // deadlines.
         let mut n = 0u32;
-        let mut topups = 0u32;
-        let mut r_topped = false;
-        let mut last_top = mono();
         let mut bounded = false;
         loop {
             let now = mono();
-            if !r_topped && R_ENTERING.load(SeqCst) != 0 {
-                r_topped = true;
-                for _ in 0..2 {
-                    let _ = yield_now();
-                }
-                spawn_until_refused(&mut spawned, &mut refusals);
-                topups += 1;
-                last_top = mono();
-            } else if now.saturating_sub(last_top) >= TOPUP_EVERY_NS {
-                spawn_until_refused(&mut spawned, &mut refusals);
-                topups += 1;
-                last_top = mono();
-            }
+            maybe_topup();
             let r_due = R_DUE_BY.load(SeqCst);
             if r_due != 0 && now >= deadline.max(r_due) + HOLD_MARGIN_NS {
                 break;
@@ -4289,14 +4323,21 @@ pub(super) mod sched_time_witness {
             let _ = yield_now();
             n += 1;
         }
+        // End the top-ups: take the pool (no round in flight), stop, count.
+        while SPAWN_LOCK.swap(1, SeqCst) != 0 {
+            let _ = yield_now();
+        }
+        TOPUP_ON.store(0, SeqCst);
+        let spawned = NEXT_FILLER.load(SeqCst);
+        SPAWN_LOCK.store(0, SeqCst);
         yarm_user_rt::user_log!(
             "STW_HOLD_END end={} w_deadline={} r_due_by={} fillers={} topups={} refusals={} holds={} bounded={}",
             mono(),
             deadline,
             R_DUE_BY.load(SeqCst),
             spawned,
-            topups,
-            refusals,
+            TOPUPS.load(SeqCst),
+            SPAWN_REFUSALS.load(SeqCst),
             n,
             u32::from(bounded)
         );
@@ -4305,9 +4346,7 @@ pub(super) mod sched_time_witness {
         }
         RELEASE.store(1, SeqCst);
         let mut waits = 0u32;
-        // R's own filler parks too.
-        let expect = spawned + usize::from(R_FILLED.load(SeqCst) == 1);
-        while (PARKED.load(SeqCst) as usize) < expect && waits < BOUND {
+        while (PARKED.load(SeqCst) as usize) < spawned && waits < BOUND {
             let _ = yield_now();
             waits += 1;
         }
@@ -4319,7 +4358,7 @@ pub(super) mod sched_time_witness {
             n,
             waits
         );
-        if (parked as usize) != expect {
+        if (parked as usize) != spawned {
             fail("rotation");
         }
         // R's deferred timeout is placed once the queues have room: bounded wait for its return.
@@ -4395,25 +4434,7 @@ pub(super) mod sched_time_witness {
             due_by,
             SAT_READY.load(SeqCst)
         );
-        // R's own top-up: while R runs, its home queue has one task fewer than when R was
-        // queued, and once R blocks nothing would refill that slot before R's deadline (H gets
-        // the CPU only once per rotation). The balanced placement puts this filler on the least
-        // loaded CPU — R's, by that one task — so R leaves its home full behind it.
-        let top = (core::ptr::addr_of_mut!(FILLER_STACKS) as usize
-            + (R_FILLER + 1) * FILLER_STACK_BYTES)
-            & !0xF;
-        let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize + R_FILLER * 64;
-        // SAFETY: a valid entry; the static stack and TLS outlive the thread.
-        let filled = match unsafe {
-            yarm_user_rt::syscall::spawn_thread(tls, top, FILLER_ENTRY.load(SeqCst))
-        } {
-            Ok(t) if t >= 10_000 => 1,
-            _ => 2,
-        };
-        R_FILLED.store(filled, SeqCst);
-        yarm_user_rt::user_log!("STW_RECV_TOPUP filled={}", u32::from(filled == 1));
         R_DUE_BY.store(due_by, SeqCst);
-        R_ENTERING.store(1, SeqCst);
         R_DEADLINE.store(earliest, SeqCst);
         if ep == 0 || SAT_READY.load(SeqCst) == 0 {
             fail("recv_not_saturated");
@@ -4496,7 +4517,13 @@ pub(super) mod sched_time_witness {
     }
 
     pub(super) extern "C" fn filler_body() -> ! {
+        let mut k = 0u32;
         while RELEASE.load(SeqCst) == 0 {
+            // Every 16th turn (a clock read per turn would double the storm's syscalls).
+            k = k.wrapping_add(1);
+            if k % 16 == 0 {
+                maybe_topup();
+            }
             let _ = yield_now();
         }
         PARKED.fetch_add(1, SeqCst);
