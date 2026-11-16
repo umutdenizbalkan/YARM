@@ -319,6 +319,17 @@ pub(crate) struct IpcWakePlacement {
     home: CpuId,
 }
 
+impl IpcWakePlacement {
+    /// SR-PLACE1 — rebuild the promise a reservation made from its pinned plan (the form a
+    /// copyable delivery snapshot carries). Only a pinned plan names a reserved home.
+    pub(crate) fn from_plan(plan: crate::kernel::task_enqueue::EnqueuePlan) -> Option<Self> {
+        match plan.target {
+            crate::kernel::task_enqueue::EnqueueTarget::Pinned(home) => Some(Self { plan, home }),
+            crate::kernel::task_enqueue::EnqueueTarget::Balanced => None,
+        }
+    }
+}
+
 impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout<'_> {
     fn rtd_ipc<R>(&mut self, f: impl FnOnce(&mut crate::kernel::boot::IpcSubsystem) -> R) -> R {
         self.0.with_ipc_split_mut(f)
@@ -14827,6 +14838,8 @@ impl SharedKernel {
             blocked_endpoint_waiter: false,
             origin_direct,
             msg,
+            // SR-PLACE1: the direct producer installs its reservation after Phase A.
+            placement: None,
         })
     }
 
@@ -14884,6 +14897,30 @@ impl SharedKernel {
             return Err(SyscallError::WouldBlock);
         }
 
+        // (1b) SR-PLACE1 — promise the receiver its home-queue slot BEFORE the first mutation.
+        // The sender is told this delivery succeeded as soon as it is stashed, so no later
+        // capacity refusal may undo it. No room: refused with the canonical retryable
+        // `WouldBlock` having taken nothing — the receiver stays blocked, the envelope is left
+        // for the outer path to settle, the sender may retry.
+        let Some(placement) = self.reserve_ipc_wake_split(waiter_tid, self.executing_cpu_split())
+        else {
+            crate::yarm_log!(
+                "SR_RECEIVER_PLACEMENT_REFUSED tid={} endpoint={} reason=home_queue_full result=retry",
+                waiter_tid,
+                endpoint_idx
+            );
+            return Err(SyscallError::WouldBlock);
+        };
+        // The snapshot carries the copyable plan; every return below that does not stash
+        // gives the promise back.
+        let plan = placement.plan;
+        let refuse = move |err: SyscallError| {
+            if let Some(promise) = IpcWakePlacement::from_plan(plan) {
+                self.release_ipc_wake_split(promise);
+            }
+            err
+        };
+
         // (2) rank 2 — consume the waiter's blocked state; its ABI travels into the snapshot and
         // selects the final projection only.
         let blocked_state = self
@@ -14893,17 +14930,19 @@ impl SharedKernel {
                     .find(|t| t.tid.0 == waiter_tid)
                     .and_then(|tcb| tcb.blocked_recv_state.take())
             })
-            .ok_or(SyscallError::InvalidArgs)?;
+            .ok_or(SyscallError::InvalidArgs)
+            .map_err(refuse)?;
         let recv_abi = blocked_state.recv_abi;
 
         // (3) rank 2+4 — the endpoint the envelope is bound to, from the waiter's saved cap.
         let recv_endpoint = self
             .resolve_capability_for_task_split(waiter_tid, blocked_state.recv_cap)
-            .map_err(SyscallError::from)?
+            .map_err(SyscallError::from)
+            .map_err(refuse)?
             .object;
         match recv_endpoint {
             CapObject::Endpoint { index, .. } if index == endpoint_idx => {}
-            _ => return Err(SyscallError::InvalidCapability),
+            _ => return Err(refuse(SyscallError::InvalidCapability)),
         }
 
         // (4) the shared Phase A: one consume, the pin taken over, rights attenuated once. The
@@ -14912,7 +14951,8 @@ impl SharedKernel {
         let mut snapshot = self
             .shared_region_phase_a_split(
                 msg.transferred_cap()
-                    .ok_or(SyscallError::InvalidCapability)?
+                    .ok_or(SyscallError::InvalidCapability)
+                    .map_err(refuse)?
                     .0,
                 recv_endpoint,
                 endpoint_idx,
@@ -14924,11 +14964,15 @@ impl SharedKernel {
                 true,
                 recv_abi,
             )
-            .map_err(SyscallError::from)?;
+            .map_err(SyscallError::from)
+            .map_err(refuse)?;
         // The receiver was consumed as a BLOCKED ENDPOINT WAITER: finalization must clear its
         // blocked-return state + the endpoint waiter slot before waking (structural, not the
         // origin marker).
         snapshot.blocked_endpoint_waiter = true;
+        // SR-PLACE1: the promise travels with the delivery; its single owner from here is the
+        // drain's transaction (commit at finalize, or release in the rollback).
+        snapshot.placement = Some(plan);
         stash_shared_region_delivery(
             cpu_idx,
             snapshot,
@@ -16661,61 +16705,124 @@ impl SharedKernel {
         all_acked
     }
 
-    /// rank 2 → rank 1 (non-nested): wake a blocked receiver exactly once. Phase 1 (task lock) reads
-    /// + validates status and sets it Runnable, capturing the affinity; phase 2 (scheduler lock)
-    /// enqueues. NO IPC/capability/VM/memory lock is held. Mirrors `apply_split_receiver_wake_plan`
-    /// (`wake_tid_to_runnable` → `enqueue_woken_task`) for a blocked recv-v2 receiver (whose plain
-    /// recv carries no IPC deadline, so the broad path's timeout-clear is a no-op here).
-    pub(crate) fn sr_wake_receiver_split(&self, tid: u64) -> bool {
-        use crate::kernel::ipc::ThreadId;
-        use crate::kernel::scheduler::TaskPriority;
-        use crate::kernel::task::{TaskClass, TaskStatus};
-        // Phase 1 (rank 2): validate + set Runnable, capture affinity.
-        let plan = self.with_task_tcbs_split_mut(|tcbs| {
+    /// rank 2 → rank 1 (non-nested): the plain-branch shared-region wake (the queued dequeue's
+    /// receiver, and the transaction proofs), placement-aware (SR-PLACE1). NO IPC / capability /
+    /// VM / memory lock is held.
+    ///
+    /// It used to write `Runnable` under the task lock and then attempt an ordinary, refusable
+    /// enqueue whose `QueueFull` it discarded (`is_ok_and`), so a full home queue left the
+    /// receiver `Runnable` but neither queued nor current; and it rewrote a RUNNING receiver (the
+    /// queued origin's own dequeuing task) to `Runnable` while it stayed current. Now:
+    /// * a RUNNING receiver is already placed — the CPU it runs on — so nothing changes and any
+    ///   promise is given back;
+    /// * a blocked or runnable receiver first holds a home-slot promise (the producer's, else
+    ///   one reserved here and stored in the snapshot). No room → `None` with NOTHING mutated, so
+    ///   the transaction's rollback is exact;
+    /// * only then is it made `Runnable` and the promise committed — exactly one entry (an
+    ///   already-queued receiver keeps its one).
+    pub(crate) fn sr_wake_receiver_split(
+        &self,
+        snap: &mut crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    ) -> Option<bool> {
+        use crate::kernel::task::TaskStatus;
+        let tid = snap.receiver_tid;
+        // rank 2, read-only: classify.
+        let status = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.status)
+        })?;
+        match status {
+            TaskStatus::Running => {
+                if let Some(promise) = snap.placement.take().and_then(IpcWakePlacement::from_plan) {
+                    self.release_ipc_wake_split(promise);
+                }
+                return Some(true);
+            }
+            TaskStatus::Blocked(_) | TaskStatus::Runnable => {}
+            _ => return None,
+        }
+        if !self.sr_ensure_receiver_placement_split(snap) {
+            return None;
+        }
+        // rank 2: revalidate and set Runnable — the claim, after the slot was secured.
+        let prior = self.with_task_tcbs_split_mut(|tcbs| {
             let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
             // SCHED-LOCK1 witness only: the incarnation this owner places, under rank 2.
             #[cfg(feature = "sched-lock1-witness")]
             crate::kernel::schedlock1_witness::stage_incarnation(tid, tcb.asid);
             let old = tcb.status;
-            if !matches!(
-                old,
-                TaskStatus::Blocked(_) | TaskStatus::Runnable | TaskStatus::Running
-            ) {
+            if !matches!(old, TaskStatus::Blocked(_) | TaskStatus::Runnable) {
                 return None;
             }
-            if !matches!(old, TaskStatus::Runnable) {
-                tcb.status = TaskStatus::Runnable;
+            tcb.status = TaskStatus::Runnable;
+            Some(old)
+        })?;
+        if !matches!(
+            self.sr_commit_receiver_placement_split(snap),
+            SrPlacementCommit::Refused
+        ) {
+            return Some(true);
+        }
+        // Invariant break only (the promised CPU refused its own reservation): put the receiver
+        // back exactly as it was, so it is never left `Runnable` without a placement.
+        self.with_task_tcbs_split_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                tcb.status = prior;
             }
-            Some(tcb.cpu_affinity)
         });
-        let Some(affinity) = plan else {
-            return false;
-        };
-        // Phase 2 (rank 1): enqueue on the pinned CPU, else the current CPU (mirrors
-        // `enqueue_woken_task`). Priority is class-derived (SystemServer=High else Normal).
-        let priority = match self.task_class_split_read(tid) {
-            Some(class) => crate::kernel::task_enqueue::priority_for_class(class),
-            // A woken task is already known live, so an absent class is Normal here rather than
-            // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
-            None => TaskPriority::Normal,
-        };
-        // AP-SCHED1: the task's home, never the ambient `sched.current_cpu`.
-        let cpu = match affinity {
-            Some(cpu) => cpu,
-            None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),
-        };
-        // SCHED-LOCK1: the destination's 1L only; the IPI after its release.
-        let enqueued = self
-            .with_cpu_sched_split(cpu, |c| c.enqueue_with_priority(ThreadId(tid), priority))
-            .is_ok_and(|r| r.is_ok());
-        #[cfg(feature = "sched-lock1-witness")]
-        if enqueued {
-            crate::kernel::schedlock1_witness::claim(self, cpu, tid);
+        None
+    }
+
+    /// SR-PLACE1 — make sure `snap` holds its receiver's home-slot promise: the producer's, else
+    /// one reserved now and stored into the snapshot, so the transaction's single rollback owns
+    /// it. `false`: the home queue has no room — nothing was mutated.
+    fn sr_ensure_receiver_placement_split(
+        &self,
+        snap: &mut crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    ) -> bool {
+        if snap.placement.is_none() {
+            snap.placement = self
+                .reserve_ipc_wake_split(snap.receiver_tid, self.executing_cpu_split())
+                .map(|promise| promise.plan);
         }
-        if enqueued {
-            crate::arch::hal::notify_enqueued(cpu);
+        snap.placement.is_some()
+    }
+
+    /// SR-PLACE1 — fill the receiver's promise (rank 1L of its home only; the IPI after the
+    /// release). It cannot be refused for capacity. The promise is consumed on every path, so
+    /// `snap.placement` is cleared: `Queued` — the receiver now has exactly one entry there;
+    /// `AlreadyPlaced` — it already had one (the promise released, nothing added); `Refused` —
+    /// an invariant break (the reserved CPU refused its own reservation), logged.
+    fn sr_commit_receiver_placement_split(
+        &self,
+        snap: &mut crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    ) -> SrPlacementCommit {
+        use crate::kernel::task_enqueue::{self as te, ReservedCommit};
+        let Some(promise) = snap.placement.take().and_then(IpcWakePlacement::from_plan) else {
+            return SrPlacementCommit::Refused;
+        };
+        match self.with_cpu_sched_split(promise.home, |c| {
+            te::commit_reserved_enqueue_on_cpu_locked(c, &promise.plan)
+        }) {
+            Ok(Ok(ReservedCommit::Queued(cpu))) => {
+                #[cfg(feature = "sched-lock1-witness")]
+                crate::kernel::schedlock1_witness::claim(self, cpu, promise.plan.tid);
+                crate::arch::hal::notify_enqueued(cpu);
+                SrPlacementCommit::Queued
+            }
+            Ok(Ok(ReservedCommit::AlreadyPlaced(_))) => SrPlacementCommit::AlreadyPlaced,
+            other => {
+                crate::yarm_log!(
+                    "SR_RECEIVER_RESERVED_COMMIT_REFUSED tid={} cpu={} result={:?}",
+                    promise.plan.tid,
+                    promise.home.0,
+                    other
+                );
+                SrPlacementCommit::Refused
+            }
         }
-        true
     }
 
     /// rank 2 (task lock) — Stage 198E3B2B1 Phase 1: blocked-receiver PREVALIDATION. Makes NO
@@ -18666,12 +18773,12 @@ impl SharedKernel {
     /// dequeue / proofs) it is a plain best-effort wake, preserving the prior executor semantics.
     pub(crate) fn sr_finalize_blocked_receiver_and_wake_split(
         &self,
-        snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+        snap: &mut crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
         result: crate::kernel::boot::BlockedRecvDeliveryResult,
     ) -> Option<bool> {
         if !snap.blocked_endpoint_waiter {
             // Plain wake path: no endpoint-waiter identity to claim (queued dequeue / txn proofs).
-            return Some(self.sr_wake_receiver_split(snap.receiver_tid));
+            return self.sr_wake_receiver_split(snap);
         }
         let CapObject::Endpoint {
             index: eidx,
@@ -18688,6 +18795,13 @@ impl SharedKernel {
         // Phase 1 (rank 2): prevalidate — NO mutation. A dead/replaced receiver is stale BEFORE claim,
         // so a replacement waiter slot is never removed on the common path.
         if !self.sr_prevalidate_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
+            return None;
+        }
+        // SR-PLACE1: the receiver's home slot is secured BEFORE the claim — normally the direct
+        // producer's promise, taken before the sender was told the delivery succeeded. Without
+        // room nothing has been claimed or cleared, so the stale rollback below is exact. From
+        // here on no capacity refusal can undo the delivery.
+        if !self.sr_ensure_receiver_placement_split(snap) {
             return None;
         }
         // Phase 2 (rank 3): the exact, generation-bearing IDENTITY claim (remove once). Because the
@@ -18707,66 +18821,54 @@ impl SharedKernel {
         let recv_cap = self.blocked_recv_cap_split_read(snap.receiver_tid, snap.receiver_asid);
         // Phase 3 (rank 2): commit — registers cleared ONLY here, strictly after the claim.
         match self.sr_commit_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid, result) {
-            ReceiverCommit::Committed(affinity, reply_deadline) => {
-                // Phase 4 (rank 1): the single enqueue — the last externally visible act.
-                //
-                // Stage 199D: a refused placement is no longer swallowed, and no longer reported
-                // as a wake either. This caller uses the GENERIC seam, which never withdraws a
-                // pre-existing entry: it owns no rollback that could complete such a withdrawal,
-                // so removing one would be a hidden side effect. On refusal it restores its own
-                // receiver — `Runnable → Blocked` on the exact recv cap, waiter reinstalled — and
-                // reports NO wake, rather than leaving a Runnable-but-unqueued task behind.
-                //
-                // An `AlreadyQueued` collision arrives unreconciled (`reconciled: None`), so the
-                // receiver's membership is unknown: fail closed with ZERO mutation — do not force
-                // it Blocked on top of live membership, and do not touch its queue entry.
-                match self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity) {
-                    ReceiverEnqueue::Enqueued { .. } => {
-                        // Stage 199D-WA3C2: the receiver is placed and will run — the claimed
-                        // incarnation is DELIVERED. Consume + retire, so the endpoint's
-                        // ownership slot returns to `Vacant` and the next receiver may publish.
-                        let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);
-                        // BL5a-2: the wait is over, so is its reply-deadline registration.
+            ReceiverCommit::Committed(_affinity, reply_deadline) => {
+                // Phase 4 (rank 1): the single placement — the last externally visible act. It
+                // fills the promise secured above, so it cannot be refused for capacity
+                // (SR-PLACE1); an already-queued receiver keeps its one entry.
+                #[cfg(feature = "sched-lock1-witness")]
+                self.with_task_tcbs_split_mut(|tcbs| {
+                    crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, snap.receiver_tid)
+                });
+                let placed = self.sr_commit_receiver_placement_split(snap);
+                if matches!(placed, SrPlacementCommit::Queued) {
+                    // Stage 199D-WA3C2: the receiver is placed and will run — the claimed
+                    // incarnation is DELIVERED. Consume + retire, so the endpoint's ownership
+                    // slot returns to `Vacant` and the next receiver may publish.
+                    let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);
+                    // BL5a-2: the wait is over, so is its reply-deadline registration.
+                    let _ = self.retire_taken_reply_deadline_split(reply_deadline);
+                    Some(true)
+                } else {
+                    // Not a wake. `AlreadyPlaced`: a blocked endpoint waiter that ALSO holds a
+                    // queue entry is an inconsistency this finalizer did not make; Stage 199D's
+                    // rule stands — its membership is left exactly as found and nothing is
+                    // delivered (no restore on top of live membership). `Refused` (an invariant
+                    // break only: the promised CPU refused its own reservation): Stage 199D's
+                    // restore — back to `Blocked` on its exact recv cap, waiter reinstalled, never
+                    // `Runnable` without a placement.
+                    let uncommit_cap =
+                        recv_cap.filter(|_| matches!(placed, SrPlacementCommit::Refused));
+                    if uncommit_cap.is_none() {
                         let _ = self.retire_taken_reply_deadline_split(reply_deadline);
-                        Some(true)
                     }
-                    ReceiverEnqueue::Rejected { cpu, error, .. } => {
-                        let unplaced = !matches!(
-                            error,
-                            crate::kernel::scheduler::SchedulerError::AlreadyQueued
-                        );
-                        // BL5a-2: the uncommit settles the taken registration (back onto the
-                        // restored wait, or retired); a receiver that is never offered to the
-                        // uncommit does not wait on it again, so it is retired here.
-                        let uncommit_cap = recv_cap.filter(|_| unplaced);
-                        if uncommit_cap.is_none() {
-                            let _ = self.retire_taken_reply_deadline_split(reply_deadline);
-                        }
-                        let restored = uncommit_cap.is_some_and(|cap| {
-                            self.sr_uncommit_blocked_receiver_split(
-                                snap.receiver_tid,
-                                snap.receiver_asid,
-                                cap,
-                                reply_deadline,
-                            )
-                        }) && self.sr_restore_endpoint_waiter_split(&claim);
-                        // Stage 199D-WA3C2: a successful restore already settled the claim
-                        // (`Claimed → Available`, waiter republished). Every other shape leaves
-                        // it LIVE, and a live claim wedges the endpoint index against all future
-                        // receivers — so cancel + retire it here. Cancel rather than consume:
-                        // nothing was delivered.
-                        if !restored {
-                            let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
-                        }
-                        crate::yarm_log!(
-                            "SR_RECEIVER_ENQUEUE_REJECTED tid={} cpu={} error={:?} restored={} result=no_wake",
+                    let restored = uncommit_cap.is_some_and(|cap| {
+                        self.sr_uncommit_blocked_receiver_split(
                             snap.receiver_tid,
-                            cpu.0,
-                            error,
-                            u32::from(restored)
-                        );
-                        None
+                            snap.receiver_asid,
+                            cap,
+                            reply_deadline,
+                        )
+                    }) && self.sr_restore_endpoint_waiter_split(&claim);
+                    if !restored {
+                        let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
                     }
+                    crate::yarm_log!(
+                        "SR_RECEIVER_ENQUEUE_REJECTED tid={} outcome={:?} restored={} result=no_wake",
+                        snap.receiver_tid,
+                        placed,
+                        u32::from(restored)
+                    );
+                    None
                 }
             }
             // Receiver exited OR was replaced (ASID changed) after the identity claim: the claimed
@@ -20228,6 +20330,17 @@ impl ReceiverEnqueue {
     }
 }
 
+/// SR-PLACE1 — what filling a shared-region receiver's promised home slot did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SrPlacementCommit {
+    /// The receiver now has exactly one queue entry on its home.
+    Queued,
+    /// It already had one there; nothing was added and the promise was released.
+    AlreadyPlaced,
+    /// Invariant break: the reserved CPU refused its own reservation (logged).
+    Refused,
+}
+
 /// Outcome of the Phase-3 task commit, run only AFTER a successful waiter claim (Stage 198E3B2B1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReceiverCommit {
@@ -20394,11 +20507,16 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
     // whether a metadata copy happens at all, so this seam stays ABI-agnostic.)
     fn ctx_finalize_and_wake(
         &mut self,
-        snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+        snap: &mut crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
         result: crate::kernel::boot::BlockedRecvDeliveryResult,
     ) -> Option<bool> {
         self.shared
             .sr_finalize_blocked_receiver_and_wake_split(snap, result)
+    }
+    fn ctx_release_placement(&mut self, plan: crate::kernel::task_enqueue::EnqueuePlan) {
+        if let Some(placement) = IpcWakePlacement::from_plan(plan) {
+            self.shared.release_ipc_wake_split(placement);
+        }
     }
     fn ctx_release_pin(&mut self, object: CapObject) {
         self.shared.sr_release_pin_split(object)

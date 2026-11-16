@@ -1342,24 +1342,43 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
         );
         return Err(SyscallError::WouldBlock);
     }
+    // SR-PLACE1 — promise the receiver its home-queue slot BEFORE the first mutation (the broad
+    // twin of the off-lock producer). No room: the canonical retryable `WouldBlock`, nothing
+    // taken. Every non-stashing return below gives the promise back.
+    use crate::kernel::boot::ReplyTimeoutDomains;
+    let Some(plan) = kernel.rtd_reserve(waiter_tid) else {
+        crate::yarm_log!(
+            "SR_RECEIVER_PLACEMENT_REFUSED tid={} endpoint={} reason=home_queue_full result=retry",
+            waiter_tid,
+            endpoint_idx
+        );
+        return Err(SyscallError::WouldBlock);
+    };
+    let refuse = |kernel: &mut KernelState, err: SyscallError| {
+        kernel.rtd_release(plan);
+        err
+    };
     // Phase A.1 — consume blocked state and resolve the endpoint the envelope is bound to.
-    let blocked_state = kernel
+    let Some(blocked_state) = kernel
         .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
         .flatten()
-        .ok_or(SyscallError::InvalidArgs)?;
+    else {
+        return Err(refuse(kernel, SyscallError::InvalidArgs));
+    };
     // Stage 199G-B §1 — the waiter's own receive ABI, captured here with the rest of its saved
     // state and carried into the snapshot. It selects the final projection only.
     let recv_abi = blocked_state.recv_abi;
-    let recv_endpoint = kernel
-        .resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
-        .map_err(SyscallError::from)?
-        .object;
+    let recv_endpoint = match kernel.resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
+    {
+        Ok(cap) => cap.object,
+        Err(e) => return Err(refuse(kernel, SyscallError::from(e))),
+    };
     let handle = msg.transferred_cap().unwrap().0;
     // Phase A.2 — build the accepted post-lock snapshot (envelope consume + pin transfer +
     // object-authoritative classification + attenuated rights + receiver generation authority).
     // The receiver's recv buffers provide the map VA and the recv-v2 meta target. Read-only for
     // the primary live seal (existing hosted tests cover the canonical writable-right gate).
-    let mut snapshot = kernel
+    let phase_a = kernel
         .shared_region_phase_a(
             handle,
             recv_endpoint,
@@ -1371,11 +1390,17 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
             true,
             recv_abi,
         )
-        .map_err(SyscallError::from)?;
+        .map_err(SyscallError::from);
+    let mut snapshot = match phase_a {
+        Ok(snapshot) => snapshot,
+        Err(e) => return Err(refuse(kernel, e)),
+    };
     // The receiver was consumed as a BLOCKED ENDPOINT WAITER: finalization must clear its
     // blocked-return state + the endpoint waiter slot before waking (structural, not the origin
     // marker).
     snapshot.blocked_endpoint_waiter = true;
+    // SR-PLACE1: the promise travels with the delivery to its single settling owner.
+    snapshot.placement = Some(plan);
     stash_shared_region_delivery(
         cpu_idx,
         snapshot,

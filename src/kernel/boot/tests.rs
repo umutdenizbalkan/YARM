@@ -71790,7 +71790,12 @@ mod stage198e3b2b_drain_switch {
     // `pages`-page MemoryObject source cap + a stashed shared-region envelope, then run the DIRECT
     // producer (which snapshots blocked_endpoint_waiter=true + origin Direct + stashes the post-work).
     // Wrap in SharedKernel for the real drain. `waiter_slot=None` leaves the endpoint slot empty.
-    fn build_blocked(pages: usize, waiter_slot: Option<u64>) -> Drn {
+    /// The blocked-receiver world WITHOUT running a producer: the kernel, the endpoint index, the
+    /// object's base frame, the receiver's ASID and the shared-region send.
+    fn world(
+        pages: usize,
+        waiter_slot: Option<u64>,
+    ) -> (KernelState, usize, u64, crate::kernel::vm::Asid, Message) {
         reset_globals();
         crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
         crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
@@ -71883,6 +71888,11 @@ mod stage198e3b2b_drain_switch {
             b"sr",
         )
         .expect("msg");
+        (s, eidx, phys0, asid, msg)
+    }
+
+    fn build_blocked(pages: usize, waiter_slot: Option<u64>) -> Drn {
+        let (mut s, eidx, phys0, asid, msg) = world(pages, waiter_slot);
         let produced = crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
             &mut s, 2, eidx, &msg,
         )
@@ -72734,6 +72744,405 @@ mod stage198e3b2b_drain_switch {
             "off the oracle knob the producer must stay dormant"
         );
         reset_globals();
+    }
+
+    /// SR-PLACE1 — shared-region receiver placement on a full home queue, driven through the
+    /// REAL producers and the REAL post-work drain (`drain_dispatch_post_work` →
+    /// `SharedRegionOffLockCtx` → `run_shared_region_txn`). The invariant every test checks:
+    /// a `Runnable` receiver is placed exactly once, and a delivery the sender was told
+    /// succeeded is delivered exactly once.
+    mod sr_place1 {
+        use super::*;
+        use std::vec::Vec;
+
+        fn queue(s: &KernelState) -> Vec<u64> {
+            let mut q = Vec::new();
+            s.for_each_queued_on_for_test(CPU0, |_, t| q.push(t.0));
+            q
+        }
+        fn placed(s: &KernelState, tid: u64) -> usize {
+            queue(s).iter().filter(|&&t| t == tid).count()
+                + usize::from(s.current_tid() == Some(tid))
+        }
+        fn reserved(s: &KernelState) -> usize {
+            s.with_scheduler_state(|all| all.reserved_user_slots_on(CPU0))
+        }
+        /// Fill CPU 0's user queue with runnable fillers until a push is refused.
+        fn fill(s: &mut KernelState, base: u64) -> Vec<u64> {
+            let mut v = Vec::new();
+            loop {
+                let t = base + v.len() as u64;
+                s.register_task(t).expect("filler");
+                s.set_task_status_for_test(t, TaskStatus::Runnable);
+                s.set_task_home_cpu(t, CPU0).expect("home");
+                if s.enqueue_task(t).is_err() {
+                    s.exit_task(t, 0).expect("retire the refused filler");
+                    return v;
+                }
+                v.push(t);
+            }
+        }
+
+        /// The QUEUED-origin producer (receiver-side dequeue) for task 2 on a one-page object.
+        /// `current`: task 2 is the CPU's running task (the origin's real shape); otherwise it is
+        /// left blocked off every queue (the shape the plain finalize branch must still handle).
+        fn build_queued(current: bool) -> Drn {
+            reset_globals();
+            crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+                .store(true, Ordering::Relaxed);
+            let mut s = Bootstrap::init().expect("init");
+            s.register_task(2).expect("task2");
+            s.set_task_home_cpu(2, CPU0).expect("home");
+            let (eidx, send_cap, _recv) = s.create_endpoint(4).expect("endpoint");
+            let endpoint = s.current_task_capability(send_cap).expect("send").object;
+            let (_id, mem_cap0) = s
+                .alloc_anonymous_memory_object_with_len(PAGE_SIZE)
+                .expect("mem");
+            let source_obj = s.current_task_capability(mem_cap0).expect("obj").object;
+            let phys0 = s
+                .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, source_obj))
+                .expect("phys")
+                .0;
+            let src_cap = s
+                .mint_capability_for_current_context(Capability::new(
+                    source_obj,
+                    CapRights::READ | CapRights::MAP,
+                ))
+                .expect("mint");
+            let (asid, aspace) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(2, asid).expect("bind");
+            s.map_user_page(
+                aspace,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x7000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+            if current {
+                s.enqueue_current_cpu(2).expect("enqueue");
+                s.dispatch_next_task().expect("dispatch");
+                assert_eq!(s.current_tid(), Some(2), "fixture: task 2 is current");
+            } else {
+                s.with_tcb_mut(2, |tcb| {
+                    tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(send_cap));
+                });
+            }
+            let region = TransferSharedRegion {
+                offset: 0,
+                len: PAGE_SIZE as u64,
+            };
+            let handle = s
+                .stash_transfer_envelope(
+                    ThreadId(0),
+                    src_cap,
+                    endpoint,
+                    Some(ThreadId(2)),
+                    Some(region),
+                )
+                .expect("stash");
+            let msg = Message::with_header(
+                0,
+                OPCODE_SHARED_MEM,
+                Message::FLAG_CAP_TRANSFER,
+                Some(handle),
+                b"sr",
+            )
+            .expect("msg");
+            let produced = crate::kernel::syscall::produce_queued_shared_region_delivery(
+                &mut s, 2, eidx, endpoint, MAP_VA, META_PTR, false, &msg,
+            )
+            .expect("producer");
+            assert!(produced, "queued producer must publish post-work");
+            Drn {
+                shared: SharedKernel::new(s),
+                eidx,
+                phys0,
+                asid,
+            }
+        }
+
+        /// R1 (baseline reproducer) — the DIRECT delivery is committed to the sender (its send
+        /// returned success when the producer stashed the post-work); the receiver's home queue
+        /// fills before the drain. The delivery must still land exactly once.
+        #[test]
+        fn r1_direct_delivery_whose_home_queue_fills_after_commit_is_delivered_once() {
+            let d = build_blocked(2, Some(2));
+            d.shared
+                .with(|s| s.set_task_home_cpu(2, CPU0).expect("home"));
+            d.shared.with(|s| fill(s, 9000));
+            let drained = drain(&d);
+            d.shared.with(|s| {
+                assert!(
+                    drained.is_ok(),
+                    "a committed delivery may not be rolled back for capacity: {drained:?}"
+                );
+                assert_eq!(
+                    s.task_status(2),
+                    Some(TaskStatus::Runnable),
+                    "receiver woken"
+                );
+                assert_eq!(placed(s, 2), 1, "receiver placed exactly once");
+                assert_eq!(reserved(s), 0, "no promise left behind");
+            });
+            assert_eq!(waiter(&d), None, "endpoint waiter consumed");
+            assert_eq!(active_mappings(&d), 1, "the region is mapped once");
+            reset_globals();
+        }
+
+        /// R2 (baseline reproducer) — the plain finalize branch on a full home queue: the receiver
+        /// may never be left `Runnable` but neither queued nor current.
+        #[test]
+        fn r2_plain_wake_on_a_full_home_queue_never_strands_the_receiver() {
+            let d = build_queued(false);
+            d.shared.with(|s| fill(s, 9000));
+            let drained = drain(&d);
+            d.shared.with(|s| {
+                if s.task_status(2) == Some(TaskStatus::Runnable) {
+                    assert_eq!(placed(s, 2), 1, "Runnable receiver is placed exactly once");
+                } else {
+                    assert!(
+                        drained.is_err(),
+                        "an unplaced receiver means nothing was published"
+                    );
+                    assert_eq!(placed(s, 2), 0);
+                }
+                assert_eq!(reserved(s), 0, "no promise left behind");
+            });
+            if drained.is_err() {
+                assert_eq!(active_mappings(&d), 0, "a refused delivery maps nothing");
+            }
+            reset_globals();
+        }
+
+        /// R3 (baseline reproducer) — the queued origin's real shape: the receiver is the CPU's
+        /// running task. Its delivery must not place it a second time.
+        #[test]
+        fn r3_plain_wake_of_the_running_receiver_places_it_once() {
+            let d = build_queued(true);
+            assert!(drain(&d).is_ok(), "the queued delivery lands");
+            d.shared.with(|s| {
+                assert_eq!(s.current_tid(), Some(2), "still the running task");
+                assert_eq!(
+                    s.task_status(2),
+                    Some(TaskStatus::Running),
+                    "the running receiver keeps its status"
+                );
+                assert_eq!(placed(s, 2), 1, "running receiver placed exactly once");
+                assert_eq!(reserved(s), 0);
+            });
+            assert_eq!(active_mappings(&d), 1);
+            reset_globals();
+        }
+
+        fn envelope_live(d: &Drn) -> usize {
+            d.shared.with(|k| {
+                k.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes
+                        .iter()
+                        .filter(|e| e.is_some())
+                        .count()
+                })
+            })
+        }
+        fn blocked_state_kept(d: &Drn) -> bool {
+            d.shared
+                .with(|k| k.with_tcb_mut(2, |tcb| tcb.blocked_recv_state.is_some()))
+                .unwrap_or(false)
+        }
+        /// After every outcome: no promise survives, and the receiver is placed iff Runnable.
+        fn settled(d: &Drn) {
+            d.shared.with(|s| {
+                assert_eq!(reserved(s), 0, "no leaked reservation");
+                if s.task_status(2) == Some(TaskStatus::Runnable) {
+                    assert_eq!(placed(s, 2), 1, "Runnable ⇒ placed exactly once");
+                } else {
+                    assert_eq!(placed(s, 2), 0, "not Runnable ⇒ not placed");
+                }
+            });
+        }
+
+        /// R4 — full-queue refusal and recovery through the OFF-LOCK producer (the production
+        /// NR 1 route): with no room the producer refuses BEFORE its first mutation — retryable
+        /// `WouldBlock`, the receiver still blocked with its saved receive state, the envelope
+        /// untouched, nothing reserved, nothing stashed. Once a slot frees, the retried send
+        /// delivers exactly once.
+        #[test]
+        fn r4_full_home_queue_refuses_the_split_producer_with_nothing_taken_then_recovers() {
+            let (s, eidx, phys0, asid, msg) = world(1, Some(2));
+            let d = Drn {
+                shared: SharedKernel::new(s),
+                eidx,
+                phys0,
+                asid,
+            };
+            d.shared
+                .with(|s| s.set_task_home_cpu(2, CPU0).expect("home"));
+            let fillers = d.shared.with(|s| fill(s, 9000));
+            let envelopes = envelope_live(&d);
+            let pin_before = pin(&d);
+            assert_eq!(
+                d.shared
+                    .produce_blocked_waiter_shared_region_delivery_split(2, eidx, &msg),
+                Err(crate::kernel::syscall::SyscallError::WouldBlock),
+                "no room: refused, retryable"
+            );
+            assert!(
+                blocked_state_kept(&d),
+                "the receiver's saved receive state is untouched"
+            );
+            assert_eq!(
+                status(&d),
+                Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    d.shared
+                        .with(|k| k.with_tcb_mut(2, |t| t.blocked_recv_state.unwrap().recv_cap))
+                        .unwrap()
+                )))
+            );
+            assert_eq!(
+                waiter(&d),
+                Some(ThreadId(2)),
+                "the endpoint waiter is untouched"
+            );
+            assert_eq!(
+                envelope_live(&d),
+                envelopes,
+                "the envelope is left for the sender path"
+            );
+            assert_eq!(pin(&d), pin_before, "no pin moved");
+            assert!(stash_empty(&d), "nothing was stashed");
+            settled(&d);
+            // Recovery: a slot frees; the retry is a fresh, complete delivery.
+            d.shared.with(|s| {
+                assert_eq!(
+                    s.withdraw_queued_tid_on(CPU0, fillers[0]),
+                    crate::kernel::scheduler::WithdrawOutcome::Removed
+                );
+                s.set_task_status_for_test(
+                    fillers[0],
+                    TaskStatus::Blocked(WaitReason::Join(ThreadId(1))),
+                );
+            });
+            assert_eq!(
+                d.shared
+                    .produce_blocked_waiter_shared_region_delivery_split(2, eidx, &msg),
+                Ok(true)
+            );
+            d.shared
+                .with(|s| assert_eq!(reserved(s), 1, "the delivery holds its promise"));
+            // The queue fills up again before the drain: the promise holds the slot.
+            d.shared.with(|s| {
+                let late = fill(s, 9500);
+                assert!(
+                    late.is_empty(),
+                    "the promised slot is not available to anyone else"
+                );
+            });
+            assert!(drain(&d).is_ok(), "the committed delivery lands");
+            assert_eq!(status(&d), Some(TaskStatus::Runnable));
+            assert_eq!(waiter(&d), None);
+            assert_eq!(active_mappings(&d), 1);
+            settled(&d);
+            assert!(drain(&d).is_ok(), "a second drain finds nothing");
+            d.shared
+                .with(|s| assert_eq!(placed(s, 2), 1, "one delivery, one completion"));
+            assert_eq!(active_mappings(&d), 1, "and one mapping");
+            reset_globals();
+        }
+
+        /// R5 — the broad producer refuses the same way.
+        #[test]
+        fn r5_full_home_queue_refuses_the_broad_producer_with_nothing_taken() {
+            let (mut s, eidx, _phys0, _asid, msg) = world(1, Some(2));
+            s.set_task_home_cpu(2, CPU0).expect("home");
+            fill(&mut s, 9000);
+            assert_eq!(
+                crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+                    &mut s, 2, eidx, &msg
+                ),
+                Err(crate::kernel::syscall::SyscallError::WouldBlock)
+            );
+            assert!(
+                s.with_tcb_mut(2, |t| t.blocked_recv_state.is_some())
+                    .unwrap()
+            );
+            assert_eq!(reserved(&s), 0);
+            assert!(unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none());
+            reset_globals();
+        }
+
+        /// R6 — a stale waiter identity (the slot now names someone else) after the promise was
+        /// taken: no claim, no wake, the promise released, nothing mapped, the pin returned.
+        #[test]
+        fn r6_stale_waiter_identity_releases_the_promise() {
+            // The endpoint's waiter slot names a DIFFERENT task (7): the receiver's promise is
+            // taken by the producer, and the finalize then finds the identity stale.
+            let d = build_blocked(1, Some(7));
+            let pin_after_produce = pin(&d);
+            d.shared.with(|s| assert_eq!(reserved(s), 1));
+            assert!(drain(&d).is_err(), "stale: rolled back");
+            assert_eq!(
+                waiter(&d),
+                Some(ThreadId(7)),
+                "the other waiter is untouched"
+            );
+            assert!(matches!(status(&d), Some(TaskStatus::Blocked(_))));
+            assert_eq!(active_mappings(&d), 0);
+            assert!(pin(&d) < pin_after_produce, "the transfer pin was released");
+            settled(&d);
+            reset_globals();
+        }
+
+        /// R7 — the receiver exits between the commit and the drain: the transaction finds it
+        /// gone, releases its promise, maps nothing, keeps nothing.
+        #[test]
+        fn r7_receiver_exit_during_delivery_releases_everything() {
+            let d = build_blocked(2, Some(2));
+            d.shared.with(|s| assert_eq!(reserved(s), 1));
+            d.shared.with(|s| s.exit_task(2, 0).expect("exit"));
+            assert!(drain(&d).is_err(), "receiver gone: rolled back");
+            assert_eq!(active_mappings(&d), 0, "no mapping survives");
+            d.shared.with(|s| {
+                assert_eq!(reserved(s), 0, "no leaked reservation");
+                assert_eq!(placed(s, 2), 0, "a dead receiver is placed nowhere");
+            });
+            reset_globals();
+        }
+
+        /// R8 — an already-placed receiver (woken and queued by another owner before the drain)
+        /// is not a blocked endpoint waiter any more: the finalize is stale, the promise is
+        /// released, and the receiver keeps its ONE existing entry — never a second.
+        #[test]
+        fn r8_already_placed_receiver_is_never_placed_twice() {
+            let d = build_blocked(1, Some(2));
+            d.shared.with(|s| {
+                s.set_task_status_for_test(2, TaskStatus::Runnable);
+                s.enqueue_task(2).expect("placed by another owner");
+                assert_eq!(placed(s, 2), 1);
+            });
+            assert!(drain(&d).is_err(), "not a blocked waiter any more: stale");
+            settled(&d);
+            d.shared
+                .with(|s| assert_eq!(placed(s, 2), 1, "still exactly one entry"));
+            assert_eq!(active_mappings(&d), 0);
+            reset_globals();
+        }
+
+        /// R9 — a failure after the promise (a mapping fault on the second page) rolls back the
+        /// delivery AND releases the promise; the receiver stays blocked.
+        #[test]
+        fn r9_failure_rollback_releases_the_promise() {
+            let d = build_blocked(2, Some(2));
+            SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(1, Ordering::SeqCst);
+            assert!(drain(&d).is_err());
+            SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+            assert!(matches!(status(&d), Some(TaskStatus::Blocked(_))));
+            assert_eq!(active_mappings(&d), 0);
+            settled(&d);
+            reset_globals();
+        }
     }
 }
 
@@ -120925,6 +121334,7 @@ mod stage199d_shared_region_enqueue_rejection {
             origin_direct: true,
             blocked_endpoint_waiter: true,
             msg: Message::with_header(1, 0, 0, None, b"sr").expect("msg"),
+            placement: None,
         };
         let recv_cap = k
             .blocked_recv_cap_split_read(2, asid2)
@@ -120983,7 +121393,7 @@ mod stage199d_shared_region_enqueue_rejection {
         });
         assert_eq!(
             fx.k.sr_finalize_blocked_receiver_and_wake_split(
-                &fx.snap,
+                &mut fx.snap.clone(),
                 crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
             ),
             None,
@@ -121008,7 +121418,7 @@ mod stage199d_shared_region_enqueue_rejection {
         }
         assert_eq!(
             fx.k.sr_finalize_blocked_receiver_and_wake_split(
-                &fx.snap,
+                &mut fx.snap.clone(),
                 crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
             ),
             None
@@ -121035,7 +121445,7 @@ mod stage199d_shared_region_enqueue_rejection {
             ));
             assert_eq!(
                 fx.k.sr_finalize_blocked_receiver_and_wake_split(
-                    &fx.snap,
+                    &mut fx.snap.clone(),
                     crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
                 ),
                 None,
@@ -121060,7 +121470,7 @@ mod stage199d_shared_region_enqueue_rejection {
             });
             assert_eq!(
                 fx.k.sr_finalize_blocked_receiver_and_wake_split(
-                    &fx.snap,
+                    &mut fx.snap.clone(),
                     crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
                 ),
                 None
@@ -121086,7 +121496,7 @@ mod stage199d_shared_region_enqueue_rejection {
             ));
             assert_eq!(
                 fx.k.sr_finalize_blocked_receiver_and_wake_split(
-                    &fx.snap,
+                    &mut fx.snap.clone(),
                     crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
                 ),
                 None
@@ -121123,9 +121533,11 @@ mod stage199d_shared_region_enqueue_rejection {
             .find("pub(crate) fn sr_finalize_blocked_receiver_and_wake_split")
             .expect("the finalizer");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("end")];
+        // SR-PLACE1: the finalizer fills the receiver's PROMISED slot — a reserved commit, which
+        // never reconciles (an existing entry is reported, never withdrawn).
         assert!(
-            body.contains("self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity)"),
-            "the finalizer uses the non-reconciling seam"
+            body.contains("self.sr_commit_receiver_placement_split(snap)"),
+            "the finalizer uses the non-reconciling reserved commit"
         );
         assert!(
             !body.contains("reconciled_split"),
@@ -121156,10 +121568,10 @@ mod stage199d_shared_region_enqueue_rejection {
             .find("pub(crate) fn sr_finalize_blocked_receiver_and_wake_split")
             .expect("the finalizer");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("end")];
+        // SR-PLACE1: the wake is reported only for a fresh placement of the promised slot.
         assert!(
-            body.contains("ReceiverEnqueue::Enqueued { .. } => {")
-                && body.contains("Some(true)")
-                && !body.contains("ReceiverEnqueue::Rejected { .. } => Some(true)"),
+            body.contains("if matches!(placed, SrPlacementCommit::Queued) {")
+                && body.contains("Some(true)"),
             "only a committed enqueue reports a wake"
         );
         // Stage 199D-WA3C2: that success arm is also the ONE place the finalizer settles its
@@ -121174,21 +121586,22 @@ mod stage199d_shared_region_enqueue_rejection {
             1,
             "and consumes it exactly once"
         );
-        assert!(
-            body.contains("ReceiverEnqueue::Rejected {"),
-            "and a rejection is handled explicitly"
-        );
         let rejected = body
-            .split("ReceiverEnqueue::Rejected {")
+            .split("if matches!(placed, SrPlacementCommit::Queued) {")
             .nth(1)
+            .and_then(|a| a.split("} else {").nth(1))
             .expect("the rejection arm");
+        let rejected = rejected
+            .split("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
+            .next()
+            .expect("the arm");
         assert!(
             !rejected.contains("Some(true)"),
             "the rejection arm must not report a wake"
         );
         assert!(
-            rejected.contains("SchedulerError::AlreadyQueued"),
-            "…and it must treat an unreconciled collision separately"
+            rejected.contains("SrPlacementCommit::Refused"),
+            "…and it must treat an existing-entry collision separately from a refusal"
         );
     }
 
@@ -122872,6 +123285,13 @@ mod stage199d_wa2a_ownership_boundary {
             // cycle, `sender_waiter::claim_blocked_send_cycle_locked`, which the receiver-side
             // publication now makes too. It moved; it did not multiply (runtime.rs 13 -> 12).
             ("src/kernel/boot/sender_waiter.rs", 1),
+            // SR-PLACE1: a NEW writer in the broad reference twin of the shared-region finalize.
+            // `KernelState::sr_place_receiver_locked` writes `Blocked|Runnable -> Runnable` only
+            // after the receiver's home slot is promised, then commits the promise. It REPLACES
+            // that finalize's two `apply_split_receiver_wake_plan` calls, whose
+            // `wake_tid_to_runnable` set `Runnable` first and then tried a refusable enqueue
+            // (and rewrote a RUNNING receiver); it is the same wake owner, made placement-safe.
+            ("src/kernel/boot/shared_region_txn.rs", 1),
             // U9-SPAWN1 SP-2: `spawn_user_thread`'s Runnable write moved to the shared
             // thread-incarnation owner, so thread_state.rs falls 4 -> 3 and the owner gains 1.
             ("src/kernel/boot/spawn_thread_core.rs", 1),
@@ -122944,7 +123364,13 @@ mod stage199d_wa2a_ownership_boundary {
             // `sender_waiter::claim_blocked_send_cycle_locked` (counted there).
             // FUTEX-FOUND1: 12 -> 9 — the split registration, its undo and the split wake moved
             // into the keyed owners in futex.rs.
-            ("src/runtime.rs", 9),
+            // SR-PLACE1: 9 -> 10. `sr_wake_receiver_split` (the plain shared-region wake) keeps
+            // its `Blocked|Runnable -> Runnable` write — now only AFTER the receiver's home slot
+            // is promised — and gains its exact inverse, which writes the captured prior status
+            // back on the one invariant-break path (the promised CPU refusing its own
+            // reservation), so a receiver is never left `Runnable` without a placement. It no
+            // longer writes a RUNNING receiver at all.
+            ("src/runtime.rs", 10),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -122979,7 +123405,10 @@ mod stage199d_wa2a_ownership_boundary {
             // FUTEX-FOUND1: 41 -> 39 — five futex writes became the three keyed owners.
             // FUTEX-TIME1: 39 -> 40 — the timeout claim.
             // SCHED-TIME-FOUNDATION1 C: 40 -> 41 — the sleep witness exit fixture.
-            41,
+            // SR-PLACE1: 41 -> 43 — `sr_wake_receiver_split`'s exact inverse and the broad
+            // twin's placement-safe wake (`sr_place_receiver_locked`), which replaced two calls
+            // into `wake_tid_to_runnable`.
+            43,
             "40 raw writes — FUTEX-TIME1 added the timeout claim `claim_futex_timeout_locked`, \
              39 -> 40, a new terminal owner of a futex wait cycle — \
              39 before it — U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex \
@@ -123665,7 +124094,8 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Can,
         ),
-        ("src/runtime.rs", "sr_wake_receiver_split", 1, Verdict::Can),
+        // SR-PLACE1: 1 -> 2 — the wake and its exact invariant-break inverse (see the census).
+        ("src/runtime.rs", "sr_wake_receiver_split", 2, Verdict::Can),
         (
             "src/runtime.rs",
             "sr_commit_blocked_receiver_split",
@@ -124261,12 +124691,23 @@ mod stage199d_wa2b_wake_owner_census {
             "}",
             "true",
         ),
+        // SR-PLACE1: the write follows the revalidation that the slot was promised for (it is
+        // reached only after `sr_ensure_receiver_placement_split`), and the second is its exact
+        // inverse on the invariant-break path.
         (
             "src/runtime.rs",
             "sr_wake_receiver_split",
             "tcb.status",
             "TaskStatus::Runnable",
-            "if !matches!(old, TaskStatus::Runnable) {",
+            "}",
+            "Some(old)",
+        ),
+        (
+            "src/runtime.rs",
+            "sr_wake_receiver_split",
+            "tcb.status",
+            "prior",
+            "if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {",
             "}",
         ),
         (
@@ -124391,7 +124832,8 @@ mod stage199d_wa2b_wake_owner_census {
         assert_eq!(
             sites.len(),
             // SCHED-TIME-FOUNDATION1 C: 36 -> 37 — the sleep witness exit fixture.
-            37,
+            // SR-PLACE1: 37 -> 38 — `sr_wake_receiver_split`'s exact invariant-break inverse.
+            38,
             "FUTEX-TIME1: 35 -> 36 — the timeout claim `claim_futex_timeout_locked` is a genuinely \
              new writer: a new terminal owner of a futex wait cycle. \
              FUTEX-FOUND1: 37 -> 35 — the five futex writes (two broad, three split) became the \
@@ -124483,7 +124925,8 @@ mod stage199d_wa2b_wake_owner_census {
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
             // SCHED-TIME-FOUNDATION1 C: 46 -> 47 — a new CANNOT writer, the witness exit fixture.
-            47,
+            // SR-PLACE1: 47 -> 48 — `sr_wake_receiver_split` 1 -> 2 (its exact inverse, CAN).
+            48,
             "FUTEX-TIME1: 45 -> 46, the timeout claim is a new CANNOT writer. \
              FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
              U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex registration, 46 -> 47, \
@@ -124513,7 +124956,8 @@ mod stage199d_wa2b_wake_owner_census {
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
             // SCHED-TIME-FOUNDATION1 C: 46 -> 47 — the sleep witness exit fixture.
-            47,
+            // SR-PLACE1: 47 -> 48 — `sr_wake_receiver_split`'s exact inverse.
+            48,
             "FUTEX-TIME1: 45 -> 46, the timeout claim is a new writer. \
              FUTEX-FOUND1: 47 -> 45, the five futex writes became three keyed owners. \
              U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, 46 -> 47 — the \
@@ -124761,11 +125205,8 @@ mod stage199d_wa2b_wake_owner_census {
                         "emit_fault_report_for_fault",
                         1,
                     ),
-                    (
-                        "src/kernel/boot/shared_region_txn.rs",
-                        "ctx_finalize_and_wake",
-                        2,
-                    ),
+                    // SR-PLACE1: the shared-region finalize's two calls are gone — that wake now
+                    // goes through `sr_place_receiver_locked`, which promises the home slot first.
                     ("src/kernel/syscall/ipc.rs", "handle_ipc_call", 1),
                     ("src/kernel/syscall/ipc.rs", "handle_ipc_send", 1),
                 ],
@@ -124876,7 +125317,8 @@ mod stage199d_wa2b_wake_owner_census {
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
             // SCHED-TIME-FOUNDATION1 C: 46 -> 47 — CANNOT +1 (the sleep witness exit fixture).
-            47,
+            // SR-PLACE1: 47 -> 48 — CAN +1 (`sr_wake_receiver_split`'s exact inverse).
+            48,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -124947,7 +125389,10 @@ mod stage199d_wa2b_wake_owner_census {
             // FUTEX-TIME1: CANNOT 18 -> 19. The timeout claim is a new terminal owner of a futex
             // wait cycle, CANNOT for the same reason as the wake claim (token-exact filter).
             // SCHED-TIME-FOUNDATION1 C: CANNOT 19 -> 20 — the sleep witness exit fixture.
-            (15, 20, 9, 2, 1)
+            // SR-PLACE1: CAN 15 -> 16. `sr_wake_receiver_split`'s second write restores the
+            // status it captured in the same function (only `Blocked(_)` or `Runnable`), so it
+            // CAN write `Blocked(EndpointReceive)` — classified with its forward write.
+            (16, 20, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -196974,21 +197419,26 @@ mod bl5a2_direct_wake_settles_the_taken_registration {
                 TXN,
                 "ReceiverCommit::Committed(affinity, server_reply_deadline) =>",
                 "server_reply_deadline",
+                "Enqueued",
             ),
             (
                 "NR7",
                 TXN,
                 "ReceiverCommit::Committed(affinity, caller_reply_deadline) =>",
                 "caller_reply_deadline",
+                "Enqueued",
             ),
+            // SR-PLACE1: the shared-region arm fills its promised slot (it no longer carries
+            // the affinity: the promise names the home).
             (
                 "shared-region",
                 RUNTIME,
-                "ReceiverCommit::Committed(affinity, reply_deadline) =>",
+                "ReceiverCommit::Committed(_affinity, reply_deadline) =>",
                 "reply_deadline",
+                "sr_commit_receiver_placement_split",
             ),
         ];
-        for (name, src, arm, var) in sites {
+        for (name, src, arm, var, placement) in sites {
             let a = src
                 .split(arm)
                 .nth(1)
@@ -197004,7 +197454,7 @@ mod bl5a2_direct_wake_settles_the_taken_registration {
             );
             // Every placement-refused exit either hands the registration to the uncommit or
             // retires it — none drops it.
-            let enqueue = a.find("Enqueued").expect("the enqueue decision");
+            let enqueue = a.find(placement).expect("the enqueue decision");
             let success = a[enqueue..]
                 .rfind(&retire)
                 .expect("a retirement after the enqueue");

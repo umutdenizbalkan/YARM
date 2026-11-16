@@ -101,6 +101,13 @@ pub(crate) struct RecvBoundarySharedRegionSnapshot {
     pub(crate) blocked_endpoint_waiter: bool,
     /// The dequeued message (recv-v2 metadata source).
     pub(crate) msg: Message,
+    /// SR-PLACE1 — the receiver's promised home-queue slot (a FUTEX-WAKE-CAP1 reservation),
+    /// taken by the direct producer BEFORE its first mutation, so the delivery the sender is
+    /// told succeeded can never meet a full queue at finalize. Exactly one owner settles it:
+    /// the finalize COMMITS it (and clears this field), or the single rollback RELEASES it.
+    /// `None` for an origin that owes no placement (the queued dequeue's running receiver);
+    /// the finalize then reserves before any claim, or refuses with nothing mutated.
+    pub(crate) placement: Option<crate::kernel::task_enqueue::EnqueuePlan>,
 }
 
 /// One-shot transaction wrapping the snapshot plus the intermediate resources the rollback must
@@ -423,6 +430,8 @@ impl KernelState {
             // proofs and the queued dequeue leave it false (plain wake).
             blocked_endpoint_waiter: false,
             msg,
+            // SR-PLACE1: the direct producer installs its reservation after Phase A.
+            placement: None,
         })
     }
 
@@ -583,11 +592,20 @@ pub(crate) trait SharedRegionExecCtx {
     /// `Some`), preserving the accepted transaction-executor semantics.
     /// `result` is the Stage 199G-B §1 final projection the completion publishes into the
     /// receiver's saved return registers — the ONLY part of this step that varies by receive ABI.
+    ///
+    /// SR-PLACE1 placement contract: the receiver's home slot is secured BEFORE any claim or
+    /// status change — the producer's reservation in `snap.placement`, else one taken here (and
+    /// stored there). `Some(_)` means the receiver is placed exactly once (the reservation was
+    /// committed and `snap.placement` cleared, or the receiver is the running task and owes no
+    /// placement). `None` leaves any reservation in `snap.placement` for the rollback to release;
+    /// no capacity refusal can reach `None` after a claim.
     fn ctx_finalize_and_wake(
         &mut self,
-        snap: &RecvBoundarySharedRegionSnapshot,
+        snap: &mut RecvBoundarySharedRegionSnapshot,
         result: crate::kernel::boot::BlockedRecvDeliveryResult,
     ) -> Option<bool>;
+    /// rank 1L: give back a home-slot promise the transaction will not fill (SR-PLACE1).
+    fn ctx_release_placement(&mut self, plan: crate::kernel::task_enqueue::EnqueuePlan);
     /// rank 6: release the transferred object pin (once).
     fn ctx_release_pin(&mut self, object: CapObject);
     /// rank 5 + TLB: unmap the mapped prefix via the two-phase shootdown-before-reclaim contract.
@@ -858,8 +876,12 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
         payload_len: txn.snapshot.msg.as_slice().len(),
         transfer_cap: Some(minted),
     };
-    let woke = match ctx.ctx_finalize_and_wake(&txn.snapshot, delivery_result) {
-        Some(woke) => woke,
+    let woke = match ctx.ctx_finalize_and_wake(&mut txn.snapshot, delivery_result) {
+        Some(woke) => {
+            // SR-PLACE1: a published delivery holds no promise — it was committed or never owed.
+            debug_assert!(txn.snapshot.placement.is_none());
+            woke
+        }
         None => {
             // Stale finalization (missing / replacement endpoint waiter): no enqueue happened.
             rollback_shared_region_txn(ctx, &mut txn);
@@ -905,7 +927,11 @@ pub(crate) fn rollback_shared_region_txn<C: SharedRegionExecCtx>(
     // Claim cleanup ownership (protocol A: the executor is the single cleanup owner).
     txn.state = SharedRegionTxnState::CleanupOwned;
 
-    // (1) Publication/wake is simply never performed on this path.
+    // (1) Publication/wake is simply never performed on this path. SR-PLACE1: the receiver's
+    // home-slot promise, if one is still held, is given back (once — guarded by take()).
+    if let Some(plan) = txn.snapshot.placement.take() {
+        ctx.ctx_release_placement(plan);
+    }
     // (2) Unmap EXACTLY the successfully-mapped page prefix (two-phase; the shootdown completes
     // before frames are freed). Does not depend on reaching the terminal `Mapped` state.
     if let Some((base, _)) = txn.mapped {
@@ -988,16 +1014,15 @@ impl SharedRegionExecCtx for KernelState {
     }
     fn ctx_finalize_and_wake(
         &mut self,
-        snap: &RecvBoundarySharedRegionSnapshot,
+        snap: &mut RecvBoundarySharedRegionSnapshot,
         result: crate::kernel::boot::BlockedRecvDeliveryResult,
     ) -> Option<bool> {
         use crate::kernel::task::{TaskStatus, WaitReason};
         if !snap.blocked_endpoint_waiter {
             // Plain wake path (queued dequeue / txn proofs): no endpoint-waiter identity to claim.
-            return Some(
-                self.apply_split_receiver_wake_plan(ThreadId(snap.receiver_tid))
-                    .is_ok(),
-            );
+            // SR-PLACE1: placement-aware — never a second placement for the running receiver,
+            // never `Runnable` without a promised slot.
+            return self.sr_place_receiver_locked(snap);
         }
         let CapObject::Endpoint {
             index: eidx,
@@ -1026,6 +1051,12 @@ impl SharedRegionExecCtx for KernelState {
             }
         });
         if !prevalid {
+            return None;
+        }
+        // SR-PLACE1: the home slot is secured before the claim — the producer's promise, else
+        // one taken now. No room: nothing has been claimed or cleared, so the stale rollback is
+        // exact.
+        if !self.sr_ensure_receiver_placement_locked(snap) {
             return None;
         }
         // Phase 2 (rank 3): exact, generation-bearing IDENTITY claim (remove once). A missing /
@@ -1070,7 +1101,7 @@ impl SharedRegionExecCtx for KernelState {
                 // still gets the canonical zeroed success shape, a legacy receiver gets its
                 // sender TID / payload length / receiver-local cap in the return lanes.
                 self.publish_blocked_recv_delivery_result(snap.receiver_tid, result);
-                Some(self.apply_split_receiver_wake_plan(receiver.tid).is_ok())
+                self.sr_place_receiver_locked(snap)
             }
             // Dead/removed OR replaced (ASID changed) receiver after the IDENTITY claim: the claimed
             // waiter belonged to our exact receiver incarnation, which no longer exists — it is
@@ -1082,6 +1113,9 @@ impl SharedRegionExecCtx for KernelState {
     }
     fn ctx_release_pin(&mut self, object: CapObject) {
         self.adjust_memory_object_pin_refcount(object, -1);
+    }
+    fn ctx_release_placement(&mut self, plan: crate::kernel::task_enqueue::EnqueuePlan) {
+        <Self as crate::kernel::boot::ReplyTimeoutDomains>::rtd_release(self, plan);
     }
     fn ctx_unmap_prefix(&mut self, asid: crate::kernel::vm::Asid, base: usize, len: usize) {
         self.unmap_range_two_phase(asid, base, len);
@@ -1096,5 +1130,60 @@ impl SharedRegionExecCtx for KernelState {
         _object: CapObject,
     ) {
         let _ = self.revoke_capability_in_cnode(cnode, cap);
+    }
+}
+
+/// SR-PLACE1 — the broad (reference) twin of the off-lock receiver placement. Same contract as
+/// `SharedKernel::sr_wake_receiver_split`: the home slot is promised before the receiver's status
+/// changes, and the promise is committed exactly once or left for the rollback to release.
+impl KernelState {
+    /// Secure a home-slot promise for `snap`'s receiver: the producer's, else a fresh one (stored
+    /// into the snapshot so the rollback owns it). `false`: no room — nothing was mutated.
+    pub(crate) fn sr_ensure_receiver_placement_locked(
+        &mut self,
+        snap: &mut RecvBoundarySharedRegionSnapshot,
+    ) -> bool {
+        if snap.placement.is_none() {
+            snap.placement = <Self as crate::kernel::boot::ReplyTimeoutDomains>::rtd_reserve(
+                self,
+                snap.receiver_tid,
+            );
+        }
+        snap.placement.is_some()
+    }
+
+    /// Place `snap`'s receiver exactly once. A RUNNING receiver (the queued dequeue's own task)
+    /// is already placed — the CPU it runs on — so its status is left alone and any promise is
+    /// given back. A blocked or runnable receiver is made `Runnable` only once a slot is
+    /// promised, and the promise is then committed (an already-queued receiver keeps its one
+    /// entry). `None`: no room or not wakeable — nothing changed; any promise stays in the
+    /// snapshot for the rollback.
+    pub(crate) fn sr_place_receiver_locked(
+        &mut self,
+        snap: &mut RecvBoundarySharedRegionSnapshot,
+    ) -> Option<bool> {
+        use crate::kernel::task::TaskStatus;
+        let tid = snap.receiver_tid;
+        match self.task_status(tid)? {
+            TaskStatus::Running => {
+                if let Some(plan) = snap.placement.take() {
+                    <Self as crate::kernel::boot::ReplyTimeoutDomains>::rtd_release(self, plan);
+                }
+                return Some(true);
+            }
+            TaskStatus::Blocked(_) | TaskStatus::Runnable => {}
+            _ => return None,
+        }
+        if !self.sr_ensure_receiver_placement_locked(snap) {
+            return None;
+        }
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                tcb.status = TaskStatus::Runnable;
+            }
+        });
+        let plan = snap.placement.take()?;
+        <Self as crate::kernel::boot::ReplyTimeoutDomains>::rtd_enqueue_reserved(self, plan);
+        Some(true)
     }
 }
