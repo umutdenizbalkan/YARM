@@ -150,11 +150,13 @@ They are never alternate dispatchers:
 * **The home rule.** `task_enqueue::fix_home_locked` records a task's CPU at its first placement:
   the balanced least-loaded choice, or the explicitly named CPU. A wake targets that home.
   Wake-only CPUs are never placed on. `balance_excluded` CPUs accept only explicit placement.
-* **No migration is enforced for Balanced plans only.** `fix_plan_home` (broad twin) and
-  `resolve_plan_home_split` (split) rewrite a **Balanced** plan to the home. A **Pinned** plan
+* **No migration is enforced for Balanced plans only.** *(Superseded by SCHED-LOCK2A, §20: the
+  home is now enforced for every plan and every 1L placement step.)* `fix_plan_home` (broad twin)
+  and `resolve_plan_home_split` (split) rewrite a **Balanced** plan to the home. A **Pinned** plan
   keeps the CPU its caller named even when the task already has a different home, and the home
   record is then left unchanged (P: existing unit test
-  `task_enqueue::tests::the_pinned_planner_names_its_own_cpu_regardless_of_affinity`).
+  `task_enqueue::tests::the_pinned_planner_names_its_own_cpu_regardless_of_affinity`, replaced by
+  `sl2a_a_pinned_plan_off_the_home_is_refused_with_nothing_written`).
 * **Which pinned callers could place an already-homed task off its home?**
   * In the default production configuration, no traced caller does so for an already-homed task.
     Spawn and fork place new tasks. The owner-revalidation rollback re-enqueues on the CPU the task
@@ -165,8 +167,8 @@ They are never alternate dispatchers:
     * `enqueue_then_dispatch_on_cpu_split` and `live_ap_user_dispatch`, under
       `yarm.ap_user_dispatch=1`.
 
-  "No migration" therefore holds in production **by caller discipline, not structurally**.
-  SC-CPU-2 makes it structural.
+  "No migration" therefore held in production **by caller discipline, not structurally**.
+  SCHED-LOCK2A (§20) makes it structural for task incarnations.
 
 ### 1.5 Preemption and wake
 
@@ -340,12 +342,16 @@ The first real-time profile is the **smallest analysable configuration**:
   placement mutates only the named CPU's queue, never displaces that CPU's running task, and
   leaves other CPUs untouched. Evidence: P `sc_cpu_1`;
   `withdraw_leaves_a_tid_queued_on_another_cpu_untouched`.
-* **SC-CPU-2 — No migration after OPERATIONAL.** **SPECIFIED → RT-SCHED1.**
+* **SC-CPU-2 — No migration after OPERATIONAL.** **ENFORCED (structural, task incarnations,
+  SCHED-LOCK2A §20) / SPECIFIED → RT-SCHED1 (scheduling contexts).**
   * After the initialization-to-operational transition (SC-POOL-4), every scheduling context is
     bound to exactly one CPU. No enqueue may place its thread elsewhere.
   * Structurally: a Pinned plan for a task with a home must name that home, or fail closed. It
-    must not silently override the home.
-  * Today this holds by caller discipline only (§1.4).
+    must not silently override the home. **Enforced** by `task_enqueue::bind_home_locked` (rank 2)
+    and `task_enqueue::admit_home_locked` (rank 2 inside the committing CPU's 1L), on every
+    reserve, commit and exact-current restore (§20). Evidence: P `sl2a_*`
+    (`src/kernel/sched_lock2a_tests/tests.rs`).
+  * The scheduling-context half (a context bound to one CPU, with budgets) remains RT-SCHED1's.
 * **SC-CPU-3 — A remote wake moves nothing.** **ENFORCED (GP) / SPECIFIED → RT-SCHED1 (RT-P1).**
   * A wake from any CPU changes only readiness. It never changes the woken context's CPU and
     never manufactures budget.
@@ -1179,7 +1185,7 @@ CPU executes.
 
 | Requirement | Current owner | Missing mechanism | Evidence needed | Package |
 |---|---|---|---|---|
-| SC-CPU-2 no migration | `task_enqueue` planners | Pinned plan must equal an existing home or fail closed | P: pinned enqueue of a homed task refused | RT-SCHED1 |
+| SC-CPU-2 no migration | `task_enqueue` planners and 1L owners (SCHED-LOCK2A, §20) | — for task incarnations (enforced); the scheduling-context binding | P: `sl2a_*` (done); scheduling-context binding | RT-SCHED1 |
 | SC-PRI-10/11/12/13 | `PriorityScheduler` (3 levels, tail-on-preempt, wake non-preempting) | 32 levels; head-on-priority-preemption; wake as scheduling point; preempting remote IPI | P on the production owners; L on three ports | RT-SCHED1 |
 | SC-PART-1…7 | none | schedule, epoch, window evaluation, boundary switch | P + L (boundary instants, idle advance) | PARTITION1 |
 | SC-CTX-1…5, 7, 8 | none (per-CPU quantum only) | scheduling contexts, budgets, conserved-debt replenishment, overrun debt and reports, same-instant order, exhausted-set membership | P + L | RT-SCHED1 |
@@ -2906,3 +2912,126 @@ The default printk ring is 64 records (`PRB_SLOTS_DEFAULT`), the structural floo
 it, a simultaneous record from every CPU could lap one still held in flight. Marker-heavy witnesses
 keep 1024 (`printk-witness-ring`). A scheduler change that raises the default boot's burst rate (for
 example, per-dispatch markers in a default image) must re-measure it.
+
+## 20. SCHED-LOCK2A: home-CPU placement (structural SC-CPU-2)
+
+Base `a1b06b2c`. The rule: **once an exact live task incarnation has a home, only that CPU may
+reserve, commit or restore its scheduler placement.** A mismatch fails closed before any
+irreversible claim or mutation, and every refusal is the existing `WrongObject` (from
+`SchedulerError::CpuOffline`, the error a commit onto a CPU that cannot take a task already
+returned), so no syscall ABI changes. GP policy, capacity refusal, same-home rollback, the lock
+order and notification-after-publication are unchanged. VM shootdown targeting is untouched.
+
+### 20.1 Owners
+
+| Owner | Rank | What it decides |
+|---|---|---|
+| `ThreadControlBlock::incarnation` | — | A stamp unique for the kernel's life, assigned when the TCB is constructed (`task::next_incarnation`), never rewritten. `{tid, asid}` is not enough: sibling threads share an ASID, so a TID reused inside one address space would pass. |
+| `task_enqueue::bind_home_locked` | 2 | An explicit placement of `tid` on `cpu`: records `cpu` as the home of a homeless incarnation, accepts the home it has, refuses (`OffHome`) any other with nothing written. Because the record is written under rank 2, two CPUs racing to place a task first record exactly one home; the loser's different CPU is refused. |
+| `task_enqueue::plan_pinned_enqueue_locked` | 2 | Binds as its LAST step, after the reservation and class refusals, and stamps the plan. |
+| `task_enqueue::plan_balanced_enqueue_locked` + `fix_home_locked` | 2 | Unchanged: a homed task plans `Pinned(home)`; a homeless one takes the balanced choice and `fix_home_locked` returns the winner's home. Stamps the plan. |
+| `task_enqueue::admit_home_locked` | 2 nested in the committing CPU's 1L (ascending) | At the reserve, commit or restore step: the TID must still name the planned incarnation (else `Stale` — exit, reap, TID reuse) and its home must be this CPU (else `OffHome`; `Homeless` if no home was ever recorded). TID 0 is always admitted. An exited but unreaped incarnation keeps its home, so it is admitted there only. |
+| `reserve_enqueue_on_cpu_locked`, `commit_enqueue_on_cpu_locked`, `commit_reserved_enqueue_on_cpu_locked`, `commit_enqueue_locked` | 1L (+2 nested) | Take the task table and run the admission first. A refused reserved commit releases its own promise (`ReservedCommit::Refused`). `commit_enqueue_locked` refuses a balanced plan for a live TID (it would place without recording a home). |
+| `SharedKernel::with_cpu_sched_and_tcbs_split` | 1L then 2 nested | THE split seam for those steps. Broad twins nest `with_tcbs` inside the scheduler guard. |
+| `set_task_home_cpu`, `smp_assign_task_home_cpu` | 2 | Initial assignments through the binding: a different existing home is refused. |
+
+### 20.2 Production paths converted
+
+* Every split enqueue built on the shared planners: `enqueue_task_split`, `enqueue_on_cpu_split`,
+  `commit_enqueue_split`.
+* Every reserve → claim → commit owner of §19.1: the FutexWake key path (`futex_wake_key_split`),
+  the requeue preflight and placement (`futex_requeue_*_split`; the claim captures the claimed
+  waiter's stamp in its own acquisition), the futex/sleep timeout collector, the receive-timeout
+  drain and the IPC wake promises (`reserve_ipc_wake_split` / `commit_ipc_wake_split`, which carry
+  the four IPC timeout / server-death owners), and the shared-region receiver placement
+  (SR-PLACE1). Broad twins: `exec_state` futex wake and requeue, `ipc_state` `rtd_*`,
+  `scheduler_state::enqueue_task` / `enqueue_on_cpu`.
+* The split wake `wake_tid_to_runnable_split` (stamp captured at its rank-2 claim).
+* The committed-receiver enqueue (`enqueue_committed_receiver_inner`, both direct-IPC seams): a
+  caller-named CPU is bound as the home first; an off-home name is refused before that CPU's lock
+  is taken; the admission runs in the same 1L as the enqueue and the reconciling withdrawal.
+* The exact-current restore (`restore_current_exact_split`, used by the exit token's
+  `restore_current_exact` and the receive unwind).
+* Plan and commit under ONE nested 1L → 2 section, so no window: the x86_64 owner-revalidation
+  rollback (`owner_revalidation_rollback_split`) and `enqueue_then_dispatch_on_cpu_split`
+  (`yarm.ap_user_dispatch=1`).
+* Dispatch, preempt-prefer and the queue-advancing selection only move a TID out of the CPU's
+  OWN queue, so they inherit the queue's home placement; they are unchanged.
+
+### 20.3 Remaining exceptions (none places a task incarnation off its home)
+
+* **Kernel threads** (`kthread.rs`) enqueue through the per-CPU primitive with their own fixed
+  home in the kthread record; they are not TCB incarnations (§18).
+* **Witness fixtures** that plant raw entries: `riscv64-d2-settle-witness` (its own phantom entry,
+  default-off), and hosted tests that plant a duplicate with `CpuView::enqueue_with_priority` to
+  exercise fail-closed reconciliation. Raw primitives remain available to these; production
+  placement goes through the owners above.
+* **The committed-receiver seams' incarnation binding** is the TID's current incarnation, not a
+  stamp captured by the caller: the direct-IPC transaction's exclusive endpoint-waiter claim
+  (`{tid, asid}`) is what holds the receiver, and the home admission runs under the committing 1L.
+  Threading the claimed stamp through `ack.server` / `ack.caller` is the SCHED-LOCK2B option.
+* **Hosted fixture rehome** (`rehome_unplaced_task_for_test`, `#[cfg(test)]`): models "first placed
+  on CPU n" for an UNPLACED task and refuses a placed one. Production has no rehome.
+
+### 20.4 Lock acquisitions
+
+* Every reserve, commit and restore step now takes rank 2 nested inside the 1L it already held
+  (ascending, the order the selection filter and the rollback already used). No new broad-lock,
+  1G or all-CPU acquisition; no lock is waited for under a 1L that was not before (rank 2 was
+  already taken inside 1L sections).
+* **x86_64 SMP blocked-server oracle (the split blocking-receive route, per published block):**
+
+  | | rank 2 (task) | rank 3 (IPC) | 1L | total |
+  |---|---|---|---|---|
+  | before, oracle off (every production recv-v2 block that publishes an ack — publication is unconfined on x86_64) | 1 | 1 | 64 (`present_anywhere_scan` over all `MAX_CPUS` cells, offline included) | 66 |
+  | after, oracle off | 0 | 0 | 0 | 0 |
+  | before = after, oracle armed | 1 | 1 | 64 | 66 |
+
+  The facts are collected through `boot::oracle_gated_facts` under the existing
+  `x86_ipccall_direct_smp_oracle_enabled()`; armed, the marker body receives exactly what it did
+  before (P `sl2a_the_smp_oracle_facts_are_collected_only_when_armed`, S
+  `sl2a_source_the_blocked_server_scan_sits_behind_the_oracle_predicate`).
+
+### 20.5 Retained readers, and the invariant SCHED-LOCK2B can use
+
+**H-HOME.** For a TID with a TCB, every queue entry and the current slot that names it lie on the
+home of its CURRENT incarnation, and an incarnation without a home is placed nowhere. It follows
+from §20.1: a placement is admitted only on the home of the incarnation the TID names at that
+step; homes are never rewritten; a stale plan for a previous incarnation is refused by its stamp;
+a homeless incarnation's 1L step is refused. An exited, unreaped incarnation keeps its home, so an
+exited entry still queued is queued on that home, and the reaper's absence check finds it there.
+Exceptions to H-HOME are only §20.3's raw-primitive fixtures. So any placement question about one
+exact incarnation can be answered by that incarnation's home 1L alone (read the home under rank 2,
+then lock that one CPU), instead of scanning every CPU.
+
+| Reader (kept for SCHED-LOCK2B) | Question | What H-HOME gives it |
+|---|---|---|
+| `entering_frame_authority_split_read` (coherent) | Is the entering incarnation `Current` on this CPU, and resumable? | `Current` can only be on its home: if home ≠ this CPU the answer is "not this CPU's" without the coherent view; if home = this CPU, this CPU's 1L answers it. |
+| `tid_placed_anywhere_split` (coherent; exit restore precondition) | Is the TID current or queued anywhere? | Only on its home: one 1L, home read under rank 2 first. |
+| `post_lock_exit_validation_split` (coherent) | Exit validation: current/queued placement of the exiting incarnation. | Same: the home's 1L. |
+| `recv_unwind_placement_outcome_split` (coherent) | Queued / executing / unreachable for the unwinding incarnation (`placement_of`). | `placement_of` restricted to the home answers all three; "executing elsewhere" can only mean executing on the home when the caller's CPU is not the home. |
+| `yield_forfeited_placement_split_read` (coherent) | Same family, for a declined `Yield`. | Same. |
+| `receiver_has_scheduler_membership_split_read` (per-CPU scan; direct-IPC preflights, reap) | Does a frozen subject hold any membership? | The home's 1L only. |
+| reap's `task_present_in_any_runqueue` / the split membership check (`reap_txn`) | Absent everywhere before a TID is freed? | Absence on the home suffices for the incarnation being reaped (an exited entry still queued is on its home). |
+
+These are kept unchanged in this pass; the five coherent reads remain the only coherent-view
+callers (guard (5) of `sched_lock1_d6_per_cpu_scheduler_ownership_rules`).
+
+### 20.6 Evidence (candidate `189a890d`; `cabe3ccc` repairs one witness script)
+
+* P: `sl2a_*` (15, `src/kernel/sched_lock2a_tests/tests.rs`). The two that use only
+  pre-SCHED-LOCK2A seams fail on `a1b06b2c`: the off-home enqueue is accepted there, and in the
+  race both first placements win (`left: 2, right: 1`).
+* Hosted: the serial lib suite (6,697 passed), the integration suites, and focused subsets (each
+  with tests: `sl2a_` 15, `task_enqueue` 9, `sl1_` 19, `sched_lock1` 20, `lock_order` 4, `abi` 271,
+  `syscall_abi` 2, `u9exit` 71, `reap` 49, `futex_wake_cap1` 14, `ipc_timeout` 4, `sr_place1` 9,
+  `census` 33, `stage199d` 427, `overtaken` 22, `qemu_context1` 21, `ap_sched1` 15, `u9spawn1` 25).
+  Lock-order: the same 30 descending-pair types on the candidate and on `a1b06b2c`, none new.
+* L: an ordinary x86_64 SMP 2 boot with the oracle off. Then the x86_64 SMP 2 direct request/reply
+  witness (`result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired`), and the oracle-armed
+  request witness (`result=blocked reason=ap_saved_frame_restore_and_recv_v2_server_not_wired`, no
+  `SERVER_BLOCKED` marker). Both results are identical on `a1b06b2c`. Then the AArch64 and RISC-V
+  direct IPC smokes (`live_cells=2`, no duplicate reply or wake). No `SCHED_HOME_REFUSED` appears
+  in any live log.
+* The armed SMP oracle's facts are therefore proven equivalent by P and S, not live: on both trees
+  the witness never reaches the marker's conditions (its AP-side server path is not wired).

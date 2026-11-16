@@ -36707,3 +36707,61 @@ logs it ran late. It is not proof; the kernel refusals above are.
 - The two items are repaired, and their evidence passed on the live cells.
 - The false AArch64 default-profile pass is corrected and requalified.
 - The kernel, and every other result in the matrix above, is unchanged from F.
+
+#### SCHED-LOCK2A (from qualified `a1b06b2c`)
+
+The first SCHED-LOCK2 pass, on `wip/sched-lock2a`.
+
+**Home-CPU placement (SC-CPU-2, structural).** Once an exact live task incarnation has a home,
+only that CPU may reserve, commit or restore its placement. The full design record is in
+`SCHEDULING_CONTRACT.md` §20.
+- A unique per-TCB `incarnation` stamp binds each plan to the incarnation it was planned for.
+- `bind_home_locked` (rank 2) records the first home atomically and refuses any other.
+- `admit_home_locked` runs at rank 2, nested in the committing CPU's 1L, inside every reserve,
+  commit and exact-current restore.
+- A refused reserved commit releases its own slot.
+- Every refusal maps to the existing `WrongObject`, so the ABI is unchanged.
+- The home setters are initial-only. Every witness and oracle setup that assigns a home does so
+  before the first placement.
+
+**Paths.** The converted production paths, the remaining exceptions, and the invariant H-HOME that
+the retained readers can use next are all in §20.2, §20.3 and §20.5. The exceptions are kthreads,
+raw-primitive fixtures, the direct-IPC committed-receiver stamp, and the hosted rehome fixture.
+
+**x86_64 oracle scan.** On the split blocking-receive route, the facts for the blocked-server
+marker are collected only when `x86_ipccall_direct_smp_oracle_enabled()` holds. With the oracle off,
+each published block now takes 0 lock acquisitions instead of 66 (1 task, 1 IPC, 64 1L). Armed, the
+marker receives the same facts as before.
+
+**Old-path demonstration.** The two regressions that use only pre-existing seams were copied
+verbatim onto `a1b06b2c`, where both fail (`qual/D1_*`):
+- the off-home enqueue is accepted;
+- in the race, two first placements both win.
+
+**Commits.**
+- `2f2dc294` — placement owners.
+- `1915f92b` — oracle gate.
+- `270bb717` — regressions.
+- `189a890d` — a guard probe re-matched after `cargo fmt`.
+- `cabe3ccc` — repair of `qemu-ipccall-direct-x86_64-smp-request-smoke.sh`, whose empty `if`
+  block has been a bash syntax error since `15114160`.
+
+The qualified candidate is `189a890d`; `cabe3ccc` adds only that script repair. The runner and both
+addenda were hashed before they ran (`qual/predeclared.sha`), and every log was kept.
+
+| step | result |
+|---|---|
+| hosted | fmt; serial lib, 6,697 passed; integration; 18 focused subsets, each with a non-zero test count (§20.6); contract gate; doc enforcement |
+| lock order | 30 descending-pair types on C and on `a1b06b2c`, none new |
+| builds | default x86_64, AArch64 and RISC-V artifacts |
+| L5 x86_64 SMP 2 ordinary boot, oracle off | pass. Kernel `197e8b5b…`, initramfs `305736ed…`. No `SCHED_HOME_REFUSED`, no blocked-server marker; the two `D6_KERNEL_SWITCH_STACK_CHECK_FAILED` lines are also in the baseline's SMP 2 boot |
+| L1 x86_64 SMP 2 direct request/reply witness | rc 0. Oracle kernel `921552d1…`. `result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired` and `QUIESCENT_SEAL … nr7_ok=0 … result=fail` are both identical on `a1b06b2c` (addendum A2) |
+| L2 x86_64 SMP 2 request witness, oracle armed (the cell that closes the armed-marker gap) | main run rc 2: the script's syntax error, pre-existing. On `cabe3ccc` (A1): rc 0, `result=blocked reason=ap_saved_frame_restore_and_recv_v2_server_not_wired`, no `SERVER_BLOCKED` marker, identical on `a1b06b2c` with the script fix only (addendum B). So no live cell can reach the armed marker on either tree; the armed path is proven by P and S |
+| L3 AArch64 direct IPC | `LIVE_SEAL … live_cells=2 … result=ok`. Kernel `5f7ecf37…`, initramfs `6a535fe9…` |
+| L4 RISC-V direct IPC | `LIVE_SEAL … live_cells=2 … result=ok`. Kernel `377d3d4e…`, initramfs `32a08478…` |
+| home-refusal scan | main run rc 1: a scope error, because it matched the format string inside kernel images copied into the log directories. Over text logs only (A3): none in any live cell |
+
+**Also found and not fixed.** `scripts/qemu-x86_64-ap-generic-return-smoke.sh` has the same
+empty-block syntax error. It is not a cell of this pass.
+
+**Verdict: QUALIFIED.**
