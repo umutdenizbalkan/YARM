@@ -1047,10 +1047,40 @@ pub fn handle_trap_entry_shared(
                     ))]
                     crate::kernel::apsched_witness::note_idle_ipi(cpu, 1);
                 } else {
-                    crate::yarm_log!(
-                        "SGI_RESCHEDULE_SETTLED cpu={} settlement=return_to_interrupted",
-                        cpu.0
-                    );
+                    // RT-SCHED1A (SC-PRI-13): an arrival on a RUNNING task (a frame to return
+                    // through) is a scheduling point; GP settles `NotRealTime` and keeps running.
+                    let settled = if frame.is_some() {
+                        crate::kernel::syscall_split::settle_rt_reschedule(
+                            shared,
+                            cpu,
+                            crate::kernel::syscall_split::RT_CAUSE_IPI,
+                        )
+                    } else {
+                        crate::kernel::syscall_split::RtReschedSettlement::NotRealTime
+                    };
+                    match settled {
+                        // The arrival re-checked priority and preempted the interrupted task —
+                        // the same transaction a preempting tick commits, so this trap is
+                        // settled exactly as that one is: the broad arm is skipped and the
+                        // existing Yield drain below selects and installs the next task through
+                        // the one selection owner. The interrupted frame was captured into the
+                        // outgoing TCB above, before any route ran.
+                        crate::kernel::syscall_split::RtReschedSettlement::Committed { .. } => {
+                            queue_advance_committed = true;
+                            crate::yarm_log!(
+                                "SGI_RESCHEDULE_SETTLED cpu={} settlement=rt_preempt_committed",
+                                cpu.0
+                            );
+                        }
+                        // GP, or an RT arrival with nothing of strictly higher priority queued
+                        // (or a switch the transaction deferred): the running task keeps running.
+                        _ => {
+                            crate::yarm_log!(
+                                "SGI_RESCHEDULE_SETTLED cpu={} settlement=return_to_interrupted",
+                                cpu.0
+                            );
+                        }
+                    }
                 }
                 Some(Ok(()))
             } else {

@@ -1213,12 +1213,42 @@ pub fn handle_riscv_trap_entry_shared(
         if arrival.at_idle_boundary() {
             ipi_idle_queue_advance = true;
         }
+        // RT-SCHED1A (SC-PRI-13): an arrival OFF the idle boundary interrupted a running user task
+        // (an S-mode trap is admitted here only at the idle boundary; a running kernel thread takes
+        // its own vectors). Under the RT profile it is a scheduling point: the owner re-checks
+        // priority and, when it must, commits the SAME transaction the timer's preempting tick
+        // does — so it is settled exactly as that arm below is, including the asynchronous
+        // preemption snapshot that carries the interrupted register file (no syscall in flight)
+        // into the outgoing TCB, and the existing Yield drain installs the next task.
+        let mut rt_preempted = false;
+        if !ipi_idle_queue_advance
+            && let crate::kernel::syscall_split::RtReschedSettlement::Committed { outgoing } =
+                crate::kernel::syscall_split::settle_rt_reschedule(
+                    shared,
+                    cpu,
+                    crate::kernel::syscall_split::RT_CAUSE_IPI,
+                )
+        {
+            let restorable = frame.capture_user_context().is_restorable();
+            let tagged = restorable && shared.snapshot_async_preempted_split(outgoing, frame);
+            crate::yarm_log!(
+                "RT_PREEMPT_ASYNC_TAGGED cpu={} outgoing={} tagged={} restorable={}",
+                cpu.0,
+                outgoing,
+                u8::from(tagged),
+                u8::from(restorable)
+            );
+            queue_advance_committed = true;
+            rt_preempted = true;
+        }
         crate::yarm_log!(
             "RISCV_IPI_SETTLED cpu={} sources=0x{:x} settlement={}",
             cpu.0,
             arrival.sources,
             if ipi_idle_queue_advance {
                 "idle_advance_owed"
+            } else if rt_preempted {
+                "rt_preempt_committed"
             } else {
                 "return_to_interrupted"
             }

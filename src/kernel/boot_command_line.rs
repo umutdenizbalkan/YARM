@@ -649,6 +649,17 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             enabled
         );
     }
+    if let Some(profile) = parsed.sched_profile {
+        // RT-SCHED1A: record the profile, then install it if the domain already exists (the
+        // quantum override's two boot orders, below).
+        crate::kernel::boot::set_sched_profile_override(profile);
+        let live = crate::kernel::boot::install_sched_profile_on_live_domain();
+        crate::yarm_log!(
+            "YARM_SCHED_PROFILE profile={} route={}",
+            profile.marker(),
+            if live { "live_domain" } else { "construction" }
+        );
+    }
     if let Some(ticks) = parsed.sched_quantum_ticks {
         // U9-TIMER1 §3: record the override, then install it if the timer already exists.
         //
@@ -1096,6 +1107,9 @@ pub struct YarmBootOptions<'a> {
     /// deadline and the interrupt is serviced by the production route; only the number of those
     /// interrupts that make a quantum changes.
     pub sched_quantum_ticks: Option<usize>,
+    /// RT-SCHED1A: `yarm.sched_profile=rt|gp` — the scheduling profile of the one active
+    /// scheduling domain (`doc/SCHEDULING_CONTRACT.md` §23). Unset is the general-purpose default.
+    pub sched_profile: Option<crate::kernel::scheduler::SchedProfile>,
 }
 
 /// Parse a `yarm.loglevel=` value: digit 0–7 or a level name.
@@ -1161,6 +1175,16 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
                     options.sched_quantum_ticks = Some(ticks);
                 }
             }
+            b"yarm.sched_profile" => match value {
+                b"rt" => {
+                    options.sched_profile = Some(crate::kernel::scheduler::SchedProfile::RealTime)
+                }
+                b"gp" => {
+                    options.sched_profile =
+                        Some(crate::kernel::scheduler::SchedProfile::GeneralPurpose)
+                }
+                _ => {}
+            },
             _ => {}
         }
         if key == b"yarm.loglevel" {

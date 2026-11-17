@@ -45,8 +45,8 @@ fn extracted_kernel_type_families_match_yarm_kernel_layouts() {
         mem::size_of::<yarm_kernel::scheduler::CpuId>()
     );
     assert_eq!(
-        TaskPriority::Normal as u8,
-        yarm_kernel::scheduler::TaskPriority::Normal as u8
+        TaskPriority::Normal.level(),
+        yarm_kernel::scheduler::TaskPriority::Normal.level()
     );
     let _sched_err: yarm_kernel::scheduler::SchedulerError = SchedulerError::QueueFull;
 

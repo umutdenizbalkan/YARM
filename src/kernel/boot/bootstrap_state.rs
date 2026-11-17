@@ -597,6 +597,8 @@ impl Bootstrap {
             present_cpu_bitmap,
             crate::kernel::boot::sched_quantum_ticks(),
         );
+        // RT-SCHED1A: the boot configuration's scheduling profile (GP unless configured).
+        scheduler.set_profile(crate::kernel::boot::sched_profile());
         scheduler
             .exclusive()
             .enqueue_on(

@@ -519,6 +519,71 @@ impl YieldOwners for SharedYieldOwners<'_> {
     }
 }
 
+/// RT-SCHED1A — the split owners for a PREEMPTION (a preempting tick, or an RT reschedule
+/// arrival): [`SharedYieldOwners`] itself, with the outgoing task's queue position chosen by
+/// `head`.
+///
+/// * `head == false` — exactly `split`: GP quantum expiry requeues at the TAIL (SC-PRI-3).
+/// * `head == true` — RT: the outgoing task was preempted by a strictly higher priority, so it
+///   returns to the HEAD of its own level (SC-PRI-12 (a)).
+///
+/// Every other step is `split`'s own — same arch gate, admission, deferral, exact
+/// `Running -> Runnable` transition and inverse — so a preemption is the SAME transaction NR 0
+/// runs, published to the SAME post-lock drain; only the queue position differs.
+pub(crate) struct SharedPreemptOwners<'a> {
+    pub(crate) split: SharedYieldOwners<'a>,
+    pub(crate) head: bool,
+}
+
+impl SharedPreemptOwners<'_> {
+    fn split(&self) -> SharedYieldOwners<'_> {
+        SharedYieldOwners {
+            shared: self.split.shared,
+        }
+    }
+}
+
+impl YieldOwners for SharedPreemptOwners<'_> {
+    fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
+        self.split().current_tid_on_cpu(cpu)
+    }
+    fn is_bootstrap_cpu(&self, cpu: CpuId) -> bool {
+        self.split().is_bootstrap_cpu(cpu)
+    }
+    fn colliding_deferral_pending(&self, cpu: CpuId) -> bool {
+        self.split().colliding_deferral_pending(cpu)
+    }
+    fn queue_advance_admission(
+        &self,
+        cpu: CpuId,
+    ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
+        self.split().queue_advance_admission(cpu)
+    }
+    fn reserve_yield_deferral(&mut self, cpu: CpuId, outgoing: u64) -> bool {
+        self.split().reserve_yield_deferral(cpu, outgoing)
+    }
+    fn release_yield_deferral(&mut self, cpu: CpuId) {
+        self.split().release_yield_deferral(cpu)
+    }
+    fn preempt_outgoing(&mut self, tid: u64) -> Option<PreemptApplied> {
+        self.split().preempt_outgoing(tid)
+    }
+    fn rollback_preempt_outgoing(&mut self, tid: u64, applied: PreemptApplied) -> bool {
+        self.split().rollback_preempt_outgoing(tid, applied)
+    }
+    fn reenqueue_and_clear_current(&mut self, cpu: CpuId) -> Option<u64> {
+        if !self.head {
+            return self.split.reenqueue_and_clear_current(cpu);
+        }
+        // SCHED-LOCK1: `cpu`'s own 1L — the head of the outgoing task's level.
+        self.split
+            .shared
+            .with_cpu_sched_split(cpu, |c| c.preempt_reenqueue_head_only().map(|t| t.0))
+            .ok()
+            .flatten()
+    }
+}
+
 /// The BROAD owner. Each method is a direct access under the guard the caller already holds, so
 /// `KernelState::yield_current` runs the same decision without acquiring anything twice.
 pub(crate) struct BroadYieldOwners<'a> {

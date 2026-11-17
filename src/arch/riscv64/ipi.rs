@@ -289,6 +289,29 @@ fn hart_of(cpu: usize) -> Option<usize> {
 
 // ─────────────────────────────── the owners ───────────────────────────────
 
+/// RT-SCHED1A — raise this CPU's OWN reschedule interrupt: the local half of an RT wake
+/// (`hal::notify_enqueued` with `target == cpu`). Publication then notification, as for a remote
+/// send: this CPU's bit in its own mailbox word, a full fence, then `sip.SSIP` — which S-mode may
+/// set on its own hart. Interrupts are masked here, so it is taken when the trap returns to the
+/// interrupted context, and `take_arrival` consumes it like any other (clear SSIP, then swap).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn raise_local_reschedule(cpu: CpuId) {
+    let Some(slot) = PENDING.get(cpu.0 as usize) else {
+        return;
+    };
+    slot.fetch_or(1u64 << (cpu.0 as u64 & 63), Ordering::AcqRel);
+    full_fence();
+    // SAFETY: `sip.SSIP` is supervisor-writable; raising it requests this hart's own software
+    // interrupt and has no other effect.
+    unsafe {
+        core::arch::asm!("csrs sip, {0}", in(reg) SSIP_BIT, options(nostack, preserves_flags))
+    };
+}
+
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+#[allow(dead_code)]
+pub fn raise_local_reschedule(_cpu: CpuId) {}
+
 /// Send the reschedule IPI from `sender` to `target`: the remote half of an enqueue the caller
 /// already COMMITTED on `target`'s run queue. Called with no domain lock held.
 #[inline(never)]

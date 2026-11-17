@@ -51,6 +51,8 @@ pub mod kirq_witness;
 pub mod kthread;
 #[cfg(feature = "kthread1-witness")]
 pub mod kthread_witness;
+#[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+pub mod rt_witness;
 #[cfg(any(test, feature = "sched-time-witness", feature = "futex-time-witness"))]
 pub(crate) mod sat_witness;
 #[cfg(feature = "sched-time-witness")]
@@ -113,6 +115,9 @@ pub mod printk;
 pub mod process;
 pub mod recv_core;
 pub mod recv_waiter_split;
+#[cfg(test)]
+#[path = "rt_sched1a_tests/tests.rs"]
+mod rt_sched1a_tests;
 #[cfg(test)]
 #[path = "sched_fair1_tests/tests.rs"]
 mod sched_fair1_tests;

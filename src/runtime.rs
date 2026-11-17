@@ -3742,6 +3742,9 @@ impl SharedKernel {
         crate::kernel::kthread_witness::maybe_start(self, authority.cpu());
         #[cfg(feature = "kthread-irq-witness")]
         crate::kernel::kirq_witness_maybe_start(self, authority.cpu());
+        // RT-SCHED1A witness (default-off): its setup thread, once, on CPU 0.
+        #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+        crate::kernel::rt_witness::maybe_start(self, authority.cpu());
         let cpu = authority.cpu();
         loop {
             // The window check is OUTSIDE the scheduler acquisition on purpose: a stale authority
@@ -6588,6 +6591,9 @@ impl SharedKernel {
             let retire = tcb.reply_timeout_token.take();
             let affinity = tcb.cpu_affinity;
             let incarnation = tcb.incarnation;
+            // RT-SCHED1A: the incarnation's configured priority, if any (read before `tcb`'s
+            // borrow ends; the class rule applies below when there is none).
+            let configured = tcb.sched_priority;
             // U9-SPAWN1 SP-1: the refusal comes from THE owner, evaluated here under rank 2
             // like every other caller's. It is unreachable on this path — a `Reserved` TCB is
             // not `Blocked|Runnable|Running`, so the status gate above has already returned —
@@ -6599,9 +6605,9 @@ impl SharedKernel {
             let priority = if tid.0 == 0 {
                 TaskPriority::Normal
             } else {
-                crate::kernel::task_enqueue::priority_for_class(
-                    classes[idx].ok_or(KernelError::TaskMissing)?,
-                )
+                let class = classes[idx].ok_or(KernelError::TaskMissing)?;
+                // RT-SCHED1A: `task_enqueue::priority_of_locked`, from the fields read above.
+                configured.unwrap_or_else(|| crate::kernel::task_enqueue::priority_for_class(class))
             };
             Ok((
                 WakeState {
@@ -14206,7 +14212,7 @@ impl SharedKernel {
             let key = FutexKey::Pending {
                 op: committed.op,
                 cpu: home.0,
-                priority: priority as u8,
+                priority: priority.level() as u8,
             };
             for _ in 0..count {
                 let Some((tid, incarnation)) = self.with_task_futex_split_mut(|tcbs, table| {
@@ -17429,8 +17435,9 @@ impl SharedKernel {
         use crate::kernel::ipc::ThreadId;
         use crate::kernel::scheduler::TaskPriority;
         use crate::kernel::task::TaskClass;
-        let priority = match self.task_class_split_read(tid) {
-            Some(class) => crate::kernel::task_enqueue::priority_for_class(class),
+        // RT-SCHED1A: the incarnation's priority (configured, else the class rule).
+        let priority = match self.task_priority_split_read(tid) {
+            Some(priority) => priority,
             // A woken task is already known live, so an absent class is Normal here rather than
             // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
             None => TaskPriority::Normal,
@@ -17473,8 +17480,9 @@ impl SharedKernel {
         self.test_force_post_copy_membership(tid, affinity);
         use crate::kernel::scheduler::TaskPriority;
         use crate::kernel::task::TaskClass;
-        let priority = match self.task_class_split_read(tid) {
-            Some(class) => crate::kernel::task_enqueue::priority_for_class(class),
+        // RT-SCHED1A: the incarnation's priority (configured, else the class rule).
+        let priority = match self.task_priority_split_read(tid) {
+            Some(priority) => priority,
             // A woken task is already known live, so an absent class is Normal here rather than
             // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
             None => TaskPriority::Normal,
@@ -19867,6 +19875,43 @@ impl SharedKernel {
         // field pointers without creating a whole-KernelState reference; the task
         // lock serializes access to both `tcbs` and `task_classes`.
         unsafe { KernelState::task_class_from_raw(self.state_ptr() as *const _, tid) }
+    }
+
+    /// RT-SCHED1A — what the RT scheduling point (`syscall_split::settle_rt_reschedule`) decides
+    /// from, in ONE section of `cpu`'s own 1L: whether a strictly higher entry than the current
+    /// task is queued, the current task, its level and the best queued level. Rank 1 only.
+    pub(crate) fn rt_reschedule_observation_split_read(
+        &self,
+        cpu: CpuId,
+    ) -> (bool, Option<u64>, Option<u64>, Option<u64>) {
+        self.with_cpu_sched_split(cpu, |c| {
+            (
+                c.rt_preempt_wanted(),
+                c.current_tid().map(|t| t.0),
+                c.current_priority().map(|p| p.level() as u64),
+                c.best_queued_priority().map(|p| p.level() as u64),
+            )
+        })
+        .unwrap_or((false, None, None, None))
+    }
+
+    /// RT-SCHED1A — `tid`'s priority as every enqueue plan reads it
+    /// (`task_enqueue::priority_of_locked`: configured, else the class rule), under rank 2 only.
+    /// `None` for no live TCB or no class.
+    pub(crate) fn task_priority_split_read(
+        &self,
+        tid: u64,
+    ) -> Option<crate::kernel::scheduler::TaskPriority> {
+        self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+            let idx = tcbs
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|t| t.tid.0 == tid))?;
+            let class = classes.get(idx).copied().flatten()?;
+            Some(crate::kernel::task_enqueue::priority_of_locked(
+                tcbs[idx].as_ref()?,
+                class,
+            ))
+        })
     }
 
     pub fn task_exists_split_read(&self, tid: u64) -> bool {

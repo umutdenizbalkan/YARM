@@ -5039,6 +5039,110 @@ impl TimerSettlement {
     }
 }
 
+/// RT-SCHED1A — the cause codes of an RT scheduling point (markers and the RT witness).
+pub(crate) const RT_CAUSE_IPI: u64 = 1;
+/// A preempting tick (`settle_recognized_timer` under the RT profile).
+pub(crate) const RT_CAUSE_TICK: u64 = 2;
+
+/// RT-SCHED1A — what the reschedule interrupt's arrival on a RUNNING CPU settled (SC-PRI-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RtReschedSettlement {
+    /// The domain runs the GP profile: the interrupted task keeps running, exactly as before.
+    NotRealTime,
+    /// No queued entry has strictly higher priority than the current task (an equal-priority wake
+    /// included, SC-PRI-11): the interrupted task keeps running and keeps its position.
+    Declined,
+    /// The current task was preempted: it is back at the HEAD of its level, `current` is clear,
+    /// and the one-shot Yield deferral is published for this trap's post-lock drain, which selects
+    /// through the one selection owner.
+    Committed { outgoing: u64 },
+    /// A switch was owed but the transaction declined before mutating anything (a deferral already
+    /// held, a refused admission or transition). The interrupted task keeps running; the next
+    /// scheduling point — the next reschedule interrupt, the next tick, its own block or yield —
+    /// re-asks, because the higher-priority entry stays queued.
+    Deferred,
+}
+
+/// RT-SCHED1A — **the RT wake scheduling point** (SC-PRI-13): a reschedule interrupt arrived on
+/// `cpu` while it ran a task, not at its idle boundary.
+///
+/// Every RT wake reaches here: a remote wake's committed enqueue is announced by
+/// `hal::notify_enqueued` AFTER the target's 1L is released, and a local one is raised on the
+/// waking CPU itself the same way, so it is taken as soon as that trap returns to the task. The
+/// arrival is the next legal scheduling point, and this owner re-checks eligibility and priority
+/// AT it, under the CPU's own 1L — never from what the waker saw. So coalesced notifications (one
+/// arrival for several wakes), concurrent wakes (the best queued entry is read now) and a wake
+/// whose task has since run, blocked or been withdrawn all settle on the current state.
+///
+/// A switch is the SAME transaction a preempting tick runs (`run_yield_transaction` over
+/// [`crate::kernel::syscall::yield_txn::SharedPreemptOwners`]): the exact `Running → Runnable`
+/// transition of the incarnation this trap entered on, the head requeue, and the Yield deferral
+/// that the existing post-lock drain consumes through the one selection owner. The interrupted
+/// frame was captured into the outgoing TCB by the bridge before any route ran, and no syscall
+/// result is in flight on an interrupt, so the frame the drain installs is the incoming task's
+/// and the outgoing one resumes later from its exact capture. Every decline mutates nothing.
+pub(crate) fn settle_rt_reschedule(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    cause: u64,
+) -> RtReschedSettlement {
+    if shared.sched_domain().profile() != crate::kernel::scheduler::SchedProfile::RealTime {
+        return RtReschedSettlement::NotRealTime;
+    }
+    let (wanted, current, current_level, best_level) =
+        shared.rt_reschedule_observation_split_read(cpu);
+    if !wanted {
+        crate::yarm_log!(
+            "RT_RESCHED_DECLINED cpu={} cause={} current={} current_level={} best_level={}",
+            cpu.0,
+            cause,
+            current.unwrap_or(0),
+            current_level.map_or(-1, |l| l as i64),
+            best_level.map_or(-1, |l| l as i64)
+        );
+        #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+        crate::kernel::rt_witness::note_declined(
+            cpu,
+            current.unwrap_or(0),
+            current_level.unwrap_or(u64::MAX),
+            best_level.unwrap_or(u64::MAX),
+            cause,
+        );
+        return RtReschedSettlement::Declined;
+    }
+    let mut owners = crate::kernel::syscall::yield_txn::SharedPreemptOwners {
+        split: crate::kernel::syscall::yield_txn::SharedYieldOwners { shared },
+        head: true,
+    };
+    match crate::kernel::syscall::yield_txn::run_yield_transaction(&mut owners, cpu) {
+        Ok(preempted) => {
+            crate::kernel::syscall::yield_txn::log_yield_deferred(cpu, preempted.outgoing);
+            crate::yarm_log!(
+                "RT_PREEMPT_COMMITTED cpu={} cause={} outgoing={} outgoing_level={} best_level={} position=head",
+                cpu.0,
+                cause,
+                preempted.outgoing,
+                current_level.map_or(-1, |l| l as i64),
+                best_level.map_or(-1, |l| l as i64)
+            );
+            #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+            crate::kernel::rt_witness::note_preempt(shared, cpu, preempted.outgoing, cause);
+            RtReschedSettlement::Committed {
+                outgoing: preempted.outgoing,
+            }
+        }
+        Err(decline) => {
+            crate::yarm_log!(
+                "RT_PREEMPT_DEFERRED cpu={} cause={} reason={} settlement=continue_current",
+                cpu.0,
+                cause,
+                crate::kernel::syscall::yield_txn::legacy_reason(decline)
+            );
+            RtReschedSettlement::Deferred
+        }
+    }
+}
+
 /// U9-TIMER-FINAL §2 — THE RECOGNIZED TIMER BODY. One tick, one claim, one re-arm, and exactly
 /// one of three settlements — plus, before any of that, one hand-off that exists only while a
 /// default-off diagnostic owns the switch path.
@@ -5263,6 +5367,9 @@ fn settle_recognized_timer(
         cpu,
         crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
     );
+    // RT-SCHED1A witness (default-off): its phase driver, after the tick decision, no lock held.
+    #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+    crate::kernel::rt_witness::on_timer(shared, cpu, entering_tid, preempting, false);
 
     // ── (4) A NON-PREEMPTING TICK ────────────────────────────────────────────────────────────
     if !preempting {
@@ -5315,9 +5422,32 @@ fn settle_recognized_timer(
     // shared bridge has ALREADY captured that frame into the outgoing TCB before this route runs
     // (`capture_outgoing_user_context_split`, keyed on `current_tid_authoritative`). Writing a
     // result here would corrupt the resumed register file.
-    let mut owners = crate::kernel::syscall::yield_txn::SharedYieldOwners { shared };
+    //
+    // RT-SCHED1A: under the RT profile a tick reports `Preempt` only when a strictly higher
+    // priority entry is queued (`CpuView::tick`), so the outgoing task was preempted by it and
+    // returns to the HEAD of its level (SC-PRI-12 (a)) — the same transaction, through the
+    // preemption owners. GP keeps the tail (quantum expiry is a yield, SC-GP-1).
+    let rt = shared.sched_domain().profile() == crate::kernel::scheduler::SchedProfile::RealTime;
+    let mut owners = crate::kernel::syscall::yield_txn::SharedPreemptOwners {
+        split: crate::kernel::syscall::yield_txn::SharedYieldOwners { shared },
+        head: rt,
+    };
     match crate::kernel::syscall::yield_txn::run_yield_transaction(&mut owners, cpu) {
         Ok(preempted) => {
+            if rt {
+                crate::yarm_log!(
+                    "RT_PREEMPT_COMMITTED cpu={} cause=2 outgoing={} position=head",
+                    cpu.0,
+                    preempted.outgoing
+                );
+                #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+                crate::kernel::rt_witness::note_preempt(
+                    shared,
+                    cpu,
+                    preempted.outgoing,
+                    RT_CAUSE_TICK,
+                );
+            }
             // The publish-side vocabulary NR 0 emits, so the post-lock drain's own markers read
             // identically whichever route published the deferral.
             crate::kernel::syscall::yield_txn::log_yield_deferred(cpu, preempted.outgoing);

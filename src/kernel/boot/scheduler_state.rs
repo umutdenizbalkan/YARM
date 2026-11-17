@@ -600,7 +600,14 @@ impl KernelState {
             return Ok(TaskPriority::Normal);
         }
         let class = self.task_class(tid).ok_or(KernelError::TaskMissing)?;
-        Ok(crate::kernel::task_enqueue::priority_for_class(class))
+        // RT-SCHED1A: a configured priority wins over the class rule.
+        let configured = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.sched_priority)
+        });
+        Ok(configured.unwrap_or(crate::kernel::task_enqueue::priority_for_class(class)))
     }
 
     fn task_cpu_affinity(&self, tid: u64) -> Result<Option<CpuId>, KernelError> {

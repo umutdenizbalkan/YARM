@@ -180,6 +180,21 @@ pub fn send_reschedule_sgi(sender: CpuId, target: CpuId) -> Result<u32, SgiRefus
     Ok(sgir)
 }
 
+/// RT-SCHED1A — raise this CPU's OWN reschedule SGI: the local half of an RT wake
+/// (`hal::notify_enqueued` with `target == cpu`). The GIC delivers an SGI whose target list names
+/// the sender's own interface to the sender; it is the same SGI, so its arrival is settled by the
+/// same owner. Interrupts are masked here, so it is taken when this trap returns to EL0.
+pub fn raise_local_reschedule_sgi(cpu: CpuId) -> Result<u32, SgiRefusal> {
+    let sgir =
+        crate::arch::gicv2_sgi::sgir_value(TARGETS.mask_of(cpu.0 as usize), RESCHEDULE_SGI_INTID)
+            .ok_or(SgiRefusal::TargetNotPublished)?;
+    let (dist, _) = gic_bases().ok_or(SgiRefusal::ControllerUnconfigured)?;
+    // SAFETY: a data synchronization barrier, as for the remote send.
+    unsafe { core::arch::asm!("dsb ishst", options(nostack, preserves_flags)) };
+    write32(dist, GICD_SGIR, sgir);
+    Ok(sgir)
+}
+
 /// Where a claimed reschedule SGI was taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArrivalOrigin {

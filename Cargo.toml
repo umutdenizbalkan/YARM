@@ -145,6 +145,15 @@ aarch64-sched-lock1-witness = ["aarch64-apsched-witness", "sched-lock1-witness"]
 riscv64-sched-lock1-witness = ["riscv64-apsched-witness", "sched-lock1-witness"]
 # The port-neutral half (`kernel::schedlock1_witness`): never enabled on its own.
 sched-lock1-witness = ["printk-witness-ring"]
+# RT-SCHED1A: the RT selection witness — local and remote (real IPI) wakes preempting a running
+# lower-priority user task, an equal-priority wake keeping FIFO, and a higher-priority kernel
+# thread honoured at a running kernel thread's scheduling point, on two CPUs. Armed only by
+# `yarm.sched_profile=rt`; graded by `scripts/grade-rt-sched-witness.py`. Default-off.
+x86-rt-sched-witness = ["rt-sched-witness"]
+aarch64-rt-sched-witness = ["rt-sched-witness"]
+riscv64-rt-sched-witness = ["rt-sched-witness"]
+# The port-neutral half (`kernel::rt_witness`): never enabled on its own.
+rt-sched-witness = []
 # QEMU-LOCK1: real subdomain-lock contention on the production VM address-space lock
 # (`vm_state_lock`, rank 5), driven by the SMP3 two-hart VM/IPI workload (which it co-enables). It
 # instruments the chosen lock's atomic acquire/release, a default-off bounded hold hook that makes a

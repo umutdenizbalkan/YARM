@@ -1399,7 +1399,7 @@ impl KernelState {
             let key = FutexKey::Pending {
                 op: committed.op,
                 cpu: home.0,
-                priority: priority as u8,
+                priority: priority.level() as u8,
             };
             for _ in 0..count {
                 let Some((tid, incarnation)) = self.with_task_futex_mut(|tcbs, table| {

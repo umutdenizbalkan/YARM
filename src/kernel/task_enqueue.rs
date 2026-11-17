@@ -198,9 +198,14 @@ pub(crate) fn bind_home_locked(
     };
     match tcb.cpu_affinity {
         Some(home) if home != cpu => Err(refuse_home(tid, cpu, Some(home), HomeRefusal::OffHome)),
-        Some(_) => Ok(tcb.incarnation),
+        Some(_) => {
+            // RT-SCHED1A: this is a placement — the configured priority is fixed from now on.
+            tcb.sched_priority_sealed = true;
+            Ok(tcb.incarnation)
+        }
         None => {
             tcb.cpu_affinity = Some(cpu);
+            tcb.sched_priority_sealed = true;
             Ok(tcb.incarnation)
         }
     }
@@ -255,6 +260,48 @@ pub(crate) const fn priority_for_class(class: TaskClass) -> TaskPriority {
     }
 }
 
+/// RT-SCHED1A — **the priority of an exact incarnation**: its configured priority
+/// ([`configure_priority_locked`]) if it has one, else the class rule. Every enqueue plan and every
+/// homed-wake placement reads this, so the priority a configuration binds is the one each of the
+/// incarnation's placements carries onto its home CPU's queue.
+#[inline]
+pub(crate) fn priority_of_locked(tcb: &ThreadControlBlock, class: TaskClass) -> TaskPriority {
+    match tcb.sched_priority {
+        Some(configured) => configured,
+        None => priority_for_class(class),
+    }
+}
+
+/// RT-SCHED1A — why a priority configuration was refused. Nothing is written on a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PriorityConfigRefusal {
+    /// No live incarnation has this TID (or it is a spawn reservation).
+    NoTask,
+    /// The incarnation has been placed: its priority is fixed (SC-PRI-10).
+    Sealed,
+}
+
+/// RT-SCHED1A — rank 2: **configure** the scheduling priority of `tid`'s incarnation, before its
+/// first placement. This is the deployment-configuration owner: the priority becomes part of the
+/// incarnation and every later placement of it carries it; once the first placement has sealed
+/// it, it cannot change (no run-time priority change, no inheritance, no aging — SC-PRI-10).
+pub(crate) fn configure_priority_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+    priority: TaskPriority,
+) -> Result<(), PriorityConfigRefusal> {
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|t| t.tid.0 == tid && !t.is_spawn_reservation())
+        .ok_or(PriorityConfigRefusal::NoTask)?;
+    if tcb.sched_priority_sealed {
+        return Err(PriorityConfigRefusal::Sealed);
+    }
+    tcb.sched_priority = Some(priority);
+    Ok(())
+}
+
 /// rank 2 — locate `tid`'s slot, refusing a spawn reservation.
 ///
 /// The run queue carries bare TIDs with no status precondition, so the enqueue seam is the only
@@ -307,10 +354,13 @@ pub(crate) fn plan_pinned_enqueue_locked(
     let priority = if tid == 0 {
         TaskPriority::Normal
     } else {
-        priority_for_class(
-            idx.and_then(|idx| classes.get(idx).copied().flatten())
-                .ok_or(KernelError::TaskMissing)?,
-        )
+        let class = idx
+            .and_then(|idx| classes.get(idx).copied().flatten())
+            .ok_or(KernelError::TaskMissing)?;
+        let tcb = idx
+            .and_then(|idx| tcbs[idx].as_ref())
+            .ok_or(KernelError::TaskMissing)?;
+        priority_of_locked(tcb, class)
     };
     // Every refusal above wrote nothing; the binding is the plan's only write, and it is last.
     let incarnation = bind_home_locked(tcbs, tid, cpu)?;
@@ -358,7 +408,7 @@ pub(crate) fn plan_balanced_enqueue_locked(
     }
     Ok(EnqueuePlan {
         tid,
-        priority: priority_for_class(class),
+        priority: priority_of_locked(tcb, class),
         target: match tcb.cpu_affinity {
             Some(cpu) => EnqueueTarget::Pinned(cpu),
             None => EnqueueTarget::Balanced,
@@ -383,7 +433,11 @@ pub(crate) fn fix_home_locked(
     chosen: CpuId,
 ) -> CpuId {
     match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
-        Some(tcb) => *tcb.cpu_affinity.get_or_insert(chosen),
+        Some(tcb) => {
+            // RT-SCHED1A: a placement — the configured priority is fixed from now on.
+            tcb.sched_priority_sealed = true;
+            *tcb.cpu_affinity.get_or_insert(chosen)
+        }
         None => chosen,
     }
 }
@@ -407,8 +461,9 @@ pub(crate) fn homed_wake_placement_locked(
             .is_some_and(|tcb| tcb.tid.0 == tid && !tcb.is_spawn_reservation())
     })?;
     let class = classes.get(idx).copied().flatten()?;
-    let home = tcbs[idx].as_ref()?.cpu_affinity?;
-    Some((home, priority_for_class(class)))
+    let tcb = tcbs[idx].as_ref()?;
+    let home = tcb.cpu_affinity?;
+    Some((home, priority_of_locked(tcb, class)))
 }
 
 /// rank 1L — **THE** commit, on the one CPU whose lock the caller holds. The only place a
@@ -487,7 +542,7 @@ pub(crate) fn reserve_enqueue_on_cpu_locked(
         crate::kernel::sat_witness::record(
             view.cpu().0 as usize,
             plan.tid,
-            plan.priority as u64,
+            plan.priority.level() as u64,
             queued,
             promised,
             reason,

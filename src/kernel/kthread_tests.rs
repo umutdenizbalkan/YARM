@@ -664,12 +664,14 @@ fn a_pending_reschedule_is_honoured_at_the_next_scheduling_point_only() {
 #[test]
 fn unfiltered_selection_never_returns_a_kernel_thread() {
     let k = kernel();
+    // Same level: the unfiltered dequeue skips the kernel thread in place and takes the user task
+    // behind it (KTHREAD1, unchanged).
     let id = k
         .kthreads
-        .create(nop, 0, CPU, TaskPriority::High)
+        .create(nop, 0, CPU, TaskPriority::Normal)
         .expect("create");
     let user = ThreadId(4242);
-    k.with_cpu_sched_split(CPU, |c| c.enqueue_with_priority(user, TaskPriority::Low))
+    k.with_cpu_sched_split(CPU, |c| c.enqueue_with_priority(user, TaskPriority::Normal))
         .expect("cpu")
         .expect("enqueue");
     k.with_cpu_sched_split(CPU, |c| {
@@ -694,6 +696,45 @@ fn unfiltered_selection_never_returns_a_kernel_thread() {
         .expect("cpu");
     assert_eq!(sel, AcceptedSelection::NoneAcceptable { examined: 1 });
     run_cpu(&k, CPU);
+}
+
+/// RT-SCHED1A (§19.3): an unfiltered selection never takes a user task from below a level that
+/// holds only a ready kernel thread of strictly higher priority. It answers nothing, and the
+/// filtered owner — the one that can run the thread — runs it first.
+#[test]
+fn unfiltered_selection_never_bypasses_a_higher_priority_kernel_thread() {
+    let k = kernel();
+    let id = k
+        .kthreads
+        .create(nop, 0, CPU, TaskPriority::High)
+        .expect("create");
+    let user = ThreadId(4243);
+    k.with_cpu_sched_split(CPU, |c| c.enqueue_with_priority(user, TaskPriority::Low))
+        .expect("cpu")
+        .expect("enqueue");
+    k.with_cpu_sched_split(CPU, |c| {
+        assert_eq!(c.peek_next_runnable(), None, "no user task ahead of it");
+        assert_eq!(c.dispatch_next(), None, "the rotation does not bypass it");
+        assert_eq!(c.current_tid(), None);
+    })
+    .expect("cpu");
+    assert_eq!(
+        queued(&k, CPU),
+        std::vec![id.raw(), user.0],
+        "nothing moved: the thread first, the user task after it"
+    );
+    // The filtered owner runs the kernel thread first, then the user task.
+    let sel = k
+        .with_cpu_sched_split(CPU, |c| {
+            c.dispatch_next_accepted_selection(|t| crate::kernel::kthread::is_kthread_tid(t.0))
+        })
+        .expect("cpu");
+    assert_eq!(
+        sel,
+        AcceptedSelection::Selected(crate::kernel::scheduler::DispatchSelection::Dequeued {
+            tid: id.tid()
+        })
+    );
 }
 
 #[test]

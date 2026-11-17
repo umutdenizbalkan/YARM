@@ -3208,8 +3208,24 @@ yarm_ap_remote_wake_stub:
     //      above, it is handed to the compiled entry as vector 0xF1 with the hardware frame
     //      untouched, and the shared bridge settles it as the idle queue advance (no second EOI).
     //      Anywhere else — kernel code, a TLB wait, ring 3 — it returns to what it interrupted.
+    // (10c) RT-SCHED1A — under the RT profile (`smp::RT_USER_RESCHED_HANDOFF` non-zero) a wake
+    //      that interrupted RING 3 is a scheduling point too (SC-PRI-13): it is handed off the
+    //      same way, and the shared bridge re-checks priority there. Kernel-origin arrivals other
+    //      than the idle park still return, and GP (flag zero) is exactly the path above.
+    //      ZF carries the decision across the pops: set = hand off.
     lea rax, [rip + yarm_x86_idle_hlt_resume]
     cmp qword ptr [rsp + 24], rax
+    je 96f
+    movzx eax, byte ptr [rip + RT_USER_RESCHED_HANDOFF]
+    test eax, eax
+    jz 97f
+    mov rax, qword ptr [rsp + 32]
+    and eax, 3
+    cmp eax, 3
+    jmp 96f
+97:
+    or eax, 1
+96:
     // (11) restore every register this handler touched (flags survive the pops).
     pop rdx
     pop rcx

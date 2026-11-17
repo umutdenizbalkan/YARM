@@ -3017,6 +3017,12 @@ pub fn bootstrap_first_user_task(
     {
         crate::yarm_log!("APSW_PROVISION_FAIL err={:?} result=fail", e);
     }
+    // RT-SCHED1A: the RT selection witness's two user processes (provisioned, not placed). Compile-
+    // time gated and armed only by `yarm.sched_profile=rt`.
+    #[cfg(feature = "riscv64-rt-sched-witness")]
+    if let Err(e) = crate::kernel::rt_witness::provision(kernel) {
+        crate::yarm_log!("RTW_PROVISION_FAIL err={:?} result=fail", e);
+    }
     #[cfg(feature = "riscv-exit-current-task-oracle")]
     if crate::kernel::boot::riscv_exit_oracle_enabled() && init_args[5] == 0 {
         init_args[5] = crate::kernel::boot::riscv_exit_current_task_selector();

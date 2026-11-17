@@ -2665,6 +2665,38 @@ pub(crate) fn send_reschedule_ipi(sender: CpuId, target: CpuId) -> bool {
     true
 }
 
+/// RT-SCHED1A — raise this CPU's OWN reschedule IPI (vector 0xF1): the local half of an RT wake
+/// (`hal::notify_enqueued` with `target == cpu`). The ICR's "self" destination shorthand; the
+/// interrupt stays pending while this trap runs masked and is taken on its return to ring 3,
+/// where the 0xF1 stub hands it to the compiled entry ([`RT_USER_RESCHED_HANDOFF`]).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn raise_local_reschedule_ipi(cpu: CpuId) {
+    use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+    const ICR_DEST_SELF: u32 = 0b01 << 18;
+    let Some(apic) = apic_of(cpu) else {
+        return;
+    };
+    wait_for_icr_idle(apic, "before_local_reschedule");
+    write_icr(apic, ICR_DEST_SELF | AP_REMOTE_WAKE_VECTOR as u32);
+}
+
+#[cfg(any(test, feature = "hosted-dev"))]
+#[allow(dead_code)]
+pub(crate) fn raise_local_reschedule_ipi(_cpu: CpuId) {}
+
+/// RT-SCHED1A — read by the 0xF1 stub (`descriptor_tables.rs`): when non-zero, a reschedule IPI
+/// that interrupted RING 3 is handed to the compiled entry, like the idle-boundary one, so the
+/// shared bridge can settle it as an RT scheduling point. Zero (GP, the default): ring-3 arrivals
+/// return to the interrupted instruction, exactly as before.
+#[unsafe(no_mangle)]
+pub static RT_USER_RESCHED_HANDOFF: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// RT-SCHED1A — set by `SchedDomain::set_profile`.
+pub(crate) fn set_rt_user_resched_handoff(on: bool) {
+    RT_USER_RESCHED_HANDOFF.store(u8::from(on), Ordering::Release);
+}
+
 /// Per-sender count of reschedule IPIs written.
 static RESCHEDULE_IPI_SENT: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 

@@ -10,7 +10,7 @@ use crate::kernel::scheduler_timer::Timer;
 use crate::kernel::ticket_lock::{TicketLockIrq, TicketLockIrqGuard};
 use crate::kernel::time::{Tick, TickInstant};
 use crate::kernel::topology::CpuTopology;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 pub use yarm_kernel::scheduler::{CpuId, SchedulerError, TaskPriority};
 
 pub const MAX_RUN_QUEUE: usize = 64;
@@ -32,9 +32,36 @@ const _: () = assert!(MAX_RUN_QUEUE.is_power_of_two());
 pub const ROTATION_SLOTS: usize = 1;
 pub const MAX_QUEUED_PER_PRIORITY: usize =
     MAX_RUN_QUEUE + ROTATION_SLOTS + crate::kernel::kthread::KTHREAD_CAPACITY;
-/// The ring's physical slots (a power of two, for the index mask).
-const RING_SLOTS: usize = MAX_QUEUED_PER_PRIORITY.next_power_of_two();
-const _: () = assert!(RING_SLOTS >= MAX_QUEUED_PER_PRIORITY);
+
+/// RT-SCHED1A — the priority levels the run queues hold (SC-PRI-10: 32, level 0 highest).
+pub const PRIORITY_LEVELS: usize = TaskPriority::LEVELS;
+const _: () = assert!(PRIORITY_LEVELS == 32);
+/// RT-SCHED1A — the user entries (queued + reserved) ONE CPU admits over all its levels. A user
+/// push is refused once `user queued + reserved` reaches this, beside the unchanged per-level rule
+/// (`len + reserved < MAX_RUN_QUEUE`).
+///
+/// **It never refuses a push the per-level rule admits in a GP configuration** (three levels):
+/// SCHED-FULL-ROT1's bound gives `V[p] <= MAX_RUN_QUEUE + 1` for each level, so
+/// `Σ (queued + reserved) <= 3 × (MAX_RUN_QUEUE + 1)`, and reaching it means every level holds
+/// `MAX_RUN_QUEUE + 1 > MAX_RUN_QUEUE - 1` entries, which the per-level rule already refuses. In
+/// an RT configuration (up to 32 levels) it is what bounds the CPU's storage: without it the
+/// per-level rule alone would admit `32 × 64` entries.
+pub const MAX_RUN_QUEUE_TOTAL: usize = 3 * (MAX_RUN_QUEUE + ROTATION_SLOTS);
+/// RT-SCHED1A — the most entries one CPU's queues can hold, all levels together:
+/// * `MAX_RUN_QUEUE_TOTAL` admitted user entries (exited entries that stay queued until a dispatch
+///   discards them count here: they were admitted and are still entries);
+/// * `ROTATION_SLOTS` for the returning occupant (the current task requeued without admission);
+/// * `KTHREAD_CAPACITY` kernel threads (each queued only on its home, at most once);
+/// * one for tid 0, the AP idle placeholder installed rather than admitted.
+///
+/// Reservations hold no entry until filled, and their fill was admitted at reservation.
+pub const MAX_QUEUED_PER_CPU: usize =
+    MAX_RUN_QUEUE_TOTAL + ROTATION_SLOTS + crate::kernel::kthread::KTHREAD_CAPACITY + 1;
+/// RT-SCHED1A — the entry pool every level of one CPU links its FIFO through.
+const POOL_SLOTS: usize = 256;
+const _: () = assert!(POOL_SLOTS >= MAX_QUEUED_PER_CPU && POOL_SLOTS < NIL as usize);
+/// The end of a level's list, and of the free list.
+const NIL: u16 = u16::MAX;
 
 /// Per-CPU slot for the recv-timeout split-read optimization.
 ///
@@ -61,11 +88,29 @@ struct ScheduledTask {
     priority: TaskPriority,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RingQueue {
-    tids: [ThreadId; RING_SLOTS],
-    head: usize,
-    len: usize,
+/// RT-SCHED1A — one CPU's run queues: [`PRIORITY_LEVELS`] FIFO lists linked through ONE pool of
+/// [`POOL_SLOTS`] entries, with a bitmap of the non-empty levels.
+///
+/// Storage per CPU: `POOL_SLOTS × (8 + 2)` bytes of entries and links plus `PRIORITY_LEVELS × 6`
+/// bytes of heads, tails and lengths — about 2.8 KiB, against the 3 × 1040 bytes of the three
+/// 128-slot rings it replaces. Thirty-two such rings would have been 33 KiB per CPU (2.1 MiB over
+/// `MAX_CPUS`), for capacity no admission rule could ever fill.
+///
+/// Every operation is bounded by occupancy, never by the pool: push at either end and pop at the
+/// head are O(1); removing a given entry walks only its own level (≤ that level's length); the
+/// highest non-empty level is one `trailing_zeros` of the bitmap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunQueues {
+    tids: [ThreadId; POOL_SLOTS],
+    next: [u16; POOL_SLOTS],
+    free: u16,
+    head: [u16; PRIORITY_LEVELS],
+    tail: [u16; PRIORITY_LEVELS],
+    len: [u16; PRIORITY_LEVELS],
+    /// Entries that are not kernel threads, over every level (the total admission's count).
+    user: u16,
+    /// Bit `l` set iff level `l` holds an entry.
+    nonempty: u32,
 }
 
 /// Stage 199D-WA3A-R1 — what a dispatch step actually did, produced **inside** the
@@ -146,118 +191,188 @@ impl AcceptedSelection {
     }
 }
 
-impl RingQueue {
+impl RunQueues {
     const fn new() -> Self {
+        let mut next = [NIL; POOL_SLOTS];
+        let mut i = 0;
+        while i + 1 < POOL_SLOTS {
+            next[i] = (i + 1) as u16;
+            i += 1;
+        }
         Self {
-            tids: [ThreadId(0); RING_SLOTS],
-            head: 0,
-            len: 0,
+            tids: [ThreadId(0); POOL_SLOTS],
+            next,
+            free: 0,
+            head: [NIL; PRIORITY_LEVELS],
+            tail: [NIL; PRIORITY_LEVELS],
+            len: [0; PRIORITY_LEVELS],
+            user: 0,
+            nonempty: 0,
         }
     }
 
-    fn index(offset: usize) -> usize {
-        offset & (RING_SLOTS - 1)
+    fn len(&self, level: usize) -> usize {
+        self.len[level] as usize
     }
 
-    fn contains(&self, tid: ThreadId) -> bool {
-        for offset in 0..self.len {
-            let idx = Self::index(self.head + offset);
-            if self.tids[idx] == tid {
-                return true;
-            }
-        }
-        false
+    /// Every entry, all levels.
+    fn total(&self) -> usize {
+        self.len.iter().map(|&l| l as usize).sum()
     }
 
-    /// Push within the ring's physical bound. The user limit ([`MAX_RUN_QUEUE`], counting
-    /// reservations) is the caller's: `PriorityScheduler::enqueue_with_priority` applies it to
-    /// every user push, and a reserved fill was admitted by it when it reserved. KTHREAD1-ACCEPTANCE
-    /// §1: kernel threads keep their reserved room.
-    /// The ring's own per-kind limit, unchanged (unit tests of the ring).
-    #[cfg(test)]
-    fn push(&mut self, tid: ThreadId) -> Result<(), SchedulerError> {
-        let limit = if crate::kernel::kthread::is_kthread_tid(tid.0) {
-            MAX_QUEUED_PER_PRIORITY
+    /// The highest-priority (lowest-numbered) non-empty level.
+    fn best_level(&self) -> Option<usize> {
+        if self.nonempty == 0 {
+            None
         } else {
-            MAX_RUN_QUEUE
-        };
-        self.push_within(tid, limit)
-    }
-
-    fn push_within(&mut self, tid: ThreadId, limit: usize) -> Result<(), SchedulerError> {
-        if self.len >= limit.min(MAX_QUEUED_PER_PRIORITY) {
-            return Err(SchedulerError::QueueFull);
+            Some(self.nonempty.trailing_zeros() as usize)
         }
-        let tail = Self::index(self.head + self.len);
-        self.tids[tail] = tid;
-        self.len += 1;
-        Ok(())
     }
 
-    fn pop(&mut self) -> Option<ThreadId> {
-        if self.len == 0 {
-            return None;
-        }
-        let tid = self.tids[self.head];
-        self.head = Self::index(self.head + 1);
-        self.len -= 1;
-        Some(tid)
+    /// The non-empty levels, highest priority first.
+    fn levels(&self) -> impl Iterator<Item = usize> + use<> {
+        let mut bits = self.nonempty;
+        core::iter::from_fn(move || {
+            if bits == 0 {
+                return None;
+            }
+            let l = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            Some(l)
+        })
     }
 
-    /// KTHREAD1 — the first entry that is not a kernel thread, in FIFO order. Read-only.
-    /// KTHREAD1 — the queued entries that are user tasks (kernel-thread ids excluded).
-    fn user_len(&self) -> usize {
-        (0..self.len)
-            .filter(|offset| {
-                !crate::kernel::kthread::is_kthread_tid(
-                    self.tids[Self::index(self.head + offset)].0,
-                )
-            })
+    /// The entries of `level`, in FIFO order.
+    fn iter(&self, level: usize) -> impl Iterator<Item = ThreadId> + '_ {
+        let mut at = self.head[level];
+        core::iter::from_fn(move || {
+            if at == NIL {
+                return None;
+            }
+            let tid = self.tids[at as usize];
+            at = self.next[at as usize];
+            Some(tid)
+        })
+    }
+
+    fn contains(&self, level: usize, tid: ThreadId) -> bool {
+        self.iter(level).any(|t| t == tid)
+    }
+
+    /// Number of entries of `level` holding `tid`. A scan only.
+    fn count_tid(&self, level: usize, tid: ThreadId) -> usize {
+        self.iter(level).filter(|&t| t == tid).count()
+    }
+
+    /// KTHREAD1 — the entries of `level` that are user tasks (kernel-thread ids excluded).
+    fn user_len(&self, level: usize) -> usize {
+        self.iter(level)
+            .filter(|t| !crate::kernel::kthread::is_kthread_tid(t.0))
             .count()
     }
 
-    fn first_user(&self) -> Option<ThreadId> {
-        (0..self.len)
-            .map(|offset| self.tids[Self::index(self.head + offset)])
-            .find(|tid| !crate::kernel::kthread::is_kthread_tid(tid.0))
+    /// KTHREAD1 — the first entry of `level` that is not a kernel thread, in FIFO order.
+    fn first_user(&self, level: usize) -> Option<ThreadId> {
+        self.iter(level)
+            .find(|t| !crate::kernel::kthread::is_kthread_tid(t.0))
     }
 
-    /// Non-mutating peek of the head (the TID `pop` would return next). Read-only.
-    fn peek(&self) -> Option<ThreadId> {
-        if self.len == 0 {
-            return None;
+    /// Non-mutating peek of `level`'s head.
+    fn peek(&self, level: usize) -> Option<ThreadId> {
+        let h = self.head[level];
+        (h != NIL).then(|| self.tids[h as usize])
+    }
+
+    /// Take a free entry for `tid` within `level`'s physical bound (`limit`, never above
+    /// [`MAX_QUEUED_PER_PRIORITY`]) and the pool's.
+    fn alloc(&mut self, level: usize, tid: ThreadId, limit: usize) -> Result<u16, SchedulerError> {
+        if self.len(level) >= limit.min(MAX_QUEUED_PER_PRIORITY) || self.free == NIL {
+            return Err(SchedulerError::QueueFull);
         }
-        Some(self.tids[self.head])
-    }
-
-    /// Number of live slots holding `tid`. A scan only — it mutates nothing and shares
-    /// `Self::index` with the rest of the ring, so no queue algorithm is duplicated.
-    fn count_tid(&self, tid: ThreadId) -> usize {
-        let mut seen = 0;
-        for offset in 0..self.len {
-            let idx = Self::index(self.head + offset);
-            if self.tids[idx] == tid {
-                seen += 1;
-            }
+        let at = self.free;
+        self.free = self.next[at as usize];
+        self.tids[at as usize] = tid;
+        self.next[at as usize] = NIL;
+        self.len[level] += 1;
+        self.nonempty |= 1 << level;
+        if !crate::kernel::kthread::is_kthread_tid(tid.0) {
+            self.user += 1;
         }
-        seen
+        Ok(at)
     }
 
-    /// Remove `tid` from any position in the ring buffer.
-    /// Compacts the elements after the removed slot toward the head.
-    /// Returns `true` if `tid` was found and removed, `false` otherwise.
-    fn remove_tid(&mut self, tid: ThreadId) -> bool {
-        for i in 0..self.len {
-            let idx = Self::index(self.head + i);
-            if self.tids[idx] == tid {
-                for j in i..self.len - 1 {
-                    let dst = Self::index(self.head + j);
-                    let src = Self::index(self.head + j + 1);
-                    self.tids[dst] = self.tids[src];
-                }
-                self.len -= 1;
+    /// Append at `level`'s TAIL (a wake, a yield, a rotation).
+    fn push_back(
+        &mut self,
+        level: usize,
+        tid: ThreadId,
+        limit: usize,
+    ) -> Result<(), SchedulerError> {
+        let at = self.alloc(level, tid, limit)?;
+        match self.tail[level] {
+            NIL => self.head[level] = at,
+            t => self.next[t as usize] = at,
+        }
+        self.tail[level] = at;
+        Ok(())
+    }
+
+    /// Insert at `level`'s HEAD (SC-PRI-12 (a): a task preempted by a strictly higher priority).
+    fn push_front(
+        &mut self,
+        level: usize,
+        tid: ThreadId,
+        limit: usize,
+    ) -> Result<(), SchedulerError> {
+        let at = self.alloc(level, tid, limit)?;
+        self.next[at as usize] = self.head[level];
+        if self.head[level] == NIL {
+            self.tail[level] = at;
+        }
+        self.head[level] = at;
+        Ok(())
+    }
+
+    /// Unlink entry `at` of `level`, whose predecessor is `prev` (`NIL` for the head), and
+    /// return it to the pool.
+    fn unlink(&mut self, level: usize, prev: u16, at: u16) -> ThreadId {
+        let after = self.next[at as usize];
+        match prev {
+            NIL => self.head[level] = after,
+            p => self.next[p as usize] = after,
+        }
+        if self.tail[level] == at {
+            self.tail[level] = prev;
+        }
+        let tid = self.tids[at as usize];
+        self.next[at as usize] = self.free;
+        self.free = at;
+        self.len[level] -= 1;
+        if self.len[level] == 0 {
+            self.nonempty &= !(1 << level);
+        }
+        if !crate::kernel::kthread::is_kthread_tid(tid.0) {
+            self.user -= 1;
+        }
+        tid
+    }
+
+    fn pop_front(&mut self, level: usize) -> Option<ThreadId> {
+        let h = self.head[level];
+        (h != NIL).then(|| self.unlink(level, NIL, h))
+    }
+
+    /// Remove the first entry of `level` holding `tid`, keeping every other entry's order.
+    fn remove_tid(&mut self, level: usize, tid: ThreadId) -> bool {
+        let mut prev = NIL;
+        let mut at = self.head[level];
+        while at != NIL {
+            if self.tids[at as usize] == tid {
+                self.unlink(level, prev, at);
                 return true;
             }
+            prev = at;
+            at = self.next[at as usize];
         }
         false
     }
@@ -307,7 +422,8 @@ pub(crate) enum WithdrawOutcome {
 
 #[derive(Debug)]
 pub struct PriorityScheduler {
-    queues: [RingQueue; 3],
+    /// RT-SCHED1A — the [`PRIORITY_LEVELS`] FIFO levels, linked through one per-CPU pool.
+    queues: RunQueues,
     current: Option<ScheduledTask>,
     membership_keys: [ThreadId; MEMBERSHIP_SLOTS],
     membership_state: [u8; MEMBERSHIP_SLOTS],
@@ -317,18 +433,21 @@ pub struct PriorityScheduler {
     /// counts these as occupied, so the promise cannot be spent by anyone else. Bounded by
     /// [`MAX_RUN_QUEUE`] per queue, because a reservation is refused once
     /// `len + reserved` reaches it.
-    reserved: [usize; 3],
+    reserved: [u16; PRIORITY_LEVELS],
+    /// RT-SCHED1A — every level's reservations together (the total admission's count).
+    reserved_total: u16,
 }
 
 impl Default for PriorityScheduler {
     fn default() -> Self {
         Self {
-            queues: [RingQueue::new(), RingQueue::new(), RingQueue::new()],
+            queues: RunQueues::new(),
             current: None,
             membership_keys: [ThreadId(0); MEMBERSHIP_SLOTS],
             membership_state: [MEMBERSHIP_EMPTY; MEMBERSHIP_SLOTS],
             membership_tracking_exhausted: false,
-            reserved: [0; 3],
+            reserved: [0; PRIORITY_LEVELS],
+            reserved_total: 0,
         }
     }
 }
@@ -397,7 +516,9 @@ impl PriorityScheduler {
         if self.current.is_some_and(|task| task.tid == tid) {
             return true;
         }
-        self.queues.iter().any(|queue| queue.contains(tid))
+        self.queues
+            .levels()
+            .any(|level| self.queues.contains(level, tid))
     }
 
     fn rebuild_membership_table(&mut self) -> bool {
@@ -411,11 +532,11 @@ impl PriorityScheduler {
             exhausted = true;
         }
 
-        for queue_idx in 0..self.queues.len() {
-            let queue_len = self.queues[queue_idx].len;
-            for offset in 0..queue_len {
-                let idx = RingQueue::index(self.queues[queue_idx].head + offset);
-                let tid = self.queues[queue_idx].tids[idx];
+        for level in self.queues.levels() {
+            let mut at = self.queues.head[level];
+            while at != NIL {
+                let tid = self.queues.tids[at as usize];
+                at = self.queues.next[at as usize];
                 if self.membership_insert(tid).is_err() {
                     exhausted = true;
                 }
@@ -426,7 +547,7 @@ impl PriorityScheduler {
     }
 
     fn priority_index(priority: TaskPriority) -> usize {
-        priority as usize
+        priority.level()
     }
 
     fn contains_tid(&self, tid: ThreadId) -> bool {
@@ -503,10 +624,34 @@ impl PriorityScheduler {
         pushed
     }
 
+    /// RT-SCHED1A — [`Self::requeue_current_with_priority`] at the HEAD of its level: SC-PRI-12 (a),
+    /// the outgoing current preempted by a strictly higher priority. The same returning occupant
+    /// under the same proof, so the same bound: it cannot hit the physical limit either.
+    fn requeue_current_at_head(
+        &mut self,
+        tid: ThreadId,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        if self.contains_tid(tid) {
+            return Err(SchedulerError::AlreadyQueued);
+        }
+        let pushed = self.push_front_unchecked_capacity(tid, priority);
+        debug_assert!(
+            pushed.is_ok() || tid.0 == 0,
+            "SCHED-FULL-ROT1: the returning occupant exceeded MAX_QUEUED_PER_PRIORITY"
+        );
+        pushed
+    }
+
     /// FUTEX-WAKE-CAP1 — whether one more user entry fits at `priority`, counting reservations.
+    ///
+    /// RT-SCHED1A: the per-level rule is unchanged; the CPU-wide [`MAX_RUN_QUEUE_TOTAL`] rule
+    /// beside it never refuses what the per-level rule admits with three levels (proof at the
+    /// constant), and is what bounds a 32-level CPU's entries by [`MAX_QUEUED_PER_CPU`].
     fn user_room(&self, priority: TaskPriority) -> bool {
         let p = Self::priority_index(priority);
-        self.queues[p].len + self.reserved[p] < MAX_RUN_QUEUE
+        self.queues.len(p) + (self.reserved[p] as usize) < MAX_RUN_QUEUE
+            && (self.queues.user as usize) + (self.reserved_total as usize) < MAX_RUN_QUEUE_TOTAL
     }
 
     /// FUTEX-WAKE-CAP1 — promise one user slot at `priority`. Refused (`QueueFull`) exactly when
@@ -519,6 +664,7 @@ impl PriorityScheduler {
             return Err(SchedulerError::QueueFull);
         }
         self.reserved[Self::priority_index(priority)] += 1;
+        self.reserved_total += 1;
         Ok(())
     }
 
@@ -526,13 +672,16 @@ impl PriorityScheduler {
     pub(crate) fn release_user_slot(&mut self, priority: TaskPriority) {
         let p = Self::priority_index(priority);
         debug_assert!(self.reserved[p] > 0, "released a user slot nobody reserved");
-        self.reserved[p] = self.reserved[p].saturating_sub(1);
+        if self.reserved[p] > 0 {
+            self.reserved[p] -= 1;
+            self.reserved_total -= 1;
+        }
     }
 
     /// FUTEX-WAKE-CAP1 — the user slots currently promised at `priority`.
     #[cfg(test)]
     pub(crate) fn reserved_user_slots(&self, priority: TaskPriority) -> usize {
-        self.reserved[Self::priority_index(priority)]
+        self.reserved[Self::priority_index(priority)] as usize
     }
 
     /// SCHED-SAT-EVIDENCE1 (witness only) — the queue's entries and promised slots at `priority`,
@@ -540,7 +689,7 @@ impl PriorityScheduler {
     #[cfg(any(test, feature = "sched-time-witness", feature = "futex-time-witness"))]
     pub(crate) fn witness_occupancy(&self, priority: TaskPriority) -> (usize, usize) {
         let p = Self::priority_index(priority);
-        (self.queues[p].len, self.reserved[p])
+        (self.queues.len(p), self.reserved[p] as usize)
     }
 
     /// FUTEX-WAKE-CAP1 — fill a promised slot. The reservation is consumed whatever the outcome;
@@ -567,7 +716,22 @@ impl PriorityScheduler {
         tid: ThreadId,
         priority: TaskPriority,
     ) -> Result<(), SchedulerError> {
-        self.queues[Self::priority_index(priority)].push_within(tid, MAX_QUEUED_PER_PRIORITY)?;
+        self.queues
+            .push_back(Self::priority_index(priority), tid, MAX_QUEUED_PER_PRIORITY)?;
+        if !self.membership_tracking_exhausted && self.membership_insert(tid).is_err() {
+            self.membership_tracking_exhausted = self.rebuild_membership_table();
+        }
+        Ok(())
+    }
+
+    /// RT-SCHED1A — [`Self::push_unchecked_capacity`] at the HEAD of the level (SC-PRI-12 (a)).
+    fn push_front_unchecked_capacity(
+        &mut self,
+        tid: ThreadId,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        self.queues
+            .push_front(Self::priority_index(priority), tid, MAX_QUEUED_PER_PRIORITY)?;
         if !self.membership_tracking_exhausted && self.membership_insert(tid).is_err() {
             self.membership_tracking_exhausted = self.rebuild_membership_table();
         }
@@ -577,32 +741,46 @@ impl PriorityScheduler {
     /// The unfiltered dequeue. KTHREAD1: it never returns a kernel thread — only the
     /// acceptance-filtered selection, under an authority whose caller can run one, does — so a
     /// queued kernel thread is skipped in place here and keeps its FIFO position.
+    ///
+    /// RT-SCHED1A (§19.3): it never takes a user task from BELOW a level that holds only kernel
+    /// threads. Such a level's threads are of strictly higher priority than any user task this
+    /// dequeue could return, so it answers `None` and the CPU's next filtered selection — the one
+    /// owner that can run a kernel thread — decides; a rotation cannot bypass them.
     fn dequeue_highest(&mut self) -> Option<ScheduledTask> {
-        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            let queue = &mut self.queues[Self::priority_index(priority)];
-            let Some(tid) = queue.first_user() else {
-                continue;
-            };
-            if queue.peek() == Some(tid) {
-                queue.pop();
-            } else {
-                queue.remove_tid(tid);
-            }
-            return Some(ScheduledTask { tid, priority });
+        let level = self.queues.levels().next()?;
+        let tid = self.queues.first_user(level)?;
+        if self.queues.peek(level) == Some(tid) {
+            self.queues.pop_front(level);
+        } else {
+            self.queues.remove_tid(level, tid);
         }
-        None
+        let priority = TaskPriority::from_level(level)?;
+        Some(ScheduledTask { tid, priority })
     }
 
     /// Non-mutating twin of [`dequeue_highest`]: return the TID that would be
     /// dispatched next from an idle/cleared current (highest-priority queue head),
     /// WITHOUT dequeuing it. Read-only — same priority scan order as `dequeue_highest`.
     fn peek_highest(&self) -> Option<ThreadId> {
-        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            if let Some(tid) = self.queues[Self::priority_index(priority)].first_user() {
-                return Some(tid);
-            }
+        let level = self.queues.levels().next()?;
+        self.queues.first_user(level)
+    }
+
+    /// RT-SCHED1A — the highest priority any entry of this CPU's queues holds (kernel threads
+    /// included: the filtered selection can run them). Read-only, O(1).
+    pub fn best_queued_priority(&self) -> Option<TaskPriority> {
+        self.queues.best_level().and_then(TaskPriority::from_level)
+    }
+
+    /// RT-SCHED1A — SC-PRI-13's predicate: a queued entry has STRICTLY higher priority than this
+    /// CPU's current task. An equal-priority entry never qualifies (SC-PRI-11: no time-slicing
+    /// among equals), and neither does an empty slot or the tid-0 idle placeholder, whose CPU is
+    /// advanced by the idle paths instead. Read-only, O(1).
+    pub fn rt_preempt_wanted(&self) -> bool {
+        match (self.current, self.best_queued_priority()) {
+            (Some(cur), Some(best)) => cur.tid.0 != 0 && best.is_higher_than(cur.priority),
+            _ => false,
         }
-        None
     }
 
     /// Provenance-preserving form of [`Self::dispatch_next`]. The `Dequeued` / `ContinuedCurrent`
@@ -671,25 +849,25 @@ impl PriorityScheduler {
             None => None,
         };
         let mut examined = 0usize;
-        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            let qi = Self::priority_index(priority);
-            // Snapshot the entries in FIFO order first: `accept` may take another lock, so it must
-            // not be called while indexing a queue this loop is about to mutate.
-            let mut candidates = [ThreadId(0); MAX_QUEUED_PER_PRIORITY];
-            let len = self.queues[qi].len;
-            for (i, slot) in candidates.iter_mut().enumerate().take(len) {
-                *slot = self.queues[qi].tids[RingQueue::index(self.queues[qi].head + i)];
-            }
-            for &tid in candidates.iter().take(len) {
+        // RT-SCHED1A: every non-empty level, highest priority first, FIFO within each. `accept`
+        // cannot reach this scheduler (it is borrowed mutably here), so the walk reads the list in
+        // place: the only mutation is the one accepted entry's unlink, after which it returns.
+        for level in self.queues.levels() {
+            let Some(priority) = TaskPriority::from_level(level) else {
+                continue;
+            };
+            let mut prev = NIL;
+            let mut at = self.queues.head[level];
+            while at != NIL {
+                let tid = self.queues.tids[at as usize];
+                let after = self.queues.next[at as usize];
                 examined += 1;
                 if !accept(tid) {
+                    prev = at;
+                    at = after;
                     continue;
                 }
-                if !self.queues[qi].remove_tid(tid) {
-                    // The entry vanished between the snapshot and the removal. Nothing was
-                    // mutated for it; keep scanning rather than claiming a dequeue.
-                    continue;
-                }
+                self.queues.unlink(level, prev, at);
                 // U9-DISPATCH-CPU1 D1 — the selected task's membership is RETAINED, exactly as
                 // `dispatch_next_selection` retains it.
                 //
@@ -777,6 +955,28 @@ impl PriorityScheduler {
         Some(running.tid)
     }
 
+    /// RT-SCHED1A — [`Self::preempt_reenqueue_only`] for a task PREEMPTED by a strictly higher
+    /// priority: the outgoing current returns to the HEAD of its own level (SC-PRI-12 (a)), so it
+    /// is the next of its level to run once the higher-priority work leaves the CPU. Same
+    /// contract otherwise: `Some(tid)` with `current` cleared, or `None` with `current` restored.
+    pub fn preempt_reenqueue_head_only(&mut self) -> Option<ThreadId> {
+        let running = self.current.take()?;
+        if !self.membership_tracking_exhausted {
+            self.membership_remove(running.tid);
+        }
+        if self
+            .requeue_current_at_head(running.tid, running.priority)
+            .is_err()
+        {
+            if !self.membership_tracking_exhausted {
+                let _ = self.membership_insert(running.tid);
+            }
+            self.current = Some(running);
+            return None;
+        }
+        Some(running.tid)
+    }
+
     /// Like `on_preempt`, but prefers dispatching `preferred` as the next task.
     ///
     /// Re-enqueues the current task at the tail of its priority queue, then:
@@ -814,16 +1014,18 @@ impl PriorityScheduler {
         }
         // Scan queues in priority order for the preferred TID. KTHREAD1: a kernel thread is never
         // a preferred handoff target (it is dispatched only by the filtered selection).
-        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            if crate::kernel::kthread::is_kthread_tid(preferred.0) {
-                break;
-            }
-            if self.queues[Self::priority_index(priority)].remove_tid(preferred) {
-                self.current = Some(ScheduledTask {
-                    tid: preferred,
-                    priority,
-                });
-                return DispatchSelection::Dequeued { tid: preferred };
+        if !crate::kernel::kthread::is_kthread_tid(preferred.0) {
+            for level in self.queues.levels() {
+                if self.queues.remove_tid(level, preferred) {
+                    let Some(priority) = TaskPriority::from_level(level) else {
+                        break;
+                    };
+                    self.current = Some(ScheduledTask {
+                        tid: preferred,
+                        priority,
+                    });
+                    return DispatchSelection::Dequeued { tid: preferred };
+                }
             }
         }
         // Preferred not in any queue; fall back to normal FIFO dispatch.
@@ -837,7 +1039,7 @@ impl PriorityScheduler {
     /// membership table that mirrors them.
     ///
     /// The membership update is load-bearing and is why this cannot simply call
-    /// `RingQueue::remove_tid`: the one existing caller (`on_preempt_prefer`) moves the task from
+    /// `RunQueues::remove_tid`: the one existing caller (`on_preempt_prefer`) moves the task from
     /// a queue to `current`, so the task stays present in this scheduler and membership must NOT
     /// change. Withdrawal removes it from the scheduler entirely, so membership must be cleared
     /// or a later `enqueue_with_priority` would refuse the TID as already queued.
@@ -850,16 +1052,16 @@ impl PriorityScheduler {
         // (5) exact-one rule: count first across every priority queue, mutate only if the count
         // is exactly 1. A duplicate fails closed with zero mutation.
         let mut total = 0usize;
-        for queue in self.queues.iter() {
-            total += queue.count_tid(tid);
+        for level in self.queues.levels() {
+            total += self.queues.count_tid(level, tid);
         }
         match total {
             0 => return WithdrawOutcome::NotQueued,
             1 => {}
             _ => return WithdrawOutcome::RefusedDuplicate,
         }
-        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            if self.queues[Self::priority_index(priority)].remove_tid(tid) {
+        for level in self.queues.levels() {
+            if self.queues.remove_tid(level, tid) {
                 // The TID has left this scheduler entirely; keep the membership mirror honest.
                 if !self.membership_tracking_exhausted {
                     self.membership_remove(tid);
@@ -923,7 +1125,20 @@ impl PriorityScheduler {
     }
 
     pub fn runnable_count(&self) -> usize {
-        self.queues.iter().map(|queue| queue.len).sum()
+        self.queues.total()
+    }
+
+    /// RT-SCHED1A — every queued entry in dispatch order: highest priority first, FIFO within a
+    /// level. Read-only.
+    fn for_each_queued(&self, f: &mut impl FnMut(TaskPriority, ThreadId)) {
+        for level in self.queues.levels() {
+            let Some(priority) = TaskPriority::from_level(level) else {
+                continue;
+            };
+            for tid in self.queues.iter(level) {
+                f(priority, tid);
+            }
+        }
     }
 
     /// KTHREAD1 — user tasks queued or current here: balanced placement's load measure. A kernel
@@ -931,7 +1146,7 @@ impl PriorityScheduler {
     /// does not steer the permanent home balanced placement chooses for a user task. With no
     /// kernel thread present this equals queued + current.
     fn user_load(&self) -> usize {
-        let queued: usize = self.queues.iter().map(RingQueue::user_len).sum();
+        let queued = self.queues.user as usize;
         let current = self
             .current
             .is_some_and(|t| !crate::kernel::kthread::is_kthread_tid(t.tid.0));
@@ -1040,12 +1255,7 @@ impl CpuSched {
     /// SCHED-LOCK1 witness only: every queued entry, read-only, in dispatch order.
     #[cfg(feature = "sched-lock1-witness")]
     pub(crate) fn witness_for_each_queued(&self, mut f: impl FnMut(TaskPriority, ThreadId)) {
-        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            let q = &self.rq.queues[PriorityScheduler::priority_index(priority)];
-            for offset in 0..q.len {
-                f(priority, q.tids[RingQueue::index(q.head + offset)]);
-            }
-        }
+        self.rq.for_each_queued(&mut f);
     }
 
     /// Where `tid` is on THIS CPU: (current here, queued here). `current` is checked separately
@@ -1053,7 +1263,10 @@ impl CpuSched {
     fn placement_here(&self, tid: ThreadId) -> (bool, bool) {
         (
             self.rq.current.is_some_and(|task| task.tid == tid),
-            self.rq.queues.iter().any(|q| q.count_tid(tid) > 0),
+            self.rq
+                .queues
+                .levels()
+                .any(|level| self.rq.queues.count_tid(level, tid) > 0),
         )
     }
 }
@@ -1098,6 +1311,47 @@ fn publish(mirror: &CpuMirror, sched: &CpuSched) {
     mirror.load.store(sched.load() as u64, Ordering::SeqCst);
 }
 
+/// RT-SCHED1A — the scheduling profile of the ONE active scheduling domain
+/// (`doc/SCHEDULING_CONTRACT.md` §23). Both profiles select through the same owners — the one
+/// selection owner, the one enqueue planner, the one transition owner and the one mark token
+/// (SC-GP-2) — over the same 32-level queues; the profile changes only the three points where
+/// RT-P1 differs from GP:
+///
+/// * a quantum tick does not rotate: it preempts only for a strictly higher-priority entry
+///   (SC-PRI-11, no time-slicing among equals);
+/// * a task preempted by a strictly higher priority returns to the HEAD of its level
+///   (SC-PRI-12 (a)); GP returns it to the tail;
+/// * a wake is a scheduling point: the woken CPU is told, and the arrival on a running CPU
+///   re-checks priority and switches when it must (SC-PRI-13); GP returns to the interrupted task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SchedProfile {
+    /// The default: three levels by class, quantum round-robin within a level.
+    GeneralPurpose = 0,
+    /// RT-P1 fixed-priority preemptive selection (no budgets, windows or kernel preemption yet).
+    RealTime = 1,
+}
+
+impl SchedProfile {
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::GeneralPurpose => "gp",
+            Self::RealTime => "rt",
+        }
+    }
+}
+
+/// RT-SCHED1A — the ONE active scheduling domain's profile, mirrored for the notification owner
+/// (`hal::notify_enqueued`), which runs after every 1L is released and holds no domain reference.
+/// Written only by [`SchedDomain::set_profile`].
+static RT_PROFILE_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// RT-SCHED1A — is the active domain's profile RT-P1? (See [`RT_PROFILE_ACTIVE`].)
+pub(crate) fn rt_profile_active() -> bool {
+    RT_PROFILE_ACTIVE.load(Ordering::Acquire)
+}
+
 /// SCHED-LOCK1 — the published admission bitmaps. Written only under 1G **and** the affected
 /// CPU's 1L (so a holder of 1L[c] sees `c`'s bits stable); read lock-free with Acquire.
 #[derive(Debug, Default)]
@@ -1106,9 +1360,16 @@ pub(crate) struct SchedTopo {
     online: AtomicU64,
     wake_only: AtomicU64,
     balance_excluded: AtomicU64,
+    /// RT-SCHED1A — the domain's scheduling profile ([`SchedProfile`]), set once by the boot
+    /// configuration before any CPU dispatches. `0` (the default) is general-purpose.
+    profile: AtomicU8,
 }
 
 impl SchedTopo {
+    /// RT-SCHED1A — is this domain configured with the RT-P1 profile?
+    pub(crate) fn rt(&self) -> bool {
+        self.profile.load(Ordering::Acquire) == SchedProfile::RealTime as u8
+    }
     pub(crate) fn present(&self) -> u64 {
         self.present.load(Ordering::Acquire)
     }
@@ -1202,6 +1463,25 @@ type SchedCells = [CpuCell; MAX_CPUS];
 impl SchedDomain {
     /// A domain with `present` CPUs present, only the boot CPU online, every quantum
     /// `quantum_ticks`, and the clock at 0.
+    /// RT-SCHED1A — configure this domain's scheduling profile. A boot/deployment decision,
+    /// made before any CPU dispatches: it is read by every CPU's tick, preemption and wake
+    /// decisions from then on.
+    pub fn set_profile(&self, profile: SchedProfile) {
+        self.topo.profile.store(profile as u8, Ordering::Release);
+        RT_PROFILE_ACTIVE.store(profile == SchedProfile::RealTime, Ordering::Release);
+        #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+        crate::arch::x86_64::smp::set_rt_user_resched_handoff(profile == SchedProfile::RealTime);
+    }
+
+    /// RT-SCHED1A — this domain's scheduling profile.
+    pub fn profile(&self) -> SchedProfile {
+        if self.topo.rt() {
+            SchedProfile::RealTime
+        } else {
+            SchedProfile::GeneralPurpose
+        }
+    }
+
     pub fn new(present: u64, quantum_ticks: u64) -> Self {
         let cells: [CpuCell; MAX_CPUS] =
             core::array::from_fn(|idx| CpuCell::new(quantum_ticks, idx));
@@ -1685,6 +1965,15 @@ impl CpuView<'_> {
         self.sched.rq.preempt_reenqueue_only()
     }
 
+    /// RT-SCHED1A — [`Self::preempt_reenqueue_only`] for a task PREEMPTED by a strictly higher
+    /// priority: it returns to the HEAD of its own level (SC-PRI-12 (a)).
+    pub fn preempt_reenqueue_head_only(&mut self) -> Option<ThreadId> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.preempt_reenqueue_head_only()
+    }
+
     pub fn on_preempt_prefer(&mut self, preferred: ThreadId) -> Option<ThreadId> {
         if !self.online() {
             return None;
@@ -1789,16 +2078,16 @@ impl CpuView<'_> {
         if !self.online() {
             return;
         }
-        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            let q = &self.sched.rq.queues[PriorityScheduler::priority_index(priority)];
-            for offset in 0..q.len {
-                f(priority, q.tids[RingQueue::index(q.head + offset)]);
-            }
-        }
+        self.sched.rq.for_each_queued(&mut f);
     }
 
     /// One timer interrupt on this CPU: the clock owner advances the scheduler tick; every CPU
-    /// consumes only its own quantum. Returns `(scheduler tick, this CPU's quantum expired)`.
+    /// consumes only its own quantum. Returns `(scheduler tick, this tick preempts)`.
+    ///
+    /// GP: the tick preempts when this CPU's quantum expired. RT-SCHED1A, RT profile: the quantum
+    /// still counts, but a tick preempts only when a strictly higher-priority entry is queued
+    /// ([`Self::rt_preempt_wanted`]): an ordinary quantum expiry never rotates an RT task
+    /// (SC-PRI-11). The tick is then a scheduling point for a wake it did not itself announce.
     pub fn tick(&mut self) -> (Tick, bool) {
         let (_, expired) = self.sched.quantum.tick_and_check();
         let now = if self.idx == CLOCK_OWNER_CPU.0 as usize {
@@ -1806,12 +2095,43 @@ impl CpuView<'_> {
         } else {
             self.clock.load(Ordering::Acquire)
         };
-        (TickInstant(now), expired)
+        let preempt = if self.topo.rt() {
+            self.sched.rq.rt_preempt_wanted()
+        } else {
+            expired
+        };
+        (TickInstant(now), preempt)
     }
 
-    /// Would this CPU's NEXT timer interrupt expire its quantum?
+    /// Would this CPU's NEXT timer interrupt preempt? GP: its quantum would expire. RT profile:
+    /// a strictly higher-priority entry is queued now.
     pub fn would_preempt_next(&self) -> bool {
-        self.sched.quantum.would_preempt_next()
+        if self.topo.rt() {
+            self.sched.rq.rt_preempt_wanted()
+        } else {
+            self.sched.quantum.would_preempt_next()
+        }
+    }
+
+    /// RT-SCHED1A — this CPU's domain runs the RT-P1 profile.
+    pub fn rt_profile(&self) -> bool {
+        self.topo.rt()
+    }
+
+    /// RT-SCHED1A — SC-PRI-13: in the RT profile, does a queued entry of STRICTLY higher priority
+    /// than this CPU's current task (a user task or a kernel thread) require a switch at this
+    /// CPU's next legal scheduling point? Always `false` under GP, for an empty slot, and for the
+    /// tid-0 idle placeholder. Read-only, O(1).
+    pub fn rt_preempt_wanted(&self) -> bool {
+        self.online() && self.topo.rt() && self.sched.rq.rt_preempt_wanted()
+    }
+
+    /// RT-SCHED1A — the highest priority queued on this CPU (kernel threads included).
+    pub fn best_queued_priority(&self) -> Option<TaskPriority> {
+        if !self.online() {
+            return None;
+        }
+        self.sched.rq.best_queued_priority()
     }
 
     /// A voluntary switch: the next task here starts with a full quantum.
@@ -2057,12 +2377,7 @@ impl SchedAll<'_> {
         let Some((_, sched)) = self.cpu_ref(cpu) else {
             return;
         };
-        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
-            let q = &sched.rq.queues[PriorityScheduler::priority_index(priority)];
-            for offset in 0..q.len {
-                f(priority, q.tids[RingQueue::index(q.head + offset)]);
-            }
-        }
+        sched.rq.for_each_queued(&mut f);
     }
 
     pub fn cpu_is_online(&self, cpu: CpuId) -> bool {
@@ -2370,43 +2685,42 @@ mod tests {
     }
 
     #[test]
-    fn withdraw_compacts_a_wrapped_ring_queue() {
-        let mut q = RingQueue::new();
-        // Advance the head so the layout below wraps the physical ring exactly as it wrapped the
-        // 64-slot ring this test was written against (KTHREAD1-ACCEPTANCE §1 grew the ring).
-        for tid in 0..(RING_SLOTS - MAX_RUN_QUEUE) as u64 {
-            q.push(ThreadId(10_000 + tid)).expect("push");
-            q.pop().expect("pop");
+    fn withdraw_preserves_order_in_a_level_whose_entries_are_scattered_through_the_pool() {
+        // RT-SCHED1A replaced the ring: a level's entries are linked through a shared pool, so
+        // churn on another level leaves this level's entries in non-adjacent, non-ascending pool
+        // slots. Removal must still keep the level's FIFO order exactly.
+        let mut q = RunQueues::new();
+        let other = 7;
+        let level = 3;
+        for round in 0..40u64 {
+            for k in 0..5u64 {
+                q.push_back(
+                    other,
+                    ThreadId(50_000 + round * 5 + k),
+                    MAX_QUEUED_PER_PRIORITY,
+                )
+                .expect("other level");
+            }
+            q.push_back(level, ThreadId(round + 1), MAX_QUEUED_PER_PRIORITY)
+                .expect("level");
+            for _ in 0..5 {
+                q.pop_front(other).expect("drain other");
+            }
         }
-        // Wrap the ring: fill most of it, drain most of that, then refill past the end.
-        for tid in 1..=60u64 {
-            q.push(ThreadId(tid)).expect("push");
-        }
-        for _ in 0..56 {
-            q.pop().expect("pop");
-        }
-        for tid in 61..=66u64 {
-            q.push(ThreadId(tid)).expect("push past the wrap");
-        }
-        assert!(
-            q.head + q.len > RING_SLOTS,
-            "the ring must be wrapped (head={}, len={})",
-            q.head,
-            q.len
-        );
-        let before = q.len;
-        // TID 61 sits at the last physical slot; its successors live past the wrap.
-        assert!(q.remove_tid(ThreadId(61)));
-        assert_eq!(q.len, before - 1);
-        let mut order = alloc::vec::Vec::new();
-        while let Some(tid) = q.pop() {
-            order.push(tid.0);
-        }
-        assert_eq!(
-            order,
-            alloc::vec![57, 58, 59, 60, 62, 63, 64, 65, 66],
-            "wrapped compaction preserves order"
-        );
+        assert_eq!(q.len(level), 40);
+        assert_eq!(q.len(other), 0);
+        assert!(q.remove_tid(level, ThreadId(1)), "head");
+        assert!(q.remove_tid(level, ThreadId(21)), "middle");
+        assert!(q.remove_tid(level, ThreadId(40)), "tail");
+        assert!(!q.remove_tid(level, ThreadId(40)), "gone");
+        let order: alloc::vec::Vec<u64> = q.iter(level).map(|t| t.0).collect();
+        let want: alloc::vec::Vec<u64> = (2..40).filter(|&t| t != 21).collect();
+        assert_eq!(order, want, "scattered removal preserves FIFO order");
+        // The tail was removed: a push must land after 39.
+        q.push_back(level, ThreadId(99), MAX_QUEUED_PER_PRIORITY)
+            .expect("push");
+        assert_eq!(q.iter(level).last(), Some(ThreadId(99)));
+        assert_eq!(q.total(), 38);
     }
 
     #[test]
@@ -2495,14 +2809,13 @@ mod tests {
         let mut sched = sched_dom.exclusive();
         // The public enqueue refuses duplicates, so force the pathological state directly to
         // prove the seam fails closed if it ever arose.
-        sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::High)]
-            .push(ThreadId(3))
+        let high = PriorityScheduler::priority_index(TaskPriority::High);
+        let normal = PriorityScheduler::priority_index(TaskPriority::Normal);
+        let q = &mut sched.cpus[0].rq.queues;
+        q.push_back(high, ThreadId(3), MAX_RUN_QUEUE).expect("push");
+        q.push_back(normal, ThreadId(3), MAX_RUN_QUEUE)
             .expect("push");
-        sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
-            .push(ThreadId(3))
-            .expect("push");
-        sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
-            .push(ThreadId(8))
+        q.push_back(normal, ThreadId(8), MAX_RUN_QUEUE)
             .expect("push");
         let before = sched.runnable_count_on(CpuId(0));
         assert_eq!(
@@ -2510,14 +2823,8 @@ mod tests {
             WithdrawOutcome::RefusedDuplicate
         );
         assert_eq!(sched.runnable_count_on(CpuId(0)), before, "zero mutation");
-        assert!(
-            sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::High)]
-                .contains(ThreadId(3))
-        );
-        assert!(
-            sched.cpus[0].rq.queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
-                .contains(ThreadId(3))
-        );
+        assert!(sched.cpus[0].rq.queues.contains(high, ThreadId(3)));
+        assert!(sched.cpus[0].rq.queues.contains(normal, ThreadId(3)));
     }
 
     #[test]
@@ -3062,26 +3369,56 @@ mod tests {
     }
 
     #[test]
-    fn ring_queue_remove_tid_compacts_correctly() {
-        let mut q = RingQueue::new();
-        q.push(ThreadId(10)).expect("10");
-        q.push(ThreadId(20)).expect("20");
-        q.push(ThreadId(30)).expect("30");
-
+    fn run_queue_level_remove_tid_compacts_correctly() {
+        let mut q = RunQueues::new();
+        for t in [10, 20, 30] {
+            q.push_back(0, ThreadId(t), MAX_RUN_QUEUE).expect("push");
+        }
         // Remove the middle element.
-        assert!(q.remove_tid(ThreadId(20)));
-        assert_eq!(q.len, 2);
-        assert_eq!(q.pop(), Some(ThreadId(10)));
-        assert_eq!(q.pop(), Some(ThreadId(30)));
-        assert_eq!(q.pop(), None);
+        assert!(q.remove_tid(0, ThreadId(20)));
+        assert_eq!(q.len(0), 2);
+        assert_eq!(q.pop_front(0), Some(ThreadId(10)));
+        assert_eq!(q.pop_front(0), Some(ThreadId(30)));
+        assert_eq!(q.pop_front(0), None);
+        assert_eq!(q.nonempty, 0, "an emptied level leaves the bitmap");
     }
 
     #[test]
-    fn ring_queue_remove_tid_returns_false_when_absent() {
-        let mut q = RingQueue::new();
-        q.push(ThreadId(5)).expect("5");
-        assert!(!q.remove_tid(ThreadId(99)));
-        assert_eq!(q.len, 1);
+    fn run_queue_level_remove_tid_returns_false_when_absent() {
+        let mut q = RunQueues::new();
+        q.push_back(0, ThreadId(5), MAX_RUN_QUEUE).expect("5");
+        assert!(!q.remove_tid(0, ThreadId(99)));
+        assert!(!q.remove_tid(1, ThreadId(5)), "another level holds nothing");
+        assert_eq!(q.len(0), 1);
+    }
+
+    #[test]
+    fn run_queue_head_insert_and_the_level_bitmap() {
+        let mut q = RunQueues::new();
+        q.push_back(31, ThreadId(1), MAX_RUN_QUEUE).expect("31");
+        q.push_back(4, ThreadId(2), MAX_RUN_QUEUE).expect("4");
+        q.push_front(4, ThreadId(3), MAX_RUN_QUEUE).expect("4 head");
+        assert_eq!(q.best_level(), Some(4));
+        assert_eq!(q.levels().collect::<alloc::vec::Vec<_>>(), [4, 31]);
+        assert_eq!(
+            q.iter(4).collect::<alloc::vec::Vec<_>>(),
+            [ThreadId(3), ThreadId(2)]
+        );
+        assert_eq!(q.pop_front(4), Some(ThreadId(3)));
+        assert_eq!(q.pop_front(4), Some(ThreadId(2)));
+        assert_eq!(q.best_level(), Some(31));
+        // The pool is the bound, not any level: it holds exactly POOL_SLOTS entries.
+        let mut q = RunQueues::new();
+        for i in 0..POOL_SLOTS {
+            let level = i % PRIORITY_LEVELS;
+            q.push_back(level, ThreadId(1000 + i as u64), MAX_QUEUED_PER_PRIORITY)
+                .expect("within the pool");
+        }
+        assert_eq!(
+            q.push_back(0, ThreadId(1), MAX_QUEUED_PER_PRIORITY),
+            Err(SchedulerError::QueueFull)
+        );
+        assert_eq!(q.total(), POOL_SLOTS);
     }
 
     #[test]
@@ -3193,8 +3530,8 @@ mod tests {
             mem::size_of::<yarm_kernel::scheduler::CpuId>()
         );
         assert_eq!(
-            TaskPriority::High as u8,
-            yarm_kernel::scheduler::TaskPriority::High as u8
+            TaskPriority::High.level(),
+            yarm_kernel::scheduler::TaskPriority::High.level()
         );
         let _err: yarm_kernel::scheduler::SchedulerError = SchedulerError::QueueFull;
     }

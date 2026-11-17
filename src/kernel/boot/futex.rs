@@ -1440,20 +1440,18 @@ pub fn next_requeue_op() -> u64 {
     NEXT_REQUEUE_OP.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
-const PRIORITIES: usize = 3;
+/// RT-SCHED1A: every run-queue level (`TaskPriority::LEVELS`).
+const PRIORITIES: usize = TaskPriority::LEVELS;
 
 fn priority_from_index(i: usize) -> TaskPriority {
-    match i {
-        0 => TaskPriority::High,
-        1 => TaskPriority::Normal,
-        _ => TaskPriority::Low,
-    }
+    TaskPriority::from_level(i).unwrap_or(TaskPriority::LOWEST)
 }
 
 /// FUTEX-REQUEUE-ATOMIC1 — run-queue slots counted by `(CPU, priority)`: the slots a preflight
-/// RESERVED, or those a commit ASSIGNED to its wake portion. Fixed size (`MAX_CPUS × 3 × u16`,
-/// 384 bytes with 64 CPUs); a run-queue reservation is a count per CPU and priority, so this is
-/// all an operation needs to remember about the slots it holds.
+/// RESERVED, or those a commit ASSIGNED to its wake portion. Fixed size (`MAX_CPUS ×
+/// TaskPriority::LEVELS × u16`: 4 KiB with 64 CPUs and RT-SCHED1A's 32 levels, 384 bytes before);
+/// a run-queue reservation is a count per CPU and priority, so this is all an operation needs to
+/// remember about the slots it holds. It lives only on the stack of the operation that holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FutexPlacementCounts {
     n: [[u16; PRIORITIES]; MAX_CPUS],
@@ -1473,14 +1471,14 @@ impl FutexPlacementCounts {
     }
     pub fn add(&mut self, cpu: CpuId, priority: TaskPriority) {
         if let Some(c) = self.n.get_mut(usize::from(cpu.0)) {
-            c[priority as usize] = c[priority as usize].saturating_add(1);
+            c[priority.level()] = c[priority.level()].saturating_add(1);
         }
     }
     /// Take one slot of `(cpu, priority)`; `false` if none is left.
     pub fn take(&mut self, cpu: CpuId, priority: TaskPriority) -> bool {
         match self.n.get_mut(usize::from(cpu.0)) {
-            Some(c) if c[priority as usize] > 0 => {
-                c[priority as usize] -= 1;
+            Some(c) if c[priority.level()] > 0 => {
+                c[priority.level()] -= 1;
                 true
             }
             _ => false,
@@ -1753,7 +1751,7 @@ pub fn compare_and_requeue_locked(
             let pending = FutexKey::Pending {
                 op,
                 cpu: cpu.0,
-                priority: priority as u8,
+                priority: priority.level() as u8,
             };
             rekey(table, slot, prev, pending, None);
             assigned.add(cpu, priority);

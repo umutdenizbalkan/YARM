@@ -55220,8 +55220,9 @@ mod stage168b_d2_recv_genuine_completion {
             .find("pub(crate) fn queue_advance_select_step_split(")
             .expect("the one selection owner");
         // U9-RECV-BLOCK2b §3 widened: the owner grew the resume-convention predicate and the
-        // derivation that explains why it is there.
-        let owner_body = &RUNTIME_SRC[owner..owner + 5200];
+        // derivation that explains why it is there. RT-SCHED1A widened it again for the
+        // default-off RT witness's start hook beside the kernel-thread witness's.
+        let owner_body = &RUNTIME_SRC[owner..owner + 5600];
         assert!(
             owner_body.contains("c.dispatch_next_accepted_selection(|tid| {"),
             "the owner must call the authoritative queue-advancing scheduler primitive"
@@ -55626,8 +55627,9 @@ mod stage169_d2_send_genuine {
             .find("pub(crate) fn queue_advance_select_step_split(")
             .expect("the one selection owner");
         // U9-RECV-BLOCK2b §3 widened: the owner grew the resume-convention predicate and the
-        // derivation that explains why it is there.
-        let owner_body = &RUNTIME_SRC[owner..owner + 5200];
+        // derivation that explains why it is there. RT-SCHED1A widened it again for the
+        // default-off RT witness's start hook beside the kernel-thread witness's.
+        let owner_body = &RUNTIME_SRC[owner..owner + 5600];
         assert!(
             owner_body.contains("c.dispatch_next_accepted_selection(|tid| {"),
             "the owner must call the authoritative queue-advancing scheduler primitive"
@@ -120309,8 +120311,9 @@ mod stage199d_runqueue_withdrawal_foundation {
         }
     }
 
-    /// No duplicated queue algorithm: removal goes through the existing `RingQueue::remove_tid`
-    /// compaction, and the exact-one count shares `RingQueue::index` with the rest of the ring.
+    /// No duplicated queue algorithm: removal goes through the run queues' own `remove_tid`
+    /// (RT-SCHED1A: the per-level list unlink that replaced the ring's compaction), and the
+    /// exact-one count walks a level through the same `iter` every other reader uses.
     #[test]
     fn the_seam_reuses_the_existing_compaction_mechanism() {
         let per_cpu = method_body(
@@ -120318,17 +120321,20 @@ mod stage199d_runqueue_withdrawal_foundation {
             "pub(crate) fn withdraw_queued_tid(&mut self, tid: ThreadId)",
         );
         assert!(
-            per_cpu.contains(".remove_tid(tid)"),
-            "removal must delegate to RingQueue::remove_tid"
+            per_cpu.contains(".remove_tid(level, tid)"),
+            "removal must delegate to RunQueues::remove_tid"
         );
         assert!(
-            per_cpu.contains(".count_tid(tid)"),
-            "the exact-one rule must count through the ring's own scan"
+            per_cpu.contains(".count_tid(level, tid)"),
+            "the exact-one rule must count through the queues' own scan"
         );
-        let count = method_body(SCHED, "fn count_tid(&self, tid: ThreadId) -> usize");
+        let count = method_body(
+            SCHED,
+            "fn count_tid(&self, level: usize, tid: ThreadId) -> usize",
+        );
         assert!(
-            count.contains("Self::index(self.head + offset)"),
-            "count_tid must reuse the ring's index mapping, not re-derive it"
+            count.contains("self.iter(level)"),
+            "count_tid must reuse the level's own walk, not re-derive it"
         );
         for mutation in ["self.len", "self.head =", "self.tids["] {
             assert!(
@@ -150075,13 +150081,18 @@ mod u9qa_split_dispatch_disposition {
         // post-lock drain owes) and its `Complete` (a carried settlement, including the fatal for
         // an unnameable victim). Both are explicit disposition arms of a route that settles the
         // trap, and neither infers anything from a stash.
+        // RT-SCHED1A re-derivation: NINE. The RT reschedule arrival on a running task
+        // (`settle_rt_reschedule` committed, SC-PRI-13) is the ninth, for exactly the preempting
+        // timer's reason: it ran the SAME yield transaction and published a queue-advance
+        // deferral, so the caller is no longer current and the post-lock drain owes the switch.
+        // It sits in the reschedule-interrupt disposition arm and infers nothing from a stash.
         assert_eq!(
             code.matches("queue_advance_committed = true;").count(),
-            8,
-            "exactly eight disposition arms may declare the broad dispatcher skipped: \
+            9,
+            "exactly nine disposition arms may declare the broad dispatcher skipped: \
              FutexWait publication, terminal-fault commit, terminal-fault fail-closed, the \
-             preempting-timer commit, the unsettled block, the idle-boundary advance, and the \
-             user instruction-fault commit and settlement"
+             preempting-timer commit, the unsettled block, the idle-boundary advance, the \
+             user instruction-fault commit and settlement, and the RT reschedule commit"
         );
         // And the fourth is reached from the TIMER route's own arm, not smuggled into another
         // one: the setter and its distinct skip reason both sit between that arm's head and the
@@ -150106,9 +150117,12 @@ mod u9qa_split_dispatch_disposition {
         );
         for (i, _) in code.match_indices("queue_advance_committed = true;") {
             let before = &code[..i];
+            // RT-SCHED1A: the reschedule arrival's commit is the typed `RtReschedSettlement`
+            // arm of the SGI / 0xF1 branch, which is the same kind of explicit settlement.
             let arm = before
                 .rfind("SplitDispatchDisposition::")
                 .or_else(|| before.rfind("D::"))
+                .or_else(|| before.rfind("RtReschedSettlement::Committed"))
                 .expect("every setter must sit inside a typed disposition arm");
             let between = &before[arm..];
             assert!(

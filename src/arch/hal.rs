@@ -219,11 +219,22 @@ pub(crate) fn notify_enqueued(target: CpuId) {
         )
     ))]
     crate::kernel::schedlock1_witness::notify(target);
+    // RT-SCHED1A (SC-PRI-13): under the RT profile a LOCAL enqueue is announced too, by raising
+    // this CPU's own reschedule interrupt. Interrupts are masked here (every caller is a trap, a
+    // kernel thread's masked section or the dispatcher), so it stays pending until this CPU next
+    // leaves masked kernel code — returning to its task, or reaching a kernel thread's unmasked
+    // body — which is exactly its next legal scheduling point; the arrival re-checks priority
+    // there (`syscall_split::settle_rt_reschedule`, `KThreadCtx::sched_point`). Several pending
+    // raises coalesce into one arrival. GP raises nothing locally, exactly as before.
+    let rt_local = crate::kernel::scheduler::rt_profile_active();
+    let _ = rt_local;
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     {
         let me = crate::arch::riscv64::boot::riscv_executing_cpu();
         if me != target {
             let _ = crate::arch::riscv64::ipi::send_reschedule(me, target);
+        } else if rt_local {
+            crate::arch::riscv64::ipi::raise_local_reschedule(me);
         }
     }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -231,6 +242,8 @@ pub(crate) fn notify_enqueued(target: CpuId) {
         let me = CpuId(crate::arch::aarch64::this_cpu_index() as u8);
         if me != target {
             let _ = crate::arch::aarch64::smp::send_reschedule_sgi(me, target);
+        } else if rt_local {
+            let _ = crate::arch::aarch64::smp::raise_local_reschedule_sgi(me);
         }
     }
     // AP-SCHED4 §B: x86_64 — the executing CPU is its own APIC ID through the map, and the
@@ -241,6 +254,8 @@ pub(crate) fn notify_enqueued(target: CpuId) {
         let me = crate::arch::x86_64::descriptor_tables::current_cpu_id();
         if me != target {
             let _ = crate::arch::x86_64::smp::send_reschedule_ipi(me, target);
+        } else if rt_local {
+            crate::arch::x86_64::smp::raise_local_reschedule_ipi(me);
         }
     }
     #[cfg(feature = "hosted-dev")]

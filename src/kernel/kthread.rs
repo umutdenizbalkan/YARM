@@ -331,7 +331,7 @@ impl KSlot {
             state: AtomicU8::new(FREE),
             generation: AtomicU32::new(0),
             home: AtomicU8::new(0),
-            priority: AtomicU8::new(TaskPriority::Normal as u8),
+            priority: AtomicU8::new(TaskPriority::Normal.level() as u8),
             wake_pending: AtomicBool::new(false),
             reason: AtomicU8::new(KSwitchReason::None as u8),
             entry: AtomicUsize::new(0),
@@ -343,11 +343,9 @@ impl KSlot {
     }
 
     fn priority(&self) -> TaskPriority {
-        match self.priority.load(Ordering::Acquire) {
-            0 => TaskPriority::High,
-            2 => TaskPriority::Low,
-            _ => TaskPriority::Normal,
-        }
+        // RT-SCHED1A: any of the 32 levels the creator bound.
+        TaskPriority::from_level(self.priority.load(Ordering::Acquire) as usize)
+            .unwrap_or(TaskPriority::Normal)
     }
 }
 
@@ -786,7 +784,7 @@ impl KThreadPool {
         // this incarnation's id (which exists only after `create` returns) always reads the home
         // that belongs to it.
         s.home.store(cpu.0, Ordering::Release);
-        s.priority.store(priority as u8, Ordering::Release);
+        s.priority.store(priority.level() as u8, Ordering::Release);
         s.entry
             .store(entry as *const () as usize, Ordering::Release);
         s.arg.store(arg, Ordering::Release);
@@ -1115,6 +1113,15 @@ impl KThreadPool {
         if preempting {
             k.need_resched.store(true, Ordering::Release);
         }
+        // RT-SCHED1A witness (default-off): its phase driver, after the tick decision.
+        #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+        crate::kernel::rt_witness::on_timer(
+            shared,
+            cpu,
+            k.running.load(Ordering::Acquire),
+            preempting,
+            true,
+        );
         preempting
     }
 
@@ -1326,10 +1333,13 @@ impl KThreadCtx {
     /// else is ready). Returns when the thread is next dispatched.
     pub fn yield_now(&self) -> Result<(), KSwitchRefusal> {
         self.switch_check("yield")?;
-        self.yield_checked()
+        // An explicit yield goes to the TAIL of the thread's level (SC-PRI-12 (b)).
+        self.yield_checked(false)
     }
 
-    fn yield_checked(&self) -> Result<(), KSwitchRefusal> {
+    /// `head`: RT-SCHED1A — the thread was preempted by a strictly higher priority and returns to
+    /// the HEAD of its level (SC-PRI-12 (a)); otherwise the tail.
+    fn yield_checked(&self, head: bool) -> Result<(), KSwitchRefusal> {
         let s = &self.pool.slots[self.id.slot()];
         let was = arch::irq_disable_save();
         let tid = self.id.tid();
@@ -1339,7 +1349,12 @@ impl KThreadCtx {
                 if c.current_tid() != Some(tid) {
                     return false;
                 }
-                if c.preempt_reenqueue_only() == Some(tid) {
+                let requeued = if head {
+                    c.preempt_reenqueue_head_only()
+                } else {
+                    c.preempt_reenqueue_only()
+                };
+                if requeued == Some(tid) {
                     s.state.store(READY, Ordering::Release);
                     true
                 } else {
@@ -1365,14 +1380,40 @@ impl KThreadCtx {
     /// The explicit scheduling point for long work: yields if an interrupt left a reschedule
     /// pending for this CPU (quantum expiry, or a remote enqueue's reschedule IPI), otherwise
     /// returns at once. Returns whether it yielded.
+    ///
+    /// RT-SCHED1A — under the RT profile a pending reschedule is honoured only when an entry of
+    /// STRICTLY higher priority than this thread is queued on its CPU (SC-PRI-13), re-checked here
+    /// under the CPU's 1L; the thread then returns to the HEAD of its level (SC-PRI-12 (a)). A
+    /// reschedule raised by an equal- or lower-priority wake is consumed and the thread keeps the
+    /// CPU (SC-PRI-11: no rotation among equals). Kernel threads stay cooperative: this is the only
+    /// place a higher-priority wake can take the CPU from one.
     pub fn sched_point(&self) -> Result<bool, KSwitchRefusal> {
         self.switch_check("sched_point")?;
         let k = &self.pool.cpus[self.home.0 as usize];
         if !k.need_resched.swap(false, Ordering::AcqRel) {
             return Ok(false);
         }
-        k.resched_honoured.fetch_add(1, Ordering::AcqRel);
-        self.yield_checked().map(|()| true)
+        let rt = self
+            .shared()
+            .with_cpu_sched_split(self.home, |c| c.rt_profile().then(|| c.rt_preempt_wanted()))
+            .ok()
+            .flatten();
+        #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+        crate::kernel::rt_witness::note_sched_point(self.home, self.id.raw(), rt);
+        match rt {
+            // RT, and nothing strictly higher is queued: keep the CPU.
+            Some(false) => Ok(false),
+            // RT, preempted by a strictly higher priority: head of the level.
+            Some(true) => {
+                k.resched_honoured.fetch_add(1, Ordering::AcqRel);
+                self.yield_checked(true).map(|()| true)
+            }
+            // GP: unchanged — the pending reschedule rotates the thread to its level's tail.
+            None => {
+                k.resched_honoured.fetch_add(1, Ordering::AcqRel);
+                self.yield_checked(false).map(|()| true)
+            }
+        }
     }
 
     /// Park until woken. A wake that arrived since the caller registered (`wake_pending`) makes

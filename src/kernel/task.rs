@@ -383,6 +383,16 @@ pub struct ThreadControlBlock {
     /// placement planned under rank 2 and committed after the lock was dropped is bound to the
     /// incarnation it was planned for.
     pub incarnation: u64,
+    /// RT-SCHED1A — the scheduling priority CONFIGURED for this exact incarnation
+    /// (`task_enqueue::configure_priority_locked`), any of the 32 levels. `None` keeps the
+    /// general-purpose class rule (`task_enqueue::priority_for_class`). Read by every enqueue plan
+    /// through `task_enqueue::priority_of_locked`, so each placement — on the incarnation's home,
+    /// the only CPU that may place it (SCHED-LOCK2A) — carries it.
+    pub sched_priority: Option<crate::kernel::scheduler::TaskPriority>,
+    /// RT-SCHED1A — set at this incarnation's FIRST placement (`task_enqueue::bind_home_locked`
+    /// / `fix_home_locked`). From then on its priority is fixed (SC-PRI-10: a property of the
+    /// context, fixed at configuration, never changed at run time): configuration is refused.
+    pub sched_priority_sealed: bool,
     /// Absolute scheduler tick at which an IPC wait should timeout.
     pub ipc_timeout_deadline: Option<u64>,
     /// Set when a blocked IPC wait is resumed due to timeout expiry.
@@ -1215,6 +1225,8 @@ impl ThreadControlBlock {
     pub fn new(tid: ThreadId, asid: Option<Asid>) -> Self {
         Self {
             incarnation: next_incarnation(),
+            sched_priority: None,
+            sched_priority_sealed: false,
             tid,
             thread_group_id: ThreadGroupId(tid.0),
             status: TaskStatus::Runnable,

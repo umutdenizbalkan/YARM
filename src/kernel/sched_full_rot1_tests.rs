@@ -24,9 +24,9 @@ fn kt(i: u64) -> ThreadId {
 
 /// One CPU's queue contents per priority, FIFO order.
 fn q(s: &PriorityScheduler, p: TaskPriority) -> Vec<u64> {
-    let r = &s.queues[PriorityScheduler::priority_index(p)];
-    (0..r.len)
-        .map(|o| r.tids[RingQueue::index(r.head + o)].0)
+    s.queues
+        .iter(PriorityScheduler::priority_index(p))
+        .map(|t| t.0)
         .collect()
 }
 

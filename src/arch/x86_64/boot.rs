@@ -1236,6 +1236,12 @@ pub fn bootstrap_first_user_task(
             crate::yarm_log!("APSW_PROVISION_FAIL err={:?} result=fail", e);
         }
     }
+    // RT-SCHED1A: the RT selection witness's two user processes (provisioned, not placed). Compile-
+    // time gated and armed only by `yarm.sched_profile=rt`.
+    #[cfg(feature = "x86-rt-sched-witness")]
+    if let Err(e) = crate::kernel::rt_witness::provision(kernel) {
+        crate::yarm_log!("RTW_PROVISION_FAIL err={:?} result=fail", e);
+    }
     // VM-INVALIDATION2: the dispatch-gap TLB witness's two tasks (observer on CPU 1, mutator on
     // CPU 0, one shared address space). Compile-time gated and armed only by its own knob; it
     // reaches the real empty-current/root-loaded window and races a production replace against it.

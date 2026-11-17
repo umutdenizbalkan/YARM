@@ -530,9 +530,17 @@ fn the_mailbox_is_consumed_only_by_the_enumerated_consumer() {
             );
         }
     }
-    // Every PENDING use sits in one of four fns; the only mutations are the publishers' fetch_or
-    // and take_arrival's swap.
-    let allowed = ["pending", "send_reschedule", "kick_self", "take_arrival"];
+    // Every PENDING use sits in one of five fns; the only mutations are the publishers' fetch_or
+    // and take_arrival's swap. RT-SCHED1A: `raise_local_reschedule` is the fifth — the RT
+    // profile's LOCAL wake publishes this CPU's own bit, then raises `sip.SSIP` on its own hart,
+    // and `take_arrival` consumes it exactly like a remote one.
+    let allowed = [
+        "pending",
+        "send_reschedule",
+        "kick_self",
+        "take_arrival",
+        "raise_local_reschedule",
+    ];
     for (i, _) in ipi.match_indices("PENDING") {
         let line_start = ipi[..i].rfind('\n').unwrap_or(0);
         if ipi[line_start..i].contains("static ") {
@@ -544,12 +552,14 @@ fn the_mailbox_is_consumed_only_by_the_enumerated_consumer() {
     let count = |head: &str, m: &str| fn_body(ipi, head).matches(m).count();
     for m in MUTATORS {
         let want = |f: &str| match (f, m) {
-            ("send_reschedule", ".fetch_or(") | ("kick_self", ".fetch_or(") => 1,
+            ("send_reschedule", ".fetch_or(")
+            | ("kick_self", ".fetch_or(")
+            | ("raise_local_reschedule", ".fetch_or(") => 1,
             ("take_arrival", ".swap(") => 1,
             _ => 0,
         };
         assert_eq!(count("pub fn pending(", m), 0, "pending is an observer");
-        for f in ["send_reschedule", "kick_self"] {
+        for f in ["send_reschedule", "kick_self", "raise_local_reschedule"] {
             let body = fn_body(ipi, &format!("pub fn {f}("));
             // SENT counters go through `bump`; only the mailbox slot is mutated in-body.
             assert_eq!(body.matches(m).count(), want(f), "{f}: {m}");

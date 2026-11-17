@@ -3134,6 +3134,39 @@ pub fn set_sched_quantum_ticks_override(ticks: u64) {
     SCHED_QUANTUM_TICKS_OVERRIDE.store(ticks, core::sync::atomic::Ordering::Release);
 }
 
+/// RT-SCHED1A — `yarm.sched_profile=` (0 = unset: the GP default; otherwise the profile's
+/// discriminant + 1).
+static SCHED_PROFILE_OVERRIDE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// RT-SCHED1A — record the boot configuration's scheduling profile.
+pub fn set_sched_profile_override(profile: crate::kernel::scheduler::SchedProfile) {
+    SCHED_PROFILE_OVERRIDE.store(profile as u8 + 1, core::sync::atomic::Ordering::Release);
+}
+
+/// RT-SCHED1A — the profile the scheduler domain is built with: the boot configuration's, or
+/// general-purpose by default. One reader, so construction and the live install cannot disagree.
+pub fn sched_profile() -> crate::kernel::scheduler::SchedProfile {
+    use crate::kernel::scheduler::SchedProfile;
+    match SCHED_PROFILE_OVERRIDE.load(core::sync::atomic::Ordering::Acquire) {
+        v if v == SchedProfile::RealTime as u8 + 1 => SchedProfile::RealTime,
+        _ => SchedProfile::GeneralPurpose,
+    }
+}
+
+/// RT-SCHED1A — install the resolved profile on an ALREADY-CONSTRUCTED scheduler domain, for the
+/// ports that capture their command line after construction (the same two boot orders
+/// [`install_sched_quantum_on_live_timer`] covers). Every port's command line is captured before
+/// its first dispatch, so no scheduling decision is made under the wrong profile.
+pub fn install_sched_profile_on_live_domain() -> bool {
+    match Bootstrap::shared_static_ref() {
+        Some(shared) => {
+            shared.sched_domain().set_profile(sched_profile());
+            true
+        }
+        None => false,
+    }
+}
+
 /// The quantum the scheduler timer should be built with: the override when one was requested,
 /// otherwise the shipped quantum. One reader, so the two cannot disagree.
 ///
