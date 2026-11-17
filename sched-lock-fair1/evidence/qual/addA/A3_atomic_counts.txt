@@ -1,0 +1,2 @@
+B x86_64 lock_xadd=1265 lock_cmpxchg=118 | riscv64 amoadd.w=21 lr.w=7
+C x86_64 lock_xadd=1310 lock_cmpxchg=115 | riscv64 amoadd.w=185 lr.w=7

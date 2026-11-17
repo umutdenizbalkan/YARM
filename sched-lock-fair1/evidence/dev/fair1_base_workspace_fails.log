@@ -1,0 +1,99 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1513:5
+     |
+1513 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1512:5
+     |
+1512 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+
+running 1 test
+tests::runtime_reexports_curated_runtime_surfaces --- FAILED
+
+failures:
+
+---- tests::runtime_reexports_curated_runtime_surfaces stdout ----
+
+thread 'tests::runtime_reexports_curated_runtime_surfaces' (6993) panicked at crates/yarm-server-runtime/src/lib.rs:22:9:
+server runtime must not glob re-export root yarm surfaces
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: yarm_server_runtime::tests::runtime_reexports_curated_runtime_surfaces
+             at ./src/lib.rs:22:9
+   3: yarm_server_runtime::tests::runtime_reexports_curated_runtime_surfaces::{closure#0}
+             at ./src/lib.rs:20:52
+   4: <yarm_server_runtime::tests::runtime_reexports_curated_runtime_surfaces::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   5: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    tests::runtime_reexports_curated_runtime_surfaces
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p yarm-server-runtime --lib`
+rc1=101
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1513:5
+     |
+1513 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1512:5
+     |
+1512 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::vec::Vec`
+ --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:4:5
+  |
+4 | use alloc::vec::Vec;
+  |     ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `build_read_message` and `build_statx_message`
+  --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:42:48
+   |
+42 |     build_close_message, build_openat_message, build_read_message, build_statx_message,
+   |                                                ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+
+
+running 1 test
+crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs - control_plane::supervisor::service::SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS (line 64) --- FAILED
+
+failures:
+
+---- crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs - control_plane::supervisor::service::SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS (line 64) stdout ----
+error: expected one of `!` or `::`, found `complete`
+  --> crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs:65:12
+   |
+65 | guaranteed complete periods = N - 1
+   |            ^^^^^^^^ expected one of `!` or `::`
+
+error: aborting due to 1 previous error
+
+Couldn't compile the test.
+
+failures:
+    crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs - control_plane::supervisor::service::SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS (line 64)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: doctest failed, to rerun pass `-p yarm-control-plane-servers --doc`
+rc2=101

@@ -1,0 +1,27 @@
+== x86_64: sized data/bss symbols B=24758008 C=24766200 delta=+8192
+     +8192 yarm::kernel::boot::bootstrap_state::BOOTSTRAP_SHARED_KERNEL
+        -8 yarm::arch::x86_64::descriptor_tables::TRAP_SHARED_KERNEL_PTR (.0.llvm.15071602964401381342)
+        -8 yarm::kernel::frame_allocator::PT_POOL_HEAP_BUDGET_PAGES (.0.llvm.4318769493958505680)
+        +8 yarm::arch::x86_64::descriptor_tables::TRAP_SHARED_KERNEL_PTR (.0.llvm.2176551737976558331)
+        +8 yarm::arch::x86_64::irq::LAPIC_MMIO_BASE (.0.llvm.11156784399820217776)
+        -8 yarm::kernel::timekeeping::RT_OFFSET_NS (.0.llvm.15071602964401381342)
+        -8 yarm::arch::x86_64::acpi::RSDP_PADDR (.0.llvm.10471146440847302069)
+        -8 yarm::kernel::timekeeping::ORIGIN (.0.llvm.15071602964401381342)
+== aarch64: sized data/bss symbols B=75600870 C=75609062 delta=+8192
+     +8192 yarm::kernel::boot::bootstrap_state::BOOTSTRAP_SHARED_KERNEL
+        -8 yarm::arch::aarch64::console::UART_BASE (.0.llvm.5199545357594655023)
+        +8 yarm::kernel::boot::SCHED_QUANTUM_TICKS_OVERRIDE (.0.llvm.16660181387377715754)
+        +8 yarm::kernel::timekeeping::FREQ_HZ (.0.llvm.1367714153173985210)
+        +8 yarm::kernel::frame_allocator::PT_POOL_HEAP_BUDGET_PAGES (.0.llvm.17573139793320254712)
+        -8 yarm::kernel::boot::IPC_RECV_PROOF_SENDER_WAKE_E1_IDX (.0.llvm.3635731859337073466)
+        +8 yarm::arch::aarch64::console::UART_BASE (.0.llvm.17573139793320254712)
+        -8 yarm::arch::boot_entry::FIRMWARE_BLOB_PROVIDER_PTR (.0.llvm.5199545357594655023)
+== riscv64: sized data/bss symbols B=92303421 C=92309605 delta=+6184
+     +8192 yarm::kernel::boot::bootstrap_state::BOOTSTRAP_SHARED_KERNEL
+     +1920 .L_MergedGlobals.502
+     -1920 .L_MergedGlobals.506
+     +1024 .L_MergedGlobals.134
+     -1024 .L_MergedGlobals.223
+      -984 .L_MergedGlobals
+      -512 yarm::kernel::idle_boundary::PARK_COUNT
+      -512 yarm::kernel::idle_boundary::STACK_ANCHOR

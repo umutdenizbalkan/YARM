@@ -1,0 +1,2 @@
+mutated 2 record copies (reacq)
+SL1W_GRADE result=fail reason=fair-order: slot 0 attempt 1: holder t1=6195 peer ty=6196 re-acquired t2=6196 (outstanding 2; seq 1/2/3) is not FIFO

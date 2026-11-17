@@ -1,0 +1,9 @@
+addB start 2026-11-17T06:23:00Z D=bf06be4c7ca9b22f11718f9ad9663661f5a5f485 sha=db6c931979571526
+files changed from b7263d21: doc/KERNEL_UNLOCKING.md doc/SCHEDULING_CONTRACT.md 
+parent: b7263d21
+B1_contract_gate rc=0 porcelain=0
+B2_doc_enforcement rc=0 porcelain=0
+B3_fmt rc=0 porcelain=0
+B4_serial_lib rc=0 porcelain=0
+test result: ok. 6715 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 135.75s
+ADDB_DONE

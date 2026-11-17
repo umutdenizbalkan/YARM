@@ -1,0 +1,111 @@
+##### x86_64 B: SpinLockIrq<CpuSched>::lock
+  [ffffffff811bbca0 size 0x0000000000000043]
+'+a' is not a recognized feature for this target (ignoring feature)
+'+c' is not a recognized feature for this target (ignoring feature)
+'+m' is not a recognized feature for this target (ignoring feature)
+  pushq	%rax
+  movb	$0x1, %cl
+  movzbl	(%rdi), %eax
+  testb	%al, %al
+  je	0xffffffff811bbcb9 <_RNvMs3_NtNtCs6QbSWpD2Kme_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0x19>
+  nopw	(%rax,%rax)
+  pause
+  movzbl	(%rdi), %eax
+  testb	%al, %al
+  jne	0xffffffff811bbcb0 <_RNvMs3_NtNtCs6QbSWpD2Kme_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0x10>
+  pushfq
+  popq	%rdx
+  cli
+  xorl	%eax, %eax
+  lock
+  cmpxchgb	%cl, (%rdi)
+  je	0xffffffff811bbcd8 <_RNvMs3_NtNtCs6QbSWpD2Kme_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0x38>
+  testl	$0x200, %edx    # imm = 0x200
+  je	0xffffffff811bbcb0 <_RNvMs3_NtNtCs6QbSWpD2Kme_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0x10>
+  sti
+  pause
+  movzbl	(%rdi), %eax
+  testb	%al, %al
+  jne	0xffffffff811bbcb0 <_RNvMs3_NtNtCs6QbSWpD2Kme_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0x10>
+  jmp	0xffffffff811bbcb9 <_RNvMs3_NtNtCs6QbSWpD2Kme_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0x19>
+  shrl	$0x9, %edx
+  andl	$0x1, %edx
+  movq	%rdi, %rax
+  popq	%rcx
+  retq
+##### x86_64 C: TicketLockIrq<CpuSched>::lock
+  [ffffffff81224ed0 size 0x000000000000003d]
+'+a' is not a recognized feature for this target (ignoring feature)
+'+c' is not a recognized feature for this target (ignoring feature)
+'+m' is not a recognized feature for this target (ignoring feature)
+  pushfq
+  popq	%rcx
+  cli
+  movl	$0x1, %edx
+  lock
+  xaddl	%edx, (%rsi)
+  movq	%rdi, %rax
+  movl	0x4(%rsi), %edi
+  cmpl	%edx, %edi
+  je	0xffffffff81224efd <_RNvMs0_NtNtCs6QbSWpD2Kme_4yarm6kernel11ticket_lockINtB5_13TicketLockIrqNtNtB7_9scheduler9AdmissionE4lockB9_+0x2d>
+  pushq	%rax
+  nopw	(%rax,%rax)
+  pause
+  movl	0x4(%rsi), %edi
+  cmpl	%edx, %edi
+  jne	0xffffffff81224ef0 <_RNvMs0_NtNtCs6QbSWpD2Kme_4yarm6kernel11ticket_lockINtB5_13TicketLockIrqNtNtB7_9scheduler9AdmissionE4lockB9_+0x20>
+  addq	$0x8, %rsp
+  movq	%rsi, (%rax)
+  movl	%edx, 0x8(%rax)
+  shrl	$0x9, %ecx
+  andb	$0x1, %cl
+  movb	%cl, 0xc(%rax)
+  retq
+##### aarch64 B: SpinLockIrq<CpuSched>::lock
+  (no out-of-line symbol: inlined at each site)
+##### aarch64 C: TicketLockIrq<CpuSched>::lock
+  [0000000040128958 size 0x0000000000000048]
+'+a' is not a recognized feature for this target (ignoring feature)
+'+c' is not a recognized feature for this target (ignoring feature)
+'+m' is not a recognized feature for this target (ignoring feature)
+  mrs	x10, DAIF
+  msr	DAIFSet, #0x2
+  ldxr	w9, [x0]
+  add	w11, w9, #0x1
+  stxr	w12, w11, [x0]
+  cbnz	w12, 0x40128960 <_RNvMs0_NtNtCslduSJ5W3pU0_4yarm6kernel11ticket_lockINtB5_13TicketLockIrqNtNtB7_9scheduler9AdmissionE4lockB9_+0x8>
+  b	0x40128978 <_RNvMs0_NtNtCslduSJ5W3pU0_4yarm6kernel11ticket_lockINtB5_13TicketLockIrqNtNtB7_9scheduler9AdmissionE4lockB9_+0x20>
+  isb
+  add	x11, x0, #0x4
+  ldar	w11, [x11]
+  cmp	w11, w9
+  b.ne	0x40128974 <_RNvMs0_NtNtCslduSJ5W3pU0_4yarm6kernel11ticket_lockINtB5_13TicketLockIrqNtNtB7_9scheduler9AdmissionE4lockB9_+0x1c>
+  tst	x10, #0x80
+  str	x0, [x8]
+  cset	w10, eq
+  str	w9, [x8, #0x8]
+  strb	w10, [x8, #0xc]
+  ret
+##### riscv64 B: SpinLockIrq<CpuSched>::lock
+  [0000000080257fbe size 0x0000000000000038]
+  li	a1, 0x2
+  li	a2, 0x1
+  j	0x80257fc8 <_RNvMs3_NtNtCsf5Rlfmy9ooE_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0xa>
+  fence	w, 0
+  lb	a3, 0x0(a0)
+  bnez	a3, 0x80257fc4 <_RNvMs3_NtNtCsf5Rlfmy9ooE_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0x6>
+  csrrc	a3, sstatus, a1
+  amoor.w.aq	a4, a2, (a0)
+  andi	a4, a4, 0xff
+  andi	a3, a3, 0x2
+  beqz	a4, 0x80257ff0 <_RNvMs3_NtNtCsf5Rlfmy9ooE_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0x32>
+  beqz	a3, 0x80257fea <_RNvMs3_NtNtCsf5Rlfmy9ooE_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0x2c>
+  csrs	sstatus, a1
+  fence	w, 0
+  j	0x80257fc8 <_RNvMs3_NtNtCsf5Rlfmy9ooE_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0xa>
+  fence	w, 0
+  j	0x80257fc8 <_RNvMs3_NtNtCsf5Rlfmy9ooE_4yarm6kernel4lockINtB5_11SpinLockIrqyE4lockB9_+0xa>
+  snez	a1, a3
+  ret
+##### riscv64 C: TicketLockIrq<CpuSched>::lock
+  (no out-of-line symbol: inlined at each site)

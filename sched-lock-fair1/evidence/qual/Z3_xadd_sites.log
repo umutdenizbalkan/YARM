@@ -1,0 +1,2 @@
+B lock-xadd=1264 lock-cmpxchg=118
+C lock-xadd=1302 lock-cmpxchg=115

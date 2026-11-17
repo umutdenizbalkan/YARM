@@ -1,0 +1,11 @@
+addA start 2026-11-17T06:00:10Z sha=24b5b536b56bfd32
+B-aarch64.elf: OK
+B-riscv64.elf: OK
+B-x86_64.elf: OK
+C-aarch64.elf: OK
+C-riscv64.elf: OK
+C-x86_64.elf: OK
+A1 rc=0
+A2 rc=0
+A3 rc=0
+ADDA_DONE

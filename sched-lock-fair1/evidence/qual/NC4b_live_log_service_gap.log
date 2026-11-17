@@ -1,0 +1,2 @@
+mutated 2 record copies (gap)
+SL1W_GRADE result=fail reason=fair-order: lock slot 1 served 1 tickets out of order
