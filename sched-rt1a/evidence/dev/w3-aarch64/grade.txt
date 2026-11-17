@@ -1,0 +1,10 @@
+[rtw-grade] records=66 damaged_lines=0
+[rtw-grade] A local-wake preemptions graded: 3/3
+RTW_RULE arch=aarch64 smp=2 rule=ID result=pass
+RTW_RULE arch=aarch64 smp=2 rule=SEAL result=pass
+RTW_RULE arch=aarch64 smp=2 rule=PHASES result=pass
+RTW_RULE arch=aarch64 smp=2 rule=A result=pass
+RTW_RULE arch=aarch64 smp=2 rule=B result=pass
+RTW_RULE arch=aarch64 smp=2 rule=C result=pass
+RTW_RULE arch=aarch64 smp=2 rule=D result=pass
+RTW_GRADE arch=aarch64 smp=2 result=pass fails=0

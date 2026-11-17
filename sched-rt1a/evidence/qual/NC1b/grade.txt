@@ -1,0 +1,14 @@
+[rtw-grade] records=62 damaged_lines=0
+[rtw-grade] A local-wake preemptions graded: 3/3; UA yields at H0's runs [2, 2, 2]
+[rtw-grade] C head-position preemption cause=1
+[rtw-grade][fail] PHASES: sequence ['SETUP', 'WARMUP', 'A_ARM', 'A_WAIT', 'A_ARM', 'A_WAIT', 'A_ARM', 'A_WAIT', 'B_ARM', 'B_WAIT', 'C_ARM', 'C_WAIT', 'C_H1', 'C_AFTER', 'D_ARM', 'D_L', 'D_WAIT', 'DONE', 'DUMPING']
+[rtw-grade][fail] C: no yield request
+[rtw-grade][fail] C: UB yields at E's run 0, expected exactly 1
+RTW_RULE arch=riscv64 smp=2 rule=ID result=pass
+RTW_RULE arch=riscv64 smp=2 rule=SEAL result=pass
+RTW_RULE arch=riscv64 smp=2 rule=PHASES result=fail
+RTW_RULE arch=riscv64 smp=2 rule=A result=pass
+RTW_RULE arch=riscv64 smp=2 rule=B result=pass
+RTW_RULE arch=riscv64 smp=2 rule=C result=fail
+RTW_RULE arch=riscv64 smp=2 rule=D result=pass
+RTW_GRADE arch=riscv64 smp=2 result=fail fails=3

@@ -1,0 +1,18 @@
+== GP x86_64
+0
+0
+== RT x86_64
+1
+    486 RT_RESCHED_DECLINED cpu=0 cause=1
+== GP aarch64
+0
+0
+== RT aarch64
+1
+    124 RT_RESCHED_DECLINED cpu=0 cause=1
+== GP riscv64
+0
+0
+== RT riscv64
+1
+   3960 RT_RESCHED_DECLINED cpu=0 cause=1

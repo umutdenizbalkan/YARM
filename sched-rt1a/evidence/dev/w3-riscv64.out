@@ -1,0 +1,4 @@
+RTW_GRADER_SELF_TEST result=pass mutants=12
+[rt-sched-witness] building base riscv64 artifacts
+[rt-sched-witness] rebuilding the kernel with riscv64-rt-sched-witness
+[rt-sched-witness] booting QEMU -smp 2 with yarm.sched_profile=rt

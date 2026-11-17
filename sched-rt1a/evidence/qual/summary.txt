@@ -1,0 +1,189 @@
+rt1a qual start 2026-11-17T08:55:43Z C=67351f6b B=bf06be4c sha=79bffb034abf763f
+=== H1_fmt [67351f6bc5c8 porcelain=0]: cargo fmt --all -- --check (start 08:55:43)
+H1_fmt rc=0 secs=7
+=== H2_hosted_lib [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 08:55:50)
+H2_hosted_lib rc=0 secs=130
+=== H3_integration [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 08:58:00)
+H3_integration rc=0 secs=266
+=== H4_subset_rt1a_ [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 rt1a_ (start 09:02:26)
+H4_subset_rt1a_ rc=0 secs=1
+=== H4_subset_thirty_two_levels [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 thirty_two_levels (start 09:02:27)
+H4_subset_thirty_two_levels rc=0 secs=0
+=== H4_subset_task_priority [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 task_priority (start 09:02:27)
+H4_subset_task_priority rc=0 secs=0
+=== H4_subset_kthread [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 kthread (start 09:02:27)
+H4_subset_kthread rc=0 secs=1
+=== H4_subset_sched_full_rot [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sched_full_rot (start 09:02:28)
+H4_subset_sched_full_rot rc=0 secs=0
+=== H4_subset_sched_lock1 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sched_lock1 (start 09:02:28)
+H4_subset_sched_lock1 rc=0 secs=2
+=== H4_subset_sl1_ [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl1_ (start 09:02:30)
+H4_subset_sl1_ rc=0 secs=2
+=== H4_subset_fair1_ [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 fair1_ (start 09:02:32)
+H4_subset_fair1_ rc=0 secs=17
+=== H4_subset_lock_order [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 lock_order (start 09:02:49)
+H4_subset_lock_order rc=0 secs=0
+=== H4_subset_census [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 census (start 09:02:49)
+H4_subset_census rc=0 secs=1
+=== H4_subset_abi [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 abi (start 09:02:50)
+H4_subset_abi rc=0 secs=3
+=== H4_subset_stage199d [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 stage199d (start 09:02:53)
+H4_subset_stage199d rc=0 secs=25
+=== H4_subset_u3_ed [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u3_ed (start 09:03:18)
+H4_subset_u3_ed rc=0 secs=0
+=== H4_subset_ap_sched1 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 ap_sched1 (start 09:03:18)
+H4_subset_ap_sched1 rc=0 secs=0
+=== H4_subset_sl2b_ [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl2b_ (start 09:03:18)
+H4_subset_sl2b_ rc=0 secs=1
+=== H4_subset_sl2a_ [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl2a_ (start 09:03:19)
+H4_subset_sl2a_ rc=0 secs=0
+=== H4_subset_task_enqueue [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 task_enqueue (start 09:03:19)
+H4_subset_task_enqueue rc=0 secs=0
+=== H4_subset_overtaken [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 overtaken (start 09:03:19)
+H4_subset_overtaken rc=0 secs=0
+=== H4_subset_reap [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 reap (start 09:03:19)
+H4_subset_reap rc=0 secs=1
+=== H4_subset_futex [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 futex (start 09:03:20)
+H4_subset_futex rc=0 secs=31
+=== H4_subset_ipc_timeout [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 ipc_timeout (start 09:03:51)
+H4_subset_ipc_timeout rc=0 secs=0
+=== H4_subset_sr_place1 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sr_place1 (start 09:03:51)
+H4_subset_sr_place1 rc=0 secs=0
+=== H4_subset_run_queue [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 run_queue (start 09:03:51)
+H4_subset_run_queue rc=0 secs=1
+=== H4_subset_the_seam_reuses [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 the_seam_reuses (start 09:03:52)
+H4_subset_the_seam_reuses rc=0 secs=0
+=== H4_crate_yarm_kernel [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-kernel --lib -- --test-threads=1 (start 09:03:52)
+H4_crate_yarm_kernel rc=0 secs=1
+=== H4_grader_self_test [67351f6bc5c8 porcelain=0]: python3 -I scripts/grade-rt-sched-witness.py --self-test (start 09:03:53)
+H4_grader_self_test rc=0 secs=0
+=== H5_lockorder_C [67351f6bc5c8 porcelain=0]: bash -c env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 --nocapture > /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/H5_C.raw.log 2>&1; echo rc=$? (start 09:03:53)
+H5_lockorder_C rc=0 secs=135
+=== H5_lockorder_B [67351f6bc5c8 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-base-wt && env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 --nocapture > /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/H5_B.raw.log 2>&1; echo rc=$? (start 09:06:08)
+H5_lockorder_B rc=0 secs=281
+H5_pairtypes C=30 B=30 diff_lines=0
+=== G1_contract_gate [67351f6bc5c8 porcelain=0]: bash scripts/check-current-contracts.sh (start 09:10:51)
+G1_contract_gate rc=0 secs=5
+=== G2_doc_enforcement [67351f6bc5c8 porcelain=0]: bash scripts/check-contract-doc-enforcement.sh (start 09:10:56)
+G2_doc_enforcement rc=0 secs=1
+=== X_check_default_x86_64 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm --bin kernel_boot (start 09:10:57)
+X_check_default_x86_64 rc=0 secs=6
+=== X_check_witness_x86_64 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features x86-rt-sched-witness -p yarm --bin kernel_boot (start 09:11:03)
+X_check_witness_x86_64 rc=0 secs=0
+=== X_check_default_aarch64 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm --bin kernel_boot (start 09:11:04)
+X_check_default_aarch64 rc=0 secs=5
+=== X_check_witness_aarch64 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features aarch64-rt-sched-witness -p yarm --bin kernel_boot (start 09:11:09)
+X_check_witness_aarch64 rc=0 secs=0
+=== X_check_default_riscv64 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm --bin kernel_boot (start 09:11:09)
+X_check_default_riscv64 rc=0 secs=4
+=== X_check_witness_riscv64 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features riscv64-rt-sched-witness -p yarm --bin kernel_boot (start 09:11:13)
+X_check_witness_riscv64 rc=0 secs=0
+=== Z1_size_probe_C [67351f6bc5c8 porcelain=0]: bash -c printf '%s\n%s\n' "$1" "$2" >> src/kernel/scheduler.rs && env -u CARGO_TARGET_DIR cargo test -q --lib rt1a_size_probe -- --nocapture --test-threads=1; rc=$?; git checkout -- src/kernel/scheduler.rs; exit $rc _ 
+#[cfg(test)]
+mod rt1a_size_probe {
+    #[test]
+    fn rt1a_size_probe() {
+        std::println!(
+            "RT1A_SIZE CpuSched={} CpuCell={} PriorityScheduler={} Admission={} SchedDomain={} align_CpuCell={}",
+            core::mem::size_of::<super::CpuSched>(),
+            core::mem::size_of::<super::CpuCell>(),
+            core::mem::size_of::<super::PriorityScheduler>(),
+            core::mem::size_of::<super::Admission>(),
+            core::mem::size_of::<super::SchedDomain>(),
+            core::mem::align_of::<super::CpuCell>()
+        );
+    }
+} 
+#[cfg(test)]
+mod rt1a_size_probe_rq {
+    #[test]
+    fn rt1a_size_probe_rq() {
+        std::println!("RT1A_SIZE RunQueues={}", core::mem::size_of::<super::RunQueues>());
+    }
+} (start 09:11:13)
+Z1_size_probe_C rc=0 secs=48
+=== Z1_size_probe_B [67351f6bc5c8 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-base-wt && printf '%s\n' "$1" >> src/kernel/scheduler.rs && env -u CARGO_TARGET_DIR cargo test -q --lib rt1a_size_probe -- --nocapture --test-threads=1; rc=$?; git checkout -- src/kernel/scheduler.rs; exit $rc _ 
+#[cfg(test)]
+mod rt1a_size_probe {
+    #[test]
+    fn rt1a_size_probe() {
+        std::println!(
+            "RT1A_SIZE CpuSched={} CpuCell={} PriorityScheduler={} Admission={} SchedDomain={} align_CpuCell={}",
+            core::mem::size_of::<super::CpuSched>(),
+            core::mem::size_of::<super::CpuCell>(),
+            core::mem::size_of::<super::PriorityScheduler>(),
+            core::mem::size_of::<super::Admission>(),
+            core::mem::size_of::<super::SchedDomain>(),
+            core::mem::align_of::<super::CpuCell>()
+        );
+    }
+} (start 09:12:01)
+Z1_size_probe_B rc=0 secs=51
+=== B_build_C_x86_64 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 09:12:52)
+B_build_C_x86_64 rc=0 secs=29
+=== S_gp_core_smp2_x86_64 [67351f6bc5c8 porcelain=0]: env KERNEL_IMAGE=build-x86_64/kernel_boot.elf INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_gp_x86_64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_gp_x86_64.smoke.log TIMEOUT_SECS=600 scripts/qemu-x86_64-core-smoke.sh (start 09:13:21)
+S_gp_core_smp2_x86_64 rc=0 secs=603
+=== S_rt_core_smp2_x86_64 [67351f6bc5c8 porcelain=0]: env KERNEL_IMAGE=build-x86_64/kernel_boot.elf INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio QEMU_SMP=2 KERNEL_CMDLINE=console=ttyS0 rdinit=/init yarm.sched_profile=rt LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_rt_x86_64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_rt_x86_64.smoke.log TIMEOUT_SECS=600 scripts/qemu-x86_64-core-smoke.sh (start 09:23:25)
+S_rt_core_smp2_x86_64 rc=0 secs=604
+=== B_build_B_x86_64 [67351f6bc5c8 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-base-wt && env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 09:33:29)
+B_build_B_x86_64 rc=0 secs=33
+=== B_build_C_aarch64 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 09:34:02)
+B_build_C_aarch64 rc=0 secs=25
+=== S_gp_core_smp2_aarch64 [67351f6bc5c8 porcelain=0]: env KERNEL_IMAGE=build-aarch64/yarm-aarch64.bin INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_gp_aarch64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_gp_aarch64.smoke.log TIMEOUT_SECS=600 scripts/qemu-aarch64-core-smoke.sh (start 09:34:27)
+S_gp_core_smp2_aarch64 rc=0 secs=13
+=== S_rt_core_smp2_aarch64 [67351f6bc5c8 porcelain=0]: env KERNEL_IMAGE=build-aarch64/yarm-aarch64.bin INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio QEMU_SMP=2 KERNEL_CMDLINE=console=ttyS0 rdinit=/init yarm.sched_profile=rt LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_rt_aarch64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_rt_aarch64.smoke.log TIMEOUT_SECS=600 scripts/qemu-aarch64-core-smoke.sh (start 09:34:40)
+S_rt_core_smp2_aarch64 rc=0 secs=13
+=== B_build_B_aarch64 [67351f6bc5c8 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-base-wt && env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 09:34:53)
+B_build_B_aarch64 rc=0 secs=31
+=== B_build_C_riscv64 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 09:35:24)
+B_build_C_riscv64 rc=0 secs=26
+=== S_gp_core_smp2_riscv64 [67351f6bc5c8 porcelain=0]: env KERNEL_IMAGE=build-riscv64/yarm-riscv64.bin INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_gp_riscv64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_gp_riscv64.smoke.log TIMEOUT_SECS=300 scripts/qemu-riscv64-core-smoke.sh (start 09:35:50)
+S_gp_core_smp2_riscv64 rc=0 secs=301
+=== S_rt_core_smp2_riscv64 [67351f6bc5c8 porcelain=0]: env KERNEL_IMAGE=build-riscv64/yarm-riscv64.bin INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio QEMU_SMP=2 KERNEL_CMDLINE=console=ttyS0 rdinit=/init yarm.sched_profile=rt LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_rt_riscv64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/S_rt_riscv64.smoke.log TIMEOUT_SECS=300 scripts/qemu-riscv64-core-smoke.sh (start 09:40:51)
+S_rt_core_smp2_riscv64 rc=0 secs=301
+=== B_build_B_riscv64 [67351f6bc5c8 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-base-wt && env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 09:45:52)
+B_build_B_riscv64 rc=0 secs=34
+Z2_sizes written
+=== W1_x86_64_smp2 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/W1 scripts/qemu-rt-sched-witness-smoke.sh x86_64 2 (start 09:46:26)
+W1_x86_64_smp2 rc=0 secs=640
+=== W2_aarch64_smp2 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/W2 scripts/qemu-rt-sched-witness-smoke.sh aarch64 2 (start 09:57:06)
+W2_aarch64_smp2 rc=0 secs=43
+=== W3_riscv64_smp2 [67351f6bc5c8 porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/W3 scripts/qemu-rt-sched-witness-smoke.sh riscv64 2 (start 09:57:49)
+W3_riscv64_smp2 rc=0 secs=269
+=== NC1a_position_tail_hosted [67351f6bc5c8 porcelain=0]: bash -c python3 -c "
+p='src/kernel/scheduler.rs'; s=open(p).read()
+a='        let pushed = self.push_front_unchecked_capacity(tid, priority);'
+assert s.count(a)==1
+open(p,'w').write(s.replace(a,'        let pushed = self.push_unchecked_capacity(tid, priority);'))
+" && git diff --stat && env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 rt1a_; rc=$?; git checkout -- src/kernel/scheduler.rs; exit $rc (start 10:02:18)
+NC1a_position_tail_hosted rc=101 secs=45
+=== NC2a_equal_preempts_hosted [67351f6bc5c8 porcelain=0]: bash -c python3 -c "
+p='src/kernel/scheduler.rs'; s=open(p).read()
+a='best.is_higher_than(cur.priority)'
+assert s.count(a)==1
+open(p,'w').write(s.replace(a,'best.level() <= cur.priority.level()'))
+" && git diff --stat && env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 rt1a_; rc=$?; git checkout -- src/kernel/scheduler.rs; exit $rc (start 10:03:04)
+NC2a_equal_preempts_hosted rc=101 secs=33
+=== NC1b_position_tail_live_riscv64 [67351f6bc5c8 porcelain=0]: bash -c python3 -c "
+p='src/kernel/scheduler.rs'; s=open(p).read()
+a='        let pushed = self.push_front_unchecked_capacity(tid, priority);'
+assert s.count(a)==1
+open(p,'w').write(s.replace(a,'        let pushed = self.push_unchecked_capacity(tid, priority);'))
+" && git diff --stat && env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/NC1b scripts/qemu-rt-sched-witness-smoke.sh riscv64 2; rc=$?; git checkout -- src/kernel/scheduler.rs; exit $rc (start 10:03:37)
+NC1b_position_tail_live_riscv64 rc=1 secs=289
+=== NC2b_equal_preempts_live_riscv64 [67351f6bc5c8 porcelain=0]: bash -c python3 -c "
+p='src/kernel/scheduler.rs'; s=open(p).read()
+a='best.is_higher_than(cur.priority)'
+assert s.count(a)==1
+open(p,'w').write(s.replace(a,'best.level() <= cur.priority.level()'))
+" && git diff --stat && env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-evidence/qual/NC2b scripts/qemu-rt-sched-witness-smoke.sh riscv64 2; rc=$?; git checkout -- src/kernel/scheduler.rs; exit $rc (start 10:08:26)
+NC2b_equal_preempts_live_riscv64 rc=1 secs=292
+post-NC porcelain=0 base-porcelain=0
+rt1a qual end 2026-11-17T10:13:18Z
+RT1A_QUAL_DONE
+addB start 2026-11-17T11:04:20Z head=5360efdd sha=967f9fc815bf4dbc
+addB_contract_gate rc=0
+addB_doc_enforcement rc=0
+addB_hosted_lib rc=0 test result: ok. 6732 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 146.20s
+addB porcelain=0
+RT1A_ADDB_DONE

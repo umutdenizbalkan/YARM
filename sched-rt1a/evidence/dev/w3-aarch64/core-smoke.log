@@ -1,0 +1,46 @@
+ARTIFACT_BINDING arch=aarch64 kernel=build-aarch64/yarm-aarch64.bin kernel_sha256=8c7d61b09833141f2b6b96092426fc11575f2ffd41c1af73b7d4cd57eb6b8821 kernel_features=aarch64-rt-sched-witness kernel_resolved_features=aarch64-rt-sched-witness,rt-sched-witness kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1a-wt/target/aarch64-yarm-none/aarch64-none/kernel_boot:fresh=1 initramfs=build-aarch64/initramfs-core.cpio initramfs_sha256=828b7bca4e33b1e38dd470b74791c93b8de3f807b13eb6440c862b0a95e0dda0 initramfs_features=none initramfs_compile_env=none source=dirty:3d8084b29f1663e5c4d7bb8550d0c17547861b4e:c26e54a0f1fe3918d2cfc706 required=kernel=aarch64-rt-sched-witness result=ok
+[info] qemu command: qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024M -smp 2 -nographic -monitor none -serial stdio -kernel build-aarch64/yarm-aarch64.bin -initrd build-aarch64/initramfs-core.cpio -append console=ttyS0 rdinit=/init yarm.sched_profile=rt
+[info] aarch64 core: completion condition: idle
+[ok] aarch64 core: terminal idle (RTW_DONE) reached — QEMU stopped intentionally
+[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell
+[ok] U9-RX4: PM decodes the lifecycle query
+[ok] U9-RX4: PM replies successfully
+[ok] U9-RX4: terminal-outcome evaluator self-test passed (8 accepted, 27 rejected)
+[ok] U9-RX4: REPLY won the terminal of record_index=0 record_generation=1 (queued route, cap 65538) — commit=1 resume=1 one-shot revoked, no timeout win
+[ok] U9-RX4: no reply cap is lost to the u32::MAX sentinel
+[ok] U9-RX4: PM never fails to decode
+[ok] U9-RX4: no writeback rollback on the witnessed path
+[ok] U9-RX4: the reply cap is never used twice
+[ok] U9-RX4: no cap materialization failure
+[ok] U9-RX4: the blocking IpcRecv route publishes and defers (n=166)
+[ok] U9-RX4: the broad dispatcher is skipped for a published block (n=402)
+[ok] U9-RX4: the existing D2-recv drain resumes a replacement (n=165)
+[ok] U9-RX4: no fail-closed settlement on the blocking route
+[ok] U9-RX4: AArch64 queued-plain reply-cap + framing witness chain complete
+[ok] BAD / BOOT BLOCKERS: empty
+[ok] aarch64 Stage 195A: DebugLog split-dispatch live (NR 27 removed; queue-advancing Yield inert)
+[info] FAT smoke marker count: INIT_FAT_SPAWN_BEGIN=0
+[info] FAT smoke marker count: INIT_FAT_SPAWN_SKIPPED=1
+[info] FAT smoke marker count: INIT_FAT_SPAWN_OK=0
+[info] FAT smoke marker count: PM_IMAGE_ID_10_FAT_SRV=0
+[info] FAT smoke marker count: FAT_CONFIG_FOUND=0
+[info] FAT smoke marker count: FAT_BLOCK_BACKEND_STARTUP_CAP=0
+[info] FAT smoke marker count: FAT_MOUNT_READY=0
+[info] FAT smoke marker count: FAT_MOUNT_FAILED=0
+[info] FAT smoke marker count: VFS_MOUNT_REGISTER_FAT_OK=0
+[info] RAMFS smoke marker count: INIT_RAMFS_SPAWN_BEGIN=1
+[info] RAMFS smoke marker count: INIT_RAMFS_SPAWN_SKIPPED=0
+[info] RAMFS smoke marker count: INIT_RAMFS_SPAWN_OK=1
+[info] RAMFS smoke marker count: PM_IMAGE_ID_11_RAMFS_SRV=1
+[info] RAMFS smoke marker count: RAMFS_CONFIG_FOUND=0
+[info] RAMFS smoke marker count: RAMFS_CONFIG_DEFAULT=1
+[info] RAMFS smoke marker count: RAMFS_MOUNT_READY=1
+[info] RAMFS smoke marker count: RAMFS_MOUNT_FAILED=0
+[info] RAMFS smoke marker count: VFS_MOUNT_REGISTER_RAMFS_OK=1
+[info] EXT4 smoke marker count: INIT_EXT4_SPAWN_BEGIN=1
+[info] EXT4 smoke marker count: INIT_EXT4_SPAWN_SKIPPED=0
+[info] EXT4 smoke marker count: INIT_EXT4_SPAWN_OK=1
+[info] EXT4 smoke marker count: PM_IMAGE_ID_12_EXT4_SRV=1
+[info] EXT4 smoke marker count: EXT4_SRV_READY=2
+[ok] TERMINAL-ACQUISITION: no broad acquisition exists and no trap reached the bridge unsettled
+[ok] aarch64 core: clean terminal idle (RTW_DONE) after all required markers — PASS

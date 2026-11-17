@@ -1,0 +1,5 @@
+79bffb034abf763f1607056a4f393c4fcf7c6aa6c79b8d05e8bd6f31cddc43da  rt1a_qual.sh
+67351f6bc5c8d2c7f670da5884d488ecc2eb3ee9
+1e316467fc48770746f15ce6e0931b561c436a6797d74cdd28cb16e18966e56f  scripts/grade-rt-sched-witness.py
+d4a89e14d24bcee50954d9c94cd014bcfb0a2f31a2d2b61f9951bea5419407ef  scripts/qemu-rt-sched-witness-smoke.sh
+967f9fc815bf4dbcef9f533e8f0c261c4ea3ea9702bcb1dacb81f2326a33a00f  ../rt1a_addB.sh

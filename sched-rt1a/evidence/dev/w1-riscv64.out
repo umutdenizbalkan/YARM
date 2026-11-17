@@ -1,0 +1,3 @@
+RTW_GRADER_SELF_TEST result=pass mutants=11
+[rt-sched-witness] rebuilding the kernel with riscv64-rt-sched-witness
+RTW_WITNESS_SEAL arch=riscv64 smp=2 result=fail reason=kernel_build

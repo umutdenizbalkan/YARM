@@ -1,0 +1,12 @@
+[rtw-grade] records=73 damaged_lines=0
+[rtw-grade] A local-wake preemptions graded: 3/3; UA yields at H0's runs [2, 2, 2]
+[rtw-grade] C head-position preemption cause=1
+[rtw-grade][fail] D: L resumed (65, 'LRESUMED', 0, (5427963450888355844, 94, 15, 0, 0))
+RTW_RULE arch=riscv64 smp=2 rule=ID result=pass
+RTW_RULE arch=riscv64 smp=2 rule=SEAL result=pass
+RTW_RULE arch=riscv64 smp=2 rule=PHASES result=pass
+RTW_RULE arch=riscv64 smp=2 rule=A result=pass
+RTW_RULE arch=riscv64 smp=2 rule=B result=pass
+RTW_RULE arch=riscv64 smp=2 rule=C result=pass
+RTW_RULE arch=riscv64 smp=2 rule=D result=fail
+RTW_GRADE arch=riscv64 smp=2 result=fail fails=1

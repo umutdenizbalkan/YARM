@@ -1,0 +1,11 @@
+[rtw-grade] records=0 damaged_lines=0
+[rtw-grade][fail] SEAL: no verified seal
+[rtw-grade][fail] ID: role H0 missing
+RTW_RULE arch=riscv64 smp=2 rule=ID result=fail
+RTW_RULE arch=riscv64 smp=2 rule=SEAL result=fail
+RTW_RULE arch=riscv64 smp=2 rule=PHASES result=pass
+RTW_RULE arch=riscv64 smp=2 rule=A result=pass
+RTW_RULE arch=riscv64 smp=2 rule=B result=pass
+RTW_RULE arch=riscv64 smp=2 rule=C result=pass
+RTW_RULE arch=riscv64 smp=2 rule=D result=pass
+RTW_GRADE arch=riscv64 smp=2 result=fail fails=2
