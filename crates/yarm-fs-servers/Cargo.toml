@@ -59,6 +59,8 @@ futex-requeue-race-witness = []
 futex-wait-witness = []
 riscv-ecall-witness = []
 futex-time-witness = []
+# FUTEX-SYNC-TIME1: accepted and inert here (init's cell; the kernel side is futex-time-witness).
+futex-sync-witness = []
 # SCHED-TIME-FOUNDATION1 C — the live sleep witness (init cell; see the kernel feature).
 sched-time-witness = []
 riscv-uart-irq-witness = []

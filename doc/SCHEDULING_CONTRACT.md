@@ -4310,7 +4310,8 @@ on `wip/futex-abs-bitset1-evidence`.
 
 ### 25.6 Remaining gaps
 
-* No timed mutex and no re-waiting timed condition variable (the next pass).
+* A timed mutex and timed condition-variable waits are user-runtime functions on this ABI,
+  FUTEX-SYNC-TIME1 (`SYSCALL_ABI.md`, *Timed mutex and condition-variable waits*).
 * No priority inheritance, `FUTEX-SEAL1` or EDF; no partitions.
 * Deadline lateness is bounded only by the collector cadence (§23.6, §24.6): no sub-tick
   enforcement and no time bound.

@@ -259,6 +259,8 @@ futex-wait-witness = ["printk-witness-ring"]
 riscv-ecall-witness = ["printk-witness-ring"]
 # FUTEX-TIME1 — the live timed-wait witness (default off; kernel markers + init role).
 futex-time-witness = ["printk-witness-ring"]
+# FUTEX-SYNC-TIME1: accepted and inert here (init's cell; the kernel side is futex-time-witness).
+futex-sync-witness = []
 # SCHED-TIME-FOUNDATION1 C — the live sleep witness (default off; kernel markers, the exit and
 # kernel-thread fixtures of `kernel::sleep_witness`, and init's cell).
 sched-time-witness = ["printk-witness-ring"]
@@ -355,6 +357,11 @@ riscv64-ipc-reply-timeout-oracle = ["ipc-reply-timeout-oracle-core"]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }
 yarm-kernel = { path = "crates/yarm-kernel" }
 yarm-srv-common = { path = "crates/yarm-srv-common" }
+
+# FUTEX-SYNC-TIME1: hosted tests drive the user runtime's real `futex_sync` code against the
+# kernel's production futex owners (test builds only; no kernel image links it).
+[dev-dependencies]
+yarm-user-rt = { path = "crates/yarm-user-rt" }
 
 [[bin]]
 name = "kernel_boot"

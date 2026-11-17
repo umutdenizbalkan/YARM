@@ -403,9 +403,75 @@ reserved holes from implemented privileged paths.
   CONTENDED store is what makes the broadcaster's own unlock issue the first mutex wake: without
   it, a broadcast that woke nobody would leave every moved waiter parked on a mutex whose word
   says "uncontended". `yarm_user_rt::futex_sync` implements exactly this; it is not a pthread
-  implementation (no timed mutex or timed condition variable beyond the single-wait
-  `wait_timeout`, no attributes, no robustness, no priority protocol). The protocol does not use
-  masks.
+  implementation (no attributes, no robustness, no priority protocol, no cancellation, no realtime
+  clock). The protocol does not use masks. Its timed forms are below.
+- **Timed mutex and condition-variable waits (`yarm_user_rt::futex_sync`, FUTEX-SYNC-TIME1).**
+  User-runtime functions on this ABI (NR 9 absolute deadlines, NR 10, NR 17, NR 18); no kernel
+  change, ABI v13 unchanged. Deadlines are absolute `CLOCK_MONOTONIC` nanoseconds.
+
+  | function | result |
+  |---|---|
+  | `FutexMutex::lock_until(&self, deadline_ns: u64)` | `LockOutcome::{Acquired, TimedOut, Failed(SyscallError)}`; held iff `Acquired` |
+  | `FutexMutex::lock_timeout(&self, timeout: Duration)` | the same, at one deadline computed first |
+  | `FutexCondvar::wait_until(&self, &FutexMutex, deadline_ns: u64)` | `WaitOutcome::{Notified, TimedOut, Failed(SyscallError)}`; held again on EVERY return |
+  | `FutexCondvar::wait_timeout(&self, &FutexMutex, timeout: Duration)` | the same (replaces the earlier `bool` form) |
+  | `FutexCondvar::wait_while_until(&self, &FutexMutex, deadline_ns: u64, keep_waiting: FnMut() -> bool)` | `WaitWhileOutcome::{Satisfied, TimedOut, Failed(SyscallError)}`; held again on every return |
+  | `FutexCondvar::wait_while_timeout(&self, &FutexMutex, timeout: Duration, keep_waiting)` | the same, at one deadline computed first |
+
+  Every operation also has a `*_with(ops, …)` form over a `FutexOps` (the futex primitives); the
+  plain form is that same code over `Syscalls`. The seam exists for tests, not as another
+  implementation.
+  - *Mutex protocol.* `0` unlocked, `1` locked, `2` contended (the unlock wakes one). The fast
+    path is one `compare_exchange(0 → 1, Acquire)`; unlock is `swap(0, Release)` and a wake of
+    one waiter when the old value was `2`. Every acquisition is an `Acquire` read-modify-write
+    and every unlock a `Release`, so a previous owner's writes before its unlock happen-before
+    the next owner's critical section, whatever path acquired. The slow path (timed or not, and
+    every condition reacquisition) acquires only by `swap(2)` and never turns `2` back into `1`:
+    an owner that came through it may have waiters parked behind it.
+  - *Wake responsibility.* A timed waiter gives up only after a `swap(2)` that found the word
+    held by another owner; that swap leaves it `2`, so the current owner's unlock still wakes
+    the next parked waiter. A waiter that received an unlock's only wake and resumes after its
+    deadline finds the `0` that unlock left and ACQUIRES (it does not abandon a free mutex with
+    others parked behind it); if a third thread took the mutex in between, the waiter gives up
+    and that owner's unlock (of the `2`) carries the wake on. No path infers "no waiters" from a
+    wake that returned `0` (see *Every waiter counted is placed*).
+  - *Boundaries.* An available mutex is acquired whatever the deadline, even one already passed
+    (no system call). A deadline observed while the mutex is free acquires it; `TimedOut` means
+    the deadline passed and another owner held the mutex at the last attempt. Every retry in one
+    call passes the same instant: a wake, `ValueChanged` or a spurious return never extends it,
+    and after such a return the deadline is checked before waiting again, so `ValueChanged`
+    churn cannot carry a call past it. A missing clock is `Failed(Unavailable)`, never an
+    untimed wait. A timeout is not a return-time guarantee: it is observed by the kernel's
+    collector (each CPU's tick at the latest), and returning needs a CPU and, for a condition
+    wait, the mutex.
+  - *Relative helpers.* `*_timeout` read the clock once, first, and refuse a duration wider than
+    `u64` nanoseconds or a deadline that would overflow with `Failed(InvalidArgs)` (never a wait
+    without end); with no clock, `Failed(Unavailable)`. Either failure returns before anything is
+    attempted: a condition wait then never released its mutex.
+  - *Condition wait.* The caller holds the mutex; the sequence is read under it; the mutex is
+    unlocked; NR 9 compares the sequence with that reading (a notification between the reading
+    and the park is seen as `ValueChanged`, i.e. `Notified`); then the mutex is reacquired
+    through the contended path, WITHOUT a deadline, on every return path: a timeout on the
+    sequence, a timeout after a requeue onto the mutex word, an error. The timeout or error
+    result is kept through the reacquisition and returned with the mutex held. `Notified`
+    includes spurious returns.
+  - *Predicate wait.* `keep_waiting` is evaluated only with the mutex held: first, and after
+    every return. A notification is never taken as satisfaction. Rule: the condition, evaluated
+    under the reacquired mutex, wins over a timeout in the same round (`Satisfied`); `TimedOut`
+    only if it still asks to wait; a failure is returned as `Failed` without evaluating it again.
+    One deadline for every wait of the loop.
+  - *Broadcast and requeue* are unchanged (above): NR 17 wakes one and moves the rest to the
+    mutex word, `CONTENDED` stored first, the capacity-limited continuation kept, never a
+    wake-all except after `WouldBlock`. A moved timed waiter keeps its deadline on the mutex word
+    (NR 17's contract); if it expires there it still reacquires the mutex, through the contended
+    path, so the unlock chain behind it is intact. Ordinary, timed and requeued waiters share the
+    one word protocol.
+  - *Preconditions (not checked):* the caller of a condition wait holds the mutex; one condition
+    variable is used with one mutex; the scope is valid for the word's memory (an untimed lock
+    whose word the kernel rejects retries without end, as before).
+  - *Limits.* The inherited wake-capacity limitation applies (`0` from a wake may be a capacity
+    refusal); no priority inheritance; no fairness guarantee (a barger can take a free mutex
+    before a woken waiter).
 - A waiter table slot exists for every possible task, so a wait cannot run out of waiter storage.
   The capacity refusal is still implemented (`TaskTableFull`, decided before anything is written).
 - Robust-futex cleanup at task exit wakes each robust word in the EXITING task's own address space,

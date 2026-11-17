@@ -80,6 +80,10 @@ futex-wait-witness = []
 riscv-ecall-witness = []
 # FUTEX-TIME1: init's live timed-wait cell (selector 18, with futex-requeue-witness); inert elsewhere.
 futex-time-witness = []
+# FUTEX-SYNC-TIME1 — the live timed mutex / condition-variable witness: init's cell (selector 18,
+# with futex-requeue-witness); accepted and inert in every other package (the kernel side is
+# futex-time-witness).
+futex-sync-witness = []
 # SCHED-TIME-FOUNDATION1 C — the live sleep witness (init cell; see the kernel feature).
 sched-time-witness = []
 riscv-uart-irq-witness = []

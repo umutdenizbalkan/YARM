@@ -2125,16 +2125,222 @@ pub mod syscall {
 /// priority protocol, and (FUTEX-TIME1) only a bounded relative-timeout condition wait — no
 /// absolute or clock-selected timeouts, no timed mutex lock.
 pub mod futex_sync {
+    //! A futex mutex and condition variable, with timed (absolute `CLOCK_MONOTONIC`) forms.
+    //!
+    //! FUTEX-SYNC-TIME1. Built on ABI v13's NR 9 absolute deadline, NR 10 and NR 17; no other
+    //! waiter mechanism. This is not a pthread implementation: no realtime clock, no attributes,
+    //! no robustness, no priority protocol, no cancellation.
+    //!
+    //! # Mutex protocol
+    //!
+    //! The word is `0` unlocked, `1` locked, `2` ([`CONTENDED`]) locked with possible waiters; the
+    //! unlock of a `2` wakes one waiter. Acquisition is an `Acquire` read-modify-write of the
+    //! word and the unlock a `Release` swap to `0`, so everything the previous owner wrote before
+    //! its unlock happens-before everything the next owner does after its acquisition (whichever
+    //! path acquired: the fast compare-exchange, a slow-path swap, or a condition waiter's
+    //! reacquisition).
+    //!
+    //! The slow path (contended, timed or not, and every condition-variable reacquisition) only
+    //! ever acquires by `swap(CONTENDED)`: an owner that came through it may have waiters parked
+    //! behind it, so its unlock must wake one. It never turns `2` back into `1`.
+    //!
+    //! **Wake responsibility.** A timed waiter gives up only after a `swap(CONTENDED)` that found
+    //! the word held by another owner. That swap leaves the word `2`, so the current owner's
+    //! unlock still wakes the next parked waiter. In particular a waiter that received an
+    //! unlock's only wake and then finds its deadline passed does not abandon: the word it swaps
+    //! is the `0` that unlock left, so it acquires. It can lose the mutex only to a thread that
+    //! took it in the meantime, and that owner's unlock (of the `2` the swap wrote) carries the
+    //! wake on. No path infers "no waiters" from a wake that returned `0`.
+    //!
+    //! # Timed results
+    //!
+    //! * The deadline is an absolute `CLOCK_MONOTONIC` instant in nanoseconds (what NR 18 reads).
+    //!   Every retry inside one call passes the SAME instant: a wake, a `ValueChanged` or a
+    //!   spurious return never extends it.
+    //! * An available mutex is acquired whatever the deadline (even one long passed): the
+    //!   deadline bounds only waiting. A waiter whose deadline is observed while the mutex is free
+    //!   acquires it ([`LockOutcome::Acquired`]); `TimedOut` means the deadline passed AND the
+    //!   mutex was held by another owner at the last attempt.
+    //! * A timeout is a lower bound, not a return-time guarantee: it is observed at the kernel's
+    //!   collector (each CPU's tick at the latest), and returning also needs a CPU, and for a
+    //!   condition variable the mutex.
+    //! * The relative helpers (`*_timeout`) read the clock ONCE, before anything else, and
+    //!   refuse a deadline that would overflow `u64` (or a duration wider than `u64`
+    //!   nanoseconds) with `InvalidArgs`, and a missing clock with `Unavailable`; in both cases
+    //!   nothing was attempted and nothing was released.
+    //!
+    //! # Seam
+    //!
+    //! Every operation has a `*_with(ops, …)` form taking the futex primitives as a
+    //! [`FutexOps`]; the plain form is that same code over [`Syscalls`], the real NR 9 / NR 10 /
+    //! NR 17 / NR 18. The seam exists so hosted tests can drive THIS implementation over a
+    //! deterministic or emulated backend; it is not a second implementation.
     use crate::syscall::{
-        FutexScope, FutexTimedWait, SyscallError, futex_cmp_requeue, futex_wait,
-        futex_wait_timeout, futex_wake,
+        CLOCK_MONOTONIC, FUTEX_BITSET_MATCH_ANY, FutexRequeueOutcome, FutexScope, FutexTimedWait,
+        SyscallError, clock_gettime, futex_cmp_requeue, futex_wait_until, futex_wake,
     };
     use core::sync::atomic::{AtomicU32, Ordering};
+    use core::time::Duration;
 
     const UNLOCKED: u32 = 0;
     const LOCKED: u32 = 1;
     /// Locked, and waiters may be parked on the word: the unlock must wake one.
     pub const CONTENDED: u32 = 2;
+
+    /// The futex primitives the synchronization objects are built on.
+    pub trait FutexOps {
+        /// NR 9: wait while `word` holds `expected`, until a wake or `deadline_ns` (absolute
+        /// `CLOCK_MONOTONIC`; `None`: untimed). The kernel compares first.
+        fn wait(
+            &self,
+            word: &AtomicU32,
+            expected: u32,
+            scope: FutexScope,
+            deadline_ns: Option<u64>,
+        ) -> Result<FutexTimedWait, SyscallError>;
+        /// NR 10: wake up to `count` waiters of `word`.
+        fn wake(
+            &self,
+            word: &AtomicU32,
+            count: u32,
+            scope: FutexScope,
+        ) -> Result<u32, SyscallError>;
+        /// NR 17: compare `source` with `expected`, wake `wake`, move up to `requeue` to `target`.
+        #[allow(clippy::too_many_arguments)]
+        fn cmp_requeue(
+            &self,
+            source: &AtomicU32,
+            source_scope: FutexScope,
+            target: &AtomicU32,
+            target_scope: FutexScope,
+            expected: u32,
+            wake: u32,
+            requeue: u32,
+        ) -> Result<FutexRequeueOutcome, SyscallError>;
+        /// NR 18: `CLOCK_MONOTONIC`, in nanoseconds.
+        fn monotonic_now(&self) -> Result<u64, SyscallError>;
+    }
+
+    /// The production [`FutexOps`]: the real system calls.
+    pub struct Syscalls;
+
+    impl FutexOps for Syscalls {
+        #[inline]
+        fn wait(
+            &self,
+            word: &AtomicU32,
+            expected: u32,
+            scope: FutexScope,
+            deadline_ns: Option<u64>,
+        ) -> Result<FutexTimedWait, SyscallError> {
+            futex_wait_until(
+                word.as_ptr(),
+                expected,
+                scope,
+                deadline_ns,
+                FUTEX_BITSET_MATCH_ANY,
+            )
+        }
+        #[inline]
+        fn wake(
+            &self,
+            word: &AtomicU32,
+            count: u32,
+            scope: FutexScope,
+        ) -> Result<u32, SyscallError> {
+            futex_wake(word.as_ptr(), count, scope)
+        }
+        #[inline]
+        fn cmp_requeue(
+            &self,
+            source: &AtomicU32,
+            source_scope: FutexScope,
+            target: &AtomicU32,
+            target_scope: FutexScope,
+            expected: u32,
+            wake: u32,
+            requeue: u32,
+        ) -> Result<FutexRequeueOutcome, SyscallError> {
+            futex_cmp_requeue(
+                source.as_ptr(),
+                source_scope,
+                target.as_ptr(),
+                target_scope,
+                expected,
+                wake,
+                requeue,
+            )
+        }
+        #[inline]
+        fn monotonic_now(&self) -> Result<u64, SyscallError> {
+            clock_gettime(CLOCK_MONOTONIC)?
+                .as_ns()
+                .ok_or(SyscallError::Unavailable)
+        }
+    }
+
+    /// The absolute deadline `timeout` from now, read once. A duration wider than `u64`
+    /// nanoseconds, or a sum that overflows, is `InvalidArgs`; no clock is `Unavailable`.
+    pub fn deadline_after<O: FutexOps + ?Sized>(
+        ops: &O,
+        timeout: Duration,
+    ) -> Result<u64, SyscallError> {
+        let ns = u64::try_from(timeout.as_nanos()).map_err(|_| SyscallError::InvalidArgs)?;
+        ops.monotonic_now()?
+            .checked_add(ns)
+            .ok_or(SyscallError::InvalidArgs)
+    }
+
+    /// The outcome of a timed lock. The caller owns the mutex iff it is `Acquired`.
+    #[must_use]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LockOutcome {
+        /// The caller holds the mutex.
+        Acquired,
+        /// The deadline passed while another owner held the mutex. Not held.
+        TimedOut,
+        /// A system call or the clock failed (for example `Unavailable`: no monotonic clock).
+        /// Not held; nothing of the mutex was changed except that it may be marked contended.
+        Failed(SyscallError),
+    }
+
+    impl LockOutcome {
+        pub fn is_acquired(self) -> bool {
+            self == Self::Acquired
+        }
+    }
+
+    /// The outcome of one condition-variable wait. The caller holds the mutex again in EVERY
+    /// case.
+    #[must_use]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum WaitOutcome {
+        /// A signal or broadcast ended the wait, or it returned spuriously (the sequence had
+        /// already moved when the kernel compared it, or an unrelated wake): re-check the
+        /// condition.
+        Notified,
+        /// The deadline ended the wait on the sequence, or on the mutex word it had been
+        /// requeued to. The mutex was then reacquired (without a deadline).
+        TimedOut,
+        /// The wait failed (for example `Unavailable`, or an argument error); the mutex was
+        /// reacquired.
+        Failed(SyscallError),
+    }
+
+    /// The outcome of a predicate wait ([`FutexCondvar::wait_while_until`]). The caller holds
+    /// the mutex again in EVERY case.
+    #[must_use]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum WaitWhileOutcome {
+        /// The condition no longer asked to wait (evaluated under the mutex). This wins over a
+        /// timeout observed in the same round.
+        Satisfied,
+        /// The deadline passed and the condition, evaluated under the reacquired mutex, still
+        /// asked to wait.
+        TimedOut,
+        /// A wait or the clock failed. The condition was not evaluated after the failure.
+        Failed(SyscallError),
+    }
 
     /// A three-state futex mutex: `0` unlocked, `1` locked, `2` locked with possible waiters.
     pub struct FutexMutex {
@@ -2154,7 +2360,12 @@ pub mod futex_sync {
             &self.word
         }
 
+        /// Lock, waiting as long as it takes.
         pub fn lock(&self) {
+            self.lock_with(&Syscalls)
+        }
+
+        pub fn lock_with<O: FutexOps + ?Sized>(&self, ops: &O) {
             if self
                 .word
                 .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
@@ -2162,21 +2373,95 @@ pub mod futex_sync {
             {
                 return;
             }
-            self.lock_contended();
+            self.lock_contended_with(ops);
         }
 
         /// The slow path, and the path a woken or requeued condition waiter takes: it marks the
         /// word contended, because other waiters may be parked behind it.
         pub fn lock_contended(&self) {
+            self.lock_contended_with(&Syscalls)
+        }
+
+        pub fn lock_contended_with<O: FutexOps + ?Sized>(&self, ops: &O) {
             while self.word.swap(CONTENDED, Ordering::Acquire) != UNLOCKED {
-                let _ = futex_wait(self.word.as_ptr(), CONTENDED, self.scope);
+                let _ = ops.wait(&self.word, CONTENDED, self.scope, None);
             }
         }
 
-        /// Unlock; when the word was contended, wake one waiter. Returns how many were woken.
+        /// Lock, waiting at most until `deadline_ns` (absolute `CLOCK_MONOTONIC`). See the
+        /// module documentation for the boundary rules.
+        pub fn lock_until(&self, deadline_ns: u64) -> LockOutcome {
+            self.lock_until_with(&Syscalls, deadline_ns)
+        }
+
+        pub fn lock_until_with<O: FutexOps + ?Sized>(
+            &self,
+            ops: &O,
+            deadline_ns: u64,
+        ) -> LockOutcome {
+            if self
+                .word
+                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return LockOutcome::Acquired;
+            }
+            let mut waited = false;
+            loop {
+                if self.word.swap(CONTENDED, Ordering::Acquire) == UNLOCKED {
+                    return LockOutcome::Acquired;
+                }
+                // The word is `2` and another owner holds it: its unlock wakes the next waiter,
+                // so giving up from here strands nobody. After a return that was not a timeout
+                // (a wake, `ValueChanged`, spurious), the same deadline bounds the retry.
+                if waited {
+                    match ops.monotonic_now() {
+                        Ok(now) if now >= deadline_ns => return LockOutcome::TimedOut,
+                        Ok(_) => {}
+                        Err(e) => return LockOutcome::Failed(e),
+                    }
+                }
+                match ops.wait(&self.word, CONTENDED, self.scope, Some(deadline_ns)) {
+                    // The deadline claimed the wait (no wake was consumed). One last attempt:
+                    // a mutex free at the boundary is acquired.
+                    Ok(FutexTimedWait::TimedOut) => {
+                        return if self.word.swap(CONTENDED, Ordering::Acquire) == UNLOCKED {
+                            LockOutcome::Acquired
+                        } else {
+                            LockOutcome::TimedOut
+                        };
+                    }
+                    Ok(_) => waited = true,
+                    Err(e) => return LockOutcome::Failed(e),
+                }
+            }
+        }
+
+        /// [`Self::lock_until`] at the instant `timeout` from now, computed once.
+        pub fn lock_timeout(&self, timeout: Duration) -> LockOutcome {
+            self.lock_timeout_with(&Syscalls, timeout)
+        }
+
+        pub fn lock_timeout_with<O: FutexOps + ?Sized>(
+            &self,
+            ops: &O,
+            timeout: Duration,
+        ) -> LockOutcome {
+            match deadline_after(ops, timeout) {
+                Ok(deadline) => self.lock_until_with(ops, deadline),
+                Err(e) => LockOutcome::Failed(e),
+            }
+        }
+
+        /// Unlock; when the word was contended, wake one waiter. Returns how many were woken
+        /// (`0` does not mean that nobody is parked).
         pub fn unlock(&self) -> u32 {
+            self.unlock_with(&Syscalls)
+        }
+
+        pub fn unlock_with<O: FutexOps + ?Sized>(&self, ops: &O) -> u32 {
             if self.word.swap(UNLOCKED, Ordering::Release) == CONTENDED {
-                futex_wake(self.word.as_ptr(), 1, self.scope).unwrap_or(0)
+                ops.wake(&self.word, 1, self.scope).unwrap_or(0)
             } else {
                 0
             }
@@ -2185,6 +2470,14 @@ pub mod futex_sync {
 
     /// A condition variable over a sequence word. Waiters park on the sequence; a broadcast
     /// wakes at most one and requeues the rest onto the mutex.
+    ///
+    /// Every wait: the caller holds the mutex; the sequence is read while holding it; the mutex
+    /// is unlocked; the wait compares the sequence with that reading (so a notification between
+    /// the reading and the park is seen, as `ValueChanged`); then the mutex is reacquired
+    /// through the contended path, WITHOUT a deadline, on every return path, timeout and error
+    /// included. A timeout or error result is kept through that reacquisition. Preconditions
+    /// (not checked): the caller holds the mutex, and one condition variable is used with one
+    /// mutex.
     pub struct FutexCondvar {
         seq: AtomicU32,
         scope: FutexScope,
@@ -2217,42 +2510,151 @@ pub mod futex_sync {
         /// Wait. The caller holds `mutex`; it holds it again on return. Spurious returns are
         /// possible: re-check the predicate.
         pub fn wait(&self, mutex: &FutexMutex) {
-            let seen = self.seq.load(Ordering::Relaxed);
-            mutex.unlock();
-            let _ = futex_wait(self.seq.as_ptr(), seen, self.scope);
-            // Woken from the sequence, or from the mutex after a requeue: other waiters may be
-            // parked on the mutex, so take it in the contended state.
-            mutex.lock_contended();
+            self.wait_with(&Syscalls, mutex)
         }
 
-        /// FUTEX-TIME1 / FUTEX-ABS-BITSET1 — [`Self::wait`] for at most `timeout`: ONE wait on
-        /// the absolute `CLOCK_MONOTONIC` instant `timeout` from now (read once). Returns `true`
-        /// iff the DEADLINE ended the wait (an error, such as no monotonic clock, is `false`, as
-        /// before; the wait is then never made untimed). Either way the caller holds `mutex` again on
-        /// return: a waiter a broadcast requeued onto the mutex word keeps its deadline there,
-        /// and still takes the mutex before returning. Spurious returns are possible: re-check
-        /// the predicate. This is not a timed condition variable (no re-wait loop, no mutex
-        /// timeout): those are a later contract.
-        pub fn wait_timeout(&self, mutex: &FutexMutex, timeout: core::time::Duration) -> bool {
+        pub fn wait_with<O: FutexOps + ?Sized>(&self, ops: &O, mutex: &FutexMutex) {
             let seen = self.seq.load(Ordering::Relaxed);
-            mutex.unlock();
-            let timed_out = matches!(
-                futex_wait_timeout(self.seq.as_ptr(), seen, self.scope, timeout),
-                Ok(FutexTimedWait::TimedOut)
-            );
-            mutex.lock_contended();
-            timed_out
+            mutex.unlock_with(ops);
+            let _ = ops.wait(&self.seq, seen, self.scope, None);
+            // Woken from the sequence, or from the mutex after a requeue: other waiters may be
+            // parked on the mutex, so take it in the contended state.
+            mutex.lock_contended_with(ops);
+        }
+
+        /// One wait, until a notification, a spurious return or `deadline_ns` (absolute
+        /// `CLOCK_MONOTONIC`). The caller holds `mutex`, and holds it again on EVERY return.
+        pub fn wait_until(&self, mutex: &FutexMutex, deadline_ns: u64) -> WaitOutcome {
+            self.wait_until_with(&Syscalls, mutex, deadline_ns)
+        }
+
+        pub fn wait_until_with<O: FutexOps + ?Sized>(
+            &self,
+            ops: &O,
+            mutex: &FutexMutex,
+            deadline_ns: u64,
+        ) -> WaitOutcome {
+            let seen = self.seq.load(Ordering::Relaxed);
+            mutex.unlock_with(ops);
+            let result = ops.wait(&self.seq, seen, self.scope, Some(deadline_ns));
+            // Mandatory, and NOT bounded by the deadline: the result is kept, and returned with
+            // the mutex held. (A waiter requeued onto the mutex that times out there takes this
+            // same path; the contended reacquisition keeps the unlock chain behind it.)
+            mutex.lock_contended_with(ops);
+            match result {
+                Ok(FutexTimedWait::TimedOut) => WaitOutcome::TimedOut,
+                Ok(_) => WaitOutcome::Notified,
+                Err(e) => WaitOutcome::Failed(e),
+            }
+        }
+
+        /// [`Self::wait_until`] at the instant `timeout` from now. The deadline is computed
+        /// before the mutex is released: a failure to compute it returns with the mutex never
+        /// released.
+        pub fn wait_timeout(&self, mutex: &FutexMutex, timeout: Duration) -> WaitOutcome {
+            self.wait_timeout_with(&Syscalls, mutex, timeout)
+        }
+
+        pub fn wait_timeout_with<O: FutexOps + ?Sized>(
+            &self,
+            ops: &O,
+            mutex: &FutexMutex,
+            timeout: Duration,
+        ) -> WaitOutcome {
+            match deadline_after(ops, timeout) {
+                Ok(deadline) => self.wait_until_with(ops, mutex, deadline),
+                Err(e) => WaitOutcome::Failed(e),
+            }
+        }
+
+        /// Wait while `keep_waiting()` returns `true`, until `deadline_ns`. `keep_waiting` is
+        /// evaluated only with `mutex` held: first, and after every reacquisition. A
+        /// notification or spurious return is never taken as satisfaction; after one, the
+        /// condition is re-checked and then the ORIGINAL deadline, so a stream of sequence
+        /// changes cannot carry the wait past it. A condition that no longer asks to wait wins
+        /// over a timeout observed in the same round. Returns with `mutex` held in every case.
+        pub fn wait_while_until<F: FnMut() -> bool>(
+            &self,
+            mutex: &FutexMutex,
+            deadline_ns: u64,
+            keep_waiting: F,
+        ) -> WaitWhileOutcome {
+            self.wait_while_until_with(&Syscalls, mutex, deadline_ns, keep_waiting)
+        }
+
+        pub fn wait_while_until_with<O: FutexOps + ?Sized, F: FnMut() -> bool>(
+            &self,
+            ops: &O,
+            mutex: &FutexMutex,
+            deadline_ns: u64,
+            mut keep_waiting: F,
+        ) -> WaitWhileOutcome {
+            if !keep_waiting() {
+                return WaitWhileOutcome::Satisfied;
+            }
+            loop {
+                match self.wait_until_with(ops, mutex, deadline_ns) {
+                    WaitOutcome::Notified => {
+                        if !keep_waiting() {
+                            return WaitWhileOutcome::Satisfied;
+                        }
+                        match ops.monotonic_now() {
+                            Ok(now) if now >= deadline_ns => return WaitWhileOutcome::TimedOut,
+                            Ok(_) => {}
+                            Err(e) => return WaitWhileOutcome::Failed(e),
+                        }
+                    }
+                    WaitOutcome::TimedOut => {
+                        return if keep_waiting() {
+                            WaitWhileOutcome::TimedOut
+                        } else {
+                            WaitWhileOutcome::Satisfied
+                        };
+                    }
+                    WaitOutcome::Failed(e) => return WaitWhileOutcome::Failed(e),
+                }
+            }
+        }
+
+        /// [`Self::wait_while_until`] at the instant `timeout` from now, computed ONCE, before
+        /// the condition is first evaluated and before anything is released (a failure to compute
+        /// it is returned with the mutex never released, even if the condition already holds).
+        pub fn wait_while_timeout<F: FnMut() -> bool>(
+            &self,
+            mutex: &FutexMutex,
+            timeout: Duration,
+            keep_waiting: F,
+        ) -> WaitWhileOutcome {
+            self.wait_while_timeout_with(&Syscalls, mutex, timeout, keep_waiting)
+        }
+
+        pub fn wait_while_timeout_with<O: FutexOps + ?Sized, F: FnMut() -> bool>(
+            &self,
+            ops: &O,
+            mutex: &FutexMutex,
+            timeout: Duration,
+            keep_waiting: F,
+        ) -> WaitWhileOutcome {
+            match deadline_after(ops, timeout) {
+                Ok(deadline) => self.wait_while_until_with(ops, mutex, deadline, keep_waiting),
+                Err(e) => WaitWhileOutcome::Failed(e),
+            }
         }
 
         pub fn signal(&self) {
+            self.signal_with(&Syscalls)
+        }
+
+        pub fn signal_with<O: FutexOps + ?Sized>(&self, ops: &O) {
             self.seq.fetch_add(1, Ordering::Release);
-            let _ = futex_wake(self.seq.as_ptr(), 1, self.scope);
+            let _ = ops.wake(&self.seq, 1, self.scope);
         }
 
         /// Broadcast. The caller MUST hold `mutex`. At most one waiter is made runnable; every
         /// other waiter is moved, still blocked, to the mutex word, and each later unlock wakes
         /// the next. The word is set to `CONTENDED` first, so the unlock that follows cannot skip
-        /// that wake.
+        /// that wake. A moved timed waiter keeps its deadline on the mutex word; if it expires
+        /// there it still reacquires the mutex before returning.
         ///
         /// Why not "re-issue the wake until it returns 0": a wake that returns 0 may have stopped
         /// at a waiter with no run-queue room, which stays parked. NR 17 reports that case
@@ -2261,6 +2663,14 @@ pub mod futex_sync {
         /// is kept for older semantics; it normally moves nothing, and anything it does move parked
         /// after the bump and sees a spurious wake, which a condition variable allows.
         pub fn broadcast(&self, mutex: &FutexMutex) -> BroadcastReport {
+            self.broadcast_with(&Syscalls, mutex)
+        }
+
+        pub fn broadcast_with<O: FutexOps + ?Sized>(
+            &self,
+            ops: &O,
+            mutex: &FutexMutex,
+        ) -> BroadcastReport {
             let seq = self.seq.fetch_add(1, Ordering::Release).wrapping_add(1);
             mutex.word.store(CONTENDED, Ordering::Relaxed);
             let mut report = BroadcastReport::default();
@@ -2269,10 +2679,10 @@ pub mod futex_sync {
             // run-queue room and so cannot be capacity-limited.
             for _ in 0..2 {
                 report.calls += 1;
-                match futex_cmp_requeue(
-                    self.seq.as_ptr(),
+                match ops.cmp_requeue(
+                    &self.seq,
                     self.scope,
-                    mutex.word.as_ptr(),
+                    &mutex.word,
                     mutex.scope,
                     seq,
                     wake,
@@ -2290,8 +2700,7 @@ pub mod futex_sync {
                         // A signal moved the sequence: every waiter that parked before it is
                         // still on the sequence. Correct, if not efficient: wake them all.
                         report.fell_back_to_wake_all = true;
-                        report.woken +=
-                            futex_wake(self.seq.as_ptr(), u32::MAX, self.scope).unwrap_or(0);
+                        report.woken += ops.wake(&self.seq, u32::MAX, self.scope).unwrap_or(0);
                         break;
                     }
                     Err(_) => break,
@@ -2850,6 +3259,11 @@ pub mod process {
 }
 
 pub mod vfs_client;
+
+// FUTEX-SYNC-TIME1: the timed mutex / condition variable, over deterministic and emulated futex
+// backends (the production code through its `FutexOps` seam).
+#[cfg(test)]
+mod futex_sync_tests;
 
 #[cfg(test)]
 mod tests {

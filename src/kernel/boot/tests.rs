@@ -215602,16 +215602,36 @@ mod futex_requeue1 {
             }
         }
         // The user runtime implements the protected protocol, not the hazard.
+        // FUTEX-SYNC-TIME1 re-derivation: the bodies moved into the `*_with(ops, ..)` forms (the
+        // plain `broadcast` / `wait` are those bodies over `Syscalls`, the real NR 17 / NR 9), so
+        // the guard reads them there; the protocol checked is unchanged.
         const USER_RT: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+        assert!(USER_RT.contains("self.broadcast_with(&Syscalls, mutex)"));
+        assert!(USER_RT.contains("self.wait_with(&Syscalls, mutex)"));
         let bc = &USER_RT[USER_RT
-            .find("pub fn broadcast(&self, mutex: &FutexMutex)")
+            .find("pub fn broadcast_with<O: FutexOps + ?Sized>(")
             .expect("broadcast")..];
         let store = bc
             .find("mutex.word.store(CONTENDED")
             .expect("contended store");
-        let call = bc.find("futex_cmp_requeue(").expect("requeue");
+        let call = bc.find("ops.cmp_requeue(").expect("requeue");
         assert!(store < call, "the contended store precedes the requeue");
-        assert!(USER_RT.contains("let _ = futex_wait(self.seq.as_ptr(), seen, self.scope);\n            // Woken from the sequence, or from the mutex after a requeue: other waiters may be\n            // parked on the mutex, so take it in the contended state.\n            mutex.lock_contended();"));
+        assert!(USER_RT.contains("let _ = ops.wait(&self.seq, seen, self.scope, None);\n            // Woken from the sequence, or from the mutex after a requeue: other waiters may be\n            // parked on the mutex, so take it in the contended state.\n            mutex.lock_contended_with(ops);"));
+        // The timed wait reacquires through the same contended path, unconditionally.
+        let tw = &USER_RT[USER_RT
+            .find("pub fn wait_until_with<O: FutexOps + ?Sized>(")
+            .expect("wait_until_with")..];
+        let park = tw
+            .find("let result = ops.wait(&self.seq, seen, self.scope, Some(deadline_ns));")
+            .expect("the timed park");
+        let relock = tw
+            .find("mutex.lock_contended_with(ops);")
+            .expect("the reacquisition");
+        let decide = tw.find("match result {").expect("the result");
+        assert!(
+            park < relock && relock < decide,
+            "reacquired before any result is returned"
+        );
     }
 
     /// ABI v11: NR 17 decodes to `FutexCmpRequeue`, the result mapping is unambiguous on every
@@ -218576,6 +218596,634 @@ mod futex_requeue1 {
             assert_eq!(completion(&w.s, t), None);
             let k = leak(w.s);
             assert_eq!(collect(k, u64::MAX), FutexTimeoutPass::default());
+        }
+    }
+
+    /// FUTEX-SYNC-TIME1 — the user runtime's REAL `futex_sync` code (`yarm_user_rt`, through its
+    /// `FutexOps` seam) against the kernel's production futex owners.
+    ///
+    /// Each user task runs the runtime on its own host thread. Every kernel call goes through
+    /// [`Harness::kernel`], which serializes on the shared kernel, makes that task current, and
+    /// first copies every registered runtime word (a host `AtomicU32`) into the task's user page,
+    /// so the kernel compares exactly the value the runtime holds (the kernel only ever reads
+    /// futex words). A wait that blocks returns only once its task has left `Blocked` AND is
+    /// dispatchable (queued or current) — so a waiter settled while budget-parked stays inside
+    /// its call until it is replenished — and, for a timed cycle, reports the kernel's own
+    /// completion. The test's main thread plays the environment: the clock, the collector, the
+    /// budget ticks, and holds that keep a woken task from resuming until a chosen moment.
+    mod sync_time1 {
+        use super::*;
+        use crate::kernel::boot::FutexWaitBroadOutcome as B;
+        use crate::kernel::boot::futex::{
+            FUTEX_BITSET_MATCH_ANY as ANY, FutexDeadline, FutexNow, FutexWaitTiming,
+        };
+        use crate::kernel::task::BlockedSyscallClass;
+        use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+        use std::collections::BTreeSet;
+        use std::time::{Duration as HostDuration, Instant};
+        use yarm_user_rt::futex_sync::{
+            CONTENDED, FutexCondvar, FutexMutex, FutexOps, LockOutcome, WaitOutcome,
+            WaitWhileOutcome,
+        };
+        use yarm_user_rt::syscall::{
+            FutexRequeueOutcome as UOut, FutexScope as UScope, FutexTimedWait as UW,
+            SyscallError as UErr,
+        };
+
+        const MS: u64 = 1_000_000;
+        const STRANDED: HostDuration = HostDuration::from_secs(20);
+        /// Consecutive waits of one task that returned without parking, beyond which the code
+        /// under test is spinning: it fails the test instead of exhausting the host.
+        const BUSY: u32 = 10_000;
+        std::thread_local! {
+            static UNPARKED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+        }
+        fn unparked() {
+            UNPARKED.with(|c| {
+                let n = c.get() + 1;
+                c.set(n);
+                assert!(
+                    n < BUSY,
+                    "busy polling: {n} waits in a row returned without parking"
+                );
+            });
+        }
+        /// A shared word on the MemoryObject page `world` maps at 0x8_0000 (value 0).
+        const SHW: usize = 0x8_0000;
+
+        fn mono_clock() -> std::sync::MutexGuard<'static, ()> {
+            let g = crate::kernel::timekeeping::CLOCK_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::arch::clock::HOSTED_COUNTER.store(0, SeqCst);
+            crate::kernel::timekeeping::force_source_for_test(
+                1_000_000_000,
+                0,
+                crate::kernel::timekeeping::SourceKind::Hosted,
+            );
+            g
+        }
+        fn set_now(ns: u64) {
+            crate::arch::clock::HOSTED_COUNTER.store(ns, SeqCst);
+        }
+
+        struct Harness {
+            k: &'static SharedKernel,
+            /// (host word address, its VA in the process, its kind)
+            words: Vec<(usize, usize, FutexKind)>,
+            held: std::sync::Mutex<BTreeSet<u64>>,
+        }
+
+        impl Harness {
+            fn new(k: &'static SharedKernel, words: &[(&AtomicU32, usize, FutexKind)]) -> Self {
+                Self {
+                    k,
+                    words: words
+                        .iter()
+                        .map(|(w, va, kind)| (w.as_ptr() as usize, *va, *kind))
+                        .collect(),
+                    held: std::sync::Mutex::new(BTreeSet::new()),
+                }
+            }
+            fn va(&self, word: &AtomicU32) -> (usize, FutexKind) {
+                let a = word.as_ptr() as usize;
+                let (_, va, kind) = *self
+                    .words
+                    .iter()
+                    .find(|(h, _, _)| *h == a)
+                    .expect("a registered runtime word");
+                (va, kind)
+            }
+            /// One kernel call as `tid`: the words synced into its page, `tid` current.
+            fn kernel<R>(&self, tid: u64, f: impl FnOnce(&mut KernelState) -> R) -> R {
+                self.k.with(|s| {
+                    for &(h, va, _) in &self.words {
+                        // SAFETY: registered words are 'static runtime objects of the test.
+                        let v = unsafe { &*(h as *const AtomicU32) }.load(SeqCst);
+                        word(s, tid, va, v);
+                    }
+                    run(s, tid);
+                    f(s)
+                })
+            }
+            fn hold(&self, tid: u64) {
+                self.held.lock().unwrap().insert(tid);
+            }
+            fn release(&self, tid: u64) {
+                self.held.lock().unwrap().remove(&tid);
+            }
+            fn dispatchable(&self, tid: u64) -> bool {
+                !self.held.lock().unwrap().contains(&tid)
+                    && self.k.with(|s| {
+                        !parked(s, tid)
+                            && (s.current_tid() == Some(tid) || queued_count(s, tid) == 1)
+                    })
+            }
+            /// The main thread waits for a state the tasks reach (never for a timer).
+            fn until(&self, what: &str, mut f: impl FnMut(&mut KernelState) -> bool) {
+                let start = Instant::now();
+                while !self.k.with(&mut f) {
+                    assert!(start.elapsed() < STRANDED, "never reached: {what}");
+                    std::thread::sleep(HostDuration::from_millis(1));
+                }
+            }
+            fn collect(&self) -> crate::kernel::boot::futex::FutexTimeoutPass {
+                self.k.run_due_futex_timeouts_at(
+                    CpuId(0),
+                    FutexNow::read(self.k.scheduler_clock_now()),
+                )
+            }
+            fn as_task(&self, tid: u64) -> T<'_> {
+                T { h: self, tid }
+            }
+        }
+
+        /// The runtime's `FutexOps` for one task.
+        struct T<'h> {
+            h: &'h Harness,
+            tid: u64,
+        }
+
+        impl FutexOps for T<'_> {
+            fn wait(
+                &self,
+                w: &AtomicU32,
+                expected: u32,
+                _scope: UScope,
+                deadline: Option<u64>,
+            ) -> Result<UW, UErr> {
+                let (va, kind) = self.h.va(w);
+                let timing = deadline.map_or(FutexWaitTiming::Untimed, |d| {
+                    FutexWaitTiming::Deadline(FutexDeadline::MonotonicNs(d))
+                });
+                let r = self.h.kernel(self.tid, |s| {
+                    s.futex_wait_current_timed(va, expected, kind, timing, ANY)
+                });
+                if !matches!(r, Ok(B::Blocked { .. })) {
+                    unparked();
+                }
+                match r {
+                    Ok(B::NotBlocked) => Ok(UW::ValueChanged),
+                    Ok(B::TimedOut) => Ok(UW::TimedOut),
+                    Ok(B::ClockUnavailable) => Err(UErr::Unavailable),
+                    Ok(B::InvalidMask) => Err(UErr::InvalidArgs),
+                    Ok(B::Blocked { timed }) => {
+                        UNPARKED.with(|c| c.set(0));
+                        let start = Instant::now();
+                        while !self.h.dispatchable(self.tid) {
+                            assert!(start.elapsed() < STRANDED, "task {} stranded", self.tid);
+                            std::thread::sleep(HostDuration::from_millis(1));
+                        }
+                        if !timed {
+                            return Ok(UW::Woken);
+                        }
+                        let c = self
+                            .h
+                            .k
+                            .with(|s| s.take_resume_completion(self.tid))
+                            .expect("a timed cycle completes exactly once");
+                        assert_eq!(c.syscall_class, BlockedSyscallClass::FutexWait);
+                        Ok(match c.result {
+                            0 => UW::Woken,
+                            9 => UW::TimedOut,
+                            other => panic!("FutexWait completion {other}"),
+                        })
+                    }
+                    Err(_) => Err(UErr::InvalidArgs),
+                }
+            }
+            fn wake(&self, w: &AtomicU32, count: u32, _scope: UScope) -> Result<u32, UErr> {
+                let (va, kind) = self.h.va(w);
+                self.h
+                    .kernel(self.tid, |s| s.futex_wake_masked(va, count, kind, ANY))
+                    .map_err(|_| UErr::InvalidArgs)
+            }
+            fn cmp_requeue(
+                &self,
+                source: &AtomicU32,
+                _ss: UScope,
+                target: &AtomicU32,
+                _ts: UScope,
+                expected: u32,
+                wake: u32,
+                requeue: u32,
+            ) -> Result<UOut, UErr> {
+                let (sva, sk) = self.h.va(source);
+                let (tva, tk) = self.h.va(target);
+                match self.h.kernel(self.tid, |s| {
+                    s.futex_cmp_requeue_current((sva, sk), (tva, tk), expected, wake, requeue)
+                }) {
+                    Ok(o) => Ok(UOut {
+                        woken: o.woken,
+                        requeued: o.requeued,
+                        capacity_limited: o.capacity_limited,
+                    }),
+                    Err(R::ValueChanged) => Err(UErr::WouldBlock),
+                    Err(_) => Err(UErr::InvalidArgs),
+                }
+            }
+            fn monotonic_now(&self) -> Result<u64, UErr> {
+                crate::kernel::timekeeping::monotonic_ns().map_err(|_| UErr::Unavailable)
+            }
+        }
+
+        fn deadline(s: &mut KernelState, t: u64) -> Option<u64> {
+            let token = token_of(s, t)?;
+            s.with_task_futex_mut(|_t, table| table.deadline_of(token).map(FutexDeadline::raw))
+        }
+        fn on_key(s: &mut KernelState, t: u64, k: FutexKey) -> bool {
+            token_of(s, t).is_some_and(|tok| key_of(s, tok) == Some(k))
+        }
+        fn keep<T>(v: T) -> &'static T {
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(v))
+        }
+        /// A new task of the process (queued, not current).
+        fn new_task(w: &mut W) -> u64 {
+            let t = w.next;
+            w.next += 1;
+            task(&mut w.s, t, w.a);
+            t
+        }
+        /// Exclusive-ownership check made by a task on return: set and clear an owner slot.
+        fn owns(owner: &AtomicU32, tid: u64) {
+            assert_eq!(
+                owner.compare_exchange(0, tid as u32, SeqCst, SeqCst),
+                Ok(0),
+                "{tid} returned without exclusive ownership"
+            );
+            owner.store(0, SeqCst);
+        }
+
+        /// 1 — a timed lock that the kernel's collector times out: `TimedOut`, not held; the
+        /// owner's lock is intact; the kernel record is gone (the owner's wake finds nobody).
+        #[test]
+        fn st01_timed_lock_times_out_through_the_collector() {
+            let _clk = mono_clock();
+            let mut w = world(79000);
+            let (o, t1) = (new_task(&mut w), new_task(&mut w));
+            let k = leak(w.s);
+            let m = keep(FutexMutex::new(UScope::Private));
+            let h = Harness::new(k, &[(m.word(), MX, P)]);
+            m.lock_with(&h.as_task(o)); // fast path
+            std::thread::scope(|sc| {
+                let hh = &h;
+                let j = sc.spawn(move || m.lock_until_with(&hh.as_task(t1), 10 * MS));
+                h.until("t1 parked", |s| parked(s, t1));
+                assert_eq!(h.k.with(|s| deadline(s, t1)), Some(10 * MS));
+                set_now(10 * MS);
+                assert_eq!(h.collect().timed_out, 1);
+                assert_eq!(j.join().unwrap(), LockOutcome::TimedOut);
+            });
+            assert_eq!(m.word().load(SeqCst), CONTENDED);
+            assert_eq!(
+                m.unlock_with(&h.as_task(o)),
+                0,
+                "the record was retired by the timeout"
+            );
+            k.with(|s| assert_eq!(occupied(s), 0));
+        }
+
+        /// 2 — THE HANDOFF CASE through the kernel: the owner's unlock gives its only wake to
+        /// the timed waiter t1; t1 resumes only after its deadline (held), finds the mutex free
+        /// and acquires it; its unlock then wakes t2, parked behind it, which acquires. Nobody
+        /// is stranded on an unlocked mutex.
+        #[test]
+        fn st02_sole_wake_after_the_deadline_hands_the_mutex_on() {
+            let _clk = mono_clock();
+            let mut w = world(79100);
+            let (o, t1, t2) = (new_task(&mut w), new_task(&mut w), new_task(&mut w));
+            let k = leak(w.s);
+            let m = keep(FutexMutex::new(UScope::Private));
+            let owner = keep(AtomicU32::new(0));
+            let h = Harness::new(k, &[(m.word(), MX, P)]);
+            m.lock_with(&h.as_task(o));
+            std::thread::scope(|sc| {
+                let hh = &h;
+                let j1 = sc.spawn(move || {
+                    let r = m.lock_until_with(&hh.as_task(t1), 10 * MS);
+                    if r.is_acquired() {
+                        owns(owner, t1);
+                        m.unlock_with(&hh.as_task(t1));
+                    }
+                    r
+                });
+                h.until("t1 parked", |s| parked(s, t1));
+                let j2 = sc.spawn(move || {
+                    m.lock_with(&hh.as_task(t2));
+                    owns(owner, t2);
+                    m.unlock_with(&hh.as_task(t2));
+                });
+                h.until("t2 parked", |s| parked(s, t2));
+                h.hold(t1);
+                assert_eq!(m.unlock_with(&h.as_task(o)), 1, "the sole wake");
+                h.until("t1 woken", |s| !parked(s, t1));
+                assert!(h.k.with(|s| parked(s, t2)), "t2 still parked behind");
+                set_now(50 * MS);
+                assert_eq!(
+                    h.collect().timed_out,
+                    0,
+                    "the wake already owned t1's cycle"
+                );
+                h.release(t1);
+                assert_eq!(j1.join().unwrap(), LockOutcome::Acquired);
+                j2.join().unwrap();
+            });
+            assert_eq!(m.word().load(SeqCst), 0);
+            k.with(|s| assert_eq!(occupied(s), 0));
+        }
+
+        /// 3 — the handoff, lost to a barger: after the sole wake a third task takes the free
+        /// mutex before t1 resumes (late). t1 gives up (`TimedOut`), but its swap left the word
+        /// CONTENDED, so the barger's unlock wakes t2, which acquires.
+        #[test]
+        fn st03_sole_wake_lost_to_a_barger_keeps_the_chain() {
+            let _clk = mono_clock();
+            let mut w = world(79200);
+            let (o, t1, t2, bg) = (
+                new_task(&mut w),
+                new_task(&mut w),
+                new_task(&mut w),
+                new_task(&mut w),
+            );
+            let k = leak(w.s);
+            let m = keep(FutexMutex::new(UScope::Private));
+            let got2 = keep(AtomicBool::new(false));
+            let h = Harness::new(k, &[(m.word(), MX, P)]);
+            m.lock_with(&h.as_task(o));
+            std::thread::scope(|sc| {
+                let hh = &h;
+                let j1 = sc.spawn(move || m.lock_until_with(&hh.as_task(t1), 10 * MS));
+                h.until("t1 parked", |s| parked(s, t1));
+                let j2 = sc.spawn(move || {
+                    m.lock_with(&hh.as_task(t2));
+                    got2.store(true, SeqCst);
+                    m.unlock_with(&hh.as_task(t2));
+                });
+                h.until("t2 parked", |s| parked(s, t2));
+                h.hold(t1);
+                assert_eq!(m.unlock_with(&h.as_task(o)), 1);
+                m.lock_with(&h.as_task(bg)); // the barger, fast path on the free word
+                set_now(50 * MS);
+                h.release(t1);
+                assert_eq!(j1.join().unwrap(), LockOutcome::TimedOut);
+                assert_eq!(m.word().load(SeqCst), CONTENDED, "the barger owes the wake");
+                assert!(!got2.load(SeqCst));
+                assert_eq!(m.unlock_with(&h.as_task(bg)), 1, "and pays it");
+                j2.join().unwrap();
+            });
+            assert!(got2.load(SeqCst));
+            k.with(|s| assert_eq!(occupied(s), 0));
+        }
+
+        /// 4 — broadcast with mixed waiters, and a timed waiter that times out AFTER the requeue,
+        /// on the mutex word, while the broadcaster holds the mutex; waiters behind it. Every
+        /// waiter returns holding the mutex; x returns `TimedOut`; its deadline survived the
+        /// requeue unchanged; the unlock chain reaches everyone.
+        #[test]
+        fn st04_timeout_after_requeue_with_waiters_behind() {
+            let _clk = mono_clock();
+            let mut w = world(79300);
+            let (b, a, x, c) = (
+                new_task(&mut w),
+                new_task(&mut w),
+                new_task(&mut w),
+                new_task(&mut w),
+            );
+            let mx = w.k(MX);
+            let k = leak(w.s);
+            let m = keep(FutexMutex::new(UScope::Private));
+            let cv = keep(FutexCondvar::new(UScope::Private));
+            let owner = keep(AtomicU32::new(0));
+            let h = Harness::new(k, &[(m.word(), MX, P), (cv.seq(), SQ, P)]);
+            std::thread::scope(|sc| {
+                let hh = &h;
+                let ja = sc.spawn(move || {
+                    let ops = hh.as_task(a);
+                    m.lock_with(&ops);
+                    cv.wait_with(&ops, m);
+                    owns(owner, a);
+                    m.unlock_with(&ops);
+                });
+                h.until("a parked", |s| parked(s, a));
+                let jx = sc.spawn(move || {
+                    let ops = hh.as_task(x);
+                    m.lock_with(&ops);
+                    let r = cv.wait_until_with(&ops, m, 10 * MS);
+                    owns(owner, x);
+                    m.unlock_with(&ops);
+                    r
+                });
+                h.until("x parked", |s| parked(s, x));
+                let jc = sc.spawn(move || {
+                    let ops = hh.as_task(c);
+                    m.lock_with(&ops);
+                    let r = cv.wait_until_with(&ops, m, 1_000 * MS);
+                    owns(owner, c);
+                    m.unlock_with(&ops);
+                    r
+                });
+                h.until("c parked", |s| parked(s, c));
+                let ob = h.as_task(b);
+                m.lock_with(&ob);
+                let r = cv.broadcast_with(&ob, m);
+                assert_eq!((r.woken, r.requeued), (1, 2), "a woken, x and c moved");
+                h.until("x and c on the mutex, a re-parked there", |s| {
+                    on_key(s, x, mx) && on_key(s, c, mx) && on_key(s, a, mx)
+                });
+                assert_eq!(
+                    h.k.with(|s| deadline(s, x)),
+                    Some(10 * MS),
+                    "kept by the requeue"
+                );
+                set_now(10 * MS);
+                assert_eq!(h.collect().timed_out, 1, "x times out on the mutex word");
+                h.until("x re-parked untimed on the mutex", |s| {
+                    on_key(s, x, mx) && deadline(s, x).is_none()
+                });
+                assert_eq!(owner.load(SeqCst), 0, "nobody returned without the mutex");
+                m.unlock_with(&ob);
+                ja.join().unwrap();
+                assert_eq!(jx.join().unwrap(), WaitOutcome::TimedOut);
+                assert_eq!(jc.join().unwrap(), WaitOutcome::Notified);
+            });
+            assert_eq!(m.word().load(SeqCst), 0);
+            k.with(|s| assert_eq!(occupied(s), 0));
+        }
+
+        /// 5 — the predicate wait through the kernel: a signal without the condition re-waits
+        /// with the SAME deadline (the kernel's own record shows it), the real notification
+        /// satisfies it; returned with the mutex held.
+        #[test]
+        fn st05_predicate_rewait_keeps_one_deadline_in_the_kernel() {
+            let _clk = mono_clock();
+            let mut w = world(79400);
+            let (n, t1) = (new_task(&mut w), new_task(&mut w));
+            let k = leak(w.s);
+            let m = keep(FutexMutex::new(UScope::Private));
+            let cv = keep(FutexCondvar::new(UScope::Private));
+            let ready = keep(AtomicBool::new(false));
+            let owner = keep(AtomicU32::new(0));
+            let h = Harness::new(k, &[(m.word(), MX, P), (cv.seq(), SQ, P)]);
+            set_now(MS);
+            std::thread::scope(|sc| {
+                let hh = &h;
+                let j = sc.spawn(move || {
+                    let ops = hh.as_task(t1);
+                    m.lock_with(&ops);
+                    let r = cv.wait_while_until_with(&ops, m, 40 * MS, || !ready.load(SeqCst));
+                    owns(owner, t1);
+                    m.unlock_with(&ops);
+                    r
+                });
+                h.until("t1 parked", |s| parked(s, t1));
+                let first = h.k.with(|s| token_of(s, t1));
+                assert_eq!(h.k.with(|s| deadline(s, t1)), Some(40 * MS));
+                cv.signal_with(&h.as_task(n)); // no condition change: a spurious return
+                h.until("t1 re-parked", |s| {
+                    parked(s, t1) && token_of(s, t1) != first
+                });
+                assert_eq!(
+                    h.k.with(|s| deadline(s, t1)),
+                    Some(40 * MS),
+                    "the same instant"
+                );
+                let on = h.as_task(n);
+                m.lock_with(&on);
+                ready.store(true, SeqCst);
+                cv.signal_with(&on);
+                m.unlock_with(&on);
+                assert_eq!(j.join().unwrap(), WaitWhileOutcome::Satisfied);
+            });
+            k.with(|s| assert_eq!(occupied(s), 0));
+        }
+
+        /// 6 — RT with budgets: a condition waiter whose budget is exhausted is settled by its
+        /// timeout as Ready but budget-parked; it stays inside its wait (not dispatchable, no
+        /// queue position) until replenishment, then reacquires the mutex and returns
+        /// `TimedOut`, once, at the unchanged deadline, holding the mutex.
+        #[test]
+        fn st06_rt_budget_parked_waiter_returns_after_replenishment_with_the_mutex() {
+            use crate::kernel::sched_budget::BudgetParams;
+            use crate::kernel::scheduler::{SchedProfile, TaskPriority};
+            use crate::kernel::task_enqueue as te;
+            struct Gp(&'static SharedKernel);
+            impl Drop for Gp {
+                fn drop(&mut self) {
+                    let _ = self.0.sched_domain().set_budget(false);
+                    self.0
+                        .sched_domain()
+                        .set_profile(SchedProfile::GeneralPurpose);
+                }
+            }
+            let _clk = mono_clock();
+            let w = world(79500);
+            let a = w.a;
+            let k = leak(w.s);
+            k.sched_domain().set_profile(SchedProfile::RealTime);
+            assert!(k.sched_domain().set_budget(true));
+            let _gp = Gp(k);
+            let t1 = 79_900;
+            k.with(|s| s.register_task_with_class(t1, TaskClass::App))
+                .expect("task");
+            k.with_task_enqueue_policy_split_mut(|tcbs, _| {
+                te::configure_priority_locked(tcbs, t1, TaskPriority::from_level(4).unwrap())
+                    .expect("priority");
+                te::configure_budget_locked(tcbs, t1, BudgetParams::validate(2, 50).unwrap())
+                    .expect("budget")
+            });
+            k.with(|s| {
+                s.bind_task_asid(t1, a).expect("bind");
+                s.set_task_status_for_test(t1, TaskStatus::Runnable);
+                s.seed_resumable_user_context_for_test(t1);
+                s.set_task_home_cpu(t1, CpuId(0)).expect("home");
+            });
+            assert_eq!(k.enqueue_on_cpu_split(CpuId(0), t1), Ok(CpuId(0)));
+            let ctx = || {
+                k.with_cpu_sched_split(CpuId(0), |c| c.context_of(ThreadId(t1)))
+                    .expect("cpu")
+                    .expect("bound")
+            };
+            let bound = ctx().bound_at();
+            let m = keep(FutexMutex::new(UScope::Private));
+            let cv = keep(FutexCondvar::new(UScope::Private));
+            let owner = keep(AtomicU32::new(0));
+            let returned = keep(AtomicBool::new(false));
+            let h = Harness::new(k, &[(m.word(), MX, P), (cv.seq(), SQ, P)]);
+            // t1 runs its budget out before it waits.
+            k.with(|s| run(s, t1));
+            for _ in 0..2 {
+                k.with_cpu_sched_split(CpuId(0), |c| c.tick())
+                    .expect("cpu0");
+            }
+            assert!(ctx().exhausted());
+            std::thread::scope(|sc| {
+                let hh = &h;
+                let j = sc.spawn(move || {
+                    let ops = hh.as_task(t1);
+                    m.lock_with(&ops);
+                    let r = cv.wait_until_with(&ops, m, 10 * MS);
+                    owns(owner, t1);
+                    returned.store(true, SeqCst);
+                    m.unlock_with(&ops);
+                    r
+                });
+                h.until("t1 parked", |s| parked(s, t1));
+                assert_eq!(h.k.with(|s| deadline(s, t1)), Some(10 * MS));
+                set_now(10 * MS);
+                assert_eq!(h.collect().timed_out, 1, "settled by the reserved commit");
+                h.k.with(|s| {
+                    assert_eq!(s.task_status(t1), Some(TaskStatus::Runnable), "Ready");
+                    assert_eq!(queued_count(s, t1), 0, "no position while exhausted");
+                });
+                assert!(ctx().parked(), "budget-parked");
+                std::thread::sleep(HostDuration::from_millis(50));
+                assert!(
+                    !returned.load(SeqCst),
+                    "still inside its wait until replenishment"
+                );
+                while k.sched_domain().clock_now().0 < bound + 50 {
+                    k.with_cpu_sched_split(CpuId(0), |c| c.tick())
+                        .expect("cpu0");
+                }
+                k.with_cpu_sched_split(CpuId(0), |c| c.tick())
+                    .expect("cpu0");
+                assert!(!ctx().parked(), "replenished and rejoined");
+                assert_eq!(j.join().unwrap(), WaitOutcome::TimedOut);
+            });
+            assert!(returned.load(SeqCst));
+            assert_eq!(m.word().load(SeqCst), 0);
+            k.with(|s| {
+                assert_eq!(s.take_resume_completion(t1), None, "exactly one completion");
+                assert_eq!(occupied(s), 0);
+            });
+        }
+
+        /// 7 — SHARED scope (a MemoryObject-backed word, one process): a timed lock parks on the
+        /// shared key and times out through the collector. (Only the same-process shared path is
+        /// exercised here; cross-process sharing is the live witness's and FUTEX-FOUND1's.)
+        #[test]
+        fn st07_shared_scope_timed_lock() {
+            let _clk = mono_clock();
+            let mut w = world(79600);
+            let (o, t1) = (new_task(&mut w), new_task(&mut w));
+            let shared = w.s.with_vm_then_memory_mut(|sp, mem| {
+                fx::resolve_futex_key_locked(sp, mem, w.a, SHW, SH)
+            });
+            let skey = shared.expect("an object-backed word").0;
+            assert!(matches!(skey, FutexKey::Shared { .. }));
+            let k = leak(w.s);
+            let m = keep(FutexMutex::new(UScope::Shared));
+            let h = Harness::new(k, &[(m.word(), SHW, SH)]);
+            m.lock_with(&h.as_task(o));
+            std::thread::scope(|sc| {
+                let hh = &h;
+                let j = sc.spawn(move || m.lock_until_with(&hh.as_task(t1), 5 * MS));
+                h.until("t1 parked on the shared key", |s| on_key(s, t1, skey));
+                set_now(5 * MS);
+                assert_eq!(h.collect().timed_out, 1);
+                assert_eq!(j.join().unwrap(), LockOutcome::TimedOut);
+            });
+            assert_eq!(m.word().load(SeqCst), CONTENDED);
         }
     }
 

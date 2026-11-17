@@ -10,6 +10,7 @@ dependencies = [
  "yarm-ipc-abi",
  "yarm-kernel",
  "yarm-srv-common",
+ "yarm-user-rt",
 ]
 
 [[package]]

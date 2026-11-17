@@ -3947,6 +3947,503 @@ fn run_futex_time_witness(s_tid: u64) {
     w::run_once(s_tid, &children);
 }
 
+/// FUTEX-SYNC-TIME1 — the live timed mutex / condition-variable witness, selector 18 when init is
+/// built with `futex-sync-witness` (it takes precedence over the futex-time, wait and requeue
+/// cells; the kernel is built with `futex-time-witness`, whose markers record every timed wait's
+/// admission, deadline and terminal owner). Every operation is `yarm_user_rt::futex_sync` itself,
+/// over the real system calls. Threads of init, by role (each spawned after the previous one
+/// reported its start, so the role is the start order):
+///
+/// | role | what it does |
+/// |---|---|
+/// | W | the driver: every timed lock and the C1/C2 condition waits; reports each result |
+/// | H | the helper: holds the mutex, confirms parked waiters, signals, broadcasts |
+/// | A | an untimed waiter (L3 on the mutex, C3 on the condition variable) |
+/// | X | C3's timed condition waiter that times out AFTER its requeue onto the mutex |
+/// | C | C3's timed condition waiter with a far deadline |
+///
+/// A waiter is confirmed parked by moving it to a scratch word and back with NR 17 (a requeue
+/// keeps its deadline and its place); no step depends on a sleep. The one hold that needs time
+/// (C3: H keeps the mutex until X's deadline has passed) is a timed wait of H's own, and the
+/// grader proves the order from the kernel's markers. Every return checks exclusive ownership
+/// (an owner slot, set and cleared under the mutex) and protected-state consistency (two
+/// counters updated together under the mutex).
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-sync-witness"
+))]
+pub(super) mod futex_sync_witness {
+    use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::SeqCst};
+    use yarm_user_rt::futex_sync::{
+        FutexCondvar, FutexMutex, LockOutcome, WaitOutcome, WaitWhileOutcome,
+    };
+    use yarm_user_rt::syscall::{
+        CLOCK_MONOTONIC, FUTEX_BITSET_MATCH_ANY, FutexScope, clock_gettime, futex_cmp_requeue,
+        futex_wait, futex_wait_until, futex_wake, yield_now,
+    };
+
+    const P: FutexScope = FutexScope::Private;
+    const MS: u64 = 1_000_000;
+    pub(super) const STACK_BYTES: usize = 16384;
+    pub(super) const THREADS: usize = 5;
+    const BOUND: u32 = 4_000_000;
+    const W: u32 = 0;
+    const H: u32 = 1;
+    const A: u32 = 2;
+    const X: u32 = 3;
+    const C: u32 = 4;
+    const NAMES: [&str; THREADS] = ["W", "H", "A", "X", "C"];
+
+    #[repr(C, align(16))]
+    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; THREADS]);
+    #[allow(unused)]
+    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; THREADS]);
+    #[allow(unused)]
+    pub(super) static mut TLS: [[u8; 256]; THREADS] = [[0; 256]; THREADS];
+
+    static M: FutexMutex = FutexMutex::new(P);
+    static CV: FutexCondvar = FutexCondvar::new(P);
+    /// The confirmation pings' scratch word, and H's private timed-wait word (never woken).
+    static SCRATCH: AtomicU32 = AtomicU32::new(0);
+    static NAP: AtomicU32 = AtomicU32::new(0);
+    static OWNER: AtomicU32 = AtomicU32::new(0);
+    static PAY_A: AtomicU64 = AtomicU64::new(0);
+    static PAY_B: AtomicU64 = AtomicU64::new(0);
+    static READY: AtomicU32 = AtomicU32::new(0);
+    static STARTED: AtomicU32 = AtomicU32::new(0);
+    static FAILS: AtomicU32 = AtomicU32::new(0);
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    /// Per-role command words: a role runs step `n` when its word reaches `n`.
+    static GO: [AtomicU32; THREADS] = [const { AtomicU32::new(0) }; THREADS];
+    /// Per-role completion counters, waited on by whoever needs that step done.
+    static ACK: [AtomicU32; THREADS] = [const { AtomicU32::new(0) }; THREADS];
+    static PARK: AtomicU32 = AtomicU32::new(0);
+    pub(super) static ENTRY: AtomicUsize = AtomicUsize::new(0);
+
+    fn mono() -> u64 {
+        clock_gettime(CLOCK_MONOTONIC)
+            .ok()
+            .and_then(|t| t.as_ns())
+            .unwrap_or(0)
+    }
+    fn fail(what: &str) {
+        FAILS.fetch_add(1, SeqCst);
+        yarm_user_rt::user_log!("FSW_FAIL what={}", what);
+    }
+    fn park() -> ! {
+        loop {
+            let v = PARK.load(SeqCst);
+            let _ = futex_wait(PARK.as_ptr(), v, P);
+        }
+    }
+    /// Block (not poll) until `word` reaches at least `n`.
+    fn await_at_least(word: &AtomicU32, n: u32) {
+        let mut k = 0;
+        loop {
+            let v = word.load(SeqCst);
+            if v >= n || k >= BOUND {
+                return;
+            }
+            let _ = futex_wait(word.as_ptr(), v, P);
+            k += 1;
+        }
+    }
+    fn bump(word: &AtomicU32) {
+        word.fetch_add(1, SeqCst);
+        let _ = futex_wake(word.as_ptr(), u32::MAX, P);
+    }
+    /// Tell `role` to run step `n`, and wait for it to finish (`ACK` reaching `n`).
+    fn order(role: u32, n: u32) {
+        GO[role as usize].store(n, SeqCst);
+        let _ = futex_wake(GO[role as usize].as_ptr(), u32::MAX, P);
+    }
+    fn await_ack(role: u32, n: u32) {
+        await_at_least(&ACK[role as usize], n);
+    }
+    fn ack(role: u32) {
+        bump(&ACK[role as usize]);
+    }
+    /// Confirm that `n` waiters are parked on `word`: move them to SCRATCH as they arrive and,
+    /// once all `n` are there, back in one call. A requeue keeps each waiter's identity, deadline
+    /// and order, and a later arrival is moved later, behind the earlier ones, so the order on
+    /// `word` afterwards is the order they parked. Nothing is moved back early: a waiter moved
+    /// back while another was still arriving would land behind it (FUTEX-SYNC-TIME1 dev run
+    /// `aarch64-dev2`: the broadcast's one wake then went to the second waiter, not the oldest).
+    fn confirm_parked(word: &AtomicU32, n: u32) -> bool {
+        let mut have = 0;
+        for _ in 0..BOUND {
+            let v = word.load(SeqCst);
+            if let Ok(o) = futex_cmp_requeue(word.as_ptr(), P, SCRATCH.as_ptr(), P, v, 0, n - have)
+            {
+                have += o.requeued;
+                if have == n {
+                    let back = futex_cmp_requeue(SCRATCH.as_ptr(), P, word.as_ptr(), P, 0, 0, n);
+                    return matches!(back, Ok(b) if b.requeued == n);
+                }
+            }
+            let _ = yield_now();
+        }
+        // Not all arrived in the bound: put back what was moved (the cell fails on `false`).
+        let _ = futex_cmp_requeue(SCRATCH.as_ptr(), P, word.as_ptr(), P, 0, 0, n);
+        false
+    }
+    /// H's own timed wait on a word nobody wakes: returns at the instant `until` (no polling).
+    fn nap_until(until: u64) {
+        while mono() < until {
+            let _ = futex_wait_until(NAP.as_ptr(), 0, P, Some(until), FUTEX_BITSET_MATCH_ANY);
+        }
+    }
+    /// The ownership check every return makes: an exclusive owner slot and the protected state.
+    fn critical(role: u32) -> (u32, u32, u32) {
+        let held = u32::from(M.word().load(SeqCst) != 0);
+        let owner_ok = u32::from(OWNER.compare_exchange(0, role + 1, SeqCst, SeqCst).is_ok());
+        let a = PAY_A.load(SeqCst);
+        let state_ok = u32::from(PAY_B.load(SeqCst) == a);
+        PAY_A.store(a + 1, SeqCst);
+        PAY_B.store(a + 1, SeqCst);
+        if owner_ok == 1 {
+            OWNER.store(0, SeqCst);
+        }
+        if held == 0 || owner_ok == 0 || state_ok == 0 {
+            fail("ownership");
+        }
+        (held, owner_ok, state_ok)
+    }
+    fn op(seq: &str, role: u32, op: &str, deadline: u64) {
+        yarm_user_rt::user_log!(
+            "FSW_OP seq={} role={} op={} deadline={} now={}",
+            seq,
+            NAMES[role as usize],
+            op,
+            deadline,
+            mono()
+        );
+    }
+    fn ret(seq: &str, role: u32, result: &str, own: Option<(u32, u32, u32)>) {
+        let (held, owner_ok, state_ok) = own.unwrap_or((0, 1, 1));
+        yarm_user_rt::user_log!(
+            "FSW_RET seq={} role={} result={} held={} owner_ok={} state_ok={} word={} now={}",
+            seq,
+            NAMES[role as usize],
+            result,
+            held,
+            owner_ok,
+            state_ok,
+            M.word().load(SeqCst),
+            mono()
+        );
+    }
+    fn lock_slug(r: LockOutcome) -> &'static str {
+        match r {
+            LockOutcome::Acquired => "acquired",
+            LockOutcome::TimedOut => "timed_out",
+            LockOutcome::Failed(_) => "failed",
+        }
+    }
+    fn wait_slug(r: WaitOutcome) -> &'static str {
+        match r {
+            WaitOutcome::Notified => "notified",
+            WaitOutcome::TimedOut => "timed_out",
+            WaitOutcome::Failed(_) => "failed",
+        }
+    }
+    fn expect(seq: &str, got: &str, want: &str) {
+        if got != want {
+            yarm_user_rt::user_log!("FSW_FAIL what={} got={} want={}", seq, got, want);
+            FAILS.fetch_add(1, SeqCst);
+        }
+    }
+
+    // ── W, the driver ───────────────────────────────────────────────────────────────────────
+    fn driver() {
+        // L1: an uncontended lock with a deadline long passed: acquired, no wait.
+        op("L1", W, "lock_until", 0);
+        let r = M.lock_until(0);
+        expect("L1", lock_slug(r), "acquired");
+        let own = r.is_acquired().then(|| critical(W));
+        ret("L1", W, lock_slug(r), own);
+        if r.is_acquired() {
+            M.unlock();
+        }
+        // L2: contended (H holds), a genuine timeout. Not held; H's lock intact.
+        order(H, 1);
+        await_ack(H, 1);
+        let d = mono() + 400 * MS;
+        op("L2", W, "lock_until", d);
+        let r = M.lock_until(d);
+        expect("L2", lock_slug(r), "timed_out");
+        ret("L2", W, lock_slug(r), None);
+        order(H, 2); // H unlocks
+        await_ack(H, 2);
+        // L3: H holds; A (untimed) parks, then W (timed) parks behind it; H keeps the mutex past
+        // W's deadline: W times out; then H unlocks and A, still parked, acquires.
+        order(H, 3);
+        await_ack(H, 3);
+        order(A, 1); // A: lock (untimed)
+        order(H, 4); // H: confirm A parked
+        await_ack(H, 4);
+        let d = mono() + 1_500 * MS;
+        DEADLINE_W.store(d, SeqCst);
+        order(H, 5); // H: confirm W parked, hold past its deadline, unlock
+        op("L3", W, "lock_until", d);
+        let r = M.lock_until(d);
+        expect("L3", lock_slug(r), "timed_out");
+        ret("L3", W, lock_slug(r), None);
+        await_ack(H, 5);
+        await_ack(A, 1);
+        // L3b: contended success: H holds, W parks, H unlocks.
+        order(H, 6);
+        await_ack(H, 6);
+        order(H, 7); // H: confirm W parked, unlock
+        let d = mono() + 30_000 * MS;
+        op("L3b", W, "lock_until", d);
+        let r = M.lock_until(d);
+        expect("L3b", lock_slug(r), "acquired");
+        let own = r.is_acquired().then(|| critical(W));
+        ret("L3b", W, lock_slug(r), own);
+        if r.is_acquired() {
+            M.unlock();
+        }
+        await_ack(H, 7);
+        // C1: the predicate wait; a spurious signal re-waits with the same deadline; the real
+        // notification satisfies it.
+        order(H, 8); // H: confirm parked, spurious signal, confirm re-parked, set READY + signal
+        M.lock();
+        let d = mono() + 20_000 * MS;
+        op("C1", W, "wait_while_until", d);
+        let r = CV.wait_while_until(&M, d, || READY.load(SeqCst) == 0);
+        let slug = match r {
+            WaitWhileOutcome::Satisfied => "satisfied",
+            WaitWhileOutcome::TimedOut => "timed_out",
+            WaitWhileOutcome::Failed(_) => "failed",
+        };
+        expect("C1", slug, "satisfied");
+        let own = critical(W);
+        ret("C1", W, slug, Some(own));
+        M.unlock();
+        await_ack(H, 8);
+        // C2: a condition wait that times out: returned with the mutex held.
+        M.lock();
+        let d = mono() + 400 * MS;
+        op("C2", W, "wait_until", d);
+        let r = CV.wait_until(&M, d);
+        expect("C2", wait_slug(r), "timed_out");
+        let own = critical(W);
+        ret("C2", W, wait_slug(r), Some(own));
+        M.unlock();
+        // C3: the broadcast with mixed waiters and a timeout after the requeue.
+        order(A, 2); // A: untimed condition wait
+        order(H, 9); // H: confirm 1 parked on the sequence
+        await_ack(H, 9);
+        order(X, 1); // X: timed condition wait, deadline 8 s out
+        order(H, 10); // H: confirm 2 parked
+        await_ack(H, 10);
+        order(C, 1); // C: timed condition wait, far deadline
+        order(H, 11); // H: confirm 3 parked; lock; broadcast; hold past X's deadline; unlock
+        await_ack(H, 11);
+        await_ack(A, 2);
+        await_ack(X, 1);
+        await_ack(C, 1);
+    }
+    static DEADLINE_W: AtomicU64 = AtomicU64::new(0);
+    static DEADLINE_X: AtomicU64 = AtomicU64::new(0);
+
+    // ── H, the helper ───────────────────────────────────────────────────────────────────────
+    fn helper(step: u32) {
+        match step {
+            1 | 3 | 6 => M.lock(),
+            2 => {
+                let woke = M.unlock();
+                yarm_user_rt::user_log!("FSW_H_UNLOCK seq=L2 woke={}", woke);
+            }
+            4 => {
+                let ok = confirm_parked(M.word(), 1);
+                yarm_user_rt::user_log!("FSW_H_PARKED seq=L3 n=1 ok={}", u32::from(ok));
+            }
+            5 => {
+                let ok = confirm_parked(M.word(), 2);
+                yarm_user_rt::user_log!("FSW_H_PARKED seq=L3 n=2 ok={}", u32::from(ok));
+                nap_until(DEADLINE_W.load(SeqCst) + 2_000 * MS);
+                let woke = M.unlock();
+                yarm_user_rt::user_log!("FSW_H_UNLOCK seq=L3 woke={}", woke);
+            }
+            7 => {
+                let ok = confirm_parked(M.word(), 1);
+                yarm_user_rt::user_log!("FSW_H_PARKED seq=L3b n=1 ok={}", u32::from(ok));
+                let woke = M.unlock();
+                yarm_user_rt::user_log!("FSW_H_UNLOCK seq=L3b woke={}", woke);
+            }
+            8 => {
+                let ok1 = confirm_parked(CV.seq(), 1);
+                CV.signal(); // spurious: READY still 0
+                let ok2 = confirm_parked(CV.seq(), 1);
+                M.lock();
+                READY.store(1, SeqCst);
+                CV.signal();
+                M.unlock();
+                yarm_user_rt::user_log!(
+                    "FSW_H_C1 parked1={} parked2={}",
+                    u32::from(ok1),
+                    u32::from(ok2)
+                );
+            }
+            9 | 10 => {
+                let ok = confirm_parked(CV.seq(), step - 8);
+                yarm_user_rt::user_log!("FSW_H_PARKED seq=C3 n={} ok={}", step - 8, u32::from(ok));
+            }
+            11 => {
+                let ok = confirm_parked(CV.seq(), 3);
+                yarm_user_rt::user_log!("FSW_H_PARKED seq=C3 n=3 ok={}", u32::from(ok));
+                M.lock();
+                let r = CV.broadcast(&M);
+                yarm_user_rt::user_log!(
+                    "FSW_C3_BCAST woken={} requeued={} calls={} fallback={} word=0x{:x}",
+                    r.woken,
+                    r.requeued,
+                    r.calls,
+                    u32::from(r.fell_back_to_wake_all),
+                    M.word().as_ptr() as usize
+                );
+                nap_until(DEADLINE_X.load(SeqCst) + 3_000 * MS);
+                yarm_user_rt::user_log!("FSW_C3_RELEASE now={}", mono());
+                M.unlock();
+            }
+            _ => {}
+        }
+    }
+
+    // ── A, X, C: the waiters ────────────────────────────────────────────────────────────────
+    fn waiter(role: u32, step: u32) {
+        match (role, step) {
+            (A, 1) => {
+                op("L3", A, "lock", 0);
+                M.lock();
+                let own = critical(A);
+                ret("L3", A, "acquired", Some(own));
+                M.unlock();
+            }
+            (A, 2) => {
+                M.lock();
+                op("C3", A, "wait", 0);
+                CV.wait(&M);
+                let own = critical(A);
+                ret("C3", A, "returned", Some(own));
+                M.unlock();
+            }
+            (X, 1) | (C, 1) => {
+                M.lock();
+                let d = mono() + if role == X { 8_000 * MS } else { 120_000 * MS };
+                if role == X {
+                    DEADLINE_X.store(d, SeqCst);
+                }
+                op("C3", role, "wait_until", d);
+                let r = CV.wait_until(&M, d);
+                expect(
+                    if role == X { "C3X" } else { "C3C" },
+                    wait_slug(r),
+                    if role == X { "timed_out" } else { "notified" },
+                );
+                let own = critical(role);
+                ret("C3", role, wait_slug(r), Some(own));
+                M.unlock();
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) extern "C" fn child_body() -> ! {
+        let role = STARTED.fetch_add(1, SeqCst);
+        let _ = futex_wake(STARTED.as_ptr(), u32::MAX, P);
+        if role == W {
+            driver();
+            yarm_user_rt::user_log!("FSW_WAITER_DONE fails={}", FAILS.load(SeqCst));
+            bump(&DONE);
+            park();
+        }
+        let mut done = 0;
+        loop {
+            await_at_least(&GO[role as usize], done + 1);
+            let step = GO[role as usize].load(SeqCst);
+            if step <= done {
+                continue;
+            }
+            done = step;
+            if role == H {
+                helper(step);
+            } else {
+                waiter(role, step);
+            }
+            ack(role);
+        }
+    }
+
+    pub(super) fn run_once(s_tid: u64, entry: usize) {
+        yarm_user_rt::user_log!(
+            "FSW_BEGIN s_tid={} word=0x{:x} seq=0x{:x}",
+            s_tid,
+            M.word().as_ptr() as usize,
+            CV.seq().as_ptr() as usize
+        );
+        let stacks = core::ptr::addr_of_mut!(STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(TLS) as usize;
+        let mut tids = [0u64; THREADS];
+        // Spawn in role order, each after the previous one has started: role = start order.
+        for i in 0..THREADS {
+            let top = (stacks + (i + 1) * STACK_BYTES) & !0xF;
+            // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+            tids[i] = unsafe { yarm_user_rt::syscall::spawn_thread(tls + i * 256, top, entry) }
+                .unwrap_or(0);
+            await_at_least(&STARTED, i as u32 + 1);
+        }
+        yarm_user_rt::user_log!(
+            "FSW_THREADS W={} H={} A={} X={} C={}",
+            tids[0],
+            tids[1],
+            tids[2],
+            tids[3],
+            tids[4]
+        );
+        await_at_least(&DONE, 1);
+        let fails = FAILS.load(SeqCst);
+        let ok = tids.iter().all(|&t| t != 0) && DONE.load(SeqCst) == 1 && fails == 0;
+        yarm_user_rt::user_log!(
+            "FSW_DONE fails={} result={}",
+            fails,
+            if ok { "ok" } else { "fail" }
+        );
+    }
+}
+
+/// x86_64 entry trampoline for the futex-sync witness (as for the timed-wait witness's).
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-sync-witness",
+    target_arch = "x86_64"
+))]
+mod x86_futex_sync {
+    #[unsafe(naked)]
+    pub(super) extern "C" fn child_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_sync_witness::child_body)
+    }
+}
+
+/// FUTEX-SYNC-TIME1 — resolve this architecture's entry and run the futex-sync witness.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-sync-witness"
+))]
+fn run_futex_sync_witness(s_tid: u64) {
+    #[cfg(target_arch = "x86_64")]
+    let entry = x86_futex_sync::child_entry as *const () as usize;
+    #[cfg(not(target_arch = "x86_64"))]
+    let entry = futex_sync_witness::child_body as *const () as usize;
+    futex_sync_witness::ENTRY.store(entry, core::sync::atomic::Ordering::SeqCst);
+    futex_sync_witness::run_once(s_tid, entry);
+}
+
 /// SCHED-TIME-FOUNDATION1 C — the live sleep / clock / rotation witness, selector 18 when init is
 /// built with `sched-time-witness` (it takes precedence over every other selector-18 cell). The
 /// kernel half is `kernel::sleep_witness` (markers, the exit fixture, the kernel-thread fixture);
@@ -10434,12 +10931,21 @@ pub fn run() {
         // the ecall register-contract witness instead.
         // FUTEX-TIME1: built with `futex-time-witness`, the timed-wait witness, before all three.
         // SCHED-TIME-FOUNDATION1: built with `sched-time-witness`, the sleep witness, before all.
+        // FUTEX-SYNC-TIME1: built with `futex-sync-witness`, the timed mutex / condition-variable
+        // witness, before every futex cell (it needs the kernel's `futex-time-witness` markers).
         #[cfg(feature = "sched-time-witness")]
         run_sched_time_witness(ctx.task_id, ctx.process_manager_reply_recv_cap);
-        #[cfg(all(not(feature = "sched-time-witness"), feature = "futex-time-witness"))]
+        #[cfg(all(not(feature = "sched-time-witness"), feature = "futex-sync-witness"))]
+        run_futex_sync_witness(ctx.task_id);
+        #[cfg(all(
+            not(feature = "sched-time-witness"),
+            not(feature = "futex-sync-witness"),
+            feature = "futex-time-witness"
+        ))]
         run_futex_time_witness(ctx.task_id);
         #[cfg(all(
             not(feature = "sched-time-witness"),
+            not(feature = "futex-sync-witness"),
             not(feature = "futex-time-witness"),
             feature = "riscv-ecall-witness",
             target_arch = "riscv64"
@@ -10447,6 +10953,7 @@ pub fn run() {
         riscv_ecall_witness::run_once(ctx.task_id);
         #[cfg(all(
             not(feature = "sched-time-witness"),
+            not(feature = "futex-sync-witness"),
             not(feature = "futex-time-witness"),
             feature = "futex-wait-witness",
             not(all(feature = "riscv-ecall-witness", target_arch = "riscv64"))
@@ -10454,6 +10961,7 @@ pub fn run() {
         run_futex_wait_witness(ctx.task_id);
         #[cfg(not(any(
             feature = "sched-time-witness",
+            feature = "futex-sync-witness",
             feature = "futex-time-witness",
             feature = "futex-wait-witness",
             all(feature = "riscv-ecall-witness", target_arch = "riscv64")
