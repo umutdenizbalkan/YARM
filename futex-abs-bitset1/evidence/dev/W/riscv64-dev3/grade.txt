@@ -1,0 +1,6 @@
+[futex-time-witness][fail] cell reported FTW_FAIL what=E_saturation
+[futex-time-witness][fail] FTW_DONE result=fail
+[futex-time-witness][fail] FTW_WAITER_DONE fails=1
+[futex-time-witness][fail] F: no A timeout was collected on an idle CPU (current=0)
+[futex-time-witness][fail] G coverage: no window held a wake from another CPU
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail timeout_lateness_ns_max=83469800 a_idle_collections=0 bitset_skips=3 g_admitted_expired=7 g_woken=5 g_timed_out=20 g_windows_woke=0 g_windows_refused=0 g_skipped=20 in_window_wakes=0 e_spawn_refusals=2 e_fillers=127 e_topups=1 e_pings=0 e_proving=1 calls=43 cycles=35

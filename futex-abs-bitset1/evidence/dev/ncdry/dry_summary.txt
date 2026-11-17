@@ -1,0 +1,5 @@
+nc1_wrong_clock_after_rekey rc=101
+nc2_ignored_wake_mask rc=101
+nc3a_reset_mask_on_requeue rc=101
+nc3b_reset_deadline_on_requeue rc=101
+nc4_duplicate_settlement rc=101

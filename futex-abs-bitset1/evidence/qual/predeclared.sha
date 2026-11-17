@@ -1,0 +1,6 @@
+45ccacb1d3fcf41cb9bac851ea3f5e15aedf9e3c94db6c7557b3717cd2af204d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fab1-evidence/fab1_qual.sh
+cce40e3d51ea9a0e027049d8a327d3bf43d1b59cb375b442c2be7578ff0354f0  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fab1-nc/nc.py
+23db01aaced2d601601da4534fc6dc115702bd6f9e49ce4af47e5c28241d84bc  a8d7952d:scripts/grade-futex-time-witness.py
+189216d3feec9bed9b625d6292a91154bc037b497ce6e8c18c1765c41217f6a4  a8d7952d:scripts/qemu-futex-time-witness-smoke.sh
+29b6b9d3e19af37d5dc24c926b65d20b5e42d0678eef8ef6ccb4c066e30f3fd4  a8d7952d:init/service.rs
+declared 2026-11-17T18:06:31Z C=a8d7952df02adff3d113abecccc8752c92e4e467 B=e1aee62d

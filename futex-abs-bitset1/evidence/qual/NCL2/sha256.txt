@@ -1,0 +1,3 @@
+f228f4e861252eda6efe4c1f8bbab7af5086333948544c2ec37a5e27c430910f  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fab1-evidence/qual/NCL2/boot.log
+0423e34d216f102d0302162b2634a9d69c4e84c900e834ec129482c3a63e5085  build-riscv64/yarm-riscv64.bin
+6562108dc0eb54baadf7cd9a77563c41fb7eac95d7cce6b8542e74fe1ccbc276  build-riscv64/initramfs-core.cpio

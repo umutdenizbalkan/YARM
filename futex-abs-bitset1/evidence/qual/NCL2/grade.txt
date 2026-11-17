@@ -1,0 +1,15 @@
+[futex-time-witness][fail] cell reported FTW_FAIL what=C
+[futex-time-witness][fail] expected exactly one U_DONE, saw 0
+[futex-time-witness][fail] expected exactly one U_WAITER_DONE, saw 0
+[futex-time-witness][fail] call 8 (C): result woken, sequence requires timed_out
+[futex-time-witness][fail] M: wake k=2 mask=0x2 woke=1 (by 10008), need mask=0x2 woke=0 by H
+[futex-time-witness][fail] M: wake k=3 mask=0x1 woke=0 (by 10008), need mask=0x1 woke=1 by H
+[futex-time-witness][fail] M: a mask-0x2 wake did not pass W (mask 0x1) over on the target — the mask was ignored, or W was not ahead of S2
+[futex-time-witness][fail] M: a mask-0x2 wake did not pass W (mask 0x1) over on the target — the mask was ignored, or W was not ahead of S2
+[futex-time-witness][fail] M: W was woken outside its own-mask wake (k=3)
+[futex-time-witness][fail] C: requeue moved=1 disjoint_wake=1 (need 1/0)
+[futex-time-witness][fail] C: the disjoint wake of the target did not pass the moved W (mask 0x4) over — its mask did not survive the requeue
+[futex-time-witness][fail] expected exactly one U_E_HOLD_END, saw 0
+[futex-time-witness][fail] expected exactly one U_E_EXPIRED_SEEN, saw 0
+[futex-time-witness][fail] E: no FUTEX_TIMEOUT_EXPIRED_UNPLACED for the waiter — the queue was not full
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail timeout_lateness_ns_max=40259900 a_idle_collections=3 bitset_skips=0 g_admitted_expired=2 g_woken=6 g_timed_out=24 g_windows_woke=8 g_windows_refused=0 g_skipped=16 in_window_wakes=8 e_spawn_refusals=1 calls=43 cycles=40

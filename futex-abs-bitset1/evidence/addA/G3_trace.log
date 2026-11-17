@@ -1,0 +1,14 @@
+# G3 replay under bash -x on an export of a8d7952d (gate + the files it reads), same sed as the runner's G3 step
++ rg -q '^    pub const SYSCALL_CLOCK_NANOSLEEP_NR: usize = 20;$' crates/yarm-user-rt/src/lib.rs
++ rg -q '^\| `20` \| `ClockNanosleep` \| public' doc/SYSCALL_ABI.md
++ rg -q '^- `11`: `Unavailable`' doc/SYSCALL_ABI.md
++ rg -q 'v11 → v12 \(SCHED-TIME-FOUNDATION1\)' doc/SYSCALL_ABI.md
++ ((  abi_code >= 13  ))
++ rg -q '^pub const FUTEX_FLAG_TIMED: usize = 1 << 1;$' src/kernel/boot/futex.rs
++ rg -q '^pub const FUTEX_FLAG_BITSET: usize = 1 << 2;$' src/kernel/boot/futex.rs
++ rg -q '^pub const FUTEX_ARG_DEADLINE: usize = 3;$' src/kernel/boot/futex.rs
++ rg -q '^pub const FUTEX_ARG_MASK: usize = 4;$' src/kernel/boot/futex.rs
++ rg -q '^pub const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;$' src/kernel/boot/futex.rs
++ rg -q '^    pub const FUTEX_FLAG_TIMED: usize = 1 << 1;$' crates/yarm-user-rt/src/lib.rs
++ rg -q '^    pub const FUTEX_FLAG_BITSET: usize = 1 << 2;$' crates/yarm-user-rt/src/lib.rs
+rc=1

@@ -1,0 +1,4 @@
+fab1 qual start 2026-11-17T18:06:36Z C=a8d7952df02adff3d113abecccc8752c92e4e467 B=e1aee62d sha=45ccacb1d3fcf41c nc=cce40e3d51ea9a0e
+=== H1_fmt [a8d7952df02a porcelain=0]: cargo fmt --all -- --check (start 18:06:36)
+H1_fmt rc=0 secs=6
+=== H2_hosted_lib [a8d7952df02a porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 18:06:42)

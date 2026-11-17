@@ -1,0 +1,6 @@
+[futex-time-witness] building base riscv64 artifacts with futex-requeue-witness,futex-time-witness
+[futex-time-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,futex-time-witness
+[futex-time-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-time-witness][fail] E: no FUTEX_TIMEOUT_EXPIRED_UNPLACED for the waiter — the queue was not full
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail timeout_lateness_ns_max=30827200 a_idle_collections=3 bitset_skips=3 g_admitted_expired=3 g_woken=7 g_timed_out=22 g_windows_woke=4 g_windows_refused=0 g_skipped=18 in_window_wakes=4 e_spawn_refusals=1 calls=43 cycles=39
+rc=1

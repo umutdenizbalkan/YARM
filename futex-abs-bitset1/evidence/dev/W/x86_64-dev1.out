@@ -1,0 +1,3 @@
+[futex-time-witness] building base x86_64 artifacts with futex-requeue-witness,futex-time-witness
+[futex-time-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle,futex-time-witness
+STOPPED: build straddled a cell edit at 17:25:34; provenance ambiguous, not graded
