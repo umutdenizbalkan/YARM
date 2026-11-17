@@ -72,7 +72,9 @@ They are never alternate dispatchers:
   (`crates/yarm-kernel/src/scheduler.rs`). They are derived only by
   `task_enqueue::priority_for_class`: `SystemServer` is High, and `Driver` and `App` are Normal.
   Nothing produces `Low` for a live task except the scheduler-owned idle placeholder (tid 0).
-* **Capacities.** Each CPU has three `RingQueue`s of `MAX_RUN_QUEUE = 64` entries each (192
+* **Capacities.** *(Baseline text; RT-SCHED1A replaced the rings with one 256-entry pool of 32
+  linked FIFOs and corrected the bound to 229 entries per CPU, §23.3–§23.4.)* Each CPU has
+  three `RingQueue`s of `MAX_RUN_QUEUE = 64` entries each (192
   runnable per CPU). A 256-slot open-addressed membership table falls back to a linear scan when
   full. The TCB array holds `MAX_TASKS = 512`. The production CPU ceiling is 8 on every port
   (`*_cpu_admission.rs` `PRODUCTION_CPU_CEILING`). Because 192 < 512, a run queue can overflow
@@ -308,7 +310,7 @@ bounded and potentially unbounded parts).
 | First dispatch at boot (x86_64 traced) | `enter_dispatched_user_task_if_available` under `BootExclusive` | the boot CPU, exclusive phase | none (exclusive token; published immediately before `iretq`) | masked | the first user task's initial context | bounded by boot sequence; AArch64/RISC-V equivalents not individually traced here |
 | Secondary admission | `admit_ap_dispatch_split` → `SmpScheduler::admit_dispatch`; `install_ap_idle_current` | the admitting CPU's own trap/boot path | 1 | masked | none (idle) | O(1) |
 | Timer, non-preempting | `settle_recognized_timer` → `scheduler_tick_split_mut` | `DispatchAuthority` | 1 | masked | interrupted task continues | O(1) + `TIMER_SPLIT_TICK_OK` log |
-| Timer, preempting | `run_yield_transaction` → queue-advance drain | `DispatchAuthority`; entering incarnation captured first | 2 → 1, then drain 1(→2) | masked | outgoing saved by `capture_outgoing_user_context_split`; incoming via `DispatchMarkToken` | selection ≤ 192 candidates × rank-2 TCB scan ≤ 512 |
+| Timer, preempting | `run_yield_transaction` → queue-advance drain | `DispatchAuthority`; entering incarnation captured first | 2 → 1, then drain 1(→2) | masked | outgoing saved by `capture_outgoing_user_context_split`; incoming via `DispatchMarkToken` | selection ≤ 229 candidates × rank-2 TCB scan ≤ 512 (§23.4) |
 | Timer at idle boundary | `TimerIdleQueueAdvance` + drain | authority + `idle_boundary::take_parked` | 1(→2) | masked | idle has none; user return constructed | as selection |
 | Yield (NR 0) | `run_yield_transaction`, Yield drain | authority | 2 → 1; drain 1(→2) | masked | as preempting timer | as selection |
 | IPC send/recv blocking (D2) | `commit_blocking_send_split`, `recv_block_phase_a_split`; `d2_*_dispatch_step_mut` | authority | 2/3 sequential, then 1; drain 1(→2) | masked | caller's saved context + parked completion | endpoint/TCB scans ≤ fixed capacities |
@@ -369,13 +371,17 @@ The first real-time profile is the **smallest analysable configuration**:
   P `sc_pri_3`.
 * **SC-PRI-4 — A wake never displaces the running task (GP).** **ENFORCED (GP).** This is the
   baseline RT-P1 changes: P `sc_pri_4`; S §1.5.
-* **SC-PRI-10 — RT-P1 has 32 fixed priority levels.** **SPECIFIED → RT-SCHED1.** Levels run
+* **SC-PRI-10 — RT-P1 has 32 fixed priority levels.** **ENFORCED under the RT profile
+  (RT-SCHED1A, §23.1); configuration by the kernel's deployment provisioning only.** Levels run
   0 (highest) to 31. A priority is a property of the scheduling context, fixed at configuration,
   and never changed at run time in RT-P1. There is no inheritance and no aging (§5.4).
-* **SC-PRI-11 — RT-P1 equal-priority order is FIFO by readiness.** **SPECIFIED → RT-SCHED1.**
+* **SC-PRI-11 — RT-P1 equal-priority order is FIFO by readiness.** **ENFORCED under the RT
+  profile (RT-SCHED1A, §23.1); the budgets that bound execution instead are SPECIFIED →
+  RT-SCHED1.**
   There is no time-slicing among equals; budgets bound execution instead. M
   `model_equal_priority_order_is_deterministic_fifo`.
-* **SC-PRI-12 — RT-P1 queue position rules.** **SPECIFIED → RT-SCHED1.**
+* **SC-PRI-12 — RT-P1 queue position rules.** **PARTIAL (RT-SCHED1A, §23.1): (a)–(d) ENFORCED
+  under the RT profile; (e) SPECIFIED → PARTITION1; (f) SPECIFIED → RT-SCHED1.**
   * M `model_preemption_yield_block_and_wake_queue_positions` checks (a) to (e).
   * (f) is checked by:
     * `model_exhausted_context_is_ineligible_despite_priority`;
@@ -395,7 +401,9 @@ The first real-time profile is the **smallest analysable configuration**:
 
   *(Corrected by SCHED-CONTRACT1-CORRECTION: the delivered model appended the thread at
   exhaustion, so it kept an earlier position while ineligible. §13 records the reproduction.)*
-* **SC-PRI-13 — In RT-P1, a wake is a scheduling point.** **SPECIFIED → RT-SCHED1.**
+* **SC-PRI-13 — In RT-P1, a wake is a scheduling point.** **ENFORCED under the RT profile
+  (RT-SCHED1A, §23.2); a running kernel thread's next preemption point is its next
+  `sched_point` (kernel threads are cooperative).**
   * A wake of a strictly higher-priority eligible thread preempts the running thread on that CPU
     at its next preemption point.
   * A remote wake MUST deliver a preempting IPI, and its arrival on a running CPU MUST reschedule
@@ -791,14 +799,14 @@ not representative of silicon, and no target hardware is in the loop.
 | # | Item | Where | Kind | Bound |
 |---|---|---|---|---|
 | W1 | `SpinLockIrq` / `SpinLock` acquisition wait | `kernel/lock.rs` | **A / N** | No structural bound: TTAS with no fairness. A bound needs a fair lock **and** every other CPU's maximum hold time. A weak-CAS spurious failure adds unbounded retries on LL/SC ports in theory. **1L and 1G** (SCHED-LOCK-FAIR1, §22): FIFO ticket lock, ≤ N − 1 earlier entrants; the hold times (A3) remain unbounded. |
-| W2 | Run-queue selection (accepted) | `dispatch_next_accepted_selection` | **S** | ≤ 3 × 64 = 192 candidates. Each runs one rank-2 acquisition and a TCB linear scan ≤ 512. Operation count O(192 × 512) per selection, with IRQs masked. Time **N**. |
+| W2 | Run-queue selection (accepted) | `dispatch_next_accepted_selection` | **S** | ≤ 229 candidates (RT-SCHED1A §23.4; the earlier "3 × 64 = 192" omitted the rotation slot and kernel-thread entries — the base bound was 291). Each runs one rank-2 acquisition and a TCB linear scan ≤ 512. Operation count O(229 × 512) per selection, with IRQs masked. Time **N**. |
 | W3 | Whole trap (IRQ-masked region) | every route | **N** | The sum of its route's work, W1, W7, allocations (W6) and page-table walks. No per-route bound is established. This is also the boundary latency (SC-PART-5) and the overrun bound (SC-CTX-5). |
 | W4 | TLB shootdown completion | VMI1/VMI2 owners | **A** | The requester waits for generation-matched ACKs. A bound needs every target to take its IPI within its own W3. A target cannot take it while it is in a masked trap. |
 | W5 | Firmware calls | RISC-V SBI `set_timer`, `send_ipi` | **N** | OpenSBI execution time is not established. |
 | W6 | Frame allocation on fault/spawn paths | memory rank 6 | **S/N** | A fixed-capacity allocator. The search bound is not analysed here. |
 | W7 | Synchronous logging | `yarm_log!` → `printk_flush` | **A** | Up to 128 × 192 bytes per flush, at UART rate, polled per byte, plus cross-CPU `PRINTK_DRAIN_LOCK` contention. It runs on every tick and on many refusal and settlement markers. This is the largest **known** variable term. |
-| W8 | Membership table | `PriorityScheduler::membership_*` | **S** | ≤ 256 probes; the linear fallback is ≤ 192 + 1. |
-| W9 | `RingQueue::remove_tid` | scheduler | **S** | ≤ 64 shifts. |
+| W8 | Membership table | `PriorityScheduler::membership_*` | **S** | ≤ 256 probes; the linear fallback is ≤ 229 + 1 (§23.4). |
+| W9 | `RunQueues::remove_tid` (RT-SCHED1A; was `RingQueue::remove_tid`, ≤ 64 shifts) | scheduler | **S** | ≤ 97 link steps, within the entry's own level (§23.4). |
 | W10 | FutexWake | `futex_wake_split_mut` | **S** | one key resolution, then per placed waiter one bucket walk (≤ 512 O(1) record visits) and four short acquisitions; ≤ `count` (≤ 512) waiters, plus at most 512 waiters taken concurrently by other owners. Each single acquisition is bounded as before. FUTEX-FOUND1, FUTEX-WAKE-CAP1. |
 | W10a | FutexCmpRequeue commit | `compare_and_requeue_locked` | **S** | two walks of the source key's bucket from its head to its tail at entry (≤ 512 O(1) record visits each: a read-only selection of the wake portion against the preflight's reserved slots, then the moves; moved records are appended past that tail and never revisited), under task, VM and memory held together; no allocation, no scheduler lock. The preflight and the placement are W10's reserve/claim/fill steps, bounded by `wake`; a stale preflight is retried, at most 4 attempts in all. FUTEX-REQUEUE1, FUTEX-REQUEUE-ATOMIC1. |
 | W10b | FutexWait compare-and-register | `compare_and_register_futex_waiter_locked` | **S** | one key resolution (one page-table lookup, one frame-owner lookup for a shared key), one word load, then the registration: a scan for a free waiter slot (≤ 512), and only when none is free one sweep of stale records (≤ 512) — under task, VM and memory held together; no allocation, no scheduler lock. FUTEX-FOUND1, FUTEX-WAIT-ATOMIC1. |
@@ -843,7 +851,9 @@ seeded random sequences of 3 000 operations each: wake, dispatch point, quantum 
 The test proves agreement for those operations on one CPU. It does not prove anything about
 placement, IPC, time or the RT-P1 rules.
 
-**SC-GP-2 — Profiles are deployment configurations.** **SPECIFIED → RT-SCHED1/PARTITION1.** GP
+**SC-GP-2 — Profiles are deployment configurations.** **ENFORCED for selection (RT-SCHED1A,
+§23: `yarm.sched_profile=rt|gp`, one domain, no profile-selected dispatcher); SPECIFIED →
+PARTITION1 for windows.** GP
 and RT-P1 share the production dispatch and lifecycle owners:
 
 * one selection owner (`queue_advance_select_step_split`);
@@ -1191,7 +1201,7 @@ CPU executes.
 | Requirement | Current owner | Missing mechanism | Evidence needed | Package |
 |---|---|---|---|---|
 | SC-CPU-2 no migration | `task_enqueue` planners and 1L owners (SCHED-LOCK2A, §20) | — for task incarnations (enforced); the scheduling-context binding | P: `sl2a_*` (done); scheduling-context binding | RT-SCHED1 |
-| SC-PRI-10/11/12/13 | `PriorityScheduler` (3 levels, tail-on-preempt, wake non-preempting) | 32 levels; head-on-priority-preemption; wake as scheduling point; preempting remote IPI | P on the production owners; L on three ports | RT-SCHED1 |
+| SC-PRI-10/11/12/13 | RT-SCHED1A (§23): 32 levels, head-on-priority-preemption, wake as scheduling point, preempting remote IPI, under the RT profile | SC-PRI-12 (e) windows, (f) exhaustion; budgets | P `rt1a_*` and L the RT witness on three ports (done, §23.7); (e)/(f) with their owners | RT-SCHED1 / PARTITION1 |
 | SC-PART-1…7 | none | schedule, epoch, window evaluation, boundary switch | P + L (boundary instants, idle advance) | PARTITION1 |
 | SC-CTX-1…5, 7, 8 | none (per-CPU quantum only) | scheduling contexts, budgets, conserved-debt replenishment, overrun debt and reports, same-instant order, exhausted-set membership | P + L | RT-SCHED1 |
 | SC-CTX-6, SC-TIME-3/4/6 | per-port relative re-arm | calibrated counter, absolute deadlines, cross-CPU time, tick unit | M (measurement) on named hardware + S | RT-SCHED1 |
@@ -1763,7 +1773,7 @@ runs, hashes) are in `doc/KERNEL_UNLOCKING.md` §0.8, bound to the commits that 
 | Teardown and reuse | Exit clears the current slot on the CPU named by the token (`clear_current_exact`), under that CPU's 1L; reaping checks absence through the coherent view. |
 | Capacity | 64 per priority per CPU. `QueueFull` is returned **before** mutation, so a committed wake is never displaced and a refused one is never half-published. There is no mailbox: the run queue is the reservation. |
 | Full-queue settlement | Each caller keeps its existing settlement (the mapped error, rollback or withdraw). The producer still owns a refused wake. |
-| Bounded drain | The destination drains by its own selections; at most 192 entries per CPU (§6 W2). |
+| Bounded drain | The destination drains by its own selections; at most 229 entries per CPU (§6 W2, §23.4). |
 | Mutual holding / waiting | No path holds two 1L guards except the coherent view, which takes them in ascending order. No path waits for an IPI, a remote completion or another CPU's lock while holding a 1L. `wake_tid_to_runnable_split` reads "already current here" under 1L[e], releases it, then takes 1L[d]. |
 | Scanning fallback, migration, new switch | None. |
 
@@ -3349,6 +3359,9 @@ They break down as follows:
   * W8 membership: at most 256 probes;
   * W9 `RingQueue::remove_tid`: at most 64 shifts.
 
+  (As landed for SCHED-LOCK-FAIR1. RT-SCHED1A corrects W2 to 229 candidates and W9 to 97 link
+  steps, §23.4.)
+
   `queue_advance_select_step_split`, `enqueue_committed_receiver_inner`,
   `withdraw_queued_tid_on`, the witness idle scan and a test-only walk are the 5 scanning sections.
 * **Kernel-thread admission:** lock-free (atomics), outside 1L.
@@ -3522,3 +3535,256 @@ kept. Unrelated coverage reuses the SCHED-LOCK2B evidence (§21.7). No historica
   * a `yarm-control-plane-servers` doctest.
 
   Both fail identically on `dce48596`, in a development `--workspace` run.
+
+---
+
+## 23. RT-SCHED1A: fixed-priority RT selection on the shared owners
+
+RT-SCHED1A puts the RT-P1 selection rules (SC-PRI-10 to SC-PRI-13) on the production paths that
+GP already uses. It adds no second dispatcher (SC-GP-2). The profile is a deployment
+configuration: `yarm.sched_profile=rt|gp` on the boot command line. Unset means GP, and GP
+decisions are unchanged.
+
+The pass covers one active scheduling domain. It does not implement:
+* scheduling contexts, budgets, replenishment or overrun debt (SC-CTX-1…8);
+* partition windows and the window-boundary rules (SC-PART-*, SC-PRI-12 (e));
+* budget exhaustion (SC-PRI-12 (f));
+* asynchronous preemption of kernel code, including kernel threads (they stay cooperative,
+  §18.3);
+* any time bound (23.6).
+
+### 23.1 What is implemented
+
+| Rule | Implemented as | Owner |
+|---|---|---|
+| SC-PRI-10: 32 levels, 0 highest | `TaskPriority(u8)`, `LEVELS = 32`; GP keeps levels 0, 1, 2 (`High`, `Normal`, `Low`) with the same indices | `crates/yarm-kernel/src/scheduler.rs` |
+| SC-PRI-10: priority fixed at configuration, bound to the context | TCB `sched_priority`, written only by `task_enqueue::configure_priority_locked` before the incarnation's first placement; sealed by the placement that binds its home (`bind_home_locked` / `fix_home_locked`); a later configuration is refused `Sealed` | `task_enqueue` (rank 2) |
+| Kernel-thread priority | the level given to `KThreadPool::create`, stored per incarnation and re-used by every wake and yield | `kthread` |
+| SC-PRI-11: FIFO at equal priority, no time-slicing | per-level FIFO lists; under RT a tick preempts only for a strictly higher queued entry (`CpuView::tick`, `would_preempt_next`) | `scheduler` (1L) |
+| SC-PRI-12 (a): preempted by strictly higher → head | `PriorityScheduler::requeue_current_at_head` (`preempt_reenqueue_head_only`), run by `SharedPreemptOwners` in the one yield transaction | `scheduler`, `yield_txn` |
+| SC-PRI-12 (b): explicit yield → tail | unchanged NR 0 transaction (`SharedYieldOwners`); kernel threads: `yield_now` | `yield_txn`, `kthread` |
+| SC-PRI-12 (c): block → removed | unchanged | `task_transition` |
+| SC-PRI-12 (d): wake → tail | unchanged enqueue, at the incarnation's own level | `task_enqueue` planners + commit |
+| SC-PRI-13: a wake is a scheduling point | local wake: `hal::notify_enqueued` raises this CPU's own reschedule interrupt; remote wake: the existing reschedule IPI after the 1L release; arrival on a running CPU: `syscall_split::settle_rt_reschedule`; on a kernel thread: `sched_point` | below |
+| Kernel threads in the real selection | the unfiltered selection never skips a higher-priority kernel thread for a lower user entry (§19.3 rule, now enforced across levels) | `scheduler` |
+
+**IPC handoffs.** No IPC path switches directly to a receiver. A receiver woken by IPC is placed
+through the same planners and commit seams (`wake_tid_to_runnable_split`,
+`sr_enqueue_committed_receiver_split` and its reconciled twin) at **its own** configured level,
+read by `task_priority_split_read` / `priority_of_locked`. The receive path's entering priority is
+the scheduler's own record of the current entry. Nothing inherits or donates a priority or a
+budget; a higher receiver then preempts the sender at the sender's next scheduling point, exactly
+as any wake does.
+
+**GP.** With the profile unset or `gp`:
+* the class rule (`priority_for_class`) is the only source of a level, and no task is configured;
+* a wake never displaces the running task (SC-PRI-4) and nothing is raised locally;
+* quantum expiry requeues at the tail (SC-PRI-3);
+* a kernel thread's scheduling point rotates it to the tail.
+
+The one GP-visible change is the unfiltered-selection rule above, and no GP kernel thread is
+created at a different level from user work (every creator uses `Normal`).
+
+### 23.2 The wake path to a scheduling point
+
+1. **Publication.** The waker commits the enqueue on the target's home CPU through the existing
+   planner (reserve → claim → commit, home incarnation checked under the target's 1L). The
+   scheduler lock is released.
+2. **Notification after unlock.** `hal::notify_enqueued(target)`:
+   * remote target: the existing reschedule IPI (x86_64 vector 0xF1, AArch64 SGI, RISC-V SSIP
+     with the per-CPU pending bit);
+   * local target, RT only: the same interrupt raised on this CPU (x86_64 ICR self shorthand,
+     AArch64 SGI to its own mask, RISC-V own pending bit + `sip.SSIP`). Interrupts are masked at
+     every caller, so it stays pending until the CPU next leaves masked kernel code.
+3. **Arrival.**
+   * On a running user task (x86_64: the 0xF1 stub hands a ring-3 arrival to the shared trap
+     path when `RT_USER_RESCHED_HANDOFF` is set; AArch64 / x86_64: the SGI branch of
+     `trap_entry`; RISC-V: the IPI block off the idle boundary): `settle_rt_reschedule` re-reads,
+     under that CPU's 1L, whether a strictly higher entry is queued. If not, `Declined`: nothing
+     moves (an equal-priority wake keeps FIFO). If so, it runs the SAME transaction a preempting
+     tick runs — the exact `Running → Runnable` of the entering incarnation, the head requeue,
+     the one-shot Yield deferral — and the existing post-lock drain selects through the one
+     selection owner. The interrupted frame is the outgoing task's (captured by the bridge on
+     x86_64 and AArch64; the asynchronous-preemption snapshot on RISC-V, the timer arm's owner).
+   * On a running kernel thread: the arrival sets `need_resched`; the thread's next
+     `sched_point` re-checks under its 1L and yields to the head only for a strictly higher
+     entry (`rt=true`), else keeps the CPU.
+   * At the idle boundary: the existing idle advance.
+4. **Coalescing and races.** Several raises coalesce into one arrival; the arrival decides from
+   the queue as it is then, so a wake whose task already ran, blocked or was withdrawn settles as
+   `Declined`. A transaction that cannot commit (a deferral already held, a refused transition)
+   settles `Deferred` and mutates nothing; the higher entry stays queued and the next scheduling
+   point (arrival, tick, the task's own block or yield) asks again.
+
+The cost: under RT every local enqueue raises an interrupt, including equal and lower ones that
+then decline. The RT core smokes count them (23.7).
+
+### 23.3 Storage: one pool per CPU, 32 linked FIFOs
+
+| Representation | Per CPU | 64 CPUs |
+|---|---|---|
+| Base: 3 rings × 128 slots | 3 × 1,040 B = 3,120 B | 195 KiB |
+| 32 rings of the same capacity | ≈ 33 KiB | ≈ 2.1 MiB |
+| **RT-SCHED1A: one 256-entry pool, 32 singly linked FIFOs** | ≈ 2.8 KiB (`POOL_SLOTS × (8 + 2)` + `32 × 6` + bitmap) | ≈ 180 KiB |
+
+Thirty-two fully provisioned rings would hold capacity no admission rule can fill. The pool is
+sized by occupancy instead (23.4). Push at either end and pop at the head are O(1); the highest
+non-empty level is one `trailing_zeros` of a 32-bit bitmap; removing an entry walks only its own
+level. The measured `size_of` deltas are in 23.7.
+
+### 23.4 Occupancy bounds (correcting "192")
+
+Admission keeps the per-level rule (`len + reserved < MAX_RUN_QUEUE = 64`) and adds a per-CPU total
+over every level: user queued + reserved < `MAX_RUN_QUEUE_TOTAL = 3 × (64 + 1) = 195`.
+
+* **It refuses nothing GP admitted.** SCHED-FULL-ROT1 bounds each level at 64 + 1 user entries,
+  so reaching 195 over three levels needs every level at 65, which the per-level rule already
+  refuses. Under RT it is what stops 32 × 64 entries.
+* **Entries per CPU**, all levels: `MAX_QUEUED_PER_CPU = 195 + 1 + 32 + 1 = 229 ≤ 256`:
+  * 195 admitted user entries — exited entries that stay queued until a dispatch discards them
+    count here, since they were admitted;
+  * 1 rotation slot (the occupant requeued without admission);
+  * 32 kernel threads (`KTHREAD_CAPACITY`; each queued only on its home, at most once);
+  * 1 for the AP idle placeholder.
+
+  Reservations hold no entry until filled, and their fill was admitted when reserved.
+* **Per level** the physical bound stays `MAX_QUEUED_PER_PRIORITY = 64 + 1 + 32 = 97`.
+
+The old "192 per CPU" (§1.1, the §2 path inventory, §6 W2/W8, §17.2 and §22.4) counted three rings of 64. It was already
+wrong for the base: each level could also hold the rotation slot and up to 32 kernel threads, so
+the base bound was 3 × 97 = 291. The corrected bounds:
+
+| Item | Base | RT-SCHED1A |
+|---|---|---|
+| W2 accepted selection | ≤ 291 candidates (stated 192), each a rank-2 TCB scan ≤ 512 | ≤ 229 candidates, each a rank-2 TCB scan ≤ 512 |
+| W8 membership linear fallback | ≤ 291 + 1 (stated 192 + 1) | ≤ 229 + 1 |
+| W9 remove one entry | ≤ 64 shifts (ring) | ≤ 97 link steps (its own level) |
+| Highest level | 3 probes | one `trailing_zeros` |
+
+### 23.5 Kernel threads
+
+Kernel threads go through the same selection. The unfiltered `dequeue_highest` / `peek_highest`
+return nothing when the highest non-empty level holds only kernel threads, so a user entry at a
+lower level can never be selected past them: a user yield storm cannot bypass a ready
+higher-priority kernel thread (§19.3, now across levels). The drain owner runs it.
+
+Kernel threads remain cooperative. A higher-priority wake while one runs is honoured at its next
+`sched_point`, which yields to the head of its level; `yield_now` goes to the tail. Under GP a
+pending reschedule still rotates it to the tail.
+
+### 23.6 What still prevents a time bound
+
+* Nested waits inside 1L: rank-2 (task) and rank-3 (IPC) TTAS locks (§22.4), unbounded.
+* The masked selection itself: ≤ 229 candidates × a 512-entry TCB scan (W2).
+* Synchronous printk under masked sections (W7), on every tick and on the RT markers
+  (`RT_RESCHED_DECLINED`, `RT_PREEMPT_COMMITTED`).
+* The whole masked trap (W3), firmware calls (W5) and frame allocation (W6).
+* Kernel threads: a higher wake waits for the running thread's next `sched_point`, whose
+  distance is the thread's own code.
+* Observed live, not a defect: under RT the level-0 supervisor's one-tick receive-timeout poll,
+  with its synchronous logging, takes nearly all of each 10 ms RISC-V TCG tick on CPU 0, so
+  level-20 work there progresses only in slivers. GP's quantum rotation hides this. RT gives the
+  supervisor what its level asks for.
+
+### 23.7 Evidence (candidate `67351f6b`)
+
+The runner was hashed before it ran, with the grader and the witness runner
+(`qual/predeclared.sha`), and every log was kept. Unaffected coverage reuses the SCHED-LOCK-FAIR1
+evidence (§22.8). No historical matrix was run.
+
+* **Hosted:**
+  * fmt;
+  * the serial lib suite: 6,732 passed;
+  * `--tests`: 43 binaries, 7,129 passed;
+  * `yarm-kernel` crate: 10 passed (the `TaskPriority` tests);
+  * the grader self-test: one passing record and 14 mutants, each caught by its rule.
+  * Focused subsets, each with its test count: `rt1a_` 15, `kthread` 43, `sched_full_rot` 15,
+    `run_queue` 7, `the_seam_reuses` 1, `sched_lock1` 20, `sl1_` 19, `fair1_` 9, `lock_order` 4,
+    `census` 33, `abi` 271, `stage199d` 427, `u3_ed` 27, `ap_sched1` 15, `sl2b_` 9, `sl2a_` 15,
+    `task_enqueue` 9, `overtaken` 23, `reap` 49, `futex` 327, `ipc_timeout` 4, `sr_place1` 9.
+  * The contract gate and doc enforcement.
+  * The default kernel and the witness feature cross-checked on all three targets.
+* **The `rt1a_` tests** drive the production owners (`CpuView`, the planners and commit,
+  `configure_priority_locked`, the yield transaction over its split owners,
+  `settle_rt_reschedule`, the IPC receiver seams, genuine hosted kernel threads):
+  * priority extremes (level 0 first, level 31 last);
+  * equal-priority FIFO;
+  * wake and yield at the tail;
+  * head requeue on a strictly higher wake and on a preempting tick;
+  * an equal or lower wake declined;
+  * a full level still taking back its preempted occupant at the head (SCHED-FULL-ROT1);
+  * the per-CPU total admission;
+  * the configured priority bound to the incarnation and sealed at its first placement;
+  * IPC receivers at their own level;
+  * GP quantum rotation and non-preempting wakes;
+  * a higher wake honoured at a running kernel thread's `sched_point`, an equal one not
+    rotating it, and GP still rotating.
+* **Lock order:** the same 30 descending sequential-pair types on the candidate and on `bf06be4c`,
+  none new.
+* **Live: the RT witness, SMP2, one boot per port,** `yarm.sched_profile=rt`. Each seals
+  `RTW_WITNESS_SEAL … result=pass`, inside a core smoke that passes under the RT profile. Every
+  rule passes (ID, SEAL, PHASES, A, B, C, D) and no record line is damaged.
+
+  | port | kernel / initramfs | records | A: UA yields at H0's 3 runs | B cause | C head-position cause | RT commits / declines |
+  |---|---|---|---|---|---|---|
+  | x86_64 | `422d6f8e…` / `4263535a…` | 67 | 920, 1418, 2004 | 1 | 1 | 376 / 117 |
+  | AArch64 | `9917dfd1…` / `828b7bca…` | 66 | 69, 106, 138 | 1 | 1 | 38 / 126 |
+  | RISC-V | `8b5e0782…` / `a5a11dd5…` | 79 | 2, 2, 3 | 1 | 1 | 1,279 / 193 |
+
+  RISC-V's UA counts are the supervisor starvation in 23.6. The runs took 640 s, 43 s and 269 s
+  under QEMU TCG; the x86_64 and RISC-V core smokes run QEMU to their budget. These are
+  measurements, not bounds.
+* **Default (GP) and RT core smokes** of the default C kernels, SMP2 on each port: all pass.
+  * GP prints no `YARM_SCHED_PROFILE` and no RT marker.
+  * RT prints `YARM_SCHED_PROFILE profile=rt route=construction`. Its only RT markers are local
+    `RT_RESCHED_DECLINED cpu=0 cause=1` (486, 124 and 3,960): equal or lower wakes declining,
+    the cost noted in 23.2.
+* **Negative controls,** each on the candidate with the tree restored (porcelain 0):
+  * **position** — a strictly-higher preemption requeues at the TAIL:
+    * hosted: 3 `rt1a_` tests fail (the two head-requeue tests and the full-level one);
+    * live RISC-V: the witness fails C and PHASES. E took CPU 1 as soon as H1 parked, ahead of
+      UB, so the yield request never came.
+  * **preemption** — an EQUAL priority preempts (and a tick rotates equals):
+    * hosted: 4 `rt1a_` tests fail;
+    * live RISC-V: the witness fails ID and SEAL. The level-0 system servers then preempt one
+      another on every wake (12,688 commits), CPU 0 never reaches idle, and the witness never
+      leaves its first phase. The grader's own `c_preempt` mutant covers the targeted rule.
+* **Sizes** (default builds of C and B with each port's own artifact script). B reproduces the
+  SCHED-LOCK-FAIR1 kernels `5412473e…`, `94889606…`, `b59e0040…`.
+
+  | port | `.text` B → C | `.bss` B → C |
+  |---|---|---|
+  | x86_64 | 1,313,822 → 1,331,726 (+17,904, +1.36 %) | 24,596,496 → 24,576,129 (−20,367) |
+  | AArch64 | 952,724 → 894,276 (−58,448, −6.13 %) | 75,448,960 → 75,429,312 (−19,648) |
+  | RISC-V | 757,120 → 759,450 (+2,330, +0.31 %) | 92,138,328 → 92,116,776 (−21,552) |
+
+  The AArch64 `.text` drop is measured, not analysed: code generation around the pool replaced
+  the ring code.
+
+  Scheduler state (hosted layout; every port is LP64):
+  * `RunQueues` 2,760 B;
+  * `PriorityScheduler` 5,472 → 5,160 (−312);
+  * `CpuSched` 5,608 → 5,296;
+  * `CpuCell` 5,760 → 5,440 (−320 at 64-byte alignment), so −20,480 B over 64 CPUs;
+  * `Admission` 40 and `SchedDomain` 192, unchanged.
+* **Development history.** Every failed development run is kept with the evidence (`dev/`):
+  * a no-FP exclusion the image check refused;
+  * an initramfs from an older dirty tree, refused by the artifact binding;
+  * the grader's first A, C and D rules, which assumed no level-0 load on CPU 0, cause 1 only,
+    and the first resume after the wake;
+  * seven source-guard failures in the first full run. Four were re-derived for new,
+    classified sites: one timer drive, the ninth broad-skip arm, the selection owner's window in
+    two guards. The RISC-V mailbox guard now enumerates `raise_local_reschedule`. Two were met in
+    code: the RT scheduling point's 1L read moved to `runtime.rs`, and the test fixture uses
+    `set_task_status_for_test`.
+
+### 23.8 Remaining gaps
+
+* **The queued-reply incarnation gap (§21.6) is unchanged.** `sr_enqueue_committed_receiver_split`
+  still admits the TID's current incarnation (`0`). It now reads that incarnation's configured
+  priority, which inherits the same gap: a TID reused before the commit is placed at its own
+  configured level.
+* Priorities are configured by the kernel's deployment provisioning only; there is no user ABI.
+  The GP classes keep their levels (0, 1, 2) under RT, so any configured level > 2 runs below
+  every system server.
+* One scheduling domain; no scheduling contexts, budgets or partitions (above).

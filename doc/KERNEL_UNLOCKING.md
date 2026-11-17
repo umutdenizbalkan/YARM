@@ -36897,3 +36897,63 @@ enforcement and the serial lib.
 | inherited | `yarm-server-runtime` `runtime_reexports_curated_runtime_surfaces` and a `yarm-control-plane-servers` doctest fail identically on `dce48596` (development `--workspace` run) |
 
 **Verdict: QUALIFIED.**
+
+#### RT-SCHED1A (from qualified `bf06be4c`)
+
+The first RT scheduling pass, on `wip/rt-sched1a`.
+
+**Fixed-priority RT selection on the shared owners.** The RT-P1 selection rules (SC-PRI-10 to
+SC-PRI-13) run on the production selection, enqueue, transition and dispatch-token owners on all
+three ports. There is no second dispatcher. The profile is a deployment configuration,
+`yarm.sched_profile=rt|gp`, for the one active scheduling domain. Unset means GP, whose decisions
+are unchanged. The full record is `SCHEDULING_CONTRACT.md` §23.
+
+- **Levels and configuration.** 32 levels, 0 highest (`TaskPriority(u8)`); GP keeps levels 0–2.
+  A priority is configured on the exact incarnation before its first placement
+  (`task_enqueue::configure_priority_locked`), sealed by the placement that binds its home, and
+  read by every planner; a kernel thread's is its creation level.
+- **Positions.** FIFO at equal priority and no tick rotation under RT. Preempted by a strictly
+  higher priority: head of its level (`SharedPreemptOwners { head: true }` in the one yield
+  transaction). Explicit yield and wake: tail. Block: removed.
+- **Wake as a scheduling point.** Remote: the existing reschedule IPI after the 1L release.
+  Local: the same interrupt raised on the waking CPU. On arrival at a running task,
+  `settle_rt_reschedule` re-checks priority under the CPU's 1L and either declines (nothing moves)
+  or commits the preempting-tick transaction, which the existing Yield drain consumes. On a
+  kernel thread, its next `sched_point` yields to the head only for a strictly higher entry.
+- **Kernel threads** go through the same selection; the unfiltered selection never skips a
+  higher-priority kernel thread for a lower user entry. They stay cooperative.
+- **IPC** receivers are placed at their own configured level through the existing seams: no
+  inheritance, no donation.
+- **Storage.** One 256-entry pool per CPU with 32 linked FIFOs and a level bitmap (≈ 2.8 KiB per
+  CPU, against 3 × 1,040 B before; 32 rings would be ≈ 33 KiB). A per-CPU total admission of
+  195 user entries (refusing nothing GP admitted) bounds occupancy at 229 entries per CPU; the
+  old "192" is corrected (§23.4).
+- **Not in this pass:** scheduling contexts and budgets, replenishment, partition windows,
+  exhaustion, asynchronous kernel preemption, any time bound.
+
+**Guards re-derived** (each for a new, classified site, none relaxed):
+- the timer route drives the yield transaction once (`SharedPreemptOwners { split, head }`);
+- the RT reschedule commit is the ninth typed disposition arm that skips the broad dispatcher;
+- the selection owner's source window grew for the default-off witness hook;
+- RISC-V `raise_local_reschedule` is the fifth enumerated `PENDING` publisher;
+- the RT scheduling point reads the 1L through a `runtime.rs` reader, not from `syscall_split.rs`.
+
+**Commits.** `67351f6b`: the policy, the owners, the wake path on three ports, the hosted tests, the
+witness, its grader and runner. The documentation commit follows it. The runner was hashed
+before it ran (`qual/predeclared.sha`), and every log was kept.
+
+| step | result |
+|---|---|
+| hosted | fmt; serial lib, 6,732 passed; `--tests`, 43 binaries, 7,129 passed; `yarm-kernel` 10; the grader self-test (14 mutants); 22 focused subsets, each with a non-zero count (§23.7; the `TaskPriority` tests run in the `yarm-kernel` crate); contract gate; doc enforcement; default and witness kernels checked on all three targets |
+| lock order | 30 descending-pair types on C and on `bf06be4c`, none new |
+| builds | default x86_64, AArch64 and RISC-V artifacts, C and B. C kernels: x86_64 `f2b28b64…`, AArch64 `34cbd4db…`, RISC-V `5ba362f9…`. B reproduces the SCHED-LOCK-FAIR1 kernels `5412473e…`, `94889606…`, `b59e0040…` |
+| sizes | `.text`: x86_64 +17,904 (+1.36 %), AArch64 −58,448 (−6.13 %), RISC-V +2,330 (+0.31 %). `.bss` −19.6 to −21.6 KiB on each port: `CpuCell` 5,760 → 5,440 B (×64 CPUs); `RunQueues` 2,760 B |
+| GP / RT core smokes | the default C kernels, SMP2, each port: GP passes with no RT marker; RT passes with `YARM_SCHED_PROFILE profile=rt` and only declined local raises (486, 124, 3,960) |
+| W1 x86_64 SMP2 | `RTW_WITNESS_SEAL … result=pass`, every rule; A 3/3 (UA yields 920 → 2004), B cause 1, C head cause 1 (kernel `422d6f8e…`) |
+| W2 AArch64 SMP2 | `result=pass`; A 3/3 (69 → 138), B cause 1, C cause 1 (kernel `9917dfd1…`) |
+| W3 RISC-V SMP2 | `result=pass`; A 3/3 (UA yields 2, 2, 3: CPU 0 is held by the level-0 supervisor's one-tick poll, §23.6), B cause 1, C cause 1 (kernel `8b5e0782…`) |
+| negative controls | tail requeue on preemption: hosted 3 `rt1a_` tests fail; live RISC-V fails C (E ran ahead of UB). Equal-priority preemption: hosted 4 tests fail; live RISC-V fails ID/SEAL (the level-0 servers preempt each other on every wake, so CPU 0 never idles and the witness never starts; the grader's `c_preempt` mutant covers the rule). Tree restored, porcelain 0 |
+| gaps kept visible | the queued-reply incarnation (§21.6), now also reading that incarnation's configured priority; no budgets, windows, exhaustion, asynchronous kernel preemption or time bound |
+| not run | a `--workspace` run (SCHED-LOCK-FAIR1 recorded its two inherited failures outside the `yarm` package); the historical matrix |
+
+**Verdict: QUALIFIED.**
