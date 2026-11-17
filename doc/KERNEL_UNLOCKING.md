@@ -37031,3 +37031,68 @@ log was kept, failures included.
 | not run | a `--workspace` run; the historical matrix |
 
 **Verdict: QUALIFIED** on `1e6cfd40` (the code of `d2027640`, with the corrected witness rule).
+
+#### FUTEX-ABS-BITSET1 (from qualified `e1aee62d`)
+
+The sixth pass of this series, on `wip/futex-abs-bitset1`.
+
+**Absolute futex deadlines and selective wake, ABI v13.** NR 9's timed form takes an absolute
+`CLOCK_MONOTONIC` deadline; NR 9 / NR 10 take a `u32` wake mask. Both extend the FUTEX-TIME1,
+FUTEX-REQUEUE-ATOMIC1 and FUTEX-WAKE-CAP1 owners on all three ports: one waiter table, one
+compare-and-register, one wake loop, one collector; no new lock, no second dispatch path. The full
+record is `SCHEDULING_CONTRACT.md` §25; the ABI is `SYSCALL_ABI.md` (*v12 → v13*, *Futex safety
+contract*).
+
+- **ABI.** `FUTEX_FLAG_TIMED` (bit 1, NR 9 only): slot 3 = absolute monotonic ns, any `u64`.
+  `FUTEX_FLAG_BITSET` (bit 2, NR 9 and NR 10): slot 4 = nonzero `u32` mask; `MATCH_ANY =
+  u32::MAX`; match iff `wait & wake != 0`. A slot is read only with its flag. Decode precedence:
+  undefined flag, width, alignment, mask — all `InvalidArgs`. `SYSCALL_ABI_VERSION` and
+  `RECV_V3_ABI_VERSION` are 13; the doc gate pins the v13 flags in the kernel and the runtime.
+- **Deadline domain.** The record holds `FutexDeadline::MonotonicNs`; `reached` reads only the
+  monotonic reading of `FutexNow` (the tick there is diagnostic). `rekey` writes key and VA only,
+  so the instant, its domain and the mask survive requeue, `Pending`, `Expired` and collector
+  retries. Admission compares the word first, then reads the clock: no reading → `Unavailable`,
+  `now >= deadline` → `TimedOut`, both with nothing published. A zero mask at the owner is
+  `InvalidMask`.
+- **Selective wake.** Oldest first among matches; a non-matching waiter is passed over in place
+  and does not consume the count; reserve before claim, stopping at the first unplaceable match.
+  NR 17's wake portion and robust exit cleanup are `MATCH_ANY`; moved records keep their masks.
+  The condition-variable broadcast is unchanged.
+- **Runtime.** `futex_wait_until` (absolute, masked), `monotonic_deadline_after`,
+  `futex_wake_bitset`; `futex_wait_timeout` reads the clock once and makes one call.
+- **Unchanged:** budgets, IPC deadlines, timer cadence, quantum. No sub-tick claim.
+- **Not in this pass:** a timed mutex or re-waiting timed condvar (pass 7), FUTEX-SEAL1, PI, EDF,
+  partitions, vDSO, signals, asynchronous kernel preemption.
+
+**Guards re-derived** (renamed or extended owners, none relaxed):
+- the park-route guards (`riscv_park_ret1::g04`, `stage191d` ×2, the `u9fw` reservation order,
+  `stage199d` census and fingerprint): `timing`/`mask` arguments, the masked registration owner;
+- `u9qa`: nine non-parking park outcomes (adds `ClockUnavailable`, `InvalidMask`), each releasing
+  its reservation;
+- `stage45`: the frozen ABI version is 13.
+
+**Commits.**
+- `a8d7952d`: the ABI, the deadline domain, the masked wake, the runtime API, the hosted tests,
+  the witness sequences, the grader rules, the gate block and the ABI documentation.
+- The documentation commit follows it.
+
+The runner was hashed before it ran (`qual/predeclared.sha`). Every log was kept, failures
+included; the first launch was stopped seconds in (it would have hit a tool time limit) and is kept
+as `qual-aborted-1`.
+
+| step | result |
+|---|---|
+| hosted | fmt; serial lib, 6,769 passed; `--tests`, 43 binaries, 7,166 passed; `yarm-kernel` 10, `yarm-user-rt` 113, `yarm-ipc-abi` 211; the grader self-test; 23 focused subsets, each with a non-zero count (`abs_bitset1` 18, `time1` 73, `sleep1` 18; `SCHEDULING_CONTRACT.md` §25.5); contract gate; doc enforcement; default, witness kernels and witness init checked on all three targets |
+| gate control | the v13 block catches a runtime `FUTEX_FLAG_BITSET` that differs from the kernel's (exit 1 at that check) |
+| lock order | 30 descending-pair types on C and on `e1aee62d`, none new |
+| builds | default x86_64, AArch64 and RISC-V artifacts, C and B. C kernels: `31ef01f8…`, `87e2befe…`, `0d0791af…`. B reproduces the RT-SCHED1B kernels `2408e75e…`, `f74eb230…`, `7ee9c405…` |
+| sizes | `.text` +176 B, −1,332 B, −116 B; `.bss` +3.8 KiB, −4 KiB, −0.9 KiB |
+| core smokes | the default C kernels, SMP2, each port: GP, RT and RT + `yarm.sched_budget=on` (`result=enforced`) pass |
+| W1 x86_64 SMP2 | `FUTEX_TIME_WITNESS_SEAL … result=ok`, every rule: P, A/F (3 idle collections), B, M (2 skips, own-mask wake), C (mask and instant kept across the requeue), D, G (13 woken / 19 timed out, 15 windows woke), E (full home proven, one later placement) |
+| W2 AArch64 SMP2 | `result=ok`; G 12 / 20, 8 windows woke; E proven by 2 refusals |
+| W3 RISC-V SMP2 | `result=ok`; G 12 / 18, 10 windows woke; E proven |
+| negative controls | hosted: wrong clock after rekey 6 tests fail, ignored wake mask 8, mask reset on requeue 3, deadline reset on requeue 8, duplicate settlement 2; live RISC-V (full build), ignored wake mask: M and C fail, no completion. Tree restored, porcelain 0 |
+| gaps kept visible | no timed mutex or re-waiting timed condvar (pass 7); no FUTEX-SEAL1, PI, EDF or partitions; lateness bounded only by the collector cadence, no sub-tick claim |
+| not run | a `--workspace` run; the historical matrix |
+
+**Verdict: QUALIFIED** on `a8d7952d`.

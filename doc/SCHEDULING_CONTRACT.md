@@ -4259,9 +4259,54 @@ settled while its budget is exhausted is made Ready but budget-parked by the res
 reservation becomes the parked slot, §24.4); its replenishment rejoins it once, and no second
 completion is made.
 
-### 25.5 Evidence
+### 25.5 Evidence (candidate `a8d7952d` against `e1aee62d`)
 
-(filled from the qualification run)
+The runner, the negative-control patches and the candidate's grader, smoke script and cell were
+hashed before the run (`qual/predeclared.sha`); every log is kept, the development boots included,
+on `wip/futex-abs-bitset1-evidence`.
+
+* **Hosted.** Serial lib 6,769 passed; `--tests` 43 binaries, 7,166 passed; `yarm-kernel` 10,
+  `yarm-user-rt` 113, `yarm-ipc-abi` 211; 23 focused subsets, each non-empty (`abs_bitset1` 18,
+  `time1` 73, `sleep1` 18, `futex` 346, `futex_requeue1` 201, `stage199d` 427). The new tests drive
+  the production owners: admission order and the unavailable clock (ab01), the zero mask (ab02),
+  the exact instant (ab03), NR 9/10 through `dispatch` (ab04), disjoint and overlapping masks, FIFO
+  and the count (ab05/06), the capacity stop (ab07), the split masked wake (ab08), repeated
+  requeue preservation (ab09), NR 17's MATCH_ANY wake portion (ab10), `Expired` ownership (ab11),
+  wake/timeout and requeue/timeout races in the phase windows (ab12–14), reuse (ab15), robust exit
+  and teardown (ab16), RT+budget settlement while exhausted (ab17), unchanged unmasked behaviour
+  (ab18), and Sleep versus futex isolation (sleep1 c18).
+* **Lock order.** 30 descending-pair types on the candidate and on `e1aee62d`, none new.
+* **Gates.** Contract and doc-enforcement gates pass; the gate's v13 block catches a runtime flag
+  that disagrees with the kernel's (a control, exit 1 at that check).
+* **Builds.** Default and witness kernels and the witness init check on all three targets. The
+  baseline kernels are byte-identical to RT-SCHED1B's. `.text` +176 B (x86_64), −1,332 B
+  (AArch64), −116 B (RISC-V).
+* **Core smokes** on the candidate's default kernels, SMP2, each port: GP, RT and RT+budget
+  (`result=enforced`) pass.
+* **Live witness**, SMP2, GP, each port (`FUTEX_TIME_WITNESS_SEAL … result=ok`, every rule):
+
+  | port | G woken / parked timed out | windows woke | idle A collections | E proof |
+  |---|---|---|---|---|
+  | x86_64 | 13 / 19 | 15 | 3 | 1 |
+  | AArch64 | 12 / 20 | 8 | 3 | 2 |
+  | RISC-V | 12 / 18 | 10 | 1 | 1 |
+
+  On every port: P was refused at admission with nothing published; M's mask-`0x2` wake passed W
+  over twice and woke S2, and W was woken only by its own mask; C's moved record kept mask `0x4`
+  (a disjoint wake passed it over) and timed out on the target at its registered instant; D's
+  ordinary wake released a masked waiter; E's timeout won while W's home queue was proven full
+  (`SATW_REFUSED … full=1`) and was placed once later.
+* **Negative controls.** Hosted, each on `futex_requeue1::` (expected failures): wrong clock after
+  rekey 6 tests; ignored wake mask 8; mask reset on requeue 3; deadline reset on requeue 8;
+  duplicate settlement (expiry leaves the record on its user key) 2. Live, the ignored wake mask on
+  RISC-V (a full build): M and C fail, no completion. The tree was restored after each (porcelain
+  0).
+* **Witness development** (kept, not graded for qualification): the first boots showed that a
+  1 ms absolute deadline usually passes before admission under TCG (the cell's own log line), that
+  spawning the E fillers outlasts a 60 s deadline on RISC-V, and that a monotonic deadline is
+  collected by whichever CPU traps first, not by the tick owner. The cell now leads G by a few
+  timer periods, takes E's deadline after the saturation, settles 1 s before A and adds a third G
+  signaller. The grader gained only the `S3` name; no rule was relaxed.
 
 ### 25.6 Remaining gaps
 
