@@ -36765,3 +36765,75 @@ addenda were hashed before they ran (`qual/predeclared.sha`), and every log was 
 empty-block syntax error. It is not a cell of this pass.
 
 **Verdict: QUALIFIED.**
+
+#### SCHED-LOCK2B (from qualified `c9fbc7ef`)
+
+The second SCHED-LOCK2 pass, on `wip/sched-lock2b`.
+
+**Exact-incarnation placement reads on the home.** A placement question about one exact task
+incarnation is answered on that incarnation's home alone. The full design record is in
+`SCHEDULING_CONTRACT.md` §21.
+- `with_incarnation_home_split` takes rank 2 for the home and the stamp, releases it, then takes the
+  home CPU's 1L with rank 2 nested and revalidates the identity.
+- H-HOME (§20.5) makes that one 1L the whole answer.
+- Production has no caller of the coherent view.
+- No functional direct-IPC or reap path walks every CPU.
+- Outcomes, the syscall ABI, GP policy, reserve → claim → commit, notification after publication
+  and VM shootdown residency targeting are unchanged.
+
+**Converted.**
+- The direct request and reply preflights and their rollback checks.
+- The reaper's pre- and post-claim proofs, both split and broad.
+- The five coherent readers:
+  - the entering-frame authority;
+  - the exit token's placement precondition;
+  - the post-lock exit validation;
+  - the receive unwind classifier;
+  - the declined-yield classifier.
+- The committed-receiver enqueue (direct-IPC seam) and `restore_current_exact_split`, which were
+  incarnation 0 in SCHED-LOCK2A, are now bound to a caller-captured stamp.
+- The x86_64 broad blocked-server marker now reads its facts only when the oracle is armed.
+
+**Identity.** Stamps are captured where the caller's identity is authoritative:
+- Phase A and the futex park, in their compare-and-clear section;
+- the entering capture;
+- the direct-IPC acks at publication, as payload, so `{tid, asid}` matching is unchanged;
+- the exit token's clear;
+- the reap claim.
+
+A missing or replaced identity is `Stale` and settles through each caller's existing refusal:
+- the request preflight answers `WouldBlock` and discards the ack;
+- the reply preflight answers `WaiterLost`;
+- the exit restore answers `IncarnationGone`;
+- the receive recovery answers `IncarnationMoved`;
+- the reap post-claim proof answers `StillScheduled` with the claim rolled back.
+
+TID 0 (the per-CPU sentinel) is answered on the asking CPU. Per-path ownership and lock counts are
+in §21.3 and §21.4.
+
+**Remaining gaps (§21.6).**
+- The generic committed-receiver seam (the queued-reply wake) still admits the TID's current
+  incarnation. Its caller holds only a rank-3 `{tid, asid}` waiter record; binding it needs a stamp
+  in `EndpointWaiterRecord`.
+- The exit validation and the entering-frame authority pin the stamp at the home lookup rather than
+  carrying one from the disposition or the trap-entry capture. §21.3 gives why that suffices for
+  each verdict.
+
+**Commits.** `79e898e9`: the implementation, the census guard, and the regressions. The runner and
+addendum A were hashed before they ran (`qual/predeclared.sha`), and every log was kept.
+
+| step | result |
+|---|---|
+| hosted | fmt; serial lib, 6,706 passed; integration; 23 focused subsets, each with a non-zero test count (§21.7); contract gate; doc enforcement |
+| negative controls | home lookup ignoring the stamp: 4 of the 9 `sl2b_` tests fail. Request preflight reading `Stale` as absent: the request test fails. Tree restored, porcelain 0 |
+| lock order | 30 descending-pair types on C and on `c9fbc7ef`, none new |
+| builds | default x86_64, AArch64 and RISC-V artifacts. Kernel / initramfs: x86_64 `03430ead…` / `305736ed…`; AArch64 `b71ad0e2…` / `6a535fe9…`; RISC-V `64709f51…` / `32a08478…` |
+| L1 x86_64 direct request/reply, functional single CPU | `LIVE_SEAL … live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok` (oracle kernel `3dd2928f…`). The cross-CPU oracle cell is not run: it returned `blocked` on both SCHED-LOCK2A trees and contributes no coverage |
+| L2 AArch64 direct request/reply | `LIVE_SEAL … live_cells=2 … result=ok` (kernel `6072c265…`) |
+| L3 AArch64 exit-current-task witness | `result=ok`, `split_route_entries=1 exit_claims_retired=1 queue_advance_deferrals_committed=1 exiting_task_reselections=0` (kernel `c7f6a720…`) |
+| L4 RISC-V direct request/reply | `LIVE_SEAL … live_cells=2 … result=ok` (kernel `61c72c66…`) |
+| L5 RISC-V exit-current-task witness | `result=ok` (kernel `800d47ea…`, initramfs `e7be2cff…`) |
+| home-refusal scan (text logs) | no `SCHED_HOME_REFUSED` in any live cell |
+| addendum A | L1, L2 and L4 each print `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL … nr7_ok=0 … result=fail`, a diagnostic the scripts do not gate on. The same three smokes on `c9fbc7ef` print it identically, with the same `LIVE_SEAL … result=ok` |
+
+**Verdict: QUALIFIED.**

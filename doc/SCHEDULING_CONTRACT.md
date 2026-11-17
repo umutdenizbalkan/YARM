@@ -2970,6 +2970,7 @@ order and notification-after-publication are unchanged. VM shootdown targeting i
   stamp captured by the caller: the direct-IPC transaction's exclusive endpoint-waiter claim
   (`{tid, asid}`) is what holds the receiver, and the home admission runs under the committing 1L.
   Threading the claimed stamp through `ack.server` / `ack.caller` is the SCHED-LOCK2B option.
+  SCHED-LOCK2B does that (§21.2): the direct-IPC seam is now bound to the acknowledged stamp.
 * **Hosted fixture rehome** (`rehome_unplaced_task_for_test`, `#[cfg(test)]`): models "first placed
   on CPU n" for an UNPLACED task and refuses a placed one. Production has no rehome.
 
@@ -3015,7 +3016,8 @@ then lock that one CPU), instead of scanning every CPU.
 | reap's `task_present_in_any_runqueue` / the split membership check (`reap_txn`) | Absent everywhere before a TID is freed? | Absence on the home suffices for the incarnation being reaped (an exited entry still queued is on its home). |
 
 These are kept unchanged in this pass; the five coherent reads remain the only coherent-view
-callers (guard (5) of `sched_lock1_d6_per_cpu_scheduler_ownership_rules`).
+callers (guard (5) of `sched_lock1_d6_per_cpu_scheduler_ownership_rules`). SCHED-LOCK2B converts every
+row of this table (§21).
 
 ### 20.6 Evidence (candidate `189a890d`; `cabe3ccc` repairs one witness script)
 
@@ -3035,3 +3037,175 @@ callers (guard (5) of `sched_lock1_d6_per_cpu_scheduler_ownership_rules`).
   in any live log.
 * The armed SMP oracle's facts are therefore proven equivalent by P and S, not live: on both trees
   the witness never reaches the marker's conditions (its AP-side server path is not wired).
+
+## 21. SCHED-LOCK2B: exact-incarnation placement reads on the home
+
+Base `c9fbc7ef`. The rule: **a placement question about one exact task incarnation is answered on
+that incarnation's home alone, against a stamp captured where the caller's identity was
+authoritative.** Production has no caller of the coherent view (1G plus every 1L), and no
+functional direct-IPC or reap path walks every CPU. Outcomes, the syscall ABI, GP policy,
+reserve → claim → commit, notification after publication and VM shootdown residency targeting are
+unchanged.
+
+### 21.1 The home section
+
+`SharedKernel::with_incarnation_home_split(tid, stamp, f)`:
+
+1. rank 2 alone — `task_enqueue::home_lookup_locked`: the TID's TCB, its stamp (the caller's must
+   match when non-zero; `0` pins the one this acquisition sees) and its home. Released.
+2. the home's 1L with rank 2 nested (ascending 1 → 2) — `task_enqueue::home_unchanged_locked`
+   revalidates that the TID is still that incarnation on that home, then `f` runs.
+
+| Result | Meaning |
+|---|---|
+| `Home { home, stamp, read }` | `f` ran under the home 1L; by H-HOME (§20.5) it saw every placement the incarnation has. |
+| `Homeless { stamp }` | No home recorded (or a recorded home that names no CPU cell): every 1L placement step admits only on a recorded, existing home, so at that rank-2 instant it is placed nowhere. |
+| `Stale` | No TCB (TID 0 and kernel-thread ids have none), a different incarnation than the caller's stamp, or the incarnation changed before its home 1L was held. Never read as "absent". |
+
+Homes are never rewritten (§20.1), so a home that changes between the steps can only mean the
+incarnation went away. On top of it: `incarnation_home_placement_split` (the four
+`TaskPlacement` shapes, each naming the home), `incarnation_home_membership_split_read`
+(`Absent | Present | Stale`), and `exact_status_and_home_placement_split` (status and placement as
+one observation, `{tid, asid}` checked under the same nested rank 2). The broad twin for the broad
+reap owner is `KernelState::incarnation_home_membership` (with_tcbs, then `lock_cpu(home)` with
+with_tcbs nested — the SCHED-LOCK2A broad-twin shape).
+
+**TID 0** is the per-CPU idle/supervisor sentinel: admitted on every CPU, never homed. H-HOME does
+not localize it, and each CPU's TID 0 is its own; the readers that ask on behalf of a CPU (the
+entering-frame authority, the receive unwind, the declined yield) answer TID 0 on that CPU's 1L
+(rank 2 nested). The membership read answers TID 0 `Stale`: it is never a direct-IPC receiver or a
+reap target.
+
+### 21.2 Where each caller's stamp comes from
+
+`ThreadControlBlock::incarnation` (§20.1). A stamp read after reacquiring a numeric TID cannot
+authenticate an earlier task, so each is captured at the original authority boundary:
+
+| Caller | Captured | Why the capture names the right incarnation |
+|---|---|---|
+| Receive family (`recv_block_phase_a_split`) | In the SAME section as the compare-and-clear: `cpu`'s 1L with rank 2 nested, with the ASID. Carried in `RecvBlockIdentity::stamp` / `RecvEnteringIncarnation::stamp`. | The slot names the TID at that instant; a current task's TCB cannot be reclaimed. (The ASID used to be read in a separate, earlier rank-2 acquisition.) |
+| Futex park (`futex_wait_park_exact_timed_split`) | In its compare-and-clear section (1L, rank 2 nested). | Same. |
+| Entering capture (`current_entering_incarnation_split_read`) | `{tid, priority}`, ASID and stamp in one 1L section with rank 2 nested (was 1L then rank 2). | Same. |
+| Direct IPC acks (`BlockedServerAck::server_incarnation`, `BlockedCallerAck::caller_incarnation`) | At publication: the split route passes Phase A's stamp; the broad arm reads it under the broad guard its receive has held since the trap. Stored as payload `AckFields::waiter_stamp` — not in `AckWaiter`, so every `{tid, asid}` match, release and absence check is unchanged. | The endpoint-waiter claim names `{tid, asid}` only, which a TID reused inside the same address space would satisfy; the stamp is what pins the incarnation through the claim. |
+| Exit token (`ClearedCurrentToken::stamp`) | In `clear_current_exact_split`'s 1L section with rank 2 nested, while the slot names the TID. | Same as Phase A. |
+| Reap (`ReapClaim::incarnation`) | In the claim's own rank-2 acquisition. | The claim holds the TCB (`Dead`) until it retires. |
+| Reap pre-claim, exit validation, entering-frame authority | `0` — pinned at the home lookup. | See 21.3. |
+
+### 21.3 Per-path ownership
+
+* **Direct request preflight (4a) and its rollback check** (`direct_server_exact_still_blocked`),
+  **direct reply preflight (2b) and its rollback check** (`direct_caller_exact_still_blocked`):
+  `incarnation_home_membership_split_read(tid, ack stamp)`. `Present` keeps the typed
+  `ReceiverMembershipViolation` and discards the acknowledgement; `Stale` is the caller's existing
+  non-mutating refusal — request: settle the lease and `WouldBlock`, as an inexact server at (4);
+  reply: `WaiterLost`, as a lost waiter at (2). Both precede the first userspace-visible mutation.
+  A rollback check answers `Absent` only, so a stale acknowledgement is never re-armed.
+* **Committed-receiver enqueue (direct-IPC seam)**: `sr_enqueue_committed_receiver_reconciled_split`
+  takes the ack stamp. A stamp that is no longer the TID's is refused before any home is bound for
+  it, and again by `admit_home_locked(tcbs, tid, stamp, cpu)` under the committing 1L; the refusal
+  is the existing `Rejected { CpuOffline }`, whose rollback is unchanged.
+* **`restore_current_exact_split`** takes the caller's stamp (exit token, receive entering
+  incarnation, futex park). The receive recovery's commit also compares the stamp, because a
+  preempt-and-prefer may have installed whatever this CPU had queued under the TID.
+* **Reap**: pre-claim `target_is_scheduled(tid, 0)` refuses on `Present` only — `Stale` (no TCB, or
+  replaced between the steps) is not residency, and the claim then refuses `TaskGone` or wins the
+  replacement; post-claim `target_is_scheduled(tid, claim.incarnation())` requires `Absent`, rolling
+  the claim back otherwise. An exited entry still queued is on its home, so a still-placed task is
+  never reclaimed. Eager queued-exit removal is not added.
+* **Exit token restore precondition**: `incarnation_placement(tid, token stamp)` — `Present` →
+  `PlacedElsewhere`, `Stale` → `IncarnationGone`, then the stamp-bound restore.
+* **Post-lock exit validation**: the home section reads the facts; home = trapping CPU (every
+  production exit) is one section, as coherent as before. Otherwise the trapping CPU's current
+  slot is read under its own 1L: it is the only non-home slot this trap returns through, a
+  contradiction there fails closed as `EXIT_TASK_EXITING_STILL_CURRENT`, and the replacement it
+  names is re-resolved under that same 1L by `post_exit_replacement_restore_split`. The pinned
+  stamp suffices because the only proceeding verdict ("terminal, identity intact, placed
+  nowhere") is monotone for an exited incarnation, and a reaped one is absent by the reaper's own
+  proof.
+* **Entering-frame authority** (`{tid, asid}` from trap entry, stamp pinned): only
+  `OwnsEnteringFrame` grants anything, and it requires `Current` on THIS CPU, whose slot only this
+  CPU's own dispatch or exact restore installs; this CPU is executing the trap. Every other
+  verdict forfeits.
+* **Receive unwind classifier and declined yield**: the entering stamp.
+
+### 21.4 Lock acquisitions per path
+
+| Path | Before | After |
+|---|---|---|
+| Direct request (4a), request rollback check, reply (2b), reply rollback check — each | 64 1L, one at a time (`present_anywhere_scan` over `MAX_CPUS`) | rank 2, then 1L with rank 2 nested: 2 rank-2, 1 1L |
+| Committed enqueue, direct seam | rank 2 (class), rank 2 (home bind), 1L + rank 2 | + 1 rank 2 (stamp precheck) |
+| Reap pre-claim / post-claim, split — each | 64 1L sequential | 2 rank-2, 1 1L |
+| Reap pre-claim / post-claim, broad — each | 1G + 64 1L | 2 rank-2, 1 1L |
+| Exit token placement precondition | 1G + 64 1L | 2 rank-2, 1 1L |
+| `clear_current_exact_split`, futex park clear, Phase A | 1L (Phase A: + 1 rank 2 before) | 1L with rank 2 nested |
+| Post-lock exit validation | 1G + 64 1L, rank 2 nested | home = trapping CPU: 2 rank-2, 1 1L; otherwise + 1 1L |
+| Entering-frame authority, receive unwind classifier, declined yield — each | 1 rank 2, then 1G + 64 1L | 2 rank-2, 1 1L (TID 0: 1 1L + rank 2 nested; homeless: 2 rank-2) |
+| x86_64 broad blocked-server marker, oracle off | 1G + 64 1L | none (behind `oracle_gated_facts`, like the split route since SCHED-LOCK2A) |
+
+Every nesting is 1L → 2 (ascending); no rank-2 section takes a 1L; no new pair type.
+
+### 21.5 Retained all-CPU reads (census, guard (5))
+
+* The coherent view (`with_all_cpus_sched_split`): **0** production callers; hosted tests only.
+* `present_anywhere_scan` / `receiver_has_scheduler_membership_split_read`: the x86_64 SMP
+  oracle's armed fact collection on the split route (inside `oracle_gated_facts`), and hosted
+  tests. Unused in a hosted production build (`allow(dead_code)` outside tests).
+* `SmpScheduler::placement_of`: hosted tests only.
+* Broad `task_present_in_any_runqueue` (1G + every 1L under the broad guard): the x86_64 broad exit
+  consumer (under the broad lock), the two x86_64 oracle markers (each behind its predicate), and
+  the `#[cfg(test)]` rehome fixture.
+* Raw-primitive fixtures (§20.3) are unchanged.
+
+### 21.6 Remaining gaps
+
+* **The generic committed-receiver seam** (`sr_enqueue_committed_receiver_split`: the queued-reply
+  wake on the split route, and hosted fixtures) still admits the TID's current incarnation (`0`).
+  Its caller holds the receiver as a rank-3 waiter record `{tid, asid}`, which carries no stamp;
+  binding it needs the stamp in `EndpointWaiterRecord` (published at the receive's Phase C).
+* **Exit validation and the entering-frame authority** pin the stamp at the lookup rather than
+  carrying one from the disposition / trap entry; 21.3 gives why that suffices for each verdict.
+  Carrying it needs a stamp in `PostLockTrapDisposition::CurrentTaskExited` and in each entering
+  capture type (`EnteringFaultIncarnation`, the switch plan's outgoing identity).
+
+### 21.7 Evidence (candidate `79e898e9`)
+
+* P: `sl2b_*` (9). Seven are in `src/kernel/sched_lock2b_tests/tests.rs`:
+  * same-ASID TID reuse across every reader and both stamp-bound owners;
+  * the receive recovery bound to Phase A's stamp;
+  * all distinct placement outcomes, including current-and-queued, which is planted through the
+    `#[cfg(test)]` `CpuView::plant_second_placement_for_test`, since the membership mirror makes
+    it unreachable otherwise;
+  * an exited entry still queued, before and after the home dispatches it, for the exit
+    validation and the reaper;
+  * the trapping CPU's own slot when it is not the home;
+  * TID 0 and kernel-thread ids;
+  * a homeless incarnation racing its first placement.
+
+  The other two are in the direct request/reply transaction modules: a stale request ack declines
+  `WouldBlock` before mutation, and the real stamp is then delivered; a stale reply ack is
+  `WaiterLost`. The second also checks that the published ack carries the caller's stamp.
+* Negative controls, each on the candidate with the tree restored afterwards:
+  * the home lookup ignoring the stamp: 4 of the 9 fail;
+  * the request preflight reading `Stale` as absent: the request test fails.
+* Hosted:
+  * fmt; the serial lib suite (6,706 passed); the integration suites.
+  * Focused subsets, each with a non-zero test count: `sl2b_` 9, `sl2a_` 15, `task_enqueue` 9,
+    `sl1_` 19, `sched_lock1` 20, `lock_order` 4, `abi` 271, `syscall_abi` 2, `u9exit` 71,
+    `reap` 49, `stage199d` 427, `stage199a2b2d` 23, `stage199a2b3` 37, `u9pf1` 38,
+    `u9pagefault3` 14, `u9recvblock` 9, `u9_recv_block` 13, `overtaken` 22, `census` 33,
+    `futex` 327, `ap_sched1` 15, `ipc_timeout` 4, `sr_place1` 9.
+  * The contract gate and doc enforcement.
+  * Lock order: the same 30 descending sequential-pair types on the candidate and on
+    `c9fbc7ef`, none new.
+* L, with the default artifacts for all three ports built:
+  * x86_64 functional single-CPU direct request/reply (the cross-CPU oracle cell returned
+    `blocked` on both SCHED-LOCK2A trees, so it contributes no coverage and is not run);
+  * AArch64 and RISC-V direct request/reply (each `LIVE_SEAL … live_cells=2 duplicate_replies=0
+    duplicate_wakes=0 result=ok`);
+  * the AArch64 and RISC-V exit-current-task witnesses (`result=ok`). These exercise the split
+    exit route: the token's clear and stamp, the exit validation on the home, and the queue
+    advance.
+
+  No `SCHED_HOME_REFUSED` appears in any live log. All five direct cells print
+  `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL … nr7_ok=0 … result=fail`, a diagnostic their scripts do
+  not gate on, and `c9fbc7ef` prints it identically in all three ports (addendum A).
