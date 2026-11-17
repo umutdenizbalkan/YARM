@@ -901,16 +901,15 @@ std::thread_local! {
     static UNPARKED: Cell<u32> = const { Cell::new(0) };
 }
 
-/// A wait returned without parking: count it, and refuse a spin.
+/// (`LocalKey::get`/`set`, not a closure: the broad-lock census counts `with` calls by text.)
+/// (`LocalKey::get` and `set`, not a closure: the broad-lock census guard counts `with` calls by text.)
 fn unparked() {
-    UNPARKED.with(|c| {
-        let n = c.get() + 1;
-        c.set(n);
-        assert!(
-            n < BUSY,
-            "busy polling: {n} waits in a row returned without parking"
-        );
-    });
+    let n = UNPARKED.get() + 1;
+    UNPARKED.set(n);
+    assert!(
+        n < BUSY,
+        "busy polling: {n} waits in a row returned without parking"
+    );
 }
 
 struct Waiter {
@@ -980,7 +979,7 @@ impl FutexOps for Emu {
             unparked();
             return Ok(FutexTimedWait::TimedOut);
         }
-        UNPARKED.with(|c| c.set(0));
+        UNPARKED.set(0);
         let id = t.next;
         t.next += 1;
         t.waiters.push(Waiter {
