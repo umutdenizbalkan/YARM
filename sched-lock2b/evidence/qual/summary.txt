@@ -1,0 +1,94 @@
+sl2b qual start 2026-11-17T01:31:26Z C=79e898e9aebbf0b06063d0ab1d3eb0ddd36b2ac3 sha=96d0b15f8e5a9353
+=== H1_fmt [79e898e9aebb porcelain=0]: cargo fmt --all -- --check (start 01:31:26)
+H1_fmt rc=0 secs=6
+=== H2_hosted_lib [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 01:31:33)
+H2_hosted_lib rc=0 secs=94
+=== H3_integration [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 01:33:07)
+H3_integration rc=0 secs=219
+=== H4_subset_sl2b_ [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl2b_ (start 01:36:46)
+H4_subset_sl2b_ rc=0 secs=0
+=== H4_subset_sl2a_ [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl2a_ (start 01:36:46)
+H4_subset_sl2a_ rc=0 secs=1
+=== H4_subset_task_enqueue [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 task_enqueue (start 01:36:47)
+H4_subset_task_enqueue rc=0 secs=0
+=== H4_subset_sl1_ [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl1_ (start 01:36:47)
+H4_subset_sl1_ rc=0 secs=2
+=== H4_subset_sched_lock1 [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sched_lock1 (start 01:36:49)
+H4_subset_sched_lock1 rc=0 secs=2
+=== H4_subset_lock_order [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 lock_order (start 01:36:51)
+H4_subset_lock_order rc=0 secs=0
+=== H4_subset_abi [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 abi (start 01:36:51)
+H4_subset_abi rc=0 secs=3
+=== H4_subset_syscall_abi [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 syscall_abi (start 01:36:54)
+H4_subset_syscall_abi rc=0 secs=0
+=== H4_subset_u9exit [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u9exit (start 01:36:54)
+H4_subset_u9exit rc=0 secs=0
+=== H4_subset_reap [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 reap (start 01:36:54)
+H4_subset_reap rc=0 secs=1
+=== H4_subset_stage199d [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 stage199d (start 01:36:55)
+H4_subset_stage199d rc=0 secs=22
+=== H4_subset_stage199a2b2d [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 stage199a2b2d (start 01:37:17)
+H4_subset_stage199a2b2d rc=0 secs=0
+=== H4_subset_stage199a2b3 [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 stage199a2b3 (start 01:37:17)
+H4_subset_stage199a2b3 rc=0 secs=0
+=== H4_subset_u9pf1 [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u9pf1 (start 01:37:17)
+H4_subset_u9pf1 rc=0 secs=1
+=== H4_subset_u9pagefault3 [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u9pagefault3 (start 01:37:18)
+H4_subset_u9pagefault3 rc=0 secs=0
+=== H4_subset_u9recvblock [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u9recvblock (start 01:37:18)
+H4_subset_u9recvblock rc=0 secs=0
+=== H4_subset_u9_recv_block [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u9_recv_block (start 01:37:18)
+H4_subset_u9_recv_block rc=0 secs=0
+=== H4_subset_overtaken [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 overtaken (start 01:37:18)
+H4_subset_overtaken rc=0 secs=0
+=== H4_subset_census [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 census (start 01:37:18)
+H4_subset_census rc=0 secs=2
+=== H4_subset_futex [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 futex (start 01:37:20)
+H4_subset_futex rc=0 secs=27
+=== H4_subset_ap_sched1 [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 ap_sched1 (start 01:37:47)
+H4_subset_ap_sched1 rc=0 secs=0
+=== H4_subset_ipc_timeout [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 ipc_timeout (start 01:37:47)
+H4_subset_ipc_timeout rc=0 secs=0
+=== H4_subset_sr_place1 [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sr_place1 (start 01:37:47)
+H4_subset_sr_place1 rc=0 secs=1
+=== H5_lockorder_C [79e898e9aebb porcelain=0]: bash -c env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 --nocapture > /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/H5_C.raw.log 2>&1; echo rc=$? (start 01:37:48)
+H5_lockorder_C rc=0 secs=98
+=== H5_lockorder_B [79e898e9aebb porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-base-wt && env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 --nocapture > /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/H5_B.raw.log 2>&1; echo rc=$? (start 01:39:26)
+H5_lockorder_B rc=0 secs=184
+H5_pairtypes C=30 B=30 diff_lines=0
+=== G1_contract_gate [79e898e9aebb porcelain=0]: bash scripts/check-current-contracts.sh (start 01:42:31)
+G1_contract_gate rc=0 secs=9
+=== G2_doc_enforcement [79e898e9aebb porcelain=0]: bash scripts/check-contract-doc-enforcement.sh (start 01:42:40)
+G2_doc_enforcement rc=0 secs=1
+=== B1_build_x86_64 [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 01:42:41)
+B1_build_x86_64 rc=0 secs=76
+=== L1_x86_64_direct_request_reply [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L1 scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh (start 01:43:57)
+L1_x86_64_direct_request_reply rc=0 secs=149
+=== B2_build_aarch64 [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 01:46:26)
+B2_build_aarch64 rc=0 secs=79
+=== L2_aarch64_direct_request_reply [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L2 scripts/qemu-ipccall-reply-direct-aarch64-smoke.sh (start 01:47:45)
+L2_aarch64_direct_request_reply rc=0 secs=44
+=== L3_aarch64_exit_current_task [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L3 scripts/qemu-aarch64-exit-current-task-smoke.sh (start 01:48:29)
+L3_aarch64_exit_current_task rc=0 secs=64
+=== B3_build_riscv64 [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 01:49:33)
+B3_build_riscv64 rc=0 secs=69
+=== L4_riscv64_direct_request_reply [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L4 scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh (start 01:50:42)
+L4_riscv64_direct_request_reply rc=0 secs=207
+=== L5_riscv64_exit_current_task [79e898e9aebb porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L5 scripts/qemu-riscv-exit-current-task-smoke.sh (start 01:54:09)
+L5_riscv64_exit_current_task rc=0 secs=218
+=== Z_home_refusal_scan [79e898e9aebb porcelain=0]: bash -c grep -rac --include='*.log' 'SCHED_HOME_REFUSED' /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L1 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L2 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L3 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L4 /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/qual/L5 | grep -v ':0$' && exit 1 || echo NO_HOME_REFUSAL_IN_ANY_LIVE_LOG (start 01:57:47)
+Z_home_refusal_scan rc=0 secs=0
+=== NC1_home_lookup_ignores_stamp [79e898e9aebb porcelain=0]: bash -c sed -i 's/^    if stamp != 0 \&\& tcb.incarnation != stamp {$/    if false \&\& stamp != 0 \&\& tcb.incarnation != stamp {/' src/kernel/task_enqueue.rs && git diff --stat && env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl2b_; rc=$?; git checkout -- src/kernel/task_enqueue.rs; exit $rc (start 01:57:47)
+NC1_home_lookup_ignores_stamp rc=101 secs=24
+=== NC2_request_stale_read_as_absent [79e898e9aebb porcelain=0]: bash -c python3 -c "
+p='src/kernel/ipccall_direct_txn.rs'; s=open(p).read()
+a='''            crate::runtime::HomeMembership::Stale => {
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
+                return Err(IpcCallDirectError::WouldBlock);
+            }'''
+assert s.count(a)==1; open(p,'w').write(s.replace(a,'            crate::runtime::HomeMembership::Stale => {}'))
+" && git diff --stat && env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sl2b_a_request; rc=$?; git checkout -- src/kernel/ipccall_direct_txn.rs; exit $rc (start 01:58:11)
+NC2_request_stale_read_as_absent rc=101 secs=26
+post-NC porcelain=0
+sl2b qual end 2026-11-17T01:58:37Z
+SL2B_QUAL_DONE

@@ -1,0 +1,22 @@
+ARTIFACT_BINDING arch=aarch64 kernel=build-aarch64/yarm-aarch64.bin kernel_sha256=5f7ecf3761ebeea1e63a7cb6547cefd6000d96698cdcfa0efcec621363abdd07 kernel_features=aarch64-ipccall-direct-oracle kernel_resolved_features=aarch64-ipccall-direct-oracle,ipccall-direct-oracle kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-base-wt/target/aarch64-yarm-none/aarch64-none/kernel_boot:fresh=0 initramfs=build-aarch64/initramfs-core.cpio initramfs_sha256=6a535fe91890dd2f875439256e51964c9a4299242d17f72ab79b2ee5148102fe initramfs_features=none initramfs_compile_env=none source=clean:e41e66e72a6b5ca6b3625feae66c05c4692fc6dd required=kernel=aarch64-ipccall-direct-oracle result=ok
+[info] qemu command: qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024M -smp 1 -nographic -monitor none -serial stdio -kernel build-aarch64/yarm-aarch64.bin -initrd build-aarch64/initramfs-core.cpio -append yarm.aarch64_ipccall_direct_oracle=1
+[info] aarch64 core: completion condition: idle
+[ok] aarch64 core: terminal idle (SCHED_ENTER_IDLE_HLT) reached — QEMU stopped intentionally
+[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell
+[ok] U9-RX4: PM decodes the lifecycle query
+[ok] U9-RX4: PM replies successfully
+[ok] U9-RX4: terminal-outcome evaluator self-test passed (8 accepted, 27 rejected)
+[ok] U9-RX4: REPLY won the terminal of record_index=0 record_generation=1 (queued route, cap 65538) — commit=1 resume=1 one-shot revoked, no timeout win
+[ok] U9-RX4: no reply cap is lost to the u32::MAX sentinel
+[ok] U9-RX4: PM never fails to decode
+[ok] U9-RX4: no writeback rollback on the witnessed path
+[ok] U9-RX4: the reply cap is never used twice
+[ok] U9-RX4: no cap materialization failure
+[ok] U9-RX4: the blocking IpcRecv route publishes and defers (n=155)
+[ok] U9-RX4: the broad dispatcher is skipped for a published block (n=223)
+[ok] U9-RX4: the existing D2-recv drain resumes a replacement (n=128)
+[ok] U9-RX4: no fail-closed settlement on the blocking route
+[ok] U9-RX4: AArch64 queued-plain reply-cap + framing witness chain complete
+[error] BAD / BOOT BLOCKERS found:
+4105:IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=18446744073709551615 record_generation=18446744073709551615 replier_tid=10000 reason=reply_cap err=InvalidCapability reply_copies=0 caller_wakes=0
+4125:USER_LOG tid=10000 msg=IPCCALL_DIRECT_ORACLE_SERVER_DUP dup_rejected=1 err=Err(InvalidCapability)

@@ -1,0 +1,9 @@
+[aarch64-exit] exact commit sha=79e898e9aebbf0b06063d0ab1d3eb0ddd36b2ac3 tree=d0bc27072a23cfc9c39e2904e221afba6bbf3a05 (clean)
+[aarch64-exit] RUN_A: building feature-OFF AArch64 kernel and auditing its literals
+[aarch64-exit] RUN_A feature-off oracle literals=0
+[aarch64-exit] RUN_B: building feature-ON servers + initramfs
+[aarch64-exit] RUN_B: one fresh -smp 1 boot with the AArch64 exit oracle armed
+[aarch64-exit] terminal edge: broad=0 split=1 declined=0 claims=1 dispatches=1
+[aarch64-exit] exiting tid=10008
+[aarch64-exit] advance resumed tid=1 (exiting tid=10008)
+STAGE_200D0C2_AARCH64_EXIT_CURRENT_TASK_LIVE_SEAL arch=aarch64 sha=79e898e9aebbf0b06063d0ab1d3eb0ddd36b2ac3 tree=d0bc27072a23cfc9c39e2904e221afba6bbf3a05 live_cells=1 boots=1 nr16_dispatches=1 terminal_broad_dispatcher_entries=0 split_route_entries=1 split_route_declines=0 exit_claims_retired=1 dispositions_published=0 dispositions_consumed=0 inlock_bypass_armings=0 queue_advance_deferrals_committed=1 exiting_frames_captured=0 broad_dispatch_skips_after_commit=1 post_lock_drain_selections=1 exiting_task_reselections=0 dead_task_user_returns=0 old_frame_restores=0 syscall_returns=0 trap_depth_clears=0 duplicate_deferrals=0 retired_broad_pipeline_markers_remaining=0 feature_off_oracle_literals=0 result=ok

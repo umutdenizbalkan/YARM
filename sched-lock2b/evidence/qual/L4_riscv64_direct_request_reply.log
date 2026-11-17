@@ -1,0 +1,6 @@
+[ipccall-reply-direct-riscv64-smoke] building base riscv64 artifacts (servers + initramfs)
+[ipccall-reply-direct-riscv64-smoke] rebuilding kernel_boot with --features riscv-ipccall-direct-oracle
+[ipccall-reply-direct-riscv64-smoke] building a feature-OFF kernel_boot and asserting it is marker-clean
+[ipccall-reply-direct-riscv64-smoke] booting QEMU-virt -smp 1 with yarm.riscv_ipccall_direct_oracle=1
+[ipccall-reply-direct-riscv64-smoke] both direct-class kernel markers + userspace completion present exactly once; no dup/fault
+STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=riscv64 classes=2 live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok

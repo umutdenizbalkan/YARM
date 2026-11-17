@@ -1,0 +1,1 @@
+[info] qemu command: qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024M -smp 1 -nographic -monitor none -serial stdio -kernel build-aarch64/yarm-aarch64.bin -initrd build-aarch64/initramfs-core.cpio -append yarm.aarch64_exit_current_task_oracle=1 -no-reboot -no-shutdown

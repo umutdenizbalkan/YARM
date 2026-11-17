@@ -1,0 +1,44 @@
+[riscv-exit] exact commit sha=79e898e9aebbf0b06063d0ab1d3eb0ddd36b2ac3 tree=d0bc27072a23cfc9c39e2904e221afba6bbf3a05 (clean)
+[riscv-exit] RUN_A: building feature-OFF RISC-V kernel and auditing its literals
+[riscv-exit] RUN_A feature-off oracle literals=0
+[riscv-exit] RUN_A: building feature-OFF RISC-V servers + initramfs
+[riscv-exit] RUN_B: building feature-ON servers + initramfs
+[riscv-exit] RUN_B: one fresh -smp 1 boot with the RISC-V exit oracle armed
+[riscv-exit] terminal edge: broad=0 split=1 declined=0 claims=1 dispatches=1
+[riscv-exit] exiting tid=10008
+[riscv-exit] advance resumed tid=2 (exiting tid=10008)
+[riscv-exit] single-boot: qemu=1 entry=1 boot_ok=1 nonce_lines=1 distinct_nonces=1
+STAGE_200D0D2_RISCV_EXIT_CURRENT_TASK_LIVE_SEAL
+arch=riscv64
+syscall_nr=16
+user_entries=1
+accepted_exits=1
+terminal_broad_dispatcher_entries=0
+split_route_entries=1
+split_route_declines=0
+exit_claims_retired=1
+dispositions_published=0
+dispositions_consumed=0
+inlock_bypass_armings=0
+queue_advance_deferrals_committed=1
+exiting_frames_captured=0
+broad_dispatch_skips_after_commit=1
+post_lock_drain_selections=1
+exiting_task_reselections=0
+dead_task_user_returns=0
+exiting_sepc_commits=0
+normal_result_writes_to_old_frame=0
+old_frame_restores=0
+syscall_returns_after_accept=0
+software_trap_depth_clears=0
+sret_ownership_errors=0
+wrong_current_task=0
+survivor_progress_completions=1
+system_health_completions=1
+duplicate_deferrals=0
+split_failed_closed=0
+single_boot_failures=0
+retired_broad_pipeline_markers_remaining=0
+exact_commit=79e898e9aebbf0b06063d0ab1d3eb0ddd36b2ac3
+exact_tree=d0bc27072a23cfc9c39e2904e221afba6bbf3a05
+result=ok

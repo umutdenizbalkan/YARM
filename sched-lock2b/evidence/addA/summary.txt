@@ -1,0 +1,11 @@
+sl2b addA start 2026-11-17T01:59:23Z sha=af2ee10b481b74ed
+=== A1_x86_64_direct_base [c9fbc7ef6aea porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/addA/A1 scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh (start 01:59:23)
+A1_x86_64_direct_base rc=0 secs=217
+=== A2_aarch64_direct_base [c9fbc7ef6aea porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/addA/A2 scripts/qemu-ipccall-reply-direct-aarch64-smoke.sh (start 02:03:00)
+A2_aarch64_direct_base rc=0 secs=108
+=== A3_riscv64_direct_base [c9fbc7ef6aea porcelain=0]: env -u CARGO_TARGET_DIR LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/sl2b-evidence/addA/A3 scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh (start 02:04:48)
+A3_riscv64_direct_base rc=0 secs=268
+A1       1 IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=0 census_ok=1 result=fail; 
+A2       1 IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=0 census_ok=1 result=fail; 
+A3       1 IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=0 census_ok=1 result=fail; 
+SL2B_ADDA_DONE
