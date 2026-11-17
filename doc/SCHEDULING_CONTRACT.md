@@ -298,7 +298,9 @@ bounded and potentially unbounded parts).
 **Common to every trap row:**
 
 * Every trap row is IRQ-masked for the whole trap.
-* Every trap row may spin on an unfair `SpinLockIrq`, with an unbounded wait (§6 W1).
+* Every trap row may spin on an unfair `SpinLockIrq`, with an unbounded wait (§6 W1). The
+  scheduler locks 1L and 1G are FIFO since SCHED-LOCK-FAIR1 (§22): at most N − 1 earlier
+  entrants, still no time bound.
 * Every trap row may run synchronous logging (§6 W7).
 
 | Path | Owner | CPU authority | Locks | IRQ | Continuation | Work |
@@ -702,6 +704,9 @@ The first real-time profile is the **smallest analysable configuration**:
 ### 4.3 Priority inversion
 
 * **SC-INV-1 — Kernel spinlock blocking.** **UNRESOLVED.**
+  * SCHED-LOCK-FAIR1 (§22) makes 1L and 1G FIFO ticket locks: a waiter has at most N − 1
+    earlier entrants. Every other lock, including ranks 2 and 3 and `PRINTK_DRAIN_LOCK` nested
+    inside 1L, is still the TTAS kind below, and no section length is bounded (§22.3 A3).
   * Kernel spinlocks are taken non-preemptively with IRQs masked, so in-CPU inversion is bounded
     by the holder's section.
   * Cross-CPU waiting on the TTAS `SpinLockIrq` has **no bound**: there is no fairness, so a
@@ -785,7 +790,7 @@ not representative of silicon, and no target hardware is in the loop.
 
 | # | Item | Where | Kind | Bound |
 |---|---|---|---|---|
-| W1 | `SpinLockIrq` / `SpinLock` acquisition wait | `kernel/lock.rs` | **A / N** | No structural bound: TTAS with no fairness. A bound needs a fair lock **and** every other CPU's maximum hold time. A weak-CAS spurious failure adds unbounded retries on LL/SC ports in theory. |
+| W1 | `SpinLockIrq` / `SpinLock` acquisition wait | `kernel/lock.rs` | **A / N** | No structural bound: TTAS with no fairness. A bound needs a fair lock **and** every other CPU's maximum hold time. A weak-CAS spurious failure adds unbounded retries on LL/SC ports in theory. **1L and 1G** (SCHED-LOCK-FAIR1, §22): FIFO ticket lock, ≤ N − 1 earlier entrants; the hold times (A3) remain unbounded. |
 | W2 | Run-queue selection (accepted) | `dispatch_next_accepted_selection` | **S** | ≤ 3 × 64 = 192 candidates. Each runs one rank-2 acquisition and a TCB linear scan ≤ 512. Operation count O(192 × 512) per selection, with IRQs masked. Time **N**. |
 | W3 | Whole trap (IRQ-masked region) | every route | **N** | The sum of its route's work, W1, W7, allocations (W6) and page-table walks. No per-route bound is established. This is also the boundary latency (SC-PART-5) and the overrun bound (SC-CTX-5). |
 | W4 | TLB shootdown completion | VMI1/VMI2 owners | **A** | The requester waits for generation-matched ACKs. A bound needs every target to take its IPI within its own W3. A target cannot take it while it is in a masked trap. |
@@ -1207,8 +1212,8 @@ CPU executes.
 | SC-FP-5 | QEMU only | execution cost on hardware | N | hardware bring-up |
 | SC-FP-4 | none | static per-task FP policy with enforced non-use | P + L | FP-POLICY1 |
 | SC-LOCK-1, SC-LOCK-3…7 (§12) | **done** (SCHED-LOCK1, §16–§17): per-CPU 1L, admission 1G, atomic clock / bitmaps / mirrors | — | P + L + S, §17 | — |
-| SC-LOCK-2 (§12) | **partial**: lock order excludes the scheduler-lock cycles; no progress argument (§17.3, corrected by SCHED-LOCK1-ACCEPTANCE) | fair lock or bounded-contention proof | S + N | RT-SCHED1 |
-| SC-INV-1, W1 for 1L / 1G | TTAS `SpinLockIrq`, now per CPU | fair lock or bounded-contention proof | S + N | RT-SCHED1 |
+| SC-LOCK-2 (§12) | **partial**: lock order excludes the scheduler-lock cycles; FIFO admission with A1, A2, A4 (SCHED-LOCK-FAIR1, §22) | section bounds (A3): nested rank-2/3 and printk waits; time on hardware | S + N | RT-SCHED1 |
+| SC-INV-1, W1 for 1L / 1G | **FIFO ticket lock** (SCHED-LOCK-FAIR1, §22): ≤ N − 1 earlier entrants | per-section bounds (A3) | S + N | RT-SCHED1 |
 
 **Not started and not part of this contract:** VFS work and hardware bring-up remain on the
 roadmap in `doc/KERNEL_UNLOCKING.md` §0.8. Hardware bring-up is the prerequisite for every **N**
@@ -1255,9 +1260,10 @@ record `doc/KERNEL_UNLOCKING.md` §0.8). The requirements and their status:
   CPU's scheduling operation does not enter that CPU's critical section, except through SC-LOCK-3.
 * **SC-LOCK-2 — Local exclusion is bounded.** **PARTIAL (corrected by SCHED-LOCK1-ACCEPTANCE,
   §17.3).** The lock order excludes cycles among the scheduler locks and between them and
-  shootdown waits. No progress argument is established: the 1L/1G wait is the unfair W1 kind, and
-  sections can wait on the task-table and printk locks. No starvation-freedom or time bound is
-  claimed; a fair lock or a bounded-contention proof is still owed (RT-SCHED1). The exclusion that
+  shootdown waits. SCHED-LOCK-FAIR1 (§22) makes the 1L/1G wait FIFO: a waiter has at most
+  N − 1 earlier entrants and, under A1, A2 and A4 (§22.3), is served once each of their sections
+  completes. Sections can still wait on the TTAS task-table, IPC and printk locks, so section
+  completion (A3) and any time bound are not established (RT-SCHED1). The exclusion that
   protects CPU-local state has a stated progress argument and a bound in the §6 kinds. A local
   lock is acceptable only with that argument. An owner-consumed queue is acceptable only with
   that argument. **"Lock-free" is not mandated and is not by itself an argument.**
@@ -1386,7 +1392,8 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-KT-2, SC-KT-3, SC-KT-6, SC-KT-7, SC-KT-10, SC-KT-11 (KTHREAD1, §18); SC-KT-8 for
     interrupt-masking guards and, since KTHREAD-CLOSURE1 Stage B, plain `SpinLock` (§18.10.2); SC-KT-9 with the deviation stated in §8;
   * SC-LOCK-1, SC-LOCK-3…7 (SCHED-LOCK1). SC-LOCK-2 is PARTIAL: the lock order excludes the
-    scheduler-lock deadlock cycles, but no progress argument is established (§17.3).
+    scheduler-lock deadlock cycles (§17.3) and admission is FIFO (SCHED-LOCK-FAIR1, §22), but
+    section completion and time are not bounded.
 * **DISCHARGED:** SC-LOCK-9 (it held until SCHED-LOCK1, which is the split).
 * **SPECIFIED, with an implementing package:**
   * SC-LOCK-8 (roadmap order: SCHED-LOCK1 before KTHREAD1 kernel preemption and RT-SCHED1).
@@ -1687,7 +1694,8 @@ kernel preemption, RT priorities/budgets, migration or partition windows.
 
 ### 16.7 Retained shared dependencies and timing kinds
 
-* W1 holds for every 1L and for 1G: TTAS, no fairness, no bound. 1L contention now comes only
+* W1 holds for every 1L and for 1G: TTAS, no fairness, no bound. *(Superseded for 1L and 1G
+  by SCHED-LOCK-FAIR1, §22: FIFO, ≤ N − 1 earlier entrants.)* 1L contention now comes only
   from operations naming that CPU (its own routes, remote enqueues/withdrawals to it, the
   per-CPU scan, the coherent snapshot) instead of from every CPU's operations.
 * W2 (rank-2 acquisitions inside the selection filter), W4 (shootdown waits, never under a 1L),
@@ -1792,7 +1800,8 @@ shootdown, an address-space switch or cross-CPU work.
 
   **No starvation-freedom, latency, WCET or kernel-preemption property is claimed for 1L, 1G or
   the coherent view.** A fair-lock redesign is outside SCHED-LOCK1 and SCHED-LOCK1-ACCEPTANCE.
-* **Fairness.** None (§6 W1, unchanged).
+* **Fairness.** None (§6 W1, unchanged). *(Superseded by SCHED-LOCK-FAIR1, §22: 1L and 1G are
+  FIFO ticket locks.)*
 * **Who contends for 1L[c]:** routes executing on `c`; remote enqueues, withdrawals and
   "anywhere" scans that name `c`; the coherent view. Previously every CPU's every scheduling
   operation contended for the one rank-1 lock.
@@ -3209,3 +3218,307 @@ Every nesting is 1L → 2 (ascending); no rank-2 section takes a 1L; no new pair
   No `SCHED_HOME_REFUSED` appears in any live log. All five direct cells print
   `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL … nr7_ok=0 … result=fail`, a diagnostic their scripts do
   not gate on, and `c9fbc7ef` prints it identically in all three ports (addendum A).
+
+## 22. SCHED-LOCK-FAIR1: FIFO admission to the scheduler locks
+
+SCHED-LOCK-FAIR1 replaces the acquisition primitive of exactly two lock kinds:
+* every per-CPU scheduler lock (rank 1L);
+* the admission lock (rank 1G).
+
+Both become `kernel::ticket_lock::TicketLockIrq`. Every other kernel lock keeps the TTAS
+`SpinLockIrq` (§6 W1 is unchanged for them). The following are unchanged:
+* per-CPU independence (one lock per CPU, §16.2);
+* the order 1G → 1L → rank 2;
+* reverse release in the retained whole-domain paths;
+* mirror publication before the 1L release and notification after it;
+* GP scheduling and placement.
+
+RT policy and the queued-reply incarnation (§21.6) are outside this pass.
+
+### 22.1 The primitive
+
+Two `u32` counters, `next` and `serving`, share one 64-byte-aligned line. That is the footprint
+of the TTAS lock's padded flag: `size_of::<TicketLockIrq<()>>() == size_of::<SpinLockIrq<()>>() == 64`,
+checked by a hosted test.
+
+* **lock:**
+  1. save and mask local interrupts;
+  2. draw `t = next.fetch_add(1, Relaxed)`;
+  3. spin, still masked, until `serving.load(Acquire) == t`.
+* **unlock** (guard drop): `serving.store(t + 1, Release)`, then restore the saved interrupt state.
+* **try_lock:**
+  1. save and mask;
+  2. read `s = serving` (Acquire);
+  3. `CAS next: s → s + 1`.
+
+  This succeeds only when nothing is held or queued. On failure nothing is published and the
+  interrupt state is restored. A try-lock never takes a place ahead of a queued entrant and never
+  leaves an unserved ticket. No kernel path try-locks a scheduler lock today. The path exists, and
+  is tested, so that adding one cannot barge.
+
+**Interrupts are masked before the draw.** Otherwise an interrupt taken between the draw and
+service, whose handler takes the same lock, would queue behind its own interrupted context forever.
+The wait stays masked for the same reason.
+
+**Wraparound.** Only equality and the wrapping difference `t − serving` are used. Both are exact
+while fewer than 2³² tickets are outstanding. At most one ticket per CPU per lock can be
+outstanding:
+* interrupts are masked from the draw to the release;
+* no path re-acquires a scheduler lock it holds.
+
+So at most `MAX_CPUS` = 64 tickets are outstanding. The try-lock's read→CAS window is the one ABA
+exposure (A4).
+
+**Ordering.** The Acquire load that sees `serving == t` synchronizes with the previous holder's
+Release store, so each section happens-before the next. The draw is a Relaxed RMW: ticket
+uniqueness and order come from the modification order of `next`, and no data is published through
+it.
+
+**Why a ticket lock, not MCS.**
+* Both are FIFO with the same entrant bound.
+* MCS needs a queue node per held lock per CPU. A CPU can hold up to 65 scheduler locks at once
+  (1G, then all 64 1L in the coherent view), so that is 65 cache-padded nodes per CPU, or about
+  266 KB of nodes at 64 CPUs.
+* The ticket lock adds no state.
+* MCS's advantage, local spinning, matters at contention levels these locks do not have: 1L is
+  per CPU, and 1G is taken only by admission and the coherent view.
+
+### 22.2 The contention bound
+
+**Theorem (FIFO admission).** Let entrant E draw ticket `t` on a scheduler lock L. E is served
+after exactly the entrants whose tickets precede `t` in `next`'s modification order and were
+outstanding when E drew. No entrant that draws after E is served before E.
+
+At most N − 1 earlier entrants exist, where N is the number of CPUs online. That follows from the
+one-outstanding-ticket-per-CPU argument in 22.1.
+
+**Proof sketch.** `serving` advances only by the holder's release, by exactly one, from `t` to
+`t + 1`. A ticket `u` is served only when `serving == u`. So service follows ticket order without
+gaps. A try-lock takes ticket `s` only when `next == serving == s`, so it never takes a place
+ahead of anyone.
+
+**What this bounds.** The number of sections that complete before E's, which is at most N − 1.
+Unlike W1, the wait cannot be lost to the same CPUs again and again.
+
+**What this does not bound.** Time. E's wait is the sum of at most N − 1 sections, each of which
+must itself complete (22.3).
+
+### 22.3 Assumptions for those holders to progress
+
+* **A1 — holders run.** A holder runs with interrupts masked and is never descheduled inside a
+  section. True by construction on every port (no kernel preemption, §18.3).
+* **A2 — no IPI-acknowledgement wait under 1L, 1G or a lock nested in them.**
+  * Kernel traps already run masked (§6 W3).
+  * Shootdowns are fire-and-forget:
+    * x86_64 queues the IPI, and the reaper submits and continues;
+    * AArch64 uses broadcast TLBI;
+    * the RISC-V SBI remote fence is served by M-mode firmware, which S-mode masking does not
+      affect.
+  * The x86 `wait_for_ack` has test callers only.
+
+  So the masked wait adds no dependency on this CPU taking an interrupt. A2 must hold for any
+  future code under these locks, including code under rank 2 or 3 taken inside a 1L.
+* **A3 — every section terminates in bounded work.** **Open.** It needs the section inventory
+  below and the per-rank bounds of the locks nested inside.
+* **A4 — no try-lock ABA.** `next` would have to advance by exactly 2³² during one masked
+  read→CAS window. With at most 64 outstanding tickets and masked sections, that needs 2³² complete
+  acquisitions inside a few instructions.
+
+### 22.4 Critical-section inventory (landed tree)
+
+The census covers 124 sections, rerun on the candidate (121 on the base; the 3 new ones are the
+witness probe's):
+* `with_cpu_sched_split`;
+* `with_cpu_sched_and_tcbs_split`;
+* `with_cpu_admission_split`;
+* `lock_cpu`, `lock_cpu_admission` and `lock_all`;
+* the broad `scheduler_state` and `with_scheduler_state[_mut]`;
+* the kthread and witness sections.
+
+They break down as follows:
+* **Nested rank 2 (task table):** 35 sections. These are:
+  * the selection filter (W2);
+  * the planners;
+  * the `*_and_tcbs_split` family.
+
+  Rank 2 is a TTAS `SpinLockIrq`, so the time a 1L holder waits for it is W1-unbounded. This is
+  the first open bound.
+* **Nested rank 3 (IPC):** `commit_blocking_send_split`. Rank 3 is TTAS as well.
+* **Queue scans:**
+  * W2 selection: at most 192 candidates, each with a rank-2 TCB lookup of at most 512;
+  * W8 membership: at most 256 probes;
+  * W9 `RingQueue::remove_tid`: at most 64 shifts.
+
+  `queue_advance_select_step_split`, `enqueue_committed_receiver_inner`,
+  `withdraw_queued_tid_on`, the witness idle scan and a test-only walk are the 5 scanning sections.
+* **Kernel-thread admission:** lock-free (atomics), outside 1L.
+* **The coherent view:** takes 1G and then every 1L in ascending order. That is 65 FIFO waits in
+  sequence; its own bound is 65 × (N − 1) sections. Production has no caller (§21).
+* **Synchronous printk (W7).** 12 sections logged under 1L on the base. SCHED-LOCK-FAIR1 moves every
+  scheduler-only diagnostic whose facts can be captured under the guard to after the release (22.5).
+  9 sections still log under the lock:
+  * the fatal `FIRST_USER_PIN_VIOLATION` (owner revalidation and `enqueue_then_dispatch`). An
+    `assert!` follows it; a deferred line would never print.
+  * `IPC_RECV_PROOF_SENDER_WAKE_WAITER_PRESENT` in `commit_blocking_send_split`. It is a
+    knob-gated proof marker, under rank 3, whose ordering against the IPC proof is part of its
+    grader.
+  * `DEBUG_*` logs, compiled out (`const false`).
+  * The broad-path sections in `boot/exec_state.rs`, `boot/scheduler_state.rs` and
+    `boot/ipc_state.rs`. They run under the broad lock with every 1L held.
+  * `PriorityScheduler`'s "failed to re-enqueue preempted task". The SCHED-FULL-ROT1 capacity
+    proof makes it unreachable.
+
+  Each of those takes `PRINTK_DRAIN_LOCK` (TTAS) and may wait on the UART (W7). This is the
+  second open bound.
+
+### 22.5 Diagnostics moved after the release
+
+The facts are captured under the guard and printed after it, in the order raised:
+* `D6_LOCAL_DISPATCH_STEP_SPLIT` (`d6_genuine_local_dispatch_observe`);
+* `D6_GENUINE_MUT_DISPATCH_STEP_SPLIT` and `DISPATCH_STEP_REFUSED_CPU_MISMATCH`
+  (`d6_genuine_local_dispatch_step_mut`);
+* `DISPATCH_STEP_REFUSED … reason=cpu_offline` and `DISPATCH_STEP_NONE_ACCEPTABLE`
+  (`queue_advance_select_step_split`);
+* `SCHED_BLOCK` (`commit_blocking_send_split`, when the outcome is `Committed`);
+* `BOOTSTRAP_ENQUEUE_VERIFY` (`enqueue_then_dispatch_on_cpu_split`);
+* `SCHED_ENQUEUE_DENIED_WAKE_ONLY` and the AArch64 `AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED`, raised
+  inside `CpuView::enqueue_with_priority`.
+
+The last two are deferred through the per-CPU `DeferredDiags` buffer, which holds 4 entries plus a
+dropped count reported as `SCHED_DEFERRED_DIAG_DROPPED`:
+* `CpuSchedGuard::drop` publishes the mirror, takes the buffer, releases 1L, then prints;
+* `SchedAllGuard::drop` collects every CPU's buffer while releasing in reverse, releases 1G, then
+  prints;
+* the exclusive (lock-free) view prints when it is dropped.
+
+Every moved line keeps its text and its order relative to the operation it reports. Each is
+printed before the function returns, so a grader that reads it after the operation sees the same
+sequence.
+
+### 22.6 Witness and checks
+
+**Hosted.** The `fair1_*` tests (`src/kernel/sched_fair1_tests/tests.rs`) run on the real
+`SchedDomain` locks:
+* **1L:** three peers queue in a known order on 1L[1], each started only after the previous one is
+  seen queued through the lock's outstanding-ticket count. The holder then releases and re-acquires
+  at once. The service order, recorded under the lock, is `[P1, P2, P3, H]` with consecutive
+  tickets.
+* **1G:** the same, with the peers on the production admission path (1G, then 1L).
+* **The coherent view:** it queues on a held 1L in order and leaves no ticket unserved.
+* **Negative control:** the order check rejects a sequence in which a known earlier entrant is
+  overtaken.
+* **IRQ state:** interrupts are masked before the draw and restored on release, through a hosted
+  IRQ model, since the hosted `irq_save` is a no-op.
+* **Wraparound:** a base of `u32::MAX − 2`.
+* **The try-lock:** it never barges and never strands a ticket.
+* **The entrant bound:** 8 threads × 2000 rounds never find more than N − 1 entrants ahead.
+* **Footprint.**
+
+**Live.** The SCHED-LOCK1 witness (§17.8), extended under the same feature, boot and grader. Each
+holder counts under the lock it holds:
+* acquisitions;
+* contended acquisitions;
+* the maximum number found ahead;
+* service gaps;
+* A-B-A yields;
+* queued handoffs.
+
+Before the measurement window opens, a deterministic probe runs on 1L[0] and on 1G:
+1. CPU 0 holds ticket `t1` until a peer CPU has announced that it is drawing and the lock shows a
+   second outstanding ticket;
+2. CPU 0 records `FAIR_HOLD`, releases, and draws `t2` at once;
+3. the peer records `FAIR_PEER(ty)` under the lock.
+
+Record sequence numbers are reserved under the lock, so the record order is the service order; it
+is never inferred from serial-log arrival. The grader requires:
+* `t1 < ty < t2`, by wrapping difference;
+* `ty` among the tickets outstanding at the release;
+* `t2` drawn after all of them;
+* the peer's record before the re-acquisition's;
+* no gap on any lock;
+* at most N − 1 entrants ahead;
+* every 1L and 1G acquired;
+* both probes contended and proved.
+
+The grader self-test has 9 fair cases (one valid trace and 8 negative controls); the fixture
+corpus has 6 fair negative controls. The same boot still grades SYNCHRONIZED independence and the
+NATURAL trace, including remote enqueues, notifications and idle wakes.
+
+### 22.7 Status
+
+* **SC-INV-1 / W1 for 1L and 1G:** the wait is now FIFO, with at most N − 1 earlier entrants
+  (22.2). No time bound is claimed. A3 is open because of the nested rank-2 and rank-3 TTAS waits
+  and synchronous printk (22.4).
+* **SC-LOCK-2:** a progress argument now exists for the scheduler locks themselves: FIFO plus A1,
+  A2 and A4. It still needs A3 for a bound, so it remains **PARTIAL**.
+* **QEMU timings** in the evidence are measurements, not bounds.
+
+### 22.8 Evidence (candidate `b7263d21`)
+
+The runner and addendum A were hashed before they ran (`qual/predeclared.sha`), and every log was
+kept. Unrelated coverage reuses the SCHED-LOCK2B evidence (§21.7). No historical matrix was run.
+
+* **Hosted:**
+  * fmt;
+  * the serial lib suite: 6,715 passed;
+  * `--tests`: 43 binaries, 7,112 passed;
+  * the grader CLI corpus.
+  * Focused subsets, each with its test count: `fair1_` 9, `sched_lock1` 20, `sl1_` 19,
+    `lock_order` 4, `census` 33, `abi` 271, `stage199d` 427, `u3_ed` 27, `kthread` 42,
+    `ap_sched1` 15, `sl2b_` 9, `sl2a_` 15, `task_enqueue` 9, the wake-only policy guard 1,
+    `overtaken` 23, `reap` 49, `futex` 327, `ipc_timeout` 4, `sr_place1` 9. The `apsched` filter
+    matched no hosted test; the AP-scheduling workload runs live below.
+  * The contract gate and doc enforcement.
+  * The witness feature cross-checked on all three targets.
+* **Lock order:** the same 30 descending sequential-pair types on the candidate and on `dce48596`,
+  none new.
+* **Live** (the SCHED-LOCK1 witness, extended, SMP2, one boot per port). Each seals
+  `SL1W_SEAL … result=pass`. Every boot also passes the AP-scheduling workload, with
+  `idle_wakes=3_ipi`, and replays its NATURAL trace exactly.
+
+  | port | kernel / initramfs | acquisitions | contended | max ahead | gaps | probe 1L[0] t1/ty/t2 | probe 1G t1/ty/t2 | remote adds / notifications |
+  |---|---|---|---|---|---|---|---|---|
+  | x86_64 | `b67c4c64…` / `305736ed…` | 8,492 | 16 | 1 | 0 | 6195/6196/6197 | 45/46/47 | 23 / 36 |
+  | AArch64 | `34bac2f0…` / `6a535fe9…` | 8,544 | 9 | 1 | 0 | 5836/5837/5838 | 24/25/26 | 20 / 85 |
+  | RISC-V | `9c5cb234…` / `32a08478…` | 8,126 | 6 | 1 | 0 | 5680/5681/5682 | 25/26/27 | 18 / 32 |
+
+  The boot times (60.0 s, 16.8 s, 10.8 s under QEMU TCG) are measurements, not bounds. A second
+  topology was not needed: SMP2 exercises every required case.
+* **Negative controls,** each on the candidate with the tree restored (porcelain 0):
+  * masking after the draw: the IRQ test fails;
+  * a try-lock that takes `next` while the lock is held: the try-lock test fails;
+  * a barging (TTAS-like) draw in place of `fetch_add`:
+    * hosted, 6 of the 9 `fair1_` tests fail, including both rapid-reacquire tests;
+    * live x86_64 (kernel `1d8faf8c…`): the workload still passes, since mutual exclusion is
+      intact, but no probe ever saw a second outstanding ticket in 8 attempts (4 per lock). The
+      grader fails it with `fair-coverage`.
+  * W1's own live log mutated, with the CRC recomputed: a re-acquire that drew the peer's ticket,
+    and a service gap on 1L[1]. Both are `fair-order`.
+* **Sizes** (default builds of C and B with each port's own artifact script; B reproduces the
+  SCHED-LOCK2B x86_64 kernel `03430ead…`):
+
+  | port | `.text` B → C | data/bss symbols | out-of-line 1L lock |
+  |---|---|---|---|
+  | x86_64 | 1,302,494 → 1,313,822 (+11,328, +0.87 %) | +8,192 (`BOOTSTRAP_SHARED_KERNEL`) | TTAS 67 B → ticket 61 B |
+  | AArch64 | 1,001,648 → 952,724 (−48,924, −4.88 %) | +8,192 (same) | TTAS inlined at every site → ticket out of line, 72 B |
+  | RISC-V | 746,996 → 757,120 (+10,124, +1.36 %) | +8,192 (same; +6,184 net with merged-global churn) | TTAS 56 B out of line → ticket inlined (`amoadd.w` 21 → 185) |
+
+  Scheduler state (hosted layout; every port is LP64):
+  * the lock is 64 B, unchanged;
+  * `CpuSched` 5,496 → 5,608 (+112: the deferred-diagnostic buffer);
+  * `CpuCell` 5,632 → 5,760 (+128 at 64-byte alignment), so +8,192 B for 64 CPUs;
+  * `Admission` 40 and `SchedDomain` 192, unchanged.
+* **The uncontended path changed.**
+  * Acquire is still one atomic RMW and one load, but in the other order, with interrupts masked
+    first:
+    * x86_64: TTAS was a load, then `cli`, then `lock cmpxchgb`. The ticket lock is `cli`, then
+      `lock xaddl`, then a load of `serving`.
+    * AArch64 (no LSE): an `ldxr`/`stxr` add loop, then `ldar`.
+    * RISC-V: `amoadd.w`, then an acquire load.
+  * Release stores `t + 1` in place of `false`.
+  * TTAS restored interrupts and re-spun while the lock was held. The ticket lock spins masked.
+* **Inherited outside the `yarm` package:**
+  * `yarm-server-runtime`'s `runtime_reexports_curated_runtime_surfaces`;
+  * a `yarm-control-plane-servers` doctest.
+
+  Both fail identically on `dce48596`, in a development `--workspace` run.

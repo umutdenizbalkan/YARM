@@ -36837,3 +36837,63 @@ addendum A were hashed before they ran (`qual/predeclared.sha`), and every log w
 | addendum A | L1, L2 and L4 each print `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL … nr7_ok=0 … result=fail`, a diagnostic the scripts do not gate on. The same three smokes on `c9fbc7ef` print it identically, with the same `LIVE_SEAL … result=ok` |
 
 **Verdict: QUALIFIED.**
+
+#### SCHED-LOCK-FAIR1 (from qualified `dce48596`)
+
+The third scheduler-lock pass, on `wip/sched-lock-fair1`.
+
+**FIFO admission to the scheduler locks.** Every per-CPU scheduler lock (1L) and the admission
+lock (1G) is now `kernel::ticket_lock::TicketLockIrq`, an IRQ-safe ticket lock in the same 64-byte
+footprint. Every other kernel lock keeps the TTAS `SpinLockIrq`. The full design record is in
+`SCHEDULING_CONTRACT.md` §22.
+
+- **lock:** save and mask interrupts, draw `next.fetch_add(1)`, spin masked until
+  `serving == t` (Acquire).
+- **unlock:** `serving = t + 1` (Release), then restore.
+- **try_lock:** CAS `next: serving → serving + 1`. It succeeds only when nothing is held or queued,
+  so it never barges and never strands a ticket.
+- At most `MAX_CPUS` tickets are outstanding, so wraparound modulo 2³² is exact.
+- A waiter has at most N − 1 earlier entrants.
+
+Per-CPU independence, 1G → 1L → rank 2, reverse release, mirror publication before unlock,
+notification after unlock, GP scheduling and placement are unchanged. RT policy and the queued-reply
+incarnation are not part of this pass.
+
+**Progress assumptions (§22.3).**
+- A1: holders run masked and are not descheduled.
+- A2: no IPI-acknowledgement wait under 1L, 1G or a lock nested in them.
+- A4: no try-lock ABA within one masked window.
+- A3 (bounded section length) is **open**:
+  - the rank-2 and rank-3 locks taken inside 1L are TTAS;
+  - 9 sections still print under 1L or the broad lock: a fatal assert's line, a knob-gated IPC
+    proof marker, compiled-out debug logs and broad-path sections;
+  - the W2 selection scan is O(192 × 512);
+  - the coherent view takes 65 FIFO waits in sequence.
+
+**Diagnostics moved after the release (§22.5).**
+- The dispatch-step observe, mutate and refusal lines.
+- `DISPATCH_STEP_NONE_ACCEPTABLE`.
+- `SCHED_BLOCK`.
+- `BOOTSTRAP_ENQUEUE_VERIFY`.
+- The wake-only denials, through a per-CPU deferred buffer that the releasing guards print.
+
+**Commits.** `b7263d21`: the primitive, the conversion, the moved diagnostics, the hosted tests,
+and the witness and grader extension. The documentation commit follows it. The runner, its
+log-mutation helper and both addenda were hashed before they ran (`qual/predeclared.sha`), and
+every log was kept. Addendum B checks the documentation commit with the contract gate, doc
+enforcement and the serial lib.
+
+| step | result |
+|---|---|
+| hosted | fmt; serial lib, 6,715 passed; `--tests`, 7,112 passed; the grader CLI corpus; 19 focused subsets, each with a non-zero test count (§22.8; the `apsched` filter matches no hosted test); contract gate; doc enforcement; the witness feature checked on all three targets |
+| lock order | 30 descending-pair types on C and on `dce48596`, none new |
+| builds | default x86_64, AArch64 and RISC-V artifacts, C and B. C kernels: x86_64 `5412473e…`, AArch64 `94889606…`, RISC-V `b59e0040…`. B reproduces the SCHED-LOCK2B x86_64 kernel `03430ead…` |
+| sizes | `.text`: x86_64 +11,328 (+0.87 %), AArch64 −48,924 (−4.88 %; the TTAS loop was inlined at every site, the ticket lock is one 72-byte function), RISC-V +10,124 (+1.36 %; the ticket draw is inlined). Data: +8,192 on each port, from the per-CPU deferred-diagnostic buffer (+128 B per `CpuCell`); the lock itself stays 64 B. The uncontended acquire is still one RMW and one load, masked first (§22.8) |
+| W1 x86_64 SMP2 | `SL1W_SEAL … result=pass`: 8,492 acquisitions, 16 contended, max 1 ahead, 0 gaps; both probes proved (1L[0] 6195/6196/6197, 1G 45/46/47); 23 remote adds, 36 notifications, `idle_wakes=3_ipi` (kernel `b67c4c64…`) |
+| W2 AArch64 SMP2 | `result=pass`: 8,544 acquisitions, 9 contended, max 1 ahead, 0 gaps; probes 5836/5837/5838 and 24/25/26; 20 remote adds, 85 notifications (kernel `34bac2f0…`) |
+| W3 RISC-V SMP2 | `result=pass`: 8,126 acquisitions, 6 contended, max 1 ahead, 0 gaps; probes 5680/5681/5682 and 25/26/27; 18 remote adds, 32 notifications (kernel `9c5cb234…`) |
+| negative controls | masking after the draw: the IRQ test fails. A barging try-lock: the try-lock test fails. A barging draw: hosted, 6 of 9 `fair1_` tests fail; live x86_64, the workload passes but the grader fails it with `fair-coverage` (no queued peer in 8 probe attempts). W1's log mutated to a re-acquire overtaking the peer, and to a service gap: both `fair-order`. Tree restored, porcelain 0 |
+| addendum A | read-only analysis of the saved kernels: data-symbol deltas, the lock functions' disassembly, atomic instruction counts |
+| inherited | `yarm-server-runtime` `runtime_reexports_curated_runtime_surfaces` and a `yarm-control-plane-servers` doctest fail identically on `dce48596` (development `--workspace` run) |
+
+**Verdict: QUALIFIED.**
