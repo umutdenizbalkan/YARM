@@ -3167,6 +3167,29 @@ pub fn install_sched_profile_on_live_domain() -> bool {
     }
 }
 
+/// RT-SCHED1B — `yarm.sched_budget=on|off` (0 = unset: off).
+static SCHED_BUDGET_OVERRIDE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// RT-SCHED1B — record the boot configuration's budget-enforcement request.
+pub fn set_sched_budget_override(on: bool) {
+    SCHED_BUDGET_OVERRIDE.store(1 + u8::from(on), core::sync::atomic::Ordering::Release);
+}
+
+/// RT-SCHED1B — was budget enforcement requested? It is honoured only with the RT profile
+/// (`SchedDomain::set_budget` fails closed otherwise).
+pub fn sched_budget_requested() -> bool {
+    SCHED_BUDGET_OVERRIDE.load(core::sync::atomic::Ordering::Acquire) == 2
+}
+
+/// RT-SCHED1B — install the request on an ALREADY-CONSTRUCTED domain (the profile's two boot
+/// orders). `None`: no domain yet (the construction applies it); `Some(enforced)`.
+pub fn install_sched_budget_on_live_domain() -> Option<bool> {
+    let shared = Bootstrap::shared_static_ref()?;
+    let requested = sched_budget_requested();
+    let accepted = shared.sched_domain().set_budget(requested);
+    Some(requested && accepted)
+}
+
 /// The quantum the scheduler timer should be built with: the override when one was requested,
 /// otherwise the shipped quantum. One reader, so the two cannot disagree.
 ///

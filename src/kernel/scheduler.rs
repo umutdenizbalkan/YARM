@@ -436,6 +436,9 @@ pub struct PriorityScheduler {
     reserved: [u16; PRIORITY_LEVELS],
     /// RT-SCHED1A — every level's reservations together (the total admission's count).
     reserved_total: u16,
+    /// RT-SCHED1B — this CPU's scheduling contexts and accounting interval (§24). Inert unless the
+    /// domain runs the RT profile with budgets enabled.
+    budget: crate::kernel::sched_budget::BudgetLedger,
 }
 
 impl Default for PriorityScheduler {
@@ -448,6 +451,7 @@ impl Default for PriorityScheduler {
             membership_tracking_exhausted: false,
             reserved: [0; PRIORITY_LEVELS],
             reserved_total: 0,
+            budget: crate::kernel::sched_budget::BudgetLedger::default(),
         }
     }
 }
@@ -516,6 +520,10 @@ impl PriorityScheduler {
         if self.current.is_some_and(|task| task.tid == tid) {
             return true;
         }
+        // RT-SCHED1B: a parked (exhausted, Ready) thread is placed here without a queue position.
+        if self.budget.get(tid.0).is_some_and(|c| c.parked()) {
+            return true;
+        }
         self.queues
             .levels()
             .any(|level| self.queues.contains(level, tid))
@@ -540,6 +548,14 @@ impl PriorityScheduler {
                 if self.membership_insert(tid).is_err() {
                     exhausted = true;
                 }
+            }
+        }
+        for i in 0..crate::kernel::sched_budget::CTX_PER_CPU {
+            if let Some(c) = self.budget.ctx[i]
+                && c.parked()
+                && self.membership_insert(ThreadId(c.tid)).is_err()
+            {
+                exhausted = true;
             }
         }
 
@@ -585,6 +601,13 @@ impl PriorityScheduler {
         if !crate::kernel::kthread::is_kthread_tid(tid.0) && !self.user_room(priority) {
             return Err(SchedulerError::QueueFull);
         }
+        // RT-SCHED1B: every thread placed on a budgeted CPU is accounted to a context; a wake of an
+        // exhausted one keeps it Ready but grants no position and no budget (SC-CTX-8).
+        self.budget_bind_default(tid)?;
+        if self.budget_exhausted(tid) {
+            self.park(tid, priority, false);
+            return Ok(());
+        }
         self.push_unchecked_capacity(tid, priority)
     }
 
@@ -613,6 +636,12 @@ impl PriorityScheduler {
         if self.contains_tid(tid) {
             return Err(SchedulerError::AlreadyQueued);
         }
+        // RT-SCHED1B: an exhausted outgoing task takes NO position (SC-PRI-12 (f)): it is parked
+        // on the slot it was just using, so this cannot fail for capacity either.
+        if self.budget_exhausted(tid) {
+            self.park(tid, priority, false);
+            return Ok(());
+        }
         let pushed = self.push_unchecked_capacity(tid, priority);
         // The one current that is installed rather than admitted is an AP's idle (tid 0,
         // `install_ap_idle_current`), so the bound does not cover it; at the physical bound its
@@ -634,6 +663,11 @@ impl PriorityScheduler {
     ) -> Result<(), SchedulerError> {
         if self.contains_tid(tid) {
             return Err(SchedulerError::AlreadyQueued);
+        }
+        // RT-SCHED1B: exhaustion overrides the head placement of (a) until a replenishment.
+        if self.budget_exhausted(tid) {
+            self.park(tid, priority, false);
+            return Ok(());
         }
         let pushed = self.push_front_unchecked_capacity(tid, priority);
         debug_assert!(
@@ -702,10 +736,21 @@ impl PriorityScheduler {
         tid: ThreadId,
         priority: TaskPriority,
     ) -> Result<(), SchedulerError> {
-        self.release_user_slot(priority);
         if self.contains_tid(tid) {
+            self.release_user_slot(priority);
             return Err(SchedulerError::AlreadyQueued);
         }
+        if let Err(e) = self.budget_bind_default(tid) {
+            self.release_user_slot(priority);
+            return Err(e);
+        }
+        // RT-SCHED1B: an exhausted waiter keeps the reservation it was woken into as its parked
+        // slot — Ready, no position, and its rejoin can never be refused.
+        if self.budget_exhausted(tid) {
+            self.park(tid, priority, true);
+            return Ok(());
+        }
+        self.release_user_slot(priority);
         self.push_unchecked_capacity(tid, priority)
     }
 
@@ -777,6 +822,14 @@ impl PriorityScheduler {
     /// among equals), and neither does an empty slot or the tid-0 idle placeholder, whose CPU is
     /// advanced by the idle paths instead. Read-only, O(1).
     pub fn rt_preempt_wanted(&self) -> bool {
+        // RT-SCHED1B: an exhausted current is ineligible whatever its priority (SC-CTX-3): the next
+        // scheduling point must take the CPU from it even when nothing else is queued.
+        if let Some(cur) = self.current
+            && cur.tid.0 != 0
+            && self.budget_exhausted(cur.tid)
+        {
+            return true;
+        }
         match (self.current, self.best_queued_priority()) {
             (Some(cur), Some(best)) => cur.tid.0 != 0 && best.is_higher_than(cur.priority),
             _ => false,
@@ -1049,6 +1102,13 @@ impl PriorityScheduler {
         if self.current.is_some_and(|task| task.tid == tid) {
             return WithdrawOutcome::RefusedCurrent;
         }
+        // RT-SCHED1B: a parked thread is withdrawn by giving back its rejoin slot.
+        if self.unpark(tid) {
+            if !self.membership_tracking_exhausted {
+                self.membership_remove(tid);
+            }
+            return WithdrawOutcome::Removed;
+        }
         // (5) exact-one rule: count first across every priority queue, mutate only if the count
         // is exactly 1. A duplicate fails closed with zero mutation.
         let mut total = 0usize;
@@ -1150,7 +1210,253 @@ impl PriorityScheduler {
         let current = self
             .current
             .is_some_and(|t| !crate::kernel::kthread::is_kthread_tid(t.tid.0));
-        queued + usize::from(current)
+        queued + usize::from(current) + self.parked_users()
+    }
+
+    // ── RT-SCHED1B: scheduling contexts (§24; `kernel::sched_budget`) ───────────────────────────
+
+    /// Parked user threads (each still occupies its home's load).
+    fn parked_users(&self) -> usize {
+        self.budget
+            .ctx
+            .iter()
+            .flatten()
+            .filter(|c| {
+                matches!(
+                    c.parked,
+                    Some((crate::kernel::sched_budget::Park::Reserved, _))
+                )
+            })
+            .count()
+    }
+
+    /// Bring this CPU's ledger up to `now`: SC-CTX-7 steps 1–3 — charge the interval since the
+    /// previous section to whoever was current, then apply every due release in ascending context
+    /// id (rejoining parked contexts left with budget, at their level's tail). Called at the start
+    /// of every 1L section of a budgeted CPU and again by the clock owner's tick after it advances
+    /// the clock. A no-op (GP, RT without budgets) when `enabled` is false.
+    pub(crate) fn budget_sync(&mut self, now: u64, enabled: bool, cpu: u8) {
+        if !enabled {
+            return;
+        }
+        if !self.budget.enabled {
+            // The first section of a budgeted CPU opens its accounting interval here.
+            self.budget.enabled = true;
+            self.budget.acct = now;
+        }
+        self.budget.cpu = cpu;
+        if now < self.budget.now {
+            return;
+        }
+        self.budget.now = now;
+        self.budget_account(cpu);
+        self.budget_replenish(cpu);
+    }
+
+    fn budget_account(&mut self, cpu: u8) {
+        let now = self.budget.now;
+        let elapsed = now.saturating_sub(self.budget.acct);
+        self.budget.acct = now;
+        if elapsed == 0 {
+            return;
+        }
+        match self.current {
+            Some(t) if t.tid.0 != 0 => match self.budget.get_mut(t.tid.0) {
+                Some(c) => {
+                    let r = crate::kernel::sched_budget::charge(c, elapsed);
+                    #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+                    if r.newly_exhausted || r.overrun > 0 {
+                        crate::kernel::rt_witness::note_budget_exhausted(cpu, c, now, r.overrun);
+                    }
+                    let _ = (r, cpu);
+                }
+                None => self.budget.unaccounted = self.budget.unaccounted.saturating_add(elapsed),
+            },
+            _ => self.budget.idle = self.budget.idle.saturating_add(elapsed),
+        }
+    }
+
+    fn budget_replenish(&mut self, cpu: u8) {
+        let now = self.budget.now;
+        if now < self.budget.earliest {
+            return;
+        }
+        for i in 0..crate::kernel::sched_budget::CTX_PER_CPU {
+            let Some(c) = self.budget.ctx[i].as_mut() else {
+                continue;
+            };
+            let Some(r) = crate::kernel::sched_budget::replenish_due(c, now) else {
+                continue;
+            };
+            let rejoin = if c.exhausted() { None } else { c.parked.take() };
+            let tid = ThreadId(c.tid);
+            #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+            crate::kernel::rt_witness::note_budget_replenished(
+                cpu,
+                c,
+                now,
+                r.release,
+                r.count,
+                rejoin.is_some(),
+            );
+            let _ = (r, cpu);
+            if let Some((kind, level)) = rejoin {
+                self.rejoin(tid, kind, level);
+            }
+        }
+        self.budget.recompute_earliest();
+    }
+
+    /// A parked context left with budget joins its level's TAIL, once (SC-PRI-12 (f), SC-CTX-7).
+    /// Its slot was guaranteed when it parked, so this push cannot be refused for capacity.
+    fn rejoin(&mut self, tid: ThreadId, kind: crate::kernel::sched_budget::Park, level: u8) {
+        let Some(priority) = TaskPriority::from_level(level as usize) else {
+            return;
+        };
+        if kind == crate::kernel::sched_budget::Park::Reserved {
+            self.release_user_slot(priority);
+        }
+        let pushed = self.push_unchecked_capacity(tid, priority);
+        debug_assert!(pushed.is_ok(), "RT-SCHED1B: a parked rejoin found no slot");
+    }
+
+    /// Is `tid` bound to an exhausted context on this budgeted CPU?
+    fn budget_exhausted(&self, tid: ThreadId) -> bool {
+        self.budget.enabled && self.budget.get(tid.0).is_some_and(|c| c.exhausted())
+    }
+
+    /// Bind `tid` to the default context if this budgeted CPU has none for it yet: every thread
+    /// placed here is accounted (the deployment configuration binds explicit budgets first, at the
+    /// incarnation's first placement). A full pool refuses the placement.
+    fn budget_bind_default(&mut self, tid: ThreadId) -> Result<(), SchedulerError> {
+        if !self.budget.enabled || tid.0 == 0 || self.budget.slot_of(tid.0).is_some() {
+            return Ok(());
+        }
+        self.budget
+            .bind(tid.0, 0, crate::kernel::sched_budget::BudgetParams::DEFAULT)
+            .map(|_| ())
+            .ok_or(SchedulerError::ContextPoolFull)
+    }
+
+    /// Park exhausted, Ready `tid` at `priority`: no queue position. A user thread holds one
+    /// reservation at its level (`already_reserved`: the one it was woken into); a kernel thread
+    /// uses the kernel-thread headroom. Its membership stays, so nothing places it twice.
+    fn park(&mut self, tid: ThreadId, priority: TaskPriority, already_reserved: bool) {
+        use crate::kernel::sched_budget::Park;
+        let kind = if crate::kernel::kthread::is_kthread_tid(tid.0) {
+            // Kernel threads are placed without admission; a reservation one was filled from
+            // (none today) is given back rather than held twice.
+            if already_reserved {
+                self.release_user_slot(priority);
+            }
+            Park::KernelThread
+        } else {
+            if !already_reserved {
+                let p = Self::priority_index(priority);
+                self.reserved[p] += 1;
+                self.reserved_total += 1;
+            }
+            Park::Reserved
+        };
+        if !self.membership_tracking_exhausted && self.membership_insert(tid).is_err() {
+            self.membership_tracking_exhausted = self.rebuild_membership_table();
+        }
+        let now = self.budget.now;
+        if let Some(c) = self.budget.get_mut(tid.0) {
+            c.parked = Some((kind, priority.level() as u8));
+            #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+            crate::kernel::rt_witness::note_budget_parked(now, c);
+        }
+        let _ = now;
+    }
+
+    /// Give back a parked thread's rejoin slot. `false`: it was not parked here.
+    fn unpark(&mut self, tid: ThreadId) -> bool {
+        let Some(c) = self.budget.get_mut(tid.0) else {
+            return false;
+        };
+        let Some((kind, level)) = c.parked.take() else {
+            return false;
+        };
+        if kind == crate::kernel::sched_budget::Park::Reserved
+            && let Some(priority) = TaskPriority::from_level(level as usize)
+        {
+            self.release_user_slot(priority);
+        }
+        true
+    }
+
+    /// RT-SCHED1B — bind `tid`'s incarnation `stamp` to a context with the configuration's
+    /// `params`, at its first placement on this (home) CPU. A binding of an earlier incarnation of
+    /// the TID is replaced (nothing is inherited); a full pool is a typed refusal.
+    pub(crate) fn bind_context(
+        &mut self,
+        tid: ThreadId,
+        stamp: u64,
+        params: crate::kernel::sched_budget::BudgetParams,
+    ) -> Result<(), SchedulerError> {
+        if !self.budget.enabled {
+            return Ok(());
+        }
+        let slot = self
+            .budget
+            .bind(tid.0, stamp, params)
+            .ok_or(SchedulerError::ContextPoolFull)?;
+        #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
+        if let Some(c) = self.budget.ctx[slot].as_ref() {
+            crate::kernel::rt_witness::note_budget_bound(self.budget.now, slot, c);
+        }
+        let _ = slot;
+        Ok(())
+    }
+
+    /// RT-SCHED1B — release `tid`'s context when its incarnation `stamp` (`0`: any) is retired
+    /// (reap, kernel-thread reclaim). A parked thread gives back its slot first. `false`: none.
+    pub(crate) fn release_context(&mut self, tid: ThreadId, stamp: u64) -> bool {
+        let Some(i) = self.budget.slot_of(tid.0) else {
+            return false;
+        };
+        let matches =
+            self.budget.ctx[i].is_some_and(|c| stamp == 0 || c.stamp == 0 || c.stamp == stamp);
+        if !matches {
+            return false;
+        }
+        if self.unpark(tid) && !self.membership_tracking_exhausted {
+            self.membership_remove(tid);
+        }
+        self.budget.ctx[i] = None;
+        self.budget.recompute_earliest();
+        true
+    }
+
+    /// RT-SCHED1B — `tid`'s context on this CPU (observation).
+    pub(crate) fn context_of(
+        &self,
+        tid: ThreadId,
+    ) -> Option<crate::kernel::sched_budget::SchedContext> {
+        self.budget.get(tid.0).copied()
+    }
+
+    /// RT-SCHED1B — this CPU's ledger: (idle, unaccounted, essential ticks, essential arrivals,
+    /// contexts bound).
+    pub(crate) fn budget_ledger(&self) -> (u64, u64, u64, u64, usize) {
+        (
+            self.budget.idle,
+            self.budget.unaccounted,
+            self.budget.essential_ticks,
+            self.budget.essential_arrivals,
+            self.budget.ctx.iter().flatten().count(),
+        )
+    }
+
+    fn note_essential(&mut self, tick: bool) {
+        if self.budget.enabled {
+            if tick {
+                self.budget.essential_ticks += 1;
+            } else {
+                self.budget.essential_arrivals += 1;
+            }
+        }
     }
 }
 
@@ -1266,7 +1572,10 @@ impl CpuSched {
             self.rq
                 .queues
                 .levels()
-                .any(|level| self.rq.queues.count_tid(level, tid) > 0),
+                .any(|level| self.rq.queues.count_tid(level, tid) > 0)
+                // RT-SCHED1B: a parked thread is Ready and placed here (its rejoin slot is held),
+                // without a queue position: every placement reader sees it as placed, not absent.
+                || self.rq.budget.get(tid.0).is_some_and(|c| c.parked()),
         )
     }
 }
@@ -1363,12 +1672,18 @@ pub(crate) struct SchedTopo {
     /// RT-SCHED1A — the domain's scheduling profile ([`SchedProfile`]), set once by the boot
     /// configuration before any CPU dispatches. `0` (the default) is general-purpose.
     profile: AtomicU8,
+    /// RT-SCHED1B — budget enforcement (`yarm.sched_budget=on`), honoured only with the RT profile.
+    budget: core::sync::atomic::AtomicBool,
 }
 
 impl SchedTopo {
     /// RT-SCHED1A — is this domain configured with the RT-P1 profile?
     pub(crate) fn rt(&self) -> bool {
         self.profile.load(Ordering::Acquire) == SchedProfile::RealTime as u8
+    }
+    /// RT-SCHED1B — are budgets enforced? Only ever under the RT profile.
+    pub(crate) fn budget(&self) -> bool {
+        self.rt() && self.budget.load(Ordering::Acquire)
     }
     pub(crate) fn present(&self) -> u64 {
         self.present.load(Ordering::Acquire)
@@ -1471,6 +1786,21 @@ impl SchedDomain {
         RT_PROFILE_ACTIVE.store(profile == SchedProfile::RealTime, Ordering::Release);
         #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
         crate::arch::x86_64::smp::set_rt_user_resched_handoff(profile == SchedProfile::RealTime);
+    }
+
+    /// RT-SCHED1B — enable budget enforcement. Fails closed: refused (`false`, nothing changed)
+    /// unless the domain runs the RT profile. A boot decision, made before any CPU dispatches.
+    pub fn set_budget(&self, on: bool) -> bool {
+        if on && !self.topo.rt() {
+            return false;
+        }
+        self.topo.budget.store(on, Ordering::Release);
+        true
+    }
+
+    /// RT-SCHED1B — are budgets enforced in this domain?
+    pub fn budget_enabled(&self) -> bool {
+        self.topo.budget()
     }
 
     /// RT-SCHED1A — this domain's scheduling profile.
@@ -1658,9 +1988,14 @@ impl SchedDomain {
     pub fn exclusive(&mut self) -> SchedAll<'_> {
         let mut cpus: [Option<&mut CpuSched>; MAX_CPUS] = [const { None }; MAX_CPUS];
         let mut mirrors: [Option<&CpuMirror>; MAX_CPUS] = [None; MAX_CPUS];
+        let now = self.clock.load(Ordering::Acquire);
+        let budget = self.topo.budget();
         for (idx, cell) in self.cpus.iter_mut().enumerate() {
             let CpuCell { lock, mirror } = cell;
-            cpus[idx] = Some(lock.get_mut());
+            let sched = lock.get_mut();
+            // RT-SCHED1B: the whole-domain view brings every CPU's ledger up to date first.
+            sched.rq.budget_sync(now, budget, idx as u8);
+            cpus[idx] = Some(sched);
             mirrors[idx] = Some(&*mirror);
         }
         SchedAll {
@@ -1695,12 +2030,19 @@ impl CpuSchedGuard<'_> {
     }
 
     pub fn view(&mut self) -> CpuView<'_> {
+        let sched = self
+            .guard
+            .as_mut()
+            .expect("the 1L guard is held until the drop");
+        // RT-SCHED1B: every section of a budgeted CPU starts with its ledger up to date.
+        sched.rq.budget_sync(
+            self.clock.load(Ordering::Acquire),
+            self.topo.budget(),
+            self.idx as u8,
+        );
         CpuView {
             idx: self.idx,
-            sched: self
-                .guard
-                .as_mut()
-                .expect("the 1L guard is held until the drop"),
+            sched,
             topo: self.topo,
             clock: self.clock,
             #[cfg(feature = "sched-lock1-witness")]
@@ -2095,6 +2437,11 @@ impl CpuView<'_> {
         } else {
             self.clock.load(Ordering::Acquire)
         };
+        // RT-SCHED1B (SC-CTX-7): charge, apply due releases, then decide — at THIS instant.
+        self.sched
+            .rq
+            .budget_sync(now, self.topo.budget(), self.idx as u8);
+        self.sched.rq.note_essential(true);
         let preempt = if self.topo.rt() {
             self.sched.rq.rt_preempt_wanted()
         } else {
@@ -2116,6 +2463,58 @@ impl CpuView<'_> {
     /// RT-SCHED1A — this CPU's domain runs the RT-P1 profile.
     pub fn rt_profile(&self) -> bool {
         self.topo.rt()
+    }
+
+    /// RT-SCHED1B — does this CPU enforce budgets (RT profile with `yarm.sched_budget=on`)?
+    pub fn budget_enabled(&self) -> bool {
+        self.topo.budget()
+    }
+
+    /// RT-SCHED1B — bind `tid`'s incarnation `stamp` to a context with `params` on this CPU (its
+    /// home), at its first placement. A no-op when budgets are not enforced; `ContextPoolFull`
+    /// when the pool is full.
+    pub(crate) fn bind_context(
+        &mut self,
+        tid: ThreadId,
+        stamp: u64,
+        params: crate::kernel::sched_budget::BudgetParams,
+    ) -> Result<(), SchedulerError> {
+        self.validate_online()?;
+        self.sched.rq.bind_context(tid, stamp, params)
+    }
+
+    /// RT-SCHED1B — release `tid`'s context (its incarnation `stamp`, `0` for any) when the
+    /// incarnation is retired. `false`: none was bound here.
+    pub(crate) fn release_context(&mut self, tid: ThreadId, stamp: u64) -> bool {
+        self.sched.rq.release_context(tid, stamp)
+    }
+
+    /// RT-SCHED1B — `tid`'s context on this CPU (observation).
+    pub(crate) fn context_of(
+        &self,
+        tid: ThreadId,
+    ) -> Option<crate::kernel::sched_budget::SchedContext> {
+        self.sched.rq.context_of(tid)
+    }
+
+    /// RT-SCHED1B — hosted FIXTURE only: `tid`'s context, mutable, to construct a state no
+    /// production path reaches in a test's lifetime (a near-overflow debt).
+    #[cfg(test)]
+    pub(crate) fn budget_context_mut_for_test(
+        &mut self,
+        tid: ThreadId,
+    ) -> Option<&mut crate::kernel::sched_budget::SchedContext> {
+        self.sched.rq.budget.get_mut(tid.0)
+    }
+
+    /// RT-SCHED1B — (idle, unaccounted, essential ticks, essential arrivals, contexts bound).
+    pub(crate) fn budget_ledger(&self) -> (u64, u64, u64, u64, usize) {
+        self.sched.rq.budget_ledger()
+    }
+
+    /// RT-SCHED1B — an RT reschedule arrival was settled here (the essential-work ledger).
+    pub(crate) fn note_rt_arrival(&mut self) {
+        self.sched.rq.note_essential(false);
     }
 
     /// RT-SCHED1A — SC-PRI-13: in the RT profile, does a queued entry of STRICTLY higher priority
@@ -2168,10 +2567,17 @@ pub struct SchedAllGuard<'a> {
 impl SchedAllGuard<'_> {
     pub fn view(&mut self) -> SchedAll<'_> {
         let domain = self.domain;
+        let now = domain.clock.load(Ordering::Acquire);
+        let budget = domain.topo.budget();
+        let mut idx = 0u8;
         let cpus = self.guards.each_mut().map(|g| {
-            &mut **g
+            let sched = &mut **g
                 .as_mut()
-                .expect("every 1L is held for the guard's lifetime")
+                .expect("every 1L is held for the guard's lifetime");
+            // RT-SCHED1B: every CPU's ledger is brought up to date as the coherent view opens.
+            sched.rq.budget_sync(now, budget, idx);
+            idx = idx.wrapping_add(1);
+            sched
         });
         SchedAll {
             cpus,
@@ -2250,6 +2656,11 @@ impl SchedAll<'_> {
     /// CPU `cpu`'s view under this authority.
     pub fn cpu(&mut self, cpu: CpuId) -> Result<CpuView<'_>, SchedulerError> {
         let idx = Self::check_cpu(cpu)?;
+        self.cpus[idx].rq.budget_sync(
+            self.clock.load(Ordering::Acquire),
+            self.topo.budget(),
+            idx as u8,
+        );
         Ok(CpuView {
             idx,
             sched: &mut *self.cpus[idx],
@@ -2501,6 +2912,12 @@ impl SchedAll<'_> {
     /// U9-EXIT3 §2 — is `tid` current on, or queued on, ANY CPU? (coherent)
     pub fn tid_present_anywhere(&self, tid: ThreadId) -> bool {
         self.cpus.iter().any(|s| s.rq.contains_or_current(tid))
+    }
+
+    /// RT-SCHED1B — release `tid`'s context on `cpu` (its incarnation `stamp`; `0`: any).
+    pub(crate) fn release_context_on(&mut self, cpu: CpuId, tid: ThreadId, stamp: u64) -> bool {
+        self.cpu(cpu)
+            .map_or(false, |mut v| v.release_context(tid, stamp))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

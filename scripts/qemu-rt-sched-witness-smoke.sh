@@ -6,6 +6,13 @@
 #
 # Usage: scripts/qemu-rt-sched-witness-smoke.sh [x86_64|aarch64|riscv64] [smp]
 #
+# RT-SCHED1B: SCHED_BUDGET=on (the default) adds `yarm.sched_budget=on` to the boot, and the
+# witness then also runs its budget phases E (a budgeted high-priority user task exhausting and
+# returning only at its release while lower work runs) and F (a budgeted cooperative kernel thread
+# charged and parked at its scheduling point); SCHED_BUDGET=off boots RT without budgets (the
+# RT-SCHED1A witness alone). The grader is told which, and checks the boot's own configuration
+# line agrees.
+#
 # One boot of the port's standard core image whose kernel is rebuilt with
 # `<port>-rt-sched-witness`, with the deployment configuration `yarm.sched_profile=rt`. The whole
 # standard core smoke runs under the RT profile (its terminal marker is the witness's `RTW_DONE`),
@@ -22,6 +29,8 @@ cd "$(dirname "$0")/.."
 
 ARCH=${1:-x86_64}
 SMP=${2:-${QEMU_SMP:-2}}
+SCHED_BUDGET=${SCHED_BUDGET:-on}
+case "$SCHED_BUDGET" in on|off) ;; *) echo "RTW_WITNESS_SEAL arch=$ARCH result=fail reason=bad_sched_budget"; exit 2 ;; esac
 case "$ARCH" in
   x86_64)
     FEATURE=x86-rt-sched-witness
@@ -60,7 +69,7 @@ case "$ARCH" in
 esac
 mkdir -p "$LOGDIR"
 BOOT_LOG="$LOGDIR/boot.log"
-seal() { echo "RTW_WITNESS_SEAL arch=$ARCH smp=$SMP $*"; }
+seal() { echo "RTW_WITNESS_SEAL arch=$ARCH smp=$SMP budget=$SCHED_BUDGET $*"; }
 
 python3 -I scripts/grade-rt-sched-witness.py --self-test >"$LOGDIR/selftest.txt" 2>&1 \
   || { cat "$LOGDIR/selftest.txt"; seal "result=fail reason=grader_self_test"; exit 1; }
@@ -83,12 +92,12 @@ if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
   fi
 fi
 
-echo "[rt-sched-witness] booting QEMU -smp $SMP with yarm.sched_profile=rt"
+echo "[rt-sched-witness] booting QEMU -smp $SMP with yarm.sched_profile=rt yarm.sched_budget=$SCHED_BUDGET"
 env \
   KERNEL_IMAGE="$DEST" \
   ARTIFACT_REQUIRE="kernel=$FEATURE" \
   INITRAMFS_IMAGE="$INITRAMFS_IMAGE" \
-  KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.sched_profile=rt" \
+  KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.sched_profile=rt yarm.sched_budget=$SCHED_BUDGET" \
   QEMU_SMP="$SMP" \
   LOGFILE="$BOOT_LOG" \
   SMOKE_LOG="$LOGDIR/smoke.log" \
@@ -105,7 +114,7 @@ NORM="$LOGDIR/boot.norm.log"
 tr '\r' '\n' <"$BOOT_LOG" >"$NORM"
 sha256sum "$BOOT_LOG" "$DEST" "$INITRAMFS_IMAGE" >"$LOGDIR/sha256.txt" 2>/dev/null || true
 
-python3 -I scripts/grade-rt-sched-witness.py --arch "$ARCH" --smp "$SMP" "$NORM" | tee "$LOGDIR/grade.txt"
+python3 -I scripts/grade-rt-sched-witness.py --arch "$ARCH" --smp "$SMP" --budget "$SCHED_BUDGET" "$NORM" | tee "$LOGDIR/grade.txt"
 grade_rc=${PIPESTATUS[0]}
 if (( core_rc != 0 )); then
   seal "result=fail reason=core_smoke core_rc=$core_rc grade_rc=$grade_rc"

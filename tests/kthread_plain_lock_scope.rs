@@ -148,7 +148,13 @@ fn the_lock_path_takes_no_lock_and_does_not_log() {
         }
     }
     // Registration happens under the pool lock before any thread of the pool can run.
-    let create = body(KTHREAD, "pub fn create(");
+    // RT-SCHED1B: `create` is `create_budgeted` with no budget, so the creation body lives there.
+    let plain = body(KTHREAD, "pub fn create(");
+    assert!(
+        plain.contains("self.create_budgeted(entry, arg, cpu, priority, None)"),
+        "`create` must delegate to the one creation body"
+    );
+    let create = body(KTHREAD, "pub fn create_budgeted(");
     let reg = create.find("plain_register(").unwrap();
     let pop = create.find("free.pop()").unwrap();
     let enqueue = create.find("enqueue_with_priority").unwrap();

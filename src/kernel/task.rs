@@ -393,6 +393,12 @@ pub struct ThreadControlBlock {
     /// / `fix_home_locked`). From then on its priority is fixed (SC-PRI-10: a property of the
     /// context, fixed at configuration, never changed at run time): configuration is refused.
     pub sched_priority_sealed: bool,
+    /// RT-SCHED1B — the scheduling-context budget CONFIGURED for this exact incarnation
+    /// (`task_enqueue::configure_budget_locked`), validated `0 < B <= T`. Sealed with the
+    /// priority. On a budgeted CPU the commit of its first placement binds it to a context on its
+    /// home (`task_enqueue::commit_enqueue_on_cpu_locked`); `None` takes the default template
+    /// (`sched_budget::BudgetParams::DEFAULT`, accounted and never exhausted by execution alone).
+    pub sched_budget: Option<crate::kernel::sched_budget::BudgetParams>,
     /// Absolute scheduler tick at which an IPC wait should timeout.
     pub ipc_timeout_deadline: Option<u64>,
     /// Set when a blocked IPC wait is resumed due to timeout expiry.
@@ -1227,6 +1233,7 @@ impl ThreadControlBlock {
             incarnation: next_incarnation(),
             sched_priority: None,
             sched_priority_sealed: false,
+            sched_budget: None,
             tid,
             thread_group_id: ThreadGroupId(tid.0),
             status: TaskStatus::Runnable,

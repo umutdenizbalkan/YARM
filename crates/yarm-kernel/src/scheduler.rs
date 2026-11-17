@@ -72,6 +72,9 @@ pub enum SchedulerError {
     WakeOnly,
     QueueFull,
     AlreadyQueued,
+    /// RT-SCHED1B: a budgeted CPU's scheduling-context pool is full, so the thread cannot be bound
+    /// to a context and is not placed (SC-POOL-2: a typed refusal, never an unbudgeted thread).
+    ContextPoolFull,
 }
 
 #[cfg(test)]

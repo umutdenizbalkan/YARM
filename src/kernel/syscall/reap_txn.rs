@@ -627,6 +627,10 @@ impl ReapOwners for BroadReapOwners<'_> {
     }
 
     fn retire_reap_claim(&mut self, claim: ReapClaim) {
+        // RT-SCHED1B: the identity is free for reuse, so its scheduling context is too.
+        let _ = self
+            .kernel
+            .release_sched_context(claim.tid(), claim.incarnation());
         emit_reap_claim_retired(&claim);
     }
 }
@@ -837,6 +841,11 @@ impl ReapOwners for SharedReapOwners<'_> {
     }
 
     fn retire_reap_claim(&mut self, claim: ReapClaim) {
+        // RT-SCHED1B: the identity is free for reuse, so its scheduling context is too (its
+        // home's 1L, after rank 2 is released).
+        let _ = self
+            .shared
+            .release_sched_context_split(claim.tid(), claim.incarnation());
         emit_reap_claim_retired(&claim);
     }
 }

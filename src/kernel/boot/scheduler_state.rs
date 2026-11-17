@@ -70,6 +70,17 @@ impl KernelState {
         })
     }
 
+    /// RT-SCHED1B — release the scheduling context of `tid`'s retired incarnation `stamp` on its
+    /// home (the broad reap owner's twin of `SharedKernel::release_sched_context_split`).
+    pub(crate) fn release_sched_context(&mut self, tid: u64, stamp: u64) -> bool {
+        let Some(home) = self.task_home_cpu(tid) else {
+            return false;
+        };
+        self.with_scheduler_state_mut(|sched| {
+            sched.release_context_on(home, crate::kernel::ipc::ThreadId(tid), stamp)
+        })
+    }
+
     /// Stage 183.5: the wake-only (online, no-placement) CPU bitmap.
     pub fn wake_only_cpu_bitmap(&self) -> u64 {
         self.with_scheduler_state(|sched| sched.wake_only_bitmap())

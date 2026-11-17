@@ -23,7 +23,9 @@
 //! * **A** (×3) — a LOCAL wake: H0 is woken on CPU 0 while UA's yield storm runs there. The wake's
 //!   self-raised reschedule is taken on the return to UA and must preempt it (cause 1); H0 runs.
 //! * **B** — a REMOTE wake through the real IPI: H1 is woken FROM CPU 0 while UB, observed running
-//!   (its heartbeat advancing), holds CPU 1. CPU 1's reschedule arrival must preempt UB; H1 runs.
+//!   (its heartbeat advancing), holds CPU 1. CPU 1's next scheduling point must preempt UB — the
+//!   reschedule arrival, or a CPU 1 tick that reached H1 first (the grader requires the arrival in
+//!   at least one of the boot's remote wakes); H1 runs.
 //! * **C** — an EQUAL-priority wake: E (level 20) is woken while UB (level 20) runs. The arrival
 //!   must be declined, and CPU 1's ticks must not rotate UB (several are counted with UB still
 //!   current and E not run). Then H1 is woken again and preempts UB, which must return to the
@@ -33,6 +35,23 @@
 //! * **D** — a higher-priority wake during a running KERNEL thread: L (level 16) takes CPU 0 from
 //!   UA, then H0 is woken while L runs. L's next scheduling point must yield (`rt=true`); H0 runs;
 //!   L resumes and finishes.
+//!
+//! RT-SCHED1B (§24) — with `yarm.sched_budget=on` as well, two budget phases follow D, on the same
+//! production owners plus the scheduling contexts (`kernel::sched_budget`):
+//!
+//! * **E** — a third user task **UH** (CPU 1, level 8, budget 2 of every 8 ticks, never yields) is
+//!   placed FROM CPU 0 while UB runs: the remote wake preempts UB. UH exhausts its budget;
+//!   the next scheduling point on CPU 1 (its tick) takes the CPU from it and parks it with no queue
+//!   position, so the LOWER-priority UB runs on the same CPU. UH returns only at its fixed release
+//!   instant (bound + k·8), rejoining its level's tail once and preempting UB at the tick. Three
+//!   cycles are recorded with both heartbeats.
+//! * **F** — a budgeted cooperative kernel thread **K** (CPU 0, level 6, budget 2 of every 10)
+//!   works in chunks with a scheduling point after each: it is charged, its exhaustion leaves a
+//!   reschedule pending that its next scheduling point honours (`rt=true`), it parks there, and it
+//!   resumes from that same point only after its release. Three cycles.
+//!
+//! The dump also records each CPU's ledger (idle, unaccounted, essential work) and UH's and K's
+//! contexts (charged, overrun, exhaustions, releases).
 //!
 //! Every fact is one record under a single causal stamp; the dumper prints them twice with a
 //! checksum per line and a seal, and `scripts/grade-rt-sched-witness.py` decides the verdict from
@@ -77,8 +96,20 @@ const USER_LEVEL: usize = 20;
 /// CPU 0 (the supervisor's one-tick receive-timeout poll takes most of each RISC-V tick).
 const UA_CHUNK: u64 = 20_000;
 const UB_CHUNK: u64 = 100_000;
+/// RT-SCHED1B: UH, the budgeted high-priority user task of phase E.
+pub const UH_TID: u64 = 9_702;
+const UH_LEVEL: usize = 8;
+const UH_BUDGET: (u64, u64) = (2, 8);
+/// RT-SCHED1B: K, the budgeted cooperative kernel thread of phase F.
+const K_LEVEL: usize = 6;
+const K_BUDGET: (u64, u64) = (2, 10);
+const K_CHUNK: u64 = 20_000;
+const K_MAX_CHUNKS: u64 = 20_000_000;
+/// Rejoins (after exhaustion) phase E and phase F each record.
+const E_CYCLES: u64 = 3;
+const F_CYCLES: u64 = 3;
 
-// Roles (kernel threads index 0..=5; the user tasks are 6 and 7).
+// Roles (kernel threads index 0..=5 and 8; the user tasks are 6, 7 and 9).
 const R_H0: usize = 0;
 const R_H1: usize = 1;
 const R_E: usize = 2;
@@ -87,10 +118,23 @@ const R_DUMP: usize = 4;
 const R_S: usize = 5;
 const R_UA: usize = 6;
 const R_UB: usize = 7;
-const ROLES: usize = 8;
-const ROLE_NAMES: [&str; ROLES] = ["H0", "H1", "E", "L", "DUMP", "S", "UA", "UB"];
+const R_K: usize = 8;
+const R_UH: usize = 9;
+const ROLES: usize = 10;
+const ROLE_NAMES: [&str; ROLES] = ["H0", "H1", "E", "L", "DUMP", "S", "UA", "UB", "K", "UH"];
 /// (home CPU, level) of each kernel-thread role.
 const KT_PLAN: [(u8, usize); 6] = [(0, 4), (1, 4), (1, USER_LEVEL), (0, 16), (0, 3), (0, 1)];
+
+/// (home CPU, level) of every role.
+fn plan(role: usize) -> (u8, usize) {
+    match role {
+        r if r < KT_PLAN.len() => KT_PLAN[r],
+        R_UA => (0, USER_LEVEL),
+        R_UB => (1, USER_LEVEL),
+        R_K => (0, K_LEVEL),
+        _ => (1, UH_LEVEL),
+    }
+}
 
 // Phases.
 const P_OFF: u64 = 0;
@@ -109,9 +153,14 @@ const P_C_YIELD: u64 = 12;
 const P_D_ARM: u64 = 13;
 const P_D_L: u64 = 14;
 const P_D_WAIT: u64 = 15;
-const P_DONE: u64 = 16;
-const P_DUMPING: u64 = 17;
-const PHASE_NAMES: [&str; 18] = [
+const P_E_ARM: u64 = 16;
+const P_E_PLACE: u64 = 17;
+const P_E_RUN: u64 = 18;
+const P_F_ARM: u64 = 19;
+const P_F_RUN: u64 = 20;
+const P_DONE: u64 = 21;
+const P_DUMPING: u64 = 22;
+const PHASE_NAMES: [&str; 23] = [
     "OFF",
     "WAIT_IDLE",
     "SETUP",
@@ -128,6 +177,11 @@ const PHASE_NAMES: [&str; 18] = [
     "D_ARM",
     "D_L",
     "D_WAIT",
+    "E_ARM",
+    "E_PLACE",
+    "E_RUN",
+    "F_ARM",
+    "F_RUN",
     "DONE",
     "DUMPING",
 ];
@@ -162,7 +216,16 @@ const K_LEND: u64 = 12;
 const K_PHASE: u64 = 13;
 const K_TIMEOUT: u64 = 14;
 const K_USER: u64 = 15;
-const KIND_NAMES: [&str; 16] = [
+const K_BIND: u64 = 16;
+const K_EXHAUST: u64 = 17;
+const K_PARK: u64 = 18;
+const K_REPLENISH: u64 = 19;
+const K_KSTART: u64 = 20;
+const K_KRESUMED: u64 = 21;
+const K_KEND: u64 = 22;
+const K_LEDGER: u64 = 23;
+const K_CTX: u64 = 24;
+const KIND_NAMES: [&str; 25] = [
     "NONE",
     "PROVISION",
     "START",
@@ -179,6 +242,15 @@ const KIND_NAMES: [&str; 16] = [
     "PHASE",
     "TIMEOUT",
     "USER",
+    "BUDGET_BIND",
+    "BUDGET_EXHAUST",
+    "BUDGET_PARK",
+    "BUDGET_REPLENISH",
+    "KSTART",
+    "KRESUMED",
+    "KEND",
+    "LEDGER",
+    "CTX",
 ];
 
 static PROVISIONED: AtomicBool = AtomicBool::new(false);
@@ -194,11 +266,20 @@ static H0_D_DONE: AtomicBool = AtomicBool::new(false);
 /// on L after its dispatch but before its first record).
 static L_STARTED: AtomicBool = AtomicBool::new(false);
 static POOL: AtomicU64 = AtomicU64::new(0);
-static MBX_PHYS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// RT-SCHED1B: the domain enforces budgets and UH was provisioned — phases E and F run.
+static BUDGETED: AtomicBool = AtomicBool::new(false);
+static UH_PROVISIONED: AtomicBool = AtomicBool::new(false);
+static E_REJOINS: AtomicU64 = AtomicU64::new(0);
+/// UH was charged again after its last recorded rejoin: it ran.
+static E_RAN_AFTER: AtomicBool = AtomicBool::new(false);
+static F_REJOINS: AtomicU64 = AtomicU64::new(0);
+/// K's completed chunks (its own heartbeat).
+static K_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static MBX_PHYS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// The exact identity of each role: a kernel thread's id, or a user task's TID.
 static ROLE_TID: [AtomicU64; ROLES] = [const { AtomicU64::new(0) }; ROLES];
-static GO: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-static QS: [KWaitQueue; 6] = [const { KWaitQueue::new() }; 6];
+static GO: [AtomicU64; R_K + 1] = [const { AtomicU64::new(0) }; R_K + 1];
+static QS: [KWaitQueue; R_K + 1] = [const { KWaitQueue::new() }; R_K + 1];
 
 fn phase() -> u64 {
     PHASE.load(Ordering::Acquire)
@@ -322,11 +403,21 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
     let len = &raw const yarm_rtw_user_end as usize - start as usize;
     // SAFETY: `start..start + len` is the program's bytes inside this kernel image's text.
     let image = unsafe { core::slice::from_raw_parts(start, len) }.to_vec();
-    let level = TaskPriority::from_level(USER_LEVEL).ok_or(KernelError::TaskMissing)?;
-    for (i, (tid, storm, chunk)) in [(UA_TID, 1u64, UA_CHUNK), (UB_TID, 0, UB_CHUNK)]
-        .into_iter()
-        .enumerate()
-    {
+    // RT-SCHED1B: UH only when budgets are requested (it is placed in phase E alone).
+    let budgeted = crate::kernel::boot::sched_budget_requested();
+    let users: &[(u64, u64, u64)] = if budgeted {
+        &[
+            (UA_TID, 1, UA_CHUNK),
+            (UB_TID, 0, UB_CHUNK),
+            (UH_TID, 0, UB_CHUNK),
+        ]
+    } else {
+        &[(UA_TID, 1, UA_CHUNK), (UB_TID, 0, UB_CHUNK)]
+    };
+    for (i, &(tid, storm, chunk)) in users.iter().enumerate() {
+        let role = [R_UA, R_UB, R_UH][i];
+        let lvl = plan(role).1;
+        let level = TaskPriority::from_level(lvl).ok_or(KernelError::TaskMissing)?;
         let (asid, _root) = kernel.create_user_address_space()?;
         map_fresh(kernel, asid, CODE_VA, (len as u64).div_ceil(0x1000))?;
         map_fresh(kernel, asid, STACK_VA, 1)?;
@@ -347,21 +438,32 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
             tcb.user_context.instruction_ptr = VirtAddr(CODE_VA);
             tcb.user_context.stack_ptr = VirtAddr(SP_TOP);
             crate::kernel::task_enqueue::configure_priority_locked(&mut tcbs[..], tid, level)
-                .map_err(|_| KernelError::TaskMissing)
+                .map_err(|_| KernelError::TaskMissing)?;
+            if role == R_UH {
+                // The deployment configuration's budget, bound at UH's first placement.
+                let params =
+                    crate::kernel::sched_budget::BudgetParams::validate(UH_BUDGET.0, UH_BUDGET.1)
+                        .map_err(|_| KernelError::TaskMissing)?;
+                crate::kernel::task_enqueue::configure_budget_locked(&mut tcbs[..], tid, params)
+                    .map_err(|_| KernelError::TaskMissing)?;
+            }
+            Ok(())
         })?;
         MBX_PHYS[i].store(mbx, Ordering::Release);
-        ROLE_TID[R_UA + i].store(tid, Ordering::Release);
+        ROLE_TID[role].store(tid, Ordering::Release);
         crate::kernel::printk::printk_emit_sync(format_args!(
-            "RTW_PROVISIONED role={} tid={} asid={} level={} storm={} chunk={} image={} placed=0",
-            ROLE_NAMES[R_UA + i],
+            "RTW_PROVISIONED role={} tid={} asid={} level={} storm={} chunk={} image={} placed=0 budget={}",
+            ROLE_NAMES[role],
             tid,
             asid.0,
-            USER_LEVEL,
+            lvl,
             storm,
             chunk,
-            image.len()
+            image.len(),
+            if role == R_UH { "2/8" } else { "default" }
         ));
     }
+    UH_PROVISIONED.store(budgeted, Ordering::Release);
     PROVISIONED.store(true, Ordering::Release);
     Ok(())
 }
@@ -382,11 +484,17 @@ pub(crate) fn maybe_start(shared: &SharedKernel, cpu: CpuId) {
         &shared.kthreads as *const crate::kernel::kthread::KThreadPool as u64,
         Ordering::Release,
     );
+    let budgeted = shared.sched_domain().budget_enabled() && UH_PROVISIONED.load(Ordering::Acquire);
+    BUDGETED.store(budgeted, Ordering::Release);
     let (home, level) = KT_PLAN[R_S];
     match create(shared, R_S, home, level) {
         Some(id) => {
             PHASE.store(P_WAIT_IDLE, Ordering::Release);
-            crate::yarm_log!("RTW_START s={:#x} cpu=0", id.raw());
+            crate::yarm_log!(
+                "RTW_START s={:#x} cpu=0 budget_phases={}",
+                id.raw(),
+                budgeted as u8
+            );
         }
         None => crate::yarm_log!("RTW_START result=fail reason=create_s"),
     }
@@ -401,7 +509,14 @@ fn pool() -> Option<&'static crate::kernel::kthread::KThreadPool> {
 
 fn create(shared: &SharedKernel, role: usize, home: u8, level: usize) -> Option<KThreadId> {
     let prio = TaskPriority::from_level(level)?;
-    let id = shared.kthreads.create(body, role, CpuId(home), prio).ok()?;
+    // RT-SCHED1B: K runs under its own budgeted context (an independent worker, SC-EXEC-3).
+    let budget = (role == R_K)
+        .then(|| crate::kernel::sched_budget::BudgetParams::validate(K_BUDGET.0, K_BUDGET.1).ok())
+        .flatten();
+    let id = shared
+        .kthreads
+        .create_budgeted(body, role, CpuId(home), prio, budget)
+        .ok()?;
     ROLE_TID[role].store(id.tid().0, Ordering::Release);
     Some(id)
 }
@@ -418,7 +533,7 @@ fn go(role: usize) {
 // ─────────────────────────────── the kernel-thread bodies ───────────────────────────────
 
 fn body(ctx: &KThreadCtx, role: usize) {
-    let (home, level) = KT_PLAN[role];
+    let (home, level) = plan(role);
     record(
         K_START,
         ctx.home().0 as u64,
@@ -429,8 +544,10 @@ fn body(ctx: &KThreadCtx, role: usize) {
         let _ = QS[role].wait_until(ctx, || GO[role].load(Ordering::Acquire) > seen);
         seen = GO[role].load(Ordering::Acquire);
         match role {
+            R_S if phase() == P_E_PLACE => place_uh(ctx),
             R_S => setup(ctx),
             R_L => l_work(ctx),
+            R_K => k_work(ctx),
             R_DUMP => dump(ctx),
             _ => run_once(ctx, role),
         }
@@ -471,8 +588,13 @@ fn run_once(ctx: &KThreadCtx, role: usize) {
 fn setup(ctx: &KThreadCtx) {
     let shared = ctx.shared();
     set_phase(P_SETUP);
-    for role in [R_H0, R_H1, R_E, R_L, R_DUMP] {
-        let (home, level) = KT_PLAN[role];
+    let roles: &[usize] = if BUDGETED.load(Ordering::Acquire) {
+        &[R_H0, R_H1, R_E, R_L, R_DUMP, R_K]
+    } else {
+        &[R_H0, R_H1, R_E, R_L, R_DUMP]
+    };
+    for &role in roles {
+        let (home, level) = plan(role);
         if create(shared, role, home, level).is_none() {
             record(K_TIMEOUT, 0, [P_SETUP, role as u64, 1, 0, 0]);
         }
@@ -521,7 +643,201 @@ fn l_work(ctx: &KThreadCtx) {
     }
     record(K_LEND, cpu, [ctx.id().tid().0, chunks, after, 0, 0]);
     if phase() == P_D_WAIT {
+        set_phase(if BUDGETED.load(Ordering::Acquire) {
+            P_E_ARM
+        } else {
+            P_DONE
+        });
+    }
+}
+
+// ─────────────────────────────── RT-SCHED1B: phases E and F ───────────────────────────────
+
+/// S, phase E: place UH on CPU 1 through the production planner, FROM CPU 0 (the remote wake's
+/// reschedule IPI), while UB runs there. The placement binds UH's configured context.
+fn place_uh(ctx: &KThreadCtx) {
+    let shared = ctx.shared();
+    let tid = ROLE_TID[R_UH].load(Ordering::Acquire);
+    let placed = shared.enqueue_on_cpu_split(CpuId(1), tid);
+    record(
+        K_USER,
+        ctx.home().0 as u64,
+        [
+            R_UH as u64,
+            tid,
+            1,
+            placed.map_or(u64::MAX, |c| c.0 as u64),
+            mbx_read(1, M_HB),
+        ],
+    );
+    set_phase(P_E_RUN);
+}
+
+/// K, phase F: chunks of work, a scheduling point after each, until it has been parked by its own
+/// exhaustion and resumed after its release `F_CYCLES` times.
+fn k_work(ctx: &KThreadCtx) {
+    let cpu = ctx.home().0 as u64;
+    let tid = ctx.id().tid().0;
+    let c = ctx
+        .shared()
+        .with_cpu_sched_split(ctx.home(), |v| {
+            v.context_of(crate::kernel::ipc::ThreadId(tid))
+        })
+        .ok()
+        .flatten();
+    record(
+        K_KSTART,
+        cpu,
+        [
+            tid,
+            c.map_or(0, |c| c.params().budget() << 32 | c.params().period()),
+            c.map_or(u64::MAX, |c| c.bound_at()),
+            c.map_or(0, |c| c.remaining()),
+            phase(),
+        ],
+    );
+    let mut chunks = 0u64;
+    while chunks < K_MAX_CHUNKS {
+        let mut x = chunks;
+        for _ in 0..K_CHUNK {
+            x = core::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
+        }
+        chunks += 1;
+        K_PROGRESS.store(chunks, Ordering::Release);
+        if let Ok(true) = ctx.sched_point() {
+            let rejoins = F_REJOINS.load(Ordering::Acquire);
+            if active() {
+                record(
+                    K_KRESUMED,
+                    cpu,
+                    [tid, chunks, phase(), rejoins, mbx_read(0, M_HB)],
+                );
+            }
+            if rejoins >= F_CYCLES {
+                break;
+            }
+        }
+    }
+    record(
+        K_KEND,
+        cpu,
+        [tid, chunks, F_REJOINS.load(Ordering::Acquire), 0, 0],
+    );
+    if phase() == P_F_RUN {
         set_phase(P_DONE);
+    }
+}
+
+/// Which phase-E/F subject `tid` is, and its own and its lower-priority neighbour's heartbeats.
+fn budget_subject(tid: u64) -> Option<(usize, u64)> {
+    let p = phase();
+    let hb = |own: u64, lower: u64| (own & 0xFFFF_FFFF) << 32 | (lower & 0xFFFF_FFFF);
+    if tid == ROLE_TID[R_UH].load(Ordering::Acquire) && (p == P_E_PLACE || p == P_E_RUN) {
+        Some((R_UH, hb(mbx_read(2, M_HB), mbx_read(1, M_HB))))
+    } else if tid != 0
+        && tid == ROLE_TID[R_K].load(Ordering::Acquire)
+        && (p == P_F_ARM || p == P_F_RUN)
+    {
+        Some((
+            R_K,
+            hb(K_PROGRESS.load(Ordering::Acquire), mbx_read(0, M_HB)),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Scheduler hook (1L held; lock-free here): `c` was bound at `now` in `slot`.
+pub(crate) fn note_budget_bound(
+    now: u64,
+    slot: usize,
+    c: &crate::kernel::sched_budget::SchedContext,
+) {
+    if let Some((_, hb)) = budget_subject(c.tid) {
+        let p = c.params();
+        record(
+            K_BIND,
+            0,
+            [c.tid, slot as u64, p.budget() << 32 | p.period(), now, hb],
+        );
+    }
+}
+
+/// Scheduler hook (1L held): a charge on `cpu` exhausted `c` or ran it into debt.
+pub(crate) fn note_budget_exhausted(
+    cpu: u8,
+    c: &crate::kernel::sched_budget::SchedContext,
+    now: u64,
+    overrun: u64,
+) {
+    if let Some((role, hb)) = budget_subject(c.tid) {
+        if role == R_UH && E_REJOINS.load(Ordering::Acquire) >= E_CYCLES {
+            E_RAN_AFTER.store(true, Ordering::Release);
+        }
+        record(
+            K_EXHAUST,
+            cpu as u64,
+            [
+                c.tid,
+                now,
+                overrun << 32 | (c.remaining() & 0xFFFF_FFFF),
+                c.debt(),
+                hb,
+            ],
+        );
+    }
+}
+
+/// Scheduler hook (1L held): exhausted `c` lost its queue position at `now`.
+pub(crate) fn note_budget_parked(now: u64, c: &crate::kernel::sched_budget::SchedContext) {
+    if let Some((_, hb)) = budget_subject(c.tid) {
+        let (kind, level) = match c.parked {
+            Some((crate::kernel::sched_budget::Park::Reserved, l)) => (1u64, l as u64),
+            Some((crate::kernel::sched_budget::Park::KernelThread, l)) => (2, l as u64),
+            None => (0, 0),
+        };
+        record(
+            K_PARK,
+            0,
+            [
+                c.tid,
+                now,
+                kind << 8 | level,
+                c.debt() << 32 | (c.remaining() & 0xFFFF_FFFF),
+                hb,
+            ],
+        );
+    }
+}
+
+/// Scheduler hook (1L held): `count` releases of `c` were due on `cpu` at `now`, the last at
+/// `release`; `rejoined` — it was parked and now has budget, so it joined its level's tail.
+pub(crate) fn note_budget_replenished(
+    cpu: u8,
+    c: &crate::kernel::sched_budget::SchedContext,
+    now: u64,
+    release: u64,
+    count: u64,
+    rejoined: bool,
+) {
+    if let Some((role, hb)) = budget_subject(c.tid) {
+        if rejoined {
+            match role {
+                R_UH => E_REJOINS.fetch_add(1, Ordering::AcqRel),
+                _ => F_REJOINS.fetch_add(1, Ordering::AcqRel),
+            };
+        }
+        record(
+            K_REPLENISH,
+            cpu as u64,
+            [
+                c.tid,
+                now,
+                release,
+                count << 32 | (rejoined as u64) << 16 | (c.remaining() & 0xFFFF),
+                hb,
+            ],
+        );
     }
 }
 
@@ -697,6 +1013,26 @@ pub(crate) fn on_timer(
             record(K_WAKE, 0, [P_D_WAIT, R_H0 as u64, current, 0, 0]);
             go(R_H0);
         }
+        P_E_ARM => {
+            // As B: UB observed running on CPU 1, then UH is placed there from CPU 0.
+            let hb = mbx_read(1, M_HB);
+            let moved = hb > LAST_UB_HB.swap(hb, Ordering::AcqRel);
+            if moved && shared.current_tid_split_read(CpuId(1)) == Some(ub) {
+                set_phase(P_E_PLACE);
+                record(
+                    K_WAKE,
+                    0,
+                    [P_E_PLACE, R_UH as u64, ub, hb, mbx_read(1, M_YIELDS)],
+                );
+                go(R_S);
+            }
+        }
+        P_E_RUN if E_RAN_AFTER.load(Ordering::Acquire) => set_phase(P_F_ARM),
+        P_F_ARM => {
+            set_phase(P_F_RUN);
+            record(K_WAKE, 0, [P_F_RUN, R_K as u64, current, 0, 0]);
+            go(R_K);
+        }
         P_DONE => {
             // Quiet the user tasks (no more yields), then dump.
             mbx_write(0, M_STORM, 0);
@@ -745,8 +1081,44 @@ fn emit(line: &Line) -> u32 {
 
 /// Every record in stamp order, then the identities and a seal — the whole dump twice, so a line
 /// damaged on the shared console in one copy survives in the other.
-fn dump(_ctx: &KThreadCtx) {
+fn dump(ctx: &KThreadCtx) {
     use core::fmt::Write;
+    if BUDGETED.load(Ordering::Acquire) {
+        let shared = ctx.shared();
+        for cpu in 0..2u8 {
+            if let Ok((idle, unaccounted, ticks, arrivals, bound)) =
+                shared.with_cpu_sched_split(CpuId(cpu), |v| v.budget_ledger())
+            {
+                record(
+                    K_LEDGER,
+                    cpu as u64,
+                    [idle, unaccounted, ticks, arrivals, bound as u64],
+                );
+            }
+        }
+        for role in [R_UH, R_K] {
+            let tid = ROLE_TID[role].load(Ordering::Acquire);
+            let c = shared
+                .with_cpu_sched_split(CpuId(plan(role).0), |v| {
+                    v.context_of(crate::kernel::ipc::ThreadId(tid))
+                })
+                .ok()
+                .flatten();
+            if let Some(c) = c {
+                record(
+                    K_CTX,
+                    plan(role).0 as u64,
+                    [
+                        tid,
+                        c.charged(),
+                        c.overrun(),
+                        (c.exhaustions() as u64) << 32 | (c.releases() & 0xFFFF_FFFF),
+                        c.debt() << 32 | (c.remaining() & 0xFFFF_FFFF),
+                    ],
+                );
+            }
+        }
+    }
     let total = SEQ.load(Ordering::Acquire).min(MAX_RECS as u64);
     for pass in 0..2u64 {
         let mut seal: u32 = 0x811C_9DC5;
@@ -756,16 +1128,7 @@ fn dump(_ctx: &KThreadCtx) {
                 buf: [0; 224],
                 len: 0,
             };
-            let level = if role < KT_PLAN.len() {
-                KT_PLAN[role].1
-            } else {
-                USER_LEVEL
-            };
-            let home = if role < KT_PLAN.len() {
-                KT_PLAN[role].0 as u64
-            } else {
-                (role - R_UA) as u64
-            };
+            let (home, level) = plan(role);
             let _ = write!(
                 line,
                 "RTW_ROLE pass={} role={} tid=0x{:x} home={} level={}",

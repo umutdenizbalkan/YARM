@@ -119,6 +119,10 @@ pub mod recv_waiter_split;
 #[path = "rt_sched1a_tests/tests.rs"]
 mod rt_sched1a_tests;
 #[cfg(test)]
+#[path = "rt_sched1b_tests/tests.rs"]
+mod rt_sched1b_tests;
+pub mod sched_budget;
+#[cfg(test)]
 #[path = "sched_fair1_tests/tests.rs"]
 mod sched_fair1_tests;
 #[cfg(test)]

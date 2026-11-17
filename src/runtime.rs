@@ -19885,6 +19885,7 @@ impl SharedKernel {
         cpu: CpuId,
     ) -> (bool, Option<u64>, Option<u64>, Option<u64>) {
         self.with_cpu_sched_split(cpu, |c| {
+            c.note_rt_arrival();
             (
                 c.rt_preempt_wanted(),
                 c.current_tid().map(|t| t.0),
@@ -19893,6 +19894,28 @@ impl SharedKernel {
             )
         })
         .unwrap_or((false, None, None, None))
+    }
+
+    /// RT-SCHED1B — release the scheduling context of `tid`'s retired incarnation `stamp`: rank 2
+    /// for its home, released, then that CPU's 1L. `false`: budgets not enforced, no home, or no
+    /// such context. Called when the reap retires the identity (`retire_reap_claim`).
+    pub(crate) fn release_sched_context_split(&self, tid: u64, stamp: u64) -> bool {
+        if !self.sched_domain().budget_enabled() {
+            return false;
+        }
+        let home = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.cpu_affinity)
+        });
+        let Some(home) = home else {
+            return false;
+        };
+        self.with_cpu_sched_split(home, |c| {
+            c.release_context(crate::kernel::ipc::ThreadId(tid), stamp)
+        })
+        .unwrap_or(false)
     }
 
     /// RT-SCHED1A — `tid`'s priority as every enqueue plan reads it

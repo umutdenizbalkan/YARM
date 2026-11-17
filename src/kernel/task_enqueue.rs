@@ -302,6 +302,51 @@ pub(crate) fn configure_priority_locked(
     Ok(())
 }
 
+/// RT-SCHED1B — rank 2: **configure** the scheduling-context budget of `tid`'s incarnation, before
+/// its first placement (the same deployment-configuration owner, and the same seal, as the
+/// priority). `params` are already validated (`BudgetParams::validate`). Nothing is written on a
+/// refusal.
+pub(crate) fn configure_budget_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+    params: crate::kernel::sched_budget::BudgetParams,
+) -> Result<(), PriorityConfigRefusal> {
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|t| t.tid.0 == tid && !t.is_spawn_reservation())
+        .ok_or(PriorityConfigRefusal::NoTask)?;
+    if tcb.sched_priority_sealed {
+        return Err(PriorityConfigRefusal::Sealed);
+    }
+    tcb.sched_budget = Some(params);
+    Ok(())
+}
+
+/// RT-SCHED1B — rank 1L with rank 2 nested: bind the plan's incarnation to its configured budget
+/// on this (home) CPU before it is placed. A no-op unless the CPU enforces budgets, and for an
+/// incarnation with no configured budget (the placement binds the default template).
+fn bind_configured_budget_locked(
+    view: &mut CpuView<'_>,
+    plan: &EnqueuePlan,
+    tcbs: &[Option<ThreadControlBlock>],
+) -> Result<(), KernelError> {
+    if !view.budget_enabled() || plan.tid == 0 {
+        return Ok(());
+    }
+    let configured = tcbs
+        .iter()
+        .flatten()
+        .find(|t| t.tid.0 == plan.tid)
+        .and_then(|t| t.sched_budget);
+    match configured {
+        Some(params) => view
+            .bind_context(ThreadId(plan.tid), plan.incarnation, params)
+            .map_err(map_scheduler_error),
+        None => Ok(()),
+    }
+}
+
 /// rank 2 — locate `tid`'s slot, refusing a spawn reservation.
 ///
 /// The run queue carries bare TIDs with no status precondition, so the enqueue seam is the only
@@ -485,6 +530,9 @@ pub(crate) fn commit_enqueue_on_cpu_locked(
 ) -> Result<CpuId, KernelError> {
     let cpu = view.cpu();
     admit_home_locked(tcbs, plan.tid, plan.incarnation, cpu)?;
+    if matches!(plan.target, EnqueueTarget::Pinned(target) if target == cpu) {
+        bind_configured_budget_locked(view, plan, tcbs)?;
+    }
     match plan.target {
         EnqueueTarget::Pinned(target) if target == cpu => view
             .enqueue_with_priority(ThreadId(plan.tid), plan.priority)
@@ -576,6 +624,10 @@ pub(crate) fn commit_reserved_enqueue_on_cpu_locked(
     if admit_home_locked(tcbs, plan.tid, plan.incarnation, cpu).is_err() {
         view.release_user_slot(plan.priority);
         return Ok(ReservedCommit::Refused(cpu));
+    }
+    if let Err(e) = bind_configured_budget_locked(view, plan, tcbs) {
+        view.release_user_slot(plan.priority);
+        return Err(e);
     }
     match view.enqueue_reserved_with_priority(ThreadId(plan.tid), plan.priority) {
         Ok(()) => Ok(ReservedCommit::Queued(cpu)),

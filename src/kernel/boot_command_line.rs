@@ -660,6 +660,37 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             if live { "live_domain" } else { "construction" }
         );
     }
+    if let Some(on) = parsed.sched_budget {
+        // RT-SCHED1B: the budget-enforcement request, after the profile it depends on. The line
+        // states the clock the budgets are measured in and enforced at (§24.2).
+        crate::kernel::boot::set_sched_budget_override(on);
+        let live = crate::kernel::boot::install_sched_budget_on_live_domain();
+        let rt = crate::kernel::boot::sched_profile()
+            == crate::kernel::scheduler::SchedProfile::RealTime;
+        let enforced = live.unwrap_or(on && rt);
+        crate::yarm_log!(
+            "YARM_SCHED_BUDGET req={} profile={} result={} route={} clock=global_scheduler_tick owner=cpu{} grain=1tick enforce=tick period_ns={} pool={} default={}/{}",
+            if on { "on" } else { "off" },
+            if rt { "rt" } else { "gp" },
+            if enforced {
+                "enforced"
+            } else if on {
+                "refused_gp"
+            } else {
+                "off"
+            },
+            if live.is_some() {
+                "live"
+            } else {
+                "construction"
+            },
+            crate::arch::platform_constants::BOOTSTRAP_CPU_ID,
+            crate::arch::platform_constants::SCHED_TICK_PERIOD_NS,
+            crate::kernel::sched_budget::CTX_PER_CPU,
+            crate::kernel::sched_budget::BUDGET_DEFAULT_PERIOD,
+            crate::kernel::sched_budget::BUDGET_DEFAULT_PERIOD
+        );
+    }
     if let Some(ticks) = parsed.sched_quantum_ticks {
         // U9-TIMER1 §3: record the override, then install it if the timer already exists.
         //
@@ -1110,6 +1141,9 @@ pub struct YarmBootOptions<'a> {
     /// RT-SCHED1A: `yarm.sched_profile=rt|gp` — the scheduling profile of the one active
     /// scheduling domain (`doc/SCHEDULING_CONTRACT.md` §23). Unset is the general-purpose default.
     pub sched_profile: Option<crate::kernel::scheduler::SchedProfile>,
+    /// RT-SCHED1B: `yarm.sched_budget=on|off` — scheduling-context budget enforcement, honoured
+    /// only together with `yarm.sched_profile=rt` (`doc/SCHEDULING_CONTRACT.md` §24). Unset is off.
+    pub sched_budget: Option<bool>,
 }
 
 /// Parse a `yarm.loglevel=` value: digit 0–7 or a level name.
@@ -1175,6 +1209,11 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
                     options.sched_quantum_ticks = Some(ticks);
                 }
             }
+            b"yarm.sched_budget" => match value {
+                b"on" | b"1" => options.sched_budget = Some(true),
+                b"off" | b"0" => options.sched_budget = Some(false),
+                _ => {}
+            },
             b"yarm.sched_profile" => match value {
                 b"rt" => {
                     options.sched_profile = Some(crate::kernel::scheduler::SchedProfile::RealTime)

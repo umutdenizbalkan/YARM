@@ -748,6 +748,21 @@ impl KThreadPool {
         cpu: CpuId,
         priority: TaskPriority,
     ) -> Result<KThreadId, KCreateError> {
+        self.create_budgeted(entry, arg, cpu, priority, None)
+    }
+
+    /// RT-SCHED1B — [`Self::create`], binding the new incarnation to a scheduling context with
+    /// `budget` on its home when that CPU enforces budgets (SC-EXEC-3: an independent worker runs
+    /// under its own budgeted context). `None` binds the default template. The binding is made in
+    /// the same 1L section as the enqueue; a full pool refuses the creation like any placement.
+    pub fn create_budgeted(
+        &self,
+        entry: KEntry,
+        arg: usize,
+        cpu: CpuId,
+        priority: TaskPriority,
+        budget: Option<crate::kernel::sched_budget::BudgetParams>,
+    ) -> Result<KThreadId, KCreateError> {
         if cpu.0 as usize >= MAX_CPUS {
             return Err(KCreateError::InvalidCpu);
         }
@@ -827,6 +842,9 @@ impl KThreadPool {
         let placed = self
             .shared()
             .with_cpu_sched_split(cpu, |c| {
+                if let Some(params) = budget {
+                    c.bind_context(id.tid(), id.raw(), params)?;
+                }
                 c.enqueue_with_priority(id.tid(), priority).map(|()| {
                     s.state.store(READY, Ordering::Release);
                 })
@@ -966,6 +984,9 @@ impl KThreadPool {
                     && !c.contains_or_current(id.tid())
                     && self.cpus[cpu.0 as usize].running.load(Ordering::Acquire) != id.raw();
                 if ok {
+                    // RT-SCHED1B: the incarnation's context goes with it (its id encodes the
+                    // generation, so no later incarnation can be named by it).
+                    let _ = c.release_context(id.tid(), 0);
                     s.state.store(FREE, Ordering::Release);
                 }
                 ok

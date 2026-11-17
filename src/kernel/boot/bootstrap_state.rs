@@ -599,6 +599,8 @@ impl Bootstrap {
         );
         // RT-SCHED1A: the boot configuration's scheduling profile (GP unless configured).
         scheduler.set_profile(crate::kernel::boot::sched_profile());
+        // RT-SCHED1B: budgets, only ever with the RT profile (refused, and so off, under GP).
+        let _ = scheduler.set_budget(crate::kernel::boot::sched_budget_requested());
         scheduler
             .exclusive()
             .enqueue_on(
