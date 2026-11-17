@@ -381,7 +381,8 @@ The first real-time profile is the **smallest analysable configuration**:
   There is no time-slicing among equals; budgets bound execution instead. M
   `model_equal_priority_order_is_deterministic_fifo`.
 * **SC-PRI-12 — RT-P1 queue position rules.** **PARTIAL (RT-SCHED1A, §23.1): (a)–(d) ENFORCED
-  under the RT profile; (e) SPECIFIED → PARTITION1; (f) SPECIFIED → RT-SCHED1.**
+  under the RT profile; (f) ENFORCED under the RT profile with budgets (RT-SCHED1B, §24.4);
+  (e) SPECIFIED → PARTITION1.**
   * M `model_preemption_yield_block_and_wake_queue_positions` checks (a) to (e).
   * (f) is checked by:
     * `model_exhausted_context_is_ineligible_despite_priority`;
@@ -457,16 +458,19 @@ The first real-time profile is the **smallest analysable configuration**:
 
 ### 3.4 Scheduling contexts and budgets
 
-* **SC-CTX-1 — A scheduling context is bound at configuration.** **SPECIFIED → RT-SCHED1.** Each
+* **SC-CTX-1 — A scheduling context is bound at configuration.** **ENFORCED under the RT profile
+  with budgets (RT-SCHED1B, §24.3); the partition field SPECIFIED → PARTITION1.** Each
   context is `{cpu, partition, priority, budget B, period T, budget owner}`, with `0 < B ≤ T`.
   In RT-P1 the budget owner is the context itself, with **exactly one thread per context**; there
   are no shared contexts.
-* **SC-CTX-2 — Only the context's own thread consumes its budget.** **SPECIFIED → RT-SCHED1.** It
+* **SC-CTX-2 — Only the context's own thread consumes its budget.** **ENFORCED to tick
+  granularity (RT-SCHED1B, §24.2–24.3).** It
   consumes it only by executing on the context's CPU inside its partition's window, including the
   synchronous kernel work of its own traps (SC-EXEC-2).
-* **SC-CTX-3 — An exhausted context is ineligible whatever its priority.** **SPECIFIED →
-  RT-SCHED1.** M `model_exhausted_context_is_ineligible_despite_priority`.
-* **SC-CTX-4 — Periodic replenishment with conserved repayment.** **SPECIFIED → RT-SCHED1.**
+* **SC-CTX-3 — An exhausted context is ineligible whatever its priority.** **ENFORCED at the next
+  scheduling point (RT-SCHED1B, §24.4).** M `model_exhausted_context_is_ineligible_despite_priority`.
+* **SC-CTX-4 — Periodic replenishment with conserved repayment.** **ENFORCED (RT-SCHED1B,
+  §24.4); the instants are `bind + kT` until PARTITION1 fixes the epoch `E`.**
   * Replenishment happens at fixed release instants `E + kT`. Each one pays the debt it can and
     carries the rest:
 
@@ -489,7 +493,8 @@ The first real-time profile is the **smallest analysable configuration**:
   *(Corrected by SCHED-CONTRACT1-CORRECTION: the delivered rule `remaining := B − debt,
   saturating`, then clearing all debt, silently forgave whatever one replenishment could not
   repay. §13.)*
-* **SC-CTX-5 — Overrun.** **SPECIFIED → RT-SCHED1.**
+* **SC-CTX-5 — Overrun.** **ENFORCED for debt, saturation and the latch (RT-SCHED1B, §24.3);
+  the health-monitor report SPECIFIED → PARTITION1 (overrun is counted per context today).**
   * Execution past exhaustion is an **overrun**. It arises from tick granularity and from a
     non-preemptible kernel section that outlived the budget.
   * It is recorded as debt, repaid from the next replenishment, and **reported** as a
@@ -524,13 +529,15 @@ The first real-time profile is the **smallest analysable configuration**:
     (§15).
   * Recovery policy is configuration (PARTITION1's health monitor). It is selected per context
     and never inferred from priority.
-* **SC-CTX-6 — Enforcement granularity.** **UNRESOLVED.**
+* **SC-CTX-6 — Enforcement granularity.** **UNRESOLVED.** (RT-SCHED1B enforces to one tick of
+  the global scheduler clock and measures the lateness, §24.2, §24.7.)
   * Missing fact: a time source with sub-quantum resolution, and a per-context accounting point
     at every trap entry and exit.
   * Owner: RT-SCHED1, after SC-TIME-3.
   * Until then a budget can be enforced only to tick granularity, and overrun bounds inherit §6
     W3.
-* **SC-CTX-7 — Same-instant event order.** **SPECIFIED → RT-SCHED1/PARTITION1.** Events falling
+* **SC-CTX-7 — Same-instant event order.** **ENFORCED per CPU for budgets (RT-SCHED1B, §24.4);
+  window boundaries SPECIFIED → PARTITION1.** Events falling
   on one instant are applied in this order:
   1. charge the running contexts for the elapsed tick;
   2. advance time;
@@ -548,7 +555,8 @@ The first real-time profile is the **smallest analysable configuration**:
   * A running thread that is both outside its window and exhausted after step 3 takes **no**
     position: exhaustion overrides the head placement of (a) and (e) until a replenishment.
   * M `model_simultaneous_replenishments_rejoin_in_context_order`.
-* **SC-CTX-8 — Queue membership.** **SPECIFIED → RT-SCHED1.** At every instant:
+* **SC-CTX-8 — Queue membership.** **ENFORCED under the RT profile with budgets (RT-SCHED1B,
+  §24.4).** At every instant:
   * every Ready thread with budget holds **exactly one** queue position;
   * every exhausted Ready thread holds **none**;
   * Running and Blocked threads hold none.
@@ -559,7 +567,8 @@ The first real-time profile is the **smallest analysable configuration**:
 
 ### 3.5 Separation of scheduling attributes
 
-* **SC-SEP-1 — Five attributes, each with one job.** **SPECIFIED → RT-SCHED1.**
+* **SC-SEP-1 — Five attributes, each with one job.** **Budget eligibility ENFORCED (RT-SCHED1B,
+  §24.4); partition eligibility SPECIFIED → PARTITION1.**
 
   | Attribute | Role |
   |---|---|
@@ -573,7 +582,9 @@ The first real-time profile is the **smallest analysable configuration**:
   priority applied. **Priority never overrides a partition boundary or an exhausted budget**
   (SC-PART-2, SC-CTX-3). M `Model::eligible`.
 * **SC-SEP-2 — Eligibility attaches to the existing acceptance-filtered selection.** **ENFORCED
-  (mechanism) / SPECIFIED → RT-SCHED1 (predicate).**
+  (mechanism); budget eligibility ENFORCED by queue membership (RT-SCHED1B, §24.5: an exhausted
+  thread is never a candidate, so there is no new filter and no second loop); the window
+  predicate SPECIFIED → PARTITION1.**
   * The production selection already takes an acceptance predicate. It skips refused candidates
     in place, and it measures exhaustion as a count (P `sc_elig_1`).
   * RT-SCHED1 extends that predicate with window and budget. It must not add a second selection
@@ -583,12 +594,16 @@ The first real-time profile is the **smallest analysable configuration**:
 
 * **SC-POOL-1 — Run queues are fixed-capacity, and exhaustion is explicit.** **ENFORCED.** P
   `sc_pool_1`.
-* **SC-POOL-2 — RT-P1 objects come from fixed pools sized at configuration.** **SPECIFIED →
-  RT-SCHED1/PARTITION1.**
+* **SC-POOL-2 — RT-P1 objects come from fixed pools sized at configuration.** **Scheduling
+  contexts ENFORCED (RT-SCHED1B, §24.3: 32 per CPU, `ContextPoolFull`); the rest SPECIFIED →
+  PARTITION1.**
   * Scheduling contexts, partitions, windows (≤ 64), per-(CPU, partition, priority) ready queues,
     kernel worker stacks (KTHREAD1) and health records are all fixed pools.
   * Exhaustion returns a typed error and never falls back.
-* **SC-POOL-3 — No run queue may be smaller than its admissible population.** **UNRESOLVED.**
+* **SC-POOL-3 — No run queue may be smaller than its admissible population.** **RESOLVED for the
+  budgeted RT configuration (RT-SCHED1B, §24.4: at most 32 contexted threads per CPU, below one
+  level's admission bound, and a parked thread's rejoin slot is held); UNRESOLVED for GP and RT
+  without budgets.**
   * Missing fact: the per-CPU bound on runnable threads in an RT-P1 configuration, which is the
     configuration's thread-to-context map.
   * Today's 64-per-level ring can refuse an admissible wake (`QueueFull`) with 512 TCB slots.
@@ -614,7 +629,9 @@ The first real-time profile is the **smallest analysable configuration**:
 
 ## 4. Execution-time ownership
 
-* **SC-EXEC-1 — Every category of execution has an owner.** **SPECIFIED → RT-SCHED1.** Every
+* **SC-EXEC-1 — Every category of execution has an owner.** **PARTIAL (RT-SCHED1B, §24.3): every
+  tick has an owner (a context, idle, or unaccounted — zero live); essential work is counted,
+  not timed; SPECIFIED → PARTITION1 for the allowance.** Every
   category below has an explicit accounting rule or a reserved system allowance. **There is no
   unlimited "kernel time" exemption.**
 
@@ -631,15 +648,19 @@ The first real-time profile is the **smallest analysable configuration**:
 | Remote requests (TLB shootdown service, reschedule IPI) | inline in the target's trap; the requester waits for ACK | **SC-EXEC-5** on the target; the requester's own context for its wait |
 | Essential scheduler work (tick, selection, switch, boundary) | inline | **SC-EXEC-5** |
 
-* **SC-EXEC-2 — Synchronous kernel work is charged to the caller.** **SPECIFIED → RT-SCHED1.**
+* **SC-EXEC-2 — Synchronous kernel work is charged to the caller.** **ENFORCED to tick granularity
+  (RT-SCHED1B, §24.3).**
   It is charged to the context of the thread whose trap performs it. M (`KernelWork::
   CallerSynchronous`) `model_overrun_debt_is_repaid_at_replenishment`.
-* **SC-EXEC-3 — Deferrable work runs in a budgeted worker.** **SPECIFIED → KTHREAD1 / RT-SCHED1.**
+* **SC-EXEC-3 — Deferrable work runs in a budgeted worker.** **ENFORCED for kernel threads
+  (RT-SCHED1B, §24.3: each runs under its own budgeted or default context); deferred interrupt
+  work bound to a device's partition SPECIFIED → PARTITION1.**
   Deferrable kernel work runs in an independent kernel worker under its own budgeted context. It
   is never charged to whichever thread happens to run. M (`KernelWork::Worker`)
   `model_essential_kernel_work_is_charged_and_overrun_reported`.
-* **SC-EXEC-4 — Essential and deferrable work are classified by name.** **SPECIFIED →
-  RT-SCHED1.** "Essential" means the work cannot be deferred without violating a kernel
+* **SC-EXEC-4 — Essential and deferrable work are classified by name.** **PARTIAL (RT-SCHED1B,
+  §24.3: the tick and the reschedule arrival are counted per CPU by name); the full enumeration
+  SPECIFIED → PARTITION1.** "Essential" means the work cannot be deferred without violating a kernel
   invariant: the interrupt acknowledgement, the scheduler's own decision, a requested
   invalidation and its ACK, a boundary switch. Everything else is deferrable. Every essential
   item is named in an enumerable list, not inferred.
@@ -663,8 +684,9 @@ The first real-time profile is the **smallest analysable configuration**:
 
 ### 4.1 IPC handoff is not budget donation
 
-* **SC-IPC-1 — A handoff satisfies the same eligibility as selection.** **SPECIFIED →
-  RT-SCHED1.**
+* **SC-IPC-1 — A handoff satisfies the same eligibility as selection.** **ENFORCED for budgets
+  (RT-SCHED1B, §24.4: an IPC wake parks an exhausted receiver); windows SPECIFIED →
+  PARTITION1.**
   * A synchronous call, reply or direct handoff makes its target *ready*. It runs only if normal
     selection on the target's own CPU would choose it.
   * It may not run outside its window, with an exhausted budget, or on another CPU.
@@ -674,7 +696,8 @@ The first real-time profile is the **smallest analysable configuration**:
     target.
 
   M `model_ipc_handoff_cannot_bypass_eligibility_or_donate_budget`.
-* **SC-IPC-2 — Budget donation is disabled.** **SPECIFIED → RT-SCHED1.**
+* **SC-IPC-2 — Budget donation is disabled.** **ENFORCED (RT-SCHED1B, §24.3: every server pays
+  under its own context; nothing donates).**
   * A server executes and pays under its own context.
   * Donation stays disabled until all of the following are specified and implemented: the
     donated budget's owner, nested calls, timeouts and cancellation mid-donation, and server death
@@ -757,7 +780,9 @@ The first real-time profile is the **smallest analysable configuration**:
       invariance and frequency; AArch64 `CNTFRQ_EL0`; the RISC-V timebase from the device tree);
     * absolute-deadline re-arming from that counter.
   * Owner: RT-SCHED1.
-* **SC-TIME-4 — Every CPU must see the same time.** **UNRESOLVED.**
+* **SC-TIME-4 — Every CPU must see the same time.** **UNRESOLVED.** (RT-SCHED1B measures budgets
+  only in the clock owner's global tick, which every CPU reads, so it does not depend on this,
+  §24.2.)
   * RT-P1 windows on CPU *n* are instants of the global time. Every CPU must therefore read, or
     derive, the same time.
   * Missing fact: cross-CPU counter synchronization per port. AArch64's system counter and
@@ -766,7 +791,8 @@ The first real-time profile is the **smallest analysable configuration**:
   * Until it is established, only `CLOCK_OWNER_CPU` time is valid. Other CPUs' boundaries must be
     signalled by the clock owner, at a cost of IPI latency.
 * **SC-TIME-5 — The next hardware deadline is the earliest pending event.** **SPECIFIED →
-  RT-SCHED1/PARTITION1.**
+  PARTITION1.** RT-SCHED1B keeps the periodic tick on every CPU, idle included, as its
+  enforcement point (lateness ≤ one tick of the enforcing CPU, §24.2).
   * The next deadline programmed on a CPU is the earliest of:
     * the next partition boundary;
     * the running context's budget-exhaustion instant;
@@ -1201,20 +1227,20 @@ CPU executes.
 | Requirement | Current owner | Missing mechanism | Evidence needed | Package |
 |---|---|---|---|---|
 | SC-CPU-2 no migration | `task_enqueue` planners and 1L owners (SCHED-LOCK2A, §20) | — for task incarnations (enforced); the scheduling-context binding | P: `sl2a_*` (done); scheduling-context binding | RT-SCHED1 |
-| SC-PRI-10/11/12/13 | RT-SCHED1A (§23): 32 levels, head-on-priority-preemption, wake as scheduling point, preempting remote IPI, under the RT profile | SC-PRI-12 (e) windows, (f) exhaustion; budgets | P `rt1a_*` and L the RT witness on three ports (done, §23.7); (e)/(f) with their owners | RT-SCHED1 / PARTITION1 |
+| SC-PRI-10/11/12/13 | RT-SCHED1A (§23): 32 levels, head-on-priority-preemption, wake as scheduling point, preempting remote IPI, under the RT profile; (f) exhaustion by RT-SCHED1B (§24) | SC-PRI-12 (e) windows | P `rt1a_*`, `rt1b_*` and L the RT witness on three ports (done, §23.7, §24.7); (e) with its owner | PARTITION1 |
 | SC-PART-1…7 | none | schedule, epoch, window evaluation, boundary switch | P + L (boundary instants, idle advance) | PARTITION1 |
-| SC-CTX-1…5, 7, 8 | none (per-CPU quantum only) | scheduling contexts, budgets, conserved-debt replenishment, overrun debt and reports, same-instant order, exhausted-set membership | P + L | RT-SCHED1 |
+| SC-CTX-1…5, 7, 8 | **RT-SCHED1B (§24)**: per-CPU contexts, conserved-debt replenishment, overrun debt and latch, same-instant order, parking | the health-monitor overrun report; the system epoch; partition fields | P `rt1b_*` + L the witness phases E/F (done, §24.7) | PARTITION1 |
 | SC-CTX-6, SC-TIME-3/4/6 | per-port relative re-arm | calibrated counter, absolute deadlines, cross-CPU time, tick unit | M (measurement) on named hardware + S | RT-SCHED1 |
-| SC-TIME-5 | periodic tick | earliest-deadline programming | P + L | RT-SCHED1 / PARTITION1 |
-| SC-SEP-1/2 | acceptance-filtered selection | window + budget in the existing predicate | P | RT-SCHED1 |
-| SC-POOL-2/3/4 | fixed arrays; `BootExclusive` phase | configured pools, queue sizing, OPERATIONAL transition | P | RT-SCHED1 / PARTITION1 |
-| SC-EXEC-1…6 | inline kernel work, uncounted | accounting points, system allowance, overrun events | P + N bounds | RT-SCHED1 / PARTITION1 |
-| SC-IPC-1/2/3 | `direct_eligibility`, ordinary selection | eligibility-checked handoff; donation stays off | P | RT-SCHED1 / PARTITION1 |
+| SC-TIME-5 | periodic tick (RT-SCHED1B enforces at it, §24.2) | earliest-deadline programming | P + L | PARTITION1 |
+| SC-SEP-1/2 | acceptance-filtered selection; budget eligibility by membership (RT-SCHED1B) | window in the existing predicate | P | PARTITION1 |
+| SC-POOL-2/3/4 | fixed arrays; `BootExclusive` phase; 32 contexts per CPU and the budgeted capacity argument (RT-SCHED1B) | partition pools, GP queue sizing, OPERATIONAL transition | P | PARTITION1 / RT-SCHED1 (GP SC-POOL-3) |
+| SC-EXEC-1…6 | contexts charge user, trap and kernel-thread time; essential work counted (RT-SCHED1B) | system allowance, its overrun events, the essential-work time | P + N bounds | PARTITION1 |
+| SC-IPC-1/2/3 | ordinary selection; exhausted receivers parked; no donation (RT-SCHED1B) | windows | P | PARTITION1 |
 | SC-KT-2, 3, 6, 7, 9, 10, 11 | **done** (KTHREAD1, §18) | — | P + L on three ports, §18.7 | — |
 | SC-KT-1 guard page | **closed by KTHREAD-CLOSURE1 Stage C (§18.10.3)** | — | — | — |
 | SC-KT-4 | cooperative kernel threads (§18.3) | asynchronous kernel preemption | P + L on three ports | unassigned |
 | SC-KT-8 plain `SpinLock` | **closed by KTHREAD-CLOSURE1 Stage B (§18.10.2)** | — | — | — |
-| SC-KT-12, SC-EXEC-3, SC-BND-2 | kernel threads with a home CPU (KTHREAD1) | budgeted contexts; boundary preemption at safe points | P + L | RT-SCHED1 / PARTITION1 |
+| SC-KT-12, SC-EXEC-3, SC-BND-2 | kernel threads with a home CPU (KTHREAD1); budgeted contexts settled at `sched_point` (RT-SCHED1B, §24.4) | boundary preemption at safe points | P + L | PARTITION1 |
 | SC-BND-3, SC-INV-2/3 | none | configuration validation (shared regions, ceilings) | P | PARTITION1 / RT-SCHED1 |
 | SC-INV-1, W1 | TTAS `SpinLockIrq` | fair lock or bounded-contention proof; per-rank section bounds | S + N | RT-SCHED1 |
 | SC-WCET-1/2, W3/W7 | synchronous logging, unbounded routes | per-route bounds, buffered diagnostics | S + N | RT-SCHED1 |
@@ -1401,6 +1427,10 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-KT-1 (KTHREAD1, guarded since KTHREAD-CLOSURE1 Stage C, §18.10.3);
   * SC-KT-2, SC-KT-3, SC-KT-6, SC-KT-7, SC-KT-10, SC-KT-11 (KTHREAD1, §18); SC-KT-8 for
     interrupt-masking guards and, since KTHREAD-CLOSURE1 Stage B, plain `SpinLock` (§18.10.2); SC-KT-9 with the deviation stated in §8;
+  * under the RT profile with budgets (RT-SCHED1B, §24.5): SC-CTX-1…4, SC-CTX-7, SC-CTX-8;
+    SC-CTX-5 except its health report; SC-PRI-12 (f); SC-SEP-1 and SC-SEP-2 for budgets;
+    SC-POOL-2 for contexts; SC-POOL-3 for the budgeted configuration; SC-EXEC-2, SC-EXEC-3 for
+    kernel threads; SC-IPC-1 for budgets; SC-IPC-2. SC-EXEC-1 and SC-EXEC-4 are PARTIAL;
   * SC-LOCK-1, SC-LOCK-3…7 (SCHED-LOCK1). SC-LOCK-2 is PARTIAL: the lock order excludes the
     scheduler-lock deadlock cycles (§17.3) and admission is FIFO (SCHED-LOCK-FAIR1, §22), but
     section completion and time are not bounded.
@@ -1414,24 +1444,25 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * **RT-SCHED1:**
     * SC-CPU-2;
     * SC-PRI-10…13;
-    * SC-CTX-1…5, SC-CTX-7, SC-CTX-8;
-    * SC-SEP-1;
-    * SC-IPC-1, SC-IPC-2;
+    * SC-CTX-1…5, SC-CTX-7, SC-CTX-8 (budgets: done by RT-SCHED1B, §24);
+    * SC-SEP-1 (budget part done);
+    * SC-IPC-1, SC-IPC-2 (budget part done);
     * SC-INV-2, SC-INV-3;
-    * SC-EXEC-1, SC-EXEC-2, SC-EXEC-4;
-    * SC-TIME-5;
+    * SC-EXEC-1, SC-EXEC-2, SC-EXEC-4 (charging done; classification partial);
     * SC-WCET-1, SC-WCET-2;
     * SC-GP-2.
   * **PARTITION1:**
     * SC-PART-1…7;
-    * SC-POOL-2, SC-POOL-4;
+    * SC-POOL-2 (beyond contexts), SC-POOL-4;
     * SC-EXEC-5;
+    * SC-TIME-5;
+    * SC-CTX-5's health report and the epoch of SC-CTX-4;
     * SC-IPC-3;
     * SC-BND-3.
   * **FP-POLICY1:** SC-FP-4.
 * **UNRESOLVED (missing fact and owner stated in place):**
   * SC-CTX-6;
-  * SC-POOL-3;
+  * SC-POOL-3 (GP and RT without budgets);
   * SC-EXEC-6;
   * SC-INV-1;
   * SC-TIME-3, SC-TIME-4, SC-TIME-6;
@@ -3546,7 +3577,7 @@ configuration: `yarm.sched_profile=rt|gp` on the boot command line. Unset means 
 decisions are unchanged.
 
 The pass covers one active scheduling domain. It does not implement:
-* scheduling contexts, budgets, replenishment or overrun debt (SC-CTX-1…8);
+* scheduling contexts, budgets, replenishment or overrun debt (SC-CTX-1…8; RT-SCHED1B, §24);
 * partition windows and the window-boundary rules (SC-PART-*, SC-PRI-12 (e));
 * budget exhaustion (SC-PRI-12 (f));
 * asynchronous preemption of kernel code, including kernel threads (they stay cooperative,
@@ -3788,3 +3819,386 @@ evidence (§22.8). No historical matrix was run.
   The GP classes keep their levels (0, 1, 2) under RT, so any configured level > 2 runs below
   every system server.
 * One scheduling domain; no scheduling contexts, budgets or partitions (above).
+
+## 24. RT-SCHED1B: budgeted fixed-priority scheduling in one domain
+
+RT-SCHED1B adds scheduling contexts and budgets (SC-CTX-1…8) to the RT-SCHED1A profile. It runs
+in one active scheduling domain, through the owners §23 qualified:
+* the enqueue planners and commit;
+* the yield transaction over its preemption owners;
+* the RT scheduling point `settle_rt_reschedule`;
+* the preempting tick;
+* the one selection owner;
+* a kernel thread's `sched_point`.
+
+It adds no lock and no second dispatcher. GP stays the default, and GP decisions are unchanged:
+no GP CPU binds a context or charges anything.
+
+It does not implement:
+* partitions, windows or the per-frame system allowance (PARTITION1: SC-PART-*, SC-EXEC-5);
+* earliest-deadline timer programming (SC-TIME-5);
+* sub-tick enforcement (SC-CTX-6);
+* a health monitor or any recovery owner for a latched context;
+* a user ABI for budgets.
+
+### 24.1 The configuration that enables enforcement
+
+Budget enforcement is on exactly when the boot command line carries **both**
+`yarm.sched_profile=rt` **and** `yarm.sched_budget=on` (or `=1`).
+
+| Command line | Result |
+|---|---|
+| neither | GP: no contexts, nothing charged |
+| `yarm.sched_profile=rt` | RT-SCHED1A selection, no budgets (unchanged) |
+| `yarm.sched_profile=rt yarm.sched_budget=on` | **RT with budgets** on every online CPU |
+| `yarm.sched_budget=on` without the RT profile | **refused, fail closed**: `SchedDomain::set_budget(true)` returns `false` under GP and nothing is enabled |
+
+The boot prints one line with the outcome and the clock it measures in, for example:
+
+```text
+YARM_SCHED_BUDGET req=on profile=rt result=enforced route=construction clock=global_scheduler_tick owner=cpu0 grain=1tick enforce=tick period_ns=10000000 pool=32 default=64/64
+```
+
+`result=` is `enforced`, `refused_gp` or `off`. `route=` names the boot order. x86_64 reads its
+command line before the domain exists, so the construction applies the request. AArch64 and
+RISC-V read it after, so `install_sched_budget_on_live_domain` applies it to the live domain.
+
+**Where budgets come from.** The kernel's deployment provisioning is the only configuration owner,
+as for priorities (§23.8).
+* A user thread's budget is written by `task_enqueue::configure_budget_locked` (rank 2) before
+  the incarnation's first placement. It is sealed by the same seal as its priority, so a later
+  configuration is refused `Sealed`. `BudgetParams::validate` refuses `B = 0`, `B > T` and
+  `T > 2^32`, and nothing is written on a refusal.
+* A kernel thread's budget is given to `KThreadPool::create_budgeted`; `create` passes none.
+* **Every other thread placed on a budgeted CPU is bound to the default template `B = T = 64`
+  ticks:** system servers, ordinary tasks, the witness's own helpers. It is accounted like any
+  context. It can never be exhausted by execution alone, because its last tick is charged at the
+  release instant that replenishes it (SC-CTX-7).
+
+### 24.2 Clocks and timer programming
+
+**One clock measures both execution and release instants: the global scheduler tick**
+(`SchedDomain.clock`). Only `CLOCK_OWNER_CPU` (CPU 0) advances it, one per clock-owner timer
+interrupt (SC-TIME-1/2). Every CPU reads the same atomic.
+
+`CLOCK_MONOTONIC` is not used. On x86_64 it is a global nondecreasing clamp over per-CPU TSC
+readings. The QEMU `qemu64` CPU reports no invariant TSC, and cross-CPU TSC synchronization is not
+established (SC-TIME-4). So a difference of two `CLOCK_MONOTONIC` reads taken on one CPU is clamped
+by other CPUs' readings, and is not a valid elapsed-time measurement there. AArch64's system
+counter and RISC-V's `time` are architecturally shared, but they are not calibrated against a
+discovered frequency either (SC-TIME-3). The global tick is the one clock with a validity argument
+on every port:
+* it has a single writer and is monotonic;
+* every CPU reads the same value;
+* an elapsed interval on a CPU is the difference of two reads of that one counter.
+
+Nothing depends on per-CPU counters or on their synchronization. The cost is the unit: one tick,
+whose wall-time length drifts with the interrupt-to-rearm latency (SC-TIME-3/6 stay open).
+
+**Accounting telescopes.** Every 1L section of a budgeted CPU begins with `budget_sync`:
+* it charges `now − acct` to whoever was `current` during the interval: its context, the idle
+  ledger (no current, or the idle placeholder), or the **unaccounted** ledger (a thread with no
+  context, which the default binding makes impossible);
+* it sets `acct = now`;
+* it then applies every due release.
+
+`current` changes only inside 1L sections, so consecutive intervals cover the CPU's time exactly
+once. On each CPU every elapsed tick is charged once, to one owner, across switch, block, idle,
+exit and reuse. The sync runs from:
+* `CpuSchedGuard::view`;
+* `SchedAll::cpu`;
+* `SchedAllGuard::view` and `SchedDomain::exclusive` (every CPU);
+* the clock owner's `CpuView::tick`, again after it advances the clock.
+
+**No new timer event is programmed.** Each CPU's existing periodic tick is its enforcement point,
+and it keeps running while the CPU is idle: the idle advance of §17 and U9-TIMER5. Exhaustion and
+releases are therefore detected at the first 1L section on that CPU after the clock reaches them,
+which is at the latest its next tick.
+
+The legacy cadence is untouched:
+* `BOOTSTRAP_TIMER_DEADLINE_TICKS`, the quantum and the clock owner's increment are unchanged;
+* futex and IPC timeouts keep their tick deadlines, collected exactly as before.
+
+**Granularity and lateness.**
+* Granularity is one tick of the global clock (S).
+* A release on CPU *n* is applied at most one CPU-*n* tick after the clock reaches it. In
+  clock-owner ticks that is 1 + the phase skew between the two CPUs' timers (S in ticks; time
+  **N**).
+* Observed lateness, every graded cycle on every port: 24.7.
+* An exhaustion takes effect at the CPU's next scheduling point (24.4). The overrun this costs is
+  charged as debt (SC-CTX-5).
+
+### 24.3 Contexts and the ledger
+
+* **Storage.** Contexts live in each CPU's scheduler state, under that CPU's 1L. They are a
+  fixed pool of `CTX_PER_CPU = 32` (`BudgetLedger`, SC-POOL-2). A binding beyond it is the typed
+  refusal `SchedulerError::ContextPoolFull`, mapped to `KernelError::SchedulerFull`, and the
+  placement fails. Nothing falls back to an unbudgeted thread.
+* **A context** is `{home CPU, priority (the incarnation's configured level), B, T}`, with
+  exactly one thread. It is bound to one exact incarnation (its stamp) on its home, in the same
+  1L section as that incarnation's first placement:
+  * user threads in `commit_enqueue_on_cpu_locked` and `commit_reserved_enqueue_on_cpu_locked`;
+    a refused bind releases the reserved slot;
+  * kernel threads at creation.
+
+  The context id is `(CPU, slot)`.
+* **Reuse.** A bind of a TID whose context carries a different stamp replaces it with a fresh
+  context: an earlier incarnation's budget or debt is never inherited. A context is released:
+  * when its incarnation is reaped (`retire_reap_claim`, both owners; the split owner takes the
+    home's 1L after rank 2 is released);
+  * when a kernel thread is reclaimed.
+
+  Reap already requires the incarnation to be neither current nor queued on its home (§21), so
+  a released context never leaves a queue entry behind.
+* **Charging.** The rules are SC-CTX-4/5:
+  * `use = min(remaining, elapsed)`; the rest is overrun, added to debt with checked arithmetic;
+  * on overflow the debt saturates at `u64::MAX` and the latch is set;
+  * exhausted means `remaining == 0` or latched.
+* **Who is charged.**
+
+  | Execution | Charged to |
+  |---|---|
+  | User execution | the running thread's own context (SC-CTX-2) |
+  | Synchronous syscall and fault work | the trapping thread's context: it stays `current` for its whole trap (SC-EXEC-2) |
+  | A kernel thread (an independent worker) | its own context, budgeted or default (SC-EXEC-3) |
+  | Idle | the CPU's idle ledger |
+  | Interrupt top halves, IPI service, the tick, selection and switch | inside the tick of whoever was current, at tick granularity; **counted** per CPU as essential work (`essential_ticks`, `essential_arrivals`). Separating their time and enforcing the per-frame allowance is PARTITION1 (SC-EXEC-5) |
+
+### 24.4 Exhaustion, parking and the rejoin
+
+* **At the next legal scheduling point an exhausted current loses the CPU, whatever its
+  priority** (SC-CTX-3). `rt_preempt_wanted` is true for an exhausted current, even with nothing
+  else queued. The scheduling points:
+
+  | Point | Path |
+  |---|---|
+  | timer | `CpuView::tick` → preempting tick → yield transaction (head owners) |
+  | IPI / reschedule arrival | `settle_rt_reschedule`, which also counts the arrival as essential work |
+  | kernel thread | `sched_point` sees `rt=true` and yields; the thread stays cooperative and settles only there |
+  | its own block or yield | unchanged transitions |
+
+* **Parking** (SC-CTX-8). Where an exhausted Ready thread would get a queue position, it is
+  PARKED instead:
+  * the head or tail requeue of a preempted or yielding current;
+  * an enqueue or reserved fill from a wake;
+  * an IPC receiver placement through the same seams (SC-IPC-1).
+
+  A parked thread:
+  * has no queue position;
+  * keeps its membership-table entry, so nothing places it twice, and a wake while it is parked
+    preserves readiness without granting a position or budget;
+  * holds a guaranteed rejoin slot. A user thread holds one reservation at its level
+    (`reserved[p]`, counted by admission). A kernel thread uses the kernel-thread headroom of its
+    level.
+  * Withdrawal or release unparks it and returns the slot.
+* **Releases** are at fixed instants `bind + kT`. The per-context epoch is its binding instant
+  until PARTITION1 fixes the system epoch `E` (SC-POOL-4).
+  * Each release pays `min(B, debt)` and leaves `remaining = B − paid`. The rest of the debt is
+    carried, and the previous `remaining` is discarded.
+  * Several due instants are applied in one O(1) step with the same result as one at a time.
+  * A latched context advances its instants and is credited nothing (SC-CTX-4/5).
+* **Same instant** (SC-CTX-7). Each section:
+  1. charges the elapsed interval;
+  2. applies the due releases in ascending slot order: each parked context left with budget
+     rejoins its level's TAIL once, after giving back its reservation;
+  3. then the scheduling decision runs.
+
+  A running thread exhausted and replenished at the same instant therefore never becomes
+  ineligible and keeps the CPU.
+* **Capacity** (SC-POOL-3 for the budgeted configuration).
+  * Every live incarnation placed on a budgeted CPU holds one of its 32 contexts: current,
+    queued, parked, or exited but still queued and not yet reaped. So budgeted work holds at most
+    32 entries plus parked slots per CPU, below one level's admission bound (`CTX_PER_CPU <
+    MAX_RUN_QUEUE`, a compile-time assertion).
+  * A pending reservation beyond that belongs to a wake whose commit must still bind a context.
+    It either binds or is refused `ContextPoolFull`, and its slot is released.
+  * A parked thread's slot was taken when it parked. For admission and for the physical pool it
+    occupies exactly the slot it would hold if queued, so the §23.4 bounds (≤ 229 ≤ 256 entries
+    per CPU, ≤ 97 per level) are unchanged.
+  * Its rejoin consumes that slot (`push_unchecked_capacity`) and needs no admission. **A due
+    replenishment cannot be refused, and cannot strand ready work**, by other parked threads,
+    pending reservations or retained exits.
+  * When the CPU is full, the pool refuses before any queue does
+    (`rt1b_a_due_replenishment_cannot_be_stranded_by_a_full_cpu`).
+
+### 24.5 Contract clauses
+
+| Clause | Status after RT-SCHED1B |
+|---|---|
+| SC-CTX-1 | **ENFORCED** (RT + budget): one context per incarnation on its home, `0 < B ≤ T`, fixed priority; the partition field → PARTITION1 |
+| SC-CTX-2 | **ENFORCED** at tick granularity: only the current thread's context is charged |
+| SC-CTX-3 | **ENFORCED**: an exhausted context is ineligible at the next scheduling point, whatever its priority |
+| SC-CTX-4 | **ENFORCED**: fixed instants, conserved repayment, no accumulation (epoch = binding instant until PARTITION1) |
+| SC-CTX-5 | **ENFORCED** for debt, checked saturation and the latch. **PARTIAL** for reporting: overrun and exhaustions are counted per context and visible to the witness, but there is no health-monitor event (PARTITION1) |
+| SC-CTX-6 | **UNRESOLVED**: enforcement is to one tick (measured, 24.7); sub-tick needs SC-TIME-3 |
+| SC-CTX-7 | **ENFORCED** per CPU: charge, releases in ascending context id, then the decision. Contexts never cross CPUs; the cross-CPU step 4 order matters only for window boundaries (PARTITION1) |
+| SC-CTX-8 | **ENFORCED**: exhausted Ready threads are parked with no position; membership prevents duplicates |
+| SC-SEP-1 | budget eligibility **ENFORCED**; partition eligibility → PARTITION1 |
+| SC-SEP-2 | **ENFORCED, by membership**: an exhausted thread is never a candidate, so the existing single-pass selection needs no new filter and no second loop |
+| SC-POOL-2 | contexts: **ENFORCED** (fixed 32 per CPU, typed refusal); partitions, windows, health records → PARTITION1 |
+| SC-POOL-3 | **RESOLVED for the budgeted configuration** (24.4); GP and RT without budgets unchanged |
+| SC-EXEC-1 | **PARTIAL**: every tick has an owner (context, idle, or unaccounted, which stays 0 live); essential work is counted, not timed |
+| SC-EXEC-2 | **ENFORCED** at tick granularity |
+| SC-EXEC-3 | **ENFORCED**: kernel threads run under their own (budgeted or default) contexts |
+| SC-EXEC-4 | **PARTIAL**: the counted essential items are named (tick, reschedule arrival); the full enumeration is PARTITION1's allowance |
+| SC-EXEC-5, SC-EXEC-6 | unchanged (PARTITION1; UNRESOLVED) |
+| SC-IPC-1 | **ENFORCED for budgets**: an IPC wake goes through the same planners and commit and parks an exhausted receiver; windows → PARTITION1 |
+| SC-IPC-2 | **ENFORCED**: no donation; every server pays under its own context |
+| SC-TIME-3, SC-TIME-4, SC-TIME-6 | **UNRESOLVED**, now with a stated scope: the budgeted configuration avoids SC-TIME-4 by measuring only the global tick, and inherits SC-TIME-3/6 as its unit |
+| SC-TIME-5 | **SPECIFIED → PARTITION1** (the periodic tick is kept; lateness ≤ one tick of the enforcing CPU) |
+| SC-PRI-12 (f) | **ENFORCED**: exhaustion removes the thread from the queues; it rejoins at the tail once |
+| SC-BND-2 (budget part) | **ENFORCED** for kernel threads: exhaustion takes effect only at `sched_point` |
+
+### 24.6 What still prevents a time bound
+
+The time-bound gaps of §23.6 are carried forward unchanged:
+* nested rank-2/3 waits inside 1L;
+* the masked selection (W2);
+* synchronous printk (W7);
+* the whole masked trap (W3);
+* firmware calls (W5);
+* frame allocation (W6).
+
+RT-SCHED1B adds:
+* **Overrun per exhaustion.** It is bounded in ticks by the distance to the next scheduling
+  point. On a user thread that is the CPU's next tick, plus the masked trap in progress (W3,
+  **N**). On a kernel thread it is the distance to its next `sched_point` (its own code,
+  **N**). The hardware WCET of either is not established.
+* **Nested locks.** The sync adds O(32) work to every 1L section: the charge, and a release scan
+  only when the earliest release has arrived. It adds no lock. The nested rank-2/3 waits inside
+  1L stay unbounded (§22.3 A3).
+* **Cooperative safe point.** A kernel thread's exhaustion waits for its `sched_point`, so a
+  thread that never reaches one is never enforced. The bound is its code (SC-KT-4: no
+  asynchronous kernel preemption).
+* **Interrupt work.** Its time is charged inside the interrupted thread's tick (24.3) until
+  PARTITION1's allowance separates it.
+
+### 24.7 Evidence (candidate `d2027640`; `1e6cfd40` corrects one witness rule)
+
+Both runners were hashed before they ran, with the grader, the witness runner and the
+negative-control patches (`qual/predeclared.sha`, `addB/predeclared.sha`). Every log was kept,
+failures included. Unaffected coverage reuses the RT-SCHED1A evidence (§23.7). No historical
+matrix was run.
+
+* **Hosted** (on `d2027640`):
+  * fmt;
+  * the serial lib suite: 6,750 passed;
+  * `--tests`: 43 binaries, 7,147 passed;
+  * `yarm-kernel` crate: 10 passed;
+  * the grader self-test: two passing records (budget off and on), 15 selection mutants and 11
+    budget mutants (on `1e6cfd40`), each caught by its rule;
+  * focused subsets, each with its count: `rt1b_` 18, `sched_budget` 5, `rt1a_` 15,
+    `kthread` 43, `sched_full_rot` 15, `sched_lock1` 20, `sl1_` 19, `fair1_` 9,
+    `lock_order` 4, `census` 33, `abi` 271, `stage199d` 427, `u3_ed` 27, `u9timer` 34,
+    `ap_sched1` 15, `sl2b_` 9, `sl2a_` 15, `task_enqueue` 9, `overtaken` 23, `reap` 49,
+    `futex` 327, `ipc_timeout` 4, `sr_place1` 9, `run_queue` 7, `boot_command_line` 40;
+  * the contract gate and doc enforcement;
+  * the default kernel and the witness feature cross-checked on all three targets.
+* **The `rt1b_` tests** drive the production owners: `CpuView`, the planners and commit, the
+  yield transaction, `settle_rt_reschedule`, the IPC wake (`wake_tid_to_runnable_split`), reap
+  and genuine hosted kernel threads.
+  * An exhausted high task yields to lower work and returns only at its release.
+  * A wake while exhausted keeps it Ready with no position and no budget.
+  * Same-instant exhaustion and replenishment keeps the selected thread running.
+  * Simultaneous releases rejoin in context-id order.
+  * Debt of 8 against 3/5 repays as (0, 5), (0, 2), (1, 0).
+  * Unused budget is discarded.
+  * A latched context never rejoins (constructed state).
+  * Exit and TID reuse carry no budget or debt.
+  * The configuration is validated and sealed, and the pool is bounded.
+  * A due replenishment is not stranded by a full CPU.
+  * Every elapsed tick is charged exactly once.
+  * GP refuses budgets and binds nothing.
+  * The knob parses.
+  * A budgeted kernel thread is charged and settles at its `sched_point`.
+* **Lock order:** the same 30 descending sequential-pair types on the candidate and on
+  `5360efdd`, none new.
+* **Core smokes** of the default C kernels, SMP2, on each port. Every one passes:
+  * GP prints no profile or budget line and no RT marker.
+  * RT is unchanged from §23.7: no budget line, and only declined local raises (485, 101,
+    3,611).
+  * RT + `yarm.sched_budget=on` prints `YARM_SCHED_BUDGET … result=enforced
+    clock=global_scheduler_tick`, with `period_ns` 800,000,000 (x86_64), 50,000,000 (AArch64)
+    and 10,000,000 (RISC-V).
+  * **Fail closed:** GP + `yarm.sched_budget=on` on RISC-V prints `result=refused_gp` and no RT
+    marker.
+* **Live: the RT witness with budgets, SMP2, one boot per port** (`yarm.sched_profile=rt
+  yarm.sched_budget=on`). Every rule passes: CFG, ID, SEAL, PHASES, A–D, IPI, E, F, LEDGER. No
+  record line is damaged. Over the three ports:
+  * release lateness is 0 ticks in every E and F cycle;
+  * UH's heartbeat is flat in every parked interval;
+  * there are no unaccounted ticks on either CPU.
+
+  | port | witness kernel | records | E: UB heartbeats while UH parked | remote-wake causes B/C/E | observed overrun (UH) | ledger CPU 0 / CPU 1: idle, essential ticks, arrivals, contexts |
+  |---|---|---|---|---|---|---|
+  | x86_64 | `afe62ae1…` | 159 | 11,883 / 12,102 / 12,506 | 1 / 1 / 1 | 0 | 1, 74, 153, 17 / 3, 74, 4, 4 |
+  | AArch64 | `08dc8174…` | 157 | 1,097 / 1,292 / 1,737 | 1 / 1 / 1 | 0 | 1, 98, 158, 17 / 27, 72, 4, 4 |
+  | RISC-V (addendum B) | `dffbd9eb…` | 157 | 243 / 336 / 62 | 1 / 1 / 2 | 3 ticks in all, 1 in one graded cycle, repaid (debt 0) | 1, 541, 210, 17 / 450, 274, 4, 4 |
+
+  * The initramfs images are RT-SCHED1A's (`4263535a…`, `828b7bca…`, `a5a11dd5…`).
+  * In F, the kernel thread K exhausts its 2/10 budget three times. Each time, its next
+    `sched_point` reports `rt=true` and it parks there. It rejoins at `bind + k·10` and resumes
+    from the same scheduling point (its progress counter equals the parked value).
+  * The runs took 665 s, 54 s and 291 s under QEMU TCG.
+  * **Without budgets:** the RISC-V witness (W4) passes A–D and IPI with no budget phase and no
+    budget record.
+* **Negative controls,** each on the candidate with the tree restored (porcelain 0):
+  * **forgive debt** (replenishment clears the debt): hosted, the two debt tests fail.
+  * **exhausted runs** (an exhausted context is never ineligible):
+    * hosted: 7 `rt1b_` tests fail;
+    * live RISC-V (addendum B): the witness fails E, F, LEDGER, PHASES and SEAL. UH is never
+      parked (0 rejoins) and keeps CPU 1, its exhaustion records overflow the buffer, and the
+      phase times out.
+* **Sizes** (default builds of C and B; B reproduces the RT-SCHED1A kernels `f2b28b64…`,
+  `34cbd4db…`, `5ba362f9…`). C kernels: `2408e75e…`, `f74eb230…`, `7ee9c405…`.
+
+  | port | `.text` B → C | `.bss` B → C |
+  |---|---|---|
+  | x86_64 | 1,331,726 → 1,363,742 (+32,016, +2.40 %) | 24,576,129 → 24,793,089 (+216,960) |
+  | AArch64 | 894,276 → 911,632 (+17,356, +1.94 %) | 75,429,312 → 75,649,432 (+220,120) |
+  | RISC-V | 759,450 → 770,646 (+11,196, +1.47 %) | 92,116,776 → 92,335,690 (+218,914) |
+
+  Scheduler state (hosted layout; every port is LP64):
+  * `SchedContext` 96 B;
+  * `BudgetLedger` 3,136 B (32 × 96 + 64);
+  * `PriorityScheduler` 5,160 → 8,296;
+  * `CpuSched` 5,296 → 8,432;
+  * `CpuCell` 5,440 → 8,576 (+3,136), so +200,704 B over 64 CPUs, most of the `.bss` delta;
+  * `RunQueues` 2,760, `Admission` 40 and `SchedDomain` 192, unchanged.
+* **Failed runs kept with the evidence.**
+  * **Main run W3 (RISC-V) failed E.** The budget facts were all correct: parks at exhaustion,
+    UH flat while parked, rejoins on the grid with lateness 0, UB preempted at each rejoin. What
+    failed was per-cycle heartbeat progress. CPU 1's vCPU logged nothing from tick 511 to 515
+    while the clock advanced. Earlier, it took five interrupts at one global tick, whose
+    synchronous logging consumed the slivers UH had. The rule now checks the scheduling facts
+    per cycle and the progress summed over the cycles (`1e6cfd40`).
+    * The same log passes the corrected rule (addendum B2).
+    * Addendum B3 is a fresh boot of the same kernel.
+  * **Main run NC2b was invalid,** not a result. `SKIP_BASE=1` reused an initramfs built from
+    the clean tree, so the artifact binding refused the patched tree before boot. It was redone
+    with a full base build (addendum B4).
+  * **Development runs** (`dev/`):
+    * RISC-V passed every rule but CFG, because the budget line's format changed mid-run (it
+      had been cut at the 192-byte printk limit);
+    * AArch64 failed B, because its two CPUs' ticks are nearly phase-aligned with the driver,
+      so a CPU 1 tick reached H1 before the IPI. B now accepts either legal scheduling point,
+      and the new IPI rule requires at least one remote wake per boot settled at the arrival;
+    * the first full `--tests` run failed one source guard, because `KThreadPool::create`'s
+      body moved to `create_budgeted`. The guard now checks `create_budgeted` and that
+      `create` delegates to it.
+
+### 24.8 Remaining gaps
+
+* **The time bound.** §24.6 and §23.6.
+* **Partitions and the system epoch.** SC-PART-*, the system allowance (SC-EXEC-5/6), health
+  reports for overrun and the latch, SC-TIME-5 — all PARTITION1.
+* **Sub-tick enforcement.** SC-CTX-6, which needs SC-TIME-3.
+* **No user ABI** for priorities or budgets: deployment provisioning only.
+* **The queued-reply incarnation gap (§21.6).** `sr_enqueue_committed_receiver_split` admits the
+  TID's current incarnation, so a reused TID placed there binds or uses that incarnation's
+  context.
+* **The latch is reached in hosted tests only,** and only by constructed state: no live path
+  overflows a 64-bit debt.
+* **Wake-while-exhausted is not observed live.** It and the IPC-handoff park are covered by
+  hosted tests on the production owners only. The live witness's budgeted threads never block
+  while exhausted.

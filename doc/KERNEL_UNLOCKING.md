@@ -36957,3 +36957,72 @@ before it ran (`qual/predeclared.sha`), and every log was kept.
 | not run | a `--workspace` run (SCHED-LOCK-FAIR1 recorded its two inherited failures outside the `yarm` package); the historical matrix |
 
 **Verdict: QUALIFIED.**
+
+#### RT-SCHED1B (from qualified `5360efdd`)
+
+The second RT scheduling pass, on `wip/rt-sched1b`.
+
+**Budgeted fixed-priority scheduling in one domain.** Scheduling contexts and budgets (SC-CTX-1…8)
+on the owners RT-SCHED1A qualified, on all three ports. No new lock, no second dispatcher, and GP
+unchanged. The full record is `SCHEDULING_CONTRACT.md` §24.
+
+- **Configuration.** Enforcement is on exactly with `yarm.sched_profile=rt yarm.sched_budget=on`.
+  `yarm.sched_budget=on` without the RT profile is refused (fail closed). The boot prints
+  `YARM_SCHED_BUDGET … result=enforced|refused_gp|off clock=global_scheduler_tick …`. Explicit
+  budgets come from the deployment provisioning: `configure_budget_locked`, sealed with the
+  priority, and `KThreadPool::create_budgeted` for kernel threads. Every other thread placed on a
+  budgeted CPU gets the default template, 64/64.
+- **Clock.** Execution and release instants are both measured in the global scheduler tick: one
+  writer (CPU 0), read by every CPU. Every 1L section of a budgeted CPU charges the interval since
+  its previous section to whoever was current (a context, idle, or unaccounted) and applies the
+  due releases. So each elapsed tick is charged exactly once.
+  - `CLOCK_MONOTONIC` is not used: on x86_64 it is a clamp over unsynchronized TSCs.
+  - No timer event is added: each CPU's periodic tick, idle included, is its enforcement point.
+  - The legacy cadence and the futex/IPC timeouts are unchanged.
+- **Contexts.** A fixed pool of 32 per CPU inside the CPU's scheduler state; a full pool is the
+  typed refusal `ContextPoolFull`. A context is bound to one exact incarnation on its home at its
+  first placement. A reused TID gets a fresh context. A context is released at reap or at
+  kernel-thread reclaim.
+- **Exhaustion.** At the next scheduling point (tick, reschedule arrival, `sched_point`) an
+  exhausted current loses the CPU whatever its priority. Requeues, wakes and IPC placements
+  park an exhausted thread instead of queuing it: Ready, no position, a held rejoin slot (one
+  reservation at its level; kernel threads use their headroom). Releases at `bind + kT` repay
+  debt across periods, discard unused budget and never credit a latched context. A parked thread
+  rejoins its level's tail once, in context order, before the decision.
+- **Capacity.** At most 32 contexted threads per CPU, which is fewer than one level's admission
+  bound. A parked thread's rejoin consumes the slot it parked on, so a due replenishment cannot be
+  refused.
+- **Not in this pass:**
+  - partitions and windows, the system allowance and health reports (PARTITION1);
+  - earliest-deadline timer programming;
+  - sub-tick enforcement;
+  - a user ABI for budgets.
+
+**Guard re-derived** (for a new, classified site, none relaxed): `tests/kthread_plain_lock_scope`
+now checks the creation order in `create_budgeted`, which `create` delegates to.
+
+**Commits.**
+- `d2027640`: the contexts, the ledger, the enforcement points on the shared owners, the
+  configuration, the hosted tests, the witness phases E and F, the grader rules and the runner.
+- `1e6cfd40`: corrects one witness rule (E) after the first RISC-V qualification boot.
+- The documentation commit follows them.
+
+The runners were hashed before they ran (`qual/predeclared.sha`, `addB/predeclared.sha`). Every
+log was kept, failures included.
+
+| step | result |
+|---|---|
+| hosted | fmt; serial lib, 6,750 passed; `--tests`, 43 binaries, 7,147 passed; `yarm-kernel` 10; the grader self-test (15 selection + 11 budget mutants); 25 focused subsets, each with a non-zero count (`rt1b_` 18, `sched_budget` 5, §24.7); contract gate; doc enforcement; default and witness kernels checked on all three targets |
+| lock order | 30 descending-pair types on C and on `5360efdd`, none new |
+| builds | default x86_64, AArch64 and RISC-V artifacts, C and B. C kernels: `2408e75e…`, `f74eb230…`, `7ee9c405…`. B reproduces the RT-SCHED1A kernels `f2b28b64…`, `34cbd4db…`, `5ba362f9…` |
+| sizes | `.text` +32,016 (+2.40 %), +17,356 (+1.94 %), +11,196 (+1.47 %). `.bss` +217 to +220 KiB on each port: `BudgetLedger` 3,136 B per CPU (32 × 96 B contexts), `CpuCell` 5,440 → 8,576 B (×64 CPUs) |
+| core smokes | the default C kernels, SMP2, each port: GP passes with no profile or budget line; RT passes unchanged; RT + `yarm.sched_budget=on` passes with `result=enforced clock=global_scheduler_tick`; GP + `yarm.sched_budget=on` (RISC-V) passes with `result=refused_gp` (fail closed) |
+| W1 x86_64 SMP2 | `RTW_WITNESS_SEAL … budget=on result=pass`, every rule; E and F 3/3 cycles each, release lateness 0, UB 11,883–12,506 heartbeats while UH parked, no unaccounted tick (kernel `afe62ae1…`) |
+| W2 AArch64 SMP2 | `result=pass`; E and F 3/3, lateness 0, UB 1,097–1,737 (kernel `08dc8174…`) |
+| W3 RISC-V SMP2 | main run: **fail E**, per-cycle heartbeat progress (CPU 1's vCPU stalled under TCG; every budget fact correct). Addendum B, after the rule correction: `result=pass`; E and F 3/3, lateness 0, an observed 1-tick overrun repaid (kernel `dffbd9eb…`, unchanged) |
+| W4 RISC-V, budgets off | `result=pass`, A–D and IPI, no budget phase |
+| negative controls | forgive debt: hosted, 2 tests fail. Exhausted runs: hosted, 7 tests fail; live RISC-V (addendum B; the main run's attempt was invalid, refused before boot by the artifact binding), fails E/F/LEDGER/PHASES/SEAL with UH never parked. Tree restored, porcelain 0 |
+| gaps kept visible | no time bound (§24.6); partitions, system allowance, health reports, earliest-deadline programming → PARTITION1; one-tick granularity; no budget ABI; the queued-reply incarnation gap (§21.6); the latch and wake-while-exhausted are hosted-only |
+| not run | a `--workspace` run; the historical matrix |
+
+**Verdict: QUALIFIED** on `1e6cfd40` (the code of `d2027640`, with the corrected witness rule).
