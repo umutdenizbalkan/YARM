@@ -294,6 +294,11 @@ pub(crate) struct BlockedServerAck {
     pub(crate) meta_user_ptr: usize,
     /// Server userspace metadata destination length bound.
     pub(crate) meta_user_len: usize,
+    /// SCHED-LOCK2B — the server incarnation's stamp, captured when its receive entered (while it
+    /// was its CPU's current) and published with the ack. The membership checks and the committed
+    /// enqueue are bound to it: the endpoint-waiter claim names `{tid, asid}` only, which a TID
+    /// reused inside the same address space would satisfy.
+    pub(crate) server_incarnation: u64,
 }
 
 impl BlockedServerAck {
@@ -336,6 +341,8 @@ pub(crate) struct BlockedCallerAck {
     pub(crate) meta_user_ptr: usize,
     /// Caller userspace metadata destination length bound.
     pub(crate) meta_user_len: usize,
+    /// SCHED-LOCK2B — the caller incarnation's stamp; see `BlockedServerAck::server_incarnation`.
+    pub(crate) caller_incarnation: u64,
 }
 
 impl BlockedCallerAck {
@@ -583,6 +590,7 @@ mod tests {
             payload_user_len: 128,
             meta_user_ptr: 0x4000_1000,
             meta_user_len: 40,
+            server_incarnation: 0,
         };
         assert!(ack.is_committed());
         assert_eq!(ack.waiter_claim_key(), (2, 9, ident(5, 3)));

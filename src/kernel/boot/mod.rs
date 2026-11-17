@@ -7516,6 +7516,7 @@ pub mod ipccall_direct_ack {
             payload_user_len: ack.payload_user_len,
             meta_user_ptr: ack.meta_user_ptr,
             meta_user_len: ack.meta_user_len,
+            waiter_stamp: ack.server_incarnation,
         }
     }
 
@@ -7532,6 +7533,7 @@ pub mod ipccall_direct_ack {
             payload_user_len: fields.payload_user_len,
             meta_user_ptr: fields.meta_user_ptr,
             meta_user_len: fields.meta_user_len,
+            server_incarnation: fields.waiter_stamp,
         }
     }
 
@@ -7745,6 +7747,9 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
     let Some((index, generation, seq)) = publish_ipccall_direct_blocked_server_ack_with(
         receiver_tid,
         kernel.task_asid(receiver_tid),
+        // SCHED-LOCK2B: under the broad guard this receive has held since its trap, so the TCB
+        // read is the receiving incarnation's own.
+        kernel.task_incarnation(receiver_tid),
         endpoint,
         state,
         |index| kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index)),
@@ -7779,6 +7784,7 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
 pub(crate) fn publish_ipccall_direct_blocked_server_ack_with(
     receiver_tid: u64,
     receiver_asid: Option<crate::kernel::vm::Asid>,
+    receiver_stamp: u64,
     endpoint: crate::kernel::capabilities::CapObject,
     state: &crate::kernel::task::BlockedRecvState,
     live_waiter: impl FnOnce(usize) -> Option<ReceiverWaiterIdentity>,
@@ -7843,6 +7849,7 @@ pub(crate) fn publish_ipccall_direct_blocked_server_ack_with(
         payload_user_len: state.payload_user_len,
         meta_user_ptr: state.meta_user_ptr,
         meta_user_len: state.meta_user_len,
+        server_incarnation: receiver_stamp,
     };
     let seq = match ipccall_direct_ack::commit(reservation, ack) {
         Ok(seq) => seq,
@@ -7872,19 +7879,28 @@ fn maybe_emit_ipccall_direct_smp_server_blocked(
     // same body the split route runs. Each read stays exactly where it was and in its own domain:
     // the saved frame and the ASID under the task domain, runqueue presence and home CPU under
     // the scheduler domain, the waiter identity under `ipc_state`.
-    emit_ipccall_direct_smp_server_blocked_with(
-        receiver_tid,
-        endpoint_index,
-        endpoint_generation,
-        ack_seq,
+    //
+    // SCHED-LOCK2B: collected only when the SMP oracle is armed — the same gate SCHED-LOCK2A put
+    // on the split route. Disarmed (every ordinary boot) the broad arm no longer reads the
+    // coherent all-CPU view (1G plus every 1L) for a marker whose body would discard it on its
+    // first check. Armed, the body receives exactly the facts it did before.
+    if let Some(facts) = oracle_gated_facts(x86_ipccall_direct_smp_oracle_enabled(), || {
         SmpServerBlockedFacts {
             saved_frame: kernel.task_has_saved_frame(receiver_tid),
             present_in_any_runqueue: kernel.task_present_in_any_runqueue(receiver_tid),
             home_cpu: kernel.task_home_cpu(receiver_tid),
             asid: kernel.task_asid(receiver_tid),
             waiter: kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(endpoint_index)),
-        },
-    );
+        }
+    }) {
+        emit_ipccall_direct_smp_server_blocked_with(
+            receiver_tid,
+            endpoint_index,
+            endpoint_generation,
+            ack_seq,
+            facts,
+        );
+    }
 }
 
 /// SCHED-LOCK2A — collect an oracle's facts only when the oracle is armed.
@@ -8020,6 +8036,7 @@ pub mod ipcreply_direct_ack {
             payload_user_len: ack.payload_user_len,
             meta_user_ptr: ack.meta_user_ptr,
             meta_user_len: ack.meta_user_len,
+            waiter_stamp: ack.caller_incarnation,
         }
     }
 
@@ -8036,6 +8053,7 @@ pub mod ipcreply_direct_ack {
             payload_user_len: fields.payload_user_len,
             meta_user_ptr: fields.meta_user_ptr,
             meta_user_len: fields.meta_user_len,
+            caller_incarnation: fields.waiter_stamp,
         }
     }
 
@@ -8227,6 +8245,9 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
     let Some((index, generation, seq)) = publish_ipcreply_direct_blocked_caller_ack_with(
         receiver_tid,
         kernel.task_asid(receiver_tid),
+        // SCHED-LOCK2B: under the broad guard this receive has held since its trap, so the TCB
+        // read is the receiving incarnation's own.
+        kernel.task_incarnation(receiver_tid),
         endpoint,
         state,
         |index| kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index)),
@@ -8251,6 +8272,7 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
 pub(crate) fn publish_ipcreply_direct_blocked_caller_ack_with(
     receiver_tid: u64,
     receiver_asid: Option<crate::kernel::vm::Asid>,
+    receiver_stamp: u64,
     endpoint: crate::kernel::capabilities::CapObject,
     state: &crate::kernel::task::BlockedRecvState,
     live_waiter: impl FnOnce(usize) -> Option<ReceiverWaiterIdentity>,
@@ -8307,6 +8329,7 @@ pub(crate) fn publish_ipcreply_direct_blocked_caller_ack_with(
         payload_user_len: state.payload_user_len,
         meta_user_ptr: state.meta_user_ptr,
         meta_user_len: state.meta_user_len,
+        caller_incarnation: receiver_stamp,
     };
     let seq = match ipcreply_direct_ack::commit(reservation, ack) {
         Ok(seq) => seq,

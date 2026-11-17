@@ -224,6 +224,11 @@ pub(crate) struct AckFields {
     pub(crate) payload_user_len: usize,
     pub(crate) meta_user_ptr: usize,
     pub(crate) meta_user_len: usize,
+    /// SCHED-LOCK2B — the blocked waiter's incarnation stamp, captured when its receive entered
+    /// (while it was its CPU's current). Carried as payload, NOT part of [`AckWaiter`]: every
+    /// match, release and absence check stays keyed on `{tid, asid}`, and the consumer validates
+    /// the stamp at each placement step it takes.
+    pub(crate) waiter_stamp: u64,
 }
 
 /// Exclusive ownership of one reserved-but-not-yet-published slot.
@@ -410,6 +415,7 @@ struct AckSlot {
     payload_user_len: AtomicUsize,
     meta_user_ptr: AtomicUsize,
     meta_user_len: AtomicUsize,
+    waiter_stamp: AtomicU64,
 }
 
 impl AckSlot {
@@ -424,6 +430,7 @@ impl AckSlot {
             payload_user_len: AtomicUsize::new(0),
             meta_user_ptr: AtomicUsize::new(0),
             meta_user_len: AtomicUsize::new(0),
+            waiter_stamp: AtomicU64::new(0),
         }
     }
 
@@ -437,6 +444,7 @@ impl AckSlot {
         self.payload_user_len.store(0, Ordering::Relaxed);
         self.meta_user_ptr.store(0, Ordering::Relaxed);
         self.meta_user_len.store(0, Ordering::Relaxed);
+        self.waiter_stamp.store(0, Ordering::Relaxed);
         self.seq.store(0, Ordering::Relaxed);
     }
 
@@ -477,6 +485,7 @@ impl AckSlot {
             payload_user_len: self.payload_user_len.load(Ordering::Relaxed),
             meta_user_ptr: self.meta_user_ptr.load(Ordering::Relaxed),
             meta_user_len: self.meta_user_len.load(Ordering::Relaxed),
+            waiter_stamp: self.waiter_stamp.load(Ordering::Relaxed),
         }
     }
 
@@ -678,6 +687,7 @@ impl DirectAckStore {
         slot.payload_user_len.store(0, Ordering::Relaxed);
         slot.meta_user_ptr.store(0, Ordering::Relaxed);
         slot.meta_user_len.store(0, Ordering::Relaxed);
+        slot.waiter_stamp.store(0, Ordering::Relaxed);
         self.reserves.fetch_add(1, Ordering::Relaxed);
         // Occupancy is maintained incrementally rather than scanned: with one slot per
         // endpoint index a scan is O(table), and this runs on every blocking recv-v2 commit.
@@ -728,6 +738,8 @@ impl DirectAckStore {
             .store(fields.meta_user_ptr, Ordering::Relaxed);
         slot.meta_user_len
             .store(fields.meta_user_len, Ordering::Relaxed);
+        slot.waiter_stamp
+            .store(fields.waiter_stamp, Ordering::Relaxed);
         slot.seq.store(seq, Ordering::Relaxed);
         // Release: every field above is visible to any consumer that acquires this state. Only
         // the reservation's owner moves the word out of exactly this `Reserved` value.
@@ -1333,6 +1345,7 @@ mod tests {
             payload_user_len: 128,
             meta_user_ptr: 0x2000 + e.index,
             meta_user_len: 32,
+            waiter_stamp: 0,
         }
     }
 

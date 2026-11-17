@@ -4395,7 +4395,9 @@ fn try_split_blocking_ipc_recv_into_frame(
     // inside Phase A refuses without touching the slot, so the caller is still current and this
     // decline is as safe as the ones above it.
     #[allow(unused_variables)]
-    let Some((receiver_asid, victim_priority)) = shared.recv_block_phase_a_split(cpu, tid) else {
+    let Some((receiver_asid, victim_priority, entering_stamp)) =
+        shared.recv_block_phase_a_split(cpu, tid)
+    else {
         crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=phase_a",
@@ -4430,6 +4432,7 @@ fn try_split_blocking_ipc_recv_into_frame(
                 tid,
                 asid: receiver_asid,
                 priority: victim_priority,
+                stamp: entering_stamp,
             },
         );
         crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
@@ -4451,6 +4454,7 @@ fn try_split_blocking_ipc_recv_into_frame(
                 tid,
                 asid: receiver_asid,
                 priority: victim_priority,
+                stamp: entering_stamp,
             },
             outcome,
             crate::kernel::syscall::SyscallError::Internal,
@@ -4469,6 +4473,7 @@ fn try_split_blocking_ipc_recv_into_frame(
             asid: receiver_asid,
             priority: victim_priority,
             wait_generation,
+            stamp: entering_stamp,
         };
     // `IPC_RECV_BLOCKED_STATE_SAVE` is NOT emitted here: `recv_block_phase_b_split` is the owner
     // of that write and already prints it, so printing it again would double the marker.
@@ -4806,6 +4811,7 @@ fn try_split_blocking_ipc_recv_into_frame(
         let server_ack = crate::kernel::boot::publish_ipccall_direct_blocked_server_ack_with(
             tid,
             asid,
+            entering_stamp,
             endpoint,
             &state,
             live_waiter,
@@ -4852,6 +4858,7 @@ fn try_split_blocking_ipc_recv_into_frame(
         let _ = crate::kernel::boot::publish_ipcreply_direct_blocked_caller_ack_with(
             tid,
             asid,
+            entering_stamp,
             endpoint,
             &state,
             live_waiter,

@@ -121,6 +121,10 @@ pub struct RecvBlockIdentity {
     pub asid: crate::kernel::vm::Asid,
     pub priority: crate::kernel::scheduler::TaskPriority,
     pub wait_generation: u64,
+    /// SCHED-LOCK2B — the entering incarnation's stamp (`ThreadControlBlock::incarnation`), read
+    /// by Phase A in the same acquisition as the ASID, before its compare-and-clear. `{tid, asid}`
+    /// cannot tell a same-address-space TID reuse apart; this can.
+    pub stamp: u64,
 }
 
 /// U9-RECV-BLOCK1 §3 — what an exact unwind actually achieved, which decides what the caller may
@@ -155,6 +159,9 @@ pub struct RecvEnteringIncarnation {
     pub tid: u64,
     pub asid: crate::kernel::vm::Asid,
     pub priority: crate::kernel::scheduler::TaskPriority,
+    /// SCHED-LOCK2B — the stamp captured with the ASID while the task was this CPU's current.
+    /// Every placement read and the exact restore of a recovery are bound to it.
+    pub stamp: u64,
 }
 
 impl RecvBlockIdentity {
@@ -165,6 +172,7 @@ impl RecvBlockIdentity {
             tid: self.tid,
             asid: self.asid,
             priority: self.priority,
+            stamp: self.stamp,
         }
     }
 }

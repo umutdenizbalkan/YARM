@@ -98,12 +98,20 @@ pub(crate) struct ReapClaim {
     pid: u64,
     restart_token: Option<RestartToken>,
     status_before: TaskStatus,
+    /// SCHED-LOCK2B — the incarnation stamp of the TCB this claim won, read in the claim's own
+    /// acquisition. The post-claim residency proof is taken against THIS incarnation's home, so a
+    /// stamp re-read later could never stand in for it.
+    incarnation: u64,
 }
 
 impl ReapClaim {
     /// The claimed thread.
     pub(crate) const fn tid(&self) -> u64 {
         self.tid
+    }
+    /// SCHED-LOCK2B — the claimed incarnation's stamp (`ThreadControlBlock::incarnation`).
+    pub(crate) const fn incarnation(&self) -> u64 {
+        self.incarnation
     }
     /// The address space that, together with [`Self::tid`], names the EXACT incarnation this
     /// claim won. Every later step matches on this pair, never on the TID alone.
@@ -195,6 +203,7 @@ pub(crate) fn claim_faulted_task_for_reap_locked(
         pid,
         restart_token,
         status_before,
+        incarnation: tcb.incarnation,
     })
 }
 

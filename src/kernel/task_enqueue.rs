@@ -75,6 +75,71 @@ pub(crate) fn incarnation_of_locked(tcbs: &[Option<ThreadControlBlock>], tid: u6
         .map_or(0, |t| t.incarnation)
 }
 
+/// SCHED-LOCK2B — what rank 2 says about where ONE exact incarnation can be placed (H-HOME,
+/// SCHEDULING_CONTRACT §20.5): only on the home of its current incarnation, and nowhere if it has
+/// none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomeLookup {
+    /// The incarnation `stamp` (never 0) has home `home`: its placement, if any, is on `home`'s
+    /// 1L and nowhere else.
+    Home { home: CpuId, stamp: u64 },
+    /// The incarnation `stamp` has no home. Every 1L placement step admits only on a recorded
+    /// home, so at this rank-2 instant it is placed on NO CPU.
+    Homeless { stamp: u64 },
+    /// TID 0 or a kernel-thread id (neither has a TCB), no TCB, or the TID names an incarnation
+    /// other than the caller's stamp.
+    Stale,
+}
+
+/// SCHED-LOCK2B — rank 2: locate `tid`'s home for the caller's incarnation `stamp`.
+///
+/// `stamp != 0` must equal the TCB's stamp, so a TID reused after the caller captured its stamp —
+/// inside the same address space included — is `Stale`. `stamp == 0` (hosted fixtures, and a caller
+/// whose identity is the numeric TID itself, such as the reaper's pre-claim proof) pins whichever
+/// incarnation this acquisition sees; the 1L step then revalidates THAT stamp
+/// ([`home_unchanged_locked`]), so the two steps are always about one incarnation.
+pub(crate) fn home_lookup_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    tid: u64,
+    stamp: u64,
+) -> HomeLookup {
+    if tid == 0 {
+        return HomeLookup::Stale;
+    }
+    let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == tid) else {
+        return HomeLookup::Stale;
+    };
+    if stamp != 0 && tcb.incarnation != stamp {
+        return HomeLookup::Stale;
+    }
+    match tcb.cpu_affinity {
+        Some(home) => HomeLookup::Home {
+            home,
+            stamp: tcb.incarnation,
+        },
+        None => HomeLookup::Homeless {
+            stamp: tcb.incarnation,
+        },
+    }
+}
+
+/// SCHED-LOCK2B — rank 2 nested in `home`'s 1L: is `tid` still incarnation `stamp`, homed on
+/// `home`? Homes are never rewritten, so `false` means the incarnation went away (exit and reap,
+/// TID reuse) between the lookup and the 1L.
+pub(crate) fn home_unchanged_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    tid: u64,
+    stamp: u64,
+    home: CpuId,
+) -> bool {
+    tid != 0
+        && tcbs
+            .iter()
+            .flatten()
+            .find(|t| t.tid.0 == tid)
+            .is_some_and(|t| t.incarnation == stamp && t.cpu_affinity == Some(home))
+}
+
 /// SCHED-LOCK2A — why a placement was refused for its home. Every refusal maps to the error a
 /// commit onto a CPU that cannot take the task already returns (`WrongObject`, from
 /// `SchedulerError::CpuOffline`), so no caller and no syscall ABI sees a new error.

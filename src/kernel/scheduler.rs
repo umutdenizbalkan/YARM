@@ -1242,6 +1242,10 @@ impl SchedDomain {
     /// SCHED-LOCK1 §16.4 — the per-CPU scan for a FROZEN subject: each CPU examined under its own
     /// 1L, one at a time, never two held. Equal to the coherent answer whenever `tid`'s placement
     /// cannot change during the scan; the caller states why it cannot.
+    ///
+    /// SCHED-LOCK2B: reached only from the x86_64 SMP oracle's armed fact collection and hosted
+    /// tests; no functional IPC or reap path calls it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn present_anywhere_scan(&self, tid: ThreadId) -> bool {
         (0..MAX_CPUS).any(|idx| {
             let cell = &self.cpus[idx];
@@ -1639,6 +1643,32 @@ impl CpuView<'_> {
     /// Is `tid` this CPU's current task or in one of its queues (online or not)?
     pub fn contains_or_current(&self, tid: ThreadId) -> bool {
         self.sched.rq.contains_or_current(tid)
+    }
+
+    /// SCHED-LOCK2B — hosted FIXTURE only: queue a second entry for `tid` even while it is this
+    /// CPU's current (the membership mirror covers the current slot, so `enqueue_with_priority`
+    /// refuses that). It builds the current-and-queued invariant break the placement readers must
+    /// report as a second placement; production has no way to reach this state.
+    #[cfg(test)]
+    pub(crate) fn plant_second_placement_for_test(
+        &mut self,
+        tid: ThreadId,
+        priority: TaskPriority,
+    ) -> Result<(), SchedulerError> {
+        self.sched.rq.push_unchecked_capacity(tid, priority)
+    }
+
+    /// SCHED-LOCK2B — [`SmpScheduler::placement_of`] restricted to THIS CPU, under this CPU's 1L
+    /// only. For a TID whose home is this CPU it is the whole answer (H-HOME, §20.5): the four
+    /// shapes the coherent read distinguished, with every `CpuId` naming this CPU.
+    pub(crate) fn placement_here_of(&self, tid: ThreadId) -> TaskPlacement {
+        let cpu = self.cpu();
+        match self.sched.placement_here(tid) {
+            (false, false) => TaskPlacement::Nowhere,
+            (false, true) => TaskPlacement::Queued(cpu),
+            (true, false) => TaskPlacement::Current(cpu),
+            (true, true) => TaskPlacement::CurrentAndQueued(cpu),
+        }
     }
 
     /// Visit every queued entry in dispatch order (High → Normal → Low, FIFO within each).
@@ -2053,6 +2083,10 @@ impl SchedAll<'_> {
     }
 
     /// U9-RECV-BLOCK2 §1 — WHERE `tid` is, as ONE coherent observation of every CPU.
+    /// SCHED-LOCK2B: no production caller remains — production placement questions about one
+    /// incarnation are answered on its home by `CpuView::placement_here_of`. Retained for hosted
+    /// tests and the census.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn placement_of(&self, tid: ThreadId) -> TaskPlacement {
         let mut queued_on = None;
         let mut current_on = None;

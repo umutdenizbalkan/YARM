@@ -82809,6 +82809,7 @@ mod stage199a2b2d_direct_request_txn {
             payload_user_len: 8,
             meta_user_ptr: SERVER_META_VA,
             meta_user_len: 40,
+            server_incarnation: 0,
         }
     }
 
@@ -83525,6 +83526,65 @@ mod stage199a2b2d_direct_request_txn {
             "the waiter is intact"
         );
     }
+
+    /// SCHED-LOCK2B — **an acknowledgement whose server TID now names another incarnation**
+    /// (exit, reap and reuse — inside the same address space, which `{tid, asid}` and the waiter
+    /// claim cannot see) is refused at the early membership check, before the first
+    /// userspace-visible mutation, as the same non-mutating `WouldBlock` an inexact server gets.
+    /// The acknowledgement is discarded and nothing about the server changes; the same
+    /// acknowledgement carrying the server's real stamp is then delivered.
+    #[test]
+    fn sl2b_a_request_ack_for_a_replaced_server_incarnation_declines_before_mutation() {
+        let fx = blocked_server_fixture();
+        let real = fx.k.with(|s| s.task_incarnation(fx.server.tid.0));
+        assert_ne!(real, 0);
+        let recv_cap =
+            fx.k.blocked_recv_cap_split_read(fx.server.tid.0, fx.server_aspace_asid)
+                .expect("recv cap");
+        let snap = snapshot_for(&fx, b"request!");
+        let stale = BlockedServerAck {
+            server_incarnation: real + 1_000_000,
+            ..ack_for(&fx)
+        };
+        let mut lease = claimed_lease(203);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &stale, &mut lease, 203),
+            Err(IpcCallDirectError::WouldBlock)
+        );
+        assert!(
+            !lease.is_available(),
+            "a stale acknowledgement is never re-armed"
+        );
+        fx.k.with(|s| {
+            assert_eq!(
+                s.task_status(fx.server.tid.0),
+                Some(TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(recv_cap)
+                )),
+                "no TCB mutation"
+            );
+        });
+        assert!(fx.k.endpoint_waiter_is_split_read(
+            fx.endpoint_index,
+            fx.endpoint_generation,
+            fx.server
+        ));
+        assert_eq!(
+            fx.k.incarnation_home_membership_split_read(fx.server.tid.0, real),
+            crate::runtime::HomeMembership::Absent,
+            "the server was not placed"
+        );
+        let exact = BlockedServerAck {
+            server_incarnation: real,
+            ..ack_for(&fx)
+        };
+        let mut lease = claimed_lease(204);
+        assert!(
+            fx.k.ipc_call_direct_request_txn(&snap, &exact, &mut lease, 204)
+                .is_ok(),
+            "the server's own stamp is admitted on its home"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84160,6 +84220,30 @@ mod stage199a2b3_direct_reply_txn {
                 "caller not yet running (enqueue != dispatch)"
             );
         });
+        teardown();
+    }
+
+    /// SCHED-LOCK2B — the blocked-caller acknowledgement carries the stamp its publication
+    /// captured (the receiving incarnation's own). One whose caller TID now names another
+    /// incarnation is refused at the early membership check as `WaiterLost`, with no mutation.
+    #[test]
+    fn sl2b_a_reply_ack_for_a_replaced_caller_incarnation_is_waiter_lost() {
+        let fx = blocked_caller_fixture();
+        let real = fx.published_ack.caller_incarnation;
+        assert_ne!(real, 0, "the publication captured the caller's stamp");
+        assert_eq!(
+            real,
+            fx.k.with(|s| s.task_incarnation(fx.published_ack.caller.tid.0))
+        );
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let mut ack = fx.published_ack;
+        ack.caller_incarnation = real + 1_000_000;
+        let mut lease = claimed_lease(7);
+        assert_eq!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 7),
+            Err(IpcReplyDirectError::WaiterLost)
+        );
+        assert_caller_still_blocked_zero_wake(&fx.k);
         teardown();
     }
 
@@ -86764,6 +86848,7 @@ mod stage199a2d1_races {
             payload_user_len: 8,
             meta_user_ptr: SERVER_META_VA,
             meta_user_len: 40,
+            server_incarnation: 0,
         };
         ServerFx {
             k: Arc::new(k),
@@ -86816,6 +86901,7 @@ mod stage199a2d1_races {
             payload_user_len: 8,
             meta_user_ptr: 0x4080,
             meta_user_len: 40,
+            server_incarnation: 0,
         };
         let _seq = ipccall_direct_ack::publish(ack);
         let barrier = Arc::new(Barrier::new(2));
@@ -86876,6 +86962,7 @@ mod stage199a2d1_races {
             payload_user_len: 8,
             meta_user_ptr: 0x4080,
             meta_user_len: 40,
+            caller_incarnation: 0,
         };
         let _seq = ipcreply_direct_ack::publish(ack);
         let barrier = Arc::new(Barrier::new(2));
@@ -87562,6 +87649,7 @@ mod stage199a2d1_memory_ordering {
             payload_user_len: 8,
             meta_user_ptr: 0x4080,
             meta_user_len: 40,
+            server_incarnation: 0,
         };
         let _ = ipccall_direct_ack::publish(ack);
         let seen = ipccall_direct_ack::sole_snapshot().expect("published slot is visible");
@@ -87589,6 +87677,7 @@ mod stage199a2d1_memory_ordering {
             payload_user_len: 8,
             meta_user_ptr: 0x4080,
             meta_user_len: 40,
+            caller_incarnation: 0,
         };
         let seq1 = ipcreply_direct_ack::publish(ack);
         let (_a, claimed_seq) = ipcreply_direct_ack::sole_claim().expect("claim first publication");
@@ -88823,6 +88912,7 @@ mod stage199d_delivery_projection_differential {
                 payload_user_len: 8,
                 meta_user_ptr: SERVER_META_VA,
                 meta_user_len: IPC_RECV_META_V2_ENCODED_LEN,
+                caller_incarnation: 0,
             }
         }
 
@@ -90252,6 +90342,7 @@ mod stage199d_production_default_guards {
             payload_user_len: 8,
             meta_user_ptr: 0x2000,
             meta_user_len: 40,
+            waiter_stamp: 0,
         };
         store.commit(reservation, fields).expect("and may commit");
         assert!(
@@ -90382,6 +90473,7 @@ mod stage199d_production_default_guards {
                     payload_user_len: 0,
                     meta_user_ptr: 0,
                     meta_user_len: 0,
+                    waiter_stamp: 0,
                 },
             )
             .expect("commit");
@@ -90432,6 +90524,7 @@ mod stage199d_production_default_guards {
                     payload_user_len: 0,
                     meta_user_ptr: 0,
                     meta_user_len: 0,
+                    waiter_stamp: 0,
                 },
             )
             .expect("commit");
@@ -90840,6 +90933,7 @@ mod stage199d_multi_pair_races {
             payload_user_len: 8,
             meta_user_ptr: 0x8000 + e.index,
             meta_user_len: 40,
+            waiter_stamp: 0,
         }
     }
 
@@ -91655,6 +91749,7 @@ mod stage199a2d2a_smp_request {
             payload_user_len: 8,
             meta_user_ptr: SERVER_META_VA,
             meta_user_len: 40,
+            server_incarnation: 0,
         };
         // Publish the ack to the single-slot store (models the recv-v2 commit publication).
         let _seq = ipccall_direct_ack::publish(published_ack);
@@ -92843,7 +92938,7 @@ mod stage199a2d2c2b2_guards {
             .find("commit_direct_reply_record_split(idx, rgen)")
             .unwrap();
         let enq = TXN
-            .find("sr_enqueue_committed_receiver_reconciled_split(ack.server.tid.0")
+            .find("sr_enqueue_committed_receiver_reconciled_split(\n                    ack.server.tid.0")
             .unwrap();
         assert!(avail < enq, "record Available before enqueue");
     }
@@ -92862,7 +92957,7 @@ mod stage199a2d2c2b2_guards {
             .nth(1)
             .expect("the request transaction");
         let enq = txn_body
-            .find("sr_enqueue_committed_receiver_reconciled_split(ack.server.tid.0")
+            .find("sr_enqueue_committed_receiver_reconciled_split(\n                    ack.server.tid.0")
             .expect("the committed enqueue");
         let success = txn_body
             .find("Ok(IpcCallDirectSuccess {")
@@ -101777,7 +101872,7 @@ mod stage200d1_publication_and_guards {
             .expect("registration");
         // Anchor on the actual CALL: the module doc comment names the helper too.
         let enqueue = TXN_SRC
-            .find("self.sr_enqueue_committed_receiver_reconciled_split(ack.server.tid.0")
+            .find("self.sr_enqueue_committed_receiver_reconciled_split(\n                    ack.server.tid.0")
             .expect("enqueue");
         assert!(
             probe < reserve,
@@ -105103,10 +105198,10 @@ mod stage200d0c1_aarch64_exit_prep {
             .split("\n    /// ")
             .next()
             .expect("its body");
-        assert!(seam.contains("current_tid_on(cpu)"));
-        assert!(seam.contains("task_present_anywhere(crate::kernel::ipc::ThreadId(tid))"));
+        assert!(seam.contains("c.current_tid().map(|t| t.0)"));
+        assert!(seam.contains("c.contains_or_current(ThreadId(tid))"));
         assert!(
-            seam.contains("validate_online_cpu(cpu)"),
+            seam.contains("c.validate_online()"),
             "offline-CPU refusal is preserved by the transaction"
         );
         // No general-purpose task-inspection syscall was added for the oracle.
@@ -105476,7 +105571,7 @@ mod stage200d0c1_aarch64_exit_prep {
             .next()
             .expect("its body");
         // Offline/invalid CPU refusal, exact identity, terminal classification, any-runqueue.
-        assert!(seam.contains("validate_online_cpu(cpu)"));
+        assert!(seam.contains("c.validate_online()"));
         assert!(seam.contains("map_err(crate::kernel::boot::map_scheduler_error)"));
         assert!(seam.contains("Some(bound) => bound == asid,"));
         assert!(
@@ -105485,7 +105580,7 @@ mod stage200d0c1_aarch64_exit_prep {
         );
         assert!(seam.contains("crate::kernel::task::TaskStatus::Exited(_)"));
         assert!(seam.contains("crate::kernel::task::TaskStatus::Dead"));
-        assert!(seam.contains("task_present_anywhere(crate::kernel::ipc::ThreadId(tid))"));
+        assert!(seam.contains("c.contains_or_current(ThreadId(tid))"));
         // The consumer still owns every decision and every fatal.
         assert!(cb.contains("if current == Some(tid) {"));
         assert!(cb.contains("EXIT_TASK_EXITING_STILL_CURRENT"));
@@ -106337,8 +106432,8 @@ mod stage200d0d1_riscv_exit_prep {
         // consumer calls exactly once. Absence is still ALL-runqueue, never this CPU's alone.
         assert!(c.contains("post_lock_exit_validation_split(cpu, tid, asid)"));
         let txn = transaction_body();
-        assert!(txn.contains("task_present_anywhere(crate::kernel::ipc::ThreadId(tid))"));
-        assert!(txn.contains("current_tid_on(cpu)"));
+        assert!(txn.contains("c.contains_or_current(ThreadId(tid))"));
+        assert!(txn.contains("c.current_tid().map(|t| t.0)"));
         assert!(txn.contains("Some(bound) => bound == asid,"));
         assert!(c.contains("identity=tid_asid"));
         assert!(c.contains("frame_source=0"));
@@ -106637,12 +106732,14 @@ mod stage200d0d1_riscv_exit_prep {
     #[test]
     fn u3_rank1_precedes_rank2_and_both_stay_held() {
         let txn = transaction_body();
+        // SCHED-LOCK2B: the facts are read in the incarnation's HOME section, whose closure runs
+        // under the home 1L with rank 2 nested (`|c, tcbs|`) — still one snapshot, ascending.
         let rank1 = txn
-            .find("_sched_split(")
-            .expect("rank-1 scheduler acquisition");
+            .find("self.with_incarnation_home_split(tid, 0, |c, tcbs| {")
+            .expect("rank-1 home section");
         let rank2 = txn
-            .find("with_task_tcbs_split_mut")
-            .expect("rank-2 task acquisition");
+            .find("facts_of(tcbs))")
+            .expect("rank-2 task facts nested in it");
         assert!(rank1 < rank2, "canonical order: scheduler(1) then task(2)");
         // The rank-2 acquisition is INSIDE the rank-1 closure: the transaction's single
         // `Ok(PostLockExitValidation` construction comes after it, still within that closure.
@@ -110933,6 +111030,7 @@ mod stage199d_ack_lease_lifecycle {
                     payload_user_len: 64,
                     meta_user_ptr: 0x9100,
                     meta_user_len: 40,
+                    waiter_stamp: 0,
                 },
             )
             .expect("commit");
@@ -111094,6 +111192,7 @@ mod stage199d_ack_lease_lifecycle {
                     payload_user_len: 64,
                     meta_user_ptr: 0x9100,
                     meta_user_len: 40,
+                    waiter_stamp: 0,
                 },
             )
             .expect("commit");
@@ -111179,6 +111278,7 @@ mod stage199d_ack_lease_lifecycle {
                         payload_user_len: 0,
                         meta_user_ptr: 0,
                         meta_user_len: 0,
+                        waiter_stamp: 0,
                     },
                 )
                 .expect("commit");
@@ -111249,6 +111349,7 @@ mod stage199d_ack_lease_lifecycle {
                         payload_user_len: 0,
                         meta_user_ptr: 0,
                         meta_user_len: 0,
+                        waiter_stamp: 0,
                     },
                 )
                 .expect("commit");
@@ -111513,6 +111614,7 @@ mod stage199d_ack_lease_lifecycle {
                         payload_user_len: 0,
                         meta_user_ptr: 0,
                         meta_user_len: 0,
+                        waiter_stamp: 0,
                     },
                 )
                 .expect("commit");
@@ -111577,6 +111679,7 @@ mod stage199d_ack_lease_lifecycle {
                         payload_user_len: 0,
                         meta_user_ptr: 0,
                         meta_user_len: 0,
+                        waiter_stamp: 0,
                     },
                 )
                 .expect("commit");
@@ -115471,7 +115574,7 @@ mod stage199d_remote_wake_authority {
                 .expect("the request transaction"),
         );
         let enqueue = txn_body
-            .find("sr_enqueue_committed_receiver_reconciled_split(ack.server.tid.0, affinity)")
+            .find("sr_enqueue_committed_receiver_reconciled_split(\n                    ack.server.tid.0,\n                    ack.server_incarnation,\n                    affinity,")
             .expect("the committed enqueue");
         let success = txn_body
             .find("Ok(IpcCallDirectSuccess {")
@@ -115615,7 +115718,7 @@ mod stage199d_remote_wake_authority {
                 .expect("the reply transaction"),
         );
         let enq = txn_body
-            .find("sr_enqueue_committed_receiver_reconciled_split(ack.caller.tid.0, affinity)")
+            .find("sr_enqueue_committed_receiver_reconciled_split(\n                    ack.caller.tid.0,\n                    ack.caller_incarnation,\n                    affinity,")
             .expect("the caller enqueue");
         let success = txn_body
             .find("Ok(IpcReplyDirectSuccess {")
@@ -120718,7 +120821,7 @@ mod stage199d_receiver_enqueue_outcome {
     /// The direct-IPC seam: the only one that reconciles. Every membership expectation below
     /// goes through it, because the generic seam deliberately does not.
     fn enqueue_reconciled(k: &SharedKernel, tid: u64, affinity: Option<CpuId>) -> ReceiverEnqueue {
-        k.sr_enqueue_committed_receiver_reconciled_split(tid, affinity)
+        k.sr_enqueue_committed_receiver_reconciled_split(tid, 0, affinity)
     }
 
     /// A rejection with no pre-existing membership — the shape the four non-membership
@@ -120945,9 +121048,17 @@ mod stage199d_receiver_enqueue_outcome {
     /// IPI + retirement marker sit behind `Ok(success)` — so a refused enqueue signals nothing.
     #[test]
     fn no_direct_success_or_wake_work_survives_a_refused_enqueue() {
-        for (direction, success) in [
-            ("ack.server.tid.0", "Ok(IpcCallDirectSuccess {"),
-            ("ack.caller.tid.0", "Ok(IpcReplyDirectSuccess {"),
+        for (direction, stamp, success) in [
+            (
+                "ack.server.tid.0",
+                "ack.server_incarnation",
+                "Ok(IpcCallDirectSuccess {",
+            ),
+            (
+                "ack.caller.tid.0",
+                "ack.caller_incarnation",
+                "Ok(IpcReplyDirectSuccess {",
+            ),
         ] {
             // Whitespace-insensitive: rustfmt reflows the let-else across lines.
             let squashed: alloc::string::String = TXN
@@ -120955,7 +121066,7 @@ mod stage199d_receiver_enqueue_outcome {
                 .collect::<alloc::vec::Vec<_>>()
                 .join(" ");
             let bind = alloc::format!(
-                "let outcome = self.sr_enqueue_committed_receiver_reconciled_split({direction}, affinity); let ReceiverEnqueue::Enqueued {{ cpu: wake_target_cpu, }} = outcome else {{"
+                "let outcome = self.sr_enqueue_committed_receiver_reconciled_split( {direction}, {stamp}, affinity, ); let ReceiverEnqueue::Enqueued {{ cpu: wake_target_cpu, }} = outcome else {{"
             );
             let bind = bind
                 .split_whitespace()
@@ -155216,8 +155327,9 @@ mod u9pagefault3_authenticated_return {
             .next()
             .expect("its body");
         assert!(
-            read.contains("task_incarnation_is_resumable_split_read(tid, entering_asid)")
-                && read.contains("placement_of("),
+            read.contains("self.exact_status_and_home_placement_split(")
+                && read.contains("status_is_resumable(status)")
+                && read.contains("TaskPlacement::Current(on) if on == cpu"),
             "the authority must rest on the exact incarnation AND the scheduler's placement"
         );
     }
@@ -167979,13 +168091,18 @@ mod u9reap1_reap_transaction {
             // The harness models no CPU-loaded roots; teardown always proceeds.
             0
         }
-        fn target_is_scheduled(&self, tid: u64) -> bool {
+        fn target_is_scheduled(&self, tid: u64, _stamp: u64) -> crate::runtime::HomeMembership {
+            use crate::runtime::HomeMembership as M;
             // The injection fires only on the SECOND probe — the one taken under the claim — so
             // the transaction reaches its rollback arm rather than refusing before the claim.
             if self.inject == Inject::ResidentAfterClaim && self.claim_calls > 0 {
-                return true;
+                return M::Present;
             }
-            self.scheduled.contains(&tid)
+            if self.scheduled.contains(&tid) {
+                M::Present
+            } else {
+                M::Absent
+            }
         }
         fn shootdown_cpu_bitmap(&self) -> u64 {
             0b101
@@ -168838,6 +168955,8 @@ mod u9exit1_self_exit_transaction {
         let mut t = ThreadControlBlock::new(ThreadId(tid), Some(Asid((tid + 200) as u16)));
         t.thread_group_id = ThreadGroupId(pid);
         t.status = status;
+        // SCHED-LOCK2B: the harness runs on CPU 0 alone, so every task's home is CPU 0 (H-HOME).
+        t.cpu_affinity = Some(CpuId(0));
         t
     }
 
@@ -168980,24 +169099,47 @@ mod u9exit1_self_exit_transaction {
                 ExitDrainVerdict::Terminal | ExitDrainVerdict::Removed
             )
         }
-        fn tid_placed_anywhere(&mut self, tid: u64) -> bool {
-            self.note("tid_placed_anywhere");
-            self.sched
-                .lock_all()
-                .view()
-                .tid_present_anywhere(ThreadId(tid))
+        fn incarnation_placement(
+            &mut self,
+            tid: u64,
+            stamp: u64,
+        ) -> crate::runtime::HomeMembership {
+            use crate::kernel::task_enqueue::{HomeLookup, home_lookup_locked};
+            use crate::runtime::HomeMembership as M;
+            self.note("incarnation_placement");
+            match home_lookup_locked(&self.tcbs, tid, stamp) {
+                HomeLookup::Home { home, .. } => {
+                    if self
+                        .sched
+                        .lock_all()
+                        .view()
+                        .cpu(home)
+                        .expect("home cpu")
+                        .contains_or_current(ThreadId(tid))
+                    {
+                        M::Present
+                    } else {
+                        M::Absent
+                    }
+                }
+                HomeLookup::Homeless { .. } => M::Absent,
+                HomeLookup::Stale => M::Stale,
+            }
         }
         fn restore_current_exact(
             &mut self,
             cpu: CpuId,
             tid: u64,
+            stamp: u64,
             priority: crate::kernel::scheduler::TaskPriority,
         ) -> bool {
             self.note("restore_current_exact");
-            self.sched
-                .lock_all()
-                .view()
-                .restore_exact_current_on(cpu, ThreadId(tid), priority)
+            crate::kernel::task_enqueue::admit_home_locked(&self.tcbs, tid, stamp, cpu).is_ok()
+                && self.sched.lock_all().view().restore_exact_current_on(
+                    cpu,
+                    ThreadId(tid),
+                    priority,
+                )
         }
         fn publish_advance_for(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
             self.note("publish_advance_for");
@@ -169050,10 +169192,12 @@ mod u9exit1_self_exit_transaction {
                     Some(ThreadId(OTHER_TID))
                 );
             }
+            let stamp = crate::kernel::task_enqueue::incarnation_of_locked(&self.tcbs, tid);
             crate::kernel::boot::cleared_current::clear_current_exact(
                 &mut self.sched.lock_all().view().cpu(cpu).expect("cpu"),
                 tid,
                 asid,
+                stamp,
             )
         }
 
@@ -170431,8 +170575,8 @@ mod u9exit1_self_exit_transaction {
         assert_eq!(h.status_of(1), Some(TaskStatus::Running));
         assert_eq!(h.count("restore_current_exact"), 1);
         // Restoration proved the exact incarnation AND its absence from every CPU before writing.
-        assert!(h.at("victim_is_running_exact") < h.at("tid_placed_anywhere"));
-        assert!(h.at("tid_placed_anywhere") < h.at("restore_current_exact"));
+        assert!(h.at("victim_is_running_exact") < h.at("incarnation_placement"));
+        assert!(h.at("incarnation_placement") < h.at("restore_current_exact"));
         // Nothing is advanced past, so the reservation it took is released.
         assert_eq!(h.queue_advance[0], None);
         assert_eq!(h.exit_deferral[0], None);
@@ -170463,7 +170607,8 @@ mod u9exit1_self_exit_transaction {
     }
 
     /// **A `Runnable` victim that a restart also re-queued** is not restored even though it is
-    /// present and ours: `tid_placed_anywhere` is what refuses it, and it is checked on EVERY CPU.
+    /// present and ours: `incarnation_placement` is what refuses it — on the incarnation's home,
+    /// which by H-HOME (SCHED-LOCK2B) is the only CPU that can hold it.
     ///
     /// U9-EXIT4 §2 extends this to the OTHER settlement. Under U9-EXIT3 the token would happily
     /// publish an advance past this victim — the caller was expected to have asked
@@ -170478,6 +170623,7 @@ mod u9exit1_self_exit_transaction {
             &mut h.sched.lock_all().view().cpu(CPU).expect("cpu"),
             1,
             Some(Asid(201)),
+            0,
         )
         .expect("the exact clear succeeds");
         h.sched
@@ -170674,6 +170820,7 @@ mod u9exit1_self_exit_transaction {
                 &mut h.sched.lock_all().view().cpu(CPU).expect("cpu"),
                 1,
                 Some(Asid(201)),
+                0,
             )
             .unwrap_or_else(|| panic!("{competitor:?}: the exact clear must succeed"));
             assert_eq!(
@@ -170916,6 +171063,7 @@ mod u9exit1_self_exit_transaction {
             &mut h.sched.lock_all().view().cpu(CPU).expect("cpu"),
             1,
             Some(Asid(201)),
+            0,
         );
         assert!(token.is_none());
         assert_eq!(h.current_of(0), Some(2), "tid 2 must still be current");
@@ -170936,6 +171084,7 @@ mod u9exit1_self_exit_transaction {
             &mut h.sched.lock_all().view().cpu(CPU).expect("cpu"),
             1,
             Some(Asid(201)),
+            0,
         )
         .expect("the exact clear succeeds");
         drop(token);
@@ -171176,15 +171325,23 @@ mod u9exit1_self_exit_transaction {
         let running = restore
             .find("victim_is_running_exact(tid, asid)")
             .expect("status");
-        let placed = restore.find("tid_placed_anywhere(tid)").expect("placement");
+        let placed = restore
+            .find("owners.incarnation_placement(tid, self.stamp)")
+            .expect("placement");
         let write = restore
-            .find("owners.restore_current_exact(cpu, tid, priority)")
+            .find("owners.restore_current_exact(cpu, tid, self.stamp, priority)")
             .expect("write");
         assert!(running < placed && placed < write);
-        // The placement question is asked of EVERY CPU, not this one.
+        // SCHED-LOCK2B: the placement question is asked of the cleared incarnation's HOME, under
+        // the stamp the clear captured — and a changed identity is a refusal, never "absent".
         assert!(
-            RUNTIME.contains("tid_present_anywhere(crate::kernel::ipc::ThreadId(tid))"),
-            "the split reader must use the all-CPU predicate"
+            restore.contains("crate::runtime::HomeMembership::Stale => {")
+                && restore.contains("RestoreRefusal::IncarnationGone"),
+            "a replaced incarnation must refuse as gone"
+        );
+        assert!(
+            EXIT_TXN.contains(".incarnation_home_membership_split_read(tid, stamp)"),
+            "the split owner must read the home, not every CPU"
         );
         let anywhere = SCHEDULER
             .split("pub fn tid_present_anywhere(&self, tid: ThreadId) -> bool {")
@@ -171206,7 +171363,7 @@ mod u9exit1_self_exit_transaction {
             .nth(1)
             .expect("the exact running reader");
         let running_reader = &running_reader[..running_reader
-            .find("\n    /// U9-EXIT3 §2 — rank 1: is `tid` current on")
+            .find("\n    /// U9-EXIT3 §2 — is `tid` current on")
             .unwrap_or(running_reader.len())];
         assert!(
             running_reader.contains("t.tid.0 == tid")
@@ -178512,13 +178669,16 @@ mod u9pf1_not_running {
     fn only_current_on_this_cpu_owns_the_entering_frame() {
         let code = seam();
         // The three facts, each from its own owner, and no fourth source of truth.
+        // SCHED-LOCK2B: identity, status and placement come from ONE home section (the
+        // incarnation's home 1L, rank 2 nested), and resumability from the shared predicate.
         assert!(
-            code.contains("self.task_incarnation_is_resumable_split_read(tid, entering_asid)"),
-            "identity and status must come from the EXISTING exact-incarnation owner"
+            code.contains("self.exact_status_and_home_placement_split(")
+                && code.contains("status_is_resumable(status)"),
+            "identity and status must come from the exact-incarnation home owner"
         );
         assert!(
-            code.contains("placement_of(crate::kernel::ipc::ThreadId(tid))"),
-            "placement must come from the scheduler's own placement owner"
+            !code.contains(".with_all_cpus_sched_split("),
+            "placement is read on the home, never through the coherent view"
         );
         // The placement map, exhaustive and with only ONE admitting arm.
         for (arm, verdict) in [
@@ -178555,10 +178715,12 @@ mod u9pf1_not_running {
         );
         // The identity refusal precedes the placement read, so a replacement incarnation is
         // refused before the scheduler is even consulted about it.
+        // SCHED-LOCK2B: identity and placement are one home-section observation; the identity
+        // and status refusals both precede the placement map.
         let ident = code
-            .find("task_incarnation_is_resumable_split_read")
+            .find("status_is_resumable(status)")
             .expect("the identity read");
-        let place = code.find("placement_of(").expect("the placement read");
+        let place = code.find("match placement {").expect("the placement read");
         assert!(
             ident < place,
             "identity is checked first — a replacement that reused the TID must never reach the \
@@ -178692,14 +178854,9 @@ mod u9pf1_not_running {
             0,
             "the rank-2 read is delegated to the owner, not re-implemented here"
         );
-        let ident_end = code
-            .find("return A::Forfeited(R::IncarnationNotResumable);")
-            .expect("the identity refusal");
-        let sched_at = code.find("_sched_split(").expect("the rank-1 acquisition");
-        assert!(
-            ident_end < sched_at,
-            "the rank-2 answer must be complete before the rank-1 acquisition is taken"
-        );
+        // SCHED-LOCK2B: no acquisition is opened here at all; the home owner takes rank 2 for
+        // the home, releases it, then the home 1L with rank 2 nested (ascending).
+        assert_eq!(code.matches("_sched_split(").count(), 0);
     }
 
     // ── the route ────────────────────────────────────────────────────────────────────────────
@@ -185142,6 +185299,7 @@ mod u9_ipc_residual3_reply_settlement {
             payload_user_len: 128,
             meta_user_ptr: 0x5000,
             meta_user_len: 64,
+            caller_incarnation: 0,
         }
     }
 
@@ -188691,8 +188849,9 @@ mod u9_recv_block1_closure {
             .expect("the placement owner");
         let recovery = &recovery[..recovery.len().min(3000)];
         assert!(
-            recovery.contains("placement_of(") && !recovery.contains("task_present_anywhere"),
-            "the outcome comes from `placement_of`, which distinguishes queued from current"
+            recovery.contains(".exact_status_and_home_placement_split(cpu, tid, asid, stamp)")
+                && !recovery.contains("task_present_anywhere"),
+            "the outcome comes from the home placement (SCHED-LOCK2B), which distinguishes queued from current"
         );
     }
 
@@ -204660,7 +204819,7 @@ mod ap_sched4_a {
 
     /// The caller blocks for the reply through the SPLIT receive's three phases (phase C arms).
     fn wait_split(fx: &Fx, deadline: Option<u64>) -> ReplyWaitArm {
-        let (asid, _prio) =
+        let (asid, _prio, _) =
             fx.k.recv_block_phase_a_split(CPU0, 1)
                 .expect("phase A blocks the caller");
         assert_eq!(asid, fx.caller_asid);
@@ -206180,7 +206339,7 @@ mod ipc_displace1 {
         cap: CapId,
         deadline: Option<u64>,
     ) -> (PublishWaiterOutcome, RecvBlockIdentity) {
-        let (asid, priority) = k.recv_block_phase_a_split(cpu, tid).expect("phase A");
+        let (asid, priority, _) = k.recv_block_phase_a_split(cpu, tid).expect("phase A");
         let wait_generation = k
             .recv_block_phase_b_split(tid, asid, cap, deadline, None)
             .expect("phase B");
@@ -206201,6 +206360,7 @@ mod ipc_displace1 {
                 asid,
                 priority,
                 wait_generation,
+                stamp: 0,
             },
         )
     }

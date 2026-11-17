@@ -243,7 +243,14 @@ impl SharedKernel {
             // Stage 199D: `Blocked` + an intact waiter is NOT sufficient. A task that is also
             // queued or current is in an inconsistent state, and re-arming an acknowledgement
             // against it would hand that state to the next drain.
-            && !self.receiver_has_scheduler_membership_split_read(ack.server.tid.0)
+            //
+            // SCHED-LOCK2B: on the acknowledged incarnation's home alone, against its stamp. A
+            // `Stale` answer (TID reused, same address space included) is not "absent": the
+            // acknowledgement then describes no live server and is discarded.
+            && self.incarnation_home_membership_split_read(
+                ack.server.tid.0,
+                ack.server_incarnation,
+            ) == crate::runtime::HomeMembership::Absent
     }
 
     /// Stage 199D — the COMPLETE rollback of a direct-request publication that has already
@@ -424,13 +431,26 @@ impl SharedKernel {
         // INVARIANT VIOLATION, not a retryable `WouldBlock`. Nothing has been mutated, so there
         // is nothing to unwind; the acknowledgement is DISCARDED rather than re-armed, because
         // re-arming would hand the same broken state to the next drain.
-        if self.receiver_has_scheduler_membership_split_read(ack.server.tid.0) {
-            lease.discard();
-            crate::yarm_log!(
-                "IPC_DIRECT_REQUEST_MEMBERSHIP_VIOLATION server_tid={} phase=pre_mutation result=failed_closed",
-                ack.server.tid.0
-            );
-            return Err(IpcCallDirectError::ReceiverMembershipViolation);
+        //
+        // SCHED-LOCK2B: answered on the server incarnation's HOME alone (one 1L, rank 2 nested)
+        // against the stamp the acknowledgement carries, instead of a 64-cell scan. By H-HOME
+        // (§20.5) a membership can only be there. A changed identity is the same non-mutating
+        // refusal as a server that is no longer exactly blocked at (4): settle and `WouldBlock`.
+        match self.incarnation_home_membership_split_read(ack.server.tid.0, ack.server_incarnation)
+        {
+            crate::runtime::HomeMembership::Absent => {}
+            crate::runtime::HomeMembership::Present => {
+                lease.discard();
+                crate::yarm_log!(
+                    "IPC_DIRECT_REQUEST_MEMBERSHIP_VIOLATION server_tid={} phase=pre_mutation result=failed_closed",
+                    ack.server.tid.0
+                );
+                return Err(IpcCallDirectError::ReceiverMembershipViolation);
+            }
+            crate::runtime::HomeMembership::Stale => {
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
+                return Err(IpcCallDirectError::WouldBlock);
+            }
         }
 
         // (4b) Stage 200D-1: RESERVE reverse-link capacity BEFORE anything becomes
@@ -633,8 +653,13 @@ impl SharedKernel {
                 }
                 // (12) scheduler enqueue LAST — the single wake. It reports what it ACTUALLY
                 //      did, and only `Enqueued` may become this success's wake target.
-                let outcome =
-                    self.sr_enqueue_committed_receiver_reconciled_split(ack.server.tid.0, affinity);
+                // SCHED-LOCK2B: admitted against the acknowledged server's stamp, under the
+                // committing 1L.
+                let outcome = self.sr_enqueue_committed_receiver_reconciled_split(
+                    ack.server.tid.0,
+                    ack.server_incarnation,
+                    affinity,
+                );
                 let ReceiverEnqueue::Enqueued {
                     cpu: wake_target_cpu,
                 } = outcome
@@ -866,7 +891,11 @@ impl SharedKernel {
             )
             // Stage 199D: see `direct_server_exact_still_blocked` — scheduler membership
             // disqualifies restoration even with a Blocked status and an intact waiter.
-            && !self.receiver_has_scheduler_membership_split_read(ack.caller.tid.0)
+            // SCHED-LOCK2B: home-scoped, against the acknowledged caller's stamp.
+            && self.incarnation_home_membership_split_read(
+                ack.caller.tid.0,
+                ack.caller_incarnation,
+            ) == crate::runtime::HomeMembership::Absent
     }
 
     /// Run the composed off-lock NR7 direct reply transaction. `lease` must already be
@@ -916,13 +945,25 @@ impl SharedKernel {
         // (4) writes the caller's user memory; a check after either cannot support authority
         // restoration, because a `RefusedCurrent` caller may already have read the reply.
         // Nothing is mutated here, so nothing is unwound; the acknowledgement is DISCARDED.
-        if self.receiver_has_scheduler_membership_split_read(ack.caller.tid.0) {
-            lease.discard();
-            crate::yarm_log!(
-                "IPC_DIRECT_REPLY_MEMBERSHIP_VIOLATION caller_tid={} phase=pre_mutation result=failed_closed",
-                ack.caller.tid.0
-            );
-            return Err(IpcReplyDirectError::ReceiverMembershipViolation);
+        //
+        // SCHED-LOCK2B: the caller incarnation's home alone, against the acknowledged stamp. A
+        // changed identity means the waiter this acknowledgement names is gone — the same
+        // non-mutating `WaiterLost` as (2).
+        match self.incarnation_home_membership_split_read(ack.caller.tid.0, ack.caller_incarnation)
+        {
+            crate::runtime::HomeMembership::Absent => {}
+            crate::runtime::HomeMembership::Present => {
+                lease.discard();
+                crate::yarm_log!(
+                    "IPC_DIRECT_REPLY_MEMBERSHIP_VIOLATION caller_tid={} phase=pre_mutation result=failed_closed",
+                    ack.caller.tid.0
+                );
+                return Err(IpcReplyDirectError::ReceiverMembershipViolation);
+            }
+            crate::runtime::HomeMembership::Stale => {
+                self.settle_reply_pre_reserve(ack, lease, lease_commit_seq);
+                return Err(IpcReplyDirectError::WaiterLost);
+            }
         }
 
         // (3) reserve the EXISTING record Available→Reserved (bound replier + exact
@@ -1078,8 +1119,12 @@ impl SharedKernel {
                 }
                 // (8) enqueue the caller LAST — the single wake. It reports what it ACTUALLY
                 //     did, and only `Enqueued` may become this success's wake target.
-                let outcome =
-                    self.sr_enqueue_committed_receiver_reconciled_split(ack.caller.tid.0, affinity);
+                // SCHED-LOCK2B: admitted against the acknowledged caller's stamp.
+                let outcome = self.sr_enqueue_committed_receiver_reconciled_split(
+                    ack.caller.tid.0,
+                    ack.caller_incarnation,
+                    affinity,
+                );
                 let ReceiverEnqueue::Enqueued {
                     cpu: wake_target_cpu,
                 } = outcome

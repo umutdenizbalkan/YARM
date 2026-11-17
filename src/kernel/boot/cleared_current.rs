@@ -146,11 +146,20 @@ pub(crate) trait ClearedCurrentOwners {
     /// Anything else must not be advanced through, because the drain would refuse and the CPU
     /// would be left with an empty current slot and no selection.
     fn victim_is_drain_honourable(&mut self, tid: u64, asid: Option<Asid>) -> bool;
-    /// rank 1 — is `tid` current on, or queued on, ANY CPU?
-    fn tid_placed_anywhere(&mut self, tid: u64) -> bool;
-    /// rank 1 — restore this exact task as `cpu`'s current at `priority`. `false` if the
-    /// scheduler refused, which it does unless the slot is still empty and the task unqueued.
-    fn restore_current_exact(&mut self, cpu: CpuId, tid: u64, priority: TaskPriority) -> bool;
+    /// SCHED-LOCK2B — is incarnation `stamp` of `tid` current on, or queued on, any CPU? Read on
+    /// its home alone (rank 2, then the home's 1L with rank 2 nested; H-HOME, §20.5). `Stale`
+    /// means the incarnation the token cleared is no longer what the TID names.
+    fn incarnation_placement(&mut self, tid: u64, stamp: u64) -> crate::runtime::HomeMembership;
+    /// rank 1 (+2 nested) — restore this exact incarnation as `cpu`'s current at `priority`.
+    /// `false` if the scheduler refused, which it does unless the slot is still empty and the task
+    /// unqueued, or if `stamp` no longer names the TID's incarnation on its home `cpu`.
+    fn restore_current_exact(
+        &mut self,
+        cpu: CpuId,
+        tid: u64,
+        stamp: u64,
+        priority: TaskPriority,
+    ) -> bool;
     /// Name the exact incarnation this CPU's already-reserved deferral advances past. `false`
     /// means one is already published, which is a duplicate.
     fn publish_advance_for(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool;
@@ -168,6 +177,10 @@ pub(crate) struct ClearedCurrentToken {
     tid: u64,
     asid: Option<Asid>,
     priority: TaskPriority,
+    /// SCHED-LOCK2B — the stamp of the incarnation the clear removed, read under the clear's own
+    /// 1L with rank 2 nested, while the slot still named it: the authority every later placement
+    /// read and the restore are bound to.
+    stamp: u64,
     /// U9-EXIT4 §3 — has one of the three settlements run? Private, never read outside this module,
     /// and the ONLY thing that defuses [`Drop`]. It replaces U9-EXIT3's `core::mem::forget(self)`
     /// so that no abandonment primitive appears anywhere in the crate for this type.
@@ -238,10 +251,18 @@ impl ClearedCurrentToken {
             };
             return Err((self, refusal));
         }
-        if owners.tid_placed_anywhere(tid) {
-            return Err((self, RestoreRefusal::PlacedElsewhere));
+        // SCHED-LOCK2B: the cleared incarnation's own stamp, on its home. A changed identity is the
+        // gone refusal, never "absent".
+        match owners.incarnation_placement(tid, self.stamp) {
+            crate::runtime::HomeMembership::Absent => {}
+            crate::runtime::HomeMembership::Present => {
+                return Err((self, RestoreRefusal::PlacedElsewhere));
+            }
+            crate::runtime::HomeMembership::Stale => {
+                return Err((self, RestoreRefusal::IncarnationGone));
+            }
         }
-        if !owners.restore_current_exact(cpu, tid, priority) {
+        if !owners.restore_current_exact(cpu, tid, self.stamp, priority) {
             return Err((self, RestoreRefusal::SchedulerRefused));
         }
         crate::yarm_log!(
@@ -374,10 +395,14 @@ impl AdvanceAuthority<'_> {
 ///
 /// SCHED-LOCK1: `view` is `cpu`'s own state under its 1L; the token names the CPU that view was
 /// built for, so no token can name a CPU whose lock the clear did not hold.
+///
+/// SCHED-LOCK2B: `stamp` is the incarnation stamp read in the SAME section (rank 2 nested in
+/// `cpu`'s 1L) — the slot names `tid`, so the TCB is the entering incarnation's.
 pub(crate) fn clear_current_exact(
     view: &mut crate::kernel::scheduler::CpuView<'_>,
     tid: u64,
     asid: Option<Asid>,
+    stamp: u64,
 ) -> Option<ClearedCurrentToken> {
     let cpu = view.cpu();
     let priority = view.block_current_exact(crate::kernel::ipc::ThreadId(tid))?;
@@ -386,6 +411,7 @@ pub(crate) fn clear_current_exact(
         tid,
         asid,
         priority,
+        stamp,
         // U9-EXIT4 §3: a freshly minted token is an unsettled obligation. Nothing outside this
         // module can construct one, and nothing anywhere can set this field except `settle`.
         settled: false,

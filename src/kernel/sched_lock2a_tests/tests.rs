@@ -353,14 +353,14 @@ fn sl2a_an_off_home_exact_current_restore_is_refused() {
             None
         );
     }
-    assert!(!k.restore_current_exact_split(CpuId(0), 94_001, TaskPriority::Normal));
+    assert!(!k.restore_current_exact_split(CpuId(0), 94_001, 0, TaskPriority::Normal));
     assert_eq!(
         k.with_cpu_sched_split(CpuId(0), |c| c.current_tid())
             .unwrap(),
         None,
         "CPU 0's current slot is untouched"
     );
-    assert!(k.restore_current_exact_split(CpuId(1), 94_001, TaskPriority::Normal));
+    assert!(k.restore_current_exact_split(CpuId(1), 94_001, 0, TaskPriority::Normal));
     assert_eq!(
         k.with_cpu_sched_split(CpuId(1), |c| c.current_tid())
             .unwrap(),

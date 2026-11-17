@@ -678,16 +678,19 @@ impl ClearedCurrentOwners for SharedExitOwners<'_> {
             V::Terminal | V::Removed
         )
     }
-    fn tid_placed_anywhere(&mut self, tid: u64) -> bool {
-        self.shared.tid_placed_anywhere_split(tid)
+    fn incarnation_placement(&mut self, tid: u64, stamp: u64) -> crate::runtime::HomeMembership {
+        self.shared
+            .incarnation_home_membership_split_read(tid, stamp)
     }
     fn restore_current_exact(
         &mut self,
         cpu: CpuId,
         tid: u64,
+        stamp: u64,
         priority: crate::kernel::scheduler::TaskPriority,
     ) -> bool {
-        self.shared.restore_current_exact_split(cpu, tid, priority)
+        self.shared
+            .restore_current_exact_split(cpu, tid, stamp, priority)
     }
     fn publish_advance_for(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
         crate::kernel::boot::exit_queue_advance_publish(cpu.0 as usize, tid, asid)

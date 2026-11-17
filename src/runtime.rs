@@ -1048,6 +1048,61 @@ impl DequeuedDispatchMarkToken {
     }
 }
 
+/// The resumable statuses of the entering-frame and receive-unwind readers: `Runnable | Running`
+/// (the predicate `task_incarnation_is_resumable_split_read` applies), never `Blocked`,
+/// `Reserved`, `Faulted`, `Exited` or `Dead`.
+fn status_is_resumable(status: crate::kernel::task::TaskStatus) -> bool {
+    matches!(
+        status,
+        crate::kernel::task::TaskStatus::Runnable | crate::kernel::task::TaskStatus::Running
+    )
+}
+
+/// SCHED-LOCK2B — what [`SharedKernel::with_incarnation_home_split`] ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomeSection<R> {
+    /// `read` was taken under `home`'s 1L with incarnation `stamp` still homed there (rank 2
+    /// nested).
+    Home { home: CpuId, stamp: u64, read: R },
+    /// Rank 2 showed incarnation `stamp` with no home: placed nowhere (H-HOME). Nothing ran.
+    Homeless { stamp: u64 },
+    /// No TCB (TID 0 and kernel threads have none), a different incarnation than the caller's
+    /// stamp, or the incarnation changed before its home 1L was held. Nothing ran.
+    Stale,
+}
+
+/// SCHED-LOCK2B — an exact incarnation's placement, read on its home alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomePlacement {
+    /// The same four shapes `SmpScheduler::placement_of` reported; any CPU named is the home.
+    /// A homeless incarnation is `On(Nowhere)`.
+    On(crate::kernel::scheduler::TaskPlacement),
+    /// The identity is missing or changed; nothing about the caller's incarnation was observed.
+    Stale,
+}
+
+/// SCHED-LOCK2B — membership of one exact incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomeMembership {
+    /// Neither queued nor current (on its home, hence anywhere), or homeless.
+    Absent,
+    /// Queued, current, or both, on its home.
+    Present,
+    /// Missing or changed identity: the caller's stale or refusal outcome applies.
+    Stale,
+}
+
+impl HomeMembership {
+    pub(crate) fn of(placement: HomePlacement) -> Self {
+        use crate::kernel::scheduler::TaskPlacement;
+        match placement {
+            HomePlacement::On(TaskPlacement::Nowhere) => Self::Absent,
+            HomePlacement::On(_) => Self::Present,
+            HomePlacement::Stale => Self::Stale,
+        }
+    }
+}
+
 /// The coherent rank-1 → rank-2 snapshot taken by
 /// [`SharedKernel::post_lock_exit_validation_split`].
 ///
@@ -1835,16 +1890,26 @@ impl SharedKernel {
             EnteringFrameAuthority as A, FrameForfeitReason as R,
         };
 
-        // Rank 2 first: identity and status, one acquisition, through the existing owner.
-        if !self.task_incarnation_is_resumable_split_read(tid, entering_asid) {
+        // SCHED-LOCK2B: identity, status and placement in ONE home section (rank 2 for the home,
+        // released; the home's 1L with rank 2 nested), instead of rank 2 and then the coherent
+        // all-CPU view. By H-HOME the home's 1L shows every placement the incarnation has, so the
+        // five verdicts are the ones the coherent read gave, with any CPU named being the home.
+        //
+        // The identity is `{tid, asid}` as captured at trap entry, with the stamp pinned at the
+        // home lookup and revalidated under the home 1L. Why that is enough: only
+        // `OwnsEnteringFrame` grants anything, and it requires the incarnation to be `Current` on
+        // THIS CPU. This CPU's current slot is installed only by this CPU's own dispatch or exact
+        // restore, and this CPU is executing this trap; so a replacement that reused the TID
+        // cannot have been made current here since entry, and any other replacement yields a
+        // forfeiting verdict, which fails closed.
+        let Some((status, placement)) =
+            self.exact_status_and_home_placement_split(cpu, tid, entering_asid, 0)
+        else {
+            return A::Forfeited(R::IncarnationNotResumable);
+        };
+        if !status_is_resumable(status) {
             return A::Forfeited(R::IncarnationNotResumable);
         }
-        // Rank 1: where the scheduler actually has it. Ranks are taken 2 then 1 with NO nesting —
-        // the rank-2 acquisition above has been released before this one is taken.
-        // SCHED-LOCK1: `placement_of` is a COHERENT all-CPU answer (§16.1) — every 1L, ascending.
-        let placement = self.with_all_cpus_sched_split(|sched| {
-            sched.placement_of(crate::kernel::ipc::ThreadId(tid))
-        });
         match placement {
             TaskPlacement::Current(on) if on == cpu => A::OwnsEnteringFrame,
             TaskPlacement::Current(_) => A::Forfeited(R::CurrentOnAnotherCpu),
@@ -3384,9 +3449,12 @@ impl SharedKernel {
         asid: Option<crate::kernel::vm::Asid>,
     ) -> Option<crate::kernel::boot::cleared_current::ClearedCurrentToken> {
         // SCHED-LOCK1: `cpu`'s own 1L; the token names the CPU whose lock the clear held.
-        self.with_cpu_sched_split(cpu, |c| {
+        // SCHED-LOCK2B: rank 2 nested (ascending) for the stamp, read while the slot still names
+        // `tid` — the one instant at which the TCB is certainly the entering incarnation's.
+        self.with_cpu_sched_and_tcbs_split(cpu, |c, tcbs| {
             c.validate_online().ok()?;
-            crate::kernel::boot::cleared_current::clear_current_exact(c, tid, asid)
+            let stamp = crate::kernel::task_enqueue::incarnation_of_locked(tcbs, tid);
+            crate::kernel::boot::cleared_current::clear_current_exact(c, tid, asid, stamp)
         })
         .ok()
         .flatten()
@@ -3407,26 +3475,34 @@ impl SharedKernel {
         })
     }
 
-    /// U9-EXIT3 §2 — rank 1: is `tid` current on, or queued on, ANY CPU?
+    /// U9-EXIT3 §2 — is `tid` current on, or queued on, ANY CPU?
     ///
-    /// SCHED-LOCK1: the restore precondition is a COHERENT all-CPU answer (§16.1), so it takes
-    /// every 1L in ascending order. Exit is rare; no ordinary dispatch path reaches this.
+    /// SCHED-LOCK2B: no longer the coherent all-CPU view. The exit token's restore precondition is
+    /// [`Self::incarnation_home_membership_split_read`] against the stamp the clear captured; this
+    /// numeric-TID form remains for hosted fixtures and answers through the same home section
+    /// (`Stale` — no TCB — reads as not placed, exactly as an absent TID did).
+    #[cfg(test)]
     pub(crate) fn tid_placed_anywhere_split(&self, tid: u64) -> bool {
-        self.with_all_cpus_sched_split(|sched| {
-            sched.tid_present_anywhere(crate::kernel::ipc::ThreadId(tid))
-        })
+        self.incarnation_home_membership_split_read(tid, 0) == HomeMembership::Present
     }
 
     /// U9-EXIT3 §2 — rank 1: the exact inverse of `clear_current_exact_split`.
+    ///
+    /// SCHED-LOCK2B: bound to the caller's `stamp` — the exit token's (captured at its clear) or
+    /// the receive family's entering incarnation (captured while it was this CPU's current). A TID
+    /// reused since, inside the same address space included, is refused `Stale` by the admission
+    /// under this same 1L, and nothing is restored. `0` admits the TID's current incarnation
+    /// (hosted fixtures only).
     pub(crate) fn restore_current_exact_split(
         &self,
         cpu: CpuId,
         tid: u64,
+        stamp: u64,
         priority: crate::kernel::scheduler::TaskPriority,
     ) -> bool {
         // SCHED-LOCK1: `cpu`'s own 1L. SCHED-LOCK2A: only the incarnation's home restores it.
         self.with_cpu_sched_and_tcbs_split(cpu, |c, tcbs| {
-            crate::kernel::task_enqueue::admit_home_locked(tcbs, tid, 0, cpu).is_ok()
+            crate::kernel::task_enqueue::admit_home_locked(tcbs, tid, stamp, cpu).is_ok()
                 && c.restore_exact_current(crate::kernel::ipc::ThreadId(tid), priority)
         })
         .unwrap_or(false)
@@ -5610,43 +5686,79 @@ impl SharedKernel {
         tid: u64,
         asid: crate::kernel::vm::Asid,
     ) -> Result<PostLockExitValidation, KernelError> {
-        // SCHED-LOCK1: `in_runqueue` is an "anywhere" fact read together with `cpu`'s current
-        // slot and (nested) the task facts — a COHERENT observation, so this rare exit-settlement
-        // path takes the coherent all-CPU view (1G, every 1L ascending), then rank 2.
-        self.with_all_cpus_sched_split(|sched| {
-            sched
-                .validate_online_cpu(cpu)
-                .map_err(crate::kernel::boot::map_scheduler_error)?;
-            let current = sched.current_tid_on(cpu).map(|t| t.0);
-            let in_runqueue = sched.task_present_anywhere(crate::kernel::ipc::ThreadId(tid));
-            // Rank 2 nested here, with the rank-1 guard above still held: the scheduler facts
-            // and the task facts are one coherent observation, not two that can tear.
-            let (identity_ok, terminal) = self.with_task_tcbs_split_mut(|tcbs| {
-                match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
-                    // FULL incarnation: a numeric TID match alone would let a restarted task
-                    // satisfy a stale disposition, so the ASID recorded at publication must
-                    // still be bound to that TID.
-                    Some(tcb) => (
-                        match tcb.asid {
-                            Some(bound) => bound == asid,
-                            None => true,
-                        },
-                        matches!(
-                            tcb.status,
-                            crate::kernel::task::TaskStatus::Exited(_)
-                                | crate::kernel::task::TaskStatus::Dead
-                        ),
+        // SCHED-LOCK2B: no coherent all-CPU view. The exiting incarnation is read on its HOME
+        // alone (rank 2 for the home, released; the home's 1L with rank 2 nested), where H-HOME
+        // (§20.5) puts every placement it can have — an exited entry still queued included.
+        //
+        // * home == `cpu` (every production exit: the task trapped here, so it was current here,
+        //   on its home): ONE section answers all four facts, exactly as coherent as before.
+        // * home != `cpu`, or homeless, or the TID replaced between the steps: `cpu`'s current
+        //   slot is read under `cpu`'s OWN 1L, separately. That observation is sufficient for this
+        //   caller. `current == Some(tid)` there is the only non-home placement that matters to
+        //   this trap — it is the slot this trap returns through — and it fails closed as
+        //   `EXIT_TASK_EXITING_STILL_CURRENT`. The replacement it names is not trusted either:
+        //   `post_exit_replacement_restore_split` re-resolves `cpu`'s current under `cpu`'s 1L and
+        //   refuses a disagreement.
+        //
+        // The stamp is pinned at the home lookup (the disposition names `{tid, asid}`). That is
+        // enough because the only verdict that lets the caller proceed is "terminal, identity
+        // intact, placed nowhere", and each half is monotone for an exited incarnation: it never
+        // leaves `Exited`/`Dead`, nothing re-places it, and a reaped one is absent by the
+        // reaper's own proof. So an answer about a replacement that passes is also true of the
+        // exiting incarnation.
+        use crate::kernel::ipc::ThreadId;
+        let facts_of = |tcbs: &[Option<crate::kernel::task::ThreadControlBlock>]| {
+            match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
+                // FULL incarnation: a numeric TID match alone would let a restarted task satisfy a
+                // stale disposition, so the ASID recorded at publication must still be bound to
+                // that TID.
+                Some(tcb) => (
+                    match tcb.asid {
+                        Some(bound) => bound == asid,
+                        None => true,
+                    },
+                    matches!(
+                        tcb.status,
+                        crate::kernel::task::TaskStatus::Exited(_)
+                            | crate::kernel::task::TaskStatus::Dead
                     ),
-                    // TCB gone entirely: identity-safe and terminal.
-                    None => (true, true),
-                }
-            });
-            Ok(PostLockExitValidation {
-                current,
-                identity_ok,
-                terminal,
-                in_runqueue,
-            })
+                ),
+                // TCB gone entirely: identity-safe and terminal.
+                None => (true, true),
+            }
+        };
+        let section = self.with_incarnation_home_split(tid, 0, |c, tcbs| {
+            let current_here = (c.cpu() == cpu)
+                .then(|| c.validate_online().map(|()| c.current_tid().map(|t| t.0)));
+            (
+                current_here,
+                c.contains_or_current(ThreadId(tid)),
+                facts_of(tcbs),
+            )
+        });
+        let (current_here, in_runqueue, (identity_ok, terminal)) = match section {
+            HomeSection::Home { read, .. } => read,
+            // Placed nowhere (homeless), or no TCB / replaced: the task facts from one rank-2 read.
+            HomeSection::Homeless { .. } | HomeSection::Stale => (
+                None,
+                false,
+                self.with_task_tcbs_split_mut(|tcbs| facts_of(tcbs)),
+            ),
+        };
+        let current = match current_here {
+            Some(read) => read.map_err(crate::kernel::boot::map_scheduler_error)?,
+            None => self
+                .with_cpu_sched_split(cpu, |c| {
+                    c.validate_online().map(|()| c.current_tid().map(|t| t.0))
+                })
+                .and_then(|r| r)
+                .map_err(crate::kernel::boot::map_scheduler_error)?,
+        };
+        Ok(PostLockExitValidation {
+            current,
+            identity_ok,
+            terminal,
+            in_runqueue,
         })
     }
 
@@ -7226,6 +7338,7 @@ impl SharedKernel {
     ) -> Option<(
         crate::kernel::vm::Asid,
         crate::kernel::scheduler::TaskPriority,
+        u64,
     )> {
         // U9-RECV-BLOCK1 §3 — COMPARE, then clear. Never the other way round.
         //
@@ -7259,18 +7372,25 @@ impl SharedKernel {
         // CPU requires running on it — which this trap is what is doing. So the value read here
         // is the incarnation the trap entered from, and the clear below either removes exactly
         // that task or removes nothing.
-        let entering_asid = self
-            .task_asid_opt_split_read(expected_tid)
-            .unwrap_or(crate::kernel::vm::Asid(0));
+        //
+        // SCHED-LOCK2B: the ASID and the incarnation stamp are read in ONE section — `cpu`'s 1L
+        // with rank 2 nested (ascending) — together with the compare-and-clear itself, so both
+        // describe the task the slot named at the instant it was cleared, with no window at all.
         // SCHED-LOCK1: `cpu`'s own 1L; the retired ambient bind is gone.
-        let priority = self
-            .with_cpu_sched_split(cpu, |c| {
+        let cleared = self
+            .with_cpu_sched_and_tcbs_split(cpu, |c, tcbs| {
                 c.validate_online().ok()?;
+                let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == expected_tid);
+                let entering_asid = tcb
+                    .and_then(|t| t.asid)
+                    .unwrap_or(crate::kernel::vm::Asid(0));
+                let stamp = crate::kernel::task_enqueue::incarnation_of_locked(tcbs, expected_tid);
                 c.block_current_exact(crate::kernel::ipc::ThreadId(expected_tid))
+                    .map(|priority| (entering_asid, priority, stamp))
             })
             .ok()
             .flatten();
-        let Some(priority) = priority else {
+        let Some((entering_asid, priority, stamp)) = cleared else {
             crate::yarm_log!(
                 "D2_RECV_SPLIT_REFUSED cpu={} phase=a reason=victim_changed expected={} removed=none",
                 cpu.0,
@@ -7279,7 +7399,7 @@ impl SharedKernel {
             return None;
         };
         crate::yarm_log!("SCHED_BLOCK tid={}", expected_tid);
-        Some((entering_asid, priority))
+        Some((entering_asid, priority, stamp))
     }
 
     /// U9-RX3 — Phase B twin (task, rank 2): mint the FRESH wait generation, mark the receiver
@@ -7672,6 +7792,7 @@ impl SharedKernel {
             tid,
             asid,
             priority,
+            stamp,
         } = incarnation;
 
         // (1) rank 1 — the PROVISIONAL placement.
@@ -7682,7 +7803,8 @@ impl SharedKernel {
         // `ipc_timeout_deadline`, so on a multi-CPU boot the deadline scan may have woken and
         // enqueued this exact task since Phase A cleared it. That reachable refusal is the
         // preempt-and-prefer primitive's exact job, and its RESULT is checked.
-        let via = if self.restore_current_exact_split(cpu, tid, priority) {
+        // SCHED-LOCK2B: bound to the entering stamp — a TID reused since Phase A is refused there.
+        let via = if self.restore_current_exact_split(cpu, tid, stamp, priority) {
             "exact"
         } else {
             match self.on_preempt_prefer_on_cpu_split(cpu, tid) {
@@ -7690,7 +7812,13 @@ impl SharedKernel {
                 other => {
                     // Neither placement recovery applied, and NOTHING was written. Report where
                     // the task actually is; the caller decides what that state owes.
-                    let observed = self.recv_unwind_placement_outcome_split(tid, asid, "placement");
+                    let observed = self.recv_unwind_placement_outcome_split(
+                        cpu,
+                        tid,
+                        asid,
+                        stamp,
+                        "placement",
+                    );
                     crate::yarm_log!(
                         "D2_RECV_SPLIT_UNWIND_FAIL tid={} asid={} phase=a reason=placement_taken observed={:?} outcome={}",
                         tid,
@@ -7715,15 +7843,20 @@ impl SharedKernel {
             // compares equal to what the trap entered with. `apply_task_transition` is then given
             // the TCB's own `Option<Asid>`, so its exact check runs against the value this
             // closure has just authenticated rather than against a re-read.
-            let Some((observed_asid, status)) = tcbs
+            let Some((observed_asid, status, observed_stamp)) = tcbs
                 .iter()
                 .flatten()
                 .find(|t| t.tid.0 == tid)
-                .map(|t| (t.asid, t.status))
+                .map(|t| (t.asid, t.status, t.incarnation))
             else {
                 return Err(TransitionRefusal::TaskMissing);
             };
-            if observed_asid.unwrap_or(crate::kernel::vm::Asid(0)) != asid {
+            // SCHED-LOCK2B: `{tid, asid}` cannot see a TID reused inside the same address space;
+            // the entering stamp can. A preempt-and-prefer above may have installed whatever this
+            // CPU had queued under the TID, so the commit is where that is refused.
+            if observed_asid.unwrap_or(crate::kernel::vm::Asid(0)) != asid
+                || (stamp != 0 && observed_stamp != stamp)
+            {
                 return Err(TransitionRefusal::IncarnationMismatch {
                     observed: observed_asid,
                 });
@@ -7790,8 +7923,13 @@ impl SharedKernel {
                     },
                 )
             });
-            let observed =
-                self.recv_unwind_placement_outcome_split(tid, asid, "placement_disagree");
+            let observed = self.recv_unwind_placement_outcome_split(
+                cpu,
+                tid,
+                asid,
+                stamp,
+                "placement_disagree",
+            );
             crate::yarm_log!(
                 "D2_RECV_SPLIT_UNWIND_FAIL tid={} asid={} phase=a reason=placement_disagree via={} outcome={}",
                 tid,
@@ -7824,13 +7962,22 @@ impl SharedKernel {
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     fn recv_unwind_placement_outcome_split(
         &self,
+        cpu: CpuId,
         tid: u64,
         asid: crate::kernel::vm::Asid,
+        stamp: u64,
         phase: &'static str,
     ) -> crate::kernel::recv_waiter_split::RecvUnwindOutcome {
         use crate::kernel::recv_waiter_split::RecvUnwindOutcome as U;
         use crate::kernel::scheduler::TaskPlacement;
-        if !self.task_incarnation_is_resumable_split_read(tid, asid) {
+        // SCHED-LOCK2B: the entering incarnation's stamp (captured by Phase A, or by the futex
+        // park's clear) and its home section — identity, `Runnable | Running` and placement read
+        // together under the home 1L with rank 2 nested — replace rank 2 then the coherent view.
+        // A missing or replaced incarnation is `IncarnationMoved`, exactly as before.
+        let observed = self
+            .exact_status_and_home_placement_split(cpu, tid, asid, stamp)
+            .filter(|(status, _)| status_is_resumable(*status));
+        let Some((_, placement)) = observed else {
             crate::yarm_log!(
                 "D2_RECV_SPLIT_UNWIND_MOVED tid={} asid={} phase={}",
                 tid,
@@ -7838,11 +7985,7 @@ impl SharedKernel {
                 phase
             );
             return U::IncarnationMoved;
-        }
-        // SCHED-LOCK1: a COHERENT all-CPU placement (§16.1) — rare unwind settlement.
-        let placement = self.with_all_cpus_sched_split(|sched| {
-            sched.placement_of(crate::kernel::ipc::ThreadId(tid))
-        });
+        };
         let outcome = match placement {
             TaskPlacement::Queued(cpu) => U::QueuedRunnable(cpu),
             TaskPlacement::Current(cpu) | TaskPlacement::CurrentAndQueued(cpu) => {
@@ -17262,7 +17405,10 @@ impl SharedKernel {
         self.with_task_tcbs_split_mut(|tcbs| {
             crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid)
         });
-        self.enqueue_committed_receiver_inner(tid, priority, affinity, false)
+        // SCHED-LOCK2B: the generic seam's callers (the queued-reply wake, hosted fixtures) hold
+        // the receiver as a rank-3 waiter record `{tid, asid}` with no stamp, so this admits the
+        // incarnation the TID names at the committing 1L (`0`), as SCHED-LOCK2A did.
+        self.enqueue_committed_receiver_inner(tid, 0, priority, affinity, false)
     }
 
     /// rank 1 — Stage 199D: the **direct-IPC-only** enqueue seam. Identical to
@@ -17272,9 +17418,16 @@ impl SharedKernel {
     /// Withdrawing a pre-existing scheduler entry is a real side effect, and only NR6/NR7 own a
     /// rollback that can complete it. It is therefore a separate seam rather than a flag: the
     /// shared-region finalizer literally cannot select it, because it calls the other function.
+    ///
+    /// SCHED-LOCK2B: `stamp` is the incarnation the direct transaction's acknowledgement carries
+    /// (captured when the receiver's receive entered). The home binding and the admission under
+    /// the committing 1L both refuse any other incarnation, so a TID reused since — inside the same
+    /// address space included — is never bound a home or placed by this transaction; the refusal
+    /// is the existing `Rejected { CpuOffline }` and the caller's rollback runs.
     pub(crate) fn sr_enqueue_committed_receiver_reconciled_split(
         &self,
         tid: u64,
+        stamp: u64,
         affinity: Option<CpuId>,
     ) -> ReceiverEnqueue {
         // Test-only: inject the post-copy membership collision here rather than in the
@@ -17296,7 +17449,7 @@ impl SharedKernel {
         self.with_task_tcbs_split_mut(|tcbs| {
             crate::kernel::schedlock1_witness::stage_from_tcbs(tcbs, tid)
         });
-        self.enqueue_committed_receiver_inner(tid, priority, affinity, true)
+        self.enqueue_committed_receiver_inner(tid, stamp, priority, affinity, true)
     }
 
     /// The shared body. `reconcile` is set ONLY by the direct-IPC seam above; the parameter is
@@ -17304,11 +17457,31 @@ impl SharedKernel {
     fn enqueue_committed_receiver_inner(
         &self,
         tid: u64,
+        stamp: u64,
         priority: crate::kernel::scheduler::TaskPriority,
         affinity: Option<CpuId>,
         reconcile: bool,
     ) -> ReceiverEnqueue {
         use crate::kernel::ipc::ThreadId;
+        // SCHED-LOCK2B: a stamped caller's incarnation must still be what the TID names BEFORE a
+        // home is bound for it, so a replacement is never given a home by a stale transaction.
+        // The same refusal repeats under the committing 1L below, which is the one that counts.
+        if stamp != 0
+            && self.with_task_tcbs_split_mut(|tcbs| {
+                crate::kernel::task_enqueue::incarnation_of_locked(tcbs, tid)
+            }) != stamp
+        {
+            crate::yarm_log!(
+                "SCHED_HOME_REFUSED tid={} cpu={} home=-1 reason=stale",
+                tid,
+                affinity.map_or(-1, |c| c.0 as i32)
+            );
+            return ReceiverEnqueue::Rejected {
+                cpu: affinity.unwrap_or_else(|| self.executing_cpu_split()),
+                error: crate::kernel::scheduler::SchedulerError::CpuOffline,
+                reconciled: None,
+            };
+        }
         // AP-SCHED1: the task's home, never the ambient `sched.current_cpu`. SCHED-LOCK2A: a
         // caller-named CPU is this task's home if it has none yet (recorded at rank 2, so a racing
         // first placement sees it); if the task already has a different home the placement is
@@ -17337,7 +17510,7 @@ impl SharedKernel {
         // committed receiver is placed on its home or nowhere; a refusal touches nothing.
         let outcome = self
             .with_cpu_sched_and_tcbs_split(cpu, |sm, tcbs| {
-                if crate::kernel::task_enqueue::admit_home_locked(tcbs, tid, 0, cpu).is_err() {
+                if crate::kernel::task_enqueue::admit_home_locked(tcbs, tid, stamp, cpu).is_err() {
                     return ReceiverEnqueue::Rejected {
                         cpu,
                         error: crate::kernel::scheduler::SchedulerError::CpuOffline,
@@ -17598,13 +17771,27 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
     ) -> Option<crate::kernel::recv_waiter_split::RecvEnteringIncarnation> {
-        let (tid, priority) = self.current_placement_split_read(cpu)?;
-        let asid = crate::kernel::vm::Asid(self.task_asid_for_tid_split_read(tid) as u16);
-        Some(crate::kernel::recv_waiter_split::RecvEnteringIncarnation {
-            tid,
-            asid,
-            priority,
+        // SCHED-LOCK2B: `{tid, priority}`, the ASID and the stamp in ONE section — `cpu`'s 1L with
+        // rank 2 nested — so all four describe the task the slot named at that instant.
+        self.with_cpu_sched_and_tcbs_split(cpu, |c, tcbs| {
+            let tid = c.current_tid()?.0;
+            let priority = c.current_priority()?;
+            let asid = crate::kernel::vm::Asid(
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .and_then(|t| t.asid)
+                    .map_or(0, |a| a.0),
+            );
+            Some(crate::kernel::recv_waiter_split::RecvEnteringIncarnation {
+                tid,
+                asid,
+                priority,
+                stamp: crate::kernel::task_enqueue::incarnation_of_locked(tcbs, tid),
+            })
         })
+        .ok()
+        .flatten()
     }
 
     /// U9-TERMINAL-SETTLEMENT — where a DISOWNED entering incarnation actually is, for a settlement
@@ -17632,18 +17819,25 @@ impl SharedKernel {
         use crate::kernel::recv_waiter_split::RecvUnwindOutcome as U;
         use crate::kernel::scheduler::TaskPlacement;
         use crate::kernel::task::TaskStatus;
-        let status = self.task_incarnation_status_split_read(entering.tid, entering.asid);
+        // SCHED-LOCK2B: status and placement of the entering incarnation (its stamp, captured with
+        // `{tid, asid, priority}` in one section while it was this CPU's current) in ONE home
+        // section, instead of rank 2 and then the coherent all-CPU view. A replacement that reused
+        // the TID — same address space included — is `IncarnationMoved`.
+        let Some((status, placement)) = self.exact_status_and_home_placement_split(
+            cpu,
+            entering.tid,
+            entering.asid,
+            entering.stamp,
+        ) else {
+            return U::IncarnationMoved;
+        };
         let running = match status {
-            Some(TaskStatus::Running) => true,
-            Some(TaskStatus::Runnable) => false,
-            // Blocked, Faulted, Exited, Dead, Reserved — or a replacement incarnation. Another
-            // owner holds it; nothing may be claimed or published.
+            TaskStatus::Running => true,
+            TaskStatus::Runnable => false,
+            // Blocked, Faulted, Exited, Dead, Reserved. Another owner holds it; nothing may be
+            // claimed or published.
             _ => return U::IncarnationMoved,
         };
-        // SCHED-LOCK1: a COHERENT all-CPU placement (§16.1) — rare settlement path.
-        let placement = self.with_all_cpus_sched_split(|sched| {
-            sched.placement_of(crate::kernel::ipc::ThreadId(entering.tid))
-        });
         match placement {
             // This CPU still holds it, alone or doubly placed, and the frame has been disowned.
             TaskPlacement::Current(on) | TaskPlacement::CurrentAndQueued(on) if on == cpu => {
@@ -17685,9 +17879,161 @@ impl SharedKernel {
     /// receiver `Blocked` with a committed endpoint waiter, which nothing can wake while both
     /// hold, and there is no migration — so its placement cannot change during the scan, and a
     /// violating membership that stays on one CPU across the scan is still reported.
+    ///
+    /// SCHED-LOCK2B: no functional IPC or reap path calls this any more — they use
+    /// [`Self::incarnation_home_membership_split_read`]. It is retained for the x86_64 SMP
+    /// oracle's armed fact collection (behind `boot::oracle_gated_facts`) and hosted tests, both
+    /// counted in the SCHED-LOCK2B census.
     pub(crate) fn receiver_has_scheduler_membership_split_read(&self, tid: u64) -> bool {
         use crate::kernel::ipc::ThreadId;
         self.sched_domain().present_anywhere_scan(ThreadId(tid))
+    }
+
+    /// SCHED-LOCK2B — THE home-scoped exact-incarnation section: `f` runs under the home 1L of
+    /// `tid`'s incarnation `stamp`, with the task table (rank 2) nested and that incarnation and
+    /// home revalidated in the same section.
+    ///
+    /// 1. rank 2 alone: [`task_enqueue::home_lookup_locked`] — the candidate home, and the stamp
+    ///    pinned (the caller's, or this acquisition's when the caller passes `0`). Released.
+    /// 2. the candidate home's 1L, rank 2 nested (ascending 1 → 2):
+    ///    [`task_enqueue::home_unchanged_locked`], then `f`.
+    ///
+    /// By H-HOME (§20.5) `f` sees every placement the incarnation has. One 1L instead of the
+    /// coherent view (1G plus every 1L) or the 64-cell scan; no 1L is held while rank 2 is taken
+    /// alone. Homes are never rewritten, so a home that changes between the steps can only mean
+    /// the incarnation went away, which is `Stale`, never a wrong answer.
+    ///
+    /// [`task_enqueue::home_lookup_locked`]: crate::kernel::task_enqueue::home_lookup_locked
+    /// [`task_enqueue::home_unchanged_locked`]: crate::kernel::task_enqueue::home_unchanged_locked
+    pub(crate) fn with_incarnation_home_split<R>(
+        &self,
+        tid: u64,
+        stamp: u64,
+        f: impl FnOnce(
+            &mut crate::kernel::scheduler::CpuView<'_>,
+            &[Option<crate::kernel::task::ThreadControlBlock>],
+        ) -> R,
+    ) -> HomeSection<R> {
+        use crate::kernel::task_enqueue::{HomeLookup, home_lookup_locked, home_unchanged_locked};
+        let lookup = self.with_task_tcbs_split_mut(|tcbs| home_lookup_locked(tcbs, tid, stamp));
+        let (home, pinned) = match lookup {
+            HomeLookup::Home { home, stamp } => (home, stamp),
+            HomeLookup::Homeless { stamp } => return HomeSection::Homeless { stamp },
+            HomeLookup::Stale => return HomeSection::Stale,
+        };
+        match self.with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
+            home_unchanged_locked(tcbs, tid, pinned, home).then(|| f(c, tcbs))
+        }) {
+            Ok(Some(read)) => HomeSection::Home {
+                home,
+                stamp: pinned,
+                read,
+            },
+            // Changed identity: nothing was read.
+            Ok(None) => HomeSection::Stale,
+            // A recorded home that names no CPU cell (`InvalidCpu`, nothing locked): every 1L
+            // placement step needs that cell, so the incarnation can be placed NOWHERE — the
+            // homeless answer, not a stale one. The enqueue owner reports its own `InvalidCpu`.
+            Err(_) => HomeSection::Homeless { stamp: pinned },
+        }
+    }
+
+    /// SCHED-LOCK2B — where the exact incarnation is: [`Self::with_incarnation_home_split`] around
+    /// [`CpuView::placement_here_of`]. Replaces `SmpScheduler::placement_of` under the coherent
+    /// view: the four shapes are the same, each naming the home.
+    ///
+    /// [`CpuView::placement_here_of`]: crate::kernel::scheduler::CpuView::placement_here_of
+    pub(crate) fn incarnation_home_placement_split(&self, tid: u64, stamp: u64) -> HomePlacement {
+        match self.with_incarnation_home_split(tid, stamp, |c, _| {
+            c.placement_here_of(crate::kernel::ipc::ThreadId(tid))
+        }) {
+            HomeSection::Home { read, .. } => HomePlacement::On(read),
+            HomeSection::Homeless { .. } => {
+                HomePlacement::On(crate::kernel::scheduler::TaskPlacement::Nowhere)
+            }
+            HomeSection::Stale => HomePlacement::Stale,
+        }
+    }
+
+    /// SCHED-LOCK2B — does the exact incarnation hold ANY scheduler membership (queued or
+    /// current)? The direct-IPC preflights and rollback checks and the reaper's proofs, in place
+    /// of [`Self::receiver_has_scheduler_membership_split_read`]. `Stale` is never "absent": each
+    /// caller settles it through its own stale or refusal outcome.
+    pub(crate) fn incarnation_home_membership_split_read(
+        &self,
+        tid: u64,
+        stamp: u64,
+    ) -> HomeMembership {
+        HomeMembership::of(self.incarnation_home_placement_split(tid, stamp))
+    }
+
+    /// SCHED-LOCK2B — the exact incarnation's status AND its placement as one observation: the
+    /// home section reads both under the home 1L with rank 2 nested. `None` when the TID names no
+    /// TCB, another incarnation (`stamp`), or a TCB whose ASID is not `asid` (the receive family's
+    /// `Asid(0)` normalization for an ASID-less task).
+    ///
+    /// A homeless incarnation is placed nowhere (H-HOME); its status is then read in a second
+    /// rank-2 acquisition that also re-proves it is still that homeless incarnation, so the pair
+    /// again describes one instant.
+    ///
+    /// **TID 0** is the per-CPU idle/supervisor sentinel: it has no home and is admitted on every
+    /// CPU (§20.1), so H-HOME cannot localize it, and each CPU's TID 0 is that CPU's own. It is
+    /// answered on `asking`'s 1L alone (rank 2 nested), which is the only CPU whose TID 0 the
+    /// asking settlement can be about.
+    pub(crate) fn exact_status_and_home_placement_split(
+        &self,
+        asking: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+        stamp: u64,
+    ) -> Option<(
+        crate::kernel::task::TaskStatus,
+        crate::kernel::scheduler::TaskPlacement,
+    )> {
+        use crate::kernel::task_enqueue::{HomeLookup, home_lookup_locked};
+        let status_of = |tcbs: &[Option<crate::kernel::task::ThreadControlBlock>]| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .filter(|t| t.asid.unwrap_or(crate::kernel::vm::Asid(0)) == asid)
+                .map(|t| t.status)
+        };
+        if tid == 0 {
+            return self
+                .with_cpu_sched_and_tcbs_split(asking, |c, tcbs| {
+                    status_of(tcbs)
+                        .map(|s| (s, c.placement_here_of(crate::kernel::ipc::ThreadId(0))))
+                })
+                .ok()
+                .flatten();
+        }
+        match self.with_incarnation_home_split(tid, stamp, |c, tcbs| {
+            (
+                status_of(tcbs),
+                c.placement_here_of(crate::kernel::ipc::ThreadId(tid)),
+            )
+        }) {
+            HomeSection::Home {
+                read: (status, placement),
+                ..
+            } => status.map(|s| (s, placement)),
+            HomeSection::Homeless { stamp: pinned } => self.with_task_tcbs_split_mut(|tcbs| {
+                // Still that incarnation, and still placeable nowhere: no home, or a home that
+                // names no CPU cell.
+                let unplaceable = match home_lookup_locked(tcbs, tid, pinned) {
+                    HomeLookup::Homeless { .. } => true,
+                    HomeLookup::Home { home, .. } => {
+                        home.0 as usize >= crate::kernel::scheduler::MAX_CPUS
+                    }
+                    HomeLookup::Stale => false,
+                };
+                unplaceable
+                    .then(|| status_of(tcbs))
+                    .flatten()
+                    .map(|s| (s, crate::kernel::scheduler::TaskPlacement::Nowhere))
+            }),
+            HomeSection::Stale => None,
+        }
     }
 
     /// U9-RECV-BLOCK1 §2 — rank 2: the two TASK-domain facts the SMP blocked-server marker
@@ -19299,17 +19645,20 @@ impl SharedKernel {
         // names exactly this task, so a mismatch costs no other task its placement. The quantum
         // reset is `block_current_cpu`'s and is preserved on the successful clear.
         // SCHED-LOCK1: `cpu`'s own 1L — its current slot and its own quantum together.
+        // SCHED-LOCK2B: rank 2 nested for the stamp, read while the slot still names `tid`, so a
+        // recovery below is bound to the incarnation that trapped, never to a TID reuse.
         let removed = self
-            .with_cpu_sched_split(cpu, |c| {
+            .with_cpu_sched_and_tcbs_split(cpu, |c, tcbs| {
+                let stamp = crate::kernel::task_enqueue::incarnation_of_locked(tcbs, tid);
                 let priority = c.block_current_exact(crate::kernel::ipc::ThreadId(tid));
                 if priority.is_some() {
                     c.reset_quantum();
                 }
-                priority
+                priority.map(|p| (p, stamp))
             })
             .ok()
             .flatten();
-        let Some(priority) = removed else {
+        let Some((priority, stamp)) = removed else {
             // Undo the registration exactly: this transaction published a block it could not
             // complete, and leaving the TCB `Blocked` would strand a task the scheduler still
             // believes is elsewhere. (A waker that claimed it meanwhile owns it; the undo then
@@ -19351,6 +19700,7 @@ impl SharedKernel {
             tid,
             asid,
             priority,
+            stamp,
         };
         let recovered = self.restore_entering_incarnation_exact_split(cpu, entering);
         crate::yarm_log!(
@@ -20734,7 +21084,7 @@ mod tests {
         );
 
         // Phase A (rank 1) — the receiver (tid 0) is removed from `current`.
-        let (receiver_asid, victim_priority) = kernel
+        let (receiver_asid, victim_priority, _) = kernel
             .recv_block_phase_a_split(cpu, 0)
             .expect("phase A must block the exact victim");
         // Phase B (rank 2) — marked `Blocked(EndpointReceive)` with a fresh generation.
@@ -20807,6 +21157,7 @@ mod tests {
                     asid: receiver_asid,
                     priority: victim_priority,
                     wait_generation,
+                    stamp: 0,
                 },
             ),
             crate::kernel::recv_waiter_split::RecvUnwindOutcome::Restored,
@@ -20894,7 +21245,7 @@ mod tests {
             recv_abi: RecvAbiVariant::RecvV2,
         };
 
-        let (asid, _priority) = kernel
+        let (asid, _priority, _) = kernel
             .recv_block_phase_a_split(cpu, 0)
             .expect("phase A must block the exact victim");
         let first_generation = kernel
@@ -20915,6 +21266,7 @@ mod tests {
                 asid,
                 priority: crate::kernel::scheduler::TaskPriority::Normal,
                 wait_generation: first_generation,
+                stamp: 0,
             },
         );
         assert_eq!(
@@ -20970,7 +21322,7 @@ mod tests {
             let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
             recv_cap
         });
-        let (asid, priority) = kernel
+        let (asid, priority, _) = kernel
             .recv_block_phase_a_split(cpu, 0)
             .expect("phase A must block the exact victim");
         let wait_generation = kernel
@@ -21002,6 +21354,7 @@ mod tests {
                 asid,
                 priority,
                 wait_generation,
+                stamp: 0,
             },
         );
         assert_eq!(
@@ -21064,7 +21417,7 @@ mod tests {
             let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
             recv_cap
         });
-        let (asid, priority) = kernel
+        let (asid, priority, _) = kernel
             .recv_block_phase_a_split(cpu, 0)
             .expect("phase A must block the exact victim");
         let wait_generation = kernel
@@ -21096,6 +21449,7 @@ mod tests {
                 asid,
                 priority,
                 wait_generation,
+                stamp: 0,
             },
         );
         // U9-RECV-BLOCK2 §1 — the recovery no longer enqueues, so the task is Runnable and
@@ -21162,7 +21516,7 @@ mod tests {
 
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let cpu = CpuId(0);
-        let (entered_asid, priority) = kernel
+        let (entered_asid, priority, _) = kernel
             .recv_block_phase_a_split(cpu, 0)
             .expect("phase A must block the exact victim");
         assert_eq!(
@@ -21182,6 +21536,7 @@ mod tests {
                 tid: 0,
                 asid: entered_asid,
                 priority,
+                stamp: 0,
             },
         );
         assert_eq!(
@@ -21211,7 +21566,7 @@ mod tests {
 
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let cpu = CpuId(0);
-        let (asid, priority) = kernel
+        let (asid, priority, _) = kernel
             .recv_block_phase_a_split(cpu, 0)
             .expect("phase A must block the exact victim");
 
@@ -21223,6 +21578,7 @@ mod tests {
                 tid: 0,
                 asid,
                 priority,
+                stamp: 0,
             },
         );
         assert_eq!(outcome, RecvUnwindOutcome::Restored);
@@ -21250,7 +21606,7 @@ mod tests {
             state.register_task(1).expect("the other task");
             state.enqueue_current_cpu(1).expect("queue the other task");
         });
-        let (asid, priority) = kernel
+        let (asid, priority, _) = kernel
             .recv_block_phase_a_split(cpu, 0)
             .expect("phase A must block the exact victim");
         // Somebody else takes this CPU's current slot, and the victim is in no run queue: both
@@ -21266,6 +21622,7 @@ mod tests {
                 tid: 0,
                 asid,
                 priority,
+                stamp: 0,
             },
         );
         // U9-RECV-BLOCK2 §1 — the recovery mutates no placement it cannot justify and does NOT
@@ -21318,6 +21675,7 @@ mod tests {
                 tid: missing_tid,
                 asid: Asid(0),
                 priority,
+                stamp: 0,
             },
         );
         assert_eq!(
@@ -21379,7 +21737,7 @@ mod tests {
             // Make it this CPU's current, exactly as a dispatch would, so Phase A has a victim.
             assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
         });
-        let (entered_asid, priority) = kernel
+        let (entered_asid, priority, _) = kernel
             .recv_block_phase_a_split(cpu, tid)
             .expect("phase A blocks the exact victim");
         assert_eq!(
@@ -21395,6 +21753,7 @@ mod tests {
                 tid,
                 asid,
                 priority,
+                stamp: 0,
             },
         );
         assert_eq!(outcome, RecvUnwindOutcome::Restored);
@@ -21432,7 +21791,7 @@ mod tests {
             s.enqueue_task(tid).expect("queue it");
             assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
         });
-        let (_, priority) = kernel
+        let (_, priority, _) = kernel
             .recv_block_phase_a_split(cpu, tid)
             .expect("phase A blocks the exact victim");
         kernel.with(|s| s.set_task_status_for_test(tid, TaskStatus::Runnable));
@@ -21447,6 +21806,7 @@ mod tests {
                 tid,
                 asid,
                 priority,
+                stamp: 0,
             },
         );
         assert_eq!(
@@ -21565,7 +21925,7 @@ mod tests {
             s.enqueue_task(victim).expect("queue victim");
             assert_eq!(s.dispatch_next_on_cpu(cpu), Some(victim));
         });
-        let (_, priority) = kernel
+        let (_, priority, _) = kernel
             .recv_block_phase_a_split(cpu, victim)
             .expect("phase A blocks the exact victim");
         kernel.with(|s| s.set_task_status_for_test(victim, TaskStatus::Runnable));
@@ -21582,6 +21942,7 @@ mod tests {
                 tid: victim,
                 asid: victim_asid,
                 priority,
+                stamp: 0,
             },
         );
         assert_eq!(outcome, RecvUnwindOutcome::Unpublished);
@@ -21626,7 +21987,7 @@ mod tests {
             s.enqueue_task(tid).expect("queue it");
             assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
         });
-        let (_, _priority) = kernel
+        let (_, _priority, _) = kernel
             .recv_block_phase_a_split(cpu, tid)
             .expect("phase A blocks the exact victim");
         kernel.with(|s| s.set_task_status_for_test(tid, TaskStatus::Runnable));
@@ -21717,7 +22078,7 @@ mod tests {
             s.enqueue_task(tid).expect("queue it");
             assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
         });
-        let (_, priority) = kernel
+        let (_, priority, _) = kernel
             .recv_block_phase_a_split(cpu, tid)
             .expect("phase A blocks the exact victim");
         // THE COMPETITOR: a deadline scan wakes the task and puts it on a run queue, and records
@@ -21734,6 +22095,7 @@ mod tests {
                 tid,
                 asid,
                 priority,
+                stamp: 0,
             },
         );
         assert_eq!(

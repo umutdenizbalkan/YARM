@@ -7159,15 +7159,86 @@ mod tests {
                 .count(),
             1
         );
-        // (5) the coherent view in production: exactly the rare paths §16.1 names.
+        // (5) SCHED-LOCK2B — the coherent view has NO production caller. Its five former callers
+        // (`entering_frame_authority_split_read`, the exit token's placement precondition,
+        // `post_lock_exit_validation_split`, `recv_unwind_placement_outcome_split`,
+        // `yield_forfeited_placement_split_read`) read one incarnation on its HOME
+        // (`with_incarnation_home_split`: rank 2, then that CPU's 1L with rank 2 nested).
         let prod = &runtime_src[..runtime_src
             .find("\n#[cfg(test)]\nmod ")
             .unwrap_or(runtime_src.len())];
-        let callers = prod.matches(".with_all_cpus_sched_split(").count();
         assert_eq!(
-            callers, 5,
-            "placement_of ×3, tid_placed_anywhere, post_lock_exit_validation — and nothing else"
+            prod.matches(".with_all_cpus_sched_split(").count(),
+            0,
+            "no production caller of the coherent all-CPU view"
         );
+        assert_eq!(prod.matches(".placement_of(").count(), 0);
+        assert!(prod.contains("pub(crate) fn with_incarnation_home_split<R>("));
+        // The functional direct-IPC request/reply (incl. rollback) checks and the reaper's pre-
+        // and post-claim proofs never reach the sequential 64-cell scan or the broad all-CPU read.
+        let direct_src = include_str!("ipccall_direct_txn.rs");
+        let reap_src = include_str!("syscall/reap_txn.rs");
+        for (name, src) in [("ipccall_direct_txn", direct_src), ("reap_txn", reap_src)] {
+            assert!(
+                !src.contains("receiver_has_scheduler_membership_split_read(")
+                    && !src.contains("task_present_in_any_runqueue(")
+                    && !src.contains("present_anywhere_scan("),
+                "{name} must not scan every CPU"
+            );
+        }
+        assert_eq!(
+            direct_src
+                .matches("self.incarnation_home_membership_split_read(")
+                .count(),
+            4,
+            "request preflight + rollback check, reply preflight + rollback check"
+        );
+        assert!(reap_src.contains(".incarnation_home_membership_split_read(tid, stamp)"));
+        assert!(reap_src.contains("self.kernel.incarnation_home_membership(tid, stamp)"));
+        // CENSUS of the retained all-CPU reads — each is boot/hosted/fixture-only, an explicitly
+        // gated witness, or a broad-lock twin; none is a split functional placement decision.
+        //  * the sequential scan: the definition, plus the x86_64 SMP oracle's armed fact
+        //    collection, which sits inside `oracle_gated_facts(`.
+        assert_eq!(prod.matches("present_anywhere_scan(").count(), 1);
+        let split_src = include_str!("syscall_split.rs");
+        assert_eq!(
+            split_src
+                .matches(".receiver_has_scheduler_membership_split_read(")
+                .count(),
+            1
+        );
+        let gated = &split_src[split_src.find("oracle_gated_facts(").expect("gate")..];
+        assert!(
+            gated[..gated
+                .find("emit_ipccall_direct_smp_server_blocked_with(")
+                .expect("emit")]
+                .contains(".receiver_has_scheduler_membership_split_read(tid)"),
+            "the split route's scan is inside the oracle gate"
+        );
+        //  * the broad all-CPU read (`task_present_in_any_runqueue`, 1G + every 1L under the broad
+        //    guard): the x86_64 broad exit consumer, the x86_64 oracle markers (the server marker
+        //    behind `oracle_gated_facts`, the caller marker behind its own early return), and the
+        //    `#[cfg(test)]` rehome fixture.
+        assert_eq!(
+            mod_src
+                .matches("kernel.task_present_in_any_runqueue(")
+                .count(),
+            2
+        );
+        let broad_marker = &mod_src[mod_src
+            .find("fn maybe_emit_ipccall_direct_smp_server_blocked(")
+            .expect("broad marker")..];
+        let broad_marker = &broad_marker[..broad_marker.find("\n}\n").expect("end")];
+        let gate = broad_marker
+            .find("oracle_gated_facts(")
+            .expect("broad gate");
+        assert!(
+            gate < broad_marker
+                .find("task_present_in_any_runqueue(")
+                .expect("read")
+        );
+        let x86_trap = include_str!("../arch/x86_64/trap.rs");
+        assert_eq!(x86_trap.matches("task_present_in_any_runqueue(").count(), 1);
         // Stage 183 (SMP-LIVE): the smoke DEFAULTS to -smp 1 but now honors an explicit
         // QEMU_SMP so the smp2/smp4 SMP-LIVE profiles can drive -smp >1. Still -smp 1 by
         // default; the SMP override selects only QEMU topology, not a production knob.

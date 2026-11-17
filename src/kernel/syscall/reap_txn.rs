@@ -99,8 +99,13 @@ pub(crate) struct ReapOutcome {
 /// No method here decides anything: conditions, ordering and counting all live in the transaction.
 pub(crate) trait ReapOwners {
     // ── rank 1 — scheduler ──────────────────────────────────────────────────────────────────
-    /// Is `tid` some CPU's `current`, or queued on any runqueue? Read-only.
-    fn target_is_scheduled(&self, tid: u64) -> bool;
+    /// Is `tid`'s incarnation `stamp` some CPU's `current`, or queued? Read-only.
+    ///
+    /// SCHED-LOCK2B: answered on that incarnation's HOME alone (H-HOME, §20.5): an exited entry
+    /// that is still queued is queued on its home, so absence there is absence everywhere.
+    /// `stamp == 0` names whichever incarnation the TID has at the read (the pre-claim proof,
+    /// whose identity is the numeric TID the request named).
+    fn target_is_scheduled(&self, tid: u64, stamp: u64) -> crate::runtime::HomeMembership;
     /// The CPUs that must acknowledge a shootdown for a destroyed address space: online, minus
     /// wake-only APs, which hold no user translations and would otherwise leak the retired-ASID
     /// slot forever.
@@ -216,7 +221,11 @@ pub(crate) fn run_reap_transaction<O: ReapOwners>(
     // `current`; nothing re-enqueues a terminal task, and a cross-CPU wake refuses one outright
     // (`CrossCpuWakeApplyResult::SkippedFaulted`). So this is a proof of absence, and finding
     // residency here means an invariant broke — refuse rather than tear down a running task.
-    if owners.target_is_scheduled(tid) {
+    //
+    // SCHED-LOCK2B: a `Stale` answer here is a TID with no TCB (or one replaced between the two
+    // steps of the read). It is not residency: the claim below then refuses `TaskGone`, or wins
+    // the replacement, and (2b) proves THAT incarnation absent against its own stamp.
+    if owners.target_is_scheduled(tid, 0) == crate::runtime::HomeMembership::Present {
         return Err(ReapRefusal::StillScheduled);
     }
 
@@ -227,7 +236,13 @@ pub(crate) fn run_reap_transaction<O: ReapOwners>(
     // (2b) The proof in (1) was taken before the claim existed, so re-take it against the claim's
     // exact incarnation. This is the LAST point at which the claim can be cleanly undone: nothing
     // below has written anything yet.
-    if owners.target_is_scheduled(claim.tid()) {
+    //
+    // SCHED-LOCK2B: against the claim's OWN stamp, captured in the claim's acquisition. The claim
+    // holds the TCB (`Dead`, retired only at (7)), so `Stale` is unreachable; it is refused all the
+    // same, because absence was not proven.
+    if owners.target_is_scheduled(claim.tid(), claim.incarnation())
+        != crate::runtime::HomeMembership::Absent
+    {
         owners.rollback_claim(&claim);
         return Err(ReapRefusal::StillScheduled);
     }
@@ -430,8 +445,8 @@ pub(crate) struct BroadReapOwners<'a> {
 }
 
 impl ReapOwners for BroadReapOwners<'_> {
-    fn target_is_scheduled(&self, tid: u64) -> bool {
-        self.kernel.task_present_in_any_runqueue(tid)
+    fn target_is_scheduled(&self, tid: u64, stamp: u64) -> crate::runtime::HomeMembership {
+        self.kernel.incarnation_home_membership(tid, stamp)
     }
     fn shootdown_cpu_bitmap(&self) -> u64 {
         // Stage 183.5's exclusion, preserved exactly: a wake-only online AP holds no user
@@ -626,9 +641,9 @@ pub(crate) struct SharedReapOwners<'a> {
 }
 
 impl ReapOwners for SharedReapOwners<'_> {
-    fn target_is_scheduled(&self, tid: u64) -> bool {
+    fn target_is_scheduled(&self, tid: u64, stamp: u64) -> crate::runtime::HomeMembership {
         self.shared
-            .receiver_has_scheduler_membership_split_read(tid)
+            .incarnation_home_membership_split_read(tid, stamp)
     }
     fn shootdown_cpu_bitmap(&self) -> u64 {
         self.shared.reap_shootdown_cpu_bitmap_split()

@@ -482,6 +482,41 @@ impl KernelState {
         self.with_scheduler_state(|sched| sched.task_present_anywhere(ThreadId(tid)))
     }
 
+    /// SCHED-LOCK2B — rank 2: the incarnation stamp of `tid` (`0` for TID 0 / no TCB).
+    pub(crate) fn task_incarnation(&self, tid: u64) -> u64 {
+        self.with_tcbs(|tcbs| crate::kernel::task_enqueue::incarnation_of_locked(tcbs, tid))
+    }
+
+    /// SCHED-LOCK2B — the broad twin of `SharedKernel::incarnation_home_membership_split_read`:
+    /// rank 2 for the home and stamp, released; then that home's 1L with rank 2 nested
+    /// (ascending, the shape every SCHED-LOCK2A broad twin uses), the incarnation revalidated
+    /// and its placement read there alone (H-HOME, §20.5).
+    pub(crate) fn incarnation_home_membership(
+        &self,
+        tid: u64,
+        stamp: u64,
+    ) -> crate::runtime::HomeMembership {
+        use crate::kernel::task_enqueue::{HomeLookup, home_lookup_locked, home_unchanged_locked};
+        use crate::runtime::HomeMembership;
+        let (home, pinned) = match self.with_tcbs(|tcbs| home_lookup_locked(tcbs, tid, stamp)) {
+            HomeLookup::Home { home, stamp } => (home, stamp),
+            HomeLookup::Homeless { .. } => return HomeMembership::Absent,
+            HomeLookup::Stale => return HomeMembership::Stale,
+        };
+        let Ok(mut guard) = self.scheduler_state.lock_cpu(home) else {
+            return HomeMembership::Stale;
+        };
+        let view = guard.view();
+        let unchanged = self.with_tcbs(|tcbs| home_unchanged_locked(tcbs, tid, pinned, home));
+        if !unchanged {
+            HomeMembership::Stale
+        } else if view.contains_or_current(ThreadId(tid)) {
+            HomeMembership::Present
+        } else {
+            HomeMembership::Absent
+        }
+    }
+
     /// Inspect TCB status and return the wake plan without mutating any state.
     ///
     /// Returns `SchedulerWakePlan::Wake(tid)` when the task is in a state that

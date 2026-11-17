@@ -118,6 +118,9 @@ mod sched_lock1_tests;
 #[cfg(test)]
 #[path = "sched_lock2a_tests/tests.rs"]
 mod sched_lock2a_tests;
+#[cfg(test)]
+#[path = "sched_lock2b_tests/tests.rs"]
+mod sched_lock2b_tests;
 pub mod scheduler;
 pub mod scheduler_timer;
 pub mod smp;
