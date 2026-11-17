@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# FUTEX-TIME1 — the LIVE timed-FutexWait witness, per architecture.
+# FUTEX-TIME1 / FUTEX-ABS-BITSET1 — the LIVE timed-FutexWait witness, per architecture.
 #
 # Usage: scripts/qemu-futex-time-witness-smoke.sh [x86_64|aarch64|riscv64] [smp]
 #
 # One clean boot with `yarm.futex_requeue_witness=1`, kernel and init both built with
-# `futex-time-witness`: init's selector-18 cell then runs the timed-wait sequences A–G (see the cell's
-# doc in init/service.rs): A/F timeouts with every other user thread blocked, B wake-before-expiry,
-# C requeue-then-timeout, D requeue-then-wake, G a cross-CPU wake/timeout race with the kernel's
-# post-claim window (opened only while a sibling runs on another CPU), and E a timeout that expires
-# while its home run queue is genuinely full.
+# `futex-time-witness`: init's selector-18 cell then runs the timed-wait sequences (see the cell's
+# doc in init/service.rs), every timed wait with an ABSOLUTE CLOCK_MONOTONIC deadline: A/F timeouts
+# with every other user thread blocked, P a deadline already passed (refused at admission), B
+# wake-before-expiry, M selective (bitset) wake, C masked requeue-then-timeout with the deadline and
+# mask unchanged, D masked requeue-then-ordinary-wake, G a cross-CPU wake/timeout race with the
+# kernel's post-claim window (opened only while a sibling runs on another CPU), and E a timeout
+# that expires while its home run queue is genuinely full.
 #
 # The verdict comes from scripts/grade-futex-time-witness.py (its docstring has the rules), plus the
 # standard core smoke. Raw serial log, normalized log and grader output are kept in $LOGDIR. Logs are

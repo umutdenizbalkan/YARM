@@ -150,7 +150,10 @@ pub(crate) fn handle_clock_nanosleep(
             0,
             0,
             crate::kernel::boot::futex::FutexKind::Sleep,
-            Some(deadline),
+            crate::kernel::boot::futex::FutexWaitTiming::Deadline(
+                crate::kernel::boot::futex::FutexDeadline::MonotonicNs(deadline),
+            ),
+            crate::kernel::boot::futex::FUTEX_BITSET_MATCH_ANY,
         )
         .map_err(SyscallError::from)?
     {
@@ -161,6 +164,14 @@ pub(crate) fn handle_clock_nanosleep(
         // word, so `NotBlocked` cannot arise; it would mean the same).
         crate::kernel::boot::FutexWaitBroadOutcome::TimedOut
         | crate::kernel::boot::FutexWaitBroadOutcome::NotBlocked => frame.set_ok(0, 0, 0),
+        // A sleep's clock was checked before its deadline was computed; a refusal here (the
+        // source cannot vanish once installed) is still the clock's answer.
+        crate::kernel::boot::FutexWaitBroadOutcome::ClockUnavailable => {
+            return Err(SyscallError::Unavailable);
+        }
+        crate::kernel::boot::FutexWaitBroadOutcome::InvalidMask => {
+            return Err(SyscallError::InvalidArgs);
+        }
     }
     Ok(())
 }

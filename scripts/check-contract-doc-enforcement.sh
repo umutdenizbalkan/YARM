@@ -69,6 +69,19 @@ if (( abi_code >= 12 )); then
   rg -q '^- `11`: `Unavailable`' doc/SYSCALL_ABI.md
   rg -q 'v11 → v12 \(SCHED-TIME-FOUNDATION1\)' doc/SYSCALL_ABI.md
 fi
+# The v13 change (FUTEX-ABS-BITSET1): NR 9's absolute-deadline flag and NR 9 / NR 10's bitset flag,
+# their slots and MATCH_ANY, identical in the kernel and the user runtime; the change note.
+if (( abi_code >= 13 )); then
+  rg -q '^pub const FUTEX_FLAG_TIMED: usize = 1 << 1;$' src/kernel/boot/futex.rs
+  rg -q '^pub const FUTEX_FLAG_BITSET: usize = 1 << 2;$' src/kernel/boot/futex.rs
+  rg -q '^pub const FUTEX_ARG_DEADLINE: usize = 3;$' src/kernel/boot/futex.rs
+  rg -q '^pub const FUTEX_ARG_MASK: usize = 4;$' src/kernel/boot/futex.rs
+  rg -q '^pub const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;$' src/kernel/boot/futex.rs
+  rg -q '^    pub const FUTEX_FLAG_TIMED: usize = 1 << 1;$' crates/yarm-user-rt/src/lib.rs
+  rg -q '^    pub const FUTEX_FLAG_BITSET: usize = 1 << 2;$' crates/yarm-user-rt/src/lib.rs
+  rg -q '^    pub const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;$' crates/yarm-user-rt/src/lib.rs
+  rg -q 'v12 → v13 \(FUTEX-ABS-BITSET1\)' doc/SYSCALL_ABI.md
+fi
 rg -q "TransferRelease" doc/SYSCALL_ABI.md
 rg -q "PROC_CODEC_V2_VERSION = 2" doc/VFS.md
 rg -q "VFS_CODEC_V1_VERSION = 1" doc/VFS.md

@@ -23,100 +23,108 @@ pub(crate) fn futex_word_range_check(addr: usize) -> Result<(), crate::kernel::b
     crate::kernel::boot::futex::futex_word_range_check(addr)
 }
 
-/// FUTEX-FOUND1 — the decoded futex syscall arguments (NR 9 and NR 10 share the layout).
+/// FUTEX-FOUND1 / FUTEX-ABS-BITSET1 (ABI v13) — the decoded futex key arguments (NR 9 and NR 10
+/// share the layout).
 ///
 /// | slot | NR 9 `FutexWait` | NR 10 `FutexWake` |
 /// |---|---|---|
 /// | 0 | word address (4-byte aligned) | word address (4-byte aligned) |
 /// | 1 | `expected` (`u32`) | `count` (`u32`) |
-/// | 2 | flags: `FUTEX_FLAG_SHARED` (bit 0); every other bit reserved, must be 0 | same |
+/// | 2 | flags: `SHARED` (bit 0), `TIMED` (bit 1), `BITSET` (bit 2); every other bit 0 | flags: `SHARED` (bit 0), `BITSET` (bit 2); every other bit 0 |
+/// | 3 | with `TIMED` only: the ABSOLUTE `CLOCK_MONOTONIC` deadline, ns (`u64`) | not read |
+/// | 4 | with `BITSET` only: the wait mask (`u32`, nonzero) | with `BITSET` only: the wake mask (`u32`, nonzero) |
 ///
 /// The kernel compares `expected` with the word IT reads (there is no caller-supplied `observed`).
-/// Later operations — an absolute deadline, a requeue target, a wake mask — are each selected by a
-/// flag bit that is reserved today, and that bit is what gives meaning to slots 3 and up; so a
-/// reserved bit set now is `InvalidArgs`, and slots 3.. are not consulted.
+/// A slot is read only when its flag gives it meaning; without `BITSET` the mask is
+/// `FUTEX_BITSET_MATCH_ANY`, so an unmasked call is the call it always was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FutexArgs {
     pub(crate) addr: usize,
     pub(crate) value: u32,
     pub(crate) kind: crate::kernel::boot::futex::FutexKind,
+    /// FUTEX-ABS-BITSET1 — the call's mask (`FUTEX_BITSET_MATCH_ANY` without `BITSET`).
+    pub(crate) mask: u32,
 }
 
-/// THE decode, shared by the broad handlers and the split routes: the value as `u32`, the flags,
-/// then the word's alignment. Its errors are all `InvalidArgs` and are answered before the address
-/// range or the caller is consulted.
-pub(crate) fn decode_futex_args(frame: &TrapFrame) -> Result<FutexArgs, SyscallError> {
-    let addr = frame.arg(SYSCALL_ARG_CAP);
-    let value = u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let kind = crate::kernel::boot::futex::FutexKind::from_flags(frame.arg(SYSCALL_ARG_LEN))
-        .ok_or(SyscallError::InvalidArgs)?;
-    if !crate::kernel::boot::futex::futex_word_aligned(addr) {
+/// THE decode of the slots both calls share, in ONE precedence, every refusal `InvalidArgs` and
+/// answered before the address range, the clock or the caller is consulted:
+///
+/// 1. an undefined flag bit (for the call's own `defined` set);
+/// 2. slot 1 wider than `u32`;
+/// 3. a misaligned word address;
+/// 4. with `BITSET`: a mask wider than `u32`, or zero.
+fn decode_futex_common(frame: &TrapFrame, defined: usize) -> Result<FutexArgs, SyscallError> {
+    use crate::kernel::boot::futex::{
+        FUTEX_ARG_MASK, FUTEX_BITSET_MATCH_ANY, FUTEX_FLAG_BITSET, FUTEX_FLAG_SHARED, FutexKind,
+        futex_word_aligned,
+    };
+    let flags = frame.arg(SYSCALL_ARG_LEN);
+    if flags & !defined != 0 {
         return Err(SyscallError::InvalidArgs);
     }
-    Ok(FutexArgs { addr, value, kind })
+    let addr = frame.arg(SYSCALL_ARG_CAP);
+    let value = u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
+    if !futex_word_aligned(addr) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let mask = if flags & FUTEX_FLAG_BITSET != 0 {
+        match u32::try_from(frame.arg(FUTEX_ARG_MASK)) {
+            Ok(m) if m != 0 => m,
+            _ => return Err(SyscallError::InvalidArgs),
+        }
+    } else {
+        FUTEX_BITSET_MATCH_ANY
+    };
+    let kind = if flags & FUTEX_FLAG_SHARED != 0 {
+        FutexKind::Shared
+    } else {
+        FutexKind::Private
+    };
+    Ok(FutexArgs {
+        addr,
+        value,
+        kind,
+        mask,
+    })
 }
 
-/// FUTEX-TIME1 — the decoded NR 9 arguments: the key arguments, and the relative timeout when
-/// `FUTEX_FLAG_TIMED` is set.
-///
-/// | slot | NR 9 `FutexWait` |
-/// |---|---|
-/// | 0 | word address (4-byte aligned) |
-/// | 1 | `expected` (`u32`) |
-/// | 2 | flags: `FUTEX_FLAG_SHARED` (bit 0), `FUTEX_FLAG_TIMED` (bit 1); every other bit 0 |
-/// | 3 | with `FUTEX_FLAG_TIMED` only: the timeout, a RELATIVE duration in nanoseconds (`u64`) |
+/// THE NR 10 decode, shared by the broad handler and the split route: [`decode_futex_common`]
+/// with NR 10's flags (`SHARED`, `BITSET`); `TIMED` is an undefined bit here.
+pub(crate) fn decode_futex_args(frame: &TrapFrame) -> Result<FutexArgs, SyscallError> {
+    decode_futex_common(frame, crate::kernel::boot::futex::FUTEX_WAKE_FLAGS_DEFINED)
+}
+
+/// FUTEX-TIME1 / FUTEX-ABS-BITSET1 — the decoded NR 9 arguments: the key arguments (with the
+/// mask), and the absolute deadline when `FUTEX_FLAG_TIMED` is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FutexWaitArgs {
     pub(crate) key: FutexArgs,
-    /// `Some(ns)` for a timed wait; `None` without `FUTEX_FLAG_TIMED`, and `args[3]` unread.
-    pub(crate) timeout_ns: Option<u64>,
+    /// `Some` for a timed wait: the caller's ABSOLUTE `CLOCK_MONOTONIC` deadline, taken as given
+    /// (every `u64` is a valid instant; `u64::MAX` is one no clock reaches). `None` without
+    /// `FUTEX_FLAG_TIMED`, and `args[3]` unread.
+    pub(crate) deadline: Option<crate::kernel::boot::futex::FutexDeadline>,
 }
 
-/// FUTEX-TIME1 — THE NR 9 decode, shared by the broad handler and the split route: the timed flag
-/// is taken out first, then exactly [`decode_futex_args`] (so every key refusal is unchanged and
-/// NR 10, which keeps using that decode, still refuses the timed bit), then `args[3]` only if the
-/// flag was set. Every refusal is `InvalidArgs`.
+/// THE NR 9 decode, shared by the broad handler and the split route: [`decode_futex_common`] with
+/// NR 9's flags (`SHARED`, `TIMED`, `BITSET`), then `args[3]` only if `TIMED` is set. Nothing about
+/// the deadline is refused here: whether it has been reached, and whether its clock can be read,
+/// are decided inside the compare-and-register hold, after the word's comparison.
 pub(crate) fn decode_futex_wait_args(frame: &TrapFrame) -> Result<FutexWaitArgs, SyscallError> {
-    use crate::kernel::boot::futex::{FUTEX_FLAG_TIMED, FUTEX_WAIT_FLAGS_DEFINED};
-    let flags = frame.arg(SYSCALL_ARG_LEN);
-    if flags & !FUTEX_WAIT_FLAGS_DEFINED != 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    let mut key_frame = frame.clone();
-    key_frame.set_arg(SYSCALL_ARG_LEN, flags & !FUTEX_FLAG_TIMED);
-    let key = decode_futex_args(&key_frame)?;
-    let timeout_ns = (flags & FUTEX_FLAG_TIMED != 0).then(|| frame.arg(3) as u64);
-    Ok(FutexWaitArgs { key, timeout_ns })
+    use crate::kernel::boot::futex::{
+        FUTEX_ARG_DEADLINE, FUTEX_FLAG_TIMED, FUTEX_WAIT_FLAGS_DEFINED, FutexDeadline,
+    };
+    let key = decode_futex_common(frame, FUTEX_WAIT_FLAGS_DEFINED)?;
+    let deadline = (frame.arg(SYSCALL_ARG_LEN) & FUTEX_FLAG_TIMED != 0)
+        .then(|| FutexDeadline::MonotonicNs(frame.arg(FUTEX_ARG_DEADLINE) as u64));
+    Ok(FutexWaitArgs { key, deadline })
 }
 
-/// FUTEX-TIME1 — a relative timeout in nanoseconds as a number of scheduler ticks.
-///
-/// `0` is `0` ticks: the deadline is the admission instant, so a matching word times out at once
-/// and a differing one still answers `0`. Any other duration is `ceil(ns / period) + 1` ticks: the
-/// clock counts SERVICED timer periods, each re-armed from a fresh sample after the previous one,
-/// so `n` increments span at least `n - 1` full periods — the `+ 1` absorbs the partial period the
-/// wait is admitted in, and the wait is guaranteed at least `ns` before it can time out. There is
-/// no upper bound (masked sections delay the tick; dispatch adds latency). Total: every `u64` is a
-/// valid duration and none overflows here (`u64::MAX / period + 2` fits).
-pub(crate) const fn futex_timeout_ticks(timeout_ns: u64, period_ns: u64) -> u64 {
-    if timeout_ns == 0 {
-        0
-    } else {
-        timeout_ns.div_ceil(period_ns) + 1
-    }
-}
-
-/// FUTEX-TIME1 — THE absolute deadline of a timed wait admitted at scheduler tick `now`, or `None`
-/// if `now + ticks` would overflow `u64` (refused `InvalidArgs`; unreachable — the tick would have
-/// to run for millennia first). The clock is a non-wrapping monotone `u64` for any physical
-/// uptime, so the collector's plain `now >= deadline` needs no wrapping arithmetic.
-pub(crate) fn futex_wait_deadline(now: u64, timeout_ns: u64) -> Option<u64> {
-    let period = crate::arch::platform_constants::SCHED_TICK_PERIOD_NS;
-    let ticks = futex_timeout_ticks(timeout_ns, period);
-    let deadline = now.checked_add(ticks);
-    #[cfg(feature = "futex-time-witness")]
-    crate::kernel::boot::futex::time_witness::deadline(timeout_ns, period, ticks, now, deadline);
-    deadline
+/// FUTEX-ABS-BITSET1 — the NR 9 admission timing of a decoded wait.
+pub(crate) fn futex_wait_timing(
+    deadline: Option<crate::kernel::boot::futex::FutexDeadline>,
+) -> crate::kernel::boot::futex::FutexWaitTiming {
+    use crate::kernel::boot::futex::FutexWaitTiming;
+    deadline.map_or(FutexWaitTiming::Untimed, FutexWaitTiming::Deadline)
 }
 
 /// THE check of compare-and-park: does the word the KERNEL read still hold `expected`?
@@ -283,6 +291,12 @@ pub(crate) enum FutexParkOutcome {
     /// compare-and-register: the timeout won before any registration. **Nothing was written**, the
     /// caller is still current, and the answer is `Err(TimedOut)`.
     TimedOut,
+    /// FUTEX-ABS-BITSET1 — the word held `expected`, the wait is timed, and its clock could not be
+    /// read inside the compare-and-register. **Nothing was written**, the caller is still current,
+    /// and the answer is `Err(Unavailable)`.
+    ClockUnavailable,
+    /// FUTEX-ABS-BITSET1 — a zero mask reached the owner. **Nothing was written**; `InvalidArgs`.
+    InvalidMask,
 }
 
 pub(super) fn handle_yield(
@@ -306,15 +320,14 @@ pub(super) fn handle_futex_wait(
         kernel.current_tid().unwrap_or(u64::MAX)
     );
     let args = decode_futex_wait_args(frame)?;
-    let deadline = match args.timeout_ns {
-        None => None,
-        Some(ns) => Some(
-            futex_wait_deadline(kernel.scheduler_tick_now(), ns)
-                .ok_or(SyscallError::InvalidArgs)?,
-        ),
-    };
     match kernel
-        .futex_wait_current_timed(args.key.addr, args.key.value, args.key.kind, deadline)
+        .futex_wait_current_timed(
+            args.key.addr,
+            args.key.value,
+            args.key.kind,
+            futex_wait_timing(args.deadline),
+            args.key.mask,
+        )
         .map_err(SyscallError::from)?
     {
         crate::kernel::boot::FutexWaitBroadOutcome::NotBlocked => frame.set_ok(0, 0, 0),
@@ -330,6 +343,12 @@ pub(super) fn handle_futex_wait(
         }
         crate::kernel::boot::FutexWaitBroadOutcome::TimedOut => {
             return Err(SyscallError::TimedOut);
+        }
+        crate::kernel::boot::FutexWaitBroadOutcome::ClockUnavailable => {
+            return Err(SyscallError::Unavailable);
+        }
+        crate::kernel::boot::FutexWaitBroadOutcome::InvalidMask => {
+            return Err(SyscallError::InvalidArgs);
         }
     }
     Ok(())
@@ -356,7 +375,7 @@ pub(super) fn handle_futex_wake(
 ) -> Result<(), SyscallError> {
     let args = decode_futex_args(frame)?;
     let woke = kernel
-        .futex_wake(args.addr, args.value, args.kind)
+        .futex_wake_masked(args.addr, args.value, args.kind, args.mask)
         .map_err(SyscallError::from)?;
     frame.set_ok(woke as usize, 0, 0);
     Ok(())

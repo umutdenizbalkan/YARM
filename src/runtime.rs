@@ -14026,6 +14026,22 @@ impl SharedKernel {
         Ok(self.futex_wake_key_split(cpu, key, count))
     }
 
+    /// FUTEX-ABS-BITSET1 — [`Self::futex_wake_split_mut`] with a wake mask (NR 10 with
+    /// `FUTEX_FLAG_BITSET`): see [`Self::futex_wake_key_masked_split`].
+    pub fn futex_wake_masked_split_mut(
+        &self,
+        cpu: CpuId,
+        asid: crate::kernel::vm::Asid,
+        addr: usize,
+        count: u32,
+        kind: crate::kernel::boot::futex::FutexKind,
+        mask: u32,
+    ) -> Result<u32, crate::kernel::boot::KernelError> {
+        crate::kernel::boot::futex::futex_word_range_check(addr)?;
+        let (key, _word) = self.resolve_futex_word_in_split(asid, addr, kind)?;
+        Ok(self.futex_wake_key_masked_split(cpu, key, count, mask))
+    }
+
     /// FUTEX-REQUEUE-ATOMIC1 — THE split compare-and-requeue (NR 17), in the caller's address
     /// space `asid`; the twin of `KernelState::futex_cmp_requeue_current`. One operation, with one
     /// linearization point (see the phase overview in `kernel::boot::futex`):
@@ -14304,7 +14320,29 @@ impl SharedKernel {
         key: crate::kernel::boot::futex::FutexKey,
         count: u32,
     ) -> u32 {
-        self.futex_wake_key_outcome_split(cpu, key, count).woke
+        self.futex_wake_key_masked_split(
+            cpu,
+            key,
+            count,
+            crate::kernel::boot::futex::FUTEX_BITSET_MATCH_ANY,
+        )
+    }
+
+    /// FUTEX-ABS-BITSET1 — THE split selective wake (NR 10 with `FUTEX_FLAG_BITSET`): exactly
+    /// [`Self::futex_wake_key_split`]'s protocol over the waiters whose mask shares a bit with
+    /// `mask`, oldest first among them. A non-matching waiter is passed over in place (its record,
+    /// order and cycle untouched) and does not consume `count`; the first matching waiter that
+    /// cannot be placed stops the wake, exactly as an unmasked wake stops, so it is never bypassed
+    /// for a younger matching one.
+    pub(crate) fn futex_wake_key_masked_split(
+        &self,
+        cpu: CpuId,
+        key: crate::kernel::boot::futex::FutexKey,
+        count: u32,
+        mask: u32,
+    ) -> u32 {
+        self.futex_wake_key_outcome_split(cpu, key, count, mask)
+            .woke
     }
 
     /// FUTEX-REQUEUE1 — [`Self::futex_wake_key_split`], also reporting whether the wake stopped
@@ -14314,6 +14352,7 @@ impl SharedKernel {
         cpu: CpuId,
         key: crate::kernel::boot::futex::FutexKey,
         count: u32,
+        mask: u32,
     ) -> crate::kernel::boot::futex::FutexWakeOutcome {
         use crate::kernel::boot::futex as fx;
         use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
@@ -14323,9 +14362,9 @@ impl SharedKernel {
         let mut attempts = 0usize;
         while woke < want && attempts < want + fx::MAX_FUTEX_WAITERS {
             attempts += 1;
-            // (1) rank 2: the oldest live waiter, then its plan.
+            // (1) rank 2: the oldest live MATCHING waiter, then its plan.
             let Some(candidate) = self.with_task_futex_split_mut(|tcbs, table| {
-                fx::next_futex_waiter_locked(tcbs, table, key)
+                fx::next_futex_waiter_masked_locked(tcbs, table, key, mask)
             }) else {
                 break;
             };
@@ -14422,7 +14461,13 @@ impl SharedKernel {
         if !crate::kernel::boot::futex::futex_timed_waits_possible() {
             return Default::default();
         }
-        self.run_due_futex_timeouts_at(cpu, self.scheduler_clock_now())
+        // FUTEX-ABS-BITSET1: every timed record's deadline is judged by its OWN domain, read once
+        // for the pass here (`CLOCK_MONOTONIC`; a failed read makes nothing due). The scheduler
+        // tick rides along for diagnostics only.
+        self.run_due_futex_timeouts_at(
+            cpu,
+            crate::kernel::boot::futex::FutexNow::read(self.scheduler_clock_now()),
+        )
     }
 
     /// FUTEX-TIME1 — the clock-injected body of [`Self::run_due_futex_timeouts`].
@@ -14445,7 +14490,7 @@ impl SharedKernel {
     pub(crate) fn run_due_futex_timeouts_at(
         &self,
         cpu: CpuId,
-        now: u64,
+        now: crate::kernel::boot::futex::FutexNow,
     ) -> crate::kernel::boot::futex::FutexTimeoutPass {
         use crate::kernel::boot::futex::{self as fx, FutexTimeoutPass};
         use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
@@ -14501,10 +14546,17 @@ impl SharedKernel {
                 // cycle is named by its wait generation, its deadline by its REGISTER.
                 #[cfg(feature = "futex-time-witness")]
                 {
-                    let (g, _, _) = self.with_task_futex_split_mut(|tcbs, table| {
+                    let (g, _, _, d, _) = self.with_task_futex_split_mut(|tcbs, table| {
                         fx::time_witness_facts_locked(tcbs, table, candidate)
                     });
-                    crate::kernel::sat_witness::emit("futex", cpu.0, candidate.tid, g, 0, now);
+                    crate::kernel::sat_witness::emit(
+                        "futex",
+                        cpu.0,
+                        candidate.tid,
+                        g,
+                        d,
+                        now.mono_ns.unwrap_or(0),
+                    );
                 }
                 // (3) The home queue cannot take it now: the timeout WINS anyway, and the
                 // placement is owed by a later pass. Nothing becomes `Runnable`.
@@ -14515,13 +14567,14 @@ impl SharedKernel {
                 if expired {
                     pass.expired += 1;
                     crate::yarm_log!(
-                        "FUTEX_TIMEOUT_EXPIRED_UNPLACED tid={} slot={} generation={} cpu={} home={} now={}",
+                        "FUTEX_TIMEOUT_EXPIRED_UNPLACED tid={} slot={} generation={} cpu={} home={} now={} tick={}",
                         candidate.tid,
                         candidate.token.slot,
                         candidate.token.generation,
                         cpu.0,
                         home.0,
-                        now
+                        now.mono_ns.unwrap_or(0),
+                        now.tick
                     );
                 } else {
                     pass.refused += 1;
@@ -14534,9 +14587,10 @@ impl SharedKernel {
                 candidate.tid,
             );
             #[cfg(feature = "futex-time-witness")]
-            let (w_gen, w_race, w_va) = self.with_task_futex_split_mut(|tcbs, table| {
-                fx::time_witness_facts_locked(tcbs, table, candidate)
-            });
+            let (w_gen, w_race, w_va, w_deadline, w_mask) =
+                self.with_task_futex_split_mut(|tcbs, table| {
+                    fx::time_witness_facts_locked(tcbs, table, candidate)
+                });
             // (4) rank 2: THE timeout claim of exactly this cycle.
             let claimed = self.with_task_futex_split_mut(|tcbs, table| {
                 fx::claim_futex_timeout_locked(tcbs, table, candidate, now)
@@ -14565,7 +14619,16 @@ impl SharedKernel {
             #[cfg(feature = "futex-time-witness")]
             {
                 let current = self.current_tid_split_read(cpu).unwrap_or(0);
-                fx::time_witness::timed_out(cpu.0, candidate.tid, w_gen, now, current, w_va);
+                fx::time_witness::timed_out(
+                    cpu.0,
+                    candidate.tid,
+                    w_gen,
+                    now.mono_ns.unwrap_or(0),
+                    current,
+                    w_va,
+                    w_deadline,
+                    w_mask,
+                );
                 if w_race {
                     let asid = self.task_asid_for_tid_split_read(candidate.tid);
                     let peer =
@@ -19572,16 +19635,26 @@ impl SharedKernel {
         expected: u32,
         kind: crate::kernel::boot::futex::FutexKind,
     ) -> crate::kernel::syscall::sched::FutexParkOutcome {
-        self.futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, None)
+        self.futex_wait_park_exact_timed_split(
+            cpu,
+            tid,
+            asid,
+            addr,
+            expected,
+            kind,
+            crate::kernel::boot::futex::FutexWaitTiming::Untimed,
+            crate::kernel::boot::futex::FUTEX_BITSET_MATCH_ANY,
+        )
     }
 
-    // FUTEX-TIME1 — THE park transaction, timed or not. `deadline` is the absolute
-    // scheduler-tick deadline the route converted once at admission; the hold below reads the
-    // clock itself, after its comparison, to decide whether it has already been reached
-    // (`FutexParkOutcome::TimedOut`, nothing published), and otherwise registers the waiter WITH
-    // that deadline attached to its exact record. Everything after the registration is the
-    // untimed transaction, unchanged: a timeout that claims the waiter between the registration
-    // and the clear is detected by the same read-back as a wake.
+    // FUTEX-TIME1 / FUTEX-ABS-BITSET1 — THE park transaction, timed or not, masked or not.
+    // `timing` carries the caller's ABSOLUTE typed deadline as given (never converted, never
+    // rebuilt); the hold below reads that deadline's own clock itself, after its comparison, to
+    // decide whether it has already been reached (`FutexParkOutcome::TimedOut`) or cannot be
+    // judged (`FutexParkOutcome::ClockUnavailable`), both with nothing published, and otherwise
+    // registers the waiter WITH its mask and deadline attached to its exact record. Everything
+    // after the registration is the untimed transaction, unchanged: a timeout that claims the
+    // waiter between the registration and the clear is detected by the same read-back as a wake.
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub(crate) fn futex_wait_park_exact_timed_split(
@@ -19592,7 +19665,8 @@ impl SharedKernel {
         addr: usize,
         expected: u32,
         kind: crate::kernel::boot::futex::FutexKind,
-        deadline: Option<u64>,
+        timing: crate::kernel::boot::futex::FutexWaitTiming,
+        mask: u32,
     ) -> crate::kernel::syscall::sched::FutexParkOutcome {
         use crate::kernel::boot::futex::{self as fx, FutexCompareRegisterRefusal};
         use crate::kernel::syscall::sched::FutexParkOutcome as O;
@@ -19624,22 +19698,10 @@ impl SharedKernel {
         // no second read: once this hold has registered the waiter, the wait has happened, and a
         // later change of the word is a later operation — one that wakes, moves or leaves it, as
         // its own sequential step would. Nothing here retracts a registration because of the word.
-        let now = || self.scheduler_clock_now();
-        let timing = match (kind, deadline) {
-            (_, None) => fx::FutexWaitTiming::Untimed,
-            // SCHED-TIME-FOUNDATION1 C: a sleep (NR 20) — monotonic nanoseconds, read in the hold.
-            (fx::FutexKind::Sleep, Some(deadline_ns)) => {
-                fx::FutexWaitTiming::MonotonicNs { deadline_ns }
-            }
-            (_, Some(deadline)) => fx::FutexWaitTiming::Timed {
-                deadline,
-                now: &now,
-            },
-        };
         let registered = self.with_task_futex_then_vm_memory_split_mut(
             |tcbs, _classes, table, spaces, memory| {
                 fx::compare_and_register_futex_waiter_locked(
-                    tcbs, table, spaces, memory, tid, asid, addr, expected, kind, timing,
+                    tcbs, table, spaces, memory, tid, asid, addr, expected, kind, timing, mask,
                 )
             },
         );
@@ -19647,6 +19709,8 @@ impl SharedKernel {
             Ok((_key, token)) => token,
             Err(FutexCompareRegisterRefusal::ValueChanged) => return O::ValueChanged,
             Err(FutexCompareRegisterRefusal::TimedOut) => return O::TimedOut,
+            Err(FutexCompareRegisterRefusal::ClockUnavailable) => return O::ClockUnavailable,
+            Err(FutexCompareRegisterRefusal::InvalidMask) => return O::InvalidMask,
             Err(FutexCompareRegisterRefusal::Word(err)) => return O::WordUnreadable(err),
             Err(FutexCompareRegisterRefusal::IncarnationMoved) => {
                 crate::yarm_log!(

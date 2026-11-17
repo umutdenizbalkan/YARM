@@ -63,14 +63,100 @@ use crate::kernel::vm::{AddressSpaceManager, Asid, PAGE_SIZE, VirtAddr};
 
 /// NR 9 / NR 10 flag: resolve a SHARED key (backing object + offset) instead of a private one.
 pub const FUTEX_FLAG_SHARED: usize = 1;
-/// FUTEX-TIME1 — NR 9 only: the wait is TIMED, and `args[3]` is its relative timeout in
-/// nanoseconds (see `syscall::sched::futex_timeout_ticks`). NR 10 refuses it like any undefined
-/// bit, and `args[3]` is not read without it.
+/// FUTEX-ABS-BITSET1 (ABI v13) — NR 9 only: the wait is TIMED, and `args[3]` is its ABSOLUTE
+/// deadline on `CLOCK_MONOTONIC`, in nanoseconds (the domain NR 18 reports). NR 10 refuses it like
+/// any undefined bit, and `args[3]` is not read without it. (FUTEX-TIME1's relative tick timeout,
+/// the bit's ABI v12 meaning, is gone.)
 pub const FUTEX_FLAG_TIMED: usize = 1 << 1;
-/// Every flag the key decode defines (NR 9 and NR 10); any other bit set is `InvalidArgs`.
+/// FUTEX-ABS-BITSET1 (ABI v13) — NR 9 and NR 10: `args[4]` is the wait's or the wake's `u32`
+/// MASK, which must be nonzero. Without the bit the mask is [`FUTEX_BITSET_MATCH_ANY`] and
+/// `args[4]` is not read.
+pub const FUTEX_FLAG_BITSET: usize = 1 << 2;
+/// Every flag the key decode defines; any other bit set is `InvalidArgs`.
 pub const FUTEX_FLAGS_DEFINED: usize = FUTEX_FLAG_SHARED;
-/// Every flag NR 9 defines: the key flags and [`FUTEX_FLAG_TIMED`].
-pub const FUTEX_WAIT_FLAGS_DEFINED: usize = FUTEX_FLAGS_DEFINED | FUTEX_FLAG_TIMED;
+/// Every flag NR 9 defines: the key flag, [`FUTEX_FLAG_TIMED`] and [`FUTEX_FLAG_BITSET`].
+pub const FUTEX_WAIT_FLAGS_DEFINED: usize =
+    FUTEX_FLAGS_DEFINED | FUTEX_FLAG_TIMED | FUTEX_FLAG_BITSET;
+/// Every flag NR 10 defines: the key flag and [`FUTEX_FLAG_BITSET`].
+pub const FUTEX_WAKE_FLAGS_DEFINED: usize = FUTEX_FLAGS_DEFINED | FUTEX_FLAG_BITSET;
+/// NR 9 argument slot of the absolute deadline (read only with [`FUTEX_FLAG_TIMED`]).
+pub const FUTEX_ARG_DEADLINE: usize = 3;
+/// NR 9 and NR 10 argument slot of the mask (read only with [`FUTEX_FLAG_BITSET`]).
+pub const FUTEX_ARG_MASK: usize = 4;
+/// FUTEX-ABS-BITSET1 — the mask that matches every other mask: every waiter and every wake that
+/// names no mask carries it, so an unmasked wait or wake behaves exactly as before the bitset.
+pub const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+
+/// FUTEX-ABS-BITSET1 — THE mask rule: a wake with mask `wake` may claim a waiter with mask `wait`
+/// iff they share a bit. Both are nonzero by construction (the decode refuses a zero mask).
+pub const fn futex_masks_match(wait: u32, wake: u32) -> bool {
+    wait & wake != 0
+}
+
+/// FUTEX-ABS-BITSET1 — a timed waiter's deadline, WITH ITS CLOCK DOMAIN.
+///
+/// The domain is part of the value the record holds, written once by the compare-and-register
+/// hold and never derived from anything else: not from the record's key (which a requeue, the
+/// compare-and-requeue's `Pending` set or the timeout's `Expired` move changes), not from the
+/// syscall that admitted it, and not from any global selector. [`Self::reached`] is the only
+/// judgment of a deadline, and it consults only the domain and the clock reading of that domain.
+/// So a rekey can never reinterpret a deadline: there is no code path from a key to a clock.
+///
+/// Every timed wait today is on `CLOCK_MONOTONIC` (word waits since ABI v13, and `ClockNanosleep`
+/// since SCHED-TIME-FOUNDATION1 C); FUTEX-TIME1's scheduler-tick domain was retired with ABI v13.
+/// A future domain is a new variant and a new arm of [`Self::reached`], never a reinterpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutexDeadline {
+    /// An absolute instant on `CLOCK_MONOTONIC`, in nanoseconds (`timekeeping::monotonic_ns`).
+    MonotonicNs(u64),
+}
+
+impl FutexDeadline {
+    /// Whether this deadline has been reached at `now`. A clock reading that is missing in the
+    /// deadline's domain is "not reached": a deadline is never judged early, and never against
+    /// another clock.
+    pub const fn reached(self, now: FutexNow) -> bool {
+        match (self, now.mono_ns) {
+            (Self::MonotonicNs(d), Some(n)) => n >= d,
+            (Self::MonotonicNs(_), None) => false,
+        }
+    }
+
+    /// The raw instant (diagnostics and witness markers only; never compared outside
+    /// [`Self::reached`]).
+    pub const fn raw(self) -> u64 {
+        match self {
+            Self::MonotonicNs(d) => d,
+        }
+    }
+}
+
+/// FUTEX-ABS-BITSET1 — the clocks one timeout-collector pass judges by, each read ONCE per pass:
+/// `mono_ns` is `CLOCK_MONOTONIC` (`None` when it cannot be read — nothing is then due), and
+/// `tick` the global scheduler tick, carried for the collector's diagnostics only. No deadline is
+/// in the tick domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FutexNow {
+    pub mono_ns: Option<u64>,
+    pub tick: u64,
+}
+
+impl FutexNow {
+    /// `CLOCK_MONOTONIC` and the scheduler tick as they read now.
+    pub fn read(tick: u64) -> Self {
+        Self {
+            mono_ns: crate::kernel::timekeeping::monotonic_ns().ok(),
+            tick,
+        }
+    }
+    /// A reading at the monotonic instant `ns` (tests and injected clocks).
+    pub const fn at_ns(ns: u64) -> Self {
+        Self {
+            mono_ns: Some(ns),
+            tick: 0,
+        }
+    }
+}
 
 /// Which namespace a futex word is resolved in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,12 +406,18 @@ struct FutexWaiterRecord {
     tcb: u16,
     /// The VA the waiter named (diagnostics and the overtaken witness's hold; never identity).
     va: u64,
-    /// FUTEX-TIME1 — the wait cycle's absolute deadline in the scheduler-tick domain, or `None`
-    /// for an untimed wait. It belongs to THIS record — this slot in this incarnation — so it
-    /// moves with every rekey (a requeue keeps it), and it dies with the record: a reused slot is
-    /// a new generation and a new record. Written only inside the compare-and-register hold that
-    /// published the record (`arm_futex_deadline_locked`).
-    deadline: Option<u64>,
+    /// FUTEX-TIME1 / FUTEX-ABS-BITSET1 — the wait cycle's absolute deadline WITH ITS CLOCK
+    /// DOMAIN ([`FutexDeadline`]), or `None` for an untimed wait. It belongs to THIS record — this
+    /// slot in this incarnation — so it moves with every rekey (a requeue, the `Pending` and
+    /// `Expired` moves keep it, domain included; [`rekey`] writes only the key and the VA), and
+    /// it dies with the record: a reused slot is a new generation and a new record. Written only
+    /// inside the compare-and-register hold that published the record
+    /// (`arm_futex_deadline_locked`).
+    deadline: Option<FutexDeadline>,
+    /// FUTEX-ABS-BITSET1 — the wait's mask ([`FUTEX_BITSET_MATCH_ANY`] for an unmasked wait and
+    /// for every kernel-private record). Written once, at registration; like the deadline it moves
+    /// with every rekey and dies with the record.
+    mask: u32,
     /// FUTEX-TIME1 live witness only: this timed cycle is a sequence-G race cycle.
     #[cfg(feature = "futex-time-witness")]
     g_race: bool,
@@ -477,10 +569,19 @@ impl FutexWaiterTable {
 
     /// FUTEX-TIME1 — the deadline a token's record holds. Test and census use.
     #[cfg(test)]
-    pub fn deadline_of(&self, token: FutexWaitToken) -> Option<u64> {
+    pub fn deadline_of(&self, token: FutexWaitToken) -> Option<FutexDeadline> {
         let slot = usize::from(token.slot);
         (slot < MAX_FUTEX_WAITERS && self.generations[slot] == token.generation)
             .then(|| self.records[slot].and_then(|r| r.deadline))
+            .flatten()
+    }
+
+    /// FUTEX-ABS-BITSET1 — the mask a token's record holds. Test and witness use.
+    #[cfg(any(test, feature = "futex-time-witness"))]
+    pub fn mask_of(&self, token: FutexWaitToken) -> Option<u32> {
+        let slot = usize::from(token.slot);
+        (slot < MAX_FUTEX_WAITERS && self.generations[slot] == token.generation)
+            .then(|| self.records[slot].map(|r| r.mask))
             .flatten()
     }
 
@@ -632,6 +733,20 @@ pub fn register_futex_waiter_locked(
     key: FutexKey,
     va: u64,
 ) -> Result<FutexWaitToken, FutexRegisterRefusal> {
+    register_futex_waiter_masked_locked(tcbs, table, tid, asid, key, va, FUTEX_BITSET_MATCH_ANY)
+}
+
+/// FUTEX-ABS-BITSET1 — [`register_futex_waiter_locked`] for a waiter with mask `mask` (nonzero;
+/// the decode refuses zero). The mask is written with the record, in the same hold.
+pub fn register_futex_waiter_masked_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    tid: u64,
+    asid: Asid,
+    key: FutexKey,
+    va: u64,
+    mask: u32,
+) -> Result<FutexWaitToken, FutexRegisterRefusal> {
     let Some(tcb_idx) = tcbs.iter().position(|t| {
         t.as_ref().is_some_and(|t| {
             t.tid.0 == tid
@@ -661,6 +776,7 @@ pub fn register_futex_waiter_locked(
         tcb: tcb_idx as u16,
         va,
         deadline: None,
+        mask,
         #[cfg(feature = "futex-time-witness")]
         g_race: false,
         next: NIL,
@@ -691,36 +807,26 @@ pub enum FutexCompareRegisterRefusal {
     /// is published and the wait answers `TimedOut`. Decided after the comparison, so a word that
     /// differs answers `ValueChanged` whatever the deadline.
     TimedOut,
+    /// FUTEX-ABS-BITSET1 — the word DID hold `expected`, the wait is timed, and `CLOCK_MONOTONIC`
+    /// could not be read inside the hold: nothing is published and the wait answers
+    /// `Unavailable`. A timed wait is never admitted without its clock, never judged against
+    /// another clock and never silently made untimed.
+    ClockUnavailable,
+    /// FUTEX-ABS-BITSET1 — a zero wait mask, which no wake could ever match. The decode refuses it
+    /// first (`InvalidArgs`); the owner refuses it too, so it can never be published.
+    InvalidMask,
 }
 
-/// FUTEX-TIME1 — whether a compare-and-register is timed, and the clock it is judged against.
-#[derive(Clone, Copy)]
-pub enum FutexWaitTiming<'a> {
+/// FUTEX-TIME1 / FUTEX-ABS-BITSET1 — whether a compare-and-register is timed, and its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutexWaitTiming {
     /// An untimed wait: exactly the FUTEX-WAIT-ATOMIC1 transaction.
     Untimed,
-    /// A timed wait whose absolute scheduler-tick deadline is `deadline`. `now` reads the clock
-    /// INSIDE the hold (a lock-free atomic load), after the comparison: that read is what decides
-    /// "already expired" at the wait's linearization point.
-    Timed {
-        deadline: u64,
-        now: &'a dyn Fn() -> u64,
-    },
-    /// SCHED-TIME-FOUNDATION1 C — a `ClockNanosleep` cycle ([`FutexKind::Sleep`]) whose absolute
-    /// deadline is `deadline_ns` on `CLOCK_MONOTONIC`. The clock is read INSIDE the hold
-    /// ([`sleep_deadline_reached`]), so a deadline already reached publishes nothing.
-    MonotonicNs { deadline_ns: u64 },
-}
-
-impl core::fmt::Debug for FutexWaitTiming<'_> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Untimed => f.write_str("Untimed"),
-            Self::Timed { deadline, .. } => write!(f, "Timed {{ deadline: {deadline} }}"),
-            Self::MonotonicNs { deadline_ns } => {
-                write!(f, "MonotonicNs {{ deadline_ns: {deadline_ns} }}")
-            }
-        }
-    }
+    /// A timed wait (an NR 9 word wait, or an NR 20 [`FutexKind::Sleep`] cycle) whose ABSOLUTE
+    /// deadline is `deadline`. The deadline's own clock is read INSIDE the hold, after the
+    /// comparison: that read decides "already reached" at the wait's linearization point, and a
+    /// reading that cannot be taken refuses the wait.
+    Deadline(FutexDeadline),
 }
 
 /// FUTEX-TIME1 — rank 2, inside the compare-and-register hold that just returned `token`: attach
@@ -732,7 +838,7 @@ fn arm_futex_deadline_locked(
     tcbs: &mut [Option<ThreadControlBlock>],
     table: &mut FutexWaiterTable,
     token: FutexWaitToken,
-    deadline: u64,
+    deadline: FutexDeadline,
 ) -> bool {
     let slot = usize::from(token.slot);
     if slot >= MAX_FUTEX_WAITERS || table.token(slot) != token {
@@ -774,12 +880,14 @@ fn arm_futex_deadline_locked(
 /// the task lock, which precedes this hold's acquisition of it) or entirely after it (and then
 /// finds this waiter). A user store that no futex operation follows is ordered by the load alone.
 ///
-/// **FUTEX-TIME1.** A [`FutexWaitTiming::Timed`] wait is decided in the SAME hold, in this order:
-/// the key and the word (their own errors), the comparison (`ValueChanged` — a word that differs
-/// answers `0` whatever the deadline), then the clock, read here: a deadline already reached is
-/// `TimedOut` with nothing published. Otherwise the waiter is registered through the one owner and
-/// its deadline attached to that exact record before the hold ends, so no other operation can ever
-/// observe the cycle untimed. An untimed wait is exactly the FUTEX-WAIT-ATOMIC1 transaction.
+/// **FUTEX-TIME1 / FUTEX-ABS-BITSET1.** A [`FutexWaitTiming::Deadline`] wait is decided in the
+/// SAME hold, in this order: the key and the word (their own errors), the comparison
+/// (`ValueChanged` — a word that differs answers `0` whatever the deadline or the clock), then the
+/// deadline's own clock, read here: no reading is `ClockUnavailable`, a deadline already reached
+/// (`deadline <= now`) is `TimedOut`, both with nothing published. Otherwise the waiter is
+/// registered through the one owner, with its `mask`, and its typed deadline attached to that
+/// exact record before the hold ends, so no other operation can ever observe the cycle untimed or
+/// unmasked. An untimed `MATCH_ANY` wait is exactly the FUTEX-WAIT-ATOMIC1 transaction.
 #[allow(clippy::too_many_arguments)]
 pub fn compare_and_register_futex_waiter_locked(
     tcbs: &mut [Option<ThreadControlBlock>],
@@ -791,11 +899,16 @@ pub fn compare_and_register_futex_waiter_locked(
     addr: usize,
     expected: u32,
     kind: FutexKind,
-    timing: FutexWaitTiming<'_>,
+    timing: FutexWaitTiming,
+    mask: u32,
 ) -> Result<(FutexKey, FutexWaitToken), FutexCompareRegisterRefusal> {
     use FutexCompareRegisterRefusal as Refused;
     if kind == FutexKind::Sleep {
         return register_sleep_waiter_locked(tcbs, table, tid, asid, timing);
+    }
+    // A zero mask could never be woken; the decode refuses it, and so does the owner.
+    if mask == 0 {
+        return Err(Refused::InvalidMask);
     }
     let (key, word) = match resolve_futex_word_locked(spaces, memory, asid, addr, kind) {
         Ok(found) => found,
@@ -807,13 +920,27 @@ pub fn compare_and_register_futex_waiter_locked(
     }
     let deadline = match timing {
         FutexWaitTiming::Untimed => None,
-        // Only a sleep carries a nanosecond deadline; a word wait never does.
-        FutexWaitTiming::MonotonicNs { .. } => return Err(Refused::Word(KernelError::WrongObject)),
-        FutexWaitTiming::Timed { deadline, now } => {
+        FutexWaitTiming::Deadline(deadline) => {
             if !entering_incarnation(tcbs, tid, asid) {
                 return Err(Refused::IncarnationMoved);
             }
-            if now() >= deadline {
+            // FUTEX-ABS-BITSET1: the deadline's OWN clock, read here, inside the hold and after
+            // the comparison (a word that differs answered `ValueChanged` above). No reading: the
+            // wait is refused, with nothing published.
+            let Some(now) = deadline_clock_now(deadline) else {
+                #[cfg(feature = "futex-time-witness")]
+                time_witness::admit(tid, deadline.raw(), 0, mask, "unavailable");
+                return Err(Refused::ClockUnavailable);
+            };
+            if deadline.reached(now) {
+                #[cfg(feature = "futex-time-witness")]
+                time_witness::admit(
+                    tid,
+                    deadline.raw(),
+                    now.mono_ns.unwrap_or(0),
+                    mask,
+                    "timed_out",
+                );
                 return Err(Refused::TimedOut);
             }
             // The generation this cycle's completion will carry must exist BEFORE anything is
@@ -826,16 +953,15 @@ pub fn compare_and_register_futex_waiter_locked(
             if !advances {
                 return Err(Refused::Full);
             }
-            Some(deadline)
+            Some((deadline, now))
         }
     };
-    let token = register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64).map_err(
-        |refusal| match refusal {
+    let token = register_futex_waiter_masked_locked(tcbs, table, tid, asid, key, addr as u64, mask)
+        .map_err(|refusal| match refusal {
             FutexRegisterRefusal::IncarnationMoved => Refused::IncarnationMoved,
             FutexRegisterRefusal::Full => Refused::Full,
-        },
-    )?;
-    if let Some(deadline) = deadline
+        })?;
+    if let Some((deadline, _)) = deadline
         && !arm_futex_deadline_locked(tcbs, table, token, deadline)
     {
         // Unreachable (the registration just wrote this record and checked the counter); an
@@ -844,7 +970,7 @@ pub fn compare_and_register_futex_waiter_locked(
         return Err(Refused::Full);
     }
     #[cfg(feature = "futex-time-witness")]
-    if let (Some(deadline), FutexWaitTiming::Timed { now, .. }) = (deadline, timing) {
+    if let Some((deadline, admitted)) = deadline {
         let slot = usize::from(token.slot);
         if let Some(rec) = table.records[slot].as_mut() {
             rec.g_race = time_witness::g_race(expected);
@@ -854,8 +980,11 @@ pub fn compare_and_register_futex_waiter_locked(
             .flatten()
             .find(|t| t.tid.0 == tid)
             .map_or(0, |t| t.futex_wait_generation);
-        let va = table.records[slot].map_or(0, |r| r.va as u64);
-        time_witness::registered(tid, generation, deadline, now(), va);
+        let va = table.records[slot].map_or(0, |r| r.va);
+        // The reading that decided the admission (not a second one).
+        let now = admitted.mono_ns.unwrap_or(0);
+        time_witness::admit(tid, deadline.raw(), now, mask, "registered");
+        time_witness::registered(tid, generation, deadline.raw(), now, va, mask);
     }
     Ok((key, token))
 }
@@ -867,15 +996,20 @@ pub fn sleep_deadline_reached(deadline_ns: u64) -> bool {
     crate::kernel::timekeeping::monotonic_ns().is_ok_and(|now| now >= deadline_ns)
 }
 
-/// FUTEX-TIME1 / SCHED-TIME-FOUNDATION1 C — whether `rec`'s deadline has been reached, in the
-/// clock its key names: the monotonic nanosecond clock for a [`FutexKey::Sleep`] record, the
-/// scheduler tick `now_tick` for every other.
-fn record_deadline_reached(rec: &FutexWaiterRecord, now_tick: u64) -> bool {
-    match (rec.deadline, rec.key) {
-        (None, _) => false,
-        (Some(d), FutexKey::Sleep { .. }) => sleep_deadline_reached(d),
-        (Some(d), _) => d <= now_tick,
+/// FUTEX-ABS-BITSET1 — the reading of `deadline`'s own clock, now; `None` if it cannot be read.
+fn deadline_clock_now(deadline: FutexDeadline) -> Option<FutexNow> {
+    match deadline {
+        FutexDeadline::MonotonicNs(_) => crate::kernel::timekeeping::monotonic_ns()
+            .ok()
+            .map(FutexNow::at_ns),
     }
+}
+
+/// FUTEX-TIME1 / FUTEX-ABS-BITSET1 — whether `rec`'s deadline has been reached at `now`. The
+/// record's own [`FutexDeadline`] decides, in its own domain; the record's KEY is never consulted
+/// (a requeued, pending, expired or sleep record is judged exactly as it was admitted).
+fn record_deadline_reached(rec: &FutexWaiterRecord, now: FutexNow) -> bool {
+    rec.deadline.is_some_and(|d| d.reached(now))
 }
 
 /// SCHED-TIME-FOUNDATION1 C — rank 2, ONE hold: THE registration of a `ClockNanosleep` cycle.
@@ -892,11 +1026,11 @@ fn register_sleep_waiter_locked(
     table: &mut FutexWaiterTable,
     tid: u64,
     asid: Asid,
-    timing: FutexWaitTiming<'_>,
+    timing: FutexWaitTiming,
 ) -> Result<(FutexKey, FutexWaitToken), FutexCompareRegisterRefusal> {
     use FutexCompareRegisterRefusal as Refused;
-    let FutexWaitTiming::MonotonicNs { deadline_ns } = timing else {
-        // A sleep is always timed, in nanoseconds.
+    let FutexWaitTiming::Deadline(FutexDeadline::MonotonicNs(deadline_ns)) = timing else {
+        // A sleep is always timed, on `CLOCK_MONOTONIC`.
         return Err(Refused::Word(KernelError::WrongObject));
     };
     if !entering_incarnation(tcbs, tid, asid) {
@@ -921,7 +1055,7 @@ fn register_sleep_waiter_locked(
                 FutexRegisterRefusal::Full => Refused::Full,
             }
         })?;
-    if !arm_futex_deadline_locked(tcbs, table, token, deadline_ns) {
+    if !arm_futex_deadline_locked(tcbs, table, token, FutexDeadline::MonotonicNs(deadline_ns)) {
         // Unreachable (see the word arm); an untimed sleep record must never exist.
         undo_futex_registration_locked(tcbs, table, tid, token);
         return Err(Refused::Full);
@@ -1001,6 +1135,20 @@ pub fn next_futex_waiter_locked(
     table: &mut FutexWaiterTable,
     key: FutexKey,
 ) -> Option<FutexWakeCandidate> {
+    next_futex_waiter_masked_locked(tcbs, table, key, FUTEX_BITSET_MATCH_ANY)
+}
+
+/// FUTEX-ABS-BITSET1 — rank 2: the OLDEST live waiter on `key` whose mask shares a bit with
+/// `mask` ([`futex_masks_match`]), without claiming it. A live waiter of `key` that does not match
+/// is passed over and left exactly where it is (its record, its order and its cycle untouched);
+/// stale records met are retired, as [`next_futex_waiter_locked`] (which is this with
+/// [`FUTEX_BITSET_MATCH_ANY`]) does. Mutates no TCB.
+pub fn next_futex_waiter_masked_locked(
+    tcbs: &[Option<ThreadControlBlock>],
+    table: &mut FutexWaiterTable,
+    key: FutexKey,
+    mask: u32,
+) -> Option<FutexWakeCandidate> {
     let b = key.bucket();
     let mut prev = NIL;
     let mut cur = table.head[b];
@@ -1009,11 +1157,15 @@ pub fn next_futex_waiter_locked(
         let rec = table.records[slot]?;
         let next = rec.next;
         if table.live(tcbs, slot) {
-            if rec.key == key {
+            if rec.key == key && futex_masks_match(rec.mask, mask) {
                 return Some(FutexWakeCandidate {
                     tid: rec.tid,
                     token: table.token(slot),
                 });
+            }
+            #[cfg(feature = "futex-time-witness")]
+            if rec.key == key && mask != FUTEX_BITSET_MATCH_ANY {
+                time_witness::bitset_skip(rec.tid, rec.mask, mask, rec.va);
             }
             prev = cur;
         } else {
@@ -1066,7 +1218,7 @@ pub fn claim_futex_waiter_locked(
     if rec.deadline.is_some() {
         publish_futex_wait_completion_locked(tcb, FutexWaitEnding::Woken);
         #[cfg(feature = "futex-time-witness")]
-        time_witness::woken(rec.tid, tcb.futex_wait_generation, rec.va as u64);
+        time_witness::woken(rec.tid, tcb.futex_wait_generation, rec.va, rec.mask);
     }
     true
 }
@@ -1159,7 +1311,7 @@ pub const FUTEX_TIMEOUT_DUE_MAX: usize = 8;
 pub fn collect_due_futex_timeouts_locked(
     tcbs: &[Option<ThreadControlBlock>],
     table: &mut FutexWaiterTable,
-    now: u64,
+    now: FutexNow,
     out: &mut [Option<FutexTimeoutCandidate>; FUTEX_TIMEOUT_DUE_MAX],
 ) -> (usize, usize) {
     if table.timed == 0 {
@@ -1213,7 +1365,7 @@ pub fn claim_futex_timeout_locked(
     tcbs: &mut [Option<ThreadControlBlock>],
     table: &mut FutexWaiterTable,
     candidate: FutexTimeoutCandidate,
-    now: u64,
+    now: FutexNow,
 ) -> bool {
     if !timeout_claimable(tcbs, table, candidate, now) {
         return false;
@@ -1256,7 +1408,7 @@ pub fn expire_futex_waiter_locked(
     tcbs: &[Option<ThreadControlBlock>],
     table: &mut FutexWaiterTable,
     candidate: FutexTimeoutCandidate,
-    now: u64,
+    now: FutexNow,
 ) -> bool {
     if !timeout_claimable(tcbs, table, candidate, now) {
         return false;
@@ -1281,7 +1433,7 @@ fn timeout_claimable(
     tcbs: &[Option<ThreadControlBlock>],
     table: &FutexWaiterTable,
     candidate: FutexTimeoutCandidate,
-    now: u64,
+    now: FutexNow,
 ) -> bool {
     let slot = usize::from(candidate.token.slot);
     if slot >= MAX_FUTEX_WAITERS || table.token(slot) != candidate.token {
@@ -1303,19 +1455,21 @@ pub fn time_witness_facts_locked(
     tcbs: &[Option<ThreadControlBlock>],
     table: &FutexWaiterTable,
     candidate: FutexTimeoutCandidate,
-) -> (u64, bool, u64) {
+) -> (u64, bool, u64, u64, u32) {
     let slot = usize::from(candidate.token.slot);
     let rec = (slot < MAX_FUTEX_WAITERS && table.token(slot) == candidate.token)
         .then(|| table.records[slot])
         .flatten();
     let g = rec.is_some_and(|r| r.g_race);
-    let va = rec.map_or(0, |r| r.va as u64);
+    let va = rec.map_or(0, |r| r.va);
     let generation = tcbs
         .iter()
         .flatten()
         .find(|t| t.tid.0 == candidate.tid)
         .map_or(0, |t| t.futex_wait_generation);
-    (generation, g, va)
+    let deadline = rec.and_then(|r| r.deadline).map_or(0, FutexDeadline::raw);
+    let mask = rec.map_or(0, |r| r.mask);
+    (generation, g, va, deadline, mask)
 }
 
 /// SCHED-TIME-FOUNDATION1 C live witness only — rank 2: `(generation, deadline)` of the cycle
@@ -1338,7 +1492,7 @@ pub fn sleep_witness_facts_locked(
         .flatten()
         .find(|t| t.tid.0 == candidate.tid)
         .map_or(0, |t| t.futex_wait_generation);
-    Some((generation, rec.deadline.unwrap_or(0)))
+    Some((generation, rec.deadline.map_or(0, FutexDeadline::raw)))
 }
 
 /// SCHED-TIME-FOUNDATION1 C live witness only (fixture 1) — rank 2, ONE hold: the task-domain
@@ -1619,7 +1773,15 @@ fn record_placement(
 
 /// Move `slot` (bucket predecessor `prev`) to `key`, appended at that key's tail: unlink, rekey,
 /// append. Its slot and incarnation, and so its waiter's token, are unchanged.
+///
+/// FUTEX-ABS-BITSET1: the KEY and the VA are all a rekey writes. The record's deadline (domain
+/// included), mask, tid and token move with it unchanged, so a requeued, pending or expired cycle
+/// is the same cycle. A sleep record is never rekeyed (its key is the only thing that reaches it).
 fn rekey(table: &mut FutexWaiterTable, slot: usize, prev: u16, key: FutexKey, va: Option<u64>) {
+    debug_assert!(
+        !table.records[slot].is_some_and(|r| matches!(r.key, FutexKey::Sleep { .. })),
+        "a sleep record is never rekeyed"
+    );
     table.unlink_after(slot, prev);
     if let Some(r) = table.records[slot].as_mut() {
         r.key = key;
@@ -2012,6 +2174,9 @@ pub mod wait_witness {
             // FUTEX-TIME1: a timed wait whose deadline was already reached at admission. The
             // wait witness issues only untimed waits, so it never logs this.
             O::TimedOut => "timed_out",
+            // FUTEX-ABS-BITSET1: timed-wait and mask refusals; the wait witness issues neither.
+            O::ClockUnavailable => "clock_unavailable",
+            O::InvalidMask => "invalid_mask",
         };
         crate::yarm_log!(
             "FUTEX_WAIT_WITNESS_RESULT wait={} tid={} outcome={}",
@@ -2065,50 +2230,83 @@ pub mod time_witness {
     pub fn g_race(expected: u32) -> bool {
         crate::kernel::boot::futex_requeue_witness_enabled() && expected & 0xFFFF_0000 == G_MAGIC
     }
-    /// NR 9's ONE deadline computation: the timeout in ns, the tick period it was rounded to,
-    /// the ticks, and the clock reading the deadline is relative to.
-    pub fn deadline(ns: u64, period: u64, ticks: u64, now: u64, deadline: Option<u64>) {
+    /// FUTEX-ABS-BITSET1 — NR 9's ONE admission decision of a timed wait whose word matched,
+    /// inside the compare-and-register hold: the ABSOLUTE `CLOCK_MONOTONIC` deadline the caller
+    /// passed, the clock reading it was judged against (`0` when unavailable), the wait's mask, and
+    /// the result (`registered`, `timed_out`: already reached, nothing published; `unavailable`:
+    /// no clock, nothing published).
+    pub fn admit(tid: u64, deadline: u64, now: u64, mask: u32, result: &str) {
         crate::yarm_log!(
-            "FUTEX_TIME_W_DEADLINE ns={} period_ns={} ticks={} now={} deadline={}",
-            ns,
-            period,
-            ticks,
+            "FUTEX_TIME_W_ADMIT tid={} deadline={} now={} mask=0x{:x} result={}",
+            tid,
+            deadline,
             now,
-            deadline.unwrap_or(u64::MAX)
+            mask,
+            result
         );
     }
     /// A timed cycle registered (inside the compare-and-register hold): `gen` is its
     /// `futex_wait_generation`, the coordinate every terminal marker below names.
-    pub fn registered(tid: u64, generation: u64, deadline: u64, now: u64, va: u64) {
+    pub fn registered(tid: u64, generation: u64, deadline: u64, now: u64, va: u64, mask: u32) {
         crate::yarm_log!(
-            "FUTEX_TIME_W_REGISTER tid={} gen={} deadline={} now={} va=0x{:x}",
+            "FUTEX_TIME_W_REGISTER tid={} gen={} deadline={} now={} va=0x{:x} mask=0x{:x}",
             tid,
             generation,
             deadline,
             now,
-            va
+            va,
+            mask
         );
     }
-    /// A wake claimed a timed cycle (inside its claim hold); `va` is the word it waited on then.
-    pub fn woken(tid: u64, generation: u64, va: u64) {
+    /// A wake claimed a timed cycle (inside its claim hold); `va` is the word it waited on then,
+    /// `mask` the record's mask as the claim found it.
+    pub fn woken(tid: u64, generation: u64, va: u64, mask: u32) {
         crate::yarm_log!(
-            "FUTEX_TIME_W_WAKE tid={} gen={} va=0x{:x}",
+            "FUTEX_TIME_W_WAKE tid={} gen={} va=0x{:x} mask=0x{:x}",
             tid,
             generation,
-            va
+            va,
+            mask
         );
     }
+    /// FUTEX-ABS-BITSET1 — a masked wake walking `va`'s key passed over a LIVE waiter whose mask
+    /// does not match its own (inside the wake's rank-2 hold): `tid` stays parked, in place.
+    pub fn bitset_skip(tid: u64, mask: u32, wake_mask: u32, va: u64) {
+        if crate::kernel::boot::futex_requeue_witness_enabled() {
+            crate::yarm_log!(
+                "FUTEX_TIME_W_BITSET_SKIP tid={} mask=0x{:x} wake_mask=0x{:x} va=0x{:x}",
+                tid,
+                mask,
+                wake_mask,
+                va
+            );
+        }
+    }
     /// The collector claimed a timed cycle's timeout (after its claim hold, before placement).
-    /// `current` is the task current on the collecting CPU (0: idle); `va` the word it waited on.
-    pub fn timed_out(cpu: u8, tid: u64, generation: u64, now: u64, current: u64, va: u64) {
+    /// `current` is the task current on the collecting CPU (0: idle); `va` the word it waited on;
+    /// `deadline` and `mask` the record's own, as the claim found them (so a requeue that changed
+    /// either would show here).
+    #[allow(clippy::too_many_arguments)]
+    pub fn timed_out(
+        cpu: u8,
+        tid: u64,
+        generation: u64,
+        now: u64,
+        current: u64,
+        va: u64,
+        deadline: u64,
+        mask: u32,
+    ) {
         crate::yarm_log!(
-            "FUTEX_TIME_W_TIMEOUT cpu={} tid={} gen={} now={} current={} va=0x{:x}",
+            "FUTEX_TIME_W_TIMEOUT cpu={} tid={} gen={} now={} current={} va=0x{:x} deadline={} mask=0x{:x}",
             cpu,
             tid,
             generation,
             now,
             current,
-            va
+            va,
+            deadline,
+            mask
         );
     }
     /// The collector found a due cycle but another owner claimed it first.

@@ -975,8 +975,14 @@ impl KernelState {
     ) -> Result<bool, KernelError> {
         // FUTEX-TIME1: the untimed broad wait — the shared body below with no deadline, so an
         // untimed NR 9 is exactly the FUTEX-WAIT-ATOMIC1 transaction it was.
-        self.futex_wait_current_inner(addr, expected, kind, None)
-            .map(|outcome| matches!(outcome, super::FutexWaitBroadOutcome::Blocked { .. }))
+        self.futex_wait_current_inner(
+            addr,
+            expected,
+            kind,
+            super::futex::FutexWaitTiming::Untimed,
+            super::futex::FUTEX_BITSET_MATCH_ANY,
+        )
+        .map(|outcome| matches!(outcome, super::FutexWaitBroadOutcome::Blocked { .. }))
     }
 
     fn futex_wait_current_inner(
@@ -984,9 +990,10 @@ impl KernelState {
         addr: usize,
         expected: u32,
         kind: super::futex::FutexKind,
-        deadline: Option<u64>,
+        timing: super::futex::FutexWaitTiming,
+        mask: u32,
     ) -> Result<super::FutexWaitBroadOutcome, KernelError> {
-        let timed = deadline.is_some();
+        let timed = timing != super::futex::FutexWaitTiming::Untimed;
         // FUTEX-WAIT-ATOMIC1: the key, the word, the comparison and the keyed registration in ONE
         // task -> vm -> memory hold — THE compare-and-register the split route uses. The broad
         // acquisition no longer excludes every waker (FutexWake and FutexCmpRequeue run off it),
@@ -997,25 +1004,9 @@ impl KernelState {
         }
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-        // FUTEX-TIME1: the broad route reads the (lock-free) clock immediately BEFORE its hold,
-        // because the hold borrows the whole state. A tick between this read and the hold can
-        // only register a wait whose deadline has just passed; the collector's next pass times
-        // it out (`TimedOut`), so the outcome is the same and only its latency differs. The split
-        // route — the production one — reads the clock inside its hold.
-        let at_hold = self.scheduler_tick_now();
-        let now = || at_hold;
-        let timing = match (kind, deadline) {
-            (_, None) => super::futex::FutexWaitTiming::Untimed,
-            // SCHED-TIME-FOUNDATION1 C: a sleep's deadline is monotonic nanoseconds, and the
-            // registration reads that clock inside its own hold.
-            (super::futex::FutexKind::Sleep, Some(deadline_ns)) => {
-                super::futex::FutexWaitTiming::MonotonicNs { deadline_ns }
-            }
-            (_, Some(deadline)) => super::futex::FutexWaitTiming::Timed {
-                deadline,
-                now: &now,
-            },
-        };
+        // FUTEX-ABS-BITSET1: both routes read the deadline's own clock (`CLOCK_MONOTONIC`, lock
+        // free) INSIDE the compare-and-register hold, after the comparison; the timing carries
+        // the typed deadline and nothing else.
         let registered =
             self.with_task_futex_then_vm_memory_mut(|tcbs, _classes, table, spaces, memory| {
                 super::futex::compare_and_register_futex_waiter_locked(
@@ -1029,6 +1020,7 @@ impl KernelState {
                     expected,
                     kind,
                     timing,
+                    mask,
                 )
             });
         {
@@ -1037,6 +1029,10 @@ impl KernelState {
                 Ok(_) => {}
                 Err(Refused::ValueChanged) => return Ok(super::FutexWaitBroadOutcome::NotBlocked),
                 Err(Refused::TimedOut) => return Ok(super::FutexWaitBroadOutcome::TimedOut),
+                Err(Refused::ClockUnavailable) => {
+                    return Ok(super::FutexWaitBroadOutcome::ClockUnavailable);
+                }
+                Err(Refused::InvalidMask) => return Ok(super::FutexWaitBroadOutcome::InvalidMask),
                 Err(Refused::Word(err)) => return Err(err),
                 Err(Refused::IncarnationMoved) => return Err(KernelError::TaskMissing),
                 Err(Refused::Full) => return Err(KernelError::TaskTableFull),
@@ -1204,16 +1200,17 @@ impl KernelState {
         Ok(super::FutexWaitBroadOutcome::Blocked { timed })
     }
 
-    /// FUTEX-TIME1 — the broad TIMED wait: the same body, with the absolute scheduler-tick
-    /// `deadline` the handler converted from the caller's relative timeout.
+    /// FUTEX-TIME1 / FUTEX-ABS-BITSET1 — the broad wait with its full NR 9 meaning: `timing`
+    /// (untimed, or an absolute typed deadline) and `mask` (`FUTEX_BITSET_MATCH_ANY` unmasked).
     pub(crate) fn futex_wait_current_timed(
         &mut self,
         addr: usize,
         expected: u32,
         kind: super::futex::FutexKind,
-        deadline: Option<u64>,
+        timing: super::futex::FutexWaitTiming,
+        mask: u32,
     ) -> Result<super::FutexWaitBroadOutcome, KernelError> {
-        self.futex_wait_current_inner(addr, expected, kind, deadline)
+        self.futex_wait_current_inner(addr, expected, kind, timing, mask)
     }
 
     pub fn futex_wake(
@@ -1222,8 +1219,21 @@ impl KernelState {
         count: u32,
         kind: super::futex::FutexKind,
     ) -> Result<u32, KernelError> {
+        self.futex_wake_masked(addr, count, kind, super::futex::FUTEX_BITSET_MATCH_ANY)
+    }
+
+    /// FUTEX-ABS-BITSET1 — the broad NR 10 with its mask: wake up to `count` waiters of the key
+    /// whose mask shares a bit with `mask`, oldest first among them. A waiter that does not match
+    /// is passed over in place and does not count.
+    pub fn futex_wake_masked(
+        &mut self,
+        addr: usize,
+        count: u32,
+        kind: super::futex::FutexKind,
+        mask: u32,
+    ) -> Result<u32, KernelError> {
         let (_tid, _asid, key, _word) = self.resolve_current_futex_word(addr, kind)?;
-        Ok(self.futex_wake_key(key, count))
+        Ok(self.futex_wake_key_outcome(key, count, mask).woke)
     }
 
     /// FUTEX-REQUEUE-ATOMIC1 — THE broad compare-and-requeue (NR 17) of the current task: the
@@ -1512,16 +1522,22 @@ impl KernelState {
     /// exactly that waiter (rank 2), then the reserved commit (rank 1). No waiter is made
     /// `Runnable` until its placement is guaranteed; a refused reservation ends the wake with
     /// that waiter and every later one still parked and uncounted. Returns how many were placed.
+    ///
+    /// Unmasked (`FUTEX_BITSET_MATCH_ANY`): the robust exit wake is never selective.
     fn futex_wake_key(&mut self, key: super::futex::FutexKey, count: u32) -> u32 {
-        self.futex_wake_key_outcome(key, count).woke
+        self.futex_wake_key_outcome(key, count, super::futex::FUTEX_BITSET_MATCH_ANY)
+            .woke
     }
 
     /// FUTEX-REQUEUE1 — [`Self::futex_wake_key`], also reporting whether it stopped at a waiter it
-    /// could not place.
+    /// could not place. FUTEX-ABS-BITSET1: only waiters whose mask matches `mask` are found; a
+    /// matching waiter that cannot be placed STOPS the wake (it is never bypassed for a younger
+    /// matching one).
     fn futex_wake_key_outcome(
         &mut self,
         key: super::futex::FutexKey,
         count: u32,
+        mask: u32,
     ) -> super::futex::FutexWakeOutcome {
         use super::futex as fx;
         use crate::kernel::task_enqueue::{self as te, EnqueueTarget, ReservedCommit};
@@ -1533,7 +1549,7 @@ impl KernelState {
         while woke < want && attempts < want + fx::MAX_FUTEX_WAITERS {
             attempts += 1;
             let Some(candidate) = self.with_task_futex_mut(|tcbs, table| {
-                fx::next_futex_waiter_locked(tcbs.as_slice(), table, key)
+                fx::next_futex_waiter_masked_locked(tcbs.as_slice(), table, key, mask)
             }) else {
                 break;
             };

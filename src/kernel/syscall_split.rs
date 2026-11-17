@@ -5696,10 +5696,11 @@ fn try_split_futex_wait_recognized(
     // (2) ABI — THE decode `handle_futex_wait` uses (FUTEX-FOUND1), and ANSWERED, because
     // `InvalidArgs` is what it produces and no later owner will produce it for us.
     let addr = frame.arg(SYSCALL_ARG_CAP);
-    // FUTEX-TIME1: THE NR 9 decode — the key arguments exactly as before, and `args[3]` as a
-    // relative timeout only when `FUTEX_FLAG_TIMED` is set.
-    let (args, timeout_ns) = match crate::kernel::syscall::sched::decode_futex_wait_args(frame) {
-        Ok(wait) => (wait.key, wait.timeout_ns),
+    // FUTEX-ABS-BITSET1: THE NR 9 decode — the key arguments and the mask (slot 4, only with
+    // `FUTEX_FLAG_BITSET`), and `args[3]` as an ABSOLUTE monotonic deadline only with
+    // `FUTEX_FLAG_TIMED`.
+    let (args, deadline) = match crate::kernel::syscall::sched::decode_futex_wait_args(frame) {
+        Ok(wait) => (wait.key, wait.deadline),
         Err(err) => {
             crate::yarm_log!(
                 "FUTEX_WAIT_SPLIT_DONE tid=0 addr={} result=invalid_args cpu={}",
@@ -5751,27 +5752,10 @@ fn try_split_futex_wait_recognized(
             return D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(err))));
         }
     };
-    // FUTEX-TIME1: the deadline, converted ONCE, from the clock at admission. Whether it has
-    // already been reached is decided later, inside the compare-and-register hold and after its
-    // comparison, so a word that differs still answers `0` below.
-    let deadline = match timeout_ns {
-        None => None,
-        Some(ns) => match crate::kernel::syscall::sched::futex_wait_deadline(
-            shared.scheduler_clock_now(),
-            ns,
-        ) {
-            Some(deadline) => Some(deadline),
-            None => {
-                crate::yarm_log!(
-                    "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=invalid_timeout cpu={}",
-                    tid,
-                    addr,
-                    cpu.0
-                );
-                return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
-            }
-        },
-    };
+    // FUTEX-ABS-BITSET1: the caller's absolute deadline is used as given — never converted to
+    // ticks, never rebuilt. Whether it has already been reached, and whether its clock can be
+    // read, are decided inside the compare-and-register hold after its comparison, so a word that
+    // differs still answers `0` below.
     if matches!(decision, FutexWaitDecision::Proceed) {
         // The futex word already moved. No transition, no switch, no drain — the canonical
         // `set_ok(usize::from(false), 0, 0)`.
@@ -5785,7 +5769,16 @@ fn try_split_futex_wait_recognized(
     }
 
     split_futex_park_tail(
-        shared, cpu, frame, authority, tid, addr, expected, args.kind, deadline,
+        shared,
+        cpu,
+        frame,
+        authority,
+        tid,
+        addr,
+        expected,
+        args.kind,
+        crate::kernel::syscall::sched::futex_wait_timing(deadline),
+        args.mask,
     )
 }
 
@@ -5860,7 +5853,10 @@ fn try_split_clock_nanosleep_recognized(
         0,
         0,
         crate::kernel::boot::futex::FutexKind::Sleep,
-        Some(deadline),
+        crate::kernel::boot::futex::FutexWaitTiming::Deadline(
+            crate::kernel::boot::futex::FutexDeadline::MonotonicNs(deadline),
+        ),
+        crate::kernel::boot::futex::FUTEX_BITSET_MATCH_ANY,
     )
 }
 
@@ -5878,10 +5874,12 @@ fn split_futex_park_tail(
     addr: usize,
     expected: u32,
     kind: crate::kernel::boot::futex::FutexKind,
-    deadline: Option<u64>,
+    timing: crate::kernel::boot::futex::FutexWaitTiming,
+    mask: u32,
 ) -> SplitBlockingDisposition {
     use crate::kernel::syscall::SyscallError;
     use crate::kernel::syscall::sched::FutexParkOutcome;
+    let timed = timing != crate::kernel::boot::futex::FutexWaitTiming::Untimed;
     use SplitBlockingDisposition as D;
     let cpu_idx = cpu.0 as usize;
     let sleep = kind == crate::kernel::boot::futex::FutexKind::Sleep;
@@ -5925,8 +5923,8 @@ fn split_futex_park_tail(
     // its TCB cannot be reclaimed — so what the transaction authenticates against is the
     // incarnation this trap entered from and not whatever later answers to the number.
     let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
-    let outcome =
-        shared.futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, deadline);
+    let outcome = shared
+        .futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, timing, mask);
     // FUTEX-WAIT-ATOMIC1 live witness (default off): the witness wait's own outcome.
     #[cfg(feature = "futex-wait-witness")]
     if let Some(w) = crate::kernel::boot::futex::wait_witness::current_wait(expected) {
@@ -5956,7 +5954,7 @@ fn split_futex_park_tail(
             // winner is not decided yet, so its frame carries a fail-closed provisional
             // (`Internal`) — never `1` — and the terminal claim parks the real result as its
             // `FutexWait` completion, which the resume boundary encodes over this.
-            if deadline.is_some() {
+            if timed {
                 frame.set_err(SyscallError::Internal.code());
             } else {
                 frame.set_ok(1, 0, 0);
@@ -6002,7 +6000,7 @@ fn split_futex_park_tail(
             }
             // FUTEX-TIME1: a timed cycle's completion stays parked for the resume that consumes
             // it; the captured frame carries the fail-closed provisional, never `1`.
-            if deadline.is_some() {
+            if timed {
                 frame.set_err(SyscallError::Internal.code());
             } else {
                 frame.set_ok(1, 0, 0);
@@ -6078,6 +6076,23 @@ fn split_futex_park_tail(
                 return D::Complete(Ok(()));
             }
             D::Complete(Err(TrapHandleError::Syscall(SyscallError::TimedOut)))
+        }
+        // FUTEX-ABS-BITSET1 — pre-mutation: the wait is timed and its clock could not be read
+        // inside the compare-and-register, so nothing was published; the caller is still current.
+        FutexParkOutcome::ClockUnavailable => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=clock_unavailable cpu={}",
+                tid,
+                addr,
+                cpu.0
+            );
+            D::Complete(Err(TrapHandleError::Syscall(SyscallError::Unavailable)))
+        }
+        // FUTEX-ABS-BITSET1 — pre-mutation: a zero mask (the decode refuses it first).
+        FutexParkOutcome::InvalidMask => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)))
         }
         FutexParkOutcome::IncarnationMoved => {
             crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
@@ -6962,7 +6977,8 @@ fn try_split_futex_wake_into_frame(
     let wait_window = crate::kernel::boot::futex::wait_witness::wake_begin();
     #[cfg(feature = "futex-time-witness")]
     let time_window = crate::kernel::boot::futex::time_witness::wake_begin();
-    let woke = shared.futex_wake_key_split(cpu, key, args.value);
+    // FUTEX-ABS-BITSET1: the wake's mask (`FUTEX_BITSET_MATCH_ANY` unless `FUTEX_FLAG_BITSET`).
+    let woke = shared.futex_wake_key_masked_split(cpu, key, args.value, args.mask);
     #[cfg(feature = "futex-time-witness")]
     crate::kernel::boot::futex::time_witness::wake_end(time_window, cpu.0, tid, woke);
     #[cfg(feature = "futex-requeue-race-witness")]

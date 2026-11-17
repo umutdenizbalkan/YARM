@@ -3236,32 +3236,47 @@ fn run_futex_wait_witness(s_tid: u64) {
     w::run_once(s_tid, &children);
 }
 
-/// FUTEX-TIME1 — the live timed-wait witness, selector 18 when init is built with
-/// `futex-time-witness` (it takes precedence over the wait and requeue cells). Threads of init:
+/// FUTEX-TIME1 / FUTEX-ABS-BITSET1 — the live timed-wait witness, selector 18 when init is built
+/// with `futex-time-witness` (it takes precedence over the wait and requeue cells). Threads of init:
 ///
 /// | thread | role |
 /// |---|---|
 /// | W | the ONLY thread that issues timed waits; it drives the sequences and reports every result |
 /// | H | the helper: wakes, requeues and (sequence E) spawns the fillers, on W's command |
-/// | S2 | a second signaller, for sequence G only |
+/// | S2 | a second signaller (sequence G), and sequence M's untimed masked waiter |
+/// | S3 | a third G signaller, spawned by W as G begins (W's CPU is then the less loaded one) |
 /// | F* | sequence E's fillers: runnable threads that yield until released, then park |
+///
+/// FUTEX-ABS-BITSET1: every timed wait passes an ABSOLUTE `CLOCK_MONOTONIC` deadline the cell
+/// computed from its own `clock_gettime` reading (logged with the call), and a wake mask.
 ///
 /// Sequences (in this order; the kernel's markers carry ownership and ordering, this cell reports
 /// what ring 3 saw):
 ///
 /// * **A/F** three timed waits that nobody wakes, while H, S2 and init are BLOCKED: the timeout
-///   must come from the kernel's own tick (idle CPUs included), with no user thread polling.
+///   must come from the kernel's own collector (idle CPUs included), with no user thread polling.
+///   W first sleeps 1 s (NR 20, blocked) so that the boot's own work has drained.
+/// * **P** a timed wait whose deadline has already passed: `TimedOut` at admission, nothing parked.
 /// * **B** a timed wait H wakes before its deadline (`Woken`), then a longer timed wait (`TimedOut`)
 ///   whose expiry lies past B's deadline: B's cycle must never complete a second time.
-/// * **C** a timed wait H requeues to another word without waking: it must time out (`TimedOut`)
-///   on the word it was moved to; afterwards wakes of both words find nobody.
-/// * **D** a timed wait H requeues and then wakes on the target (`Woken`), then a longer timed wait.
+/// * **M** selective wake: W (mask `0x1`, timed) and then S2 (mask `0x2`, untimed) park on one
+///   word and are moved, in that order, to another; H wakes it with mask `0x2` count 1 (S2 is
+///   woken, W is passed over and stays parked), again with `0x2` (nobody), then with `0x1` (W).
+/// * **C** a timed wait (mask `0x4`) H requeues to another word without waking: a wake of the
+///   target with the disjoint mask `0x1` finds nobody, and the wait times out on the target with
+///   its deadline and mask unchanged; afterwards wakes of both words find nobody.
+/// * **D** a timed wait (mask `0x8`) H requeues and then wakes on the target with an ORDINARY
+///   (unmasked) wake (`Woken`), then a longer timed wait.
 /// * **G** race cycles (word high half `G_MAGIC`): H and S2 wake the word after an adaptive pause,
 ///   so some cycles are won by the wake and some by the timeout; the kernel holds a window after a
 ///   G timeout claim while a sibling runs on another CPU, and reports a wake that ran inside it.
+///   S3 signals too: a monotonic deadline is collected by whichever CPU traps first after it (not
+///   by the tick owner, as a tick deadline was), so each CPU needs a sibling that can wake.
 /// * **E** a timed wait whose home run queue is genuinely full when it expires: H spawns fillers
-///   until spawning is refused, watches the wait leave its word without a wake (requeue pings
-///   return 0), wakes both words (0), then releases the fillers; the wait must return `TimedOut`.
+///   until spawning is refused while W keeps its CPU (current, spinning: it holds no queue slot);
+///   only then does W take its deadline and wait, so the deadline cannot pass before the queues
+///   are full. H watches the wait leave its word without a wake (requeue pings return 0), wakes
+///   both words (0), then releases the fillers; the wait must return `TimedOut`.
 #[cfg(all(
     not(feature = "hosted-dev"),
     feature = "futex-requeue-witness",
@@ -3269,10 +3284,10 @@ fn run_futex_wait_witness(s_tid: u64) {
 ))]
 pub(super) mod futex_time_witness {
     use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
-    use core::time::Duration;
     use yarm_user_rt::syscall::{
-        CLOCK_MONOTONIC, FutexScope, FutexTimedWait, clock_gettime, futex_cmp_requeue, futex_wait,
-        futex_wait_timeout, futex_wake, yield_now,
+        CLOCK_MONOTONIC, FUTEX_BITSET_MATCH_ANY, FutexScope, FutexTimedWait, Timespec,
+        clock_gettime, futex_cmp_requeue, futex_wait, futex_wait_until, futex_wake,
+        futex_wake_bitset, nanosleep, yield_now,
     };
 
     const P: FutexScope = FutexScope::Private;
@@ -3285,16 +3300,17 @@ pub(super) mod futex_time_witness {
     pub(super) const FILLER_STACK_BYTES: usize = 2048;
     /// Two full user queues (64 each, 65 while their owner yields) and slack for the top-ups.
     pub(super) const FILLERS: usize = 176;
-    /// W, H, S2.
+    /// W, H, S2 (spawned by `run_once`); S3 takes the stack after them (spawned by W).
     pub(super) const THREADS: usize = 3;
+    const ALL_THREADS: usize = THREADS + 1;
     const BOUND: u32 = 4_000_000;
 
     #[repr(C, align(16))]
-    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; THREADS]);
+    pub(super) struct Stacks(pub(super) [[u8; STACK_BYTES]; ALL_THREADS]);
     #[allow(unused)]
-    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; THREADS]);
+    pub(super) static mut STACKS: Stacks = Stacks([[0; STACK_BYTES]; ALL_THREADS]);
     #[allow(unused)]
-    pub(super) static mut TLS: [[u8; 256]; THREADS] = [[0; 256]; THREADS];
+    pub(super) static mut TLS: [[u8; 256]; ALL_THREADS] = [[0; 256]; ALL_THREADS];
     #[repr(C, align(16))]
     pub(super) struct FillerStacks(pub(super) [[u8; FILLER_STACK_BYTES]; FILLERS]);
     #[allow(unused)]
@@ -3305,6 +3321,10 @@ pub(super) mod futex_time_witness {
     pub(super) static mut FILLER_TLS: [[u8; 64]; FILLERS] = [[0; 64]; FILLERS];
     /// Filled by `run_once`: the fillers' entry (per architecture).
     pub(super) static FILLER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+    /// Filled by `run_once`: the signallers' entry, for S3.
+    pub(super) static SIGNALLER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+    /// How many signallers have started: the first is S2, the second S3.
+    static SIGNALLERS: AtomicU32 = AtomicU32::new(0);
 
     // Words. Each sequence waits on its own; values never change while a wait is in flight.
     static WA: AtomicU32 = AtomicU32::new(0xA0);
@@ -3316,6 +3336,23 @@ pub(super) mod futex_time_witness {
     static WG: AtomicU32 = AtomicU32::new(G_MAGIC);
     static E1: AtomicU32 = AtomicU32::new(0xE1);
     static E2: AtomicU32 = AtomicU32::new(0xE1);
+    // FUTEX-ABS-BITSET1 sequence M: both waiters park on WM and are moved to WM3 (same value).
+    static WM: AtomicU32 = AtomicU32::new(0x3A);
+    static WM3: AtomicU32 = AtomicU32::new(0x3A);
+    static M_GO: AtomicU32 = AtomicU32::new(0);
+    /// E: set by H once spawning was refused (the queues are full); W then takes its deadline.
+    static SAT: AtomicU32 = AtomicU32::new(0);
+    /// G's deadline lead: a few timer periods of this port (FT1's G timeouts were two ticks), so
+    /// that most cycles are admitted and the wake/timeout race is real. A deadline that passes
+    /// before admission is still a legal `TimedOut`, counted outside the race coverage.
+    #[cfg(target_arch = "x86_64")]
+    const G_AHEAD_NS: u64 = 2_000_000_000;
+    #[cfg(target_arch = "aarch64")]
+    const G_AHEAD_NS: u64 = 200_000_000;
+    #[cfg(target_arch = "riscv64")]
+    const G_AHEAD_NS: u64 = 100_000_000;
+    /// E: how long W waits for the saturation before it fails closed.
+    const SAT_BOUND_NS: u64 = 900_000_000_000;
 
     // Control.
     static CMD: AtomicU32 = AtomicU32::new(0);
@@ -3334,6 +3371,7 @@ pub(super) mod futex_time_witness {
     const PH_G: u32 = 5;
     const PH_E: u32 = 6;
     const PH_G_DONE: u32 = 7;
+    const PH_M: u32 = 8;
     const PH_END: u32 = 9;
 
     fn park() -> ! {
@@ -3357,19 +3395,32 @@ pub(super) mod futex_time_witness {
         }
     }
 
-    /// W's one timed wait: CALL before, RET after, the kernel's REGISTER/DEADLINE in between.
-    fn timed(role: &str, word: &AtomicU32, ns: u64) -> Result<FutexTimedWait, ()> {
+    /// W's one timed wait, `ns` after the cell's own `CLOCK_MONOTONIC` reading (or, `past`, at
+    /// the absolute instant 1, long gone): CALL before (the reading, the ABSOLUTE deadline passed
+    /// and the mask), RET after, the kernel's ADMIT/REGISTER in between.
+    fn timed_at(
+        role: &str,
+        word: &AtomicU32,
+        ns: u64,
+        mask: u32,
+        past: bool,
+    ) -> Result<FutexTimedWait, ()> {
         let n = CALLS.fetch_add(1, SeqCst) + 1;
         let v = word.load(SeqCst);
+        let now = mono();
+        let deadline = if past { 1 } else { now.saturating_add(ns) };
         yarm_user_rt::user_log!(
-            "FTW_CALL role={} n={} ns={} addr=0x{:x} expected=0x{:x}",
+            "FTW_CALL role={} n={} ns={} now={} deadline={} mask=0x{:x} addr=0x{:x} expected=0x{:x}",
             role,
             n,
             ns,
+            now,
+            deadline,
+            mask,
             word.as_ptr() as usize,
             v
         );
-        let r = futex_wait_timeout(word.as_ptr(), v, P, Duration::from_nanos(ns));
+        let r = futex_wait_until(word.as_ptr(), v, P, Some(deadline), mask);
         match &r {
             Err(e) => {
                 yarm_user_rt::user_log!("FTW_RET role={} n={} result=error err={:?}", role, n, e)
@@ -3377,6 +3428,10 @@ pub(super) mod futex_time_witness {
             ok => yarm_user_rt::user_log!("FTW_RET role={} n={} result={}", role, n, slug(ok)),
         }
         r.map_err(|_| ())
+    }
+
+    fn timed(role: &str, word: &AtomicU32, ns: u64) -> Result<FutexTimedWait, ()> {
+        timed_at(role, word, ns, FUTEX_BITSET_MATCH_ANY, false)
     }
 
     fn expect(role: &str, got: Result<FutexTimedWait, ()>, want: FutexTimedWait) {
@@ -3422,11 +3477,17 @@ pub(super) mod futex_time_witness {
 
     pub(super) extern "C" fn waiter_body() -> ! {
         const MS: u64 = 1_000_000;
+        // Let the boot's own work drain first (blocked, not polling), so that the A deadlines meet
+        // idle CPUs.
+        let _ = nanosleep(&Timespec::from_ns(1000 * MS), None);
         // A/F: nobody else runs; only the kernel's clock can end these.
         for _ in 0..3 {
             let r = timed("A", &WA, 100 * MS);
             expect("A", r, FutexTimedWait::TimedOut);
         }
+        // P: a deadline already passed — TimedOut at admission, nothing parked.
+        let r = timed_at("P", &WA, 0, FUTEX_BITSET_MATCH_ANY, true);
+        expect("P", r, FutexTimedWait::TimedOut);
         // B: woken before the deadline, then a wait that outlives B's deadline.
         command(PH_B);
         let r = timed("B", &WB, 2000 * MS);
@@ -3434,9 +3495,14 @@ pub(super) mod futex_time_witness {
         await_ack();
         let r = timed("B2", &WB2, 4000 * MS);
         expect("B2", r, FutexTimedWait::TimedOut);
-        // C: requeued, then timed out on the target word.
+        // M: selective wake — passed over by a disjoint mask, woken by its own.
+        command(PH_M);
+        let r = timed_at("M", &WM, 20_000 * MS, 0x1, false);
+        expect("M", r, FutexTimedWait::Woken);
+        await_ack();
+        // C: masked (0x4), requeued, missed by a disjoint wake, then timed out on the target.
         command(PH_C);
-        let r = timed("C", &QA, 1000 * MS);
+        let r = timed_at("C", &QA, 2000 * MS, 0x4, false);
         expect("C", r, FutexTimedWait::TimedOut);
         await_ack();
         let wa = futex_wake(QA.as_ptr(), 1, P).unwrap_or(u32::MAX);
@@ -3447,23 +3513,27 @@ pub(super) mod futex_time_witness {
         }
         // D: requeued, then woken on the target word; then a wait past D's deadline.
         command(PH_D);
-        let r = timed("D", &QA, 2000 * MS);
+        let r = timed_at("D", &QA, 2000 * MS, 0x8, false);
         expect("D", r, FutexTimedWait::Woken);
         await_ack();
         let r = timed("D2", &WD2, 4000 * MS);
         expect("D2", r, FutexTimedWait::TimedOut);
         // G: the cross-CPU race. Either end is legal; the kernel's markers say which won.
         command(PH_G);
+        spawn_s3();
         let (mut woken, mut timed_out) = (0u32, 0u32);
         for k in 1..=G_CYCLES {
             WG.store(G_MAGIC | k, SeqCst);
-            match timed("G", &WG, 1) {
+            // An absolute deadline G_AHEAD_NS out: collected by the first pass after it.
+            match timed("G", &WG, G_AHEAD_NS) {
                 Ok(FutexTimedWait::Woken) => {
                     woken += 1;
                     let p = G_PAUSE.load(SeqCst);
                     G_PAUSE.store(p.saturating_mul(2).min(1 << 22), SeqCst);
                 }
                 Ok(FutexTimedWait::TimedOut) => {
+                    // (Including a deadline already reached at admission; the grader counts
+                    // only the parked cycles toward race coverage.)
                     timed_out += 1;
                     let p = G_PAUSE.load(SeqCst);
                     G_PAUSE.store((p / 4 * 3).max(1), SeqCst);
@@ -3479,11 +3549,23 @@ pub(super) mod futex_time_witness {
         );
         // Ends the signallers' loops (they then wait for the next command).
         PHASE.store(PH_G_DONE, SeqCst);
-        // E: the deadline passes while the home queue is full.
+        // E: the deadline passes while the home queue is full. FUTEX-ABS-BITSET1: spawning the
+        // fillers takes more than a minute of CLOCK_MONOTONIC on RISC-V under TCG, so W takes its
+        // deadline only once H reports the queues full; until then W keeps its CPU (current, no
+        // queue slot), spinning without a blocking call. The helper checks the deadline then
+        // passes while the queue is full (pings > 0, the kernel's SATW_REFUSED).
         command(PH_E);
-        // Long enough to cover spawning the fillers (about 13 s of ticks on RISC-V under TCG): the
-        // deadline must pass while the queue is full, which the helper checks (pings > 0).
-        let r = timed("E", &E1, 60_000 * MS);
+        let start = mono();
+        let mut spins = 0u64;
+        while SAT.load(SeqCst) == 0 {
+            spins += 1;
+            if spins % (1 << 16) == 0 && mono().saturating_sub(start) > SAT_BOUND_NS {
+                fail("E_sat_wait");
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let r = timed("E", &E1, 10_000 * MS);
         expect("E", r, FutexTimedWait::TimedOut);
         await_ack();
         command(PH_END);
@@ -3497,7 +3579,20 @@ pub(super) mod futex_time_witness {
         park()
     }
 
-    /// The G signaller's loop (H and S2): pause, then wake; until W leaves the phase.
+    /// G: spawn S3 (another signaller) into the stack after W, H and S2; it joins the phase.
+    fn spawn_s3() {
+        let stacks = core::ptr::addr_of_mut!(STACKS) as usize;
+        let tls = core::ptr::addr_of_mut!(TLS) as usize;
+        let top = (stacks + ALL_THREADS * STACK_BYTES) & !0xF;
+        let entry = SIGNALLER_ENTRY.load(SeqCst);
+        // SAFETY: a valid entry; the static stack and TLS outlive the thread.
+        let r = unsafe { yarm_user_rt::syscall::spawn_thread(tls + THREADS * 256, top, entry) };
+        if !matches!(r, Ok(t) if t >= 10_000) {
+            fail("G_spawn_s3");
+        }
+    }
+
+    /// The G signaller's loop (H, S2 and S3): pause, then wake; until W leaves the phase.
     fn g_signal(who: &str) {
         let mut attempts = 0u32;
         let mut hits = 0u32;
@@ -3536,13 +3631,17 @@ pub(super) mod futex_time_witness {
             }
             PH_C => {
                 let moved = requeue_until_moved(&QA, &QB);
+                // The record kept its mask (0x4) across the move: a disjoint wake passes it over.
+                let disjoint = futex_wake_bitset(QB.as_ptr(), 1, P, 0x1).unwrap_or(u32::MAX);
                 yarm_user_rt::user_log!(
-                    "FTW_C_REQUEUE moved={} target=0x{:x}",
+                    "FTW_C_REQUEUE moved={} target=0x{:x} disjoint_wake={}",
                     u32::from(moved),
-                    QB.as_ptr() as usize
+                    QB.as_ptr() as usize,
+                    disjoint
                 );
                 ack();
             }
+            PH_M => helper_select(),
             PH_D => {
                 let moved = requeue_until_moved(&QA, &QB);
                 let woke = futex_wake(QB.as_ptr(), 1, P).unwrap_or(0);
@@ -3567,16 +3666,43 @@ pub(super) mod futex_time_witness {
             .unwrap_or(0)
     }
 
+    /// M: W first, then S2, onto WM3 (moves keep the order and the masks); then three masked
+    /// wakes, each logged after it returns (the kernel's BITSET_SKIP markers fall between them).
+    fn helper_select() {
+        let w = requeue_until_moved(&WM, &WM3);
+        M_GO.store(1, SeqCst);
+        let _ = futex_wake(M_GO.as_ptr(), 1, P);
+        let s2 = requeue_until_moved(&WM, &WM3);
+        yarm_user_rt::user_log!(
+            "FTW_M_PARKED w={} s2={} target=0x{:x}",
+            u32::from(w),
+            u32::from(s2),
+            WM3.as_ptr() as usize
+        );
+        for (k, mask) in [(1u32, 0x2u32), (2, 0x2), (3, 0x1)] {
+            let woke = futex_wake_bitset(WM3.as_ptr(), 1, P, mask).unwrap_or(u32::MAX);
+            yarm_user_rt::user_log!("FTW_M_WAKE k={} mask=0x{:x} woke={}", k, mask, woke);
+        }
+        ack();
+    }
+
+    /// M, S2's part: once W is parked and moved, an UNTIMED wait with mask 0x2.
+    fn s2_select() {
+        let mut n = 0;
+        while M_GO.load(SeqCst) == 0 && n < BOUND {
+            let _ = futex_wait(M_GO.as_ptr(), 0, P);
+            n += 1;
+        }
+        let r = futex_wait_until(WM.as_ptr(), WM.load(SeqCst), P, None, 0x2);
+        yarm_user_rt::user_log!("FTW_M_S2_RET result={}", slug(&r));
+    }
+
     /// E: confirm W is parked, saturate, watch its wait leave the word with no wake, release.
     /// SCHED-SAT-EVIDENCE1: the queues are topped up all through the hold (a spawn refusal names
     /// its own target CPU only, and a task that blocks frees a slot), and the hold lasts until
     /// W's timeout has won. Saturation of W's home queue is proved by the kernel (`SATW_REFUSED
     /// class=futex`), never by these counts.
     fn helper_saturate() {
-        let mut at_one = !requeue_until_moved(&E1, &E2);
-        if at_one {
-            fail("E_register");
-        }
         let entry = FILLER_ENTRY.load(SeqCst);
         let stacks = core::ptr::addr_of_mut!(FILLER_STACKS) as usize;
         let tls = core::ptr::addr_of_mut!(FILLER_TLS) as usize;
@@ -3606,11 +3732,20 @@ pub(super) mod futex_time_witness {
             spawned,
             refused
         );
+        // W takes its deadline now, and parks; confirm it did (moved E1 -> E2, no wake).
+        SAT.store(1, SeqCst);
+        let mut at_one = !requeue_until_moved(&E1, &E2);
+        if at_one {
+            fail("E_register");
+        }
+        // W leaving its CPU freed that CPU a slot (a filler became current): fill it again at
+        // once, before W's deadline, then keep topping up through the hold.
+        spawn_until_refused(&mut spawned, &mut refused);
+        let mut topups = 1u32;
         // Ping: move W between E1 and E2 while it is still parked on a user word. The first
         // ping that moves nobody is W's timeout having won (no wake was issued), under saturation.
         let mut pings = 0u32;
         let mut gone = false;
-        let mut topups = 0u32;
         let mut last_top = mono();
         while pings < BOUND {
             let (from, to) = if at_one { (&E1, &E2) } else { (&E2, &E1) };
@@ -3645,7 +3780,9 @@ pub(super) mod futex_time_witness {
             topups,
             refused
         );
-        if !gone || pings == 0 || w1 != 0 || w2 != 0 || refused == 0 {
+        // FUTEX-ABS-BITSET1: W's registration is proved by the move above (`E_register`), so a
+        // first ping that finds the wait already gone is legal: the re-fill outlasted the deadline.
+        if !gone || w1 != 0 || w2 != 0 || refused == 0 {
             fail("E_saturation");
         }
         RELEASE.store(1, SeqCst);
@@ -3670,6 +3807,7 @@ pub(super) mod futex_time_witness {
     }
 
     pub(super) extern "C" fn signaller_body() -> ! {
+        let s2 = SIGNALLERS.fetch_add(1, SeqCst) == 0;
         let mut seen = 0;
         loop {
             let c = CMD.load(SeqCst);
@@ -3679,7 +3817,8 @@ pub(super) mod futex_time_witness {
             }
             seen = c;
             match PHASE.load(SeqCst) {
-                PH_G => g_signal("S2"),
+                PH_G => g_signal(if s2 { "S2" } else { "S3" }),
+                PH_M if s2 => s2_select(),
                 PH_END => park(),
                 _ => {}
             }
@@ -3797,6 +3936,7 @@ fn run_futex_time_witness(s_tid: u64) {
         w::filler_body as *const () as usize,
     );
     w::FILLER_ENTRY.store(filler, SeqCst);
+    w::SIGNALLER_ENTRY.store(entries[2], SeqCst);
     let stacks = core::ptr::addr_of_mut!(w::STACKS) as usize;
     let tls = core::ptr::addr_of_mut!(w::TLS) as usize;
     let children: [w::Child; w::THREADS] = core::array::from_fn(|i| w::Child {

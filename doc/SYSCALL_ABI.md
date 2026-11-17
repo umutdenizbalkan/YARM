@@ -1,15 +1,15 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# YARM Syscall ABI v12 (Frozen Contract)
+# YARM Syscall ABI v13 (Frozen Contract)
 
-- ABI Version: `12`
+- ABI Version: `13`
 - Public syscall count: `21` (`0..=20`)
 - Kernel dispatch table count: `32` (`SYSCALL_COUNT`, slots `0..=31`)
 
-## Public ABI v12 syscall numbers
+## Public ABI v13 syscall numbers
 
 `SYSCALL_COUNT` in the kernel is the dispatch-table size, not the public ABI
-count. The current public ABI v12 surface is the contiguous user-callable range
+count. The current public ABI v13 surface is the contiguous user-callable range
 `0..=20` (**21 slots**). Some public slots still enforce capability or control
 plane policy and can return `MissingRight`; that does not make them private
 kernel-extension slots.
@@ -25,8 +25,8 @@ kernel-extension slots.
 | `6` | `IpcCall` | public, send with kernel-minted ephemeral reply-cap transfer |
 | `7` | `IpcReply` | public, consumes a reply-cap and sends reply to the bound caller endpoint |
 | `8` | `ControlPlaneSetCnodeSlots` | public control-plane ABI; policy-gated by `control_plane_set_process_cnode_slots`, non-authorized callers receive `MissingRight` |
-| `9` | `FutexWait` | public (`arg0=addr`, 4-byte aligned; `arg1=expected`, `u32`; `arg2=flags`; `arg3=timeout_ns`, read only with `FUTEX_FLAG_TIMED`) — FUTEX-FOUND1, timed form FUTEX-TIME1 |
-| `10` | `FutexWake` | public (`arg0=addr`, 4-byte aligned; `arg1=count`, `u32`; `arg2=flags`) — FUTEX-FOUND1 |
+| `9` | `FutexWait` | public (`arg0=addr`, 4-byte aligned; `arg1=expected`, `u32`; `arg2=flags`; `arg3=deadline_ns`, an absolute `CLOCK_MONOTONIC` instant, read only with `FUTEX_FLAG_TIMED`; `arg4=mask`, a nonzero `u32`, read only with `FUTEX_FLAG_BITSET`) — FUTEX-FOUND1, timed form FUTEX-TIME1, absolute deadline and bitset FUTEX-ABS-BITSET1 (ABI v13) |
+| `10` | `FutexWake` | public (`arg0=addr`, 4-byte aligned; `arg1=count`, `u32`; `arg2=flags`; `arg4=mask`, a nonzero `u32`, read only with `FUTEX_FLAG_BITSET`) — FUTEX-FOUND1, bitset FUTEX-ABS-BITSET1 (ABI v13) |
 | `11` | `SpawnThread` | public (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`) |
 | `12` | `Fork` | public, forks current process with CoW and returns child tid in parent |
 | `13` | `VmAnonMap` | public, wired anonymous page mapping syscall |
@@ -42,58 +42,68 @@ kernel-extension slots.
 
 Status terms used by this matrix:
 
-- **public v12**: part of the stable user-callable syscall ABI for version `12`.
-- **privileged extension**: implemented dispatch-table slot outside the public v12
+- **public v13**: part of the stable user-callable syscall ABI for version `13`.
+- **privileged extension**: implemented dispatch-table slot outside the public v13
   range; intended for PM/SystemServer/bootstrap plumbing and not counted in the
   public ABI surface.
-- **reserved gap**: not assigned and not dispatched in v12. Calls currently fail
+- **reserved gap**: not assigned and not dispatched in v13. Calls currently fail
   with `InvalidNumber`; assignment to a public user ABI requires a future ABI
   version as described below.
 - **deprecated**: still dispatched for compatibility, but discouraged, with a
-  documented replacement and removal plan. **No public v12 syscall is currently
+  documented replacement and removal plan. **No public v13 syscall is currently
   deprecated.**
 - **removed/invalid**: not dispatched by this kernel ABI.
 
 | Slot/range | Name | Status | Caller class | Notes |
 |------------|------|--------|--------------|-------|
-| `0` | `Yield` | public v12 | any user task | Stable public syscall. |
-| `1` | `IpcSend` | public v12 | any user task with endpoint rights | Capability/right checks apply. |
-| `2` | `IpcRecv` | public v12 | any user task with endpoint rights | Capability/right checks apply. |
-| `3` | `VmMap` | public v12 | any user task with mapping capability | Capability-targeted VM mapping. |
-| `4` | `TransferRelease` | public v12 | transfer receiver | Releases auto-mapped shared-memory transfer. |
-| `5` | `IpcRecvTimeout` | public v12 | any user task with endpoint rights | Bounded receive/probe variant. |
-| `6` | `IpcCall` | public v12 | any user task with endpoint rights | Request send with kernel-minted reply-cap transfer. |
-| `7` | `IpcReply` | public v12 | reply-cap holder | Consumes one-shot reply capability. |
-| `8` | `ControlPlaneSetCnodeSlots` | public v12 | policy-gated user/control-plane callers | Public ABI slot; kernel policy may return `MissingRight`. |
-| `9` | `FutexWait` | public v12 | any user task | Futex address validation applies. |
-| `10` | `FutexWake` | public v12 | any user task | Futex address validation applies. |
-| `11` | `SpawnThread` | public v12 | any user task | Spawns a thread in the current process/thread group. |
-| `12` | `Fork` | public v12 | any user task | CoW process fork. |
-| `13` | `VmAnonMap` | public v12 | any user task | Wired anonymous mapping syscall; not reserved or deprecated. |
-| `14` | `VmBrk` | public v12 | thread-group leader | Staged per-task brk contract. |
-| `15` | `DebugLog` | public v12 | any user task | Debug logging aid; semantics are best-effort. |
-| `16` | `ExitCurrentTask` | public v12 | any user task | Terminates the calling task; non-returning trap disposition, so no success return-register contract. |
-| `17` | `FutexCmpRequeue` | public v12 | any user task | Futex address validation applies to both words; split from birth on every port. |
-| `18` | `ClockGetTime` | public v12 | any user task | Coherent clock read; split from birth on every port. |
-| `19` | `ClockSetRealtime` | public v12 | `SystemServer` only | Realtime epoch initialization; others receive `MissingRight`; split from birth. |
-| `20` | `ClockNanosleep` | public v12 | any user task | Sleep on a monotonic deadline; a switching class parked through the FutexWait park tail on every port. |
+| `0` | `Yield` | public v13 | any user task | Stable public syscall. |
+| `1` | `IpcSend` | public v13 | any user task with endpoint rights | Capability/right checks apply. |
+| `2` | `IpcRecv` | public v13 | any user task with endpoint rights | Capability/right checks apply. |
+| `3` | `VmMap` | public v13 | any user task with mapping capability | Capability-targeted VM mapping. |
+| `4` | `TransferRelease` | public v13 | transfer receiver | Releases auto-mapped shared-memory transfer. |
+| `5` | `IpcRecvTimeout` | public v13 | any user task with endpoint rights | Bounded receive/probe variant. |
+| `6` | `IpcCall` | public v13 | any user task with endpoint rights | Request send with kernel-minted reply-cap transfer. |
+| `7` | `IpcReply` | public v13 | reply-cap holder | Consumes one-shot reply capability. |
+| `8` | `ControlPlaneSetCnodeSlots` | public v13 | policy-gated user/control-plane callers | Public ABI slot; kernel policy may return `MissingRight`. |
+| `9` | `FutexWait` | public v13 | any user task | Futex address validation applies. |
+| `10` | `FutexWake` | public v13 | any user task | Futex address validation applies. |
+| `11` | `SpawnThread` | public v13 | any user task | Spawns a thread in the current process/thread group. |
+| `12` | `Fork` | public v13 | any user task | CoW process fork. |
+| `13` | `VmAnonMap` | public v13 | any user task | Wired anonymous mapping syscall; not reserved or deprecated. |
+| `14` | `VmBrk` | public v13 | thread-group leader | Staged per-task brk contract. |
+| `15` | `DebugLog` | public v13 | any user task | Debug logging aid; semantics are best-effort. |
+| `16` | `ExitCurrentTask` | public v13 | any user task | Terminates the calling task; non-returning trap disposition, so no success return-register contract. |
+| `17` | `FutexCmpRequeue` | public v13 | any user task | Futex address validation applies to both words; split from birth on every port. |
+| `18` | `ClockGetTime` | public v13 | any user task | Coherent clock read; split from birth on every port. |
+| `19` | `ClockSetRealtime` | public v13 | `SystemServer` only | Realtime epoch initialization; others receive `MissingRight`; split from birth. |
+| `20` | `ClockNanosleep` | public v13 | any user task | Sleep on a monotonic deadline; a switching class parked through the FutexWait park tail on every port. |
 | `21..=22` | — | reserved gap | none | `Syscall::decode` rejects these with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
-| `23` | `SpawnProcess` | privileged extension | privileged/bootstrap control-plane use | Implemented kernel dispatch slot; not part of public v12 count. |
+| `23` | `SpawnProcess` | privileged extension | privileged/bootstrap control-plane use | Implemented kernel dispatch slot; not part of public v13 count. |
 | `24` | *(retired)* | — | — | `SpawnProcessFromUserBuf`, removed in U9-SPAWN2 §1. The number stays **unassigned and non-reusable**; see `RETIRED_SYSCALL_NUMBERS`. |
 | `25` | — | reserved gap | none | `Syscall::decode` rejects this with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
 | `26` | *(retired)* | — | — | `SpawnFromInitramfsFile`, removed in U9-ASPACE1 §2. The number stays **unassigned and non-reusable**; see `RETIRED_SYSCALL_NUMBERS`. |
 | `27` | — | reserved gap (removed) | none | Formerly `InitramfsReadChunk` (Phase 2A/2B byte-copy bridge), removed in Stage 197A. `Syscall::decode` rejects `27` with `InvalidNumber`; the number is unused and reusable by a future ABI. |
-| `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v12 count. |
-| `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v12 count. |
+| `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v13 count. |
+| `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v13 count. |
 | `30` | `RecvSharedV3` | non-blocking recv extension | any user task | Stage 42+43: non-blocking `recv_shared_v3` (NR 30); `timeout_ticks=0` only; no mapped receive. See `KERNEL_LOCKING.md §58`. |
 | `31` | `ReapFaultedTask` | privileged PM restart-cleanup extension | PM TID `3` only | SUP-L7K-A: reaps an old terminal Faulted/Exited/Dead task after PM has successfully spawned and recorded a restart replacement. `arg0=target_tid`; self-target returns `InvalidArgs`; non-PM returns `MissingRight`; Running/Runnable/Blocked targets return `WrongObject`; missing targets are treated as already gone and return success. Uses the no-allocation terminal-task reap cleanup path (`reap_faulted_task_noalloc_cleanup`) for VM/task/cnode release; not a kill-running-task syscall. |
 | `32+` | — | removed/invalid | none | Outside `SYSCALL_COUNT = 32`; not dispatched. |
 
 ## ABI versioning and deprecation policy
 
-The v12 contract is frozen for the public ABI slots listed above. Freezing means
-call numbers and incompatible user-visible semantics do not change inside v12;
+The v13 contract is frozen for the public ABI slots listed above. Freezing means
+call numbers and incompatible user-visible semantics do not change inside v13;
 it does not prevent compatible implementation fixes or documentation updates.
+
+**v12 → v13 (FUTEX-ABS-BITSET1).** NR `9` `FutexWait` with `FUTEX_FLAG_TIMED` (bit 1) now takes
+an ABSOLUTE `CLOCK_MONOTONIC` deadline in nanoseconds in slot 3 (in v12 it took a relative timeout
+the kernel converted to scheduler ticks; that meaning is gone, so the bump). NR `9` and NR `10` gain
+`FUTEX_FLAG_BITSET` (bit 2): slot 4 is a nonzero `u32` wake mask and a wake takes only waiters
+whose masks share a bit with its own (`FUTEX_BITSET_MATCH_ANY = u32::MAX`). A timed wait with no
+monotonic clock is refused with `Unavailable` (`11`), nothing parked. `SYSCALL_ABI_VERSION` is
+`13`, and the `abi_version` field NR 30 writes reports it (`RECV_V3_ABI_VERSION`). Unmasked,
+untimed waits and wakes, NR `17` and every other number, layout and contract are v12's. See
+"Futex safety contract" below.
 
 **v11 → v12 (SCHED-TIME-FOUNDATION1).** NR `18` `ClockGetTime`, NR `19` `ClockSetRealtime` and
 NR `20` `ClockNanosleep` are assigned from the reserved gap, and error code `11` `Unavailable` is added (a clock that has
@@ -109,7 +119,7 @@ other number, layout and contract is v10's. The bump also formally covers FUTEX-
 NR 10 argument redesign (slot 2 became `flags`; the `observed` argument was removed), which was
 made while the version still read `10`.
 
-Changes that require an ABI v13 bump include:
+Changes that require an ABI v14 bump include:
 
 - renumbering any public syscall;
 - changing public syscall argument layout, return layout, error behavior, or
@@ -118,14 +128,14 @@ Changes that require an ABI v13 bump include:
   syscall;
 - changing public struct layout, encoded metadata bytes, flag bits, sentinel
   values, or existing flag meanings incompatibly;
-- removing or making invalid a public v12 syscall that is still documented as
+- removing or making invalid a public v13 syscall that is still documented as
   callable.
 
-Changes allowed within v12 include:
+Changes allowed within v13 include:
 
 - bug fixes that preserve the documented public behavior;
 - documentation clarifications and reserved-slot documentation;
-- adding or refining privileged extension slots outside the public v12 range,
+- adding or refining privileged extension slots outside the public v13 range,
   provided they do not change existing public syscall behavior;
 - tightening access checks for privileged-only extension syscalls;
 - compatible additions that do not change existing public argument/return
@@ -140,9 +150,9 @@ Reserved/deprecated terminology:
   and planned removal gate.
 - **Removed/invalid** means not dispatched by this kernel ABI.
 
-The public tail slots `13..=15` are assigned and dispatched in v12:
+The public tail slots `13..=15` are assigned and dispatched in v13:
 `13` is `VmAnonMap`, `14` is `VmBrk`, and `15` is `DebugLog`.
-They are not reserved gaps and are covered by the public ABI v12 matrix above.
+They are not reserved gaps and are covered by the public ABI v13 matrix above.
 
 ## Per-architecture broad-lock dispatch matrix
 
@@ -176,9 +186,9 @@ purpose-built bridge (`src/arch/riscv64/trap.rs:417`) whose gate admits a fixed 
 
 ## Reserved and gap slots
 
-- `21..=22`: reserved/unassigned in ABI v12 (`17` became `FutexCmpRequeue` in v11; `18` `ClockGetTime`, `19` `ClockSetRealtime` and `20` `ClockNanosleep` in v12). `Syscall::decode` rejects these
+- `21..=22`: reserved/unassigned in ABI v13 (`17` became `FutexCmpRequeue` in v11; `18` `ClockGetTime`, `19` `ClockSetRealtime` and `20` `ClockNanosleep` in v12). `Syscall::decode` rejects these
   numbers with `InvalidNumber`. (`16` is now `ExitCurrentTask` — see above.)
-- `25`: reserved/unassigned in ABI v12. `Syscall::decode` rejects this number
+- `25`: reserved/unassigned in ABI v13. `Syscall::decode` rejects this number
   with `InvalidNumber`.
 - `30`: `RecvSharedV3` — Stage 42+43 live non-blocking recv_shared_v3 extension (NR 30).
 - `31`: `ReapFaultedTask` — SUP-L7K-A PM-only terminal-task cleanup extension.
@@ -203,7 +213,7 @@ reserved holes from implemented privileged paths.
 | `27` | — (removed) | Formerly `InitramfsReadChunk`, removed in Stage 197A. `Syscall::decode(27)` returns `InvalidNumber`; the number is unused and reusable by a future ABI. | — | — | Raw `nr=27` is a normal unknown-syscall error encoded into the trap frame (non-fatal), not a privileged path. | Removed: MemoryObject zero-copy grant (NR 28/29) is the sole ELF-load path |
 | `28` | `CreateInitramfsFileSliceMo` | SystemServer-only (`initramfs_srv`) Phase 3A bridge. Non-`TaskClass::SystemServer` callers receive `MissingRight`. | `arg0=name_ptr`, `arg1=name_len`, `arg2=flags` (reserved, must be `0`), `arg3..arg5` reserved/unused. | On success, `ret0=0`, `ret1=cap_id`, `ret2=file_len`. | Non-SystemServer receives `MissingRight`; empty/overlong names, nonzero flags, invalid user memory/UTF-8, missing/empty files, bounds failures, or MemoryObject/capability allocation failures return errors. | MemoryObject-backed initramfs spawn path |
 | `29` | `SpawnFromMemoryObject` | PM-only Phase 3A zero-copy spawn path. Caller TID must be PM bootstrap TID `3`; other callers receive `MissingRight`. | `arg0=image_id`, `arg1=mo_cap`, `arg2=parent_pid`, `arg3=startup_args_ptr`, `arg4=startup_args_count`, `arg5` reserved/unused. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | Non-PM callers receive `MissingRight`; invalid caps, wrong object type/kind, invalid initrd slice bounds, malformed ELF/startup args, or spawn/load/capacity failures return errors. | Phase 3A MemoryObject zero-copy spawn path |
-| `30` | `RecvSharedV3` | Any user task with a RECEIVE-right capability. No class/TID gate. | `arg0=req_ptr` (ptr to `RecvSharedV3Request`, ≥64 bytes), `arg1=req_len`. Output written to `metadata_ptr` field inside the request struct. `timeout_ticks` must be 0 (non-blocking only). `map_intent`: `0x0`=no mapping, `0x1`=MAP_READ, `0x3`=MAP_READ\|MAP_WRITE; `0x2` (WRITE-only) is invalid. When `map_intent != 0`, `metadata_ptr` must be non-zero and `metadata_len >= V3_LIVE_OUTPUT_LEN`. | On success (message delivered): `ret0=V3_STATUS_OK(0)`, `ret1=sender_tid`, `ret2=0`; `RecvSharedV3Output` (80 bytes) written to `metadata_ptr`: `version=3`, `record_len=80`, `abi_version=12`, `result_status`, `sender_tid`, `message_len`, `message_flags`, `transferred_cap` (cap ID or `RECV_V3_NO_TRANSFER_CAP`). When `map_intent != 0`: `mapped_base` (offset 88), `page_rounded_mapped_len` (offset 96 — the sender descriptor's object-relative selection, page-rounded; not the whole capability window), `actual_mapping_perm` (offset 104; `1`=RO, `3`=RW), `cleanup_token` (offset 112). A mapped receive requires a `DmaRegion` grant. FUTURE fields are 0. | `req_len < 64` → `InvalidArgs`; `timeout_ticks != 0` → `WouldBlock`; `map_intent=0x2` (WRITE-only) → `InvalidArgs`; unknown `map_intent` bits → `InvalidArgs`; `map_intent != 0` with `metadata_len < V3_LIVE_OUTPUT_LEN` → `InvalidArgs`; cap lacks `CAP_RIGHT_WRITE` but `map_intent=0x3` → `InvalidArgs`; invalid/wrong-type cap → `WrongObject`/`InvalidCapability`; empty queue → `WouldBlock`; cap materialization failure → `InvalidCapability`; user-copy fault to `metadata_ptr` → rollback + `InvalidArgs`; a mapped receive of a bare `MemoryObject` grant, or of a selection its backing cannot hold → rollback + `InvalidArgs`, nothing consumed. See `KERNEL_LOCKING.md §58`. | Stage 42+43+72 recv_shared_v3 |
+| `30` | `RecvSharedV3` | Any user task with a RECEIVE-right capability. No class/TID gate. | `arg0=req_ptr` (ptr to `RecvSharedV3Request`, ≥64 bytes), `arg1=req_len`. Output written to `metadata_ptr` field inside the request struct. `timeout_ticks` must be 0 (non-blocking only). `map_intent`: `0x0`=no mapping, `0x1`=MAP_READ, `0x3`=MAP_READ\|MAP_WRITE; `0x2` (WRITE-only) is invalid. When `map_intent != 0`, `metadata_ptr` must be non-zero and `metadata_len >= V3_LIVE_OUTPUT_LEN`. | On success (message delivered): `ret0=V3_STATUS_OK(0)`, `ret1=sender_tid`, `ret2=0`; `RecvSharedV3Output` (80 bytes) written to `metadata_ptr`: `version=3`, `record_len=80`, `abi_version=13`, `result_status`, `sender_tid`, `message_len`, `message_flags`, `transferred_cap` (cap ID or `RECV_V3_NO_TRANSFER_CAP`). When `map_intent != 0`: `mapped_base` (offset 88), `page_rounded_mapped_len` (offset 96 — the sender descriptor's object-relative selection, page-rounded; not the whole capability window), `actual_mapping_perm` (offset 104; `1`=RO, `3`=RW), `cleanup_token` (offset 112). A mapped receive requires a `DmaRegion` grant. FUTURE fields are 0. | `req_len < 64` → `InvalidArgs`; `timeout_ticks != 0` → `WouldBlock`; `map_intent=0x2` (WRITE-only) → `InvalidArgs`; unknown `map_intent` bits → `InvalidArgs`; `map_intent != 0` with `metadata_len < V3_LIVE_OUTPUT_LEN` → `InvalidArgs`; cap lacks `CAP_RIGHT_WRITE` but `map_intent=0x3` → `InvalidArgs`; invalid/wrong-type cap → `WrongObject`/`InvalidCapability`; empty queue → `WouldBlock`; cap materialization failure → `InvalidCapability`; user-copy fault to `metadata_ptr` → rollback + `InvalidArgs`; a mapped receive of a bare `MemoryObject` grant, or of a selection its backing cannot hold → rollback + `InvalidArgs`, nothing consumed. See `KERNEL_LOCKING.md §58`. | Stage 42+43+72 recv_shared_v3 |
 
 ## Syscalls `9..14` status
 
@@ -222,10 +232,20 @@ reserved holes from implemented privileged paths.
   `addr` must be 4-byte aligned and `expected` / `count` must fit in `u32`. `flags` bit 0 is
   `FUTEX_FLAG_SHARED`; every other bit is reserved and a set reserved bit is `InvalidArgs`. All
   three argument errors are `InvalidArgs` and are answered before the address range or the caller
-  is consulted. Further slots are read only when a flag bit gives them meaning: since FUTEX-TIME1,
-  `FutexWait` bit 1 (`FUTEX_FLAG_TIMED`) makes slot 3 a timeout (below); `FutexWake` still treats
-  bit 1 as reserved (`InvalidArgs`). Compare-and-requeue has its own number (NR 17, below). There
-  is no caller-supplied `observed`.
+  is consulted. Further slots are read only when a flag bit gives them meaning (ABI v13,
+  FUTEX-ABS-BITSET1):
+
+  | flag | bit | NR 9 `FutexWait` | NR 10 `FutexWake` |
+  |---|---|---|---|
+  | `FUTEX_FLAG_SHARED` | 0 | shared key | shared key |
+  | `FUTEX_FLAG_TIMED` | 1 | slot 3 = absolute `CLOCK_MONOTONIC` deadline, ns, any `u64` | reserved: `InvalidArgs` |
+  | `FUTEX_FLAG_BITSET` | 2 | slot 4 = wait mask, nonzero `u32` | slot 4 = wake mask, nonzero `u32` |
+  | any other | ≥ 3 | reserved: `InvalidArgs` | reserved: `InvalidArgs` |
+
+  Without its flag a slot is not read (whatever it holds). The decode answers, in this order and
+  all with `InvalidArgs`: an undefined flag, a value or count wider than `u32`, a misaligned
+  address, then a mask wider than `u32` or zero. Compare-and-requeue has its own number (NR 17,
+  below). There is no caller-supplied `observed`.
 - **Keys.** A *private* futex (`flags = 0`) is `{address space, its generation, va}`: threads of one
   address space share it, and nothing in another address space — including a later address space
   that reuses the same ASID number — can reach it. A *shared* futex (`flags = FUTEX_FLAG_SHARED`)
@@ -248,36 +268,47 @@ reserved holes from implemented privileged paths.
   their condition. (Before FUTEX-WAIT-ATOMIC1 the word was compared before the registration and
   read again after it; a wake or requeue between the two did not see the waiter, and one after
   the registration could still take it although the word had already moved.)
-- **Timed waits (FUTEX-TIME1).** `FutexWait(addr, expected, flags | FUTEX_FLAG_TIMED, timeout_ns)`.
-  - *Units.* `timeout_ns` is a RELATIVE duration in nanoseconds, a full `u64`, measured from the
-    wait's admission. The timeout is independent of the ABI v12 clocks (NR 18) and needs none: the
-    kernel turns the duration into a deadline on its own scheduler tick when the call is admitted.
-    `0` is a deadline at admission (a matching word times out at once; a differing word still
-    answers `0`). Any other value becomes `ceil(timeout_ns / period) + 1` ticks, where `period` is
-    the CPU timer's tick (0.8 s on x86_64, 50 ms on AArch64, 10 ms on RISC-V — each derived from the
-    same constant that programs the timer). The `+ 1` absorbs the partial tick the wait is admitted
-    in, so the timeout is a LOWER bound: the wait never times out before `timeout_ns` has elapsed,
-    and may end later (tick granularity, masked sections, scheduling latency). A deadline that would
-    overflow the tick counter is `InvalidArgs`. The ABI version stays `11`: the bit was reserved,
-    and untimed waits are unchanged (slot 3 is not read without the flag).
-  - *Results.* `0`: the word did not hold `expected` (nothing parked, whatever the timeout).
-    `1` (`Ok(true)`): a wake — `FutexWake`, the wake portion of `FutexCmpRequeue`, or a robust exit
-    wake — claimed this wait. `TimedOut` (code `9`): the deadline claimed it. Exactly one of the two
-    claims a cycle; `1` is never returned because a timed wait merely stopped blocking. On x86_64 the
-    error is in the error lane; on AArch64 and RISC-V `ret0 > 1` is the error code.
+- **Timed waits (FUTEX-TIME1; absolute since FUTEX-ABS-BITSET1, ABI v13).**
+  `FutexWait(addr, expected, flags | FUTEX_FLAG_TIMED, deadline_ns)`.
+  - *Units.* `deadline_ns` is an ABSOLUTE instant on `CLOCK_MONOTONIC` (the NR 18 clock, below),
+    in nanoseconds, a full `u64` (`u64::MAX` is an instant no clock reaches). The kernel never
+    converts it: the record holds the instant together with its clock domain, and it is compared
+    with that clock directly, never with the scheduler tick, and never with a clock inferred from
+    the word's key. A wait that retries (after a spurious wake, or to re-check its condition) passes
+    the SAME instant again, so retries never extend the total wait; `yarm_user_rt`'s relative
+    helper reads the clock once and makes one absolute call. The deadline is a LOWER bound: the
+    wait is never ended before the clock reaches it, and ends at the first collector pass after it
+    (below) plus scheduling latency; no sub-tick latency is promised. (v12's relative tick timeout,
+    `ceil(timeout_ns / period) + 1` ticks, is gone.)
+  - *Admission order.* Inside the one compare-and-register hold: the arguments are validated (the
+    decode above), the key resolved and the word loaded and compared — a differing word answers
+    `0` whatever the deadline and whatever the clock — then the deadline's own clock is read: no
+    reading (no monotonic source) refuses the wait with `Unavailable` (code `11`), and a deadline
+    already reached (`now >= deadline`, equality included) is `TimedOut`; neither publishes
+    anything, and a timed wait is never turned into an untimed one. Otherwise the waiter is
+    registered with its deadline and mask.
+  - *Results.* `0`: the word did not hold `expected` (nothing parked, whatever the deadline).
+    `1` (`Ok(true)`): a wake — `FutexWake` with a matching mask, the wake portion of
+    `FutexCmpRequeue`, or a robust exit wake — claimed this wait. `TimedOut` (code `9`): the
+    deadline claimed it. Exactly one of the two claims a cycle; `1` is never returned because a
+    timed wait merely stopped blocking. On x86_64 the error is in the error lane; on AArch64 and
+    RISC-V `ret0 > 1` is the error code. (NR 20 `ClockNanosleep` shares the collector but answers
+    success `0` at its deadline, never `TimedOut`; the two completions never cross.)
   - *Arbitration.* The deadline is attached to the waiter's record inside the same
-    compare-and-register hold, after the comparison (a differing word wins) and after a clock read
-    (a deadline already reached is `TimedOut` with nothing published). From then on a wake, a
-    requeue, the timeout, exit and teardown all act on the record under the task lock, by its exact
-    `{slot, generation}` token: whichever claims first ends the cycle, and every later claimant
-    finds nothing. A requeue moves the record with its deadline: the wait times out on the target
-    word, or is woken there. A requeue whose wake portion has already committed to the waiter owns
-    it; the timeout skips it.
+    compare-and-register hold. From then on a wake, a requeue, the timeout, exit and teardown all
+    act on the record under the task lock, by its exact `{slot, generation}` token: whichever
+    claims first ends the cycle, and every later claimant finds nothing. A requeue moves the record
+    with its deadline, its clock domain and its mask, unchanged: the wait times out on the target
+    word at the instant it was admitted with, or is woken there. A requeue whose wake portion has
+    already committed to the waiter owns it; the timeout skips it.
   - *Capacity.* A timeout, like a wake, claims only after it has reserved a run-queue slot on the
     waiter's home CPU. If that queue is full, the timeout still wins: the record moves to a key
-    private to the kernel (no user wake or requeue can reach it), the task stays blocked — never
-    runnable without a queue slot — and a later collector pass places it once room appears; the
-    call then returns `TimedOut`.
+    private to the kernel (no user wake or requeue can reach it), keeping its deadline and mask, the
+    task stays blocked — never runnable without a queue slot — and a later collector pass places it
+    once room appears; the call then returns `TimedOut`, once. With budgets enforced (RT profile,
+    `SCHEDULING_CONTRACT.md` §24), a waiter whose budget is exhausted is settled the same way and
+    placed Ready but budget-parked (no queue position, its rejoin slot held); its replenishment
+    rejoins it, with no second completion.
   - *Who ends a wait.* A bounded collector runs on every CPU's trap tail and in the kernel timer
     thread, including on idle CPUs (each CPU's timer keeps firing while it idles; the scheduler clock
     is advanced by CPU 0's). It examines at most 64 timed records per pass, resumes from a cursor, and
@@ -288,6 +319,18 @@ reserved holes from implemented privileged paths.
     wait generation).
 - `FutexWake` wakes up to `count` waiters of the key `addr` resolves to in the caller's address
   space, oldest first, and returns how many it woke. `count = 0` wakes nobody.
+- **Selective wake (FUTEX-ABS-BITSET1, ABI v13).** Every waiter has a `u32` mask: the one its
+  `FutexWait` passed with `FUTEX_FLAG_BITSET`, else `FUTEX_BITSET_MATCH_ANY` (`u32::MAX`). Every
+  wake has one too, the same way. A wake matches a waiter iff `(wait_mask & wake_mask) != 0`; a
+  zero mask is `InvalidArgs` on both calls. A masked `FutexWake` walks the key's waiters oldest
+  first and takes the matching ones in that order; a non-matching waiter is passed over IN PLACE —
+  it stays parked, keeps its position and does not consume the count. A matching waiter whose
+  placement cannot be reserved stops the wake (it is never bypassed for a later match), so the
+  return is the number actually claimed, and `0` may be a capacity refusal. An unmasked
+  (`MATCH_ANY`) wake matches every waiter, so an ordinary wake also releases masked waiters, and
+  unmasked untimed waits and wakes behave exactly as in v12. NR 17's wake portion is `MATCH_ANY`;
+  the waiters it moves keep their masks. Robust exit cleanup is not selective. The collector
+  ignores masks.
 - **Every waiter counted is placed (FUTEX-WAKE-CAP1).** A waiter is claimed only after a run-queue
   slot on its home CPU is reserved for it, so a woken waiter is always queued exactly once (or is
   still current, finishing its own wait). When no slot can be reserved — the home CPU's queue for
@@ -360,17 +403,21 @@ reserved holes from implemented privileged paths.
   CONTENDED store is what makes the broadcaster's own unlock issue the first mutex wake: without
   it, a broadcast that woke nobody would leave every moved waiter parked on a mutex whose word
   says "uncontended". `yarm_user_rt::futex_sync` implements exactly this; it is not a pthread
-  implementation (no timeouts, no attributes, no robustness, no priority protocol).
+  implementation (no timed mutex or timed condition variable beyond the single-wait
+  `wait_timeout`, no attributes, no robustness, no priority protocol). The protocol does not use
+  masks.
 - A waiter table slot exists for every possible task, so a wait cannot run out of waiter storage.
   The capacity refusal is still implemented (`TaskTableFull`, decided before anything is written).
 - Robust-futex cleanup at task exit wakes each robust word in the EXITING task's own address space,
-  under its private key and, when an object backs the word, its shared key.
+  under its private key and, when an object backs the word, its shared key, whatever the waiters'
+  masks (a `MATCH_ANY` wake).
 
 ## Timekeeping (SCHED-TIME-FOUNDATION1)
 
-ABI v12 adds a nanosecond clock that is separate from the scheduler tick. FutexWait timeouts, IPC
-and reply deadlines and scheduler quanta keep their tick semantics; nothing in those paths reads
-this clock.
+ABI v12 adds a nanosecond clock that is separate from the scheduler tick. Since ABI v13
+(FUTEX-ABS-BITSET1) `FutexWait` deadlines are instants on this clock's `CLOCK_MONOTONIC`, as
+`ClockNanosleep`'s are. IPC and reply deadlines, budgets and scheduler quanta keep their tick
+semantics; nothing in those paths reads this clock.
 
 - **`Timespec`** (`#[repr(C)]`, 16 bytes, 8-aligned): `sec: i64` at offset 0, `nsec: i64` at
   offset 8. Every value the kernel writes is normalized, `0 <= nsec < 1_000_000_000`. A value the
@@ -637,7 +684,7 @@ context-management stage first.
 
 `VmAnonMap` semantics:
 
-- The syscall is public v12 and wired; it is not reserved or deprecated.
+- The syscall is public v13 and wired; it is not reserved or deprecated.
 - The kernel validates the `(addr, len, prot)` triple, rejects zero length and
   non-page-aligned addresses, rounds length up to page size, allocates anonymous
   MemoryObjects page-by-page, and maps them into the current address space.
@@ -878,7 +925,8 @@ Portability boundary:
 - `8`: `PageFault`
 - `9`: `TimedOut`
 - `10`: `ServerDied`
-- `11`: `Unavailable` (ABI v12: the requested clock has no trustworthy value)
+- `11`: `Unavailable` (ABI v12: the requested clock has no trustworthy value; since ABI v13 also
+  a timed `FutexWait` with no monotonic clock, refused with nothing parked)
 - `255`: `Internal`
 
 ## Per-ISA shape source of truth

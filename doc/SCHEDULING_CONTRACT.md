@@ -319,7 +319,7 @@ bounded and potentially unbounded parts).
 | Server death / reap / exit | `drain_server_death_post_work`, exit/terminal drains | authority | 2, 3, 4, 1 | masked | exiting task has none; replacement via token | per-object teardown; bounded by fixed tables |
 | FutexWait | `try_split_futex_wait_recognized` → `futex_wait_park_exact_split` → drain | authority + per-CPU deferral cell | decision 5 → 6; compare-and-register 2 → 5 → 6 (one hold, FUTEX-WAIT-ATOMIC1); compare-and-clear 1; read-back 2; drain 1(→2) | masked | caller parked; incoming via token | O(1) + selection |
 | FutexWake | `futex_wake_split_mut` → `futex_wake_key_split` | trapping CPU | 5 → 6 (key); then per waiter 2 (find, plan), 1 (reserve), 2 (claim), 1 (reserved commit) — alternating, never nested | masked | caller continues | per waiter: ≤ 512 record visits in one bucket, O(1) each, and ≤ 4 acquisitions; ≤ `count` waiters (FUTEX-FOUND1, FUTEX-WAKE-CAP1) |
-| FutexWait timeout (FUTEX-TIME1) | `run_due_futex_timeouts` on every trap tail (x86_64/AArch64 `trap_entry.rs`, RISC-V `handle_riscv_trap_entry_shared`, idle timer traps included) and the kernel timer thread | the collecting CPU; the waiter's home CPU for the placement | 2 (bounded scan); then per due waiter 2 (plan), 1 (reserve), 2 (timeout claim, or `Expired` on a refused reservation), 1 (reserved commit) — alternating, never nested | masked | the waiter resumes with `TimedOut` from its published completion | ≤ 64 timed records examined, ≤ 1 wrap of 512 slots, ≤ 8 due waiters per pass; a cursor resumes the next pass |
+| FutexWait timeout (FUTEX-TIME1; absolute `CLOCK_MONOTONIC` deadlines since FUTEX-ABS-BITSET1, §25) | `run_due_futex_timeouts` on every trap tail (x86_64/AArch64 `trap_entry.rs`, RISC-V `handle_riscv_trap_entry_shared`, idle timer traps included) and the kernel timer thread | the collecting CPU; the waiter's home CPU for the placement | 2 (bounded scan); then per due waiter 2 (plan), 1 (reserve), 2 (timeout claim, or `Expired` on a refused reservation), 1 (reserved commit) — alternating, never nested | masked | the waiter resumes with `TimedOut` from its published completion | ≤ 64 timed records examined, ≤ 1 wrap of 512 slots, ≤ 8 due waiters per pass; a cursor resumes the next pass |
 | FutexCmpRequeue (NR 17) | `futex_cmp_requeue_split`: preflight → `compare_and_requeue_locked` → placement | trapping CPU (reservations and fills on each waiter's home CPU) | preflight: 2 and 1 alternately, never nested (a slot reserved per wake-portion waiter); commit: 2 → 5 → 6 held together (keys, word, comparison, both portions selected and moved: the linearization point); placement: 2 then 1 per woken waiter (claim, reserved commit), then 1 to release unused slots | masked | caller continues | preflight ≤ `wake` reservations; commit two walks of one bucket, ≤ 512 O(1) visits each, no scheduler lock; placement ≤ `wake` claim/fill pairs; ≤ 4 attempts (FUTEX-REQUEUE1, FUTEX-REQUEUE-ATOMIC1) |
 | Page fault (COW/demand recovered) | COW / demand routes | authority | 2, 5, 6 | masked | faulting task resumes | one frame allocation; page-table walk |
 | Page fault (terminal) | terminal route + queue advance | authority + reserved deferral | 2, 8, 1 | masked | faulting task terminated | as selection |
@@ -3917,7 +3917,9 @@ which is at the latest its next tick.
 
 The legacy cadence is untouched:
 * `BOOTSTRAP_TIMER_DEADLINE_TICKS`, the quantum and the clock owner's increment are unchanged;
-* futex and IPC timeouts keep their tick deadlines, collected exactly as before.
+* IPC timeouts keep their tick deadlines; futex timeouts were tick deadlines too until
+  FUTEX-ABS-BITSET1 made them `CLOCK_MONOTONIC` instants (§25), collected by the same collector at
+  the same points. Budgets never read that clock.
 
 **Granularity and lateness.**
 * Granularity is one tick of the global clock (S).
@@ -4202,3 +4204,68 @@ matrix was run.
 * **Wake-while-exhausted is not observed live.** It and the IPC-handoff park are covered by
   hosted tests on the production owners only. The live witness's budgeted threads never block
   while exhausted.
+
+## 25. Absolute futex deadlines and selective wake (FUTEX-ABS-BITSET1)
+
+ABI v13 (`SYSCALL_ABI.md`, *Futex safety contract*). NR 9's timed form takes an ABSOLUTE
+`CLOCK_MONOTONIC` deadline, and NR 9 / NR 10 take a `u32` wake mask. Both extend the owners
+FUTEX-TIME1, FUTEX-REQUEUE-ATOMIC1 and FUTEX-WAKE-CAP1 qualified: the one waiter table, the one
+compare-and-register, the one wake loop, the one collector. No second waiter structure, no second
+dispatch path, no new lock and no new timer event.
+
+### 25.1 The deadline domain
+
+* **One domain, named in the record.** A timed record holds `FutexDeadline::MonotonicNs(d)`: the
+  instant the caller passed, with its clock. `FutexDeadline::reached(now)` is the only comparison
+  and reads `now.mono_ns` (NR 18's clock); the scheduler tick that `FutexNow` also carries is
+  diagnostic only. The clock is never inferred from the key: a requeue (`rekey`) writes the key and
+  VA only, so the instant and its domain survive requeue, `Pending`, `Expired` and every collector
+  retry.
+* **Never early, never untimed.** No monotonic reading at admission refuses the wait
+  (`Unavailable`, nothing published); a collector pass with no reading expires nothing. A deadline
+  is a lower bound; it ends at the first collector pass after it (each CPU's next timer tick at the
+  latest), plus scheduling latency. No sub-tick latency is claimed.
+* **Unchanged:** budgets (§24) and IPC deadlines stay on the global scheduler tick; the timer
+  cadence and the quantum are unchanged. `ClockNanosleep` (NR 20) uses the same domain and the same
+  collector, and keeps its success result; a futex cycle's result is `TimedOut`.
+
+### 25.2 Admission (the compare-and-register hold)
+
+Validate (decode precedence: undefined flag, width, alignment, mask), then resolve the key, load
+and compare the word (`ValueChanged` = `0`), then read the deadline's clock: no reading →
+`Unavailable`; `now >= deadline` → `TimedOut`. Neither publishes anything. Otherwise the record is
+registered with its mask and, in the same hold, armed with its deadline. A zero mask reaching the
+owner is refused (`InvalidMask`) before anything is published.
+
+### 25.3 Selective wake
+
+`futex_masks_match(wait, wake) = wait & wake != 0`. The wake loop (`next_futex_waiter_masked_locked`)
+walks the key oldest first and passes over a live non-matching waiter IN PLACE; non-matching
+waiters keep their positions and do not consume the count. Per matching waiter it reserves a
+placement on the waiter's home CPU before it claims, and stops at the first matching waiter it
+cannot place (never bypassing it), so the result is the number actually claimed, and `0` may be a
+capacity refusal. `MATCH_ANY` (`u32::MAX`) is every unmasked waiter's and every unmasked wake's
+mask: an ordinary wake releases masked waiters, and unmasked untimed behaviour is v12's. NR 17's
+wake portion and robust exit cleanup are `MATCH_ANY`; the records NR 17 moves keep their masks. The
+condition-variable broadcast protocol is unchanged and uses no masks.
+
+### 25.4 Settlement and capacity
+
+Unchanged owners, exact tokens and generations: one terminal owner (wake or timeout) and one
+completion per cycle. A timeout whose home queue is full still wins (`Expired`: a kernel-private
+key, the instant and the mask kept), and the later placement returns `TimedOut` once; the collector
+stays bounded (64 timed records, 8 due waiters, one wrap per pass). With budgets enforced, a waiter
+settled while its budget is exhausted is made Ready but budget-parked by the reserved commit (its
+reservation becomes the parked slot, §24.4); its replenishment rejoins it once, and no second
+completion is made.
+
+### 25.5 Evidence
+
+(filled from the qualification run)
+
+### 25.6 Remaining gaps
+
+* No timed mutex and no re-waiting timed condition variable (the next pass).
+* No priority inheritance, `FUTEX-SEAL1` or EDF; no partitions.
+* Deadline lateness is bounded only by the collector cadence (§23.6, §24.6): no sub-tick
+  enforcement and no time bound.

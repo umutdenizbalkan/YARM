@@ -199,6 +199,11 @@ pub(crate) enum FutexWaitBroadOutcome {
     Blocked { timed: bool },
     /// The deadline had been reached when the word matched: nothing was published.
     TimedOut,
+    /// FUTEX-ABS-BITSET1 — a timed wait whose clock could not be read when the word matched:
+    /// nothing was published; the answer is `Unavailable`.
+    ClockUnavailable,
+    /// FUTEX-ABS-BITSET1 — a zero mask reached the owner: nothing was published; `InvalidArgs`.
+    InvalidMask,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

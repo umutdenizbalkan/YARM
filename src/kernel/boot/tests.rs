@@ -28216,8 +28216,9 @@ mod stage45 {
     use crate::kernel::vm::{Asid, CachePolicy, PageFlags, VirtAddr};
 
     const RECV_V3_VERSION: u32 = 3;
-    // The NR 30 record reports the syscall ABI version: v12 since SCHED-TIME-FOUNDATION1.
-    const RECV_V3_ABI_VERSION: u32 = 12;
+    // The NR 30 record reports the syscall ABI version: v12 since SCHED-TIME-FOUNDATION1, v13
+    // since FUTEX-ABS-BITSET1 (NR 9/10's absolute deadline and wake-mask flags).
+    const RECV_V3_ABI_VERSION: u32 = 13;
     const RECV_V3_STATUS_OK: u32 = 0;
     const RECV_V3_NO_TRANSFER_CAP: u64 = u64::MAX;
 
@@ -63700,11 +63701,13 @@ mod stage191d_futex_wait_block_publish {
         );
         // FUTEX-WAIT-ATOMIC1 re-derivation: both routes reach the one registration owner through
         // THE compare-and-register, which calls it inside the hold that compared the word.
+        // FUTEX-ABS-BITSET1 re-derivation: that owner is the masked registration (the unmasked
+        // name is its MATCH_ANY wrapper), called with the wait's validated mask.
         assert!(
             EXEC_SRC.contains("super::futex::compare_and_register_futex_waiter_locked(")
                 && park.contains("fx::compare_and_register_futex_waiter_locked(")
                 && FUTEX_SRC.contains(
-                    "register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)"
+                    "register_futex_waiter_masked_locked(tcbs, table, tid, asid, key, addr as u64, mask)"
                 ),
             "both routes must register through the one owner"
         );
@@ -64535,8 +64538,10 @@ mod stage191d_futex_wait_block_publish {
             // BL3b: the park transaction re-checks the word against the caller's `expected`.
             // FUTEX-TIME1 re-derivation: THE park transaction is the timed one, carrying the
             // deadline the route converted at admission (`None` for an untimed wait).
+            // FUTEX-ABS-BITSET1 re-derivation: it carries the typed timing (an absolute monotonic
+            // deadline, or `Untimed`) and the wait's validated mask.
             .find(
-                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, deadline)",
+                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, timing, mask)",
             )
             .expect("the park transaction");
         assert!(
@@ -79977,10 +79982,12 @@ mod stage197_first_cohort_seal {
         // FUTEX-FOUND1: through THE registration owner, which writes the keyed token.
         // FUTEX-WAIT-ATOMIC1 re-derivation: reached through THE compare-and-register, which calls
         // that owner inside the hold that compared the word.
+        // FUTEX-ABS-BITSET1 re-derivation: the owner is the masked registration, called with the
+        // wait's validated mask (`register_futex_waiter_locked` is its MATCH_ANY wrapper).
         assert!(
             EXEC_STATE_SRC.contains("super::futex::compare_and_register_futex_waiter_locked(")
                 && include_str!("futex.rs").contains(
-                    "register_futex_waiter_locked(tcbs, table, tid, asid, key, addr as u64)"
+                    "register_futex_waiter_masked_locked(tcbs, table, tid, asid, key, addr as u64, mask)"
                 )
                 && include_str!("futex.rs")
                     .contains("tcb.status = TaskStatus::Blocked(WaitReason::Futex(token));"),
@@ -124298,9 +124305,11 @@ mod stage199d_wa2b_wake_owner_census {
         // THE registration: `Running -> Blocked(Futex(token))`, for the exact `{tid, asid}`
         // incarnation, with its keyed record in the same task-lock critical section. Both routes
         // reach it. It moves a task INTO a futex wait and can write nothing else.
+        // FUTEX-ABS-BITSET1: the one body is the MASKED registration (the unmasked name is its
+        // MATCH_ANY wrapper and writes nothing itself).
         (
             "src/kernel/boot/futex.rs",
-            "register_futex_waiter_locked",
+            "register_futex_waiter_masked_locked",
             1,
             Verdict::IntoBlocked,
         ),
@@ -124591,9 +124600,10 @@ mod stage199d_wa2b_wake_owner_census {
         // after resolving the exact incarnation; the undo writes only after finding the TCB on
         // exactly that token; the claim writes only for a record's own token, and records the
         // claimed TID next.
+        // FUTEX-ABS-BITSET1: the same write, in the masked registration's body.
         (
             "src/kernel/boot/futex.rs",
-            "register_futex_waiter_locked",
+            "register_futex_waiter_masked_locked",
             "tcb.status",
             "TaskStatus::Blocked(WaitReason::Futex(token))",
             "if let Some(tcb) = tcbs[tcb_idx].as_mut() {",
@@ -149990,10 +150000,12 @@ mod u9qa_split_dispatch_disposition {
         // registration's `CapacityExhausted` refusal is a sixth, decided before any write.
         // FUTEX-TIME1: seven — `TimedOut` (the deadline reached when the word matched) is a
         // seventh, decided before any write.
+        // FUTEX-ABS-BITSET1: nine — `ClockUnavailable` (a timed wait with no monotonic clock) and
+        // `InvalidMask` (a zero mask reaching the owner) are refused before any write too.
         assert_eq!(
             after.matches("futex_wait_dispatch_clear(cpu_idx)").count(),
-            7,
-            "the seven non-parking park outcomes each release the reservation"
+            9,
+            "the nine non-parking park outcomes each release the reservation"
         );
     }
 
@@ -150024,8 +150036,10 @@ mod u9qa_split_dispatch_disposition {
             // BL3b: the park transaction re-checks the word against the caller's `expected`.
             // FUTEX-TIME1 re-derivation: THE park transaction is the timed one, carrying the
             // deadline the route converted at admission (`None` for an untimed wait).
+            // FUTEX-ABS-BITSET1 re-derivation: it carries the typed timing (an absolute monotonic
+            // deadline, or `Untimed`) and the wait's validated mask.
             .find(
-                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, deadline)",
+                "futex_wait_park_exact_timed_split(cpu, tid, asid, addr, expected, kind, timing, mask)",
             )
             .expect("the park transaction");
         assert!(
@@ -215612,7 +215626,7 @@ mod futex_requeue1 {
             SYSCALL_ABI_VERSION, SYSCALL_FUTEX_CMP_REQUEUE_NR, Syscall, SyscallError,
         };
         // SCHED-TIME-FOUNDATION1 moved the ABI to v12 (NR 18 / 19 assigned); NR 17 is unchanged.
-        assert_eq!(SYSCALL_ABI_VERSION, 12);
+        assert_eq!(SYSCALL_ABI_VERSION, 13);
         assert_eq!(
             Syscall::decode(SYSCALL_FUTEX_CMP_REQUEUE_NR),
             Ok(Syscall::FutexCmpRequeue)
@@ -215793,7 +215807,10 @@ mod futex_requeue1 {
                 })
         }
         fn collect(k: &SharedKernel) -> FutexTimeoutPass {
-            k.run_due_futex_timeouts_at(CpuId(0), k.scheduler_clock_now())
+            k.run_due_futex_timeouts_at(
+                CpuId(0),
+                crate::kernel::boot::futex::FutexNow::read(k.scheduler_clock_now()),
+            )
         }
         fn sleep_key(s: &mut KernelState, t: u64) -> Option<FutexKey> {
             let token = token_of(s, t)?;
@@ -216045,7 +216062,12 @@ mod futex_requeue1 {
             };
             let claimed = k.with(|s| {
                 s.with_task_futex_mut(|tcbs, table| {
-                    fx::claim_futex_timeout_locked(tcbs.as_mut_slice(), table, stale, u64::MAX)
+                    fx::claim_futex_timeout_locked(
+                        tcbs.as_mut_slice(),
+                        table,
+                        stale,
+                        fx::FutexNow::at_ns(u64::MAX),
+                    )
                 })
             });
             assert!(
@@ -216246,7 +216268,8 @@ mod futex_requeue1 {
                     0,
                     0,
                     FutexKind::Sleep,
-                    Some(1_000)
+                    fx::FutexWaitTiming::Deadline(fx::FutexDeadline::MonotonicNs(1_000)),
+                    fx::FUTEX_BITSET_MATCH_ANY
                 ),
                 O::TimedOut
             );
@@ -216261,7 +216284,8 @@ mod futex_requeue1 {
                 0,
                 0,
                 FutexKind::Sleep,
-                Some(2_000),
+                fx::FutexWaitTiming::Deadline(fx::FutexDeadline::MonotonicNs(2_000)),
+                fx::FUTEX_BITSET_MATCH_ANY,
             );
             assert!(matches!(o, O::Parked { .. }), "{o:?}");
             k.with(|s| assert_eq!(sleep_key(s, t), Some(FutexKey::Sleep { tid: t })));
@@ -216270,8 +216294,10 @@ mod futex_requeue1 {
             k.with(|s| assert!(slept(s, t)));
         }
 
-        /// 15 — a word wait can never be registered with a nanosecond deadline, nor a sleep
-        /// without one (the registration refuses both and writes nothing).
+        /// 15 — FUTEX-ABS-BITSET1 re-derivation: a sleep is never registered without a deadline,
+        /// and a word wait never with a zero mask (no wake could match it); the registration
+        /// refuses both and writes nothing. (A word wait WITH a monotonic deadline is an ABI v13
+        /// timed wait, no longer a refusal: `time1` and `abs_bitset1`.)
         #[test]
         fn c15_mismatched_timing_is_refused_before_any_write() {
             use crate::kernel::boot::futex::{
@@ -216283,9 +216309,14 @@ mod futex_requeue1 {
             task(&mut w.s, t, w.a);
             run(&mut w.s, t);
             let a = w.a;
-            for (kind, timing) in [
-                (P, FutexWaitTiming::MonotonicNs { deadline_ns: 10 }),
-                (FutexKind::Sleep, FutexWaitTiming::Untimed),
+            for (kind, timing, mask) in [
+                (P, FutexWaitTiming::Untimed, 0u32),
+                (
+                    P,
+                    FutexWaitTiming::Deadline(fx::FutexDeadline::MonotonicNs(10)),
+                    0u32,
+                ),
+                (FutexKind::Sleep, FutexWaitTiming::Untimed, u32::MAX),
             ] {
                 let r =
                     w.s.with_task_futex_then_vm_memory_mut(|tcbs, _c, table, sp, m| {
@@ -216300,9 +216331,13 @@ mod futex_requeue1 {
                             5,
                             kind,
                             timing,
+                            mask,
                         )
                     });
-                assert!(matches!(r, Err(Refused::Word(_))), "{r:?}");
+                assert!(
+                    matches!(r, Err(Refused::Word(_) | Refused::InvalidMask)),
+                    "{r:?}"
+                );
             }
             assert_eq!(w.s.task_status(t), Some(TaskStatus::Running));
             assert_eq!(occupied(&mut w.s), 0);
@@ -216380,16 +216415,61 @@ mod futex_requeue1 {
                 "exactly once"
             );
         }
+
+        /// 18 — FUTEX-ABS-BITSET1: a sleep and a MASKED timed futex wait due at the same
+        /// monotonic instant stay separate. No futex wake, masked or not, reaches the sleep
+        /// record; one collector pass ends both, each in its own class: Sleep success (`0`) and
+        /// futex `TimedOut`.
+        #[test]
+        fn c18_sleep_and_a_masked_timed_futex_wait_at_one_instant_stay_separate() {
+            use crate::kernel::boot::FutexWaitBroadOutcome;
+            use crate::kernel::boot::futex::{FutexDeadline, FutexWaitTiming};
+            let _g = clock(0);
+            let mut w = world(81500);
+            let (sl, _) = sleeper(&mut w, MONO, ABS, ts(10));
+            let ft = w.next;
+            w.next += 1;
+            task(&mut w.s, ft, w.a);
+            run(&mut w.s, ft);
+            assert_eq!(
+                w.s.futex_wait_current_timed(
+                    SQ,
+                    5,
+                    P,
+                    FutexWaitTiming::Deadline(FutexDeadline::MonotonicNs(10)),
+                    0x1
+                ),
+                Ok(FutexWaitBroadOutcome::Blocked { timed: true })
+            );
+            w.back();
+            assert_eq!(w.s.futex_wake_masked(SQ, 9, P, 0x2), Ok(0), "disjoint");
+            assert!(parked(&w.s, sl) && parked(&w.s, ft));
+            let k = leak(w.s);
+            at(10);
+            assert_eq!(collect(k).timed_out, 2, "one pass, both due");
+            k.with(|s| {
+                assert!(slept(s, sl), "Sleep: success, its own class");
+                let c = completion(s, ft).expect("the futex completion");
+                assert_eq!(
+                    (c.syscall_class, c.result),
+                    (BlockedSyscallClass::FutexWait, 9),
+                    "futex: TimedOut"
+                );
+            });
+            assert_eq!(collect(k), FutexTimeoutPass::default(), "once each");
+        }
     }
 
     mod time1 {
         use super::*;
         use crate::kernel::boot::FutexWaitBroadOutcome as B;
         use crate::kernel::boot::futex::{
+            FUTEX_BITSET_MATCH_ANY as ANY, FutexDeadline, FutexNow, FutexWaitTiming,
+        };
+        use crate::kernel::boot::futex::{
             FutexTimeoutPass, FutexWaitEnding, futex_phase_hook as hook,
         };
         use crate::kernel::syscall::SyscallError;
-        use crate::kernel::syscall::sched::{futex_timeout_ticks, futex_wait_deadline};
         use crate::kernel::task::{BlockedSyscallClass, BlockedSyscallCompletion};
 
         const TIMED_OUT: u64 = 9;
@@ -216417,7 +216497,25 @@ mod futex_requeue1 {
         }
         fn deadline(s: &mut KernelState, t: u64) -> Option<u64> {
             let token = token_of(s, t)?;
-            s.with_task_futex_mut(|_tcbs, table| table.deadline_of(token))
+            s.with_task_futex_mut(|_tcbs, table| table.deadline_of(token).map(FutexDeadline::raw))
+        }
+        /// FUTEX-ABS-BITSET1: every timed wait here is on `CLOCK_MONOTONIC`, a hosted 1 GHz source
+        /// at origin 0 (so these instants are nanoseconds). The clock statics are global: hold it.
+        fn mono_clock() -> std::sync::MutexGuard<'static, ()> {
+            let g = crate::kernel::timekeeping::CLOCK_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::arch::clock::HOSTED_COUNTER.store(0, core::sync::atomic::Ordering::Release);
+            crate::kernel::timekeeping::force_source_for_test(
+                1_000_000_000,
+                0,
+                crate::kernel::timekeeping::SourceKind::Hosted,
+            );
+            g
+        }
+        /// The typed absolute deadline `d` (monotonic ns).
+        fn dl(d: u64) -> FutexWaitTiming {
+            FutexWaitTiming::Deadline(FutexDeadline::MonotonicNs(d))
         }
         fn timed_records(s: &mut KernelState) -> usize {
             s.with_task_futex_mut(|_tcbs, table| table.timed_records())
@@ -216428,16 +216526,19 @@ mod futex_requeue1 {
             };
             s.with_task_futex_mut(|_tcbs, table| fx::futex_waiter_expired_locked(table, token))
         }
-        fn now(k: &SharedKernel) -> u64 {
-            k.scheduler_clock_now()
+        fn now(_k: &SharedKernel) -> u64 {
+            crate::kernel::timekeeping::monotonic_ns().expect("monotonic")
         }
+        /// Advance `CLOCK_MONOTONIC` by `n` ns (and the scheduler tick, which no futex deadline
+        /// reads, by up to 64).
         fn tick(k: &SharedKernel, n: u64) {
-            for _ in 0..n {
+            crate::arch::clock::HOSTED_COUNTER.fetch_add(n, core::sync::atomic::Ordering::AcqRel);
+            for _ in 0..n.min(64) {
                 k.with(|s| s.with_scheduler_state_mut(|sched| sched.advance_clock_owner_tick()));
             }
         }
         fn collect(k: &SharedKernel, at: u64) -> FutexTimeoutPass {
-            k.run_due_futex_timeouts_at(CpuId(0), at)
+            k.run_due_futex_timeouts_at(CpuId(0), FutexNow::at_ns(at))
         }
         /// A new task of `w`'s process, parked TIMED on `va` (holding `v`) through the broad
         /// body (the same compare-and-register as the split route), deadline `d`.
@@ -216447,7 +216548,7 @@ mod futex_requeue1 {
             task(&mut w.s, t, w.a);
             run(&mut w.s, t);
             assert_eq!(
-                w.s.futex_wait_current_timed(va, v, kind, Some(d)),
+                w.s.futex_wait_current_timed(va, v, kind, dl(d), ANY),
                 Ok(B::Blocked { timed: true }),
                 "{t} parks timed"
             );
@@ -216488,6 +216589,7 @@ mod futex_requeue1 {
         /// completion, `1` from a wake; the collector never touches it.
         #[test]
         fn t01_untimed_nr9_is_unchanged() {
+            let _clk = mono_clock();
             let mut w = world(70000);
             let ws = w.park_n(1, SQ, 5);
             assert_eq!(deadline(&mut w.s, ws[0]), None);
@@ -216506,31 +216608,51 @@ mod futex_requeue1 {
             });
         }
 
-        /// 2 — decode: bit 1 is NR 9's timed flag; any other unknown bit, or bit 1 on NR 10,
-        /// is `InvalidArgs`; without bit 1, slot 3 is not read.
+        /// 2 — decode (ABI v13): bit 1 makes slot 3 an ABSOLUTE monotonic deadline, taken as
+        /// given; bit 2 makes slot 4 a nonzero `u32` mask; any other bit, bit 1 on NR 10, a zero
+        /// or wide mask, a wide value or a misaligned word is `InvalidArgs`; slots 3 and 4 are not
+        /// read without their flags.
         #[test]
         fn t02_invalid_timed_flag_and_malformed_arguments() {
+            let _clk = mono_clock();
             use crate::kernel::syscall::sched::{decode_futex_args, decode_futex_wait_args};
             use crate::kernel::trapframe::TrapFrame;
             let f = |args: [usize; 6]| TrapFrame::new(9, args);
-            let ok = decode_futex_wait_args(&f([0x6_0000, 5, 0b10, 1_000, 0, 0])).unwrap();
-            assert_eq!(ok.timeout_ns, Some(1_000));
-            assert_eq!(ok.key.kind, P);
-            let shared = decode_futex_wait_args(&f([0x6_0000, 5, 0b11, 7, 0, 0])).unwrap();
-            assert_eq!((shared.key.kind, shared.timeout_ns), (SH, Some(7)));
-            let untimed = decode_futex_wait_args(&f([0x6_0000, 5, 0, 99, 0, 0])).unwrap();
+            let ok = decode_futex_wait_args(&f([0x6_0000, 5, 0b10, 1_000, 7, 0])).unwrap();
+            assert_eq!(ok.deadline, Some(FutexDeadline::MonotonicNs(1_000)));
             assert_eq!(
-                untimed.timeout_ns, None,
-                "slot 3 is not read without the flag"
+                (ok.key.kind, ok.key.mask),
+                (P, ANY),
+                "slot 4 unread without BITSET"
+            );
+            let shared = decode_futex_wait_args(&f([0x6_0000, 5, 0b11, 7, 0, 0])).unwrap();
+            assert_eq!(
+                (shared.key.kind, shared.deadline),
+                (SH, Some(FutexDeadline::MonotonicNs(7)))
+            );
+            let max = decode_futex_wait_args(&f([0x6_0000, 5, 0b10, usize::MAX, 0, 0])).unwrap();
+            assert_eq!(
+                max.deadline,
+                Some(FutexDeadline::MonotonicNs(u64::MAX)),
+                "every u64 is an instant; none is refused or wrapped"
+            );
+            let masked = decode_futex_wait_args(&f([0x6_0000, 5, 0b100, 99, 0x6, 0])).unwrap();
+            assert_eq!(
+                (masked.deadline, masked.key.mask),
+                (None, 0x6),
+                "slot 3 is not read without TIMED"
             );
             for bad in [
-                [0x6_0000, 5, 0b100, 0, 0, 0],
+                [0x6_0000, 5, 0b1000, 0, 0, 0],
                 [0x6_0002, 5, 0b10, 0, 0, 0],
                 [0x6_0000, 1 << 40, 0b10, 0, 0, 0],
+                [0x6_0000, 5, 0b100, 0, 0, 0],
+                [0x6_0000, 5, 0b110, 9, 1 << 40, 0],
             ] {
                 assert_eq!(
                     decode_futex_wait_args(&f(bad)),
-                    Err(SyscallError::InvalidArgs)
+                    Err(SyscallError::InvalidArgs),
+                    "{bad:x?}"
                 );
             }
             assert_eq!(
@@ -216538,23 +216660,31 @@ mod futex_requeue1 {
                 Err(SyscallError::InvalidArgs),
                 "NR 10 refuses the timed bit"
             );
+            let wake =
+                decode_futex_args(&TrapFrame::new(10, [0x6_0000, 3, 0b101, 77, 0x9, 0])).unwrap();
             assert_eq!(
-                futex_wait_deadline(u64::MAX - 1, 1),
-                None,
-                "overflow refused"
+                (wake.value, wake.kind, wake.mask),
+                (3, SH, 0x9),
+                "NR 10 reads its mask from slot 4, never slot 3"
+            );
+            assert_eq!(
+                decode_futex_args(&TrapFrame::new(10, [0x6_0000, 1, 0b100, 0, 0, 0])),
+                Err(SyscallError::InvalidArgs),
+                "a zero wake mask"
             );
         }
 
         /// 3 — zero timeout, matching word: `TimedOut`, nothing published.
         #[test]
         fn t03_zero_timeout_matching_word_times_out_without_parking() {
+            let _clk = mono_clock();
             let mut w = world(70100);
             let t = w.next;
             task(&mut w.s, t, w.a);
             run(&mut w.s, t);
-            let d = futex_wait_deadline(w.s.scheduler_tick_now(), 0).unwrap();
+            let d = crate::kernel::timekeeping::monotonic_ns().unwrap();
             assert_eq!(
-                w.s.futex_wait_current_timed(SQ, 5, P, Some(d)),
+                w.s.futex_wait_current_timed(SQ, 5, P, dl(d), ANY),
                 Ok(B::TimedOut)
             );
             assert_eq!(w.s.current_tid(), Some(t), "still current");
@@ -216566,13 +216696,14 @@ mod futex_requeue1 {
         /// 4 — zero timeout, differing word: `0` (`NotBlocked`), never `TimedOut`.
         #[test]
         fn t04_zero_timeout_mismatching_word_answers_zero() {
+            let _clk = mono_clock();
             let mut w = world(70200);
             let t = w.next;
             task(&mut w.s, t, w.a);
             run(&mut w.s, t);
-            let d = futex_wait_deadline(w.s.scheduler_tick_now(), 0).unwrap();
+            let d = crate::kernel::timekeeping::monotonic_ns().unwrap();
             assert_eq!(
-                w.s.futex_wait_current_timed(SQ, 6, P, Some(d)),
+                w.s.futex_wait_current_timed(SQ, 6, P, dl(d), ANY),
                 Ok(B::NotBlocked)
             );
             assert_eq!(occupied(&mut w.s), 0);
@@ -216581,6 +216712,7 @@ mod futex_requeue1 {
         /// 5 — a deadline not yet reached: the collector leaves the waiter parked.
         #[test]
         fn t05_deadline_not_reached_keeps_the_waiter_parked() {
+            let _clk = mono_clock();
             let mut w = world(70300);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216596,6 +216728,7 @@ mod futex_requeue1 {
         /// 6 — the deadline reached exactly (`now == deadline`) times out.
         #[test]
         fn t06_deadline_reached_exactly_times_out() {
+            let _clk = mono_clock();
             let mut w = world(70400);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216613,6 +216746,7 @@ mod futex_requeue1 {
         /// published (the hold reads the clock after its comparison).
         #[test]
         fn t07_deadline_already_expired_at_admission() {
+            let _clk = mono_clock();
             let w = world(70500);
             let (a, t) = (w.a, w.next);
             let k = leak(w.s);
@@ -216621,14 +216755,14 @@ mod futex_requeue1 {
                 task(s, t, a);
                 run(s, t);
             });
-            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 5, P, Some(3));
+            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 5, P, dl(3), ANY);
             assert_eq!(o, FutexParkOutcome::TimedOut);
             k.with(|s| {
                 assert_eq!(s.task_status(t), Some(TaskStatus::Running));
                 assert_eq!(occupied(s), 0);
             });
             // …and a differing word still answers `0` with the same expired deadline.
-            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 6, P, Some(3));
+            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 6, P, dl(3), ANY);
             assert_eq!(o, FutexParkOutcome::ValueChanged);
         }
 
@@ -216638,6 +216772,7 @@ mod futex_requeue1 {
         /// pass at any time finds nothing.
         #[test]
         fn t08_wake_before_timeout() {
+            let _clk = mono_clock();
             let mut w = world(70600);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216652,6 +216787,7 @@ mod futex_requeue1 {
         /// next waiter in FIFO order is still selectable.
         #[test]
         fn t09_timeout_before_wake() {
+            let _clk = mono_clock();
             let mut w = world(70700);
             let t1 = tpark(&mut w, SQ, 5, P, 10);
             let t2 = w.park(SQ, 5, P);
@@ -216675,6 +216811,7 @@ mod futex_requeue1 {
         /// reservation conferred no ownership; the waker releases it and counts 0.
         #[test]
         fn t10_wake_reservation_racing_timeout() {
+            let _clk = mono_clock();
             let mut w = world(70800);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216701,6 +216838,7 @@ mod futex_requeue1 {
         /// wake stays authoritative, no `TimedOut`, one placement.
         #[test]
         fn t11_wake_claim_racing_timeout() {
+            let _clk = mono_clock();
             let mut w = world(70900);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216731,6 +216869,7 @@ mod futex_requeue1 {
         /// timeout's claim and its commit, finds nobody; the waiter is queued exactly once.
         #[test]
         fn t12_scheduler_enqueue_racing_timeout() {
+            let _clk = mono_clock();
             let mut w = world(71000);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216758,6 +216897,7 @@ mod futex_requeue1 {
         /// `Runnable` — never Runnable-but-unqueued — and no wake can take it now.
         #[test]
         fn t13_full_home_queue_commits_the_timeout_without_placement() {
+            let _clk = mono_clock();
             let mut w = world(71100);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216783,6 +216923,7 @@ mod futex_requeue1 {
         /// `TimedOut` (never `Ok(true)`), exactly once.
         #[test]
         fn t14_capacity_after_expiry_places_with_timed_out() {
+            let _clk = mono_clock();
             let mut w = world(71200);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216805,6 +216946,7 @@ mod futex_requeue1 {
         /// removed, `TimedOut`; a later wake of T or S finds nothing.
         #[test]
         fn t15_requeue_before_expiry_times_out_on_the_target() {
+            let _clk = mono_clock();
             let mut w = world(71300);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216835,6 +216977,7 @@ mod futex_requeue1 {
         /// excludes the timed-out one.
         #[test]
         fn t16_timeout_before_requeue_is_excluded_from_it() {
+            let _clk = mono_clock();
             let mut w = world(71400);
             let t = tpark(&mut w, SQ, 5, P, 10);
             let u = w.park(SQ, 5, P);
@@ -216858,6 +217001,7 @@ mod futex_requeue1 {
         /// the deadline: the timeout cannot steal it; it is placed with `Ok(true)`.
         #[test]
         fn t17_pending_requeue_wake_beats_the_timeout() {
+            let _clk = mono_clock();
             let mut w = world(71500);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216884,6 +217028,7 @@ mod futex_requeue1 {
         /// 18 — requeue across two different keys keeps one identity and one deadline.
         #[test]
         fn t18_requeue_across_two_keys_keeps_identity_and_deadline() {
+            let _clk = mono_clock();
             let mut w = world(71600);
             let t = tpark(&mut w, SQ, 5, P, 40);
             w.back();
@@ -216897,6 +217042,7 @@ mod futex_requeue1 {
         /// 19 (T7) — S → T → U: expiry removes the record from U, never from an obsolete key.
         #[test]
         fn t19_requeue_across_three_keys_expires_on_the_last() {
+            let _clk = mono_clock();
             let mut w = world(71700);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -216928,6 +217074,7 @@ mod futex_requeue1 {
         /// and times out there.
         #[test]
         fn t20_private_shared_identity_transition() {
+            let _clk = mono_clock();
             let mut w = world(71800);
             let t = tpark(&mut w, 0x8_0000, 0, SH, 10);
             w.back();
@@ -216950,6 +217097,7 @@ mod futex_requeue1 {
         /// 21 — unrelated keys in ONE hash bucket: the timeout of one removes only it.
         #[test]
         fn t21_same_hash_bucket_with_unrelated_keys() {
+            let _clk = mono_clock();
             let mut w = world(71900);
             let target = w.k(SQ).bucket_for_test();
             let other = (0..512usize)
@@ -216981,6 +217129,7 @@ mod futex_requeue1 {
         /// place with `TimedOut` from the completion, which is consumed, not left behind.
         #[test]
         fn t22_timeout_during_split_park_publication() {
+            let _clk = mono_clock();
             let w = world(72000);
             let (a, t) = (w.a, w.next);
             let k = leak(w.s);
@@ -216991,7 +217140,7 @@ mod futex_requeue1 {
             hook::arm_after_register(alloc::boxed::Box::new(move || {
                 assert_eq!(collect(k, 10).timed_out, 1);
             }));
-            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 5, P, Some(10));
+            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 5, P, dl(10), ANY);
             hook::run_after_register();
             assert!(
                 matches!(o, FutexParkOutcome::WokenDuringPublication { .. }),
@@ -217010,6 +217159,7 @@ mod futex_requeue1 {
         /// 23 — a wake inside the same window: the completion is `Ok(true)`.
         #[test]
         fn t23_wake_during_split_park_publication() {
+            let _clk = mono_clock();
             let w = world(72100);
             let (a, t) = (w.a, w.next);
             let k = leak(w.s);
@@ -217020,7 +217170,7 @@ mod futex_requeue1 {
             hook::arm_after_register(alloc::boxed::Box::new(move || {
                 assert_eq!(k.futex_wake_split_mut(CpuId(1), a, SQ, 1, P), Ok(1));
             }));
-            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 5, P, Some(10));
+            let o = k.futex_wait_park_exact_timed_split(CpuId(0), t, a, SQ, 5, P, dl(10), ANY);
             hook::run_after_register();
             assert!(
                 matches!(o, FutexParkOutcome::WokenDuringPublication { .. }),
@@ -217043,6 +217193,7 @@ mod futex_requeue1 {
         /// never resurrects the task.
         #[test]
         fn t24_task_exit_before_expiry() {
+            let _clk = mono_clock();
             let mut w = world(72200);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217060,6 +217211,7 @@ mod futex_requeue1 {
         /// retires the record; a later pass with room places nobody.
         #[test]
         fn t25_task_exit_after_timeout_claim_before_placement() {
+            let _clk = mono_clock();
             let mut w = world(72300);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217083,6 +217235,7 @@ mod futex_requeue1 {
         /// is never timed out by the old one.
         #[test]
         fn t26_reap_and_numeric_tid_reuse() {
+            let _clk = mono_clock();
             let mut w = world(72400);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217114,6 +217267,7 @@ mod futex_requeue1 {
         /// unless its own registration says otherwise, and has a new generation.
         #[test]
         fn t27_waiter_slot_and_generation_reuse() {
+            let _clk = mono_clock();
             let mut w = world(72500);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217133,6 +217287,7 @@ mod futex_requeue1 {
         /// with its task; the reused ASID's waiter is untouched.
         #[test]
         fn t28_address_space_generation_reuse() {
+            let _clk = mono_clock();
             let mut w = world(72600);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217167,6 +217322,7 @@ mod futex_requeue1 {
         /// registered identity, without resolving the unmapped VA.
         #[test]
         fn t29_mapping_teardown_before_expiry() {
+            let _clk = mono_clock();
             let mut w = world(72700);
             let t = tpark(&mut w, Y, 9, P, 10);
             w.back();
@@ -217184,6 +217340,7 @@ mod futex_requeue1 {
         /// releases its reservation.
         #[test]
         fn t30_simultaneous_deadline_collectors() {
+            let _clk = mono_clock();
             let mut w = world(72800);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217195,7 +217352,9 @@ mod futex_requeue1 {
                     k.with(|s| {
                         s.with_task_futex_mut(|_t, table| table.reset_timeout_cursor_for_test())
                     });
-                    i2.set(Some(k.run_due_futex_timeouts_at(CpuId(1), 10)));
+                    i2.set(Some(
+                        k.run_due_futex_timeouts_at(CpuId(1), FutexNow::at_ns(10)),
+                    ));
                     return false;
                 }
                 true
@@ -217213,6 +217372,7 @@ mod futex_requeue1 {
         /// 31 — repeated overdue scans deliver one timeout.
         #[test]
         fn t31_repeated_overdue_scans_are_idempotent() {
+            let _clk = mono_clock();
             let mut w = world(72900);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217229,6 +217389,7 @@ mod futex_requeue1 {
         /// indices, a full window and a refusal, every due waiter is settled within one cycle.
         #[test]
         fn t32_scanner_cursor_wrap_and_refusal() {
+            let _clk = mono_clock();
             let mut w = world(73000);
             let mut ts = Vec::new();
             for _ in 0..12 {
@@ -217249,6 +217410,7 @@ mod futex_requeue1 {
         /// collector alone settles the timed one.
         #[test]
         fn t33_all_user_threads_blocked() {
+            let _clk = mono_clock();
             let mut w = world(73100);
             let t = tpark(&mut w, SQ, 5, P, 10);
             let u = w.park(MX, 0, P);
@@ -217262,22 +217424,14 @@ mod futex_requeue1 {
             });
         }
 
-        /// 34 — the clock the collector uses is the scheduler tick: advancing it by the
-        /// converted duration makes the deadline due; one tick less does not.
+        /// 34 — FUTEX-ABS-BITSET1: the clock the production collector judges a word wait by is
+        /// `CLOCK_MONOTONIC`, compared with the absolute deadline directly: one nanosecond short
+        /// is not due, the instant itself is. No tick conversion exists any more.
         #[test]
         fn t34_timer_progress_reaches_the_deadline() {
-            let period = crate::arch::platform_constants::SCHED_TICK_PERIOD_NS;
-            assert_eq!(futex_timeout_ticks(0, period), 0);
-            assert_eq!(
-                futex_timeout_ticks(1, period),
-                2,
-                "a partial period plus one"
-            );
-            assert_eq!(futex_timeout_ticks(period, period), 2);
-            assert_eq!(futex_timeout_ticks(period + 1, period), 3);
-            assert_eq!(futex_timeout_ticks(u64::MAX, period), u64::MAX / period + 2);
+            let _clk = mono_clock();
             let mut w = world(73200);
-            let d = futex_wait_deadline(w.s.scheduler_tick_now(), 3 * period).unwrap();
+            let d = 3 * crate::arch::platform_constants::SCHED_TICK_PERIOD_NS;
             let t = tpark(&mut w, SQ, 5, P, d);
             w.back();
             let k = leak(w.s);
@@ -217291,11 +217445,16 @@ mod futex_requeue1 {
         /// 35 — a collector on another CPU delivers a timeout to a waiter whose home is CPU 0.
         #[test]
         fn t35_multi_cpu_timeout_delivery() {
+            let _clk = mono_clock();
             let mut w = world(73300);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
             let k = leak(w.s);
-            assert_eq!(k.run_due_futex_timeouts_at(CpuId(1), 10).timed_out, 1);
+            assert_eq!(
+                k.run_due_futex_timeouts_at(CpuId(1), FutexNow::at_ns(10))
+                    .timed_out,
+                1
+            );
             k.with(|s| {
                 assert!(timed_out(s, t));
                 assert_eq!(
@@ -217311,6 +217470,7 @@ mod futex_requeue1 {
         /// `FUTEX_TIMEOUT_DUE_MAX`; the passes together still reach the last-registered waiter.
         #[test]
         fn t41_bounded_collector_work_with_many_timed_waiters() {
+            let _clk = mono_clock();
             let mut w = world(74000);
             let n = fx::FUTEX_TIMEOUT_SCAN_WINDOW + 20;
             let mut far = Vec::new();
@@ -217375,6 +217535,7 @@ mod futex_requeue1 {
         /// continuation tag.
         #[test]
         fn t36_riscv_parked_timeout_return_value() {
+            let _clk = mono_clock();
             const RV: &str = include_str!("../../arch/riscv64/trap.rs");
             assert!(RV.contains("frame.set_user_gpr(10, done.result_register());"));
             assert!(RV.contains("kernel.take_resume_completion(current_tid)"));
@@ -217386,6 +217547,7 @@ mod futex_requeue1 {
         /// 37 — AArch64: `x0` is the result register (`encode_blocked_completion_result`).
         #[test]
         fn t37_aarch64_parked_timeout_return_value() {
+            let _clk = mono_clock();
             const A64: &str = include_str!("../../arch/aarch64/trap.rs");
             assert_eq!(
                 A64.matches(
@@ -217403,6 +217565,7 @@ mod futex_requeue1 {
         /// 38 — x86_64: the error lane carries `TimedOut`; a wake is `set_ok(1, 0, 0)`.
         #[test]
         fn t38_x86_64_parked_timeout_return_value() {
+            let _clk = mono_clock();
             const X86: &str = include_str!("../../arch/x86_64/trap.rs");
             // FUTEX-TIME1 x86 repair: both consumers encode through ONE helper, which writes the
             // fields and (timed FutexWait) the continuation's return-lane registers (t42).
@@ -217429,6 +217592,7 @@ mod futex_requeue1 {
         /// in-lock consumers) delivers a timed-out cycle's result, exactly once.
         #[test]
         fn t43_in_lock_resume_take_delivers_the_timed_result_once() {
+            let _clk = mono_clock();
             let mut w = world(74100);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217451,6 +217615,7 @@ mod futex_requeue1 {
         /// for its own incarnation.
         #[test]
         fn t44_thread_restore_facts_carry_the_timed_result_once() {
+            let _clk = mono_clock();
             let mut w = world(74200);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217489,6 +217654,7 @@ mod futex_requeue1 {
         /// which the completion carries; a TID-and-ASID match alone is not enough.
         #[test]
         fn t45_a_stale_cycle_completion_never_answers_a_later_cycle() {
+            let _clk = mono_clock();
             let mut w = world(74300);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217503,7 +217669,7 @@ mod futex_requeue1 {
                 s.enqueue_task(t).expect("queue");
                 run(s, t);
                 assert_eq!(
-                    s.futex_wait_current_timed(SQ, 5, P, Some(1_000)),
+                    s.futex_wait_current_timed(SQ, 5, P, dl(1_000), ANY),
                     Ok(B::Blocked { timed: true }),
                     "cycle 2 parks"
                 );
@@ -217533,6 +217699,7 @@ mod futex_requeue1 {
         /// encoded completion must replace exactly those lanes and nothing else.
         #[test]
         fn t42_x86_64_switched_resume_carries_the_timed_result_in_registers() {
+            let _clk = mono_clock();
             use crate::arch::x86_64::trap::encode_x86_blocked_completion;
             let parked = || {
                 let mut f = crate::kernel::trapframe::TrapFrame::new(9, [SQ, 5, 2, 1_000, 0, 0]);
@@ -217594,6 +217761,7 @@ mod futex_requeue1 {
         /// completion.
         #[test]
         fn t39_no_duplicate_enqueue_or_completion() {
+            let _clk = mono_clock();
             let mut w = world(73400);
             let t = tpark(&mut w, SQ, 5, P, 10);
             w.back();
@@ -217621,6 +217789,7 @@ mod futex_requeue1 {
         /// 40 — no leak: after a mixed history every record, deadline and reservation is gone.
         #[test]
         fn t40_no_deadline_reservation_or_record_leak() {
+            let _clk = mono_clock();
             let mut w = world(73500);
             let t1 = tpark(&mut w, SQ, 5, P, 10);
             let t2 = tpark(&mut w, SQ, 5, P, 100);
@@ -217636,6 +217805,777 @@ mod futex_requeue1 {
                 assert_eq!(reserved(s), 0);
                 consistent(s);
             });
+        }
+    }
+
+    /// FUTEX-ABS-BITSET1 — absolute `CLOCK_MONOTONIC` deadlines and selective (bitset) wake, on
+    /// the production owners: the broad and split wait/wake/requeue routes, NR 9/10 through
+    /// `dispatch`, the timeout collector with its phase windows, exit/reap, and the RT budget
+    /// owners. The deadline domain is the hosted 1 GHz monotonic source at origin 0, so every
+    /// instant here is nanoseconds.
+    mod abs_bitset1 {
+        use super::*;
+        use crate::kernel::boot::FutexWaitBroadOutcome as B;
+        use crate::kernel::boot::futex::{
+            FUTEX_BITSET_MATCH_ANY as ANY, FutexDeadline, FutexNow, FutexTimeoutPass,
+            FutexWaitTiming, futex_phase_hook as hook,
+        };
+        use crate::kernel::syscall::{SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SyscallError};
+        use crate::kernel::task::{BlockedSyscallClass, BlockedSyscallCompletion};
+        use crate::kernel::trapframe::TrapFrame;
+
+        const TIMED_OUT: u64 = 9;
+        const F_TIMED: usize = 1 << 1;
+        const F_BITSET: usize = 1 << 2;
+
+        fn mono_clock() -> std::sync::MutexGuard<'static, ()> {
+            let g = crate::kernel::timekeeping::CLOCK_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::arch::clock::HOSTED_COUNTER.store(0, core::sync::atomic::Ordering::Release);
+            crate::kernel::timekeeping::force_source_for_test(
+                1_000_000_000,
+                0,
+                crate::kernel::timekeeping::SourceKind::Hosted,
+            );
+            g
+        }
+        fn at(ns: u64) {
+            crate::arch::clock::HOSTED_COUNTER.store(ns, core::sync::atomic::Ordering::Release);
+        }
+        fn dl(d: u64) -> FutexWaitTiming {
+            FutexWaitTiming::Deadline(FutexDeadline::MonotonicNs(d))
+        }
+        fn completion(s: &KernelState, t: u64) -> Option<BlockedSyscallCompletion> {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|x| x.tid.0 == t)
+                    .and_then(|x| x.pending_syscall_completion)
+            })
+        }
+        fn futex_result(s: &KernelState, t: u64) -> Option<u64> {
+            completion(s, t)
+                .filter(|c| c.syscall_class == BlockedSyscallClass::FutexWait)
+                .map(|c| c.result)
+        }
+        fn deadline(s: &mut KernelState, t: u64) -> Option<u64> {
+            let token = token_of(s, t)?;
+            s.with_task_futex_mut(|_t, table| table.deadline_of(token).map(FutexDeadline::raw))
+        }
+        fn mask(s: &mut KernelState, t: u64) -> Option<u32> {
+            let token = token_of(s, t)?;
+            s.with_task_futex_mut(|_t, table| table.mask_of(token))
+        }
+        fn collect(k: &SharedKernel, ns: u64) -> FutexTimeoutPass {
+            k.run_due_futex_timeouts_at(CpuId(0), FutexNow::at_ns(ns))
+        }
+        /// A new task of `w`'s process, parked on `va` (holding `v`) through the broad
+        /// compare-and-register, with `timing` and `m`.
+        fn mpark(w: &mut W, va: usize, v: u32, timing: FutexWaitTiming, m: u32) -> u64 {
+            let t = w.next;
+            w.next += 1;
+            task(&mut w.s, t, w.a);
+            run(&mut w.s, t);
+            let timed = timing != FutexWaitTiming::Untimed;
+            assert_eq!(
+                w.s.futex_wait_current_timed(va, v, P, timing, m),
+                Ok(B::Blocked { timed }),
+                "{t} parks (mask {m:#x})"
+            );
+            t
+        }
+        /// A new task of `w`'s process, current, and nothing else.
+        fn current(w: &mut W) -> u64 {
+            let t = w.next;
+            w.next += 1;
+            task(&mut w.s, t, w.a);
+            run(&mut w.s, t);
+            t
+        }
+        fn fill(s: &mut KernelState, a: Asid, base: u64) -> Vec<u64> {
+            let mut fillers = Vec::new();
+            for i in 0..200u64 {
+                let t = base + i;
+                s.register_task(t).expect("task");
+                s.bind_task_asid(t, a).expect("bind");
+                s.set_task_status_for_test(t, TaskStatus::Runnable);
+                s.seed_resumable_user_context_for_test(t);
+                s.set_task_home_cpu(t, CpuId(0)).expect("home");
+                if s.enqueue_task(t).is_err() {
+                    s.set_task_status_for_test(
+                        t,
+                        TaskStatus::Blocked(WaitReason::Join(ThreadId(1))),
+                    );
+                    return fillers;
+                }
+                fillers.push(t);
+            }
+            panic!("the queue never filled");
+        }
+        fn drain_one(s: &mut KernelState, t: u64) {
+            assert_eq!(
+                s.withdraw_queued_tid_on(CpuId(0), t),
+                crate::kernel::scheduler::WithdrawOutcome::Removed
+            );
+            s.set_task_status_for_test(t, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
+        }
+
+        // ── Admission: compare, then the deadline's own clock ───────────────────────────────
+
+        /// 1 — compare-and-register order: a differing word is `ValueChanged` (`NotBlocked`)
+        /// whatever the deadline, even with NO clock; a matching word with no clock refuses
+        /// (`ClockUnavailable`, never an untimed fallback); a matching word whose deadline is
+        /// reached (equal included) is `TimedOut`; nothing is published by any of them.
+        #[test]
+        fn ab01_mismatch_then_clock_then_deadline_and_nothing_published() {
+            let _clk = mono_clock();
+            let mut w = world(76000);
+            let t = current(&mut w);
+            at(500);
+            assert_eq!(
+                w.s.futex_wait_current_timed(SQ, 6, P, dl(0), ANY),
+                Ok(B::NotBlocked),
+                "a mismatch outranks an expired deadline"
+            );
+            assert_eq!(
+                w.s.futex_wait_current_timed(SQ, 5, P, dl(500), 0x3),
+                Ok(B::TimedOut),
+                "deadline == now is reached"
+            );
+            crate::kernel::timekeeping::reset_for_test();
+            assert_eq!(
+                w.s.futex_wait_current_timed(SQ, 6, P, dl(u64::MAX), ANY),
+                Ok(B::NotBlocked),
+                "a mismatch outranks an unavailable clock"
+            );
+            assert_eq!(
+                w.s.futex_wait_current_timed(SQ, 5, P, dl(u64::MAX), ANY),
+                Ok(B::ClockUnavailable),
+                "no clock: refused, never parked untimed"
+            );
+            assert_eq!(
+                w.s.futex_wait_current_timed(SQ, 5, P, FutexWaitTiming::Untimed, 0x8),
+                Ok(B::Blocked { timed: false }),
+                "an untimed (masked) wait needs no clock"
+            );
+            assert_eq!(mask(&mut w.s, t), Some(0x8));
+            assert_eq!(deadline(&mut w.s, t), None);
+            w.back();
+            assert_eq!(w.s.futex_wake_masked(SQ, 1, P, 0x8), Ok(1));
+            assert_eq!(occupied(&mut w.s), 0);
+        }
+
+        /// 2 — a zero mask reaching the owner is refused (`InvalidMask`, `InvalidArgs` at the
+        /// syscall) before anything is published, timed or not; NR 9/10 through `dispatch`
+        /// refuse it at decode.
+        #[test]
+        fn ab02_zero_mask_is_refused_before_publication() {
+            let _clk = mono_clock();
+            let mut w = world(76100);
+            let t = current(&mut w);
+            for timing in [FutexWaitTiming::Untimed, dl(1_000)] {
+                assert_eq!(
+                    w.s.futex_wait_current_timed(SQ, 5, P, timing, 0),
+                    Ok(B::InvalidMask)
+                );
+            }
+            assert_eq!(w.s.current_tid(), Some(t), "still current");
+            assert_eq!(occupied(&mut w.s), 0);
+            let mut f = TrapFrame::new(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, F_BITSET, 0, 0, 0]);
+            assert_eq!(
+                crate::kernel::syscall::dispatch(&mut w.s, &mut f),
+                Err(SyscallError::InvalidArgs)
+            );
+            let mut f = TrapFrame::new(SYSCALL_FUTEX_WAKE_NR, [SQ, 1, F_BITSET, 0, 0, 0]);
+            assert_eq!(
+                crate::kernel::syscall::dispatch(&mut w.s, &mut f),
+                Err(SyscallError::InvalidArgs)
+            );
+            assert_eq!(occupied(&mut w.s), 0);
+        }
+
+        /// 3 — the deadline is the caller's INSTANT, stored and compared as given (no tick
+        /// conversion, no rounding): an odd instant survives exactly; the collector expires it at
+        /// that nanosecond, not a tick later or earlier; the scheduler tick never decides it.
+        #[test]
+        fn ab03_the_instant_is_stored_and_compared_exactly() {
+            let _clk = mono_clock();
+            let mut w = world(76200);
+            const D: u64 = 1_234_567_891;
+            let t = mpark(&mut w, SQ, 5, dl(D), ANY);
+            w.back();
+            assert_eq!(deadline(&mut w.s, t), Some(D));
+            let k = leak(w.s);
+            assert_eq!(collect(k, D - 1).timed_out, 0, "never early");
+            let tick_only = k.run_due_futex_timeouts_at(
+                CpuId(0),
+                FutexNow {
+                    mono_ns: Some(D - 1),
+                    tick: u64::MAX,
+                },
+            );
+            assert_eq!(
+                tick_only.timed_out, 0,
+                "the tick is not the deadline's clock"
+            );
+            let no_clock = k.run_due_futex_timeouts_at(
+                CpuId(0),
+                FutexNow {
+                    mono_ns: None,
+                    tick: u64::MAX,
+                },
+            );
+            assert_eq!(
+                (no_clock.due, no_clock.timed_out),
+                (0, 0),
+                "an unreadable clock never expires a record"
+            );
+            k.with(|s| assert!(parked(s, t)));
+            assert_eq!(collect(k, D).timed_out, 1);
+            k.with(|s| assert_eq!(futex_result(s, t), Some(TIMED_OUT)));
+        }
+
+        /// 4 — NR 9 through `dispatch` with TIMED|BITSET: slot 3 is the absolute deadline and
+        /// slot 4 the mask, both as given; a parked timed wait's frame is the fail-closed
+        /// provisional; NR 10 with BITSET wakes only an overlapping mask, and its count is
+        /// `ret0`.
+        #[test]
+        fn ab04_nr9_nr10_through_dispatch() {
+            let _clk = mono_clock();
+            let mut w = world(76300);
+            let t = current(&mut w);
+            let mut f = TrapFrame::new(
+                SYSCALL_FUTEX_WAIT_NR,
+                [SQ, 5, F_TIMED | F_BITSET, 777_777, 0x30, 0],
+            );
+            crate::kernel::syscall::dispatch(&mut w.s, &mut f).expect("parks");
+            assert_eq!(
+                f.error,
+                SyscallError::Internal.code(),
+                "provisional, never 1"
+            );
+            assert_eq!(deadline(&mut w.s, t), Some(777_777));
+            assert_eq!(mask(&mut w.s, t), Some(0x30));
+            w.back();
+            let mut miss = TrapFrame::new(SYSCALL_FUTEX_WAKE_NR, [SQ, 9, F_BITSET, 5, 0x0F, 0]);
+            crate::kernel::syscall::dispatch(&mut w.s, &mut miss).expect("wake");
+            assert_eq!(miss.ret0, 0, "disjoint: nobody");
+            assert!(parked(&w.s, t));
+            let mut hit = TrapFrame::new(SYSCALL_FUTEX_WAKE_NR, [SQ, 9, F_BITSET, 0, 0x10, 0]);
+            crate::kernel::syscall::dispatch(&mut w.s, &mut hit).expect("wake");
+            assert_eq!(hit.ret0, 1);
+            assert!(placed(&w.s, t));
+            assert_eq!(futex_result(&w.s, t), Some(0), "Woken");
+        }
+
+        // ── Selective wake ──────────────────────────────────────────────────────────────────
+
+        /// 5 — a non-matching waiter ahead of matching ones is passed over IN PLACE and does not
+        /// consume the count; FIFO holds among the matches; a disjoint wake is `0`; an ordinary
+        /// (MATCH_ANY) wake releases a masked waiter.
+        #[test]
+        fn ab05_disjoint_waiters_stay_parked_and_do_not_consume_the_count() {
+            let _clk = mono_clock();
+            let mut w = world(76400);
+            let u = FutexWaitTiming::Untimed;
+            let a1 = mpark(&mut w, SQ, 5, u, 0x1);
+            let b1 = mpark(&mut w, SQ, 5, u, 0x2);
+            let a2 = mpark(&mut w, SQ, 5, u, 0x1);
+            let b2 = mpark(&mut w, SQ, 5, u, 0x2);
+            w.back();
+            assert_eq!(w.s.futex_wake_masked(SQ, 1, P, 0x2), Ok(1));
+            assert!(placed(&w.s, b1), "the OLDEST match, past a1");
+            assert_eq!(w.order(SQ), vec![a1, a2, b2], "a1 stayed in place");
+            assert_eq!(w.s.futex_wake_masked(SQ, 1, P, 0x4), Ok(0), "disjoint");
+            assert_eq!(w.order(SQ), vec![a1, a2, b2], "nothing moved");
+            assert_eq!(
+                w.s.futex_wake_masked(SQ, 9, P, 0x2),
+                Ok(1),
+                "only b2 matches"
+            );
+            assert_eq!(w.order(SQ), vec![a1, a2]);
+            assert_eq!(w.s.futex_wake(SQ, 1, P), Ok(1), "an ordinary wake");
+            assert!(placed(&w.s, a1));
+            assert_eq!(contract(&w.s, &[a1, b1, a2, b2]), 3);
+        }
+
+        /// 6 — overlap, not equality: any shared bit matches; MATCH_ANY waiters match every
+        /// nonzero wake mask; FIFO among overlapping matches with a count.
+        #[test]
+        fn ab06_overlapping_masks_match_in_fifo_order() {
+            let _clk = mono_clock();
+            let mut w = world(76500);
+            let u = FutexWaitTiming::Untimed;
+            let ws: Vec<u64> = [0x1u32, 0x6, ANY, 0x3, 0x8]
+                .iter()
+                .map(|&m| mpark(&mut w, SQ, 5, u, m))
+                .collect();
+            w.back();
+            assert_eq!(w.s.futex_wake_masked(SQ, 2, P, 0x2), Ok(2));
+            assert!(
+                placed(&w.s, ws[1]) && placed(&w.s, ws[2]),
+                "0x6 and ANY, oldest first"
+            );
+            assert_eq!(
+                w.order(SQ),
+                vec![ws[0], ws[3], ws[4]],
+                "0x3 left: count reached"
+            );
+            assert_eq!(w.s.futex_wake_masked(SQ, 9, P, 0x80), Ok(0));
+            assert_eq!(w.s.futex_wake_masked(SQ, 9, P, 0x9), Ok(3), "0x1, 0x3, 0x8");
+            assert_eq!(contract(&w.s, &ws), 5);
+        }
+
+        /// 7 — capacity: a matching waiter that cannot be placed stops the wake (reserve before
+        /// claim, no bypass to a later match); `0` may be a refusal, with nothing changed; with
+        /// one slot freed, exactly the oldest match is placed.
+        #[test]
+        fn ab07_capacity_refusal_stops_at_the_first_unplaceable_match() {
+            let _clk = mono_clock();
+            let mut w = world(76600);
+            let u = FutexWaitTiming::Untimed;
+            let n = mpark(&mut w, SQ, 5, u, 0x1);
+            let m1 = mpark(&mut w, SQ, 5, u, 0x2);
+            let m2 = mpark(&mut w, SQ, 5, u, 0x2);
+            w.back();
+            let a = w.a;
+            let fillers = fill(&mut w.s, a, 77000);
+            assert_eq!(
+                w.s.futex_wake_masked(SQ, 2, P, 0x2),
+                Ok(0),
+                "refused for capacity"
+            );
+            assert_eq!(
+                w.order(SQ),
+                vec![n, m1, m2],
+                "nothing claimed, nothing reordered"
+            );
+            assert_eq!(reserved(&w.s), 0, "nothing promised");
+            drain_one(&mut w.s, fillers[0]);
+            assert_eq!(
+                w.s.futex_wake_masked(SQ, 2, P, 0x2),
+                Ok(1),
+                "one slot: one placement"
+            );
+            assert!(placed(&w.s, m1), "the oldest match");
+            assert_eq!(w.order(SQ), vec![n, m2]);
+            assert_eq!(reserved(&w.s), 0);
+        }
+
+        /// 8 — the split masked wake (THE route NR 10 takes) is the same policy as the broad one.
+        #[test]
+        fn ab08_split_masked_wake_selects_like_the_broad_one() {
+            let _clk = mono_clock();
+            let mut w = world(76700);
+            let u = FutexWaitTiming::Untimed;
+            let a1 = mpark(&mut w, SQ, 5, u, 0x1);
+            let b1 = mpark(&mut w, SQ, 5, dl(1 << 40), 0x2);
+            w.back();
+            let (a, k) = (w.a, leak(w.s));
+            assert_eq!(
+                k.futex_wake_masked_split_mut(CpuId(1), a, SQ, 1, P, 0x4),
+                Ok(0)
+            );
+            assert_eq!(
+                k.futex_wake_masked_split_mut(CpuId(1), a, SQ, 1, P, 0x2),
+                Ok(1)
+            );
+            k.with(|s| {
+                assert!(placed(s, b1) && parked(s, a1));
+                assert_eq!(futex_result(s, b1), Some(0), "the timed match: Woken");
+                assert_eq!(timed_records(s), 0);
+            });
+        }
+
+        // ── Requeue preserves deadline, mask and identity ───────────────────────────────────
+
+        fn timed_records(s: &mut KernelState) -> usize {
+            s.with_task_futex_mut(|_t, table| table.timed_records())
+        }
+
+        /// 9 — repeated requeue (S → T → U → S) keeps the exact token, deadline and mask; a
+        /// disjoint wake on each key passes it over; the deadline expires on the last key, at the
+        /// unchanged instant, exactly once.
+        #[test]
+        fn ab09_repeated_requeue_preserves_deadline_mask_and_identity() {
+            let _clk = mono_clock();
+            let mut w = world(76800);
+            let t = mpark(&mut w, SQ, 5, dl(10_000), 0x4);
+            w.back();
+            let tok = token_of(&w.s, t).unwrap();
+            word(&mut w.s, w.driver, UQ, 5);
+            for (from, to) in [(SQ, MX), (MX, UQ), (UQ, SQ)] {
+                let v = rd(&w.s, w.driver, from);
+                assert_eq!(rq(&mut w.s, from, to, v, 0, 1), Ok(out(0, 1, false)));
+                assert_eq!(token_of(&w.s, t), Some(tok), "one identity");
+                assert_eq!(key_of(&mut w.s, tok), Some(w.k(to)));
+                assert_eq!(
+                    deadline(&mut w.s, t),
+                    Some(10_000),
+                    "the instant moved with it"
+                );
+                assert_eq!(mask(&mut w.s, t), Some(0x4), "the mask moved with it");
+                assert_eq!(
+                    w.s.futex_wake_masked(to, 1, P, 0x1),
+                    Ok(0),
+                    "disjoint on {to:#x}"
+                );
+                assert!(parked(&w.s, t));
+            }
+            let k = leak(w.s);
+            assert_eq!(collect(k, 9_999).timed_out, 0);
+            assert_eq!(collect(k, 10_000).timed_out, 1);
+            k.with(|s| {
+                assert_eq!(futex_result(s, t), Some(TIMED_OUT));
+                assert_eq!(s.futex_wake(SQ, 1, P), Ok(0));
+                consistent(s);
+            });
+            assert_eq!(collect(k, u64::MAX), FutexTimeoutPass::default(), "once");
+        }
+
+        /// 10 — NR 17's wake portion is MATCH_ANY (it takes a masked waiter), and its moved
+        /// records keep their masks on the target.
+        #[test]
+        fn ab10_requeue_wake_portion_is_match_any_and_moved_keep_masks() {
+            let _clk = mono_clock();
+            let mut w = world(76900);
+            let u = FutexWaitTiming::Untimed;
+            let w1 = mpark(&mut w, SQ, 5, u, 0x4);
+            let w2 = mpark(&mut w, SQ, 5, dl(1 << 40), 0x8);
+            w.back();
+            assert_eq!(rq(&mut w.s, SQ, MX, 5, 1, 1), Ok(out(1, 1, false)));
+            assert!(
+                placed(&w.s, w1),
+                "the masked oldest, by the MATCH_ANY wake portion"
+            );
+            assert_eq!(mask(&mut w.s, w2), Some(0x8));
+            assert_eq!(deadline(&mut w.s, w2), Some(1 << 40));
+            assert_eq!(w.s.futex_wake_masked(MX, 1, P, 0x4), Ok(0));
+            assert_eq!(w.s.futex_wake_masked(MX, 1, P, 0x8), Ok(1));
+            assert_eq!(futex_result(&w.s, w2), Some(0));
+        }
+
+        /// 11 — Expired (the home queue full at the deadline) keeps timeout ownership AND the
+        /// record's deadline and mask; a MATCHING wake cannot claim it; the later placement
+        /// returns `TimedOut` exactly once.
+        #[test]
+        fn ab11_expired_keeps_ownership_deadline_and_mask() {
+            let _clk = mono_clock();
+            let mut w = world(77300);
+            let t = mpark(&mut w, SQ, 5, dl(10), 0x2);
+            w.back();
+            let a = w.a;
+            let fillers = fill(&mut w.s, a, 77400);
+            let k = leak(w.s);
+            assert_eq!(collect(k, 10).expired, 1);
+            k.with(|s| {
+                assert!(parked(s, t));
+                assert_eq!((deadline(s, t), mask(s, t)), (Some(10), Some(0x2)));
+                drain_one(s, fillers[0]);
+                assert_eq!(
+                    s.futex_wake_masked(SQ, 1, P, 0x2),
+                    Ok(0),
+                    "Expired: no wake claims"
+                );
+            });
+            assert_eq!(collect(k, 11).timed_out, 1);
+            k.with(|s| assert_eq!(futex_result(s, t), Some(TIMED_OUT)));
+            assert_eq!(collect(k, 12), FutexTimeoutPass::default());
+        }
+
+        // ── Races ───────────────────────────────────────────────────────────────────────────
+
+        /// 12 — a MASKED wake reserved, then the timeout claims inside its window: the wake
+        /// counts 0 and releases; the timeout's result stands.
+        #[test]
+        fn ab12_masked_wake_reservation_loses_to_the_timeout() {
+            let _clk = mono_clock();
+            let mut w = world(77500);
+            let t = mpark(&mut w, SQ, 5, dl(10), 0x2);
+            w.back();
+            let (a, k) = (w.a, leak(w.s));
+            let ran = alloc::rc::Rc::new(core::cell::Cell::new(0u32));
+            let r = ran.clone();
+            hook::arm_wake_step(alloc::boxed::Box::new(move |step, tid| {
+                if step == hook::WAKE_AFTER_RESERVE && tid == t {
+                    r.set(collect(k, 10).timed_out);
+                    return false;
+                }
+                true
+            }));
+            assert_eq!(
+                k.futex_wake_masked_split_mut(CpuId(1), a, SQ, 1, P, 0x3),
+                Ok(0)
+            );
+            assert_eq!(ran.get(), 1);
+            k.with(|s| {
+                assert_eq!(futex_result(s, t), Some(TIMED_OUT));
+                assert_eq!(reserved(s), 0);
+            });
+        }
+
+        /// 13 — the masked wake CLAIMED, then the collector finds the deadline due: the wake
+        /// stays authoritative (one completion, `Woken`).
+        #[test]
+        fn ab13_masked_wake_claim_beats_the_due_timeout() {
+            let _clk = mono_clock();
+            let mut w = world(77600);
+            let t = mpark(&mut w, SQ, 5, dl(10), 0x2);
+            w.back();
+            let (a, k) = (w.a, leak(w.s));
+            let pass = alloc::rc::Rc::new(core::cell::Cell::new(None));
+            let p2 = pass.clone();
+            hook::arm_wake_step(alloc::boxed::Box::new(move |step, tid| {
+                if step == hook::WAKE_AFTER_CLAIM && tid == t {
+                    p2.set(Some(collect(k, 10)));
+                    return false;
+                }
+                true
+            }));
+            assert_eq!(
+                k.futex_wake_masked_split_mut(CpuId(1), a, SQ, 1, P, 0x2),
+                Ok(1)
+            );
+            let pass = pass.get().expect("collector ran");
+            assert_eq!((pass.due, pass.timed_out), (0, 0));
+            k.with(|s| {
+                assert_eq!(futex_result(s, t), Some(0));
+                assert!(placed(s, t));
+            });
+        }
+
+        /// 14 — a requeue moves the record inside the collector's reserve→claim window: the
+        /// claim follows the exact token to the new key and times it out with the unchanged
+        /// deadline; the target is left consistent and empty.
+        #[test]
+        fn ab14_requeue_inside_the_timeout_window_keeps_the_claim_exact() {
+            let _clk = mono_clock();
+            let mut w = world(77700);
+            let t = mpark(&mut w, SQ, 5, dl(10), 0x4);
+            w.back();
+            let (a, k) = (w.a, leak(w.s));
+            let moved = alloc::rc::Rc::new(core::cell::Cell::new(None));
+            let m2 = moved.clone();
+            hook::arm_timeout_step(alloc::boxed::Box::new(move |step, tid| {
+                if step == hook::TIMEOUT_AFTER_RESERVE && tid == t {
+                    m2.set(Some(k.futex_cmp_requeue_split(
+                        CpuId(1),
+                        a,
+                        (SQ, P),
+                        (MX, P),
+                        5,
+                        0,
+                        1,
+                    )));
+                    return false;
+                }
+                true
+            }));
+            let pass = collect(k, 10);
+            assert_eq!(
+                moved.get(),
+                Some(Ok(out(0, 1, false))),
+                "moved inside the window"
+            );
+            assert_eq!(pass.timed_out, 1);
+            k.with(|s| {
+                assert_eq!(futex_result(s, t), Some(TIMED_OUT));
+                assert_eq!(s.futex_wake(MX, 1, P), Ok(0));
+                assert_eq!(reserved(s), 0);
+                consistent(s);
+            });
+        }
+
+        // ── Reuse, exit, teardown, Sleep ────────────────────────────────────────────────────
+
+        /// 15 — slot, generation and numeric-TID reuse: a new incarnation in the slot of a
+        /// masked timed record inherits neither its mask nor its deadline, and a stale claim by
+        /// the old token is refused.
+        #[test]
+        fn ab15_reuse_inherits_neither_mask_nor_deadline() {
+            let _clk = mono_clock();
+            let mut w = world(77800);
+            let t = mpark(&mut w, SQ, 5, dl(10), 0x2);
+            w.back();
+            let old = token_of(&w.s, t).unwrap();
+            assert_eq!(w.s.futex_wake_masked(SQ, 1, P, 0x2), Ok(1));
+            let u = mpark(&mut w, SQ, 5, FutexWaitTiming::Untimed, ANY);
+            w.back();
+            let new = token_of(&w.s, u).unwrap();
+            assert_eq!(new.slot, old.slot);
+            assert_ne!(new.generation, old.generation);
+            assert_eq!(
+                (mask(&mut w.s, u), deadline(&mut w.s, u)),
+                (Some(ANY), None)
+            );
+            let stale = w.s.with_task_futex_mut(|tcbs, table| {
+                fx::claim_futex_timeout_locked(
+                    tcbs,
+                    table,
+                    fx::FutexTimeoutCandidate {
+                        tid: t,
+                        token: old,
+                        expired: false,
+                    },
+                    FutexNow::at_ns(u64::MAX),
+                )
+            });
+            assert!(!stale, "the old cycle's token claims nothing");
+            assert!(parked(&w.s, u));
+            assert_eq!(
+                w.s.futex_wake_masked(SQ, 1, P, 0x80),
+                Ok(1),
+                "ANY matches 0x80"
+            );
+        }
+
+        /// 16 — robust exit cleanup is NOT selective (it wakes a masked waiter of the owner's
+        /// word), and an exited masked timed waiter leaves nothing for the collector.
+        #[test]
+        fn ab16_robust_exit_wake_ignores_masks_and_exit_leaves_no_record() {
+            let _clk = mono_clock();
+            let mut w = world(77900);
+            let owner = w.next;
+            w.next += 1;
+            task(&mut w.s, owner, w.a);
+            w.s.set_robust_futex_head(owner, SQ, 1).expect("robust");
+            let m = mpark(&mut w, SQ, 5, FutexWaitTiming::Untimed, 0x40);
+            let doomed = mpark(&mut w, MX, 0, dl(10), 0x4);
+            w.back();
+            w.s.exit_task(owner, 0).expect("owner exits");
+            assert_eq!(
+                w.s.task_status(m),
+                Some(TaskStatus::Runnable),
+                "masked waiter woken"
+            );
+            w.s.exit_task(doomed, 0).expect("timed waiter exits");
+            let k = leak(w.s);
+            assert_eq!(collect(k, u64::MAX), FutexTimeoutPass::default());
+            k.with(|s| assert_eq!(timed_records(s), 0));
+        }
+
+        // ── RT + budget ─────────────────────────────────────────────────────────────────────
+
+        /// 17 — RT profile with budgets: a timed waiter that blocked EXHAUSTED is settled by its
+        /// timeout as Ready but budget-parked (no queue position, its rejoin slot held, one
+        /// `TimedOut` completion); its replenishment rejoins it once, with no second completion
+        /// and nothing left for the collector.
+        #[test]
+        fn ab17_rt_budget_exhausted_settlement_parks_then_rejoins_once() {
+            use crate::kernel::sched_budget::BudgetParams;
+            use crate::kernel::scheduler::SchedProfile;
+            use crate::kernel::task_enqueue as te;
+            struct Gp(&'static SharedKernel);
+            impl Drop for Gp {
+                fn drop(&mut self) {
+                    let _ = self.0.sched_domain().set_budget(false);
+                    self.0
+                        .sched_domain()
+                        .set_profile(SchedProfile::GeneralPurpose);
+                }
+            }
+            let _clk = mono_clock();
+            let w = world(78000);
+            let (a, driver) = (w.a, w.driver);
+            let k = leak(w.s);
+            k.sched_domain().set_profile(SchedProfile::RealTime);
+            assert!(k.sched_domain().set_budget(true));
+            let _gp = Gp(k);
+            let t = 78500;
+            // Configured as deployment provisioning does: priority, then budget, sealed together
+            // before the first placement.
+            k.with(|s| s.register_task_with_class(t, TaskClass::App))
+                .expect("task");
+            k.with_task_enqueue_policy_split_mut(|tcbs, _| {
+                let level = crate::kernel::scheduler::TaskPriority::from_level(4).expect("level");
+                te::configure_priority_locked(tcbs, t, level).expect("priority");
+                te::configure_budget_locked(tcbs, t, BudgetParams::validate(2, 50).unwrap())
+                    .expect("budget")
+            });
+            k.with(|s| {
+                s.bind_task_asid(t, a).expect("bind");
+                s.set_task_status_for_test(t, TaskStatus::Runnable);
+                s.seed_resumable_user_context_for_test(t);
+                s.set_task_home_cpu(t, CpuId(0)).expect("home");
+            });
+            assert_eq!(k.enqueue_on_cpu_split(CpuId(0), t), Ok(CpuId(0)));
+            let ctx = |k: &SharedKernel| {
+                k.with_cpu_sched_split(CpuId(0), |c| c.context_of(ThreadId(t)))
+                    .expect("cpu")
+                    .expect("bound")
+            };
+            let bound = ctx(k).bound_at();
+            k.with(|s| run(s, t));
+            for _ in 0..2 {
+                k.with_cpu_sched_split(CpuId(0), |c| c.tick())
+                    .expect("cpu0");
+            }
+            assert!(ctx(k).exhausted(), "it ran its budget out");
+            assert_eq!(
+                k.with(|s| s.futex_wait_current_timed(SQ, 5, P, dl(10), 0x2)),
+                Ok(B::Blocked { timed: true })
+            );
+            k.with(|s| run(s, driver));
+            let pass = collect(k, 10);
+            assert_eq!(pass.timed_out, 1, "settled: the reserved commit parked it");
+            k.with(|s| {
+                assert_eq!(s.task_status(t), Some(TaskStatus::Runnable), "Ready");
+                assert_eq!(queued_count(s, t), 0, "no position while exhausted");
+                assert_eq!(futex_result(s, t), Some(TIMED_OUT));
+            });
+            assert!(ctx(k).parked(), "budget-parked, holding its rejoin slot");
+            while k.sched_domain().clock_now().0 < bound + 50 {
+                k.with_cpu_sched_split(CpuId(0), |c| c.tick())
+                    .expect("cpu0");
+            }
+            k.with_cpu_sched_split(CpuId(0), |c| c.tick())
+                .expect("cpu0");
+            let c = ctx(k);
+            assert!(!c.parked() && c.releases() >= 1, "replenished and rejoined");
+            k.with(|s| {
+                assert_eq!(queued_count(s, t), 1, "one position, once");
+                assert_eq!(
+                    futex_result(s, t),
+                    Some(TIMED_OUT),
+                    "the one completion, unchanged"
+                );
+            });
+            assert_eq!(
+                collect(k, u64::MAX),
+                FutexTimeoutPass::default(),
+                "nothing owed"
+            );
+        }
+
+        // ── Ordinary behaviour unchanged ────────────────────────────────────────────────────
+
+        /// 18 — unmasked untimed NR 9/10 are the v12 transaction: `1` from a parked wait's
+        /// frame, a wake count, no completion, no record mask but MATCH_ANY, no collector work.
+        #[test]
+        fn ab18_unmasked_untimed_wait_and_wake_are_unchanged() {
+            let _clk = mono_clock();
+            let mut w = world(78100);
+            let t = current(&mut w);
+            let mut f = TrapFrame::new(SYSCALL_FUTEX_WAIT_NR, [SQ, 5, 0, 0xDEAD, 0, 0]);
+            crate::kernel::syscall::dispatch(&mut w.s, &mut f).expect("parks");
+            assert_eq!(
+                (f.ret0, f.error),
+                (1, 0),
+                "slots 3/4 unread without their flags"
+            );
+            assert_eq!(
+                (mask(&mut w.s, t), deadline(&mut w.s, t)),
+                (Some(ANY), None)
+            );
+            w.back();
+            let mut wake = TrapFrame::new(SYSCALL_FUTEX_WAKE_NR, [SQ, 1, 0, 0, 0, 0]);
+            crate::kernel::syscall::dispatch(&mut w.s, &mut wake).expect("wake");
+            assert_eq!(wake.ret0, 1);
+            assert!(placed(&w.s, t));
+            assert_eq!(completion(&w.s, t), None);
+            let k = leak(w.s);
+            assert_eq!(collect(k, u64::MAX), FutexTimeoutPass::default());
         }
     }
 
@@ -218459,8 +219399,10 @@ mod futex_requeue1 {
             // FUTEX-TIME1 re-derivation: `1` is the parked answer of an UNTIMED wait only — its
             // one outcome is a wake. A TIMED wait parks a fail-closed provisional (`Internal`,
             // never `1`), and its terminal claim parks the real result as its completion.
+            // FUTEX-ABS-BITSET1 re-derivation: the route carries a typed `FutexWaitTiming`, so the
+            // timed/untimed choice is `timed` (`timing != Untimed`); the answers are unchanged.
             assert!(parked.trim_end().ends_with(
-                "if deadline.is_some() {\n                frame.set_err(SyscallError::Internal.code());\n            } else {\n                frame.set_ok(1, 0, 0);\n            }"
+                "if timed {\n                frame.set_err(SyscallError::Internal.code());\n            } else {\n                frame.set_ok(1, 0, 0);\n            }"
             ));
             let y = SPLIT
                 .split("pub(crate) fn split_yield_settle<")
@@ -222151,8 +223093,10 @@ mod sched_time_foundation1_b_clock {
     #[test]
     fn s07_the_existing_tick_clocks_are_untouched() {
         let _g = lock();
-        // Installing and advancing the new clock changes no scheduler tick and no tick-domain
-        // conversion: a FutexWait timeout still converts on the scheduler tick (FUTEX-TIME1).
+        // Installing and advancing the new clock changes no scheduler tick (IPC and reply
+        // deadlines and quanta stay on it). FUTEX-ABS-BITSET1 re-derivation: a FutexWait
+        // deadline is no longer a tick conversion at all — it is an absolute monotonic instant,
+        // judged by the monotonic reading alone and never by the tick.
         let (s, _asid) = world(TaskClass::App);
         let before = s.scheduler_tick_now();
         tk::force_source_for_test(1_000_000_000, 0, SourceKind::Hosted);
@@ -222162,17 +223106,17 @@ mod sched_time_foundation1_b_clock {
             before,
             "the scheduler tick is not the clock"
         );
-        assert_eq!(
-            crate::kernel::syscall::sched::futex_timeout_ticks(0, 10_000_000),
-            0
+        use crate::kernel::boot::futex::{FutexDeadline, FutexNow};
+        let d = FutexDeadline::MonotonicNs(1_000);
+        let tick_only = FutexNow {
+            mono_ns: None,
+            tick: u64::MAX,
+        };
+        assert!(
+            !d.reached(tick_only),
+            "the tick never decides a futex deadline"
         );
-        assert_eq!(
-            crate::kernel::syscall::sched::futex_timeout_ticks(1, 10_000_000),
-            2
-        );
-        assert_eq!(
-            crate::kernel::syscall::sched::futex_timeout_ticks(10_000_000, 10_000_000),
-            2
-        );
+        assert!(!d.reached(FutexNow::at_ns(999)));
+        assert!(d.reached(FutexNow::at_ns(1_000)));
     }
 }

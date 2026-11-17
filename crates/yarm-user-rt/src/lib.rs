@@ -1704,39 +1704,56 @@ pub mod syscall {
         Ok(ret.ret0 != 0)
     }
 
-    /// FUTEX-TIME1 — NR 9 flag (bit 1): the wait is timed, and argument slot 3 is its relative
-    /// timeout in nanoseconds.
+    /// FUTEX-ABS-BITSET1 (ABI v13) — NR 9 flag (bit 1): the wait is timed, and argument slot 3 is
+    /// its ABSOLUTE deadline on `CLOCK_MONOTONIC`, in nanoseconds (the domain [`clock_gettime`]
+    /// reports). Must match `kernel::boot::futex::FUTEX_FLAG_TIMED`.
     pub const FUTEX_FLAG_TIMED: usize = 1 << 1;
+    /// FUTEX-ABS-BITSET1 (ABI v13) — NR 9 and NR 10 flag (bit 2): argument slot 4 is the wait's or
+    /// the wake's `u32` mask, which must be nonzero. Must match `FUTEX_FLAG_BITSET`.
+    pub const FUTEX_FLAG_BITSET: usize = 1 << 2;
+    /// FUTEX-ABS-BITSET1 — the mask an unmasked wait or wake carries: it matches every mask.
+    pub const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
-    /// FUTEX-TIME1 — what a timed wait returned.
+    /// FUTEX-TIME1 — what a timed (or masked) wait returned.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum FutexTimedWait {
-        /// The word did not hold `expected`: nothing parked (even if the timeout was zero).
+        /// The word did not hold `expected`: nothing parked (even if the deadline had passed).
         ValueChanged,
-        /// A wake (`futex_wake`, the wake portion of `futex_cmp_requeue`) took this wait.
+        /// A wake (`futex_wake`, `futex_wake_bitset` with a matching mask, the wake portion of
+        /// `futex_cmp_requeue`) took this wait.
         Woken,
-        /// The timeout took this wait: at least `timeout` elapsed and no wake won.
+        /// The deadline took this wait: `CLOCK_MONOTONIC` had reached it and no wake won.
         TimedOut,
     }
 
-    /// FUTEX-TIME1 — [`futex_wait`] with a relative `timeout` (NR 9 with `FUTEX_FLAG_TIMED`; the
-    /// same kernel transaction).
+    /// FUTEX-ABS-BITSET1 — THE wait primitive (NR 9 with its full v13 meaning): wait while the
+    /// word at `addr` holds `expected`, until a wake whose mask shares a bit with `mask` takes it,
+    /// or until `CLOCK_MONOTONIC` reaches `deadline_ns` (`None`: no deadline).
     ///
+    /// The deadline is an INSTANT, not a duration: the kernel compares it with the clock directly,
+    /// never converts it, and a requeue keeps it. So a caller that retries (after a spurious wake,
+    /// or to re-check its condition) passes the SAME instant again and the total wait never grows.
     /// The kernel reads the word and compares it first, so a word that already differs is
-    /// `ValueChanged` whatever the timeout; a matching word with a zero timeout is `TimedOut`
-    /// without parking. Otherwise exactly one of a wake and the timeout ends the wait, and this
-    /// returns which: `Woken` is never reported for a wait the timeout ended. The timeout is a
-    /// LOWER bound: the kernel rounds it up to its scheduler tick (0.8 s on x86_64, 50 ms on
-    /// AArch64, 10 ms on RISC-V) plus one, and adds scheduling latency. A requeue keeps the
-    /// deadline. Durations beyond `u64::MAX` nanoseconds are clamped to it.
+    /// `ValueChanged` whatever the deadline; a matching word whose deadline has been reached is
+    /// `TimedOut` without parking. Exactly one of a wake and the deadline ends a parked wait, and
+    /// `Woken` is never reported for a wait the deadline ended. `mask` must be nonzero
+    /// (`InvalidArgs` otherwise); [`FUTEX_BITSET_MATCH_ANY`] is an ordinary wait. Errors include
+    /// `Unavailable` (a timed wait and no monotonic clock: nothing parked).
     #[inline]
-    pub fn futex_wait_timeout(
+    pub fn futex_wait_until(
         addr: *const u32,
         expected: u32,
         scope: FutexScope,
-        timeout: core::time::Duration,
+        deadline_ns: Option<u64>,
+        mask: u32,
     ) -> core::result::Result<FutexTimedWait, SyscallError> {
-        let ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        let mut flags = scope.flags();
+        if deadline_ns.is_some() {
+            flags |= FUTEX_FLAG_TIMED;
+        }
+        if mask != FUTEX_BITSET_MATCH_ANY {
+            flags |= FUTEX_FLAG_BITSET;
+        }
         // SAFETY: Uses architecture syscall ABI to enter kernel. The kernel validates that `addr`
         // names a readable current-user futex word before blocking.
         let ret = unsafe {
@@ -1745,9 +1762,9 @@ pub mod syscall {
                 [
                     addr as usize,
                     expected as usize,
-                    scope.flags() | FUTEX_FLAG_TIMED,
-                    ns as usize,
-                    0,
+                    flags,
+                    deadline_ns.unwrap_or(0) as usize,
+                    mask as usize,
                     0,
                 ],
             )
@@ -1762,6 +1779,84 @@ pub mod syscall {
             None if ret.ret0 != 0 => Ok(FutexTimedWait::Woken),
             None => Ok(FutexTimedWait::ValueChanged),
         }
+    }
+
+    /// FUTEX-ABS-BITSET1 — the `CLOCK_MONOTONIC` instant `timeout` from now, read ONCE: the
+    /// deadline a relative wait (and every retry of it) passes to [`futex_wait_until`]. Saturates
+    /// at `u64::MAX` (an instant no clock reaches).
+    #[inline]
+    pub fn monotonic_deadline_after(
+        timeout: core::time::Duration,
+    ) -> core::result::Result<u64, SyscallError> {
+        let now = clock_gettime(CLOCK_MONOTONIC)?
+            .as_ns()
+            .ok_or(SyscallError::Unavailable)?;
+        let ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        Ok(now.saturating_add(ns))
+    }
+
+    /// FUTEX-TIME1 / FUTEX-ABS-BITSET1 — a convenience: [`futex_wait`] for at most `timeout`. It
+    /// reads `CLOCK_MONOTONIC` once ([`monotonic_deadline_after`]) and makes ONE absolute-deadline
+    /// wait ([`futex_wait_until`]); it never retries. A caller that loops must compute the
+    /// deadline once and call [`futex_wait_until`] with it, or its wait would be extended on every
+    /// retry. The deadline is a LOWER bound on the wait: it ends at the first timeout-collector
+    /// pass after it (each CPU's next timer tick at the latest when nothing else runs), plus
+    /// scheduling latency.
+    #[inline]
+    pub fn futex_wait_timeout(
+        addr: *const u32,
+        expected: u32,
+        scope: FutexScope,
+        timeout: core::time::Duration,
+    ) -> core::result::Result<FutexTimedWait, SyscallError> {
+        let deadline = monotonic_deadline_after(timeout)?;
+        futex_wait_until(
+            addr,
+            expected,
+            scope,
+            Some(deadline),
+            FUTEX_BITSET_MATCH_ANY,
+        )
+    }
+
+    /// FUTEX-ABS-BITSET1 — NR 10 with a mask: wake up to `count` waiters of the word at `addr`
+    /// whose mask shares a bit with `mask`, oldest first among them. A non-matching waiter stays
+    /// parked in place and does not count. Returns the number woken; as for [`futex_wake`], a
+    /// result below `count` (even `0`) may mean the oldest matching waiter's run queue is full,
+    /// not that no matching waiter is left. `mask` must be nonzero (`InvalidArgs`).
+    #[inline]
+    pub fn futex_wake_bitset(
+        addr: *const u32,
+        count: u32,
+        scope: FutexScope,
+        mask: u32,
+    ) -> core::result::Result<u32, SyscallError> {
+        if mask == 0 {
+            return Err(SyscallError::InvalidArgs);
+        }
+        // SAFETY: Uses architecture syscall ABI. The kernel validates that `addr` names a
+        // readable current-user futex word before claiming waiters.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_FUTEX_WAKE_NR,
+                [
+                    addr as usize,
+                    count as usize,
+                    scope.flags() | FUTEX_FLAG_BITSET,
+                    0,
+                    mask as usize,
+                    0,
+                ],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        // AArch64/RISC-V: as for `futex_wake`, the count is in ret0 and NR 10 has no separate
+        // error lane there; the one refusal a caller can cause by its arguments alone (a zero
+        // mask) is answered above, before the trap.
+        Ok(ret.ret0 as u32)
     }
 
     /// Wake up to `count` waiters of the futex word at `addr` in `scope`, oldest first (NR 10).
@@ -2130,10 +2225,14 @@ pub mod futex_sync {
             mutex.lock_contended();
         }
 
-        /// FUTEX-TIME1 — [`Self::wait`] for at most `timeout`. Returns `true` iff the TIMEOUT
-        /// ended the wait. Either way the caller holds `mutex` again on return: a waiter a
-        /// broadcast requeued onto the mutex word keeps its deadline there, and still takes the
-        /// mutex before returning. Spurious returns are possible: re-check the predicate.
+        /// FUTEX-TIME1 / FUTEX-ABS-BITSET1 — [`Self::wait`] for at most `timeout`: ONE wait on
+        /// the absolute `CLOCK_MONOTONIC` instant `timeout` from now (read once). Returns `true`
+        /// iff the DEADLINE ended the wait (an error, such as no monotonic clock, is `false`, as
+        /// before; the wait is then never made untimed). Either way the caller holds `mutex` again on
+        /// return: a waiter a broadcast requeued onto the mutex word keeps its deadline there,
+        /// and still takes the mutex before returning. Spurious returns are possible: re-check
+        /// the predicate. This is not a timed condition variable (no re-wait loop, no mutex
+        /// timeout): those are a later contract.
         pub fn wait_timeout(&self, mutex: &FutexMutex, timeout: core::time::Duration) -> bool {
             let seen = self.seq.load(Ordering::Relaxed);
             mutex.unlock();

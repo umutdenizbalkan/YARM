@@ -6021,6 +6021,11 @@ so the ABI version stays 11 and untimed waits are unchanged. `yarm-user-rt` gain
 `futex_wait_timeout(addr, expected, scope, timeout: Duration) -> Result<FutexTimedWait,
 SyscallError>` (`ValueChanged` / `Woken` / `TimedOut`; durations beyond `u64::MAX` ns clamp).
 
+*Superseded in ABI v13 (FUTEX-ABS-BITSET1, `SCHEDULING_CONTRACT.md` §25):* slot 3 is now an
+ABSOLUTE `CLOCK_MONOTONIC` deadline, compared without any tick conversion; the relative form and
+its tick arithmetic above are gone. The arbitration, capacity, collector and lifetime rules of this
+stage carry over unchanged.
+
 **The arbitration.** The deadline is attached to the waiter's record in the SAME compare-and-register
 hold (task 2 → VM 5 → memory 6) as the untimed registration, after the comparison and after one
 atomic clock read; a reached deadline is `TimedOut` with nothing published. From then on every

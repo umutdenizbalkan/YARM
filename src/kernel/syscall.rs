@@ -10,7 +10,10 @@ use super::vm::{PAGE_SIZE, VirtAddr};
 use crate::arch::syscall_abi;
 use crate::kernel::boot::TrapHandleError;
 
-pub const SYSCALL_ABI_VERSION: u16 = 12;
+/// FUTEX-ABS-BITSET1 — v13: NR 9 `FUTEX_FLAG_TIMED` names an ABSOLUTE `CLOCK_MONOTONIC` deadline
+/// (it named a relative tick timeout in v12), and NR 9 / NR 10 gain `FUTEX_FLAG_BITSET` and the
+/// mask in slot 4 (`doc/SYSCALL_ABI.md`).
+pub const SYSCALL_ABI_VERSION: u16 = 13;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
@@ -2779,7 +2782,18 @@ mod tests {
     fn syscall_abi_numbers_are_frozen() {
         // FUTEX-REQUEUE1: v11 — NR 17 assigned from the reserved gap (doc/SYSCALL_ABI.md).
         // SCHED-TIME-FOUNDATION1: v12 — NR 18, NR 19 and NR 20 assigned next.
-        assert_eq!(SYSCALL_ABI_VERSION, 12);
+        // FUTEX-ABS-BITSET1: v13 — NR 9 absolute monotonic deadlines; NR 9 / NR 10 wake masks.
+        assert_eq!(SYSCALL_ABI_VERSION, 13);
+        {
+            use crate::kernel::boot::futex as fx;
+            assert_eq!(fx::FUTEX_FLAG_SHARED, 1);
+            assert_eq!(fx::FUTEX_FLAG_TIMED, 1 << 1);
+            assert_eq!(fx::FUTEX_FLAG_BITSET, 1 << 2);
+            assert_eq!(fx::FUTEX_WAIT_FLAGS_DEFINED, 0b111);
+            assert_eq!(fx::FUTEX_WAKE_FLAGS_DEFINED, 0b101);
+            assert_eq!((fx::FUTEX_ARG_DEADLINE, fx::FUTEX_ARG_MASK), (3, 4));
+            assert_eq!(fx::FUTEX_BITSET_MATCH_ANY, u32::MAX);
+        }
         assert_eq!(SYSCALL_FUTEX_CMP_REQUEUE_NR, 17);
         assert_eq!(SYSCALL_CLOCK_GETTIME_NR, 18);
         assert_eq!(SYSCALL_CLOCK_SET_REALTIME_NR, 19);

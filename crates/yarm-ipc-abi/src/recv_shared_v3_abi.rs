@@ -72,8 +72,9 @@ pub const RECV_V3_FIELD_UNAVAILABLE: u64 = 0;
 pub const RECV_V3_CLEANUP_TOKEN_NONE: u64 = 0;
 
 /// Syscall ABI version written into `RecvSharedV3Output::abi_version`.
-/// (v11 since FUTEX-REQUEUE1, which assigned NR 17.)
-pub const RECV_V3_ABI_VERSION: u32 = 12;
+/// (v11 since FUTEX-REQUEUE1, which assigned NR 17; v12 since SCHED-TIME-FOUNDATION1; v13 since
+/// FUTEX-ABS-BITSET1, which made NR 9's timeout an absolute monotonic deadline and added masks.)
+pub const RECV_V3_ABI_VERSION: u32 = 13;
 
 /// Output status: operation succeeded.
 pub const RECV_V3_STATUS_OK: u32 = 0;
