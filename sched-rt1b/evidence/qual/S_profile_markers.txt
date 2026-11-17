@@ -1,0 +1,36 @@
+== GP x86_64
+0
+0
+== RT x86_64
+1
+0
+    485 RT_RESCHED_DECLINED cpu=0 cause=1
+== RT+budget x86_64
+YARM_SCHED_PROFILE profile=rt route=construction
+YARM_SCHED_BUDGET req=on profile=rt result=enforced route=construction clock=global_scheduler_tick owner=cpu0 grain=1tick enforce=tick period_ns=800000000 pool=32 default=64/64
+    485 RT_RESCHED_DECLINED cpu=0 cause=1
+== GP aarch64
+0
+0
+== RT aarch64
+1
+0
+    101 RT_RESCHED_DECLINED cpu=0 cause=1
+== RT+budget aarch64
+YARM_SCHED_PROFILE profile=rt route=construction
+YARM_SCHED_BUDGET req=on profile=rt result=enforced route=construction clock=global_scheduler_tick owner=cpu0 grain=1tick enforce=tick period_ns=50000000 pool=32 default=64/64
+    102 RT_RESCHED_DECLINED cpu=0 cause=1
+== GP riscv64
+0
+0
+== RT riscv64
+1
+0
+   3611 RT_RESCHED_DECLINED cpu=0 cause=1
+== RT+budget riscv64
+YARM_SCHED_PROFILE profile=rt route=construction
+YARM_SCHED_BUDGET req=on profile=rt result=enforced route=construction clock=global_scheduler_tick owner=cpu0 grain=1tick enforce=tick period_ns=10000000 pool=32 default=64/64
+   3874 RT_RESCHED_DECLINED cpu=0 cause=1
+== GP + yarm.sched_budget=on riscv64 (must be refused)
+YARM_SCHED_BUDGET req=on profile=gp result=refused_gp route=construction clock=global_scheduler_tick owner=cpu0 grain=1tick enforce=tick period_ns=10000000 pool=32 default=64/64
+0

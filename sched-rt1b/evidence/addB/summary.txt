@@ -1,0 +1,18 @@
+rt1b addB start 2026-11-17T14:14:13Z C2=1e6cfd40 sha=33d3f3c6082bfb5a
+=== B1_grader_self_test [1e6cfd402a73 porcelain=0]: python3 -I scripts/grade-rt-sched-witness.py --self-test (start 14:14:13)
+B1_grader_self_test rc=0 secs=0
+=== B2_regrade_W1_x86_64 [1e6cfd402a73 porcelain=0]: python3 -I scripts/grade-rt-sched-witness.py --arch x86_64 --smp 2 --budget on /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1b-evidence/qual/W1/boot.norm.log (start 14:14:13)
+B2_regrade_W1_x86_64 rc=0 secs=0
+=== B2_regrade_W2_aarch64 [1e6cfd402a73 porcelain=0]: python3 -I scripts/grade-rt-sched-witness.py --arch aarch64 --smp 2 --budget on /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1b-evidence/qual/W2/boot.norm.log (start 14:14:13)
+B2_regrade_W2_aarch64 rc=0 secs=0
+=== B2_regrade_W4_riscv64_budget_off [1e6cfd402a73 porcelain=0]: python3 -I scripts/grade-rt-sched-witness.py --arch riscv64 --smp 2 --budget off /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1b-evidence/qual/W4/boot.norm.log (start 14:14:13)
+B2_regrade_W4_riscv64_budget_off rc=0 secs=0
+=== B2_regrade_W3_failed_riscv64 [1e6cfd402a73 porcelain=0]: python3 -I scripts/grade-rt-sched-witness.py --arch riscv64 --smp 2 --budget on /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1b-evidence/qual/W3/boot.norm.log (start 14:14:13)
+B2_regrade_W3_failed_riscv64 rc=0 secs=1
+=== B3_W3_riscv64_smp2 [1e6cfd402a73 porcelain=0]: env -u CARGO_TARGET_DIR SCHED_BUDGET=on LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1b-evidence/addB/W3 scripts/qemu-rt-sched-witness-smoke.sh riscv64 2 (start 14:14:14)
+B3_W3_riscv64_smp2 rc=0 secs=291
+=== B4_NC2b_exhausted_runs_live_riscv64 [1e6cfd402a73 porcelain=0]: bash -c python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1b-nc/runs.py && git diff --stat && env -u CARGO_TARGET_DIR SCHED_BUDGET=on LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1b-evidence/addB/NC2b scripts/qemu-rt-sched-witness-smoke.sh riscv64 2; rc=$?; git checkout -- src/kernel/scheduler.rs; exit $rc (start 14:19:05)
+B4_NC2b_exhausted_runs_live_riscv64 rc=1 secs=291
+post-NC porcelain=0
+rt1b addB end 2026-11-17T14:23:56Z
+RT1B_ADDB_DONE

@@ -1,0 +1,35 @@
+ src/kernel/scheduler.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+RTW_GRADER_SELF_TEST result=pass mutants=15 budget_mutants=11
+[rt-sched-witness] building base riscv64 artifacts
+[rt-sched-witness] rebuilding the kernel with riscv64-rt-sched-witness
+[rt-sched-witness] booting QEMU -smp 2 with yarm.sched_profile=rt yarm.sched_budget=on
+[rtw-grade] records=2048 damaged_lines=0
+[rtw-grade] budget configuration req=on profile=rt result=enforced route=construction clock=global_scheduler_tick
+[rtw-grade] A local-wake preemptions graded: 3/3; UA yields at H0's runs [1, 1, 1]
+[rtw-grade] C head-position preemption cause=1
+[rtw-grade] E UH bound at tick 475 with 2/8
+[rtw-grade] E cycles=0 exhaust-preemption causes=[] release lateness=[] UB heartbeats while parked=[] overruns=[1]
+[rtw-grade] remote-wake preemption causes [('B', 1), ('C', 1), ('E', 1)]
+[rtw-grade][fail] SEAL: overflow=87
+[rtw-grade][fail] SEAL: overflow=87
+[rtw-grade][fail] PHASES: sequence ['SETUP', 'WARMUP', 'A_ARM', 'A_WAIT', 'A_ARM', 'A_WAIT', 'A_ARM', 'A_WAIT', 'B_ARM', 'B_WAIT', 'C_ARM', 'C_WAIT', 'C_H1', 'C_AFTER', 'C_YIELD', 'D_ARM', 'D_L', 'D_WAIT', 'E_ARM', 'E_PLACE', 'E_RUN']
+[rtw-grade][fail] E: only 0 rejoins after exhaustion (need 3)
+[rtw-grade][fail] F: K's wake/start [] []
+[rtw-grade][fail] LEDGER: ledgers []
+[rtw-grade][fail] LEDGER: UH's context missing at the dump
+[rtw-grade][fail] LEDGER: K's context missing at the dump
+RTW_RULE arch=riscv64 smp=2 rule=CFG result=pass
+RTW_RULE arch=riscv64 smp=2 rule=ID result=pass
+RTW_RULE arch=riscv64 smp=2 rule=SEAL result=fail
+RTW_RULE arch=riscv64 smp=2 rule=PHASES result=fail
+RTW_RULE arch=riscv64 smp=2 rule=A result=pass
+RTW_RULE arch=riscv64 smp=2 rule=B result=pass
+RTW_RULE arch=riscv64 smp=2 rule=C result=pass
+RTW_RULE arch=riscv64 smp=2 rule=D result=pass
+RTW_RULE arch=riscv64 smp=2 rule=IPI result=pass
+RTW_RULE arch=riscv64 smp=2 rule=E result=fail
+RTW_RULE arch=riscv64 smp=2 rule=F result=fail
+RTW_RULE arch=riscv64 smp=2 rule=LEDGER result=fail
+RTW_GRADE arch=riscv64 smp=2 budget=on result=fail fails=8
+RTW_WITNESS_SEAL arch=riscv64 smp=2 budget=on result=fail reason=grade

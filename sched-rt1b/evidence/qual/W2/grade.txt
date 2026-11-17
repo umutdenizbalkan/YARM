@@ -1,0 +1,25 @@
+[rtw-grade] records=157 damaged_lines=0
+[rtw-grade] budget configuration req=on profile=rt result=enforced route=construction clock=global_scheduler_tick
+[rtw-grade] A local-wake preemptions graded: 3/3; UA yields at H0's runs [73, 107, 142]
+[rtw-grade] C head-position preemption cause=1
+[rtw-grade] E UH bound at tick 42 with 2/8
+[rtw-grade] E cycles=3 exhaust-preemption causes=[2, 2, 2] release lateness=[0, 0, 0] UB heartbeats while parked=[1097, 1292, 1737] overruns=[0]
+[rtw-grade] F cycles=3 release lateness=[0, 0, 0] overruns=[0]
+[rtw-grade] LEDGER cpu=0 idle=1 unaccounted=0 essential_ticks=98 essential_arrivals=158 contexts=17
+[rtw-grade] LEDGER cpu=1 idle=27 unaccounted=0 essential_ticks=72 essential_arrivals=4 contexts=4
+[rtw-grade] CTX UH charged=14 overrun=0 exhaustions=7 releases=7 debt=0 remaining=2
+[rtw-grade] CTX K charged=6 overrun=0 exhaustions=3 releases=7 debt=0 remaining=2
+[rtw-grade] remote-wake preemption causes [('B', 1), ('C', 1), ('E', 1)]
+RTW_RULE arch=aarch64 smp=2 rule=CFG result=pass
+RTW_RULE arch=aarch64 smp=2 rule=ID result=pass
+RTW_RULE arch=aarch64 smp=2 rule=SEAL result=pass
+RTW_RULE arch=aarch64 smp=2 rule=PHASES result=pass
+RTW_RULE arch=aarch64 smp=2 rule=A result=pass
+RTW_RULE arch=aarch64 smp=2 rule=B result=pass
+RTW_RULE arch=aarch64 smp=2 rule=C result=pass
+RTW_RULE arch=aarch64 smp=2 rule=D result=pass
+RTW_RULE arch=aarch64 smp=2 rule=IPI result=pass
+RTW_RULE arch=aarch64 smp=2 rule=E result=pass
+RTW_RULE arch=aarch64 smp=2 rule=F result=pass
+RTW_RULE arch=aarch64 smp=2 rule=LEDGER result=pass
+RTW_GRADE arch=aarch64 smp=2 budget=on result=pass fails=0

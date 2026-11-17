@@ -1,0 +1,11 @@
+fmt rc=0
+lib rc=0
+tests rc=101
+g1 rc=0
+g2 rc=0
+xd_x86_64 rc=0
+xw_x86_64 rc=0
+xd_aarch64 rc=0
+xw_aarch64 rc=0
+xd_riscv64 rc=0
+xw_riscv64 rc=0

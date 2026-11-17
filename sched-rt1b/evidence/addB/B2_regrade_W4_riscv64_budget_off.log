@@ -1,0 +1,15 @@
+[rtw-grade] records=78 damaged_lines=0
+[rtw-grade] budget configuration req=off profile=rt result=off route=construction clock=global_scheduler_tick
+[rtw-grade] A local-wake preemptions graded: 3/3; UA yields at H0's runs [2, 2, 3]
+[rtw-grade] C head-position preemption cause=1
+[rtw-grade] remote-wake preemption causes [('B', 1), ('C', 1)]
+RTW_RULE arch=riscv64 smp=2 rule=CFG result=pass
+RTW_RULE arch=riscv64 smp=2 rule=ID result=pass
+RTW_RULE arch=riscv64 smp=2 rule=SEAL result=pass
+RTW_RULE arch=riscv64 smp=2 rule=PHASES result=pass
+RTW_RULE arch=riscv64 smp=2 rule=A result=pass
+RTW_RULE arch=riscv64 smp=2 rule=B result=pass
+RTW_RULE arch=riscv64 smp=2 rule=C result=pass
+RTW_RULE arch=riscv64 smp=2 rule=D result=pass
+RTW_RULE arch=riscv64 smp=2 rule=IPI result=pass
+RTW_GRADE arch=riscv64 smp=2 budget=off result=pass fails=0

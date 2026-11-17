@@ -1,0 +1,3 @@
+20fa054db77af96f744b3866c384b03cd1aa2d96a3421374c13c6f6d6f2b4826  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rt1b-evidence/qual/W2/boot.log
+08dc81744b1e6389c8e57bc6ab78a168b15a13d7e410d216623ce44f979f4f42  build-aarch64/yarm-aarch64.bin
+828b7bca4e33b1e38dd470b74791c93b8de3f807b13eb6440c862b0a95e0dda0  build-aarch64/initramfs-core.cpio

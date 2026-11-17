@@ -1,0 +1,6 @@
+ src/kernel/scheduler.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+RTW_GRADER_SELF_TEST result=pass mutants=15 budget_mutants=10
+[rt-sched-witness] rebuilding the kernel with riscv64-rt-sched-witness
+[rt-sched-witness] booting QEMU -smp 2 with yarm.sched_profile=rt yarm.sched_budget=on
+RTW_WITNESS_SEAL arch=riscv64 smp=2 budget=on result=fail reason=no_boot_log core_rc=1

@@ -1,0 +1,11 @@
+rt1b addC start 2026-11-17T14:26:23Z D=e1aee62d sha=8ccc841d11daae7f
+=== C1_contract_gate [e1aee62d2a28 porcelain=0]: bash scripts/check-current-contracts.sh (start 14:26:23)
+C1_contract_gate rc=0 secs=1
+=== C2_doc_enforcement [e1aee62d2a28 porcelain=0]: bash scripts/check-contract-doc-enforcement.sh (start 14:26:24)
+C2_doc_enforcement rc=0 secs=1
+=== C3_hosted_lib [e1aee62d2a28 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 14:26:25)
+C3_hosted_lib rc=0 secs=154
+=== C4_diff_from_C2 [e1aee62d2a28 porcelain=0]: git diff --stat 1e6cfd40 e1aee62d (start 14:28:59)
+C4_diff_from_C2 rc=0 secs=0
+rt1b addC end 2026-11-17T14:28:59Z
+RT1B_ADDC_DONE

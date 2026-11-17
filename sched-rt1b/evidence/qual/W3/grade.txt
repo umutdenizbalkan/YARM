@@ -1,0 +1,27 @@
+[rtw-grade] records=156 damaged_lines=0
+[rtw-grade] budget configuration req=on profile=rt result=enforced route=construction clock=global_scheduler_tick
+[rtw-grade] A local-wake preemptions graded: 3/3; UA yields at H0's runs [2, 2, 2]
+[rtw-grade] C head-position preemption cause=1
+[rtw-grade] E UH bound at tick 501 with 2/8
+[rtw-grade] E cycles=3 exhaust-preemption causes=[2, 2, 2] release lateness=[0, 0, 0] UB heartbeats while parked=[242, 0, 170] overruns=[0]
+[rtw-grade] F cycles=3 release lateness=[0, 0, 0] overruns=[0]
+[rtw-grade] LEDGER cpu=0 idle=1 unaccounted=0 essential_ticks=582 essential_arrivals=211 contexts=17
+[rtw-grade] LEDGER cpu=1 idle=468 unaccounted=0 essential_ticks=343 essential_arrivals=4 contexts=4
+[rtw-grade] CTX UH charged=21 overrun=2 exhaustions=10 releases=10 debt=0 remaining=1
+[rtw-grade] CTX K charged=10 overrun=0 exhaustions=4 releases=13 debt=0 remaining=1
+[rtw-grade] remote-wake preemption causes [('B', 1), ('C', 1), ('E', 1)]
+[rtw-grade][fail] E: cycle 1: UH did not run after its rejoin: (85, 'BUDGET_EXHAUST', 1, (9702, 511, 0, 0, 77309412047))
+[rtw-grade][fail] E: cycle 2: lower-priority UB did not run while UH was parked (719 -> 719)
+RTW_RULE arch=riscv64 smp=2 rule=CFG result=pass
+RTW_RULE arch=riscv64 smp=2 rule=ID result=pass
+RTW_RULE arch=riscv64 smp=2 rule=SEAL result=pass
+RTW_RULE arch=riscv64 smp=2 rule=PHASES result=pass
+RTW_RULE arch=riscv64 smp=2 rule=A result=pass
+RTW_RULE arch=riscv64 smp=2 rule=B result=pass
+RTW_RULE arch=riscv64 smp=2 rule=C result=pass
+RTW_RULE arch=riscv64 smp=2 rule=D result=pass
+RTW_RULE arch=riscv64 smp=2 rule=IPI result=pass
+RTW_RULE arch=riscv64 smp=2 rule=E result=fail
+RTW_RULE arch=riscv64 smp=2 rule=F result=pass
+RTW_RULE arch=riscv64 smp=2 rule=LEDGER result=pass
+RTW_GRADE arch=riscv64 smp=2 budget=on result=fail fails=2
