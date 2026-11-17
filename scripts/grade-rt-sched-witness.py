@@ -52,11 +52,14 @@ RT-SCHED1B (`--budget on`: the boot also carries `yarm.sched_budget=on`):
          a running UB and its remote wake preempts UB (cause 1); its context is bound with 2/8.
          Then at least 3 cycles, each: UH is charged to exhaustion (remaining 0); the next CPU 1
          preemption takes the CPU from UH and UH is parked (one reservation, level 8) with no
-         queue position; while it is parked UH's heartbeat does not move and UB's (level 20, the
-         LOWER priority) does; UH rejoins only at a release instant bound + k*8 that is later
-         than its park, at most LATE_MAX ticks late, with budget; the next CPU 1 preemption after
-         the rejoin is UB's (UH takes the CPU back) and UH's heartbeat moves before its next
-         exhaustion.
+         queue position; while it is parked UH's heartbeat does not move; UH rejoins only at a
+         release instant bound + k*8 that is later than its park, at most LATE_MAX ticks late,
+         with budget; the next CPU 1 preemption after the rejoin takes the CPU from UB (level 20,
+         the LOWER priority: it was CPU 1's current while UH was parked) and UH is charged again
+         after it. Over the cycles together, UB's heartbeat rises while UH is parked and UH's
+         rises across the phase. (Per-cycle heartbeat progress is not required: under RISC-V TCG a
+         vCPU can execute nothing for several guest ticks, and CPU 1's synchronous tick logging
+         can consume the slivers between interrupts, §19.5 and W7.)
   F      (budget exhaustion, a cooperative kernel thread) K (CPU 0, level 6, 2/10) starts with its
          context bound 2/10; at least 3 cycles, each: K is charged to exhaustion; its next
          scheduling point reports rt=true (the safe point honours the exhaustion) and K is parked
@@ -407,18 +410,20 @@ def grade_budget(g, ev, tid, after, between, preempt):
                         "cycle %d: the CPU was not taken from exhausted UH: %s" % (i + 1, tp))
                 if tp is not None:
                     causes.append(tp[3][1])
-                g.check("E", hb_lower(r) > hb_lower(pk),
-                        "cycle %d: lower-priority UB did not run while UH was parked (%d -> %d)"
-                        % (i + 1, hb_lower(pk), hb_lower(r)))
                 lows.append(hb_lower(r) - hb_lower(pk))
                 lates.append(r[3][1] - r[3][2])
                 back = after(r[0], preempt(1))
                 g.check("E", back is not None and back[3][0] == ub,
                         "cycle %d: UH did not take CPU 1 back from UB after its rejoin: %s" % (i + 1, back))
                 nx = after(r[0], lambda e: e[1] == "BUDGET_EXHAUST" and e[3][0] == uh)
-                g.check("E", nx is not None and hb_own(nx) > hb_own(r),
-                        "cycle %d: UH did not run after its rejoin: %s" % (i + 1, nx))
+                g.check("E", nx is not None and back is not None and nx[0] > back[0],
+                        "cycle %d: UH was not charged after taking CPU 1 back: %s" % (i + 1, nx))
             ex = [e for e in ev if e[1] == "BUDGET_EXHAUST" and e[3][0] == uh]
+            if cyc:
+                g.check("E", sum(lows) > 0,
+                        "lower-priority UB never progressed while UH was parked: %s" % lows)
+                g.check("E", len(ex) >= 2 and hb_own(ex[-1]) > hb_own(ex[0]),
+                        "UH never progressed across the phase: %s" % [hb_own(e) for e in ex])
             g.notes.append("E cycles=%d exhaust-preemption causes=%s release lateness=%s UB heartbeats while parked=%s overruns=%s"
                            % (len(cyc), causes, lates, lows, sorted(set(e[3][2] >> 32 for e in ex))))
 
@@ -590,14 +595,14 @@ def synth_budget(add, ph, tid, mut):
     ph("E_RUN")
     own, low, t = 0, 900, bound
     for c in range(E_CYCLES + 1):
-        own += 50
+        own += 0 if mut == "e_uh_never_ran" else (0 if c == 1 else 50)
         t += 2
         add("BUDGET_EXHAUST", 1, uh, t, 0, 0, hb(own, low))
         if c == E_CYCLES:
             break
         add("BUDGET_PARK", 0, uh, t, 1 << 8 | 8, 0, hb(own, low))
         add("PREEMPT", 1, uh, 2, PHASE["E_RUN"])
-        low += 0 if (mut == "e_lower_starved" and c == 1) else 40
+        low += 0 if mut == "e_lower_starved" else (0 if c == 1 else 40)
         rel = t - 2 + UH_BUDGET[1] + (1 if (mut == "e_off_grid" and c == 0) else 0)
         run_parked = 5 if (mut == "e_ran_parked" and c == 2) else 0
         add("BUDGET_REPLENISH", 1, uh, rel + 1, rel, 1 << 32 | 1 << 16 | 2, hb(own + run_parked, low))
@@ -636,7 +641,7 @@ MUTANTS = {
 
 
 BUDGET_MUTANTS = {
-    "e_lower_starved": "E", "e_off_grid": "E", "e_ran_parked": "E", "e_no_return": "E",
+    "e_lower_starved": "E", "e_uh_never_ran": "E", "e_off_grid": "E", "e_ran_parked": "E", "e_no_return": "E",
     "f_kept": "F", "f_moved": "F", "ledger_unaccounted": "LEDGER", "ipi_never": "IPI",
 }
 
