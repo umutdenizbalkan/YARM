@@ -87,6 +87,7 @@ pub mod lock;
     )
 ))]
 pub mod schedlock1_witness;
+pub mod ticket_lock;
 // SCHED-LOCK1-ORDER1: the witness's in-hold membership rule, a pure function of record order —
 // compiled with the witness and into the hosted tests, which pin its boundary deterministically.
 #[cfg(any(test, feature = "sched-lock1-witness"))]
@@ -112,6 +113,9 @@ pub mod printk;
 pub mod process;
 pub mod recv_core;
 pub mod recv_waiter_split;
+#[cfg(test)]
+#[path = "sched_fair1_tests/tests.rs"]
+mod sched_fair1_tests;
 #[cfg(test)]
 #[path = "sched_lock1_tests/tests.rs"]
 mod sched_lock1_tests;

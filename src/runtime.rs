@@ -2472,19 +2472,19 @@ impl SharedKernel {
     pub(crate) fn d6_genuine_local_dispatch_observe(&self, cpu: CpuId) -> Option<u64> {
         // SCHED-LOCK1: the observation names `cpu` explicitly (the retired ambient selector no
         // longer exists) and holds only that CPU's 1L.
-        self.with_cpu_sched_split(cpu, |c| {
-            let current = c.current_tid().map(|tid| tid.0);
-            let runnable = c.runnable_count();
-            crate::yarm_log!(
-                "D6_LOCAL_DISPATCH_STEP_SPLIT cpu={} tid={:?} runnable={}",
-                cpu.0,
-                current,
-                runnable
-            );
-            current
-        })
-        .ok()
-        .flatten()
+        // SCHED-LOCK-FAIR1: the facts are read under 1L; the line is printed after the release.
+        let (current, runnable) = self
+            .with_cpu_sched_split(cpu, |c| {
+                (c.current_tid().map(|tid| tid.0), c.runnable_count())
+            })
+            .ok()?;
+        crate::yarm_log!(
+            "D6_LOCAL_DISPATCH_STEP_SPLIT cpu={} tid={:?} runnable={}",
+            cpu.0,
+            current,
+            runnable
+        );
+        current
     }
 
     /// Stage 200D-2B1D5A — re-validate an `idle` restore-owner decision AFTER the post-lock
@@ -2907,23 +2907,22 @@ impl SharedKernel {
             // Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's CPU against the
             // authoritative dispatch CPU BEFORE any mutation. On mismatch nothing is dequeued.
             if dispatch_cpu != cpu {
-                crate::yarm_log!(
-                    "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}",
-                    "d6_genuine_local_dispatch_step_mut",
-                    cpu.0,
-                    dispatch_cpu.0
-                );
+                // SCHED-LOCK-FAIR1: `DISPATCH_STEP_REFUSED_CPU_MISMATCH` is printed after the
+                // release, from this refusal.
                 // U9-DISPATCH-CPU1 §3: this consumer is NOT migrated. The D6 queue-NEUTRAL
                 // observation slice is x86_64-only, runs under `d6_genuine_enabled()` and its
                 // caller's own single-dispatcher eligibility, and its whole contract is that it
                 // provably does not dequeue. Its admission gate is untouched, so it keeps the
                 // ambient check — now spelled as the typed refusal it always was.
-                return CpuDispatch::Refused {
-                    requested: cpu,
-                    reason: DispatchAuthorityRefusal::AmbientMismatch {
-                        authoritative: dispatch_cpu,
+                return (
+                    CpuDispatch::Refused {
+                        requested: cpu,
+                        reason: DispatchAuthorityRefusal::AmbientMismatch {
+                            authoritative: dispatch_cpu,
+                        },
                     },
-                };
+                    None,
+                );
             }
             // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
             let selection = c.dispatch_next_selection();
@@ -2935,16 +2934,33 @@ impl SharedKernel {
                 crate::kernel::scheduler::DispatchSelection::Idle => "none",
                 _ => "some",
             };
-            crate::yarm_log!(
-                "D6_GENUINE_MUT_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
-                cpu.0,
-                result,
-                incoming
-            );
-            CpuDispatch::Selected {
-                cpu: dispatch_cpu,
-                selection,
+            (
+                CpuDispatch::Selected {
+                    cpu: dispatch_cpu,
+                    selection,
+                },
+                Some((result, incoming)),
+            )
+        });
+        // SCHED-LOCK-FAIR1: both markers are printed here, after `cpu`'s 1L is released, from
+        // facts the section returned — the same text, in the same order relative to the step.
+        let outcome = outcome.map(|(dispatch, marker)| {
+            match (&dispatch, marker) {
+                (_, Some((result, incoming))) => crate::yarm_log!(
+                    "D6_GENUINE_MUT_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
+                    cpu.0,
+                    result,
+                    incoming
+                ),
+                (CpuDispatch::Refused { .. }, None) => crate::yarm_log!(
+                    "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}",
+                    "d6_genuine_local_dispatch_step_mut",
+                    cpu.0,
+                    dispatch_cpu.0
+                ),
+                _ => {}
             }
+            dispatch
         });
         outcome.unwrap_or(CpuDispatch::Refused {
             requested: cpu,
@@ -3748,11 +3764,8 @@ impl SharedKernel {
                 // `current_tid_authoritative` applies, and the reason `CpuOutOfRange` is no longer
                 // a reachable selection refusal (an out-of-range CPU cannot mint a live authority).
                 if c.validate_online().is_err() {
-                    crate::yarm_log!(
-                        "DISPATCH_STEP_REFUSED site={} requested={} reason=cpu_offline",
-                        site,
-                        cpu.0
-                    );
+                    // SCHED-LOCK-FAIR1: `DISPATCH_STEP_REFUSED … reason=cpu_offline` is printed
+                    // after the release, from this refusal.
                     return CpuDispatch::Refused {
                         requested: cpu,
                         reason: DispatchAuthorityRefusal::CpuOffline,
@@ -3832,16 +3845,29 @@ impl SharedKernel {
                         selection: crate::kernel::scheduler::DispatchSelection::Idle,
                     },
                     crate::kernel::scheduler::AcceptedSelection::NoneAcceptable { examined } => {
-                        crate::yarm_log!(
-                            "DISPATCH_STEP_NONE_ACCEPTABLE site={} cpu={} examined={}",
-                            site,
-                            cpu.0,
-                            examined
-                        );
                         CpuDispatch::NoneAcceptable { examined }
                     }
                 }
             });
+            // SCHED-LOCK-FAIR1: the selection's two scheduler-only refusal markers are printed
+            // here, after `cpu`'s 1L is released, from the outcome the section returned.
+            match &outcome {
+                Ok(CpuDispatch::Refused {
+                    reason: DispatchAuthorityRefusal::CpuOffline,
+                    ..
+                }) => crate::yarm_log!(
+                    "DISPATCH_STEP_REFUSED site={} requested={} reason=cpu_offline",
+                    site,
+                    cpu.0
+                ),
+                Ok(CpuDispatch::NoneAcceptable { examined }) => crate::yarm_log!(
+                    "DISPATCH_STEP_NONE_ACCEPTABLE site={} cpu={} examined={}",
+                    site,
+                    cpu.0,
+                    examined
+                ),
+                _ => {}
+            }
             match outcome {
                 Ok(CpuDispatch::Selected {
                     cpu,
@@ -6426,12 +6452,15 @@ impl SharedKernel {
                     Some(snap.sender_tid),
                     "rank-1 preflight already proved the sender is current"
                 );
-                crate::yarm_log!("SCHED_BLOCK tid={}", snap.sender_tid);
                 BlockingSendCommitOutcome::Committed {
                     send_generation: next_generation,
                 }
             })
         });
+        // SCHED-LOCK-FAIR1: printed after `snap.cpu`'s 1L (and the nested ranks) are released.
+        if matches!(outcome, Ok(BlockingSendCommitOutcome::Committed { .. })) {
+            crate::yarm_log!("SCHED_BLOCK tid={}", snap.sender_tid);
+        }
         // An out-of-range CPU has no lock to take; it is refused exactly as the preflight above
         // refuses any CPU that is not the executing one.
         outcome.unwrap_or(BlockingSendCommitOutcome::RefusedCpuMismatch {
@@ -6959,8 +6988,11 @@ impl SharedKernel {
         const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
         const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 
+        // SCHED-LOCK-FAIR1: the bootstrap verification's queue lengths, captured under 1L and
+        // printed after the release.
+        let mut bootstrap_verify: Option<[usize; 4]> = None;
         // SCHED-LOCK1: `cpu`'s own 1L for the whole enqueue→dispatch, rank 2 nested inside.
-        self.with_cpu_sched_split(cpu, |c| {
+        let result = self.with_cpu_sched_split(cpu, |c| {
             // (2) Same admission predicate `set_current_cpu` uses. A refusal returns the same
             // error class with nothing below having run.
             c.validate_online().map_err(map_scheduler_error)?;
@@ -7029,13 +7061,7 @@ impl SharedKernel {
                                 domain.load_mirror(n as usize)
                             }
                         };
-                        crate::yarm_log!(
-                            "BOOTSTRAP_ENQUEUE_VERIFY tid=1 queue0_len={} queue1_len={} queue2_len={} queue3_len={}",
-                            q(0),
-                            q(1),
-                            q(2),
-                            q(3)
-                        );
+                        bootstrap_verify = Some([q(0), q(1), q(2), q(3)]);
                     }
                     placed
                 }
@@ -7047,8 +7073,18 @@ impl SharedKernel {
                 _ => c.dispatch_next().map(|t| t.0),
             };
             Ok(CpuEnqueueDispatch { enqueued, selected })
-        })
-        .map_err(map_scheduler_error)?
+        });
+        let result = result.map_err(map_scheduler_error)?;
+        if let Some(q) = bootstrap_verify {
+            crate::yarm_log!(
+                "BOOTSTRAP_ENQUEUE_VERIFY tid=1 queue0_len={} queue1_len={} queue2_len={} queue3_len={}",
+                q[0],
+                q[1],
+                q[2],
+                q[3]
+            );
+        }
+        result
     }
 
     /// QEMU-SMP1 §2 — the ONE authentication both FP/SIMD-home accessors below share.

@@ -120633,9 +120633,18 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             body.contains("if self.wake_only() {"),
             "the wake-only branch guards placement"
         );
+        // SCHED-LOCK-FAIR1: the denial's facts are captured in the branch and its line printed by
+        // the releasing guard after 1L is released.
         assert!(
-            body.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY")
-                && body.contains("reason=no_ap_dispatcher_yet"),
+            body.contains(".push(DeferredDiag::WakeOnlyDenied { cpu, tid });"),
+            "the denial is captured under 1L"
+        );
+        let emit = &SCHED[SCHED
+            .find("    fn emit(self) {")
+            .expect("the post-release emitter")..];
+        assert!(
+            emit[..1500].contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY")
+                && emit[..1500].contains("reason=no_ap_dispatcher_yet"),
             "the denial is attested with its reason"
         );
         assert!(

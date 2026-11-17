@@ -57,6 +57,10 @@ import zlib
 KINDS = {"SNAP_BEGIN", "SNAP_CUR", "SNAP_Q", "SEC", "ADD", "REM", "CLAIM", "NOTIFY",
          "HOLD_BEGIN", "PROGRESS", "HOLD_END", "RELATED", "CENSUS_BEGIN", "CENSUS_CUR",
          "CENSUS_Q", "CENSUS_END", "ALL_MUTATED", "CELL", "RUN", "UNINSTALL"}
+# SCHED-LOCK-FAIR1: fair admission of the actual scheduler locks (see `grade_fair`).
+FAIR_KINDS = {"FAIR_STAT", "FAIR_HOLD", "FAIR_PEER", "FAIR_REACQ"}
+FAIR_1G = 8          # the 1G slot (MAX_W_CPUS); 1L slots are the CPU index
+TICKET_MOD = 1 << 32
 REC = re.compile(r"(SL1W_R seq=(\d+) kind=(\w+) cpu=(\d+) exec=(\d+) f0=(\d+) f1=(\d+) f2=(\d+) "
                  r"f3=(\d+) f4=(\d+) f5=(\d+)) crc=([0-9a-f]{8})")
 END = re.compile(r"(SL1W_END count=(\d+) overflow=(\d) phase=(\d) ncpu=(\d+) rounds=(\d+) "
@@ -133,7 +137,12 @@ def grade(text, expect_cpus=None):
     if sorted(recs) != list(range(1, end["count"] + 1)):
         missing = sorted(set(range(1, end["count"] + 1)) - set(recs))
         fail("validity", "records missing or extra (first missing %s)" % missing[:5])
-    rs = [recs[i] for i in range(1, end["count"] + 1)]
+    rs_all = [recs[i] for i in range(1, end["count"] + 1)]
+    # SCHED-LOCK-FAIR1: the fair-admission records are graded on their own (their slot field is a
+    # lock, which may name a CPU cell the coherent view took, or 1G); the membership trace below
+    # is everything else, exactly as before.
+    fair_summary = grade_fair([r for r in rs_all if r["kind"] in FAIR_KINDS], n)
+    rs = [r for r in rs_all if r["kind"] not in FAIR_KINDS]
     by_seq = {r["seq"]: r for r in rs}
     for r in rs:
         if r["kind"] not in KINDS:
@@ -589,12 +598,85 @@ def grade(text, expect_cpus=None):
             "%d from kernel mode), %d progress records, each checked against the installation in force | "
             "CLAIMS: %d claims bound to their commits, %d incarnations confirmed by a later run, %d unconfirmed "
             "(%s), %d claiming no address space | NATURAL trace: %d sections (%d remote adds, %d notifications, "
-            "%d restores) replayed SNAP→CENSUS exactly; cells %s"
+            "%d restores) replayed SNAP→CENSUS exactly; cells %s | FAIR %s"
             % (n, len(credited), rounds, len(attempts), uncredited, dirs, late, len(installs), n_obs, n_end_unobs,
                n_open, len(runs), n_user, len(runs) - n_user, n_prog, len(claims), verified,
                sum(unconfirmed.values()), ", ".join("%s %d" % kv for kv in unconfirmed.items()), no_asid_claims,
                len(secs), remote_adds, notifies, restores,
-               " ".join("%d:%#x" % (c, cell[c]) for c in range(n))))
+               " ".join("%d:%#x" % (c, cell[c]) for c in range(n)), fair_summary))
+
+
+def grade_fair(fr, n):
+    """SCHED-LOCK-FAIR1 — the scheduler locks admitted their entrants in ticket order.
+
+    Every value comes from the primitive (`kernel::ticket_lock`): tickets it drew and served, and
+    per-lock counters each holder kept under the lock it held. Record order is the reservation
+    order of the ring, reserved under the lock, never the order lines reached the serial log.
+
+    * FAIR_STAT per lock: no service gap (every holder's ticket is its predecessor's + 1), at most
+      n − 1 entrants found ahead of any ticket, and 1L of every CPU and 1G each acquired.
+    * The probe, on 1L[0] and on 1G: CPU 0 held ticket t1 and released only after a peer was
+      queued; it re-drew at once (t2). The peer's ticket ty lies strictly between t1 and t2, the
+      peer's record (under the lock) precedes the re-acquisition's, and the re-draw came after
+      every ticket outstanding at the release.
+    """
+    stats = {}
+    for r in fr:
+        if r["cpu"] > FAIR_1G:
+            fail("fair-validity", "seq %d names lock slot %d" % (r["seq"], r["cpu"]))
+        if r["kind"] == "FAIR_STAT":
+            if r["cpu"] in stats:
+                fail("fair-validity", "two FAIR_STAT records for slot %d" % r["cpu"])
+            stats[r["cpu"]] = r["f"]
+    need = list(range(n)) + [FAIR_1G]
+    for slot in need:
+        if slot not in stats or stats[slot][0] == 0:
+            fail("fair-coverage", "lock slot %d was never acquired" % slot)
+    for slot, f in stats.items():
+        acq, contended, max_ahead, gaps, aba, handoffs = f
+        if gaps:
+            fail("fair-order", "lock slot %d served %d tickets out of order" % (slot, gaps))
+        if max_ahead > n - 1:
+            fail("fair-bound", "lock slot %d: a ticket found %d entrants ahead (n=%d)" % (slot, max_ahead, n))
+        if contended > acq or handoffs > acq or aba > acq:
+            fail("fair-validity", "lock slot %d counters exceed its acquisitions" % slot)
+    proved = {}
+    for slot in (0, FAIR_1G):
+        holds = {r["f"][0]: r for r in fr if r["kind"] == "FAIR_HOLD" and r["cpu"] == slot}
+        peers = {r["f"][0]: r for r in fr if r["kind"] == "FAIR_PEER" and r["cpu"] == slot}
+        reacqs = {r["f"][0]: r for r in fr if r["kind"] == "FAIR_REACQ" and r["cpu"] == slot}
+        for att, h in sorted(holds.items()):
+            p, q = peers.get(att), reacqs.get(att)
+            if q is None:
+                fail("fair-validity", "slot %d attempt %d has no re-acquisition record" % (slot, att))
+            claimed = q["f"][2] == 1
+            if p is None or h["f"][3] != 1:
+                if claimed:
+                    fail("fair-order", "slot %d attempt %d claims a pass with no queued peer" % (slot, att))
+                continue
+            t1, outstanding, ty, t2 = h["f"][1], h["f"][2], p["f"][1], q["f"][1]
+            d_peer = (ty - t1) % TICKET_MOD
+            d_re = (t2 - t1) % TICKET_MOD
+            ok = (h["exec"] == 0 and q["exec"] == 0 and p["exec"] != 0
+                  and h["seq"] < p["seq"] < q["seq"]
+                  and 1 <= d_peer < outstanding and d_re >= outstanding)
+            if claimed and not ok:
+                fail("fair-order", "slot %d attempt %d: holder t1=%d peer ty=%d re-acquired t2=%d (outstanding %d; "
+                     "seq %d/%d/%d) is not FIFO" % (slot, att, t1, ty, t2, outstanding, h["seq"], p["seq"], q["seq"]))
+            if ok and not claimed:
+                fail("fair-validity", "slot %d attempt %d: FIFO evidence the producer did not report" % (slot, att))
+            if ok:
+                proved.setdefault(slot, (att, t1, ty, t2, outstanding))
+        if slot not in proved:
+            fail("fair-coverage", "no probe on lock slot %d showed a queued peer served before a rapid re-acquire" % slot)
+        if stats[slot][1] == 0:
+            fail("fair-coverage", "lock slot %d never found an entrant ahead" % slot)
+    contended = sum(f[1] for f in stats.values())
+    return ("locks %d, %d acquisitions, %d contended, max ahead %d, 0 gaps, %d A-B-A yields, %d queued handoffs; "
+            "probe 1L[0] att %d t1=%d ty=%d t2=%d, 1G att %d t1=%d ty=%d t2=%d"
+            % (len(stats), sum(f[0] for f in stats.values()), contended,
+               max(f[2] for f in stats.values()), sum(f[4] for f in stats.values()),
+               sum(f[5] for f in stats.values()), *proved[0][:4], *proved[FAIR_1G][:4]))
 
 
 # ── self-test (the full corpus is tests/fixtures/sched_lock1/mkcases.py) ───────────────────────
@@ -667,8 +749,21 @@ def pre_hold_commit():
     return ev[:hb] + ev[first:last] + [ev[hb]] + ev[last:]
 
 
+def with_fair(ev):
+    """SCHED-LOCK-FAIR1: `ev` with the fair-admission records the producer adds: the probe of 1L[0]
+    and of 1G before the window opens (CPU 0 holds t1 until CPU 1 queues, then re-draws), and the
+    per-lock FAIR_STAT records at the dump."""
+    probe = [("FAIR_HOLD", 0, 0, [1, 40, 2, 1]), ("FAIR_PEER", 0, 1, [1, 41, 1]),
+             ("FAIR_REACQ", 0, 0, [1, 42, 1, 42, 40]),
+             ("FAIR_HOLD", FAIR_1G, 0, [1, 10, 2, 1]), ("FAIR_PEER", FAIR_1G, 1, [1, 11, 1]),
+             ("FAIR_REACQ", FAIR_1G, 0, [1, 12, 1, 12, 10])]
+    stats = [("FAIR_STAT", 0, 0, [50, 3, 1, 0, 2, 3]), ("FAIR_STAT", 1, 0, [40, 2, 1, 0, 1, 2]),
+             ("FAIR_STAT", FAIR_1G, 0, [9, 1, 1, 0, 1, 1])]
+    return probe + list(ev) + stats
+
+
 def self_test():
-    g = good()
+    g = with_fair(good())
 
     def sub(kind, k, idx, val):
         ev = [list(e) for e in g]
@@ -677,7 +772,37 @@ def self_test():
         ev[i][3][idx] = val
         return [tuple(e) for e in ev]
 
-    cases = [("valid trace", build(g), None),
+    gf = g
+
+    def fsub(kind, slot, idx, val, k=0):
+        ev = [list(e) for e in gf]
+        i = [i for i, e in enumerate(ev) if e[0] == kind and e[1] == slot][k]
+        ev[i][3] = list(ev[i][3])
+        ev[i][3][idx] = val
+        return [tuple(e) for e in ev]
+
+    def fswap(slot):
+        """The peer's record AFTER the re-acquisition: the releasing holder was served first."""
+        ev = list(gf)
+        ip = [i for i, e in enumerate(ev) if e[0] == "FAIR_PEER" and e[1] == slot][0]
+        iq = [i for i, e in enumerate(ev) if e[0] == "FAIR_REACQ" and e[1] == slot][0]
+        ev[ip], ev[iq] = ev[iq], ev[ip]
+        return ev
+
+    fair_cases = [
+        ("valid trace with fair admission", build(gf), None),
+        # NEGATIVE CONTROLS — a known earlier entrant overtaken, in every form the evidence can take.
+        ("1L: re-acquire drew before the queued peer", build(fsub("FAIR_REACQ", 0, 1, 41)), "fair-order:"),
+        ("1G: re-acquire drew before the queued peer", build(fsub("FAIR_REACQ", FAIR_1G, 1, 11)), "fair-order:"),
+        ("1L: releasing holder served before the peer", build(fswap(0)), "fair-order:"),
+        ("1G: releasing holder served before the peer", build(fswap(FAIR_1G)), "fair-order:"),
+        ("service gap counted on a lock", build(fsub("FAIR_STAT", 1, 3, 1)), "fair-order:"),
+        ("more than n-1 entrants ahead", build(fsub("FAIR_STAT", 0, 2, 2)), "fair-bound:"),
+        ("probe of 1G never saw a queued peer", build(fsub("FAIR_HOLD", FAIR_1G, 3, 0)), "fair-order:"),
+        ("1G never acquired", build([e for e in gf if not (e[0] == "FAIR_STAT" and e[1] == FAIR_1G)]),
+         "fair-coverage:"),
+    ]
+    cases = fair_cases + [("valid trace", build(gf), None),
              ("section names a third lock instance", build(sub("SEC", 0, 5, 0x7E570000)), "lock-instance:"),
              ("claim incarnation substituted", build(sub("CLAIM", 0, 1, A2(77))), "claim-incarnation:"),
              ("claim names another commit", build(sub("CLAIM", 0, 3, 9)), "claim-commit:"),
@@ -688,7 +813,7 @@ def self_test():
              # SCHED-LOCK1-ORDER1: the defect's exact shape — the observer's installing commit
              # (SEC/REM) lands just BEFORE the hold's HOLD_BEGIN, yet the hold credits it and its
              # PROGRESS names it. The producer no longer emits this; the grader still refuses it.
-             ("pre-hold commit credited to the hold", build(pre_hold_commit()), "progress:"),
+             ("pre-hold commit credited to the hold", build(with_fair(pre_hold_commit())), "progress:"),
              ("overflow", build(g, overflow=1), "validity:"),
              ("window not closed", build(g, phase=1), "validity:")]
     bad = 0

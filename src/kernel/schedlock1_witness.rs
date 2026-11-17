@@ -108,7 +108,11 @@ pub const K_ALL_MUTATED: u8 = 17;
 pub const K_CELL: u8 = 18;
 pub const K_RUN: u8 = 19;
 pub const K_UNINSTALL: u8 = 20;
-const KINDS: [&str; 21] = [
+pub const K_FAIR_STAT: u8 = 21;
+pub const K_FAIR_HOLD: u8 = 22;
+pub const K_FAIR_PEER: u8 = 23;
+pub const K_FAIR_REACQ: u8 = 24;
+const KINDS: [&str; 25] = [
     "-",
     "SNAP_BEGIN",
     "SNAP_CUR",
@@ -130,6 +134,10 @@ const KINDS: [&str; 21] = [
     "CELL",
     "RUN",
     "UNINSTALL",
+    "FAIR_STAT",
+    "FAIR_HOLD",
+    "FAIR_PEER",
+    "FAIR_REACQ",
 ];
 
 /// `RUN` origins (f5): the first kernel entry came from kernel mode, or from user mode.
@@ -942,6 +950,10 @@ pub(crate) fn after_tick(shared: &SharedKernel, cpu: CpuId) {
     if !crate::kernel::apsched_witness::enabled() {
         return;
     }
+    // SCHED-LOCK-FAIR1: a CPU other than the prober joins an armed probe as its peer.
+    if cpu.0 != 0 {
+        fair_probe_peer(shared, cpu);
+    }
     match PHASE.load(Ordering::Acquire) {
         0 if cpu.0 == 0 => {
             let topo = shared.sched_domain().topo();
@@ -953,6 +965,11 @@ pub(crate) fn after_tick(shared: &SharedKernel, cpu: CpuId) {
             // (two per CPU, rotated by timer preemption: local scheduling on each CPU).
             let started = crate::kernel::apsched_witness::spinner_cpus();
             if started & present != present {
+                return;
+            }
+            // SCHED-LOCK-FAIR1: the fair-admission probe (both lock kinds) runs to its end
+            // before the window opens, so it cannot overlap a hold or the membership trace.
+            if !fair_probe_step(shared, cpu) {
                 return;
             }
             OPENED_AT.store(shared.sched_domain().clock_now().0, Ordering::Release);
@@ -1041,6 +1058,7 @@ pub(crate) fn holds_phase_a() -> bool {
 
 /// The sealed dump, after the AP-scheduling witness's own.
 pub(crate) fn dump() {
+    fair_record_stats();
     let n = NEXT.load(Ordering::Acquire).min(RECS_MAX);
     for (i, r) in RECS.iter().take(n).enumerate() {
         let mut spins = 0u32;
@@ -1075,4 +1093,305 @@ pub(crate) fn dump() {
         total_rounds(),
         ROUNDS_OK.load(Ordering::Acquire)
     ));
+}
+
+// ── SCHED-LOCK-FAIR1: fair admission of the actual scheduler locks ──────────────────────────────
+//
+// Two kinds of evidence, both taken by the primitive itself (`kernel::ticket_lock`), never from
+// the order lines reach the serial log:
+//
+// * **FAIR_STAT** — per lock (1L of CPUs 0..MAX_W_CPUS, and 1G), counted by each holder under
+//   the lock it holds, from boot to the dump: acquisitions, acquisitions that found earlier
+//   entrants (`ahead > 0`), the most entrants found ahead, service GAPS (a holder whose ticket is
+//   not its predecessor's + 1 — an overtaking), A-B-A yields (this CPU's previous acquisition of
+//   the lock was followed by another CPU's before this one: it re-drew and was served after a
+//   peer), and releases that handed the lock to a queued waiter.
+// * **FAIR_HOLD / FAIR_PEER / FAIR_REACQ** — the deterministic probe, run on 1L[0] and on 1G
+//   before the window opens: CPU 0 takes the lock (ticket t1) and waits, interrupts masked and
+//   bounded, until CPU 1 has announced it is drawing and a second ticket is outstanding; it
+//   releases and IMMEDIATELY re-acquires (t2). CPU 1 records its ticket ty under the lock. The
+//   records' sequence numbers are reserved under the lock, so their order is the service order.
+//   The probe passes when t1 < ty < t2 and CPU 1's record precedes CPU 0's re-acquisition.
+
+use crate::kernel::ticket_lock::FAIR_ID_1G;
+
+const FAIR_LOCKS: usize = MAX_W_CPUS + 1;
+/// Bound on the prober's wait for its peer, in spin iterations (interrupts masked).
+const FAIR_SPINS: u64 = 200_000_000;
+/// Probe attempts per lock before it is recorded as unexercised.
+const FAIR_ATTEMPTS: u64 = 4;
+
+struct FairStat {
+    acq: AtomicU64,
+    contended: AtomicU64,
+    max_ahead: AtomicU64,
+    gaps: AtomicU64,
+    aba: AtomicU64,
+    handoffs: AtomicU64,
+    /// last served ticket + 1 (0 = none yet)
+    last: AtomicU64,
+    /// the executing CPUs of the last two acquisitions, + 1 (0 = none)
+    prev1: AtomicU64,
+    prev2: AtomicU64,
+}
+
+const EMPTY_FAIR: FairStat = FairStat {
+    acq: AtomicU64::new(0),
+    contended: AtomicU64::new(0),
+    max_ahead: AtomicU64::new(0),
+    gaps: AtomicU64::new(0),
+    aba: AtomicU64::new(0),
+    handoffs: AtomicU64::new(0),
+    last: AtomicU64::new(0),
+    prev1: AtomicU64::new(0),
+    prev2: AtomicU64::new(0),
+};
+static FAIR: [FairStat; FAIR_LOCKS] = [EMPTY_FAIR; FAIR_LOCKS];
+
+fn fair_slot(id: u8) -> Option<usize> {
+    if id == FAIR_ID_1G {
+        Some(MAX_W_CPUS)
+    } else if (id as usize) < MAX_W_CPUS {
+        Some(id as usize)
+    } else {
+        None
+    }
+}
+
+/// The primitive's acquisition hook: ticket `ticket` is now served, `ahead` entrants were found
+/// ahead of it at the draw. Called by the HOLDER, so each lock's counters have one writer at a
+/// time (the lock itself serializes them).
+pub(crate) fn fair_acquired(id: u8, ticket: u32, ahead: u32) {
+    let Some(slot) = fair_slot(id) else { return };
+    let st = &FAIR[slot];
+    st.acq.fetch_add(1, Ordering::Relaxed);
+    if ahead > 0 {
+        st.contended.fetch_add(1, Ordering::Relaxed);
+    }
+    if u64::from(ahead) > st.max_ahead.load(Ordering::Relaxed) {
+        st.max_ahead.store(u64::from(ahead), Ordering::Relaxed);
+    }
+    let last = st.last.load(Ordering::Relaxed);
+    if last != 0 && (last - 1) as u32 != ticket.wrapping_sub(1) {
+        st.gaps.fetch_add(1, Ordering::Relaxed);
+    }
+    st.last.store(u64::from(ticket) + 1, Ordering::Relaxed);
+    let me = exec_cpu() as u64 + 1;
+    let p1 = st.prev1.load(Ordering::Relaxed);
+    if st.prev2.load(Ordering::Relaxed) == me && p1 != me && p1 != 0 {
+        st.aba.fetch_add(1, Ordering::Relaxed);
+    }
+    st.prev2.store(p1, Ordering::Relaxed);
+    st.prev1.store(me, Ordering::Relaxed);
+}
+
+/// The primitive's release hook: `waiting` tickets are queued behind the one being released.
+pub(crate) fn fair_released(id: u8, _ticket: u32, waiting: u32) {
+    let Some(slot) = fair_slot(id) else { return };
+    if waiting > 0 {
+        FAIR[slot].handoffs.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn fair_record_stats() {
+    for (slot, st) in FAIR.iter().enumerate() {
+        let acq = st.acq.load(Ordering::Relaxed);
+        if acq == 0 {
+            continue;
+        }
+        record(
+            K_FAIR_STAT,
+            slot,
+            [
+                acq,
+                st.contended.load(Ordering::Relaxed),
+                st.max_ahead.load(Ordering::Relaxed),
+                st.gaps.load(Ordering::Relaxed),
+                st.aba.load(Ordering::Relaxed),
+                st.handoffs.load(Ordering::Relaxed),
+            ],
+        );
+    }
+}
+
+/// Probe state: 0 = 1L[0] pending, 1 = 1G pending, 2 = done.
+static FAIR_PROBE_LOCK: AtomicU64 = AtomicU64::new(0);
+static FAIR_PROBE_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+/// `attempt << 8 | lock + 1` while CPU 0 holds the probed lock and waits for a peer; 0 otherwise.
+static FAIR_ARMED: AtomicU64 = AtomicU64::new(0);
+/// The armed value the peer is drawing for (set just before its `lock()`).
+static FAIR_PEER_DRAWING: AtomicU64 = AtomicU64::new(0);
+/// `ty + 1` of the peer's acquisition for the armed value it drew under (0 = none).
+static FAIR_PEER_TICKET: AtomicU64 = AtomicU64::new(0);
+static FAIR_PEER_FOR: AtomicU64 = AtomicU64::new(0);
+
+fn fair_outstanding(shared: &SharedKernel, lock: u64) -> u32 {
+    let d = shared.sched_domain();
+    if lock == 0 {
+        d.witness_cpu_outstanding(0)
+    } else {
+        d.witness_admission_outstanding()
+    }
+}
+
+/// CPU 0's probe step, from `after_tick` (no scheduler lock held). Returns `true` once both
+/// locks are probed (passed or attempts exhausted): the window may open.
+fn fair_probe_step(shared: &SharedKernel, cpu: CpuId) -> bool {
+    let lock = FAIR_PROBE_LOCK.load(Ordering::Acquire);
+    if lock >= 2 {
+        return true;
+    }
+    if cpu.0 != 0 {
+        return false;
+    }
+    let attempt = FAIR_PROBE_ATTEMPT.fetch_add(1, Ordering::AcqRel) + 1;
+    let armed = attempt << 8 | (lock + 1);
+    let domain = shared.sched_domain();
+    let mut passed = false;
+    if lock == 0 {
+        let guard = domain.lock_cpu(CpuId(0)).expect("cpu 0");
+        let t1 = guard.witness_ticket();
+        let (queued, outstanding) = fair_wait_for_peer(shared, lock, armed);
+        record(
+            K_FAIR_HOLD,
+            0,
+            [
+                attempt,
+                u64::from(t1),
+                u64::from(outstanding),
+                u64::from(queued),
+                0,
+                0,
+            ],
+        );
+        drop(guard);
+        let again = domain.lock_cpu(CpuId(0)).expect("cpu 0");
+        let t2 = again.witness_ticket();
+        passed = fair_reacquired(lock, attempt, armed, t1, t2, outstanding, queued);
+        drop(again);
+    } else {
+        let guard = domain.witness_lock_admission();
+        let t1 = guard.ticket();
+        let (queued, outstanding) = fair_wait_for_peer(shared, lock, armed);
+        record(
+            K_FAIR_HOLD,
+            MAX_W_CPUS,
+            [
+                attempt,
+                u64::from(t1),
+                u64::from(outstanding),
+                u64::from(queued),
+                0,
+                0,
+            ],
+        );
+        drop(guard);
+        let again = domain.witness_lock_admission();
+        let t2 = again.ticket();
+        passed = fair_reacquired(lock, attempt, armed, t1, t2, outstanding, queued);
+        drop(again);
+    }
+    FAIR_ARMED.store(0, Ordering::Release);
+    if passed || attempt >= FAIR_ATTEMPTS * (lock + 1) {
+        FAIR_PROBE_LOCK.store(lock + 1, Ordering::Release);
+    }
+    FAIR_PROBE_LOCK.load(Ordering::Acquire) >= 2
+}
+
+/// Holding the probed lock: arm, then wait (bounded) for the peer to announce it is drawing AND
+/// for a second ticket to be outstanding. Returns `(peer queued, tickets outstanding at release)`.
+fn fair_wait_for_peer(shared: &SharedKernel, lock: u64, armed: u64) -> (bool, u32) {
+    FAIR_ARMED.store(armed, Ordering::Release);
+    let mut spins = 0u64;
+    loop {
+        let outstanding = fair_outstanding(shared, lock);
+        if FAIR_PEER_DRAWING.load(Ordering::Acquire) == armed && outstanding >= 2 {
+            // Stop new arrivals counting as the peer, then let the release hand over.
+            FAIR_ARMED.store(0, Ordering::Release);
+            return (true, fair_outstanding(shared, lock));
+        }
+        if spins >= FAIR_SPINS {
+            FAIR_ARMED.store(0, Ordering::Release);
+            return (false, fair_outstanding(shared, lock));
+        }
+        core::hint::spin_loop();
+        spins += 1;
+    }
+}
+
+/// Holding the RE-acquired lock (ticket `t2`): the peer, if it was queued at the release, was
+/// served before this acquisition — its record is already in the ring and its ticket is known.
+fn fair_reacquired(
+    lock: u64,
+    attempt: u64,
+    armed: u64,
+    t1: u32,
+    t2: u32,
+    outstanding: u32,
+    queued: bool,
+) -> bool {
+    let peer = if FAIR_PEER_FOR.load(Ordering::Acquire) == armed {
+        FAIR_PEER_TICKET.load(Ordering::Acquire)
+    } else {
+        0
+    };
+    let ty = peer.wrapping_sub(1) as u32;
+    let passed = queued
+        && peer != 0
+        && ty.wrapping_sub(t1) >= 1
+        && ty.wrapping_sub(t1) < outstanding
+        && t2.wrapping_sub(t1) >= outstanding;
+    let slot = if lock == 0 { 0 } else { MAX_W_CPUS };
+    record(
+        K_FAIR_REACQ,
+        slot,
+        [
+            attempt,
+            u64::from(t2),
+            u64::from(passed),
+            peer,
+            u64::from(t1),
+            0,
+        ],
+    );
+    passed
+}
+
+/// A peer CPU, from its own `after_tick` (no scheduler lock held): if CPU 0 is holding a probed
+/// lock and waiting, announce and queue on it; record the ticket while holding it.
+fn fair_probe_peer(shared: &SharedKernel, cpu: CpuId) {
+    let armed = FAIR_ARMED.load(Ordering::Acquire);
+    if armed == 0 || FAIR_PEER_DRAWING.load(Ordering::Acquire) == armed {
+        return;
+    }
+    let lock = (armed & 0xFF) - 1;
+    let attempt = armed >> 8;
+    FAIR_PEER_DRAWING.store(armed, Ordering::Release);
+    let domain = shared.sched_domain();
+    let (ticket, slot) = if lock == 0 {
+        let guard = domain.lock_cpu(CpuId(0)).expect("cpu 0");
+        let t = guard.witness_ticket();
+        FAIR_PEER_TICKET.store(u64::from(t) + 1, Ordering::Release);
+        FAIR_PEER_FOR.store(armed, Ordering::Release);
+        record(
+            K_FAIR_PEER,
+            0,
+            [attempt, u64::from(t), cpu.0 as u64, 0, 0, 0],
+        );
+        drop(guard);
+        (t, 0)
+    } else {
+        let guard = domain.witness_lock_admission();
+        let t = guard.ticket();
+        FAIR_PEER_TICKET.store(u64::from(t) + 1, Ordering::Release);
+        FAIR_PEER_FOR.store(armed, Ordering::Release);
+        record(
+            K_FAIR_PEER,
+            MAX_W_CPUS,
+            [attempt, u64::from(t), cpu.0 as u64, 0, 0, 0],
+        );
+        drop(guard);
+        (t, MAX_W_CPUS)
+    };
+    let _ = (ticket, slot);
 }

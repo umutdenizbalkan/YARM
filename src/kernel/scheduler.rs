@@ -6,8 +6,8 @@ use crate::arch::platform_constants;
 #[cfg(test)]
 use crate::arch::topology;
 use crate::kernel::ipc::ThreadId;
-use crate::kernel::lock::{SpinLockIrq, SpinLockIrqGuard};
 use crate::kernel::scheduler_timer::Timer;
+use crate::kernel::ticket_lock::{TicketLockIrq, TicketLockIrqGuard};
 use crate::kernel::time::{Tick, TickInstant};
 use crate::kernel::topology::CpuTopology;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -950,6 +950,71 @@ pub(crate) const CLOCK_OWNER_CPU: CpuId = CpuId(platform_constants::BOOTSTRAP_CP
 pub struct CpuSched {
     rq: PriorityScheduler,
     quantum: Timer,
+    /// SCHED-LOCK-FAIR1: scheduler-only diagnostics raised inside a 1L section, emitted by the
+    /// releasing guard AFTER 1L is released (synchronous printk is not done under 1L).
+    deferred: DeferredDiags,
+}
+
+/// SCHED-LOCK-FAIR1 — a scheduler-only diagnostic whose facts are captured under 1L and whose
+/// line is printed after the release, in the order raised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredDiag {
+    /// An explicit placement refused on a wake-only CPU (Stage 183.5 / 195D).
+    WakeOnlyDenied { cpu: CpuId, tid: ThreadId },
+}
+
+/// At most `DEFERRED_MAX` diagnostics per section are kept; any more are counted and reported
+/// as one `SCHED_DEFERRED_DIAG_DROPPED` line, so nothing is silently lost.
+const DEFERRED_MAX: usize = 4;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DeferredDiags {
+    diags: [Option<DeferredDiag>; DEFERRED_MAX],
+    len: usize,
+    dropped: u32,
+}
+
+impl DeferredDiags {
+    fn push(&mut self, diag: DeferredDiag) {
+        if self.len < DEFERRED_MAX {
+            self.diags[self.len] = Some(diag);
+            self.len += 1;
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// Hand the pending diagnostics out of the locked state (still under 1L).
+    fn take(&mut self) -> Self {
+        core::mem::take(self)
+    }
+
+    /// Print them — called with NO scheduler lock held.
+    fn emit(self) {
+        for diag in self.diags.iter().take(self.len).flatten() {
+            match *diag {
+                DeferredDiag::WakeOnlyDenied { cpu, tid } => {
+                    crate::yarm_log!(
+                        "SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu={} tid={} reason=no_ap_dispatcher_yet",
+                        cpu.0,
+                        tid.0
+                    );
+                    // Stage 195D (BSP DISPATCH AFFINITY): an actual prevented placement of a
+                    // runnable user task onto a wake-only AP queue. Emitted ONLY on a real
+                    // rejection (never fabricated); the caller reroutes to the BSP dispatcher.
+                    #[cfg(target_arch = "aarch64")]
+                    crate::yarm_log!(
+                        "AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid={} cpu={}",
+                        tid.0,
+                        cpu.0
+                    );
+                }
+            }
+        }
+        if self.dropped != 0 {
+            crate::yarm_log!("SCHED_DEFERRED_DIAG_DROPPED count={}", self.dropped);
+        }
+    }
 }
 
 impl CpuSched {
@@ -957,6 +1022,7 @@ impl CpuSched {
         Self {
             rq: PriorityScheduler::default(),
             quantum: Timer::new(quantum_ticks),
+            deferred: DeferredDiags::default(),
         }
     }
 
@@ -1006,14 +1072,19 @@ struct CpuMirror {
 #[derive(Debug)]
 #[repr(align(64))]
 pub struct CpuCell {
-    lock: SpinLockIrq<CpuSched>,
+    /// Rank 1L. SCHED-LOCK-FAIR1: a FIFO ticket lock (`kernel::ticket_lock`), not the TTAS
+    /// `SpinLockIrq`.
+    lock: TicketLockIrq<CpuSched>,
     mirror: CpuMirror,
 }
 
 impl CpuCell {
-    fn new(quantum_ticks: u64) -> Self {
+    fn new(quantum_ticks: u64, _idx: usize) -> Self {
         Self {
-            lock: SpinLockIrq::new(CpuSched::new(quantum_ticks)),
+            #[cfg(not(feature = "sched-lock1-witness"))]
+            lock: TicketLockIrq::new(CpuSched::new(quantum_ticks)),
+            #[cfg(feature = "sched-lock1-witness")]
+            lock: TicketLockIrq::new_fair(CpuSched::new(quantum_ticks), _idx as u8),
             mirror: CpuMirror::default(),
         }
     }
@@ -1116,7 +1187,8 @@ pub(crate) struct Admission {
 #[derive(Debug)]
 pub struct SchedDomain {
     cpus: SchedCells,
-    admission: SpinLockIrq<Admission>,
+    /// Rank 1G. SCHED-LOCK-FAIR1: a FIFO ticket lock, like every 1L.
+    admission: TicketLockIrq<Admission>,
     topo: SchedTopo,
     /// The scheduler tick. Single writer: [`CpuView::tick`] on [`CLOCK_OWNER_CPU`], under its 1L.
     clock: AtomicU64,
@@ -1131,7 +1203,8 @@ impl SchedDomain {
     /// A domain with `present` CPUs present, only the boot CPU online, every quantum
     /// `quantum_ticks`, and the clock at 0.
     pub fn new(present: u64, quantum_ticks: u64) -> Self {
-        let cells: [CpuCell; MAX_CPUS] = core::array::from_fn(|_| CpuCell::new(quantum_ticks));
+        let cells: [CpuCell; MAX_CPUS] =
+            core::array::from_fn(|idx| CpuCell::new(quantum_ticks, idx));
         #[cfg(feature = "hosted-dev")]
         let cells = alloc::boxed::Box::new(cells);
         let topology = CpuTopology::from_present_bitmap(present);
@@ -1139,10 +1212,19 @@ impl SchedDomain {
         topo.publish_topology(&topology);
         Self {
             cpus: cells,
-            admission: SpinLockIrq::new(Admission {
+            #[cfg(not(feature = "sched-lock1-witness"))]
+            admission: TicketLockIrq::new(Admission {
                 topology,
                 next_balance_cpu: 0,
             }),
+            #[cfg(feature = "sched-lock1-witness")]
+            admission: TicketLockIrq::new_fair(
+                Admission {
+                    topology,
+                    next_balance_cpu: 0,
+                },
+                crate::kernel::ticket_lock::FAIR_ID_1G,
+            ),
             topo,
             clock: AtomicU64::new(0),
         }
@@ -1158,6 +1240,24 @@ impl SchedDomain {
         TickInstant(self.clock.load(Ordering::Acquire))
     }
 
+    /// SCHED-LOCK-FAIR1 witness only: tickets outstanding (holder + waiters) on CPU `idx`'s 1L.
+    #[cfg(any(test, feature = "sched-lock1-witness"))]
+    pub(crate) fn witness_cpu_outstanding(&self, idx: usize) -> u32 {
+        self.cpus[idx].lock.outstanding()
+    }
+
+    /// SCHED-LOCK-FAIR1 witness only: tickets outstanding on 1G.
+    #[cfg(any(test, feature = "sched-lock1-witness"))]
+    pub(crate) fn witness_admission_outstanding(&self) -> u32 {
+        self.admission.outstanding()
+    }
+
+    /// SCHED-LOCK-FAIR1 witness only: 1G alone, for the fair-admission probe (no 1L is taken).
+    #[cfg(any(test, feature = "sched-lock1-witness"))]
+    pub(crate) fn witness_lock_admission(&self) -> TicketLockIrqGuard<'_, Admission> {
+        self.admission.lock()
+    }
+
     /// SCHED-LOCK1 witness only: CPU `idx`'s cell and its lock, as addresses — the authoritative
     /// CPU → lock-instance map the witness records under the coherent view.
     #[cfg(feature = "sched-lock1-witness")]
@@ -1165,7 +1265,7 @@ impl SchedDomain {
         let cell = &self.cpus[idx];
         (
             cell as *const CpuCell as usize,
-            &cell.lock as *const SpinLockIrq<CpuSched> as usize,
+            &cell.lock as *const TicketLockIrq<CpuSched> as usize,
         )
     }
 
@@ -1203,7 +1303,7 @@ impl SchedDomain {
         #[cfg(feature = "sched-lock1-witness")]
         crate::kernel::schedlock1_witness::after_acquire(idx, &guard);
         Ok(CpuSchedGuard {
-            guard,
+            guard: Some(guard),
             cell,
             topo: &self.topo,
             clock: &self.clock,
@@ -1258,7 +1358,7 @@ impl SchedDomain {
     /// only (§16.1). Released in descending order, 1G last.
     pub fn lock_all(&self) -> SchedAllGuard<'_> {
         let admission = self.admission.lock();
-        let mut guards: [Option<SpinLockIrqGuard<'_, CpuSched>>; MAX_CPUS] =
+        let mut guards: [Option<TicketLockIrqGuard<'_, CpuSched>>; MAX_CPUS] =
             [const { None }; MAX_CPUS];
         for (idx, slot) in guards.iter_mut().enumerate() {
             *slot = Some(self.cpus[idx].lock.lock());
@@ -1289,6 +1389,8 @@ impl SchedDomain {
             admission: self.admission.get_mut(),
             topo: &self.topo,
             clock: &self.clock,
+            // No lock is held: the view's own drop prints what its sections deferred.
+            emit_deferred: true,
         }
     }
 }
@@ -1296,7 +1398,9 @@ impl SchedDomain {
 /// SCHED-LOCK1 — a held 1L on one CPU. Projects ONLY that CPU's [`CpuSched`]; republishes the
 /// CPU's mirror when released (before the lock itself is released).
 pub struct CpuSchedGuard<'a> {
-    guard: SpinLockIrqGuard<'a, CpuSched>,
+    /// `Some` until the drop releases it — so the drop can publish the mirror while 1L is held,
+    /// release, and only then emit the section's deferred diagnostics.
+    guard: Option<TicketLockIrqGuard<'a, CpuSched>>,
     cell: &'a CpuCell,
     topo: &'a SchedTopo,
     clock: &'a AtomicU64,
@@ -1304,10 +1408,19 @@ pub struct CpuSchedGuard<'a> {
 }
 
 impl CpuSchedGuard<'_> {
+    /// SCHED-LOCK-FAIR1 witness and tests: the ticket this 1L guard holds.
+    #[cfg(any(test, feature = "sched-lock1-witness"))]
+    pub(crate) fn witness_ticket(&self) -> u32 {
+        self.guard.as_ref().map_or(0, |g| g.ticket())
+    }
+
     pub fn view(&mut self) -> CpuView<'_> {
         CpuView {
             idx: self.idx,
-            sched: &mut self.guard,
+            sched: self
+                .guard
+                .as_mut()
+                .expect("the 1L guard is held until the drop"),
             topo: self.topo,
             clock: self.clock,
             #[cfg(feature = "sched-lock1-witness")]
@@ -1318,14 +1431,21 @@ impl CpuSchedGuard<'_> {
 
 impl Drop for CpuSchedGuard<'_> {
     fn drop(&mut self) {
+        let Some(mut guard) = self.guard.take() else {
+            return;
+        };
         #[cfg(feature = "sched-lock1-witness")]
         crate::kernel::schedlock1_witness::before_release(
             self.idx,
             self.cell as *const CpuCell as usize,
-            &self.guard,
+            &guard,
         );
-        publish(&self.cell.mirror, &self.guard);
-        // `guard` is dropped after this body: the mirror is published while 1L is still held.
+        // The mirror is published while 1L is still held, then 1L is released, and only then
+        // are the section's scheduler-only diagnostics printed (SCHED-LOCK-FAIR1).
+        publish(&self.cell.mirror, &guard);
+        let deferred = guard.deferred.take();
+        drop(guard);
+        deferred.emit();
     }
 }
 
@@ -1333,7 +1453,7 @@ impl Drop for CpuSchedGuard<'_> {
 pub(crate) struct CpuAdmissionGuard<'a> {
     // Field order is drop order: the 1L guard is released before 1G.
     cpu: CpuSchedGuard<'a>,
-    admission: SpinLockIrqGuard<'a, Admission>,
+    admission: TicketLockIrqGuard<'a, Admission>,
 }
 
 #[cfg(feature = "sched-lock1-witness")]
@@ -1426,20 +1546,12 @@ impl CpuView<'_> {
         // its queue would strand forever. Deny placement explicitly (nothing pins
         // work to APs today; 183.6 lifts this per CPU when the AP dispatcher lands).
         if self.wake_only() {
-            crate::yarm_log!(
-                "SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu={} tid={} reason=no_ap_dispatcher_yet",
-                cpu.0,
-                tid.0
-            );
-            // Stage 195D (BSP DISPATCH AFFINITY): an actual prevented placement of a runnable
-            // user task onto a wake-only AP queue. Emitted ONLY on a real rejection (never
-            // fabricated); the caller reroutes to the BSP dispatcher.
-            #[cfg(target_arch = "aarch64")]
-            crate::yarm_log!(
-                "AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid={} cpu={}",
-                tid.0,
-                cpu.0
-            );
+            // `SCHED_ENQUEUE_DENIED_WAKE_ONLY … reason=no_ap_dispatcher_yet` (and, on AArch64,
+            // `AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED`): SCHED-LOCK-FAIR1 captures the facts here
+            // and the releasing guard prints them after 1L is released (`DeferredDiags::emit`).
+            self.sched
+                .deferred
+                .push(DeferredDiag::WakeOnlyDenied { cpu, tid });
             // Stage 199D: `WakeOnly`, not `CpuOffline`. The CPU is up; it refuses work. A
             // direct-IPC wake must be able to tell those apart — collapsing them is what let
             // `sr_enqueue_committed_receiver_split` report a placement that never happened.
@@ -1729,8 +1841,8 @@ impl CpuView<'_> {
 /// SCHED-LOCK1 — held 1G and every 1L (see [`SchedDomain::lock_all`]).
 pub struct SchedAllGuard<'a> {
     domain: &'a SchedDomain,
-    guards: [Option<SpinLockIrqGuard<'a, CpuSched>>; MAX_CPUS],
-    admission: Option<SpinLockIrqGuard<'a, Admission>>,
+    guards: [Option<TicketLockIrqGuard<'a, CpuSched>>; MAX_CPUS],
+    admission: Option<TicketLockIrqGuard<'a, Admission>>,
 }
 
 impl SchedAllGuard<'_> {
@@ -1750,6 +1862,8 @@ impl SchedAllGuard<'_> {
                 .expect("1G is held for the guard's lifetime"),
             topo: &domain.topo,
             clock: &domain.clock,
+            // Every lock is still held when the view drops: the guard prints after releasing.
+            emit_deferred: false,
         }
     }
 }
@@ -1761,10 +1875,18 @@ impl Drop for SchedAllGuard<'_> {
         // were republished by the view, while every 1L was held.)
         #[cfg(feature = "sched-lock1-witness")]
         crate::kernel::schedlock1_witness::all_released();
+        let mut deferred = [DeferredDiags::default(); MAX_CPUS];
         for idx in (0..MAX_CPUS).rev() {
-            drop(self.guards[idx].take());
+            if let Some(mut guard) = self.guards[idx].take() {
+                deferred[idx] = guard.deferred.take();
+                drop(guard);
+            }
         }
         drop(self.admission.take());
+        // SCHED-LOCK-FAIR1: printed only once every 1L and 1G is released, in CPU order.
+        for d in deferred {
+            d.emit();
+        }
     }
 }
 
@@ -1778,12 +1900,20 @@ pub struct SchedAll<'a> {
     admission: &'a mut Admission,
     topo: &'a SchedTopo,
     clock: &'a AtomicU64,
+    /// SCHED-LOCK-FAIR1: `true` only for the lock-free exclusive view, whose drop may print the
+    /// deferred diagnostics; under [`SchedAllGuard`] the guard prints them after releasing.
+    emit_deferred: bool,
 }
 
 impl Drop for SchedAll<'_> {
     fn drop(&mut self) {
         for idx in 0..MAX_CPUS {
             publish(self.mirrors[idx], self.cpus[idx]);
+        }
+        if self.emit_deferred {
+            for idx in 0..MAX_CPUS {
+                self.cpus[idx].deferred.take().emit();
+            }
         }
     }
 }

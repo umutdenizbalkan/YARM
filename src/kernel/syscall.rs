@@ -7079,7 +7079,28 @@ mod tests {
         assert!(mod_src.contains("    scheduler_state: crate::kernel::scheduler::SchedDomain,\n"));
         assert!(!mod_src.contains("scheduler_state: SpinLockIrq<"));
         assert!(!sched_src.contains("pub struct SmpScheduler"));
-        assert!(sched_src.contains("    lock: SpinLockIrq<CpuSched>,\n"));
+        // SCHED-LOCK-FAIR1: every 1L and 1G is the FIFO ticket lock, masking before the draw.
+        assert!(sched_src.contains("    lock: TicketLockIrq<CpuSched>,\n"));
+        assert!(sched_src.contains("    admission: TicketLockIrq<Admission>,\n"));
+        assert!(
+            !sched_src.contains("SpinLockIrq<"),
+            "no TTAS lock left in the scheduler domain"
+        );
+        let ticket_src = include_str!("ticket_lock.rs");
+        let lock_fn = &ticket_src[ticket_src
+            .find("pub fn lock(&self) -> TicketLockIrqGuard<'_, T> {")
+            .expect("lock")..];
+        let save = lock_fn.find("let irq_state = irq_save();").expect("save");
+        let draw = lock_fn
+            .find("self.tickets.next.fetch_add(1, Ordering::Relaxed)")
+            .expect("draw");
+        let wait = lock_fn
+            .find("while self.tickets.serving.load(Ordering::Acquire) != ticket {")
+            .expect("wait");
+        assert!(
+            save < draw && draw < wait,
+            "mask, then draw, then wait masked"
+        );
         // (2) the per-CPU guard projects only its CPU.
         let guard = &sched_src[sched_src.find("impl CpuSchedGuard<'_> {").expect("guard")..];
         let guard = &guard[..guard.find("\n}\n").expect("end")];

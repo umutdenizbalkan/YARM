@@ -84,10 +84,23 @@ def seal(events):
     return out
 
 
-def render(events, ok, ncpu=2, phase=2, overflow=0, transform=None, census_ok=None):
+# SCHED-LOCK-FAIR1: the fair-admission records the producer adds to every trace — the probe of
+# 1L[0] and of 1G (before the window opens) and the per-lock counters (at the dump). Slot 8 is 1G.
+FAIR_PROBE = [("FAIR_HOLD", 0, 0, [1, 7, 2, 1]), ("FAIR_PEER", 0, 1, [1, 8, 1]),
+              ("FAIR_REACQ", 0, 0, [1, 9, 1, 9, 7]),
+              ("FAIR_HOLD", 8, 0, [2, 3, 2, 1]), ("FAIR_PEER", 8, 1, [2, 4, 1]),
+              ("FAIR_REACQ", 8, 0, [2, 5, 1, 5, 3])]
+FAIR_STATS = [("FAIR_STAT", 0, 0, [120, 4, 1, 0, 3, 4]), ("FAIR_STAT", 1, 0, [80, 1, 1, 0, 0, 1]),
+              ("FAIR_STAT", 8, 0, [6, 1, 1, 0, 1, 1])]
+
+
+def render(events, ok, ncpu=2, phase=2, overflow=0, transform=None, census_ok=None, fair=None):
     """`ok` is the producer's success count, carried by both CENSUS_END and SL1W_END (they are
-    written from one counter); `census_ok` overrides CENSUS_END's alone."""
+    written from one counter); `census_ok` overrides CENSUS_END's alone. `fair` replaces the
+    fair-admission records (probe, stats)."""
     events = seal(events)
+    probe, stats = fair if fair is not None else (FAIR_PROBE, FAIR_STATS)
+    events = list(probe) + events + list(stats)
     events = [e if e[0] not in ("CENSUS_END", "CENSUS_BEGIN") else
               (e[0], e[1], e[2], [ok if census_ok is None else census_ok, 2] if e[0] == "CENSUS_END"
                else e[3][:4] + [ok if census_ok is None else census_ok] + e[3][5:]) + tuple(e[4:])
@@ -612,6 +625,26 @@ def cases():
     neg("lost wake at census", H, lambda ev: ev.pop(idx(ev, "CENSUS_Q", 1)), "natural:")
     neg("window not closed", H, lambda ev: None, "validity:", phase=1)
     neg("ring overflowed", H, lambda ev: None, "validity:", overflow=1)
+
+    # ── SCHED-LOCK-FAIR1: fair admission (a known earlier entrant overtaken) ────────────────
+    def fair_case(name, probe, stats, expect):
+        out.append((name, render(H, 2, fair=(probe, stats)), "fail", expect))
+    reacq_first = [e if e[0] != "FAIR_REACQ" or e[1] != 0 else (e[0], e[1], e[2], [1, 8, 1, 9, 7])
+                   for e in FAIR_PROBE]
+    fair_case("1L rapid re-acquire drew before the queued peer", reacq_first, FAIR_STATS, "fair-order:")
+    swapped = list(FAIR_PROBE)
+    swapped[1], swapped[2] = swapped[2], swapped[1]
+    fair_case("1L releasing holder served before the queued peer", swapped, FAIR_STATS, "fair-order:")
+    g_first = [e if e[0] != "FAIR_REACQ" or e[1] != 8 else (e[0], e[1], e[2], [2, 4, 1, 5, 3])
+               for e in FAIR_PROBE]
+    fair_case("1G rapid re-acquire drew before the queued peer", g_first, FAIR_STATS, "fair-order:")
+    gap = [e if e[0] != "FAIR_STAT" or e[1] != 1 else (e[0], e[1], e[2], [80, 1, 1, 2, 0, 1])
+           for e in FAIR_STATS]
+    fair_case("a 1L served tickets out of order", FAIR_PROBE, gap, "fair-order:")
+    wide = [e if e[0] != "FAIR_STAT" or e[1] != 8 else (e[0], e[1], e[2], [6, 1, 2, 0, 1, 1])
+            for e in FAIR_STATS]
+    fair_case("more than n-1 entrants ahead on 1G", FAIR_PROBE, wide, "fair-bound:")
+    fair_case("no 1G probe", [e for e in FAIR_PROBE if e[1] != 8], FAIR_STATS, "fair-coverage:")
 
     def torn(lines):
         return [l.replace("kind=SEC cpu=1 exec=0", "kind=SEC cpu=1 exec=1", 1) for l in lines]
