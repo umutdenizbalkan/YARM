@@ -1,0 +1,9 @@
+[futex-sync-witness] building base aarch64 artifacts with futex-requeue-witness,futex-time-witness,futex-sync-witness
+[futex-sync-witness] rebuilding kernel_boot with aarch64-shared-region-direct-oracle,futex-time-witness
+[futex-sync-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+[futex-sync-witness][fail] cell reported FSW_FAIL what=C3X
+[futex-sync-witness][fail] FSW_DONE result=fail
+[futex-sync-witness][fail] FSW_WAITER_DONE fails=1
+[futex-sync-witness][fail] C3 X: result notified, the sequence requires timed_out
+[futex-sync-witness][fail] C3: X's wait must end by one TIMEOUT: ['WAKE']
+FUTEX_SYNC_WITNESS_SEAL arch=aarch64 smp=2 result=fail admits_L2_W=1 admits_L3_W=1 admits_L3b_W=1 admits_C1_W=2 admits_C2_W=1 admits_C3_X=1 admits_C3_C=1 c1_waits=2 ops=10

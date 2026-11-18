@@ -1,0 +1,3 @@
+[futex-sync-witness] building base x86_64 artifacts with futex-requeue-witness,futex-time-witness,futex-sync-witness
+[futex-sync-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle,futex-time-witness
+[futex-sync-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1

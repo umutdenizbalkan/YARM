@@ -1,0 +1,295 @@
+   Compiling yarm-kernel v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fst1-ncdry2/crates/yarm-kernel)
+   Compiling yarm-ipc-abi v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fst1-ncdry2/crates/yarm-ipc-abi)
+   Compiling yarm-user-rt v0.1.0 (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fst1-ncdry2/crates/yarm-user-rt)
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1513:5
+     |
+1513 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1512:5
+     |
+1512 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: `yarm-user-rt` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.10s
+     Running unittests src/lib.rs (/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fst1-ncdry2-target/debug/build/yarm-user-rt/0954aa6adec9ea2c/out/yarm_user_rt-0954aa6adec9ea2c)
+
+running 29 tests
+test futex_sync_tests::b01_broadcast_marks_contended_first_and_continues_after_a_capacity_stop ... ok
+test futex_sync_tests::b02_a_moved_sequence_falls_back_to_waking_every_sequence_waiter ... ok
+test futex_sync_tests::c01_timeout_returns_with_the_mutex_held ... ok
+test futex_sync_tests::c02_error_returns_with_the_mutex_held ... ok
+test futex_sync_tests::c03_timeout_after_requeue_reacquires_without_a_deadline ... ok
+test futex_sync_tests::c04_notification_between_observation_and_park_is_not_lost ... ok
+test futex_sync_tests::c05_predicate_false_then_true_across_a_spurious_return ... FAILED
+test futex_sync_tests::c06_predicate_satisfied_at_the_timeout_boundary_wins ... ok
+test futex_sync_tests::c07_predicate_still_false_at_the_timeout_returns_timed_out_with_the_mutex ... ok
+test futex_sync_tests::c08_sequence_churn_cannot_carry_the_predicate_wait_past_its_deadline ... FAILED
+test futex_sync_tests::c09_relative_predicate_wait_computes_one_deadline ... FAILED
+test futex_sync_tests::c10_predicate_satisfied_initially_needs_no_wait ... ok
+test futex_sync_tests::c11_predicate_wait_reports_an_error_with_the_mutex_held ... ok
+test futex_sync_tests::e01_protected_data_under_mixed_timed_and_ordinary_lockers ... ok
+test futex_sync_tests::e02_timeouts_under_a_held_lock_strand_no_ordinary_waiter ... ok
+test futex_sync_tests::e03_broadcast_with_mixed_waiters_and_a_timeout_after_requeue ... ok
+test futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals ... FAILED
+test futex_sync_tests::m01_uncontended_acquires_even_with_a_passed_deadline ... ok
+test futex_sync_tests::m02_contended_with_a_passed_deadline_times_out_at_admission ... ok
+test futex_sync_tests::m03_contended_success_keeps_the_word_contended ... ok
+test futex_sync_tests::m04_genuine_timeout_leaves_the_owner_its_lock ... ok
+test futex_sync_tests::m05_mutex_free_at_the_boundary_is_acquired ... ok
+test futex_sync_tests::m06_unavailable_clock_fails_without_ownership ... ok
+test futex_sync_tests::m07_repeated_wakes_reuse_the_original_deadline_and_stop_at_it ... FAILED
+test futex_sync_tests::m08_value_changed_churn_cannot_carry_the_lock_past_its_deadline ... FAILED
+test futex_sync_tests::m09_sole_wake_after_the_deadline_acquires_instead_of_abandoning ... ok
+test futex_sync_tests::m10_sole_wake_lost_to_a_barger_transfers_wake_responsibility ... FAILED
+test futex_sync_tests::m11_relative_lock_reads_the_clock_once_and_refuses_overflow ... FAILED
+test futex_sync_tests::m12_untimed_and_timed_waiters_interoperate_on_one_word ... ok
+
+failures:
+
+---- futex_sync_tests::c05_predicate_false_then_true_across_a_spurious_return stdout ----
+
+thread 'futex_sync_tests::c05_predicate_false_then_true_across_a_spurious_return' (7019) panicked at crates/yarm-user-rt/src/futex_sync_tests.rs:655:5:
+assertion `left == right` failed
+  left: [Some(9000000), Some(1009000000)]
+ right: [Some(9000000), Some(9000000)]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<alloc::vec::Vec<core::option::Option<u64>>, alloc::vec::Vec<core::option::Option<u64>>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_user_rt::futex_sync_tests::c05_predicate_false_then_true_across_a_spurious_return
+             at ./src/futex_sync_tests.rs:655:5
+   5: yarm_user_rt::futex_sync_tests::c05_predicate_false_then_true_across_a_spurious_return::{closure#0}
+             at ./src/futex_sync_tests.rs:626:60
+   6: <yarm_user_rt::futex_sync_tests::c05_predicate_false_then_true_across_a_spurious_return::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- futex_sync_tests::c08_sequence_churn_cannot_carry_the_predicate_wait_past_its_deadline stdout ----
+
+thread 'futex_sync_tests::c08_sequence_churn_cannot_carry_the_predicate_wait_past_its_deadline' (7022) panicked at crates/yarm-user-rt/src/futex_sync_tests.rs:154:14:
+a wait parked with no scripted event: it would block forever
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic_display::<&str>
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:259:5
+   3: core::option::expect_failed
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/option.rs:2262:5
+   4: <core::option::Option<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a yarm_user_rt::futex_sync_tests::Sim,), Output = yarm_user_rt::futex_sync_tests::Park>>>>::expect
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/option.rs:971:21
+   5: <yarm_user_rt::futex_sync_tests::Sim as yarm_user_rt::futex_sync::FutexOps>::wait
+             at ./src/futex_sync_tests.rs:154:14
+   6: <yarm_user_rt::futex_sync::FutexCondvar>::wait_until_with::<yarm_user_rt::futex_sync_tests::Sim>
+             at ./src/lib.rs:2542:30
+   7: <yarm_user_rt::futex_sync::FutexCondvar>::wait_while_until_with::<yarm_user_rt::futex_sync_tests::Sim, yarm_user_rt::futex_sync_tests::c08_sequence_churn_cannot_carry_the_predicate_wait_past_its_deadline::{closure#1}>
+             at ./src/lib.rs:2599:28
+   8: yarm_user_rt::futex_sync_tests::c08_sequence_churn_cannot_carry_the_predicate_wait_past_its_deadline
+             at ./src/futex_sync_tests.rs:711:18
+   9: yarm_user_rt::futex_sync_tests::c08_sequence_churn_cannot_carry_the_predicate_wait_past_its_deadline::{closure#0}
+             at ./src/futex_sync_tests.rs:701:74
+  10: <yarm_user_rt::futex_sync_tests::c08_sequence_churn_cannot_carry_the_predicate_wait_past_its_deadline::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  11: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- futex_sync_tests::c09_relative_predicate_wait_computes_one_deadline stdout ----
+
+thread 'futex_sync_tests::c09_relative_predicate_wait_computes_one_deadline' (7023) panicked at crates/yarm-user-rt/src/futex_sync_tests.rs:738:5:
+assertion `left == right` failed
+  left: [Some(50007000), Some(1050007000), Some(2050007000)]
+ right: [Some(50007000), Some(50007000), Some(50007000)]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<alloc::vec::Vec<core::option::Option<u64>>, alloc::vec::Vec<core::option::Option<u64>>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_user_rt::futex_sync_tests::c09_relative_predicate_wait_computes_one_deadline
+             at ./src/futex_sync_tests.rs:738:5
+   5: yarm_user_rt::futex_sync_tests::c09_relative_predicate_wait_computes_one_deadline::{closure#0}
+             at ./src/futex_sync_tests.rs:721:55
+   6: <yarm_user_rt::futex_sync_tests::c09_relative_predicate_wait_computes_one_deadline::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals stdout ----
+
+thread 'futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals' (7048) panicked at crates/yarm-user-rt/src/futex_sync_tests.rs:1279:9:
+one deadline: [Some(30000096426), Some(31000096426), Some(32000096426), Some(33000096426)]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals::{closure#0}
+             at ./src/futex_sync_tests.rs:1279:9
+   3: std::thread::scoped::scope::<yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals::{closure#0}, ()>::{closure#0}
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/scoped.rs:158:51
+   4: <core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope<yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals::{closure#0}, ()>::{closure#0}> as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panic/unwind_safe.rs:272:9
+   5: std::panicking::catch_unwind::do_call::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope<yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals::{closure#0}, ()>::{closure#0}>, ()>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:573:43
+   6: __rust_try
+   7: std::panicking::catch_unwind::<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope<yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals::{closure#0}, ()>::{closure#0}>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:541:19
+   8: std::panic::catch_unwind::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope<yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals::{closure#0}, ()>::{closure#0}>, ()>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panic.rs:359:14
+   9: std::thread::scoped::scope::<yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals::{closure#0}, ()>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/scoped.rs:158:18
+  10: yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals
+             at ./src/futex_sync_tests.rs:1255:5
+  11: yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals::{closure#0}
+             at ./src/futex_sync_tests.rs:1216:66
+  12: <yarm_user_rt::futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  13: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- futex_sync_tests::m07_repeated_wakes_reuse_the_original_deadline_and_stop_at_it stdout ----
+
+thread 'futex_sync_tests::m07_repeated_wakes_reuse_the_original_deadline_and_stop_at_it' (7056) panicked at crates/yarm-user-rt/src/futex_sync_tests.rs:154:14:
+a wait parked with no scripted event: it would block forever
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic_display::<&str>
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:259:5
+   3: core::option::expect_failed
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/option.rs:2262:5
+   4: <core::option::Option<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a yarm_user_rt::futex_sync_tests::Sim,), Output = yarm_user_rt::futex_sync_tests::Park>>>>::expect
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/option.rs:971:21
+   5: <yarm_user_rt::futex_sync_tests::Sim as yarm_user_rt::futex_sync::FutexOps>::wait
+             at ./src/futex_sync_tests.rs:154:14
+   6: <yarm_user_rt::futex_sync::FutexMutex>::lock_until_with::<yarm_user_rt::futex_sync_tests::Sim>
+             at ./src/lib.rs:2424:27
+   7: yarm_user_rt::futex_sync_tests::m07_repeated_wakes_reuse_the_original_deadline_and_stop_at_it
+             at ./src/futex_sync_tests.rs:357:18
+   8: yarm_user_rt::futex_sync_tests::m07_repeated_wakes_reuse_the_original_deadline_and_stop_at_it::{closure#0}
+             at ./src/futex_sync_tests.rs:344:67
+   9: <yarm_user_rt::futex_sync_tests::m07_repeated_wakes_reuse_the_original_deadline_and_stop_at_it::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  10: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- futex_sync_tests::m08_value_changed_churn_cannot_carry_the_lock_past_its_deadline stdout ----
+
+thread 'futex_sync_tests::m08_value_changed_churn_cannot_carry_the_lock_past_its_deadline' (7057) panicked at crates/yarm-user-rt/src/futex_sync_tests.rs:154:14:
+a wait parked with no scripted event: it would block forever
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic_display::<&str>
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:259:5
+   3: core::option::expect_failed
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/option.rs:2262:5
+   4: <core::option::Option<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a yarm_user_rt::futex_sync_tests::Sim,), Output = yarm_user_rt::futex_sync_tests::Park>>>>::expect
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/option.rs:971:21
+   5: <yarm_user_rt::futex_sync_tests::Sim as yarm_user_rt::futex_sync::FutexOps>::wait
+             at ./src/futex_sync_tests.rs:154:14
+   6: <yarm_user_rt::futex_sync::FutexMutex>::lock_until_with::<yarm_user_rt::futex_sync_tests::Sim>
+             at ./src/lib.rs:2424:27
+   7: yarm_user_rt::futex_sync_tests::m08_value_changed_churn_cannot_carry_the_lock_past_its_deadline
+             at ./src/futex_sync_tests.rs:387:18
+   8: yarm_user_rt::futex_sync_tests::m08_value_changed_churn_cannot_carry_the_lock_past_its_deadline::{closure#0}
+             at ./src/futex_sync_tests.rs:376:69
+   9: <yarm_user_rt::futex_sync_tests::m08_value_changed_churn_cannot_carry_the_lock_past_its_deadline::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  10: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- futex_sync_tests::m10_sole_wake_lost_to_a_barger_transfers_wake_responsibility stdout ----
+
+thread 'futex_sync_tests::m10_sole_wake_lost_to_a_barger_transfers_wake_responsibility' (7059) panicked at crates/yarm-user-rt/src/futex_sync_tests.rs:154:14:
+a wait parked with no scripted event: it would block forever
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic_display::<&str>
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:259:5
+   3: core::option::expect_failed
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/option.rs:2262:5
+   4: <core::option::Option<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a yarm_user_rt::futex_sync_tests::Sim,), Output = yarm_user_rt::futex_sync_tests::Park>>>>::expect
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/option.rs:971:21
+   5: <yarm_user_rt::futex_sync_tests::Sim as yarm_user_rt::futex_sync::FutexOps>::wait
+             at ./src/futex_sync_tests.rs:154:14
+   6: <yarm_user_rt::futex_sync::FutexMutex>::lock_until_with::<yarm_user_rt::futex_sync_tests::Sim>
+             at ./src/lib.rs:2424:27
+   7: yarm_user_rt::futex_sync_tests::m10_sole_wake_lost_to_a_barger_transfers_wake_responsibility
+             at ./src/futex_sync_tests.rs:436:18
+   8: yarm_user_rt::futex_sync_tests::m10_sole_wake_lost_to_a_barger_transfers_wake_responsibility::{closure#0}
+             at ./src/futex_sync_tests.rs:423:66
+   9: <yarm_user_rt::futex_sync_tests::m10_sole_wake_lost_to_a_barger_transfers_wake_responsibility::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  10: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- futex_sync_tests::m11_relative_lock_reads_the_clock_once_and_refuses_overflow stdout ----
+
+thread 'futex_sync_tests::m11_relative_lock_reads_the_clock_once_and_refuses_overflow' (7060) panicked at crates/yarm-user-rt/src/futex_sync_tests.rs:469:5:
+assertion `left == right` failed: one deadline, computed from the first reading
+  left: [Some(5001000), Some(1005001000)]
+ right: [Some(5001000), Some(5001000)]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:447:23
+   3: core::panicking::assert_failed::<alloc::vec::Vec<core::option::Option<u64>>, alloc::vec::Vec<core::option::Option<u64>>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_user_rt::futex_sync_tests::m11_relative_lock_reads_the_clock_once_and_refuses_overflow
+             at ./src/futex_sync_tests.rs:469:5
+   5: yarm_user_rt::futex_sync_tests::m11_relative_lock_reads_the_clock_once_and_refuses_overflow::{closure#0}
+             at ./src/futex_sync_tests.rs:452:65
+   6: <yarm_user_rt::futex_sync_tests::m11_relative_lock_reads_the_clock_once_and_refuses_overflow::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    futex_sync_tests::c05_predicate_false_then_true_across_a_spurious_return
+    futex_sync_tests::c08_sequence_churn_cannot_carry_the_predicate_wait_past_its_deadline
+    futex_sync_tests::c09_relative_predicate_wait_computes_one_deadline
+    futex_sync_tests::e04_predicate_wait_with_one_deadline_across_spurious_signals
+    futex_sync_tests::m07_repeated_wakes_reuse_the_original_deadline_and_stop_at_it
+    futex_sync_tests::m08_value_changed_churn_cannot_carry_the_lock_past_its_deadline
+    futex_sync_tests::m10_sole_wake_lost_to_a_barger_transfers_wake_responsibility
+    futex_sync_tests::m11_relative_lock_reads_the_clock_once_and_refuses_overflow
+
+test result: FAILED. 21 passed; 8 failed; 0 ignored; 0 measured; 113 filtered out; finished in 0.46s
+
+error: test failed, to rerun pass `-p yarm-user-rt --lib`

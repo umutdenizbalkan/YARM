@@ -1,0 +1,9 @@
+[futex-sync-witness][fail] cell reported FSW_FAIL what=ownership
+[futex-sync-witness][fail] FSW_DONE result=fail
+[futex-sync-witness][fail] FSW_WAITER_DONE fails=1
+[futex-sync-witness][fail] C2 W: returned without proven ownership: held=0 owner_ok=1 state_ok=1
+[futex-sync-witness][fail] C3: C's wait must end by a WAKE on the mutex word after the release: [('WAKE', '0x471278')]
+[futex-sync-witness][fail] C3: A returned before the release (without the mutex)
+[futex-sync-witness][fail] C3: X returned before the release (without the mutex)
+[futex-sync-witness][fail] C3: C returned before the release (without the mutex)
+FUTEX_SYNC_WITNESS_SEAL arch=riscv64 smp=2 result=fail admits_L2_W=1 admits_L3_W=1 admits_L3b_W=1 admits_C1_W=2 admits_C2_W=1 admits_C3_X=1 admits_C3_C=1 c1_waits=2 ops=10

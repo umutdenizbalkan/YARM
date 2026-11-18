@@ -1,0 +1,3 @@
+721c4778c259bed05015c9633ce143411e340e3586b7d546997f9ab66f08f1b3  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fst1-evidence/qual/W3/boot.log
+cc8f3a64685e8886aea091c7ae002a0d91065bc4eb48b8b891ad9b51c4f47d78  build-riscv64/yarm-riscv64.bin
+bbaf5a158653f22933aa914e1d8de7bb0065379a6174c6b81d5027f0bf243bd8  build-riscv64/initramfs-core.cpio

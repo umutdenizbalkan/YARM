@@ -1,0 +1,2 @@
+[futex-sync-witness] building base aarch64 artifacts with futex-requeue-witness,futex-time-witness,futex-sync-witness
+[futex-sync-witness] rebuilding kernel_boot with aarch64-shared-region-direct-oracle,futex-time-witness

@@ -1,0 +1,1 @@
+dry2: nc3 was the old (busy-loop) mutation; rt run OOM-killed in c03 (host memcg), k run killed by hand at 6.3 GB RSS. Superseded by dry3.

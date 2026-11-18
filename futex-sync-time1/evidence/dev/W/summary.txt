@@ -1,0 +1,8 @@
+riscv64-dev2 rc=0
+aarch64-dev1 STOPPED-INVALID (tree changed during build)
+aarch64-dev2 rc=1
+x86_64-dev1, aarch64-dev3 STOPPED (concurrent scripts)
+aarch64-dev4 rc=0
+x86_64-dev2 rc=0
+riscv64-dev3 rc=0
+ALLDONE

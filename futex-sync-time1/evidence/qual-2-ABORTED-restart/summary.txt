@@ -1,0 +1,7 @@
+fst1 qual start 2026-11-17T22:24:53Z C=f88db55a2cd0a9d979b08a2ab5ce6b54feda0443 B=253ca580 sha=204e112beb19f1cd nc=0f02386fd6caf412
+=== H1_fmt [f88db55a2cd0 porcelain=0]: cargo fmt --all -- --check (start 22:24:53)
+H1_fmt rc=0 secs=6
+=== H2_hosted_lib [f88db55a2cd0 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 22:24:59)
+H2_hosted_lib rc=0 secs=105
+=== H3_integration [f88db55a2cd0 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 22:26:44)
+ABORTED: host worker restarted at ~22:28Z (uptime reset) during H3_integration; no result. Retained; superseded by qual-3 (same candidate, runner, grader, NCs).

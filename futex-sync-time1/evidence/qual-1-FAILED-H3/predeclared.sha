@@ -1,0 +1,6 @@
+204e112beb19f1cdfcb18180a72f0e801e88714ebf46076854d4115f15f4cd10  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fst1-evidence/fst1_qual.sh
+0f02386fd6caf412c5bbaa0f0f05a71f8f53e30a07de5f697e28b61f87dfa42e  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fst1-nc/nc.py
+08f3ff3548da0f40136d004c3b972a792e063850469f1248eaaf05fb3d150f37  scripts/grade-futex-sync-witness.py
+d0f1ac597243274b03b61650a58cdcaf310efa8178f5163df41b00156b8e980c  scripts/qemu-futex-sync-witness-smoke.sh
+23db01aaced2d601601da4534fc6dc115702bd6f9e49ce4af47e5c28241d84bc  scripts/grade-futex-time-witness.py
+candidate 3bd3e7dddea4d6188464ec975196bcc0ead4012e tree 41ec5ee2caeaa53c508ed5e986b2067758db0513

@@ -1,0 +1,19 @@
+fst1 qual start 2026-11-17T22:13:35Z C=3bd3e7dddea4d6188464ec975196bcc0ead4012e B=253ca580 sha=204e112beb19f1cd nc=0f02386fd6caf412
+=== H1_fmt [3bd3e7dddea4 porcelain=0]: cargo fmt --all -- --check (start 22:13:35)
+H1_fmt rc=0 secs=6
+=== H2_hosted_lib [3bd3e7dddea4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 22:13:41)
+H2_hosted_lib rc=0 secs=141
+=== H3_integration [3bd3e7dddea4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 22:16:02)
+H3_integration rc=101 secs=214
+=== H4_subset_sync_time1 [3bd3e7dddea4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sync_time1 (start 22:19:36)
+H4_subset_sync_time1 rc=0 secs=0
+=== H4_subset_r30_the_contended_state [3bd3e7dddea4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 r30_the_contended_state (start 22:19:36)
+H4_subset_r30_the_contended_state rc=0 secs=0
+=== H4_subset_futex_requeue1 [3bd3e7dddea4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 futex_requeue1 (start 22:19:36)
+H4_subset_futex_requeue1 rc=0 secs=19
+=== H4_subset_abs_bitset1 [3bd3e7dddea4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 abs_bitset1 (start 22:19:55)
+H4_subset_abs_bitset1 rc=0 secs=1
+=== H4_subset_time1 [3bd3e7dddea4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 time1 (start 22:19:56)
+H4_subset_time1 rc=0 secs=1
+=== H4_subset_futex [3bd3e7dddea4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 futex (start 22:19:57)
+STOPPED by hand at 2026-11-17T22:20:13Z after H3_integration rc=101 (broad_lock_census_guard: thread_local .with( in futex_sync_tests.rs counted as broad callsites). Candidate 3bd3e7dd NOT qualified; superseded by qual-2 on a new candidate.

@@ -1,0 +1,5 @@
+[futex-sync-witness] building base riscv64 artifacts with futex-requeue-witness,futex-time-witness,futex-sync-witness
+[futex-sync-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,futex-time-witness
+[futex-sync-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+FUTEX_SYNC_WITNESS_SEAL arch=riscv64 smp=2 result=fail reason=no_boot_log
+rc=1

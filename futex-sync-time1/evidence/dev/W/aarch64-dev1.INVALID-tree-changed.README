@@ -1,0 +1,1 @@
+INVALID: crates/yarm-user-rt/src/lib.rs was mutated (NC3 trial) and then reverted to HEAD while this run was building; stopped, retained, not graded. Superseded by aarch64-dev2.

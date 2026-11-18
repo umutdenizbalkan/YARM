@@ -1,0 +1,5 @@
+nc1_reset_deadline_on_retry rt_rc=101 rt_failed=8 k_rc=101 k_failed=2
+nc2_timeout_without_reacquire rt_rc=101 rt_failed=5 k_rc=101 k_failed=1
+nc3_drop_contended rt_rc=101 rt_failed=1 k_rc=101 k_failed=0
+nc4_no_predicate_recheck rt_rc=101 rt_failed=5 k_rc=101 k_failed=1
+ALLDONE

@@ -1,0 +1,1 @@
+x86_64-dev1 and aarch64-dev3: STOPPED by hand — two dev scripts ran concurrently in one worktree and x86_64-dev1's build straddled the confirm_parked edit. Retained, not graded.
