@@ -37096,3 +37096,106 @@ as `qual-aborted-1`.
 | not run | a `--workspace` run; the historical matrix |
 
 **Verdict: QUALIFIED** on `a8d7952d`.
+
+#### FUTEX-SYNC-TIME1 (from qualified `253ca580`)
+
+The seventh pass of this series, on `wip/futex-sync-time1`.
+
+**Timed mutex acquisition and absolute condition-variable waits, in the user runtime.** The timed
+forms of `yarm_user_rt::futex_sync` are built on FUTEX-ABS-BITSET1's primitives (NR 9 with an
+absolute `CLOCK_MONOTONIC` deadline, NR 10, NR 17, the monotonic clock): no new waiter mechanism,
+no kernel change outside `cfg(test)`, ABI v13 unchanged. The API, the protocol and the predicate
+rule are `SYSCALL_ABI.md` (*Timed mutex and condition-variable waits*); `SCHEDULING_CONTRACT.md`
+§25.6 points there.
+
+- **Results.** `lock_until` / `lock_timeout` → `LockOutcome::{Acquired, TimedOut, Failed}`;
+  `wait_until` / `wait_timeout` → `WaitOutcome::{Notified, TimedOut, Failed}` (the earlier `bool`
+  `wait_timeout` is replaced); `wait_while_until` / `wait_while_timeout` →
+  `WaitWhileOutcome::{Satisfied, TimedOut, Failed}`. A condition wait returns with the mutex
+  held on every path.
+- **Mutex.** The 0/1/2 word is kept: fast path `compare_exchange(0 → 1, Acquire)`, unlock
+  `swap(0, Release)` plus one wake when the old value was `2`. The slow path acquires only by
+  `swap(2, Acquire)` and never turns `2` into `1`. A timed waiter gives up only after a swap that
+  found another owner, which leaves the word `2`, so that owner's unlock wakes the next waiter. A
+  waiter that received the sole wake and resumes after its deadline finds the unlock's `0` and
+  acquires. Every retry passes the original instant; after a wake, `ValueChanged` or a spurious
+  return the clock is checked against it before waiting again. A wake's `0` is never read as "no
+  waiters".
+- **Condition variable.** The lost-wakeup protocol is unchanged (sequence read under the mutex,
+  compared by NR 9). Reacquisition goes through the contended path with no deadline on every
+  return (timeout on the sequence, timeout after a requeue onto the mutex word, error), and the
+  pending result is returned with the mutex held. The predicate loop evaluates the predicate only
+  under the mutex, rechecks it after every reacquisition, never takes a notification as
+  satisfaction, and checks the one deadline after every notified round. Frozen rule: a predicate
+  satisfied under the reacquired mutex wins over a timeout in the same round; errors are always
+  reported.
+- **Relative helpers** read the clock once; overflow and a duration wider than `u64` ns are
+  `Failed(InvalidArgs)`, a missing clock `Failed(Unavailable)`, both before anything is attempted.
+- **Broadcast** is unchanged: `CONTENDED` stored, then NR 17 wakes one and moves the rest; a moved
+  timed waiter keeps its deadline on the mutex word and, expiring there, still reacquires.
+- **Seam.** `FutexOps` (`wait`, `wake`, `cmp_requeue`, `monotonic_now`); the plain functions are
+  the `*_with` forms over `Syscalls`.
+
+**Tests.**
+- `yarm-user-rt` `futex_sync_tests` (29): a deterministic backend that applies NR 9's admission
+  order with scripted interleavings (m01–m12, c01–c11, b01–b02), and a threaded futex emulation
+  (e01–e04). Both fail a stranded waiter and refuse busy polling.
+- `futex_requeue1::sync_time1` (7): the runtime code against the kernel's futex owners, one OS
+  thread per task: collector timeout (st01), the sole wake after the deadline (st02), a barger
+  (st03), a timeout after requeue with waiters behind (st04), the predicate re-wait with one
+  deadline (st05), an RT condition waiter whose budget is exhausted when its timeout settles it:
+  it stays budget-parked inside the wait until replenishment, then returns `TimedOut` once with
+  the mutex (st06), a shared word (st07). RT and budgets are reached through the production
+  scheduler owners; private scope everywhere except st07.
+- The live cell (`futex-sync-witness`, init roles W, H, A, X, C) runs L1–L3b and C1–C3 over the
+  real system calls on SMP2; `scripts/grade-futex-sync-witness.py` checks results, ownership,
+  one deadline per operation against the kernel's admission markers, and each terminal owner.
+
+**Guard re-derived:** `r30_the_contended_state_protocol_guarantees_eventual_target_wakeup` reads
+the `*_with` forms (the store before `ops.cmp_requeue`; park, then relock, then the result).
+
+**Found on the way (dev runs, kept):**
+- the witness's parked-waiter confirmation moved a partial set to its scratch word and back, which
+  could put the oldest waiter behind a later arrival (`aarch64-dev2`: the broadcast's one wake
+  correctly went to the head, which was then X). It now accumulates the waiters and moves all of
+  them back in one call;
+- the first NC3 (slow path swapping `1`) made the waits spin without parking and exhausted host
+  memory (a dev dry run, OOM-killed). NC3 now drops `CONTENDED` after each slow-path acquisition,
+  which is the intended defect, and every backend refuses busy polling.
+- dev runs invalidated by the host (disk full) or by the tree changing during a build are kept
+  and labelled.
+
+**Commits.**
+- `3bd3e7dd`: the runtime API and protocol, the seam, the hosted tests, the witness cell, its
+  smoke script and grader, the ABI documentation.
+- `f88db55a`: the runtime tests' spin counter uses `LocalKey::get`/`set`. The thread-local `with`
+  closure had been counted by `tests/broad_lock_census_guard.rs` as two broad `SharedKernel::with`
+  callsites (qualification run 1, H3). Behaviour is unchanged.
+- The documentation commit follows it.
+
+The runner, `nc.py`, both graders and the smoke script were hashed before each run
+(`predeclared.sha`). Every log was kept. Run 1 on `3bd3e7dd` failed at H3 (the census guard
+above) and was stopped; it is kept as `qual-1-FAILED-H3`. Run 2 on `f88db55a` was cut off by a
+host restart during H3 and is kept as `qual-2-ABORTED-restart`. Run 3 used the same candidate,
+runner and controls, and is the run below.
+
+Reused rather than rerun: this pass changes no kernel source outside `cfg(test)`. So the hosted
+lock-order baseline is the FUTEX-ABS-BITSET1 candidate run (`a8d7952d`, code-identical to
+`253ca580`), and the kernel-level timed and bitset witness is pass 6's W1–W3.
+
+| step | result |
+|---|---|
+| hosted | fmt; serial lib, 6,776 passed; `--tests`, 43 binaries, 7,173 passed; `yarm-user-rt` 142 (`futex_sync_tests` 29), `yarm-kernel` 10, `yarm-ipc-abi` 211; both grader self-tests; 12 focused subsets, each non-zero (`sync_time1` 7, the r30 guard 1, `futex_requeue1` 208, `abs_bitset1` 18, `time1` 80, `futex` 353, `rt1b_` 18, `sched_budget` 5, `rt1a_` 15); contract gate; doc enforcement |
+| checks | the default kernel, the witness kernel, the sync witness init and the pass-6 time witness init, on all three targets |
+| lock order | 30 descending-pair types on C and on the reused `a8d7952d` run, none new |
+| builds | default x86_64, AArch64 and RISC-V artifacts, C and B. C's kernels are byte-identical to B's and to FUTEX-ABS-BITSET1's (`31ef01f8…`, `87e2befe…`, `0d0791af…`). In the core initramfs, AArch64 is identical. On x86_64 and RISC-V every user binary's `.text`, `.rodata` and `.data` are identical to B's (26 binaries); only local symbol names differ, through LLVM's per-module hash of the changed runtime crate |
+| sizes | kernel `.text`, `.rodata`, `.data` and `.bss` unchanged on all three ports. The timed functions are linked only into the witness init; no default binary uses them |
+| core smokes | the default C kernels, SMP2, each port: GP, RT and RT + `yarm.sched_budget=on` (`result=enforced`) pass |
+| W1 x86_64 SMP2 | `FUTEX_SYNC_WITNESS_SEAL … result=ok`, every rule R1–R6 |
+| W2 AArch64 SMP2 | `result=ok` |
+| W3 RISC-V SMP2 | `result=ok` |
+| negative controls | hosted, runtime suite / kernel suite: deadline reset on retry, 8 / 2 tests fail; condvar timeout without reacquiring, 5 / 1; `CONTENDED` dropped after a slow-path acquisition, 8 / 2 (stranded waiters, lost contended state); predicate recheck suppressed, 5 / 1. Live RISC-V (full build), timeout without reacquiring: C2 returns `timed_out held=0`, `result=fail`. Tree restored, porcelain 0 |
+| gaps kept visible | the inherited wake-capacity limitation (a `0` from a wake may be a capacity refusal); no fairness guarantee (a barger may take a free mutex before a woken waiter); timeout lateness bounded only by the collector cadence; no priority inheritance; no realtime clock or POSIX conformance claim; FUTEX-SEAL1 is pass 8 |
+| not run | a `--workspace` run; the historical matrix; stack-depth measurement |
+
+**Verdict: QUALIFIED** on `f88db55a`.
