@@ -37199,3 +37199,235 @@ lock-order baseline is the FUTEX-ABS-BITSET1 candidate run (`a8d7952d`, code-ide
 | not run | a `--workspace` run; the historical matrix; stack-depth measurement |
 
 **Verdict: QUALIFIED** on `f88db55a`.
+
+#### FUTEX-SEAL1 (from qualified `c4cac895`)
+
+The eighth and sealing pass of the futex series, on `wip/futex-seal1`. It reaches two separate
+conclusions:
+- a correctness witness: the delivered kernel futexes, the runtime's timed mutex and condition
+  variable, and RT budgets work together on all three ports;
+- a measurement of what compare-requeue changes in a condition-variable broadcast.
+
+No production behaviour changes. ABI v13, the production broadcast and the scheduler policy are
+the baseline. Every addition is default-off witness code: `futex-seal-witness` in the kernel, and
+one init feature per cell.
+
+**The witness.**
+- **Kernel half (`kernel::seal_witness`).** Only the budget sequence needs it. No user ABI
+  configures a thread's budget, so every user thread gets the default `B = T = 64` ticks. A tick
+  that exhausts a running thread is itself the scheduling point that takes its CPU. So a waiter
+  cannot naturally be blocked with no budget at settlement. The only overlap is its NR 9 block
+  section falling between the clock owner's tick and its own CPU's next one: a timer-phase window,
+  not a reliable state. The exhaustion is therefore INDUCED, once, for one exact wait instance:
+  - init marks the instance by its expected word value (`BUDGET_MAGIC` in the high half), and
+    registration arms exactly that `(tid, generation)`;
+  - after the collector claims that instance's timeout, its reserved commit charges the context
+    its whole remaining budget through the production `sched_budget::charge`. The charge runs on
+    the home CPU, in the commit's own 1L section, after that section's budget sync applied every
+    due release, and immediately before the production placement decision;
+  - settlement's placement, the park (Ready, no queue position, rejoin slot held), the release,
+    the rejoin and the completion are all production code. The scheduler's `park` and
+    `budget_replenish` record the armed thread's events into stamped atomics (nothing is printed
+    under 1L), and a second marked wait prints the record (`FSEAL_K_BUDGET1/2`);
+  - a first form drained at registration (NR 9's park tail). It is kept as dev evidence: on
+    RISC-V a release preceded the settlement (`full1-riscv64-rtb`, graded INCONCLUSIVE), because
+    releases continue on the period grid while the waiter is blocked. In the commit section no
+    release can fall between the drain and the placement decision.
+- **Init cells**, one file each, run by feature in this order, then `FSEAL_ALL_END`:
+  - `os` (`futex_seal_os.rs`): selective wake;
+  - `nr17`: NR 17's unfiltered wake, then requeue, wake and expiry on the target;
+  - `lh`: the late sole-wake handoff;
+  - `pb` (`futex_seal_witness.rs`): the paired broadcast;
+  - `rb`: the budget sequence. It runs last because it is the only cell that arms the hook, so
+    the paired broadcast never runs with the hook armed.
+
+  x86_64 enters each cell through the existing naked-trampoline pattern.
+- **Grader** `scripts/grade-futex-seal-witness.py`: rules CORE, OS, NR17, LH, RB and PB (see its
+  docstring). Identities and words come from the kernel's markers wherever they exist, never from
+  the order of user lines. Its self-test covers a passing GP boot, a passing RT+budget boot and 21
+  mutants, each caught by its rule.
+- **Smoke** `scripts/qemu-futex-seal-witness-smoke.sh` (`SEAL_CELLS`, `SEAL_PROFILE=gp|rtb`).
+- The FUTEX-ABS-BITSET1 time cell (W_time) and the FUTEX-SYNC-TIME1 sync cell (W_sync) are rerun
+  in this pass for the claims they observe.
+
+**Claims, verdicts and where they come from.** Verdicts are from qualification run 3 (candidate
+`9d5282c4`). "Live ×3" means the named rule passed on x86_64, AArch64 and RISC-V SMP2 boots of
+that run. The seal boots ran under both GP and RT + budgets.
+
+| Claim | Evidence (rule — boot) | Verdict |
+|---|---|---|
+| Selective wake: a nonmatching waiter stays parked, keeps its order and consumes no count | OS: A(0x1), B(0x2), C(0x1); wakes select B, then A, then C, identities from the kernel's WAKE markers; A passed over by BITSET_SKIP before B's wake — seal gp/rtb | PASS, live ×3 |
+| NR 17 keeps mask and deadline | NR17: X (0x2, 4 s) moved N1→N2 times out ON N2 with its registered deadline and mask; FUTEX-ABS-BITSET1 C (masked requeue, then timeout, deadline and mask unchanged) — seal, time | PASS, live ×3 |
+| Wake and expiry after requeue | NR17: V2 woken on N2 (mask 0x4), X expires on N2; time D (requeued, then woken on the target) | PASS, live ×3 |
+| NR 17's wake portion is unfiltered | NR17: V (0x8) woken on N1 by NR 17's wake, never skipped | PASS, live ×3 |
+| Robust cleanup preserved | FUTEX-ABS-BITSET1 hosted tests (`abs_bitset1` subset, H2/H4 in this run) | PASS, hosted only (inherited): no system call registers a robust list, so there is no live registration path |
+| Wake-versus-timeout race, both winners | time G: 32 cycles, both WAKE- and TIMEOUT-won cycles observed, each with one terminal; winner named by the kernel's markers, never by a wake's return | PASS, live ×3 |
+| Full-home-queue expiry with pending placement, then one completion | time E: SATW_REFUSED class=futex full=1 for W's home, one FUTEX_TIMEOUT_EXPIRED_UNPLACED, then exactly one final TIMEOUT and W returns timed_out | PASS, live ×3 |
+| Timed lock and timeout | sync L1/L2/L3/L3b: one deadline per operation (R4), a timed-out lock leaves the word CONTENDED | PASS, live ×3 (FUTEX-SYNC-TIME1 cell, rerun) |
+| Late sole-wake handoff with a follower | LH: rounds whose wake landed at or after W's deadline (late) acquired the mutex; F completed with ownership after W's return; at least one late round | PASS, live ×3 (seal gp/rtb) |
+| Timed condvar waiter requeued onto its mutex; its deadline passes while another holds the mutex | sync C3: X registered on the sequence word, requeued by the broadcast, times out ON the mutex word with its registered deadline before the holder's release, returns holding the mutex | PASS, live ×3 |
+| `wait_while`'s Satisfied rule and the original deadline | sync C1 (re-wait after a spurious signal returns Satisfied; every admission names the one deadline); runtime hosted `futex_sync_tests` | PASS, live ×3 + hosted |
+| RT budget: settlement, Ready but budget-parked, replenishment, runtime return with the mutex; one completion and one rejoin | RB rtb: one INDUCED drain at the collector's commit, park stamped after the drain and before the commit, commit_parked=1, the first release stamped after the commit, one rejoin for that release, W returns timed_out holding and owning the mutex. Deadline graded in CLOCK_MONOTONIC (REGISTER/TIMEOUT now ≥ deadline), budget in global ticks (park tick < release ≤ rejoin tick) | PASS (INDUCED exhaustion), live ×3; gp boots: no budget context, nothing parked |
+| Paired broadcast measurement | PB: one oracle for both arms, every round clean in both arms | MEASURED (no threshold), live ×3 × gp/rtb |
+
+**Paired broadcast: compare-requeue against wake-all.**
+- **Setup.** Ten waiters, one mutex, one condition variable. Both arms use the same workers,
+  predicate, mutex hold and critical section. Each boot runs four paired rounds in ABBA order.
+- **Arms.** `rq` is the production `FutexCondvar::broadcast_with`. `wa` is the same Release
+  increment of the sequence followed by NR 10 on the sequence: witness-only, not in the
+  production API.
+- **Counting.** A `FutexOps` over the real system calls counts every futex call of the workers
+  and of the broadcaster.
+  - A "re-park" is a waiter's NR 9 on the mutex word that returned `Woken`, so it actually parked.
+    `ValueChanged` returns are counted separately.
+  - An unlock's wake call and the number it reported woken are counted separately, because a `0`
+    may be a capacity refusal.
+  - Dispatches and context switches are not counted: nothing in the witness attributes them.
+- **Raw counts.** One cell per round, in round order, from run 3. Every round of every arm was
+  clean on every port; no fallback or capacity-limited round occurred. Elapsed times are QEMU
+  observations, not latency bounds.
+
+| port | profile | arm | clean rounds | direct wakes | requeued | NR 17 calls | mutex re-parks (actually parked) | mutex `ValueChanged` | worker unlock wake calls / woke | broadcaster unlock calls / woke | elapsed median (min–max) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| x86_64 | gp | rq | 4/4 | 1 1 1 1 | 9 9 9 9 | 1 each | 0 0 0 0 | 0 0 0 0 | 10/8 10/8 10/8 10/8 | 1/1 1/1 1/1 1/1 | 480 ms (362–591) |
+| x86_64 | gp | wa | 4/4 | 10 10 10 10 | 0 0 0 0 | 0 | 0 0 0 0 | 0 0 0 0 | 10/0 10/0 10/0 10/0 | 0/0 0/0 0/0 0/0 | 508 ms (383–556) |
+| x86_64 | rtb | rq | 4/4 | 1 1 1 1 | 9 9 9 9 | 1 each | 0 0 0 0 | 0 0 0 0 | 10/8 10/8 10/8 10/8 | 1/1 1/1 1/1 1/1 | 477 ms (463–626) |
+| x86_64 | rtb | wa | 4/4 | 10 10 10 10 | 0 0 0 0 | 0 | 0 0 0 0 | 0 0 0 0 | 10/0 10/0 10/0 10/0 | 0/0 0/0 0/0 0/0 | 468 ms (390–557) |
+| aarch64 | gp | rq | 4/4 | 1 1 1 1 | 9 9 9 9 | 1 each | 0 0 0 0 | 0 0 0 0 | 10/8 10/8 10/8 10/8 | 1/1 1/1 1/1 1/1 | 96 ms (87–108) |
+| aarch64 | gp | wa | 4/4 | 10 10 10 10 | 0 0 0 0 | 0 | 0 0 0 0 | 0 0 0 0 | 10/0 10/0 10/0 10/0 | 0/0 0/0 0/0 0/0 | 96 ms (91–104) |
+| aarch64 | rtb | rq | 4/4 | 1 1 1 1 | 9 9 9 9 | 1 each | 0 0 0 0 | 0 0 0 0 | 10/8 10/8 10/8 10/8 | 1/1 1/1 1/1 1/1 | 98 ms (84–120) |
+| aarch64 | rtb | wa | 4/4 | 10 10 10 10 | 0 0 0 0 | 0 | 0 0 0 0 | 0 0 0 0 | 10/0 10/0 10/0 10/0 | 0/0 0/0 0/0 0/0 | 101 ms (84–115) |
+| riscv64 | gp | rq | 4/4 | 1 1 1 1 | 9 9 9 9 | 1 each | 1 0 1 0 | 0 0 0 0 | 10/9 10/8 10/9 10/8 | 1/1 1/1 1/1 1/1 | 1870 ms (1633–2347) |
+| riscv64 | gp | wa | 4/4 | 10 10 10 10 | 0 0 0 0 | 0 | 0 0 0 0 | 0 0 0 0 | 10/0 10/0 10/0 10/0 | 0/0 0/0 0/0 0/0 | 1615 ms (1396–2840) |
+| riscv64 | rtb | rq | 4/4 | 1 1 1 1 | 9 9 9 9 | 1 each | 0 0 0 0 | 0 0 0 0 | 10/8 10/8 10/8 10/8 | 1/1 1/1 1/1 1/1 | 1830 ms (1652–2160) |
+| riscv64 | rtb | wa | 4/4 | 10 10 10 10 | 0 0 0 0 | 0 | 0 0 0 0 | 0 0 0 0 | 10/0 10/0 10/0 10/0 | 0/0 0/0 0/0 0/0 | 1930 ms (1867–2655) |
+
+What compare-requeue changed here:
+- **Fan-out.** The broadcast's direct wakes fall from 10 to 1. The other nine waiters are handed
+  the mutex one at a time by the unlock chain: the broadcaster's unlock and the workers' unlocks
+  together wake each of them once.
+- **One re-park.** In two RISC-V GP rounds the directly woken waiter itself parked once on the
+  mutex before acquiring (re-parks `1`), and the worker unlocks then woke 9.
+- **Wake-all's cost.** Its ten direct wakes did not turn into parking work: no waiter re-parked on
+  the mutex in any round of that arm on any port. On two vCPUs with this short critical section
+  the woken waiters ran one at a time. Its cost appears instead as ten worker unlock wake calls per
+  round that woke nobody (the contended lock marks the word `2` whether or not anyone parks).
+- Other boots of the same cell did see re-parks (totals over four rounds): wake-all 2 in
+  `full3-riscv64-rtb`, and wake-all 15 with compare-requeue 4 in run 2's `W_seal_gp_riscv64`.
+  So the zeros above are observations of these boots, not a property.
+
+**Budget sequence (RB, RT + budgets, INDUCED exhaustion).** Each domain is graded in its own
+units: the deadline in CLOCK_MONOTONIC, the budget in global scheduler ticks.
+
+| port | induced drains | park tick (CPU) | release instant | rejoin tick | rejoin lateness (ticks) | deadline → settled (CLOCK_MONOTONIC) |
+|---|---|---|---|---|---|---|
+| x86_64 | 1 | 43 (CPU 1) | 105 | 105 | 0 | 0.6 ms after |
+| aarch64 | 1 | 559 (CPU 1) | 594 | 628 | 34 | 0.6 ms after |
+| riscv64 | 1 | 3040 (CPU 1) | 3046 | 3065 | 19 | 10.3 ms after |
+
+**Found on the way (kept, each with its disposition).**
+- **Natural exhaustion.** It was not reliably reachable (above), so the exhaustion is induced. The
+  registration-time form was INCONCLUSIVE (`full1-riscv64-rtb`).
+- **Split budget record.** The kernel log truncates long lines, so the budget record is printed
+  as two lines.
+- **Invalid dev runs.** The x86_64 `full1` boots are INVALID: the tree changed under the run, and
+  artifact binding refused the boot.
+- **The FUTEX-ABS-BITSET1 time cell on RISC-V** depended on load in three ways, each a witness
+  assumption, none a kernel defect:
+  - **closing handoff** (run 1): init's handoff wake was refused for capacity and not retried
+    (`ac8be6dd`);
+  - **E's 10 s deadline lead** (run 2): the lead was shorter than the helper's re-fill under
+    saturation. The helper ran about once per rotation of a full queue, about 4 s under TCG. The
+    timeout found the vacated slot free and was placed (no `EXPIRED_UNPLACED`). Then the
+    helper's closing ack was refused for capacity, and W stayed parked until the wall timeout.
+    The fix is a 60 s lead and a retried ack (`f3a806f2`). That retry first used a flag cleared
+    by the next command, which hung the dev boot `time-fix-riscv64` after C. It is now keyed to
+    the command number (`9bd304d6`);
+  - **rule F's three samples**: in `time-fix2-riscv64` CPU 0 was busy (the supervisor's one-tick
+    poll) at 11 of the 13 ticks spanning the three A calls, and none was collected idle. Runs 1
+    and 2 were idle at about half of them, so three samples fail roughly one boot in eight even
+    then. The cell and the grader now use sixteen A calls; the rule is unchanged (`9d5282c4`).
+  - Earlier dev boots `time-dev-riscv64` (wall timeout) and `time-dev2-riscv64` (E's saturation
+    not established) are kept with their notes.
+- **AArch64 completion checker** (run 1): `scripts/check-aarch64-boot-completion.py` required
+  the ext4 server's readiness line before init's spawn line, but the two come from concurrent
+  tasks. Each pair is now matched as an unordered group (`7335d45f`).
+- **Seal ownership check** (run 1): the check did not exclude the main thread's hold, so the
+  live control "condvar returns without reacquiring" was caught only through a hang. The main
+  thread now holds the owner slot for its whole hold, and the control is caught by RB, `own=0`
+  (`acbf79c1`).
+- **ERRATUM, FUTEX-SYNC-TIME1.** That pass's `evidence/addA/initramfs_sections.txt`, and run 1's
+  kernel section analysis in this pass, piped `llvm-objcopy` to `/dev/stdout`, which writes
+  nothing. They compared empty outputs, so as a method they are invalid. Both were redone
+  through files:
+  - pass 7's artifacts were rebuilt (253ca580 again gives pass 7's B images byte for byte), and
+    every user binary's `.text`, `.rodata` and `.data` is identical in the x86_64 and RISC-V core
+    initramfs. The pass-7 conclusion holds; its evidence did not show it
+    (`addA/p7_initramfs_sections_recheck.txt`);
+  - this pass's kernel analysis is `addA/kernel_sections.txt`.
+
+**Commits.**
+- `bc5194a5`: the kernel half, the five cells, the grader, the smoke script and the cargo
+  features.
+- `7335d45f`: the AArch64 completion checker groups concurrent readiness lines.
+- `ac8be6dd`, `f3a806f2`, `9bd304d6`, `9d5282c4`: the FUTEX-ABS-BITSET1 time cell (and, in
+  `9d5282c4`, its grader's A count), as described above.
+- `acbf79c1`: the seal cells' ownership checks exclude the main thread's hold.
+- The documentation commit follows `9d5282c4`. It is record-only, and the tested code commit is
+  `9d5282c4`.
+
+**Qualification.**
+- **Frozen inputs.** The runner, `nc.py`, the three graders, the three witness smoke scripts and
+  the completion checker were hashed before each run (`predeclared.sha`). Every artifact's binding
+  to its commit and tree was checked at boot.
+- **Run 1** on `bc5194a5`: FAILED (the AArch64 checker, the time cell's handoff, ncB caught only
+  through a hang). Kept as `qual-1-FAILED`.
+- **Run 2** on `acbf79c1`: FAILED, at `W_time_riscv64` only (E's lead and the ack). Kept as
+  `qual-2-FAILED`; its other steps and its four controls passed.
+- **Run 3** on `9d5282c4` (tree `2d1dc946`) is the run below. Every step ran in order; nothing
+  was rerun in place.
+
+Reused rather than rerun:
+- **Lock-order baseline.** The hosted lock-order baseline is FUTEX-SYNC-TIME1's run 3
+  (`f88db55a`). `c4cac895` differs from it only in `doc/`.
+- **Kernel section analysis.** It was computed on run 2's kernels. Run 3's are byte-identical to
+  them, since only init and a grader changed between the two candidates.
+- **Robust-futex cleanup** is FUTEX-ABS-BITSET1's hosted evidence, rerun here as hosted tests. It
+  has no live path.
+
+| step | result |
+|---|---|
+| hosted | fmt; serial lib, 6,776 passed; `--tests`, 43 binaries, 7,173 passed; `yarm-user-rt` 142, `yarm-kernel` 10, `yarm-ipc-abi` 211; the three grader self-tests (seal, sync, time); 13 focused subsets, each non-zero (`futex_requeue1` 208, `sync_time1` 7, the r30 guard 1, `abs_bitset1` 18, `time1` 80, `futex` 353, `rt1b_` 18, `sched_budget` 5, `rt1a_` 15, `stage45` 2, `syscall_abi` 2, `lock_order` 4, `census` 33); contract gate; doc enforcement |
+| checks | the default kernel, the seal kernel, the seal init (all five cells), the sync init and the time init, on all three targets |
+| lock order | 30 descending-pair types on C and on the reused `f88db55a` run, none new |
+| builds | default x86_64, AArch64 and RISC-V artifacts, C and B. B's kernels are pass 7's (`31ef01f8…`, `87e2befe…`, `0d0791af…`). C's default kernels: `.text` and `.data` identical to B's, `.rodata` differs only in 18 panic-location line numbers; section sizes equal. C's core initramfs is byte-identical to B's on all three ports |
+| core smokes | the default C kernels, SMP2, each port: GP, RT and RT + `yarm.sched_budget=on` (`result=enforced`) pass |
+| seal boots | x86_64, AArch64, RISC-V SMP2, GP and RT + budgets: `FUTEX_SEAL_WITNESS_SEAL … result=ok`, all six; rules CORE, OS, NR17, LH, RB, PB |
+| W_time (FUTEX-ABS-BITSET1 cell) | `result=ok` on all three ports; A idle collections 16/16 each; G both winners each port (woken / timed out: x86_64 13/19, AArch64 12/20, RISC-V 4/18); E saturated with `EXPIRED_UNPLACED` then one completion |
+| W_sync (FUTEX-SYNC-TIME1 cell) | `result=ok` on all three ports |
+| negative controls | hosted: duplicate settlement (the expiry not rekeyed) fails `futex_requeue1`; condvar timeout without reacquiring fails `futex_sync_tests`. Live RISC-V, freshly built images: wake-all substituted in the arm labelled `rq`, caught by PB only (`rq arm made no NR 17 call`, four rounds; every correctness rule passed); condvar timeout without reacquiring (RT + budgets), caught by RB (`own=0`, `FSB_END fails=2`). Tree restored, porcelain 0 |
+| not run | a `--workspace` run; the historical matrix; stack-depth measurement; a live robust-list path (none exists) |
+
+**Limits carried forward.**
+- **Wake capacity.** A `0` from a wake may be a capacity refusal. This pass met it live:
+  `FUTEX_WAKE_STOPPED … reason=no_placement err=SchedulerFull woke=0` (runs 1 and 2, the time
+  cell's handoffs). No fallback or capacity-limited broadcast round occurred.
+- **Mutex barging.** There is no fairness guarantee: a barger can take a free mutex before a woken
+  waiter.
+- **Timeout lateness** is bounded only by the collector cadence. A condition wait's return also
+  waits for an untimed reacquisition (the LH and RB returns show both). The W_time maximum
+  includes E, whose expiry stays pending placement until the helper releases the full queue.
+- **Budget release application.** A parked waiter's rejoin was observed late after its release
+  instant, on its home CPU: 0 ticks on x86_64, 34 on AArch64 and 19 on RISC-V in run 3 (earlier boots of the cell: x86_64 0, AArch64 35, RISC-V 8 to 38). Idle secondary CPUs on AArch64 and RISC-V run only
+  their backstop (§24.2).
+- No hard latency bound and no stack-depth bound.
+- **Robust-futex cleanup at exit** remains hosted evidence (FUTEX-ABS-BITSET1): no system call
+  registers a robust list, so there is no live registration path.
+- **Induced budget exhaustion.** The budget exhaustion is induced, not produced by execution.
+- **Measurement scope.** The broadcast comparison measures counts on two QEMU vCPUs. It sets no
+  speedup threshold and claims no performance result.
+- PI, donation, POSIX realtime semantics, cancellation and later scheduler work are outside this
+  pass.
+
+**Verdict: QUALIFIED** on `9d5282c4`: every claim above PASS (the budget claim with induced
+exhaustion; robust cleanup hosted only); the paired broadcast measured on all three ports.
