@@ -3364,7 +3364,9 @@ pub(super) mod futex_time_witness {
     static CMD: AtomicU32 = AtomicU32::new(0);
     static PHASE: AtomicU32 = AtomicU32::new(0);
     static ACK: AtomicU32 = AtomicU32::new(0);
-    /// Set by W once it has seen ACK (FUTEX-SEAL1): H retries its ack wake until then.
+    /// The command number whose ack W has seen (FUTEX-SEAL1): H retries its ack wake until it
+    /// equals the command H is acking. A number, not a flag: W issues the next command at once,
+    /// and a flag cleared by it would leave H retrying a stale ack into the next phase.
     static ACK_SEEN: AtomicU32 = AtomicU32::new(0);
     static RELEASE: AtomicU32 = AtomicU32::new(0);
     static DONE: AtomicU32 = AtomicU32::new(0);
@@ -3454,7 +3456,6 @@ pub(super) mod futex_time_witness {
     fn command(phase: u32) {
         PHASE.store(phase, SeqCst);
         ACK.store(0, SeqCst);
-        ACK_SEEN.store(0, SeqCst);
         CMD.fetch_add(1, SeqCst);
         let _ = futex_wake(CMD.as_ptr(), 8, P);
     }
@@ -3466,17 +3467,20 @@ pub(super) mod futex_time_witness {
             let _ = futex_wait(ACK.as_ptr(), 0, P);
             n += 1;
         }
-        ACK_SEEN.store(1, SeqCst);
+        ACK_SEEN.store(CMD.load(SeqCst), SeqCst);
     }
 
     /// FUTEX-SEAL1: a wake can be refused for capacity (`0`, nobody woken). In qualification
     /// run 2 (RISC-V) E's closing ack was (`FUTEX_WAKE_STOPPED tid=<W> reason=no_placement
     /// err=SchedulerFull woke=0`: the released fillers still filled W's home queue), and W stayed
-    /// parked. The ack wake is retried until it wakes W or W has seen ACK.
+    /// parked. The ack wake is retried until it wakes W or W has seen this command's ACK (W
+    /// issues no further command before it has). A late retry can still wake W parked for the
+    /// next ack; `await_ack` re-checks ACK and parks again.
     fn ack() {
+        let cmd = CMD.load(SeqCst);
         ACK.store(1, SeqCst);
         let mut tries = 0u32;
-        while ACK_SEEN.load(SeqCst) == 0 && tries < BOUND {
+        while ACK_SEEN.load(SeqCst) != cmd && tries < BOUND {
             if futex_wake(ACK.as_ptr(), 1, P).unwrap_or(0) == 1 {
                 break;
             }
