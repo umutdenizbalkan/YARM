@@ -3351,6 +3351,8 @@ pub(super) mod futex_time_witness {
     const G_AHEAD_NS: u64 = 200_000_000;
     #[cfg(target_arch = "riscv64")]
     const G_AHEAD_NS: u64 = 100_000_000;
+    /// A/F's timed waits (`scripts/grade-futex-time-witness.py` CALLS_EXPECT["A"]).
+    const A_CALLS: u32 = 16;
     /// E: how long W waits for the saturation before it fails closed.
     const SAT_BOUND_NS: u64 = 900_000_000_000;
     /// E's deadline lead. FUTEX-SEAL1 qualification run 2 (RISC-V): with both queues full, H runs
@@ -3507,8 +3509,12 @@ pub(super) mod futex_time_witness {
         // Let the boot's own work drain first (blocked, not polling), so that the A deadlines meet
         // idle CPUs.
         let _ = nanosleep(&Timespec::from_ns(1000 * MS), None);
-        // A/F: nobody else runs; only the kernel's clock can end these.
-        for _ in 0..3 {
+        // A/F: nobody else runs; only the kernel's clock can end these. FUTEX-SEAL1: sixteen
+        // samples, not three. Whether a collection meets an idle CPU depends on whether the
+        // supervisor's one-tick poll is still current at that tick (RISC-V dev boot
+        // time-fix2-riscv64: CPU 0 was busy at 11 of the 13 ticks of three A calls, and none was
+        // collected idle); the claim is unchanged — at least one idle collection.
+        for _ in 0..A_CALLS {
             let r = timed("A", &WA, 100 * MS);
             expect("A", r, FutexTimedWait::TimedOut);
         }

@@ -48,7 +48,7 @@ Every BITSET_SKIP passed over a waiter whose mask is DISJOINT from the wake's (a
 a lost wake), and lies inside sequence M's or C's wakes (no other wake is masked).
 
 Sequences:
-  A/F  three A calls end timed_out; during each, no user thread of the cell but W logs anything
+  A/F  sixteen A calls end timed_out; during each, no user thread of the cell but W logs anything
        (H and S2 are parked); at least one A timeout was collected on an idle CPU (current=0).
   P    deadline 1 (long past): admitted timed_out with nothing published.
   B    woken (FTW_B_WAKE woke=1); B2 timed_out at now >= B's deadline (B never completed again).
@@ -103,7 +103,9 @@ FATAL = (
 )
 ROLES_EXPECT = {"A": "timed_out", "P": "timed_out", "B": "woken", "B2": "timed_out", "M": "woken",
                 "C": "timed_out", "D": "woken", "D2": "timed_out", "E": "timed_out"}
-CALLS_EXPECT = {"A": 3, "P": 1, "B": 1, "B2": 1, "M": 1, "C": 1, "D": 1, "D2": 1, "G": 32, "E": 1}
+# A: sixteen samples (FUTEX-SEAL1; three were too few for an idle collection to be reliable, see
+# the cell's A/F comment). The rule is unchanged: at least one A timeout collected idle.
+CALLS_EXPECT = {"A": 16, "P": 1, "B": 1, "B2": 1, "M": 1, "C": 1, "D": 1, "D2": 1, "G": 32, "E": 1}
 # Roles whose deadline may already have passed at admission (nothing published).
 ADMIT_TIMED_OUT_OK = {"P", "G"}
 MASK = {"M": 0x1, "C": 0x4, "D": 0x8}
@@ -682,7 +684,7 @@ def synth():
                 f"FUTEX_TIME_W_ADMIT tid={W} deadline={dl} now={an} mask={ANY} result=timed_out",
                 f"USER_LOG tid={W} msg=FTW_RET role={role} n={n} result=timed_out"]
 
-    for _ in range(3):
+    for _ in range(CALLS_EXPECT["A"]):
         out += call("A", 100_000_000, "0x4000", "timed_out")
     out += call_expired("P", "0x4000", 0)
     out += call("B", 2_000_000_000, "0x4010", "woken")
@@ -842,7 +844,8 @@ def self_test():
                if l.startswith("FUTEX_TIME_W_ADMIT") and "deadline=1100000000 " in l else l for l in good],
               "A refused at admission", "only")
     # A/F
-    must_fail([l.replace("current=0 ", "current=21 ") if "gen=1 " in l or "gen=2 " in l or "gen=3 " in l else l
+    a_gens = tuple(f"gen={g} " for g in range(1, CALLS_EXPECT["A"] + 1))
+    must_fail([l.replace("current=0 ", "current=21 ") if any(g in l for g in a_gens) else l
                for l in good], "no idle collection", "idle CPU")
     must_fail(insert_after("FUTEX_TIME_W_REGISTER tid=20 gen=2", "USER_LOG tid=21 msg=FTW_B_WAKE woke=0 tries=1"),
               "a helper polled during A", "helper ran")
