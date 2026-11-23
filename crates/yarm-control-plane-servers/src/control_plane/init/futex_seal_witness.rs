@@ -58,6 +58,9 @@ static DONE: AtomicU32 = AtomicU32::new(0);
 /// Per worker: the last round it completed.
 static COMPLETED: [AtomicU32; WORKERS] = [const { AtomicU32::new(0) }; WORKERS];
 static FAILS: AtomicU32 = AtomicU32::new(0);
+/// The exclusive owner slot: taken by whoever holds `M` (worker `k + 1`, the broadcaster `u32::MAX`)
+/// for its critical section, so a completion that does not truly own the mutex shows `own=0`.
+static OWNER: AtomicU32 = AtomicU32::new(0);
 static PARK: AtomicU32 = AtomicU32::new(0);
 pub(super) static ENTRY: AtomicUsize = AtomicUsize::new(0);
 
@@ -247,14 +250,19 @@ fn worker(k: u32) {
             fail("completion_order");
         }
         let held = u32::from(M.word().load(SeqCst) != 0);
+        let own = OWNER.compare_exchange(0, k + 1, SeqCst, SeqCst).is_ok();
+        if !own {
+            fail("ownership");
+        }
         let s = k as usize;
         yarm_user_rt::user_log!(
-            "FSL_DONE round={} arm={} worker={} seen={} held={} seq_parked={} seq_vc={} mtx_parked={} mtx_vc={}",
+            "FSL_DONE round={} arm={} worker={} seen={} held={} own={} seq_parked={} seq_vc={} mtx_parked={} mtx_vc={}",
             r,
             arm_of(r),
             k,
             seen,
             held,
+            u32::from(own),
             SEQ_PARKED[s].load(SeqCst),
             SEQ_VC[s].load(SeqCst),
             MTX_PARKED[s].load(SeqCst),
@@ -263,6 +271,9 @@ fn worker(k: u32) {
         let before = WAKE_CALLS[s].load(SeqCst);
         // The unlock's wake call (if the word was CONTENDED) and what that call reported woken:
         // `0` may also be a capacity refusal, not only an empty queue.
+        if own {
+            OWNER.store(0, SeqCst);
+        }
         let woke = M.unlock_with(&ops);
         let unlock_wakes = WAKE_CALLS[s].load(SeqCst) - before;
         yarm_user_rt::user_log!(
@@ -322,6 +333,10 @@ pub(super) fn run_once(s_tid: u64, entry: usize) {
         reset(HB);
         let t0 = mono();
         M.lock_with(&ops);
+        let h_own = OWNER.compare_exchange(0, u32::MAX, SeqCst, SeqCst).is_ok();
+        if !h_own {
+            fail("main_owner");
+        }
         PRED.store(r, SeqCst);
         let (woken, requeued, calls, fallback) = if arm == "rq" {
             let rep = CV.broadcast_with(&ops, &M);
@@ -343,6 +358,9 @@ pub(super) fn run_once(s_tid: u64, entry: usize) {
         let rq_calls = RQ_CALLS[HB].load(SeqCst);
         let bcast_wake_calls = WAKE_CALLS[HB].load(SeqCst);
         let before = WAKE_CALLS[HB].load(SeqCst);
+        if h_own {
+            OWNER.store(0, SeqCst);
+        }
         let unlock_woke = M.unlock_with(&ops);
         let unlock_wakes = WAKE_CALLS[HB].load(SeqCst) - before;
         let all = await_at_least(&DONE, cohort);

@@ -311,8 +311,8 @@ def grade(lines, cells, profile, core_rc=0, summary=None):
         for _, d in done:
             r, k = num(d.get("round")), num(d.get("worker"))
             per.setdefault(r, []).append(d)
-            if num(d.get("seen")) != r or num(d.get("held")) != 1:
-                bad("PB", f"round {r} worker {k}: seen={d.get('seen')} held={d.get('held')}")
+            if num(d.get("seen")) != r or num(d.get("held")) != 1 or num(d.get("own")) != 1:
+                bad("PB", f"round {r} worker {k}: seen={d.get('seen')} held={d.get('held')} own={d.get('own')}")
             if last.get(k, 0) + 1 != r:
                 bad("PB", f"worker {k}: round {r} out of order (after {last.get(k, 0)})")
             last[k] = r
@@ -469,7 +469,7 @@ def synth(profile, n=10, rounds=8):
         u(1, f"FSL_PARKED round={r} arm={arm} n={n} ok=1")
         for k in range(n):
             rp = 0 if arm == "rq" else (1 if k else 0)
-            u(40 + k, f"FSL_DONE round={r} arm={arm} worker={k} seen={r} held=1 seq_parked=1 seq_vc=0 mtx_parked={rp} mtx_vc=0")
+            u(40 + k, f"FSL_DONE round={r} arm={arm} worker={k} seen={r} held=1 own=1 seq_parked=1 seq_vc=0 mtx_parked={rp} mtx_vc=0")
             u(40 + k, f"FSL_UNLOCK round={r} worker={k} wakes=1 woke={1 if k < n - 1 else 0}")
         if arm == "rq":
             u(1, f"FSL_BCAST round={r} arm=rq woken=1 requeued={n-1} calls=1 fallback=0 rq_calls=1 wake_calls=0 unlock_wakes=1 unlock_woke=1 elapsed_ns=100")
@@ -534,8 +534,12 @@ def self_test():
             for l in L
         ]
     mutant("gp", "PB", wa_in_rq)
-    mutant("gp", "PB", lambda L: L + ["USER_LOG tid=40 msg=FSL_DONE round=2 arm=wa worker=0 seen=2 held=1 seq_parked=1 seq_vc=0 mtx_parked=0 mtx_vc=0"])
+    mutant("gp", "PB", lambda L: L + ["USER_LOG tid=40 msg=FSL_DONE round=2 arm=wa worker=0 seen=2 held=1 own=1 seq_parked=1 seq_vc=0 mtx_parked=0 mtx_vc=0"])
     mutant("gp", "PB", sub("FSL_DONE round=3 arm=wa worker=4 seen=3 held=1", "FSL_DONE round=3 arm=wa worker=4 seen=3 held=0"))
+    # A completion that saw the word held, but by another owner.
+    mutant("gp", "PB", sub("FSL_DONE round=6 arm=wa worker=2 seen=6 held=1 own=1", "FSL_DONE round=6 arm=wa worker=2 seen=6 held=1 own=0"))
+    # RB: W returned while the main thread still held the mutex (held=1, own=0).
+    mutant("rtb", "RB", sub("FSB_RET role=W result=timed_out held=1 own=1", "FSB_RET role=W result=timed_out held=1 own=0"))
     # RB: replenished before settlement (inconclusive); not parked; drained twice; gp with a park.
     mutant("rtb", "RB", sub("first_release_stamp=4", "first_release_stamp=2"))
     mutant("rtb", "RB", sub("commit_parked=1", "commit_parked=0"))
@@ -545,7 +549,7 @@ def self_test():
     mutant("rtb", "RB", sub("FSB_RET role=W result=timed_out held=1", "FSB_RET role=W result=timed_out held=0"))
     # CORE
     mutant("gp", "CORE", sub("FSEAL_ALL_END cells=5", "FSEAL_ALL_END cells=4"))
-    print("self-test ok: 2 passing boots, 19 mutants each caught by its rule")
+    print("self-test ok: 2 passing boots, 21 mutants each caught by its rule")
 
 
 def main():

@@ -269,6 +269,11 @@ pub(super) fn run_once(s_tid: u64, entry: usize) {
     for r in 1..=ROUNDS {
         let eps = EPS_NS[(r - 1) as usize];
         M.lock();
+        // The main thread holds the owner slot for its whole hold: a W or F "owning" the mutex
+        // while the main thread still holds it fails its ownership check.
+        if OWNER.compare_exchange(0, 3, SeqCst, SeqCst).is_err() {
+            fail("main_owner");
+        }
         bump(&GO_W);
         await_at_least(&W_READY, r);
         let w_parked = confirm_parked(M.word(), 1);
@@ -288,6 +293,7 @@ pub(super) fn run_once(s_tid: u64, entry: usize) {
         while t < target {
             t = mono();
         }
+        OWNER.store(0, SeqCst);
         let woke = M.unlock();
         yarm_user_rt::user_log!(
             "FSH_UNLOCK round={} eps={} at={} deadline={} woke={}",

@@ -142,11 +142,16 @@ fn bump(word: &AtomicU32) {
     let _ = futex_wake(word.as_ptr(), u32::MAX, P);
 }
 
-/// The order-preserving parked-waiter observation, bounded by time instead of by attempts.
-fn confirm_parked_within(word: &AtomicU32, n: u32, max_ns: u64) -> bool {
+/// The order-preserving parked-waiter observation, bounded by time instead of by attempts, and
+/// abandoned once `stop` is nonzero (the observed thread already returned instead of parking).
+fn confirm_parked_within(word: &AtomicU32, n: u32, max_ns: u64, stop: &AtomicU32) -> bool {
     let until = mono().saturating_add(max_ns);
     let mut have = 0;
     loop {
+        if stop.load(SeqCst) != 0 {
+            let _ = futex_cmp_requeue(SCRATCH.as_ptr(), P, word.as_ptr(), P, 0, 0, n);
+            return false;
+        }
         let v = word.load(SeqCst);
         if let Ok(o) = futex_cmp_requeue(word.as_ptr(), P, SCRATCH.as_ptr(), P, v, 0, n - have) {
             have += o.requeued;
@@ -197,7 +202,11 @@ fn w_body() {
     if !held || !mine {
         fail("ownership");
     }
-    M.unlock();
+    // Only an owner unlocks: a W that returned without the mutex must not release the main
+    // thread's hold.
+    if mine {
+        M.unlock();
+    }
     bump(&DONE);
 }
 
@@ -225,18 +234,27 @@ pub(super) fn run_once(s_tid: u64, entry: usize) {
     await_at_least(&STARTED, 1);
     yarm_user_rt::user_log!("FSB_THREAD role=W tid={}", tid);
     await_at_least(&READY, 1);
-    let parked = confirm_parked_within(CV.seq(), 1, 30_000_000_000);
+    let parked = confirm_parked_within(CV.seq(), 1, 30_000_000_000, &DONE);
     yarm_user_rt::user_log!("FSB_PARKED word=seq ok={}", u32::from(parked));
     if !parked {
         fail("parked");
     }
-    // Hold the mutex across W's deadline, settlement, budget park and rejoin.
+    // Hold the mutex across W's deadline, settlement, budget park and rejoin. The main thread
+    // takes the owner slot for its whole hold, so W's ownership check cannot pass while the main
+    // thread still holds the mutex.
     M.lock();
-    yarm_user_rt::user_log!("FSB_HOLD now={}", mono());
-    let on_mutex = confirm_parked_within(M.word(), 1, REJOIN_BOUND_NS);
+    let h_own = OWNER.compare_exchange(0, 2, SeqCst, SeqCst).is_ok();
+    if !h_own {
+        fail("main_owner");
+    }
+    yarm_user_rt::user_log!("FSB_HOLD now={} own={}", mono(), u32::from(h_own));
+    let on_mutex = confirm_parked_within(M.word(), 1, REJOIN_BOUND_NS, &DONE);
     yarm_user_rt::user_log!("FSB_MUTEX_PARKED ok={} now={}", u32::from(on_mutex), mono());
     if !on_mutex {
         fail("mutex_parked");
+    }
+    if h_own {
+        OWNER.store(0, SeqCst);
     }
     let woke = M.unlock();
     yarm_user_rt::user_log!("FSB_UNLOCK woke={} now={}", woke, mono());
