@@ -3353,11 +3353,19 @@ pub(super) mod futex_time_witness {
     const G_AHEAD_NS: u64 = 100_000_000;
     /// E: how long W waits for the saturation before it fails closed.
     const SAT_BOUND_NS: u64 = 900_000_000_000;
+    /// E's deadline lead. FUTEX-SEAL1 qualification run 2 (RISC-V): with both queues full, H runs
+    /// about once per rotation of its queue (~4 s under TCG) and is preempted after almost every
+    /// call, so its re-fill of the slot W vacated came after a 10 s deadline; the timeout then
+    /// found that slot free and was placed (legal; no EXPIRED_UNPLACED). The lead must outlast
+    /// H's confirm-and-re-fill under saturation (several rotations), on every port.
+    const E_LEAD_NS: u64 = 60_000_000_000;
 
     // Control.
     static CMD: AtomicU32 = AtomicU32::new(0);
     static PHASE: AtomicU32 = AtomicU32::new(0);
     static ACK: AtomicU32 = AtomicU32::new(0);
+    /// Set by W once it has seen ACK (FUTEX-SEAL1): H retries its ack wake until then.
+    static ACK_SEEN: AtomicU32 = AtomicU32::new(0);
     static RELEASE: AtomicU32 = AtomicU32::new(0);
     static DONE: AtomicU32 = AtomicU32::new(0);
     /// Set by init once it has seen DONE (FUTEX-SEAL1): W retries its handoff wake until then.
@@ -3446,6 +3454,7 @@ pub(super) mod futex_time_witness {
     fn command(phase: u32) {
         PHASE.store(phase, SeqCst);
         ACK.store(0, SeqCst);
+        ACK_SEEN.store(0, SeqCst);
         CMD.fetch_add(1, SeqCst);
         let _ = futex_wake(CMD.as_ptr(), 8, P);
     }
@@ -3457,11 +3466,23 @@ pub(super) mod futex_time_witness {
             let _ = futex_wait(ACK.as_ptr(), 0, P);
             n += 1;
         }
+        ACK_SEEN.store(1, SeqCst);
     }
 
+    /// FUTEX-SEAL1: a wake can be refused for capacity (`0`, nobody woken). In qualification
+    /// run 2 (RISC-V) E's closing ack was (`FUTEX_WAKE_STOPPED tid=<W> reason=no_placement
+    /// err=SchedulerFull woke=0`: the released fillers still filled W's home queue), and W stayed
+    /// parked. The ack wake is retried until it wakes W or W has seen ACK.
     fn ack() {
         ACK.store(1, SeqCst);
-        let _ = futex_wake(ACK.as_ptr(), 1, P);
+        let mut tries = 0u32;
+        while ACK_SEEN.load(SeqCst) == 0 && tries < BOUND {
+            if futex_wake(ACK.as_ptr(), 1, P).unwrap_or(0) == 1 {
+                break;
+            }
+            let _ = yield_now();
+            tries += 1;
+        }
     }
 
     /// Requeue the one waiter of `from` to `to` (no wake) until one moves; the bound fails closed.
@@ -3567,7 +3588,7 @@ pub(super) mod futex_time_witness {
             }
             core::hint::spin_loop();
         }
-        let r = timed("E", &E1, 10_000 * MS);
+        let r = timed("E", &E1, E_LEAD_NS);
         expect("E", r, FutexTimedWait::TimedOut);
         await_ack();
         command(PH_END);
