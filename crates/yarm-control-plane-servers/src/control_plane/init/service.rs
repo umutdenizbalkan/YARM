@@ -3360,6 +3360,8 @@ pub(super) mod futex_time_witness {
     static ACK: AtomicU32 = AtomicU32::new(0);
     static RELEASE: AtomicU32 = AtomicU32::new(0);
     static DONE: AtomicU32 = AtomicU32::new(0);
+    /// Set by init once it has seen DONE (FUTEX-SEAL1): W retries its handoff wake until then.
+    static SEEN: AtomicU32 = AtomicU32::new(0);
     static PARK: AtomicU32 = AtomicU32::new(0);
     static G_PAUSE: AtomicU32 = AtomicU32::new(16);
     static FAILS: AtomicU32 = AtomicU32::new(0);
@@ -3575,7 +3577,17 @@ pub(super) mod futex_time_witness {
             FAILS.load(SeqCst)
         );
         DONE.store(1, SeqCst);
-        let _ = futex_wake(DONE.as_ptr(), 1, P);
+        // FUTEX-SEAL1: a wake can be refused for capacity (`0`, nobody woken) while E's fillers
+        // still fill init's home queue (qualification run 1, RISC-V: FUTEX_WAKE_STOPPED tid=1
+        // reason=no_placement), so the handoff is retried until init has seen DONE.
+        let mut tries = 0u32;
+        while SEEN.load(SeqCst) == 0 && tries < BOUND {
+            if futex_wake(DONE.as_ptr(), 1, P).unwrap_or(0) == 1 {
+                break;
+            }
+            let _ = yield_now();
+            tries += 1;
+        }
         park()
     }
 
@@ -3866,6 +3878,7 @@ pub(super) mod futex_time_witness {
             let _ = futex_wait(DONE.as_ptr(), 0, P);
             waits += 1;
         }
+        SEEN.store(1, SeqCst);
         let fails = FAILS.load(SeqCst);
         let ok = tids.iter().all(|&t| t != 0) && DONE.load(SeqCst) == 1 && fails == 0;
         yarm_user_rt::user_log!(
