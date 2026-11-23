@@ -4444,6 +4444,162 @@ fn run_futex_sync_witness(s_tid: u64) {
     futex_sync_witness::run_once(s_tid, entry);
 }
 
+/// FUTEX-SEAL1 — the live futex seal cell (`futex_seal_witness.rs`), selector 18 when init is built
+/// with `futex-seal-witness`; it takes precedence over the futex-sync and futex-time cells.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness",
+    feature = "futex-seal-witness",
+    feature = "futex-seal-pb"
+))]
+#[path = "futex_seal_witness.rs"]
+pub(super) mod futex_seal_witness;
+
+/// FUTEX-SEAL1 — the NR 17 cell (`futex_seal_nr17.rs`), with `futex-seal-nr17`.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness",
+    feature = "futex-seal-witness",
+    feature = "futex-seal-nr17"
+))]
+#[path = "futex_seal_nr17.rs"]
+pub(super) mod futex_seal_nr17;
+
+/// FUTEX-SEAL1 — the late sole-wake handoff cell (`futex_seal_lh.rs`), with `futex-seal-lh`.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness",
+    feature = "futex-seal-witness",
+    feature = "futex-seal-lh"
+))]
+#[path = "futex_seal_lh.rs"]
+pub(super) mod futex_seal_lh;
+
+/// FUTEX-SEAL1 — the RT-budget cell (`futex_seal_rb.rs`), with `futex-seal-rb`.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness",
+    feature = "futex-seal-witness",
+    feature = "futex-seal-rb"
+))]
+#[path = "futex_seal_rb.rs"]
+pub(super) mod futex_seal_rb;
+
+/// FUTEX-SEAL1 — the selective-wake order cell (`futex_seal_os.rs`), with `futex-seal-os`.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness",
+    feature = "futex-seal-witness",
+    feature = "futex-seal-os"
+))]
+#[path = "futex_seal_os.rs"]
+pub(super) mod futex_seal_os;
+
+/// x86_64 entry trampolines for the futex seal cells (as for the futex-sync witness's).
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness",
+    feature = "futex-seal-witness",
+    target_arch = "x86_64"
+))]
+mod x86_futex_seal {
+    #[cfg(feature = "futex-seal-os")]
+    #[unsafe(naked)]
+    pub(super) extern "C" fn os_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_seal_os::child_body)
+    }
+    #[cfg(feature = "futex-seal-nr17")]
+    #[unsafe(naked)]
+    pub(super) extern "C" fn nr17_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_seal_nr17::child_body)
+    }
+    #[cfg(feature = "futex-seal-lh")]
+    #[unsafe(naked)]
+    pub(super) extern "C" fn lh_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_seal_lh::child_body)
+    }
+    #[cfg(feature = "futex-seal-pb")]
+    #[unsafe(naked)]
+    pub(super) extern "C" fn pb_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_seal_witness::child_body)
+    }
+    #[cfg(feature = "futex-seal-rb")]
+    #[unsafe(naked)]
+    pub(super) extern "C" fn rb_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::futex_seal_rb::child_body)
+    }
+}
+
+/// FUTEX-SEAL1 — resolve each enabled cell's entry for this architecture and run the cells.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-requeue-witness",
+    feature = "futex-time-witness",
+    feature = "futex-seal-witness"
+))]
+fn run_futex_seal_witness(s_tid: u64) {
+    use core::sync::atomic::Ordering::SeqCst;
+    let mut cells = 0u32;
+    #[cfg(feature = "futex-seal-os")]
+    {
+        #[cfg(target_arch = "x86_64")]
+        let entry = x86_futex_seal::os_entry as *const () as usize;
+        #[cfg(not(target_arch = "x86_64"))]
+        let entry = futex_seal_os::child_body as *const () as usize;
+        futex_seal_os::ENTRY.store(entry, SeqCst);
+        futex_seal_os::run_once(s_tid, entry);
+        cells += 1;
+    }
+    #[cfg(feature = "futex-seal-nr17")]
+    {
+        #[cfg(target_arch = "x86_64")]
+        let entry = x86_futex_seal::nr17_entry as *const () as usize;
+        #[cfg(not(target_arch = "x86_64"))]
+        let entry = futex_seal_nr17::child_body as *const () as usize;
+        futex_seal_nr17::ENTRY.store(entry, SeqCst);
+        futex_seal_nr17::run_once(s_tid, entry);
+        cells += 1;
+    }
+    #[cfg(feature = "futex-seal-lh")]
+    {
+        #[cfg(target_arch = "x86_64")]
+        let entry = x86_futex_seal::lh_entry as *const () as usize;
+        #[cfg(not(target_arch = "x86_64"))]
+        let entry = futex_seal_lh::child_body as *const () as usize;
+        futex_seal_lh::ENTRY.store(entry, SeqCst);
+        futex_seal_lh::run_once(s_tid, entry);
+        cells += 1;
+    }
+    #[cfg(feature = "futex-seal-pb")]
+    {
+        #[cfg(target_arch = "x86_64")]
+        let entry = x86_futex_seal::pb_entry as *const () as usize;
+        #[cfg(not(target_arch = "x86_64"))]
+        let entry = futex_seal_witness::child_body as *const () as usize;
+        futex_seal_witness::ENTRY.store(entry, SeqCst);
+        futex_seal_witness::run_once(s_tid, entry);
+        cells += 1;
+    }
+    // Last: the only cell that arms the kernel's budget hook.
+    #[cfg(feature = "futex-seal-rb")]
+    {
+        #[cfg(target_arch = "x86_64")]
+        let entry = x86_futex_seal::rb_entry as *const () as usize;
+        #[cfg(not(target_arch = "x86_64"))]
+        let entry = futex_seal_rb::child_body as *const () as usize;
+        futex_seal_rb::ENTRY.store(entry, SeqCst);
+        futex_seal_rb::run_once(s_tid, entry);
+        cells += 1;
+    }
+    yarm_user_rt::user_log!("FSEAL_ALL_END cells={}", cells);
+}
+
 /// SCHED-TIME-FOUNDATION1 C — the live sleep / clock / rotation witness, selector 18 when init is
 /// built with `sched-time-witness` (it takes precedence over every other selector-18 cell). The
 /// kernel half is `kernel::sleep_witness` (markers, the exit fixture, the kernel-thread fixture);
@@ -10935,17 +11091,26 @@ pub fn run() {
         // witness, before every futex cell (it needs the kernel's `futex-time-witness` markers).
         #[cfg(feature = "sched-time-witness")]
         run_sched_time_witness(ctx.task_id, ctx.process_manager_reply_recv_cap);
-        #[cfg(all(not(feature = "sched-time-witness"), feature = "futex-sync-witness"))]
+        // FUTEX-SEAL1: built with `futex-seal-witness`, the seal cell, before the sync cell.
+        #[cfg(all(not(feature = "sched-time-witness"), feature = "futex-seal-witness"))]
+        run_futex_seal_witness(ctx.task_id);
+        #[cfg(all(
+            not(feature = "sched-time-witness"),
+            not(feature = "futex-seal-witness"),
+            feature = "futex-sync-witness"
+        ))]
         run_futex_sync_witness(ctx.task_id);
         #[cfg(all(
             not(feature = "sched-time-witness"),
             not(feature = "futex-sync-witness"),
+            not(feature = "futex-seal-witness"),
             feature = "futex-time-witness"
         ))]
         run_futex_time_witness(ctx.task_id);
         #[cfg(all(
             not(feature = "sched-time-witness"),
             not(feature = "futex-sync-witness"),
+            not(feature = "futex-seal-witness"),
             not(feature = "futex-time-witness"),
             feature = "riscv-ecall-witness",
             target_arch = "riscv64"
@@ -10954,6 +11119,7 @@ pub fn run() {
         #[cfg(all(
             not(feature = "sched-time-witness"),
             not(feature = "futex-sync-witness"),
+            not(feature = "futex-seal-witness"),
             not(feature = "futex-time-witness"),
             feature = "futex-wait-witness",
             not(all(feature = "riscv-ecall-witness", target_arch = "riscv64"))

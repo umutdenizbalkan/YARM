@@ -84,6 +84,18 @@ futex-time-witness = []
 # with futex-requeue-witness); accepted and inert in every other package (the kernel side is
 # futex-time-witness).
 futex-sync-witness = []
+# FUTEX-SEAL1 — the live futex seal cell: init's cell (selector 18, with futex-requeue-witness and
+# futex-time-witness); accepted and inert elsewhere (the kernel side is the root crate's feature).
+futex-seal-witness = []
+# FUTEX-SEAL1 — with futex-seal-witness, the sequence cells to run, in this order, one file each:
+# selective-wake order (futex_seal_os.rs), NR 17 (futex_seal_nr17.rs), the late sole-wake
+# handoff (futex_seal_lh.rs), the paired broadcast (futex_seal_witness.rs), and last the RT-budget
+# cell (futex_seal_rb.rs), so the budget hook is never armed during the broadcast rounds.
+futex-seal-os = []
+futex-seal-nr17 = []
+futex-seal-lh = []
+futex-seal-pb = []
+futex-seal-rb = []
 # SCHED-TIME-FOUNDATION1 C — the live sleep witness (init cell; see the kernel feature).
 sched-time-witness = []
 riscv-uart-irq-witness = []

@@ -261,6 +261,16 @@ riscv-ecall-witness = ["printk-witness-ring"]
 futex-time-witness = ["printk-witness-ring"]
 # FUTEX-SYNC-TIME1: accepted and inert here (init's cell; the kernel side is futex-time-witness).
 futex-sync-witness = []
+# FUTEX-SEAL1 — the live futex seal witness (default off): the kernel half `kernel::seal_witness`
+# (the budget sequence's one induced exhaustion and its record) on top of the FUTEX-TIME1 markers;
+# init's cell is the same-named feature of yarm-control-plane-servers.
+futex-seal-witness = ["futex-time-witness"]
+# FUTEX-SEAL1: init's per-sequence cell selectors; accepted and inert here.
+futex-seal-os = []
+futex-seal-nr17 = []
+futex-seal-lh = []
+futex-seal-pb = []
+futex-seal-rb = []
 # SCHED-TIME-FOUNDATION1 C — the live sleep witness (default off; kernel markers, the exit and
 # kernel-thread fixtures of `kernel::sleep_witness`, and init's cell).
 sched-time-witness = ["printk-witness-ring"]

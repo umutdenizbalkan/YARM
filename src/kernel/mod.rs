@@ -55,6 +55,8 @@ pub mod kthread_witness;
 pub mod rt_witness;
 #[cfg(any(test, feature = "sched-time-witness", feature = "futex-time-witness"))]
 pub(crate) mod sat_witness;
+#[cfg(feature = "futex-seal-witness")]
+pub mod seal_witness;
 #[cfg(feature = "sched-time-witness")]
 pub mod sleep_witness;
 

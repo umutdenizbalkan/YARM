@@ -985,6 +985,16 @@ pub fn compare_and_register_futex_waiter_locked(
         let now = admitted.mono_ns.unwrap_or(0);
         time_witness::admit(tid, deadline.raw(), now, mask, "registered");
         time_witness::registered(tid, generation, deadline.raw(), now, va, mask);
+        // FUTEX-SEAL1 live witness only: the budget sequence's marked cycle, and the record dump.
+        #[cfg(feature = "futex-seal-witness")]
+        {
+            if crate::kernel::seal_witness::is_budget(expected) {
+                crate::kernel::seal_witness::arm(tid, generation);
+            }
+            if crate::kernel::seal_witness::is_dump(expected) {
+                crate::kernel::seal_witness::dump();
+            }
+        }
     }
     Ok((key, token))
 }

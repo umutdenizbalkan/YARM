@@ -14641,9 +14641,30 @@ impl SharedKernel {
                 fx::futex_phase_hook::TIMEOUT_AFTER_CLAIM,
                 candidate.tid,
             );
+            // FUTEX-SEAL1 live witness only: the budget sequence's marked cycle (claimed above).
+            #[cfg(feature = "futex-seal-witness")]
+            let w_seal = crate::kernel::seal_witness::armed_cycle(candidate.tid, w_gen);
             // (5) rank 1: the reserved commit, which cannot be refused for capacity.
             match self.with_cpu_sched_and_tcbs_split(home, |c, tcbs| {
-                te::commit_reserved_enqueue_on_cpu_locked(c, &plan, tcbs)
+                // FUTEX-SEAL1 live witness only (`kernel::seal_witness`): for the one marked wait
+                // instance, after this 1L section's own budget sync (every due release applied)
+                // and immediately BEFORE the production placement decision below, its context
+                // is charged its whole remaining budget once through the production charge.
+                #[cfg(feature = "futex-seal-witness")]
+                if w_seal && crate::kernel::seal_witness::take_pending(candidate.tid) {
+                    crate::kernel::seal_witness::note_drain(
+                        c.seal_witness_drain(crate::kernel::ipc::ThreadId(candidate.tid)),
+                    );
+                }
+                let committed = te::commit_reserved_enqueue_on_cpu_locked(c, &plan, tcbs);
+                #[cfg(feature = "futex-seal-witness")]
+                if w_seal {
+                    crate::kernel::seal_witness::note_commit(
+                        c.context_of(crate::kernel::ipc::ThreadId(candidate.tid))
+                            .is_some_and(|ctx| ctx.parked()),
+                    );
+                }
+                committed
             }) {
                 Ok(Ok(ReservedCommit::Queued(t))) => {
                     #[cfg(feature = "sched-lock1-witness")]

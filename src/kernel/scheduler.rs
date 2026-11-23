@@ -1299,6 +1299,14 @@ impl PriorityScheduler {
                 r.count,
                 rejoin.is_some(),
             );
+            #[cfg(feature = "futex-seal-witness")]
+            crate::kernel::seal_witness::note_replenished(
+                now,
+                tid.0,
+                r.release,
+                rejoin.is_some(),
+                cpu,
+            );
             let _ = (r, cpu);
             if let Some((kind, level)) = rejoin {
                 self.rejoin(tid, kind, level);
@@ -1366,6 +1374,8 @@ impl PriorityScheduler {
             c.parked = Some((kind, priority.level() as u8));
             #[cfg(all(feature = "rt-sched-witness", not(feature = "hosted-dev")))]
             crate::kernel::rt_witness::note_budget_parked(now, c);
+            #[cfg(feature = "futex-seal-witness")]
+            crate::kernel::seal_witness::note_parked(now, c.tid, c.next_release(), self.budget.cpu);
         }
         let _ = now;
     }
@@ -2487,6 +2497,23 @@ impl CpuView<'_> {
     /// incarnation is retired. `false`: none was bound here.
     pub(crate) fn release_context(&mut self, tid: ThreadId, stamp: u64) -> bool {
         self.sched.rq.release_context(tid, stamp)
+    }
+
+    /// FUTEX-SEAL1 live witness only (`kernel::seal_witness`): charge `tid`'s context on this
+    /// budgeted CPU its whole remaining budget through the production `sched_budget::charge`
+    /// (an induced exhaustion, not elapsed time). `(remaining before, tick, next release)`, or
+    /// `None` when budgets are off or `tid` has no context here.
+    #[cfg(feature = "futex-seal-witness")]
+    pub(crate) fn seal_witness_drain(&mut self, tid: ThreadId) -> Option<(u64, u64, u64)> {
+        let rq = &mut self.sched.rq;
+        if !rq.budget.enabled {
+            return None;
+        }
+        let now = rq.budget.now;
+        let c = rq.budget.get_mut(tid.0)?;
+        let before = c.remaining();
+        let _ = crate::kernel::sched_budget::charge(c, before);
+        Some((before, now, c.next_release()))
     }
 
     /// RT-SCHED1B — `tid`'s context on this CPU (observation).
