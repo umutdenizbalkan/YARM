@@ -10,6 +10,13 @@ ORDER:
   1. the core services have started (supervisor, process manager, init, initramfs, devfs, VFS);
   2. RAMFS is spawned, reports its `/ram` mount ready, and VFS registers `/ram`;
   3. EXT4 is spawned, becomes ready, and VFS registers `/ext4`;
+
+  In stages 2 and 3 the server's own readiness line and init's spawn-OK line come from two tasks
+  that run concurrently, so they may print in either order: each pair is matched as an UNORDERED
+  group after the spawn began, and the next stage must follow both. EXT4 readiness is the server's
+  own line (`EXT4_SRV_READY` with nothing after it), not init's `EXT4_SRV_READY child_tid=` echo,
+  which init prints after its spawn-OK by construction (FUTEX-SEAL1: qualification run 1's
+  AArch64 GP core smoke printed init's spawn-OK before the server's readiness and was refused).
   4. init reaches its terminal park (INIT_IDLE_PARK_BEGIN, INIT_IDLE_PARK_FUTEX_BEGIN, and the
      kernel publishing init's futex block);
   5. the scheduler then enters idle (`SCHED_ENTER_IDLE_HLT`), with init still parked.
@@ -39,12 +46,16 @@ CORE = [
 
 ORDERED = [
     ("ramfs_spawn", r"\bmsg=INIT_RAMFS_SPAWN_BEGIN\b"),
-    ("ramfs_mount_ready", r"\bmsg=RAMFS_MOUNT_READY prefix=/ram\b"),
-    ("ramfs_spawn_ok", r"\bmsg=INIT_RAMFS_SPAWN_OK\b.*\bprefix=/ram\b"),
+    ("GROUP", [
+        ("ramfs_mount_ready", r"\bmsg=RAMFS_MOUNT_READY prefix=/ram\b"),
+        ("ramfs_spawn_ok", r"\bmsg=INIT_RAMFS_SPAWN_OK\b.*\bprefix=/ram\b"),
+    ]),
     ("ram_registered", r"\bmsg=VFS_MOUNT_REGISTER_RAMFS_OK prefix=/ram\b"),
     ("ext4_spawn", r"\bmsg=INIT_EXT4_SPAWN_BEGIN\b"),
-    ("ext4_ready", r"\bmsg=EXT4_SRV_READY\b"),
-    ("ext4_spawn_ok", r"\bmsg=INIT_EXT4_SPAWN_OK\b"),
+    ("GROUP", [
+        ("ext4_ready", r"\bmsg=EXT4_SRV_READY$"),
+        ("ext4_spawn_ok", r"\bmsg=INIT_EXT4_SPAWN_OK\b"),
+    ]),
     ("ext4_registered", r"\bmsg=VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4\b"),
     ("init_park", r"\bmsg=INIT_IDLE_PARK_BEGIN\b"),
     ("init_park_futex", r"\bmsg=INIT_IDLE_PARK_FUTEX_BEGIN\b"),
@@ -72,6 +83,20 @@ def evaluate(lines):
         records.append((name, at + 1, lines[at]))
     pos = -1
     for name, pat in ORDERED:
+        if name == "GROUP":
+            # Concurrent producers: every member after `pos`, in any order; the next stage
+            # follows the last of them.
+            found = []
+            for member, mpat in pat:
+                mrx = re.compile(mpat)
+                at = next((i for i in range(pos + 1, len(lines)) if mrx.search(lines[i])), None)
+                if at is None:
+                    return False, records, f"missing {member} after line {pos + 1}"
+                found.append((member, at))
+            for member, at in sorted(found, key=lambda x: x[1]):
+                records.append((member, at + 1, lines[at]))
+            pos = max(at for _, at in found)
+            continue
         rx = re.compile(pat)
         at = next((i for i in range(pos + 1, len(lines)) if rx.search(lines[i])), None)
         if at is None:
@@ -155,6 +180,14 @@ def self_test():
          ["YARM_BOOT_OK", "SCHED_ENTER_IDLE_HLT"] + synthetic(early_idle=False)[1:8] + ["SCHED_ENTER_IDLE_HLT"], False),
         ("no /ram registration", synthetic(drop=("ram_registered",)), False),
         ("no EXT4 ready", synthetic(drop=("ext4_ready",)), False),
+        ("EXT4 ready printed after init's spawn OK (concurrent producers)",
+         synthetic(swap=("ext4_ready", "ext4_spawn_ok")), True),
+        ("RAMFS ready printed after init's spawn OK (concurrent producers)",
+         synthetic(swap=("ramfs_mount_ready", "ramfs_spawn_ok")), True),
+        ("only init's EXT4 echo, no server readiness",
+         [l.replace("tid=10007 msg=EXT4_SRV_READY", "tid=1 msg=EXT4_SRV_READY child_tid=10007")
+          for l in synthetic()], False),
+        ("no EXT4 spawn OK", synthetic(drop=("ext4_spawn_ok",)), False),
         ("no /ext4 registration", synthetic(drop=("ext4_registered",)), False),
         ("/ext4 registered before /ram", synthetic(swap=("ram_registered", "ext4_registered")), False),
         ("init's block published before its park began", synthetic(swap=("init_park_futex", "init_parked")), False),
