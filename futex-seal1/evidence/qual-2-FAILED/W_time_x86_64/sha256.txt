@@ -1,0 +1,3 @@
+ed3daabe7227933ad9bfab1d82bad878daf847875e1fe43762b1d6abf1b6cce7  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_time_x86_64/boot.log
+51470b5d3006e15d5f493842ab04ce85c1202c5901e9c9d705c825ed6b14150e  build-x86_64/kernel_boot.elf
+652821f6cda31089c42bb74a98a87830f7c7f1e5b322b97f8e3b64c2baabc490  build-x86_64/initramfs-core.cpio

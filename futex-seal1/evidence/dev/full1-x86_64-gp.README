@@ -1,0 +1,1 @@
+INVALID: the source tree changed under this run (the drain was moved to the collector's commit section); full1-x86_64-gp was refused by ARTIFACT-BINDING (initramfs built from a different dirty-tree hash), full1-x86_64-rtb was stopped by hand before booting. Not graded.

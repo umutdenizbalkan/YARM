@@ -1,0 +1,1 @@
+FUTEX_SEAL_WITNESS_SEAL arch=aarch64 smp=2 profile=gp cells=os,nr17,lh,pb,rb lh_late=8 lh_early=0 lh_timeout=0 lh_timeout_acquired=2 rb_induced=0 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=ok

@@ -1,0 +1,8 @@
+71676468d3a0e947cc281acd3dc20bb273757be4ebff52f63e650c1aa079efca  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/fs1_qual.sh
+1e592653d2539d59b357421ade02163ab62f4910bf1e50620f36bb6bf61eea22  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-nc/nc.py
+ace28628246e68e7cfd45a609b8715ad1fcc59e7fa9ba5f5c7dbe412b5b609be  scripts/grade-futex-seal-witness.py
+28920f1f9ace6f275527d33f290e97b17f3240985151976b3dfd3df197f0a8d1  scripts/qemu-futex-seal-witness-smoke.sh
+08f3ff3548da0f40136d004c3b972a792e063850469f1248eaaf05fb3d150f37  scripts/grade-futex-sync-witness.py
+23db01aaced2d601601da4534fc6dc115702bd6f9e49ce4af47e5c28241d84bc  scripts/grade-futex-time-witness.py
+d6f5715e5f934e2adf5a9a03019a15fdd6a76763166e7b76099329815d980f9e  scripts/check-aarch64-boot-completion.py
+candidate acbf79c1e16d2aa821662f7c9bde2a2a4dcedf1b tree 9d3c6760d4f5f926bb64d093bfe51ed85d51e6ad; baseline c4cac895211a52bb69914ebe13c5689fcef4812b (run 2; run 1 on bc5194a5 kept as qual-1-FAILED)

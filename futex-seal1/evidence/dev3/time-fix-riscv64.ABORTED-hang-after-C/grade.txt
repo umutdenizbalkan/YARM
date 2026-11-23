@@ -1,0 +1,15 @@
+[futex-time-witness][fail] expected exactly one U_DONE, saw 0
+[futex-time-witness][fail] expected exactly one U_WAITER_DONE, saw 0
+[futex-time-witness][fail] calls per role {'A': 3, 'P': 1, 'B': 1, 'B2': 1, 'M': 1, 'C': 1}, expected {'A': 3, 'P': 1, 'B': 1, 'B2': 1, 'M': 1, 'C': 1, 'D': 1, 'D2': 1, 'G': 32, 'E': 1}
+[futex-time-witness][fail] expected exactly one U_C_REQUEUE, saw 0
+[futex-time-witness][fail] C: timed out on the word it was requeued away from
+[futex-time-witness][fail] expected exactly one U_C_AFTER, saw 0
+[futex-time-witness][fail] expected exactly one U_D_REQUEUE_WAKE, saw 0
+[futex-time-witness][fail] G coverage: no window held a wake from another CPU
+[futex-time-witness][fail] G coverage: woken=0 timed_out=0 (need both >= 1)
+[futex-time-witness][fail] expected exactly one U_G_SUMMARY, saw 0
+[futex-time-witness][fail] expected exactly one U_E_SATURATED, saw 0
+[futex-time-witness][fail] expected exactly one U_E_HOLD_END, saw 0
+[futex-time-witness][fail] E: H's spawning must end in SchedulerFull refusals only (kernel: [])
+[futex-time-witness][fail] expected exactly one U_E_EXPIRED_SEEN, saw 0
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail timeout_lateness_ns_max=28779000 a_idle_collections=3 bitset_skips=2 g_admitted_expired=0 g_woken=0 g_timed_out=0 g_windows_woke=0 g_windows_refused=0 g_skipped=0 in_window_wakes=0 e_spawn_refusals=0 calls=8 cycles=7

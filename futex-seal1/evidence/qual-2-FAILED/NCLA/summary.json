@@ -1,0 +1,197 @@
+{
+ "lh": {
+  "early": 0,
+  "late": 4,
+  "timeout": 4,
+  "timeout_acquired": 2
+ },
+ "pb": {
+  "arms": {
+   "rq": {
+    "classes": {
+     "invalid": 4
+    },
+    "clean": 0,
+    "direct_woken": [],
+    "elapsed_ns_max": null,
+    "elapsed_ns_median": null,
+    "elapsed_ns_min": null,
+    "mutex_reparks": [],
+    "requeued": [],
+    "rounds": 4,
+    "worker_unlock_wake_calls": [],
+    "worker_unlock_woke": []
+   },
+   "wa": {
+    "classes": {
+     "clean": 4
+    },
+    "clean": 4,
+    "direct_woken": [
+     10,
+     10,
+     10,
+     10
+    ],
+    "elapsed_ns_max": 3827428500,
+    "elapsed_ns_median": 2668731000,
+    "elapsed_ns_min": 2457828300,
+    "mutex_reparks": [
+     1,
+     4,
+     4,
+     7
+    ],
+    "requeued": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "rounds": 4,
+    "worker_unlock_wake_calls": [
+     10,
+     10,
+     10,
+     10
+    ],
+    "worker_unlock_woke": [
+     2,
+     0,
+     3,
+     8
+    ]
+   }
+  },
+  "cohort": 10,
+  "rounds": {
+   "rq": [
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "invalid",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 3272864800,
+     "mutex_reparks": 0,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 1,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 0
+    },
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "invalid",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 4340191900,
+     "mutex_reparks": 6,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 4,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 6
+    },
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "invalid",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 3432422600,
+     "mutex_reparks": 1,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 5,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 0
+    },
+    {
+     "broadcaster_unlock_wake_calls": 1,
+     "broadcaster_unlock_woke": 0,
+     "class": "invalid",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 1660614200,
+     "mutex_reparks": 1,
+     "mutex_value_changed": 1,
+     "requeued": 0,
+     "round": 8,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 0
+    }
+   ],
+   "wa": [
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 3827428500,
+     "mutex_reparks": 1,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 2,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 2
+    },
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 2457828300,
+     "mutex_reparks": 4,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 3,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 0
+    },
+    {
+     "broadcaster_unlock_wake_calls": 1,
+     "broadcaster_unlock_woke": 1,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 2500583200,
+     "mutex_reparks": 4,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 6,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 3
+    },
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 2836878800,
+     "mutex_reparks": 7,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 7,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 8
+    }
+   ]
+  }
+ },
+ "rb": {
+  "induced_exhaustion": 0
+ }
+}

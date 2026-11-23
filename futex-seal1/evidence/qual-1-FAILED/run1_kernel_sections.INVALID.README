@@ -1,0 +1,1 @@
+INVALID: computed with llvm-objcopy writing to /dev/stdout, which yields 0 bytes; every 'same' compared two empty outputs. Superseded by addA/kernel_sections.txt (run 2, through files).

@@ -1,0 +1,12 @@
+kernel x86_64 .text bytes=1363918 B=53cb979bd9e5a63b C=53cb979bd9e5a63b same
+kernel x86_64 .rodata bytes=193321 B=cb60bcd0451fc821 C=161548baa64b4b98 DIFF
+kernel x86_64 .data bytes=181552 B=686c1667945b517e C=686c1667945b517e same
+kernel aarch64 .text bytes=910300 B=f6366cf6005707d1 C=f6366cf6005707d1 same
+kernel aarch64 .rodata bytes=149353 B=e2625dcb81ec50f9 C=0be177a787167c38 DIFF
+kernel aarch64 .data bytes=166104 B=41ab257ea82a1b4e C=41ab257ea82a1b4e same
+kernel riscv64 .text bytes=770530 B=448d297fec11ac58 C=448d297fec11ac58 same
+kernel riscv64 .rodata bytes=159755 B=b698e31d0fbdbc1c C=375b5f5c8e29eecd DIFF
+kernel riscv64 .data bytes=163872 B=37cfa8a6c707c460 C=37cfa8a6c707c460 same
+# x86_64 .rodata: 20 differing bytes in 18 aligned u32 words; old values 1104..20734, deltas (new-old)
+# 10 (x12), 21 (x3), 27 (x2), 8 (x1): line numbers in panic locations, shifted by the lines this
+# candidate adds to src/kernel/boot/futex.rs (+10), src/kernel/scheduler.rs and src/runtime.rs.

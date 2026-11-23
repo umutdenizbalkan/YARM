@@ -1,0 +1,1 @@
+time-dev2-riscv64 (1800 s): FTW_DONE result=ok printed (handshake fixed); graded FAIL only on E — 127 fillers, top-up refused, the expiry was placed at once (no FUTEX_TIMEOUT_EXPIRED_UNPLACED): E's saturation hit the task limit before the run-queue limit.

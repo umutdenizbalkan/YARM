@@ -1,0 +1,3 @@
+fa07ee76d2d02d220a17391b44282a31288b381eb648c863386c79b3b4ce613d  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-dev/full1-aarch64-gp/boot.log
+a5539a7fa960ff403dc44609d4806ba95c050a9864529acc26a80ffaed08b1ea  build-aarch64/yarm-aarch64.bin
+f73836d0ab3b117ad9eb6f29189d9036eb20d64be61321a8f64fb10f5fa83204  build-aarch64/initramfs-core.cpio

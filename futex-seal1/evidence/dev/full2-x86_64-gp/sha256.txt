@@ -1,0 +1,3 @@
+62a1aed4de135c80f00391d4f5907712b4282c22f111daedd26f65466e2090c6  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-dev/full2-x86_64-gp/boot.log
+4bc1eb9266053b32af0ef7285fd05b68e1d587d185d9badf2a0b949cea953760  build-x86_64/kernel_boot.elf
+8469f8550d25fc329dbf9c4d5ff3557ebedd237f2b85a8b95d70f7eb9f517508  build-x86_64/initramfs-core.cpio

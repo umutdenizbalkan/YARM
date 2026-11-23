@@ -1,0 +1,7 @@
+428021b7b00fa9bea2f53e174a72c0c8f741351f4075a26196a95d4d8285b327  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/fs1_qual.sh
+1e592653d2539d59b357421ade02163ab62f4910bf1e50620f36bb6bf61eea22  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-nc/nc.py
+3886dd553868683bd4d0291e9b06dffd36b42bb321c3914a7b77772fc04d7314  scripts/grade-futex-seal-witness.py
+28920f1f9ace6f275527d33f290e97b17f3240985151976b3dfd3df197f0a8d1  scripts/qemu-futex-seal-witness-smoke.sh
+08f3ff3548da0f40136d004c3b972a792e063850469f1248eaaf05fb3d150f37  scripts/grade-futex-sync-witness.py
+23db01aaced2d601601da4534fc6dc115702bd6f9e49ce4af47e5c28241d84bc  scripts/grade-futex-time-witness.py
+candidate bc5194a5fdc8b0f31b3c2cb192498014396f80d5 tree c3ef354ac39ae8936d69b1bd00da50b1589dffde; baseline c4cac895211a52bb69914ebe13c5689fcef4812b

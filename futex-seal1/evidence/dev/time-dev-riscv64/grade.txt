@@ -1,0 +1,6 @@
+[futex-time-witness][fail] expected exactly one U_DONE, saw 0
+[futex-time-witness][fail] expected exactly one U_WAITER_DONE, saw 0
+[futex-time-witness][fail] expected exactly one U_E_HOLD_END, saw 0
+[futex-time-witness][fail] expected exactly one U_E_EXPIRED_SEEN, saw 0
+[futex-time-witness][fail] E: no FUTEX_TIMEOUT_EXPIRED_UNPLACED for the waiter — the queue was not full
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail timeout_lateness_ns_max=41981200 a_idle_collections=2 bitset_skips=3 g_admitted_expired=2 g_woken=10 g_timed_out=20 g_windows_woke=11 g_windows_refused=1 g_skipped=8 in_window_wakes=11 e_spawn_refusals=1 calls=43 cycles=40

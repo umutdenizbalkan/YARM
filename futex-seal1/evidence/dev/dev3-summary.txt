@@ -1,0 +1,5 @@
+full3-riscv64-rtb rc=0 FUTEX_SEAL_WITNESS_SEAL arch=riscv64 smp=2 profile=rtb cells=os,nr17,lh,pb,rb lh_late=6 lh_early=0 lh_timeout=0 lh_timeout_acquired=4 rb_induced=1 rb_release_lateness_ticks=13 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=2 result=ok
+ncB-dev rc=1 FUTEX_SEAL_WITNESS_SEAL arch=riscv64 smp=2 profile=rtb cells=os,nr17,lh,pb,rb lh_late=7 lh_early=0 lh_timeout=0 lh_timeout_acquired=3 rb_induced=1 rb_release_lateness_ticks=19 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=fail
+porcelain=0
+time-dev-riscv64 rc=1 FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail timeout_lateness_ns_max=41981200 a_idle_collections=2 bitset_skips=3 g_admitted_expired=2 g_woken=10 g_timed_out=20 g_windows_woke=11 g_windows_r
+ALLDONE

@@ -1,0 +1,3 @@
+2931eab3f7ddb37ae806b7aba2b8e89398fe2d1205a1a6add200e1393fd2277a  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/NCLA/boot.log
+cc78d17b417aac6e1f38bae60dee25e1c466fbe259c8e52fcec0b1512cc973e4  build-riscv64/yarm-riscv64.bin
+cdaca8419c1d46fb3e38dda5c1c7c0789bf36247016e5550f4fe61ff7ee44ea9  build-riscv64/initramfs-core.cpio

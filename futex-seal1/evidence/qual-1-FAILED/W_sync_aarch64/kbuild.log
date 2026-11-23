@@ -1,0 +1,1963 @@
+warning: unused import: `crate::kernel::capabilities::CapRights`
+ --> src/kernel/boot/exec_state.rs:6:5
+  |
+6 | use crate::kernel::capabilities::CapRights;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `TaskStatus`
+ --> src/kernel/boot/exec_state.rs:9:27
+  |
+9 | use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext};
+  |                           ^^^^^^^^^^
+
+warning: unused import: `QueueAdvanceOutcome`
+  --> src/kernel/boot/mod.rs:41:50
+   |
+41 |     IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome, QueueAdvanceRefusal,
+   |                                                  ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SUPERVISOR_FAULT_REPORT_WIRE_LEN`
+  --> src/kernel/boot/mod.rs:57:60
+   |
+57 |     PageFaultFacts, PageFaultRoute, PreMutationSettlement, SUPERVISOR_FAULT_REPORT_WIRE_LEN,
+   |                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `DetachOutcome` and `enqueue_reply_into_endpoint_locked`
+  --> src/kernel/boot/mod.rs:69:34
+   |
+69 |     BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ParkedDeathHandoff,
+   |                                  ^^^^^^^^^^^^^
+...
+74 |     complete_server_death_over, enqueue_reply_into_endpoint_locked, log_parked_death_handoff,
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `orchestrator_state::x86_smp_unlock_audit_claimed`
+  --> src/kernel/boot/mod.rs:85:16
+   |
+85 | pub(crate) use orchestrator_state::x86_smp_unlock_audit_claimed;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+  --> src/kernel/boot/scheduler_state.rs:10:27
+   |
+10 | use crate::kernel::task::{TaskClass, TaskStatus};
+   |                           ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+ --> src/kernel/boot/task_policy_state.rs:6:5
+  |
+6 | use crate::kernel::ipc::ThreadId;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ThreadControlBlock`
+ --> src/kernel/boot/task_policy_state.rs:7:38
+  |
+7 | use crate::kernel::task::{TaskClass, ThreadControlBlock};
+  |                                      ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+ --> src/kernel/boot/thread_state.rs:8:47
+  |
+8 |     KernelExecutionContext, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
+  |                                               ^^^^^^^^^
+
+warning: unused import: `crate::kernel::vm::Asid`
+  --> src/kernel/boot/thread_state.rs:12:5
+   |
+12 | use crate::kernel::vm::Asid;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc_state::rt_detach_server_link`
+    --> src/kernel/boot/mod.rs:5677:16
+     |
+5677 | pub(crate) use ipc_state::rt_detach_server_link;
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapObject`
+  --> src/kernel/recv_waiter_split.rs:94:42
+   |
+94 | use crate::kernel::capabilities::{CapId, CapObject};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+ --> src/kernel/syscall.rs:9:17
+  |
+9 | use super::vm::{PAGE_SIZE, VirtAddr};
+  |                 ^^^^^^^^^
+
+warning: unused import: `SYSCALL_NO_TRANSFER_CAP`
+  --> src/kernel/syscall/recv_shared_v3.rs:12:26
+   |
+12 |     SYSCALL_ABI_VERSION, SYSCALL_NO_TRANSFER_CAP, SyscallError, current_tid,
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapRights`
+  --> src/kernel/syscall/recv_shared_v3.rs:16:42
+   |
+16 | use crate::kernel::capabilities::{CapId, CapRights};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::Message`
+  --> src/kernel/syscall/recv_shared_v3.rs:17:5
+   |
+17 | use crate::kernel::ipc::Message;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CachePolicy`, `Mapping`, `PAGE_SIZE`, `PageFlags`, `PhysAddr`, and `VirtAddr`
+  --> src/kernel/syscall/recv_shared_v3.rs:20:25
+   |
+20 | use crate::kernel::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                         ^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^  ^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+  --> src/kernel/syscall/vm.rs:28:40
+   |
+28 | use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                                        ^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_CAP`, `SYSCALL_ARG_LEN`, and `SYSCALL_ARG_PTR`
+    --> src/kernel/syscall_split.rs:5657:34
+     |
+5657 |     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
+     |                                  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `FutexParkOutcome`
+    --> src/kernel/syscall_split.rs:5680:41
+     |
+5680 |     use crate::kernel::syscall::sched::{FutexParkOutcome, FutexWaitDecision};
+     |                                         ^^^^^^^^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_LEN` and `SYSCALL_ARG_PTR`
+    --> src/kernel/syscall_split.rs:5681:51
+     |
+5681 |     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError};
+     |                                                   ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `SYSCALL_ARG_PTR`
+    --> src/kernel/syscall_split.rs:6863:51
+     |
+6863 |     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_PTR};
+     |                                                   ^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+    --> src/runtime.rs:6546:35
+     |
+6546 |         use crate::kernel::task::{TaskClass, TaskStatus};
+     |                                   ^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_CAP`, `SYSCALL_ARG_LEN`, and `SYSCALL_ARG_PTR`
+     --> src/runtime.rs:10050:55
+      |
+10050 |             OPCODE_SHARED_MEM, RecvQueuedSplitPhaseA, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0,
+      |                                                       ^^^^^^^^^^^^^^^
+10051 |             SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError,
+      |                                          ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+     --> src/runtime.rs:17519:13
+      |
+17519 |         use crate::kernel::ipc::ThreadId;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:17521:13
+      |
+17521 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:17566:13
+      |
+17566 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> src/kernel/direct_ack_census.rs:53:29
+   |
+53 |     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |                             ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+53 -     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+53 +     let _ = WAITERS_CURRENT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |
+
+warning: value assigned to `queue_advance_committed` is never read
+    --> src/arch/trap_entry.rs:1575:17
+     |
+1575 |                 queue_advance_committed = true;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `deadline`
+    --> src/kernel/boot/ipc_state.rs:5700:30
+     |
+5700 |                     let Some(deadline) = tcb.ipc_timeout_deadline else {
+     |                              ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_deadline`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `tid`
+    --> src/kernel/boot/orchestrator_state.rs:1463:51
+     |
+1463 |     fn run_unlock_graduated_proof_with(&mut self, tid: u64, cnode: CNodeId) {
+     |                                                   ^^^ help: if this is intentional, prefix it with an underscore: `_tid`
+
+warning: value assigned to `scratch` is never read
+    --> src/kernel/boot/mod.rs:9875:5
+     |
+9875 |     scratch.init_ep_cap = Some(init_ep_cap);
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `stash_bound_receiver_tid` is never read
+   --> src/kernel/syscall/ipc.rs:464:78
+    |
+464 |     let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
+    |                                                                              ^^^^ this value is reassigned later and never used
+...
+509 |             stash_bound_receiver_tid = bound_tid;
+    |             ------------------------------------ `stash_bound_receiver_tid` is overwritten here before the previous value is read
+
+warning: unused variable: `cpu`
+    --> src/kernel/syscall_split.rs:9522:5
+     |
+9522 |     cpu: CpuId,
+     |     ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: unused variable: `cpu`
+    --> src/runtime.rs:8193:9
+     |
+8193 |         cpu: CpuId,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: unused variable: `virt`
+     --> src/runtime.rs:16856:9
+      |
+16856 |         virt: crate::kernel::vm::VirtAddr,
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_virt`
+
+warning: type `BlockedServerAck` is more private than the item `ipccall_direct_ack::snapshot`
+    --> src/kernel/boot/mod.rs:7671:5
+     |
+7671 |     pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedServerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `ipccall_direct_ack::snapshot` is reachable at visibility `pub`
+     |
+note: but type `BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `BlockedServerAck` is more private than the item `ipccall_direct_ack::claim`
+    --> src/kernel/boot/mod.rs:7685:5
+     |
+7685 | /     pub fn claim(
+7686 | |         endpoint_index: usize,
+7687 | |         endpoint_generation: u64,
+7688 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `ipccall_direct_ack::claim` is reachable at visibility `pub`
+     |
+note: but type `BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipccall_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:7694:5
+     |
+7694 | /     pub fn claim_exact(
+7695 | |         endpoint_index: usize,
+7696 | |         endpoint_generation: u64,
+7697 | |         expect_server: Option<ReceiverWaiterIdentity>,
+7698 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `ipccall_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedServerAck` is more private than the item `ipccall_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:7694:5
+     |
+7694 | /     pub fn claim_exact(
+7695 | |         endpoint_index: usize,
+7696 | |         endpoint_generation: u64,
+7697 | |         expect_server: Option<ReceiverWaiterIdentity>,
+7698 | |     ) -> Option<(BlockedServerAck, u64)> {
+     | |________________________________________^ function `ipccall_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `BlockedServerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:280:1
+     |
+ 280 | pub(crate) struct BlockedServerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipccall_direct_ack::release`
+    --> src/kernel/boot/mod.rs:7711:5
+     |
+7711 | /     pub fn release(
+7712 | |         endpoint_index: usize,
+7713 | |         endpoint_generation: u64,
+7714 | |         server: ReceiverWaiterIdentity,
+7715 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipccall_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `AckRelease` is more private than the item `ipccall_direct_ack::release`
+    --> src/kernel/boot/mod.rs:7711:5
+     |
+7711 | /     pub fn release(
+7712 | |         endpoint_index: usize,
+7713 | |         endpoint_generation: u64,
+7714 | |         server: ReceiverWaiterIdentity,
+7715 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipccall_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `AckRelease` is only usable at visibility `pub(crate)`
+    --> src/kernel/direct_ack_store.rs:351:1
+     |
+ 351 | pub(crate) enum AckRelease {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::snapshot`
+    --> src/kernel/boot/mod.rs:8182:5
+     |
+8182 |     pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedCallerAck> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `ipcreply_direct_ack::snapshot` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:327:1
+     |
+ 327 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::claim`
+    --> src/kernel/boot/mod.rs:8190:5
+     |
+8190 | /     pub fn claim(
+8191 | |         endpoint_index: usize,
+8192 | |         endpoint_generation: u64,
+8193 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `ipcreply_direct_ack::claim` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:327:1
+     |
+ 327 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipcreply_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:8198:5
+     |
+8198 | /     pub fn claim_exact(
+8199 | |         endpoint_index: usize,
+8200 | |         endpoint_generation: u64,
+8201 | |         expect_caller: Option<ReceiverWaiterIdentity>,
+8202 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `ipcreply_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `BlockedCallerAck` is more private than the item `ipcreply_direct_ack::claim_exact`
+    --> src/kernel/boot/mod.rs:8198:5
+     |
+8198 | /     pub fn claim_exact(
+8199 | |         endpoint_index: usize,
+8200 | |         endpoint_generation: u64,
+8201 | |         expect_caller: Option<ReceiverWaiterIdentity>,
+8202 | |     ) -> Option<(BlockedCallerAck, u64)> {
+     | |________________________________________^ function `ipcreply_direct_ack::claim_exact` is reachable at visibility `pub`
+     |
+note: but type `BlockedCallerAck` is only usable at visibility `pub(crate)`
+    --> src/kernel/ipccall_direct.rs:327:1
+     |
+ 327 | pub(crate) struct BlockedCallerAck {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `defs::ReceiverWaiterIdentity` is more private than the item `ipcreply_direct_ack::release`
+    --> src/kernel/boot/mod.rs:8214:5
+     |
+8214 | /     pub fn release(
+8215 | |         endpoint_index: usize,
+8216 | |         endpoint_generation: u64,
+8217 | |         caller: ReceiverWaiterIdentity,
+8218 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipcreply_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `defs::ReceiverWaiterIdentity` is only usable at visibility `pub(crate)`
+    --> src/kernel/boot/defs.rs:232:1
+     |
+ 232 | pub(crate) struct ReceiverWaiterIdentity {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `AckRelease` is more private than the item `ipcreply_direct_ack::release`
+    --> src/kernel/boot/mod.rs:8214:5
+     |
+8214 | /     pub fn release(
+8215 | |         endpoint_index: usize,
+8216 | |         endpoint_generation: u64,
+8217 | |         caller: ReceiverWaiterIdentity,
+8218 | |     ) -> crate::kernel::direct_ack_store::AckRelease {
+     | |____________________________________________________^ function `ipcreply_direct_ack::release` is reachable at visibility `pub`
+     |
+note: but type `AckRelease` is only usable at visibility `pub(crate)`
+    --> src/kernel/direct_ack_store.rs:351:1
+     |
+ 351 | pub(crate) enum AckRelease {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `RecvImmediateOutcome` is more private than the item `SharedKernel::try_split_ipc_recv_timeout_immediate_into_frame`
+     --> src/runtime.rs:11556:5
+      |
+11556 | /     pub fn try_split_ipc_recv_timeout_immediate_into_frame(
+11557 | |         &self,
+11558 | |         cpu: CpuId,
+11559 | |         frame: &mut TrapFrame,
+11560 | |     ) -> crate::kernel::syscall::RecvImmediateOutcome {
+      | |_____________________________________________________^ method `SharedKernel::try_split_ipc_recv_timeout_immediate_into_frame` is reachable at visibility `pub`
+      |
+note: but type `RecvImmediateOutcome` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall.rs:1978:1
+      |
+ 1978 | pub(crate) enum RecvImmediateOutcome {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `RecvImmediateOutcome` is more private than the item `SharedKernel::try_split_ipc_recv_queued_plain_into_frame`
+     --> src/runtime.rs:11885:5
+      |
+11885 | /     pub fn try_split_ipc_recv_queued_plain_into_frame(
+11886 | |         &self,
+11887 | |         cpu: CpuId,
+11888 | |         frame: &mut TrapFrame,
+11889 | |     ) -> crate::kernel::syscall::RecvImmediateOutcome {
+      | |_____________________________________________________^ method `SharedKernel::try_split_ipc_recv_queued_plain_into_frame` is reachable at visibility `pub`
+      |
+note: but type `RecvImmediateOutcome` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall.rs:1978:1
+      |
+ 1978 | pub(crate) enum RecvImmediateOutcome {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `FutexWaitDecision` is more private than the item `SharedKernel::futex_wait_decide_split_read`
+     --> src/runtime.rs:19551:5
+      |
+19551 | /     pub fn futex_wait_decide_split_read(
+19552 | |         &self,
+19553 | |         tid: u64,
+19554 | |         addr: usize,
+19555 | |         expected: u32,
+19556 | |         kind: crate::kernel::boot::futex::FutexKind,
+19557 | |     ) -> Result<crate::kernel::syscall::sched::FutexWaitDecision, crate::kernel::boot::KernelError>
+      | |___________________________________________________________________________________________________^ method `SharedKernel::futex_wait_decide_split_read` is reachable at visibility `pub`
+      |
+note: but type `FutexWaitDecision` is only usable at visibility `pub(crate)`
+     --> src/kernel/syscall/sched.rs:238:1
+      |
+  238 | pub(crate) enum FutexWaitDecision {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `memory_reg` is never used
+  --> src/arch/fdt.rs:81:8
+   |
+81 | pub fn memory_reg(bytes: &[u8]) -> Option<(u64, u64)> {
+   |        ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `cpus_hart_id_bitmap` is never used
+   --> src/arch/fdt.rs:162:8
+    |
+162 | pub fn cpus_hart_id_bitmap(bytes: &[u8]) -> Option<u64> {
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `cpus_timebase_frequency` is never used
+   --> src/arch/fdt.rs:268:8
+    |
+268 | pub fn cpus_timebase_frequency(bytes: &[u8]) -> Option<u64> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_cpu_unit_addr` is never used
+   --> src/arch/fdt.rs:346:4
+    |
+346 | fn parse_cpu_unit_addr(name: &[u8]) -> Option<u32> {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `find_node_reg_by_name_prefix` is never used
+   --> src/arch/fdt.rs:373:8
+    |
+373 | pub fn find_node_reg_by_name_prefix(bytes: &[u8], prefix: &[u8]) -> Option<(u64, u64)> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `chosen_initrd` is never used
+   --> src/arch/fdt.rs:589:8
+    |
+589 | pub fn chosen_initrd(bytes: &[u8]) -> Option<(u64, u64)> {
+    |        ^^^^^^^^^^^^^
+
+warning: function `decode_reg_pair` is never used
+   --> src/arch/fdt.rs:663:4
+    |
+663 | fn decode_reg_pair(data: &[u8], address_cells: u32, size_cells: u32) -> Option<(u64, u64)> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `decode_cells` is never used
+   --> src/arch/fdt.rs:670:4
+    |
+670 | fn decode_cells(data: &[u8], offset: usize, cells: u32) -> Option<u64> {
+    |    ^^^^^^^^^^^^
+
+warning: function `decode_int` is never used
+   --> src/arch/fdt.rs:683:4
+    |
+683 | fn decode_int(data: &[u8]) -> Option<u64> {
+    |    ^^^^^^^^^^
+
+warning: function `handle_trap_entry_with_fault_bookkeeping_mode` is never used
+   --> src/arch/trap_entry.rs:106:15
+    |
+106 | pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `AlreadyRecordedBySharedSeam` is never constructed
+   --> src/kernel/boot/mod.rs:212:5
+    |
+210 | pub(crate) enum FaultBookkeepingMode {
+    |                 -------------------- variant in this enum
+211 |     RecordInHandleTrapEvent,
+212 |     AlreadyRecordedBySharedSeam,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `FaultBookkeepingMode` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `VmBrkPlan` is never constructed
+   --> src/kernel/boot/mod.rs:455:19
+    |
+455 | pub(crate) struct VmBrkPlan {
+    |                   ^^^^^^^^^
+
+warning: struct `VmAnonMapProgressPlan` is never constructed
+   --> src/kernel/boot/mod.rs:587:19
+    |
+587 | pub(crate) struct VmAnonMapProgressPlan {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `outgoing_stack_top` is never read
+   --> src/kernel/boot/mod.rs:751:16
+    |
+723 | pub(crate) struct DispatchSwitchPlan {
+    |                   ------------------ field in this struct
+...
+751 |     pub(crate) outgoing_stack_top: Option<u64>,
+    |                ^^^^^^^^^^^^^^^^^^
+
+warning: function `queue_advance_deferral_reserved_by` is never used
+   --> src/kernel/boot/mod.rs:892:15
+    |
+892 | pub(crate) fn queue_advance_deferral_reserved_by(cpu_idx: usize) -> Option<&'static str> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `D6_PRE_LOCK_PF_DIAG_PENDING` is never used
+    --> src/kernel/boot/mod.rs:1095:19
+     |
+1095 | pub(crate) static D6_PRE_LOCK_PF_DIAG_PENDING: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_d6_controlled_switch_proof_enabled` is never used
+    --> src/kernel/boot/mod.rs:1099:15
+     |
+1099 | pub(crate) fn set_d6_controlled_switch_proof_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_d6_switch_a_enabled` is never used
+    --> src/kernel/boot/mod.rs:1124:15
+     |
+1124 | pub(crate) fn set_d6_switch_a_enabled(enabled: bool) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `D6_GENUINE_SEAM_COUNT` is never used
+    --> src/kernel/boot/mod.rs:1230:19
+     |
+1230 | pub(crate) static D6_GENUINE_SEAM_COUNT: [core::sync::atomic::AtomicU64;
+     |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `D6_GENUINE_MUT_DISPATCH_COUNT` is never used
+    --> src/kernel/boot/mod.rs:1237:19
+     |
+1237 | pub(crate) static D6_GENUINE_MUT_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `D6_GENUINE_DISPATCH_DEFERRED` is never used
+    --> src/kernel/boot/mod.rs:1246:19
+     |
+1246 | pub(crate) static D6_GENUINE_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `D6_GENUINE_DISPATCH_OUTGOING` is never used
+    --> src/kernel/boot/mod.rs:1252:19
+     |
+1252 | pub(crate) static D6_GENUINE_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `d6_genuine_dispatch_try_defer` is never used
+    --> src/kernel/boot/mod.rs:1259:15
+     |
+1259 | pub(crate) fn d6_genuine_dispatch_try_defer(cpu_idx: usize, outgoing: Option<u64>) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `d6_genuine_dispatch_is_deferred` is never used
+    --> src/kernel/boot/mod.rs:1282:15
+     |
+1282 | pub(crate) fn d6_genuine_dispatch_is_deferred(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `d6_genuine_dispatch_clear_deferred` is never used
+    --> src/kernel/boot/mod.rs:1289:15
+     |
+1289 | pub(crate) fn d6_genuine_dispatch_clear_deferred(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `FUTEX_WAIT_DISPATCH_COUNT` is never used
+    --> src/kernel/boot/mod.rs:1403:19
+     |
+1403 | pub(crate) static FUTEX_WAIT_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `YIELD_DISPATCH_COUNT` is never used
+    --> src/kernel/boot/mod.rs:1636:19
+     |
+1636 | pub(crate) static YIELD_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+     |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_ASYNC_RESUME_PENDING` is never used
+    --> src/kernel/boot/mod.rs:1775:19
+     |
+1775 | pub(crate) static RISCV_ASYNC_RESUME_PENDING: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_publish` is never used
+    --> src/kernel/boot/mod.rs:1781:15
+     |
+1781 | pub(crate) fn riscv_async_resume_publish(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_take` is never used
+    --> src/kernel/boot/mod.rs:1800:15
+     |
+1800 | pub(crate) fn riscv_async_resume_take(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_async_resume_clear` is never used
+    --> src/kernel/boot/mod.rs:1812:15
+     |
+1812 | pub(crate) fn riscv_async_resume_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_SYSCALL_CONTINUATION_PENDING` is never used
+    --> src/kernel/boot/mod.rs:1836:19
+     |
+1836 | pub(crate) static RISCV_SYSCALL_CONTINUATION_PENDING: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_publish` is never used
+    --> src/kernel/boot/mod.rs:1842:15
+     |
+1842 | pub(crate) fn riscv_syscall_continuation_publish(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_take` is never used
+    --> src/kernel/boot/mod.rs:1850:15
+     |
+1850 | pub(crate) fn riscv_syscall_continuation_take(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_syscall_continuation_clear` is never used
+    --> src/kernel/boot/mod.rs:1859:15
+     |
+1859 | pub(crate) fn riscv_syscall_continuation_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED` is never used
+    --> src/kernel/boot/mod.rs:1871:19
+     |
+1871 | pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED: [core::sync::atomic::AtomicBool;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING` is never used
+    --> src/kernel/boot/mod.rs:1874:19
+     |
+1874 | pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING: [core::sync::atomic::AtomicU64;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_QUEUE_SWITCH_FOUNDATION_DONE` is never used
+    --> src/kernel/boot/mod.rs:1879:8
+     |
+1879 | static RISCV_QUEUE_SWITCH_FOUNDATION_DONE: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_armed` is never used
+    --> src/kernel/boot/mod.rs:1899:15
+     |
+1899 | pub(crate) fn riscv_queue_switch_foundation_armed() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_try_defer` is never used
+    --> src/kernel/boot/mod.rs:1906:15
+     |
+1906 | pub(crate) fn riscv_queue_switch_foundation_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_is_deferred` is never used
+    --> src/kernel/boot/mod.rs:1938:15
+     |
+1938 | pub(crate) fn riscv_queue_switch_foundation_is_deferred(cpu_idx: usize) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_outgoing` is never used
+    --> src/kernel/boot/mod.rs:1944:15
+     |
+1944 | pub(crate) fn riscv_queue_switch_foundation_outgoing(cpu_idx: usize) -> Option<u64> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `riscv_queue_switch_foundation_clear` is never used
+    --> src/kernel/boot/mod.rs:1955:15
+     |
+1955 | pub(crate) fn riscv_queue_switch_foundation_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:2007:8
+     |
+2007 | static RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_riscv_futex_wait_retire_default_on` is never used
+    --> src/kernel/boot/mod.rs:2012:15
+     |
+2012 | pub(crate) fn maybe_log_riscv_futex_wait_retire_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RISCV_YIELD_DEFAULT_ON_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:2091:8
+     |
+2091 | static RISCV_YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_riscv_yield_retire_default_on` is never used
+    --> src/kernel/boot/mod.rs:2096:15
+     |
+2096 | pub(crate) fn maybe_log_riscv_yield_retire_default_on() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_code` is never used
+    --> src/kernel/boot/mod.rs:2204:8
+     |
+2189 | impl BlockingSyscallClass {
+     | ------------------------- associated function in this implementation
+...
+2204 |     fn from_code(code: u8) -> Option<BlockingSyscallClass> {
+     |        ^^^^^^^^^
+
+warning: function `blocked_syscall_idle_provenance_take` is never used
+    --> src/kernel/boot/mod.rs:2243:15
+     |
+2243 | pub(crate) fn blocked_syscall_idle_provenance_take(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `current_arch_tag` is never used
+    --> src/kernel/boot/mod.rs:2271:21
+     |
+2271 | pub(crate) const fn current_arch_tag() -> &'static str {
+     |                     ^^^^^^^^^^^^^^^^
+
+warning: static `SHARED_REGION_CANCEL_FUSE_LOGGED` is never used
+    --> src/kernel/boot/mod.rs:2330:8
+     |
+2330 | static SHARED_REGION_CANCEL_FUSE_LOGGED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_log_shared_region_cancel_fuse_set` is never used
+    --> src/kernel/boot/mod.rs:2337:15
+     |
+2337 | pub(crate) fn maybe_log_shared_region_cancel_fuse_set() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `d6_controlled_switch_proof_try_start` is never used
+    --> src/kernel/boot/mod.rs:3378:15
+     |
+3378 | pub(crate) fn d6_controlled_switch_proof_try_start() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `d6_controlled_switch_proof_mark_pending_done` is never used
+    --> src/kernel/boot/mod.rs:3417:15
+     |
+3417 | pub(crate) fn d6_controlled_switch_proof_mark_pending_done() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipccall_direct_smp_request_note_delivered` is never used
+    --> src/kernel/boot/mod.rs:4502:15
+     |
+4502 | pub(crate) fn ipccall_direct_smp_request_note_delivered() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipcreply_direct_smp_reply_note_delivered` is never used
+    --> src/kernel/boot/mod.rs:4726:15
+     |
+4726 | pub(crate) fn ipcreply_direct_smp_reply_note_delivered() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_x86_c2c_client_tid` is never used
+    --> src/kernel/boot/mod.rs:4869:15
+     |
+4869 | pub(crate) fn set_x86_c2c_client_tid(tid: u64) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipccall_direct_oracle_endpoints` is never used
+    --> src/kernel/boot/mod.rs:4958:15
+     |
+4958 | pub(crate) fn set_ipccall_direct_oracle_endpoints(req_eidx: usize, rep_eidx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_reply_timeout_oracle_reply_endpoint` is never used
+    --> src/kernel/boot/mod.rs:5353:15
+     |
+5353 | pub(crate) fn set_ipc_reply_timeout_oracle_reply_endpoint(eidx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `IPC_REPLY_TIMEOUT_RW_DEADLINE` is never used
+    --> src/kernel/boot/mod.rs:5360:8
+     |
+5360 | static IPC_REPLY_TIMEOUT_RW_DEADLINE: core::sync::atomic::AtomicU64 =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `IPC_REPLY_TIMEOUT_RW_LATE_EMITTED` is never used
+    --> src/kernel/boot/mod.rs:5362:8
+     |
+5362 | static IPC_REPLY_TIMEOUT_RW_LATE_EMITTED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_ipc_reply_timeout_rw_deadline` is never used
+    --> src/kernel/boot/mod.rs:5365:15
+     |
+5365 | pub(crate) fn set_ipc_reply_timeout_rw_deadline(tick: u64) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipc_reply_timeout_rw_deadline` is never used
+    --> src/kernel/boot/mod.rs:5368:15
+     |
+5368 | pub(crate) fn ipc_reply_timeout_rw_deadline() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ipc_reply_timeout_rw_late_scan_once` is never used
+    --> src/kernel/boot/mod.rs:5372:15
+     |
+5372 | pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `slot` is never used
+    --> src/kernel/boot/mod.rs:6537:19
+     |
+6536 | impl ServerDeathWorkReservation {
+     | ------------------------------- method in this implementation
+6537 |     pub(crate) fn slot(&self) -> usize {
+     |                   ^^^^
+
+warning: function `server_death_work_len` is never used
+    --> src/kernel/boot/mod.rs:6641:15
+     |
+6641 | pub(crate) fn server_death_work_len(cpu_idx: usize) -> usize {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_clear` is never used
+    --> src/kernel/boot/mod.rs:6653:15
+     |
+6653 | pub(crate) fn server_death_work_clear(cpu_idx: usize) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_published_count` is never used
+    --> src/kernel/boot/mod.rs:6865:15
+     |
+6865 | pub(crate) fn server_death_work_published_count() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `server_death_work_drained_count` is never used
+    --> src/kernel/boot/mod.rs:6868:15
+     |
+6868 | pub(crate) fn server_death_work_drained_count() -> u64 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `REPLY_TIMEOUT_RETIRE_EMITTED` is never used
+    --> src/kernel/boot/mod.rs:7005:8
+     |
+7005 | static REPLY_TIMEOUT_RETIRE_EMITTED: core::sync::atomic::AtomicBool =
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `maybe_emit_reply_timeout_class_retired` is never used
+    --> src/kernel/boot/mod.rs:7017:15
+     |
+7017 | pub(crate) fn maybe_emit_reply_timeout_class_retired() {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `oracle_gated_facts` is never used
+    --> src/kernel/boot/mod.rs:7974:15
+     |
+7974 | pub(crate) fn oracle_gated_facts<T>(armed: bool, collect: impl FnOnce() -> T) -> Option<T> {
+     |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `note_recv_broad_entry` is never used
+    --> src/kernel/boot/mod.rs:9144:15
+     |
+9144 | pub(crate) fn note_recv_broad_entry() {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_shared_region_oracle_fault_inject` is never used
+    --> src/kernel/boot/mod.rs:9563:15
+     |
+9563 | pub(crate) fn set_shared_region_oracle_fault_inject(step: u32) {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `cpu_id`, `incoming_tid`, `outgoing_frame_ptr`, `incoming_frame_ptr`, and `outgoing_stack_top` are never read
+     --> src/kernel/boot/mod.rs:10248:16
+      |
+10246 | pub(crate) struct FirstResumeContext {
+      |                   ------------------ fields in this struct
+10247 |     /// CPU ID of the CPU on which the switch is occurring.
+10248 |     pub(crate) cpu_id: crate::kernel::scheduler::CpuId,
+      |                ^^^^^^
+10249 |     /// TID of the incoming (first-resuming) task.
+10250 |     pub(crate) incoming_tid: u64,
+      |                ^^^^^^^^^^^^
+10251 |     /// Pointer to the outgoing task's frame (for the switch-back `next` arg).
+10252 |     pub(crate) outgoing_frame_ptr: *const crate::kernel::task::ArchSwitchContext,
+      |                ^^^^^^^^^^^^^^^^^^
+10253 |     /// Pointer to the incoming task's frame (for the switch-back `prev` arg).
+10254 |     pub(crate) incoming_frame_ptr: *mut crate::kernel::task::ArchSwitchContext,
+      |                ^^^^^^^^^^^^^^^^^^
+10255 |     /// Outgoing task's kernel stack top for TSS RSP0 update on switch-back.
+10256 |     pub(crate) outgoing_stack_top: Option<u64>,
+      |                ^^^^^^^^^^^^^^^^^^
+
+warning: method `store` is never used
+     --> src/kernel/boot/mod.rs:10285:26
+      |
+10273 | impl PerCpuFirstResumeStash {
+      | --------------------------- method in this implementation
+...
+10285 |     pub(crate) unsafe fn store(&self, ctx: FirstResumeContext) {
+      |                          ^^^^^
+
+warning: method `find_current_task_cap_for_memory_object_phys` is never used
+   --> src/kernel/boot/capability_lifecycle_state.rs:808:19
+    |
+  7 | impl KernelState {
+    | ---------------- method in this implementation
+...
+808 |     pub(crate) fn find_current_task_cap_for_memory_object_phys(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `resolved_cap_object_split` is never used
+    --> src/kernel/boot/capability_lifecycle_state.rs:1072:19
+     |
+1063 | impl crate::runtime::SharedKernel {
+     | --------------------------------- method in this implementation
+...
+1072 |     pub(crate) fn resolved_cap_object_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ALL_COW_CLONE_SITES` is never used
+  --> src/kernel/boot/cow_clone.rs:79:18
+   |
+79 | pub(crate) const ALL_COW_CLONE_SITES: [&str; 8] = [
+   |                  ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CowPageRecord` is never constructed
+   --> src/kernel/boot/defs.rs:219:19
+    |
+219 | pub(crate) struct CowPageRecord {
+    |                   ^^^^^^^^^^^^^
+
+warning: constant `BOOTSTRAP_SUPERVISOR_TID` is never used
+  --> src/kernel/boot/exec_state.rs:45:7
+   |
+45 | const BOOTSTRAP_SUPERVISOR_TID: u64 = 2;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `AP_PROBE_STUB` is never used
+  --> src/kernel/boot/exec_state.rs:91:22
+   |
+91 |     pub(crate) const AP_PROBE_STUB: [u8; 119] = [
+   |                      ^^^^^^^^^^^^^
+
+warning: enum `QueueAdvanceOutcome` is never used
+   --> src/kernel/boot/exec_state.rs:192:17
+    |
+192 | pub(crate) enum QueueAdvanceOutcome {
+    |                 ^^^^^^^^^^^^^^^^^^^
+
+warning: variant `StashedKernelSwitch` is never constructed
+   --> src/kernel/boot/exec_state.rs:222:5
+    |
+218 | pub(crate) enum QueueAdvanceApply {
+    |                 ----------------- variant in this enum
+...
+222 |     StashedKernelSwitch,
+    |     ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `QueueAdvanceApply` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: associated items `maybe_run_d6_controlled_switch_proof_split` and `d2_recv_switch_incoming_asid` are never used
+    --> src/kernel/boot/exec_state.rs:744:19
+     |
+ 426 | impl KernelState {
+     | ---------------- associated items in this implementation
+...
+ 744 |     pub(crate) fn maybe_run_d6_controlled_switch_proof_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2916 |     pub(crate) fn d2_recv_switch_incoming_asid(&mut self, incoming: u64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `queue_advance_admit_split` and `queue_advance_commit_split` are never used
+    --> src/kernel/boot/exec_state.rs:4826:19
+     |
+4675 | impl crate::runtime::SharedKernel {
+     | --------------------------------- methods in this implementation
+...
+4826 |     pub(crate) fn queue_advance_admit_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+5054 |     pub(crate) fn queue_advance_commit_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `marker` is never used
+   --> src/kernel/boot/fault_state.rs:186:19
+    |
+185 | impl PageFaultClassifyRefusal {
+    | ----------------------------- method in this implementation
+186 |     pub(crate) fn marker(self) -> &'static str {
+    |                   ^^^^^^
+
+warning: variant `RetryInstruction` is never constructed
+   --> src/kernel/boot/fault_state.rs:382:5
+    |
+378 | pub(crate) enum PreMutationSettlement {
+    |                 --------------------- variant in this enum
+...
+382 |     RetryInstruction,
+    |     ^^^^^^^^^^^^^^^^
+    |
+    = note: `PreMutationSettlement` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: enum `BufferedFaultAdmission` is never used
+   --> src/kernel/boot/fault_state.rs:576:17
+    |
+576 | pub(crate) enum BufferedFaultAdmission {
+    |                 ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `read_terminal_fault_policy_split`, `classify_page_fault_split`, and `fault_current_task_unsupported_instruction` are never used
+    --> src/kernel/boot/fault_state.rs:1296:19
+     |
+1188 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+1296 |     pub(crate) fn read_terminal_fault_policy_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1368 |     pub(crate) fn classify_page_fault_split(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2034 |     pub(crate) fn fault_current_task_unsupported_instruction(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `remove_endpoint_waiter_exact` is never used
+    --> src/kernel/boot/ipc_state.rs:1064:19
+     |
+ 797 | impl IpcSubsystem {
+     | ----------------- method in this implementation
+...
+1064 |     pub(crate) fn remove_endpoint_waiter_exact(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: multiple methods are never used
+    --> src/kernel/boot/ipc_state.rs:2327:19
+     |
+2149 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+2327 |     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2486 |     pub(crate) fn revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2508 |     pub(crate) fn reserve_direct_reply_record(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2523 |     pub(crate) fn commit_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2630 |     pub(crate) fn unregister_server_reply_link(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2717 |     pub(crate) fn live_server_reply_link_count(&self) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2729 |     pub(crate) fn cancel_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2758 |     pub(crate) fn bind_direct_reply_record_server_cap(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2798 |     pub(crate) fn reply_terminal_armed_identity(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2873 |     pub(crate) fn rearm_terminal_for_reply_record(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2923 |     pub(crate) fn try_claim_reply_terminal_slot(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2944 |     pub(crate) fn commit_reply_terminal_slot(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2956 |     pub(crate) fn release_reply_terminal_slot_if_retryable(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3042 |     pub(crate) fn claim_deadline_fire_exact(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3055 |     pub(crate) fn cancel_deadline_exact(
+     |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+3069 |     pub(crate) fn disarm_deadline_after_terminal_completion(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3084 |     pub(crate) fn complete_deadline_fire(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+3098 |     pub(crate) fn disarm_deadline_fire(
+     |                   ^^^^^^^^^^^^^^^^^^^^
+...
+3114 |     pub(crate) fn claim_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3128 |     pub(crate) fn complete_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3143 |     pub(crate) fn restore_deadline_reply_lease(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3639 |     pub(crate) fn reply_record_slot_generation(&self, index: usize) -> Option<u64> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3729 |     pub(crate) fn set_task_status_for_test(&mut self, tid: u64, status: TaskStatus) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3737 |     pub(crate) fn has_pending_syscall_completion(&self, tid: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4307 |     pub(crate) fn run_reply_timeout_completion_locked(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+6958 |     pub(crate) fn try_ipc_send_boundary_split_plain_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+7027 |     pub(crate) fn try_ipc_send_boundary_split_ordinary_cap_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+7136 |     pub(crate) fn try_ipc_send_boundary_split_reply_cap_pub(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `mark_cow_page`, `clone_user_address_space_cow`, and `alloc_user_data_frame` are never used
+    --> src/kernel/boot/memory_state.rs:46:8
+     |
+  13 | impl KernelState {
+     | ---------------- methods in this implementation
+...
+  46 |     fn mark_cow_page(&mut self, asid: Asid, virt: VirtAddr) -> Result<(), KernelError> {
+     |        ^^^^^^^^^^^^^
+...
+ 429 |     pub(crate) fn clone_user_address_space_cow(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1100 |     pub(crate) fn alloc_user_data_frame(&mut self) -> Result<u64, KernelError> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `x86_smp_unlock_audit_claimed` is never used
+  --> src/kernel/boot/orchestrator_state.rs:23:15
+   |
+23 | pub(crate) fn x86_smp_unlock_audit_claimed() -> bool {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `with_task_robust_futex_mut` is never used
+    --> src/kernel/boot/orchestrator_state.rs:2264:19
+     |
+ 100 | impl KernelState {
+     | ---------------- method in this implementation
+...
+2264 |     pub(crate) fn with_task_robust_futex_mut<R>(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `mask_of` is never used
+   --> src/kernel/boot/futex.rs:581:12
+    |
+472 | impl FutexWaiterTable {
+    | --------------------- method in this implementation
+...
+581 |     pub fn mask_of(&self, token: FutexWaitToken) -> Option<u32> {
+    |            ^^^^^^^
+
+warning: function `futex_waiter_expired_locked` is never used
+    --> src/kernel/boot/futex.rs:1538:8
+     |
+1538 | pub fn futex_waiter_expired_locked(table: &FutexWaiterTable, token: FutexWaitToken) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `nothing_created` is never used
+  --> src/kernel/boot/process_cnode_txn.rs:91:25
+   |
+88 | impl ProcessCNodeGrant {
+   | ---------------------- associated function in this implementation
+...
+91 |     pub(crate) const fn nothing_created(cnode: CNodeId) -> Self {
+   |                         ^^^^^^^^^^^^^^^
+
+warning: methods `withdraw_queued_tid_on`, `on_dispatch_selection_on_cpu`, `on_preempt_prefer_current_cpu`, `task_present_in_any_runqueue`, and `set_task_home_cpu` are never used
+   --> src/kernel/boot/scheduler_state.rs:63:19
+    |
+ 23 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+ 63 |     pub(crate) fn withdraw_queued_tid_on(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+167 |     pub(crate) fn on_dispatch_selection_on_cpu(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+329 |     pub(crate) fn on_preempt_prefer_current_cpu(&mut self, preferred: u64) -> Option<u64> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+492 |     pub(crate) fn task_present_in_any_runqueue(&self, tid: u64) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+671 |     pub(crate) fn set_task_home_cpu(&mut self, tid: u64, cpu: CpuId) -> Result<(), KernelError> {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: methods `shared_region_request_cancel`, `shared_region_execute`, and `rollback_shared_region_direct_txn` are never used
+   --> src/kernel/boot/shared_region_txn.rs:255:19
+    |
+240 | impl KernelState {
+    | ---------------- methods in this implementation
+...
+255 |     pub(crate) fn shared_region_request_cancel(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+446 |     pub(crate) fn shared_region_execute(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+461 |     pub(crate) fn rollback_shared_region_direct_txn(&mut self, txn: &mut SharedRegionDirectTxn) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `D6_PROOF_MAX_TASKS` is never used
+  --> src/kernel/boot/thread_state.rs:94:7
+   |
+94 | const D6_PROOF_MAX_TASKS: usize = 128;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+    --> src/kernel/boot/thread_state.rs:324:8
+     |
+ 323 | impl KernelState {
+     | ---------------- associated items in this implementation
+ 324 |     fn fork_should_inherit_capability(object: CapObject) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 340 |     fn inherit_parent_capabilities_for_fork(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 438 |     pub(crate) fn clear_blocked_recv_return_regs_locked(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1068 |     pub(crate) fn ensure_active_root_can_use_kernel_switch_stack(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1221 |     pub(crate) fn d6_ensure_full_proof_switch_stack_mapped(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1270 |     pub(crate) fn d6_ensure_live_rsp_region_mapped(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2516 |     pub(crate) fn snapshot_async_preempted_current(&mut self, frame: &TrapFrame) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2545 |     pub(crate) fn take_async_preempt_for_incoming(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2558 |     pub(crate) fn cancel_async_preempt_for(&mut self, tid: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2567 |     pub(crate) fn async_preempted_resume_pending(&mut self, tid: u64) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `update_active_transfer_mapping_len_locked` is never used
+   --> src/kernel/boot/transfer_state.rs:426:19
+    |
+  6 | impl KernelState {
+    | ---------------- associated function in this implementation
+...
+426 |     pub(crate) fn update_active_transfer_mapping_len_locked(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `write_user_byte` is never used
+  --> src/kernel/boot/user_memory_state.rs:18:8
+   |
+ 8 | impl KernelState {
+   | ---------------- method in this implementation
+...
+18 |     fn write_user_byte(
+   |        ^^^^^^^^^^^^^^^
+
+warning: variants `OrdinaryTimeout` and `Notification` are never constructed
+   --> src/kernel/boot/waiter_ownership.rs:149:5
+    |
+143 | pub(crate) enum WaiterOwner {
+    |                 ----------- variants in this enum
+...
+149 |     OrdinaryTimeout,
+    |     ^^^^^^^^^^^^^^^
+...
+153 |     Notification,
+    |     ^^^^^^^^^^^^
+    |
+    = note: `WaiterOwner` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `owner`, `endpoint_index`, and `waiter` are never used
+   --> src/kernel/boot/waiter_ownership.rs:314:19
+    |
+312 | impl WaiterClaimToken {
+    | --------------------- methods in this implementation
+313 |     /// Which owner earned this claim — so a future owner can log and assert its own identity.
+314 |     pub(crate) fn owner(&self) -> WaiterOwner {
+    |                   ^^^^^
+...
+320 |     pub(crate) fn endpoint_index(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^
+...
+326 |     pub(crate) fn waiter(&self) -> ReceiverWaiterIdentity {
+    |                   ^^^^^^
+
+warning: methods `claimed_count` and `occupied_count` are never used
+   --> src/kernel/boot/waiter_ownership.rs:720:8
+    |
+494 | impl WaiterOwnershipTable {
+    | ------------------------- methods in this implementation
+...
+720 |     fn claimed_count(&self) -> usize {
+    |        ^^^^^^^^^^^^^
+...
+729 |     fn occupied_count(&self) -> usize {
+    |        ^^^^^^^^^^^^^^
+
+warning: methods `waiter_ownership_claimed_count` and `waiter_ownership_occupied_count` are never used
+   --> src/kernel/boot/waiter_ownership.rs:785:19
+    |
+740 | impl IpcSubsystem {
+    | ----------------- methods in this implementation
+...
+785 |     pub(crate) fn waiter_ownership_claimed_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+789 |     pub(crate) fn waiter_ownership_occupied_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `publish` is never used
+    --> src/kernel/boot/mod.rs:7647:19
+     |
+7647 |     pub(crate) fn publish(ack: BlockedServerAck) -> u64 {
+     |                   ^^^^^^^
+
+warning: function `publish` is never used
+    --> src/kernel/boot/mod.rs:8158:19
+     |
+8158 |     pub(crate) fn publish(ack: BlockedCallerAck) -> u64 {
+     |                   ^^^^^^^
+
+warning: constant `NONE` is never used
+    --> src/kernel/boot/mod.rs:9551:15
+     |
+9551 |     pub const NONE: u32 = 0;
+     |               ^^^^
+
+warning: constant `LAST` is never used
+    --> src/kernel/boot/mod.rs:9559:15
+     |
+9559 |     pub const LAST: u32 = MINT_EP;
+     |               ^^^^
+
+warning: methods `status` and `set_raw_cmdline_from_bytes_monotonic` are never used
+  --> src/kernel/boot_command_line.rs:72:18
+   |
+39 | impl BootCommandLine {
+   | -------------------- methods in this implementation
+...
+72 |     pub const fn status(&self) -> BootCommandLineStatus {
+   |                  ^^^^^^
+...
+90 |     pub fn set_raw_cmdline_from_bytes_monotonic(&mut self, source: &[u8]) -> bool {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `set_raw_cmdline_from_bytes_monotonic` is never used
+   --> src/kernel/boot_command_line.rs:737:8
+    |
+737 | pub fn set_raw_cmdline_from_bytes_monotonic(source: &[u8]) -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `boot_command_line` is never used
+   --> src/kernel/boot_command_line.rs:751:8
+    |
+751 | pub fn boot_command_line() -> BootCommandLine {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: constant `NO_ENDPOINT` is never used
+   --> src/kernel/direct_ack_store.rs:180:7
+    |
+180 | const NO_ENDPOINT: usize = usize::MAX;
+    |       ^^^^^^^^^^^
+
+warning: methods `released_seq` and `is_anomaly` are never used
+   --> src/kernel/direct_ack_store.rs:379:19
+    |
+377 | impl AckRelease {
+    | --------------- methods in this implementation
+378 |     /// The retired publication sequence, when this call is the one that ended the lease.
+379 |     pub(crate) fn released_seq(self) -> Option<u64> {
+    |                   ^^^^^^^^^^^^
+...
+394 |     pub(crate) fn is_anomaly(self) -> bool {
+    |                   ^^^^^^^^^^
+
+warning: field `admission` is never read
+   --> src/kernel/direct_ack_store.rs:513:5
+    |
+500 | pub(crate) struct DirectAckStore {
+    |                   -------------- field in this struct
+...
+513 |     admission: AtomicBool,
+    |     ^^^^^^^^^
+    |
+    = note: `DirectAckStore` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: method `live_pair_count_scan` is never used
+    --> src/kernel/direct_ack_store.rs:1182:19
+     |
+ 550 | impl DirectAckStore {
+     | ------------------- method in this implementation
+...
+1182 |     pub(crate) fn live_pair_count_scan(&self) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `None` is never constructed
+  --> src/kernel/dispatch_post_work.rs:96:5
+   |
+92 | pub(crate) enum DispatchPostWork {
+   |                 ---------------- variant in this enum
+...
+96 |     None,
+   |     ^^^^
+   |
+   = note: `DispatchPostWork` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: enum `ReplyReservationError` is never used
+   --> src/kernel/ipccall_direct.rs:140:17
+    |
+140 | pub(crate) enum ReplyReservationError {
+    |                 ^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ReplyReservation` is never used
+   --> src/kernel/ipccall_direct.rs:167:17
+    |
+167 | pub(crate) enum ReplyReservation {
+    |                 ^^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src/kernel/ipccall_direct.rs:180:25
+    |
+179 | impl ReplyReservation {
+    | --------------------- associated items in this implementation
+180 |     pub(crate) const fn new() -> Self {
+    |                         ^^^
+...
+184 |     pub(crate) const fn is_available(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+...
+188 |     pub(crate) const fn is_reserved(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+192 |     pub(crate) const fn is_consumed(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+198 |     pub(crate) fn reserve(
+    |                   ^^^^^^^
+...
+218 |     pub(crate) fn release(
+    |                   ^^^^^^^
+...
+239 |     pub(crate) fn consume(
+    |                   ^^^^^^^
+
+warning: method `waiter_claim_key` is never used
+   --> src/kernel/ipccall_direct.rs:315:25
+    |
+304 | impl BlockedServerAck {
+    | --------------------- method in this implementation
+...
+315 |     pub(crate) const fn waiter_claim_key(&self) -> (usize, u64, ReceiverWaiterIdentity) {
+    |                         ^^^^^^^^^^^^^^^^
+
+warning: methods `is_claimed` and `is_consumed` are never used
+   --> src/kernel/ipccall_direct.rs:394:25
+    |
+386 | impl AckLease {
+    | ------------- methods in this implementation
+...
+394 |     pub(crate) const fn is_claimed(&self) -> bool {
+    |                         ^^^^^^^^^^
+...
+397 |     pub(crate) const fn is_consumed(&self) -> bool {
+    |                         ^^^^^^^^^^^
+
+warning: associated functions `from_recv_v2`, `from_legacy_mapped_recv`, and `from_v3_abi_request` are never used
+   --> src/kernel/recv_core.rs:256:19
+    |
+166 | impl RecvRequest {
+    | ---------------- associated functions in this implementation
+...
+256 |     pub(crate) fn from_recv_v2(
+    |                   ^^^^^^^^^^^^
+...
+299 |     pub(crate) fn from_legacy_mapped_recv(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+333 |     pub(crate) fn from_v3_abi_request(
+    |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: function `peek_recv_core_user_plain` is never used
+   --> src/kernel/recv_core.rs:766:15
+    |
+766 | pub(crate) fn peek_recv_core_user_plain(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_user_asid_plain_writeback` is never used
+   --> src/kernel/recv_core.rs:803:15
+    |
+803 | pub(crate) fn execute_user_asid_plain_writeback(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `user_len` is never used
+   --> src/kernel/scheduler.rs:268:8
+    |
+194 | impl RunQueues {
+    | -------------- method in this implementation
+...
+268 |     fn user_len(&self, level: usize) -> usize {
+    |        ^^^^^^^^
+
+warning: methods `for_each_queued`, `context_of`, and `budget_ledger` are never used
+    --> src/kernel/scheduler.rs:1193:8
+     |
+ 459 | impl PriorityScheduler {
+     | ---------------------- methods in this implementation
+...
+1193 |     fn for_each_queued(&self, f: &mut impl FnMut(TaskPriority, ThreadId)) {
+     |        ^^^^^^^^^^^^^^^
+...
+1443 |     pub(crate) fn context_of(
+     |                   ^^^^^^^^^^
+...
+1452 |     pub(crate) fn budget_ledger(&self) -> (u64, u64, u64, u64, usize) {
+     |                   ^^^^^^^^^^^^^
+
+warning: methods `context_of` and `budget_ledger` are never used
+    --> src/kernel/scheduler.rs:2520:19
+     |
+2149 | impl CpuView<'_> {
+     | ---------------- methods in this implementation
+...
+2520 |     pub(crate) fn context_of(
+     |                   ^^^^^^^^^^
+...
+2538 |     pub(crate) fn budget_ledger(&self) -> (u64, u64, u64, u64, usize) {
+     |                   ^^^^^^^^^^^^^
+
+warning: function `produce_queued_shared_region_delivery` is never used
+    --> src/kernel/syscall.rs:1444:15
+     |
+1444 | pub(crate) fn produce_queued_shared_region_delivery(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new` and `try_take` are never used
+   --> src/kernel/syscall/process.rs:272:25
+    |
+271 | impl<const N: usize> TakeOnceStagingBuffer<N> {
+    | --------------------------------------------- associated items in this implementation
+272 |     pub(super) const fn new() -> Self {
+    |                         ^^^
+...
+281 |     pub(super) fn try_take(&'static self) -> Option<StagingBufferClaim<'static, N>> {
+    |                   ^^^^^^^^
+
+warning: struct `StagingBufferClaim` is never constructed
+   --> src/kernel/syscall/process.rs:292:19
+    |
+292 | pub(super) struct StagingBufferClaim<'a, const N: usize> {
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: method `as_mut_slice` is never used
+   --> src/kernel/syscall/process.rs:297:19
+    |
+296 | impl<'a, const N: usize> StagingBufferClaim<'a, N> {
+    | -------------------------------------------------- method in this implementation
+297 |     pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
+    |                   ^^^^^^^^^^^^
+
+warning: function `write_v3_output_to_user` is never used
+   --> src/kernel/syscall/recv_shared_v3.rs:144:4
+    |
+144 | fn write_v3_output_to_user(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `read_user` is never used
+  --> src/kernel/syscall/recv_v3_txn.rs:82:8
+   |
+77 | pub(crate) trait RecvV3Owners {
+   |                  ------------ method in this trait
+...
+82 |     fn read_user(&mut self, asid: Asid, ptr: usize, len: usize) -> Option<[u8; 80]>;
+   |        ^^^^^^^^^
+
+warning: method `len` is never used
+   --> src/kernel/syscall/spawn_image_txn.rs:195:25
+    |
+168 | impl SpawnLedger {
+    | ---------------- method in this implementation
+...
+195 |     pub(crate) const fn len(&self) -> usize {
+    |                         ^^^
+
+warning: field `asid` is never read
+   --> src/kernel/syscall/spawn_image_txn.rs:369:16
+    |
+364 | pub(crate) struct SpawnImageCommitted {
+    |                   ------------------- field in this struct
+...
+369 |     pub(crate) asid: Asid,
+    |                ^^^^
+
+warning: methods `thread_kernel_stack_top`, `thread_kernel_context_initialized`, and `initialize_thread_kernel_switch_frame` are never used
+   --> src/kernel/syscall/spawn_txn.rs:146:8
+    |
+ 76 | pub(crate) trait SpawnTxnOwners {
+    |                  -------------- methods in this trait
+...
+146 |     fn thread_kernel_stack_top(&self, tid: u64) -> u64;
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+147 |     /// Whether the child's kernel context has been initialized, for the x86_64 retry gate.
+148 |     fn thread_kernel_context_initialized(&self, tid: u64) -> bool;
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+149 |     /// x86_64 bootstrap only: publish an initialized kernel switch frame.
+150 |     fn initialize_thread_kernel_switch_frame(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `BOOTSTRAP_SUPERVISOR_TID` is never used
+   --> src/kernel/syscall/spawn_txn.rs:330:7
+    |
+330 | const BOOTSTRAP_SUPERVISOR_TID: u64 = 2;
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `NoAsid` is never constructed
+   --> src/kernel/syscall/xfer_txn.rs:140:5
+    |
+122 | pub(crate) enum XferRefusal {
+    |                 ----------- variant in this enum
+...
+140 |     NoAsid,
+    |     ^^^^^^
+    |
+    = note: `XferRefusal` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variant `PostWorkCommitted` is never constructed
+    --> src/kernel/syscall_split.rs:2364:5
+     |
+2357 | pub(crate) enum SplitBlockingDisposition {
+     |                 ------------------------ variant in this enum
+...
+2364 |     PostWorkCommitted { finalize_syscall: bool },
+     |     ^^^^^^^^^^^^^^^^^
+     |
+     = note: `SplitBlockingDisposition` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `0` is never read
+    --> src/kernel/syscall_split.rs:3547:22
+     |
+3547 |     AdmissionRefused(crate::kernel::boot::QueueAdvanceRefusal),
+     |     ---------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |     |
+     |     field in this variant
+     |
+     = note: `CannotParkReason` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+     |
+3547 -     AdmissionRefused(crate::kernel::boot::QueueAdvanceRefusal),
+3547 +     AdmissionRefused(()),
+     |
+
+warning: constant `RT_CAUSE_TICK` is never used
+    --> src/kernel/syscall_split.rs:5045:18
+     |
+5045 | pub(crate) const RT_CAUSE_TICK: u64 = 2;
+     |                  ^^^^^^^^^^^^^
+
+warning: enum `AsyncResumeClass` is never used
+   --> src/kernel/task.rs:724:17
+    |
+724 | pub(crate) enum AsyncResumeClass {
+    |                 ^^^^^^^^^^^^^^^^
+
+warning: method `restores_verbatim` is never used
+   --> src/kernel/task.rs:740:19
+    |
+737 | impl AsyncResumeClass {
+    | --------------------- method in this implementation
+...
+740 |     pub(crate) fn restores_verbatim(self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: function `classify_and_take_async_resume` is never used
+   --> src/kernel/task.rs:796:15
+    |
+796 | pub(crate) fn classify_and_take_async_resume(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resume_boundary_consumes` is never used
+   --> src/kernel/task.rs:850:21
+    |
+850 | pub(crate) const fn resume_boundary_consumes(class: BlockedSyscallClass) -> bool {
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `cancel_async_resume` is never used
+   --> src/kernel/task.rs:876:15
+    |
+876 | pub(crate) fn cancel_async_resume(tcbs: &mut [Option<ThreadControlBlock>], tid: u64) -> bool {
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: function `publish_async_preempt_snapshot` is never used
+   --> src/kernel/task.rs:909:15
+    |
+909 | pub(crate) fn publish_async_preempt_snapshot(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `PriorityConfigRefusal` is never used
+   --> src/kernel/task_enqueue.rs:277:17
+    |
+277 | pub(crate) enum PriorityConfigRefusal {
+    |                 ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `configure_priority_locked` is never used
+   --> src/kernel/task_enqueue.rs:288:15
+    |
+288 | pub(crate) fn configure_priority_locked(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `configure_budget_locked` is never used
+   --> src/kernel/task_enqueue.rs:309:15
+    |
+309 | pub(crate) fn configure_budget_locked(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `AmbientMismatch` is never constructed
+   --> src/runtime.rs:824:5
+    |
+816 | pub(crate) enum DispatchAuthorityRefusal {
+    |                 ------------------------ variant in this enum
+...
+824 |     AmbientMismatch { authoritative: CpuId },
+    |     ^^^^^^^^^^^^^^^
+    |
+    = note: `DispatchAuthorityRefusal` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `consume_resume_convention_locked` is never used
+   --> src/runtime.rs:920:15
+    |
+920 | pub(crate) fn consume_resume_convention_locked(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `provenance` is never used
+    --> src/runtime.rs:1031:19
+     |
+ 984 | impl DispatchMarkToken {
+     | ---------------------- method in this implementation
+...
+1031 |     pub(crate) fn provenance(&self) -> crate::kernel::scheduler::DispatchSelection {
+     |                   ^^^^^^^^^^
+
+warning: enum `DispatchDisposition` is never used
+    --> src/runtime.rs:1396:17
+     |
+1396 | pub(crate) enum DispatchDisposition {
+     |                 ^^^^^^^^^^^^^^^^^^^
+
+warning: method `disposition` is never used
+    --> src/runtime.rs:1533:19
+     |
+1520 | impl DispatchMarkOutcome {
+     | ------------------------ method in this implementation
+...
+1533 |     pub(crate) fn disposition(self) -> DispatchDisposition {
+     |                   ^^^^^^^^^^^
+
+warning: enum `D6SwitchPublication` is never used
+    --> src/runtime.rs:1619:17
+     |
+1619 | pub(crate) enum D6SwitchPublication {
+     |                 ^^^^^^^^^^^^^^^^^^^
+
+warning: enum `D6PublishRefusal` is never used
+    --> src/runtime.rs:1630:17
+     |
+1630 | pub(crate) enum D6PublishRefusal {
+     |                 ^^^^^^^^^^^^^^^^
+
+warning: method `marker` is never used
+    --> src/runtime.rs:1655:19
+     |
+1654 | impl D6PublishRefusal {
+     | --------------------- method in this implementation
+1655 |     pub(crate) fn marker(self) -> &'static str {
+     |                   ^^^^^^
+
+warning: multiple methods are never used
+     --> src/runtime.rs:2452:19
+      |
+ 1669 | impl SharedKernel {
+      | ----------------- methods in this implementation
+...
+ 2452 |     pub(crate) fn with_all_cpus_sched_split<R>(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3388 |     pub(crate) fn server_reply_link_for_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3595 |     pub(crate) fn timer_would_preempt_split_read(&self, cpu: CpuId) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 3669 |     pub(crate) fn scheduler_tick_if_no_switch_split_mut(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5503 |     pub(crate) fn direct_dispatch_classify_and_consume_convention_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5605 |     pub(crate) fn take_async_preempt_for_incoming_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5632 |     pub(crate) fn snapshot_async_preempted_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 5648 |     pub(crate) fn cancel_async_preempt_for_split(&self, tid: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 6918 |     pub(crate) fn terminal_idle_on_cpu_split(&self, cpu: CpuId) -> Result<bool, KernelError> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 8064 |     pub(crate) fn admit_buffered_fault_report_shared(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9780 |     pub(crate) fn ipc_try_recv_queued_plain_endpoint_only_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9808 |     pub(crate) fn recv_would_block_split_read(&self, endpoint_idx: usize, generation: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 9837 |     pub(crate) fn ipc_try_recv_queued_with_cap_transfer_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+10840 |     pub(crate) fn memory_object_phys_by_id_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+13776 |     pub(crate) fn d6_publish_switch_plan_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+14727 |     pub(crate) fn sr_update_mapped_prefix_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15600 |     pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+15629 |     pub(crate) fn ipc_try_send_queued_plain_endpoint_only_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16590 |     pub(crate) fn reply_terminal_committed_winner_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+17818 |     pub(crate) fn task_is_runnable_split_read(&self, tid: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+17846 |     pub(crate) fn task_incarnation_is_resumable_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+17872 |     pub(crate) fn task_incarnation_status_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18015 |     pub(crate) fn receiver_has_scheduler_membership_split_read(&self, tid: u64) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18176 |     pub(crate) fn smp_blocked_server_task_facts_split_read(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18278 |     pub(crate) fn smp_request_wake_target_split_read(&self, tid: u64) -> Option<CpuId> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19265 |     pub(crate) fn disarm_reply_deadline_on_reply_win(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19310 |     pub(crate) fn smp_assign_task_home_cpu(&self, tid: u64, cpu: CpuId) -> bool {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+19650 |     pub(crate) fn futex_wait_park_exact_split(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `enqueued_cpu` is never used
+     --> src/runtime.rs:20894:19
+      |
+20891 | impl ReceiverEnqueue {
+      | -------------------- method in this implementation
+...
+20894 |     pub(crate) fn enqueued_cpu(self) -> Option<CpuId> {
+      |                   ^^^^^^^^^^^^
+
+warning: `yarm` (lib) generated 216 warnings (run `cargo fix --lib -p yarm` to apply 34 suggestions)
+    Finished `aarch64-none` profile [optimized] target(s) in 0.18s
+warning: the following packages contain code that will be rejected by a future version of Rust: core v0.0.0 (/root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+ARTIFACT_CARGO_OUTPUT bin=kernel_boot path=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fst1-wt/target/aarch64-yarm-none/aarch64-none/kernel_boot fresh=1 sha256=ecce3016212ca5a1e54024e380f1669b4a40d2becaed9fe3c83d20e334c60859
+NOFP_CHECK arch=aarch64 image_sha256=ecce3016212ca5a1e54024e380f1669b4a40d2becaed9fe3c83d20e334c60859 features=aarch64-shared-region-direct-oracle,futex-time-witness,printk-witness-ring,shared-region-direct-oracle toolchain="5b7b37aefcb5b2fba3c2392bc9065b9e4602d494 1.102.0-nightly" disassembler="Ubuntu LLVM version 18.1.3" disassembler_path="/usr/bin/llvm-objdump" failures=0 ordinary_fp=0 obligations=- result=pass
+[ok] ARTIFACT-PUBLISH: aarch64 kernel yarm-aarch64.elf + yarm-aarch64.bin published with provenance (default_features=0 features=aarch64-shared-region-direct-oracle,futex-time-witness)

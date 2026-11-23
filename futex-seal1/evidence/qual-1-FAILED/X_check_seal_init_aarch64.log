@@ -1,0 +1,526 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1513:5
+     |
+1513 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1512:5
+     |
+1512 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+ --> crates/yarm-user-rt/src/arch/aarch64.rs:8:13
+  |
+8 |     let mut x0 = args[0];
+  |         ----^^
+  |         |
+  |         help: remove this `mut`
+  |
+  = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+ --> crates/yarm-user-rt/src/arch/aarch64.rs:9:13
+  |
+9 |     let mut x1 = args[1];
+  |         ----^^
+  |         |
+  |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:10:13
+   |
+10 |     let mut x2 = args[2];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:11:13
+   |
+11 |     let mut x3 = args[3];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:12:13
+   |
+12 |     let mut x4 = args[4];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:13:13
+   |
+13 |     let mut x5 = args[5];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:63:13
+   |
+63 |     let mut x0 = args[0];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:64:13
+   |
+64 |     let mut x1 = args[1];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:65:13
+   |
+65 |     let mut x2 = args[2];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:66:13
+   |
+66 |     let mut x3 = args[3];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:67:13
+   |
+67 |     let mut x4 = args[4];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:68:13
+   |
+68 |     let mut x5 = args[5];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused import: `alloc::vec::Vec`
+ --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:4:5
+  |
+4 | use alloc::vec::Vec;
+  |     ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `build_read_message` and `build_statx_message`
+  --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:42:48
+   |
+42 |     build_close_message, build_openat_message, build_read_message, build_statx_message,
+   |                                                ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `d`
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:6434:21
+     |
+6434 |         let Ok(Some(d)) = got else {
+     |                     ^ help: if this is intentional, prefix it with an underscore: `_d`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `run_futex_time_witness` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3917:4
+     |
+3917 | fn run_futex_time_witness(s_tid: u64) {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `P` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3293:11
+     |
+3293 |     const P: FutexScope = FutexScope::Private;
+     |           ^
+
+warning: constant `TOPUP_EVERY_NS` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3295:11
+     |
+3295 |     const TOPUP_EVERY_NS: u64 = 500_000_000;
+     |           ^^^^^^^^^^^^^^
+
+warning: constant `G_MAGIC` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3297:22
+     |
+3297 |     pub(super) const G_MAGIC: u32 = 0xF7B1_0000;
+     |                      ^^^^^^^
+
+warning: constant `G_CYCLES` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3298:22
+     |
+3298 |     pub(super) const G_CYCLES: u32 = 32;
+     |                      ^^^^^^^^
+
+warning: constant `BOUND` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3306:11
+     |
+3306 |     const BOUND: u32 = 4_000_000;
+     |           ^^^^^
+
+warning: static `FILLER_ENTRY` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3323:23
+     |
+3323 |     pub(super) static FILLER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+     |                       ^^^^^^^^^^^^
+
+warning: static `SIGNALLER_ENTRY` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3325:23
+     |
+3325 |     pub(super) static SIGNALLER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+     |                       ^^^^^^^^^^^^^^^
+
+warning: static `SIGNALLERS` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3327:12
+     |
+3327 |     static SIGNALLERS: AtomicU32 = AtomicU32::new(0);
+     |            ^^^^^^^^^^
+
+warning: static `WA` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3330:12
+     |
+3330 |     static WA: AtomicU32 = AtomicU32::new(0xA0);
+     |            ^^
+
+warning: static `WB` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3331:12
+     |
+3331 |     static WB: AtomicU32 = AtomicU32::new(0xB0);
+     |            ^^
+
+warning: static `WB2` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3332:12
+     |
+3332 |     static WB2: AtomicU32 = AtomicU32::new(0xB2);
+     |            ^^^
+
+warning: static `QA` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3333:12
+     |
+3333 |     static QA: AtomicU32 = AtomicU32::new(0xC0);
+     |            ^^
+
+warning: static `QB` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3334:12
+     |
+3334 |     static QB: AtomicU32 = AtomicU32::new(0xC1);
+     |            ^^
+
+warning: static `WD2` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3335:12
+     |
+3335 |     static WD2: AtomicU32 = AtomicU32::new(0xD2);
+     |            ^^^
+
+warning: static `WG` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3336:12
+     |
+3336 |     static WG: AtomicU32 = AtomicU32::new(G_MAGIC);
+     |            ^^
+
+warning: static `E1` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3337:12
+     |
+3337 |     static E1: AtomicU32 = AtomicU32::new(0xE1);
+     |            ^^
+
+warning: static `E2` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3338:12
+     |
+3338 |     static E2: AtomicU32 = AtomicU32::new(0xE1);
+     |            ^^
+
+warning: static `WM` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3340:12
+     |
+3340 |     static WM: AtomicU32 = AtomicU32::new(0x3A);
+     |            ^^
+
+warning: static `WM3` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3341:12
+     |
+3341 |     static WM3: AtomicU32 = AtomicU32::new(0x3A);
+     |            ^^^
+
+warning: static `M_GO` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3342:12
+     |
+3342 |     static M_GO: AtomicU32 = AtomicU32::new(0);
+     |            ^^^^
+
+warning: static `SAT` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3344:12
+     |
+3344 |     static SAT: AtomicU32 = AtomicU32::new(0);
+     |            ^^^
+
+warning: constant `G_AHEAD_NS` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3351:11
+     |
+3351 |     const G_AHEAD_NS: u64 = 200_000_000;
+     |           ^^^^^^^^^^
+
+warning: constant `SAT_BOUND_NS` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3355:11
+     |
+3355 |     const SAT_BOUND_NS: u64 = 900_000_000_000;
+     |           ^^^^^^^^^^^^
+
+warning: static `CMD` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3358:12
+     |
+3358 |     static CMD: AtomicU32 = AtomicU32::new(0);
+     |            ^^^
+
+warning: static `PHASE` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3359:12
+     |
+3359 |     static PHASE: AtomicU32 = AtomicU32::new(0);
+     |            ^^^^^
+
+warning: static `ACK` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3360:12
+     |
+3360 |     static ACK: AtomicU32 = AtomicU32::new(0);
+     |            ^^^
+
+warning: static `RELEASE` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3361:12
+     |
+3361 |     static RELEASE: AtomicU32 = AtomicU32::new(0);
+     |            ^^^^^^^
+
+warning: static `DONE` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3362:12
+     |
+3362 |     static DONE: AtomicU32 = AtomicU32::new(0);
+     |            ^^^^
+
+warning: static `PARK` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3363:12
+     |
+3363 |     static PARK: AtomicU32 = AtomicU32::new(0);
+     |            ^^^^
+
+warning: static `G_PAUSE` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3364:12
+     |
+3364 |     static G_PAUSE: AtomicU32 = AtomicU32::new(16);
+     |            ^^^^^^^
+
+warning: static `FAILS` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3365:12
+     |
+3365 |     static FAILS: AtomicU32 = AtomicU32::new(0);
+     |            ^^^^^
+
+warning: static `CALLS` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3366:12
+     |
+3366 |     static CALLS: AtomicU32 = AtomicU32::new(0);
+     |            ^^^^^
+
+warning: constant `PH_B` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3368:11
+     |
+3368 |     const PH_B: u32 = 2;
+     |           ^^^^
+
+warning: constant `PH_C` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3369:11
+     |
+3369 |     const PH_C: u32 = 3;
+     |           ^^^^
+
+warning: constant `PH_D` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3370:11
+     |
+3370 |     const PH_D: u32 = 4;
+     |           ^^^^
+
+warning: constant `PH_G` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3371:11
+     |
+3371 |     const PH_G: u32 = 5;
+     |           ^^^^
+
+warning: constant `PH_E` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3372:11
+     |
+3372 |     const PH_E: u32 = 6;
+     |           ^^^^
+
+warning: constant `PH_G_DONE` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3373:11
+     |
+3373 |     const PH_G_DONE: u32 = 7;
+     |           ^^^^^^^^^
+
+warning: constant `PH_M` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3374:11
+     |
+3374 |     const PH_M: u32 = 8;
+     |           ^^^^
+
+warning: constant `PH_END` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3375:11
+     |
+3375 |     const PH_END: u32 = 9;
+     |           ^^^^^^
+
+warning: function `park` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3377:8
+     |
+3377 |     fn park() -> ! {
+     |        ^^^^
+
+warning: function `fail` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3384:8
+     |
+3384 |     fn fail(what: &str) {
+     |        ^^^^
+
+warning: function `slug` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3389:8
+     |
+3389 |     fn slug(r: &Result<FutexTimedWait, yarm_user_rt::syscall::SyscallError>) -> &'static str {
+     |        ^^^^
+
+warning: function `timed_at` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3401:8
+     |
+3401 |     fn timed_at(
+     |        ^^^^^^^^
+
+warning: function `timed` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3433:8
+     |
+3433 |     fn timed(role: &str, word: &AtomicU32, ns: u64) -> Result<FutexTimedWait, ()> {
+     |        ^^^^^
+
+warning: function `expect` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3437:8
+     |
+3437 |     fn expect(role: &str, got: Result<FutexTimedWait, ()>, want: FutexTimedWait) {
+     |        ^^^^^^
+
+warning: function `command` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3444:8
+     |
+3444 |     fn command(phase: u32) {
+     |        ^^^^^^^
+
+warning: function `await_ack` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3452:8
+     |
+3452 |     fn await_ack() {
+     |        ^^^^^^^^^
+
+warning: function `ack` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3460:8
+     |
+3460 |     fn ack() {
+     |        ^^^
+
+warning: function `requeue_until_moved` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3466:8
+     |
+3466 |     fn requeue_until_moved(from: &AtomicU32, to: &AtomicU32) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `waiter_body` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3478:30
+     |
+3478 |     pub(super) extern "C" fn waiter_body() -> ! {
+     |                              ^^^^^^^^^^^
+
+warning: function `spawn_s3` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3583:8
+     |
+3583 |     fn spawn_s3() {
+     |        ^^^^^^^^
+
+warning: function `g_signal` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3596:8
+     |
+3596 |     fn g_signal(who: &str) {
+     |        ^^^^^^^^
+
+warning: function `helper_phase` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3617:8
+     |
+3617 |     fn helper_phase(phase: u32) {
+     |        ^^^^^^^^^^^^
+
+warning: function `mono` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3662:8
+     |
+3662 |     fn mono() -> u64 {
+     |        ^^^^
+
+warning: function `helper_select` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3671:8
+     |
+3671 |     fn helper_select() {
+     |        ^^^^^^^^^^^^^
+
+warning: function `s2_select` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3690:8
+     |
+3690 |     fn s2_select() {
+     |        ^^^^^^^^^
+
+warning: function `helper_saturate` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3705:8
+     |
+3705 |     fn helper_saturate() {
+     |        ^^^^^^^^^^^^^^^
+
+warning: function `helper_body` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3792:30
+     |
+3792 |     pub(super) extern "C" fn helper_body() -> ! {
+     |                              ^^^^^^^^^^^
+
+warning: function `signaller_body` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3809:30
+     |
+3809 |     pub(super) extern "C" fn signaller_body() -> ! {
+     |                              ^^^^^^^^^^^^^^
+
+warning: function `filler_body` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3828:30
+     |
+3828 |     pub(super) extern "C" fn filler_body() -> ! {
+     |                              ^^^^^^^^^^^
+
+warning: struct `Child` is never constructed
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3835:23
+     |
+3835 |     pub(super) struct Child {
+     |                       ^^^^^
+
+warning: function `run_once` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:3841:19
+     |
+3841 |     pub(super) fn run_once(s_tid: u64, children: &[Child; THREADS]) {
+     |                   ^^^^^^^^
+
+warning: function `is_reply_wins` is never used
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:7990:19
+     |
+7990 |     pub(super) fn is_reply_wins() -> bool {
+     |                   ^^^^^^^^^^^^^
+

@@ -1,0 +1,4 @@
+riscv64 rc=0
+aarch64 rc=0
+x86_64 rc=0
+FIX3_DONE

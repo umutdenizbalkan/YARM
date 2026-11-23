@@ -1,0 +1,148 @@
+fs1 qual start 2026-11-23T10:28:47Z C=acbf79c1e16d2aa821662f7c9bde2a2a4dcedf1b B=c4cac895 sha=71676468d3a0e947 nc=1e592653d2539d59
+=== H1_fmt [acbf79c1e16d porcelain=0]: cargo fmt --all -- --check (start 10:28:47)
+H1_fmt rc=0 secs=7
+=== H2_hosted_lib [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 10:28:54)
+H2_hosted_lib rc=0 secs=173
+=== H3_integration [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 10:31:47)
+H3_integration rc=0 secs=272
+=== H4_subset_futex_requeue1 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 futex_requeue1 (start 10:36:19)
+H4_subset_futex_requeue1 rc=0 secs=23
+=== H4_subset_sync_time1 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sync_time1 (start 10:36:42)
+H4_subset_sync_time1 rc=0 secs=0
+=== H4_subset_r30_the_contended_state [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 r30_the_contended_state (start 10:36:42)
+H4_subset_r30_the_contended_state rc=0 secs=0
+=== H4_subset_abs_bitset1 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 abs_bitset1 (start 10:36:42)
+H4_subset_abs_bitset1 rc=0 secs=1
+=== H4_subset_time1 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 time1 (start 10:36:43)
+H4_subset_time1 rc=0 secs=1
+=== H4_subset_futex [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 futex (start 10:36:44)
+H4_subset_futex rc=0 secs=35
+=== H4_subset_rt1b_ [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 rt1b_ (start 10:37:19)
+H4_subset_rt1b_ rc=0 secs=0
+=== H4_subset_sched_budget [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 sched_budget (start 10:37:19)
+H4_subset_sched_budget rc=0 secs=0
+=== H4_subset_rt1a_ [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 rt1a_ (start 10:37:19)
+H4_subset_rt1a_ rc=0 secs=0
+=== H4_subset_stage45 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 stage45 (start 10:37:19)
+H4_subset_stage45 rc=0 secs=1
+=== H4_subset_syscall_abi [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 syscall_abi (start 10:37:20)
+H4_subset_syscall_abi rc=0 secs=0
+=== H4_subset_lock_order [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 lock_order (start 10:37:20)
+H4_subset_lock_order rc=0 secs=0
+=== H4_subset_census [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 census (start 10:37:20)
+H4_subset_census rc=0 secs=1
+=== H4_crate_yarm_user_rt [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-user-rt --lib -- --test-threads=1 (start 10:37:21)
+H4_crate_yarm_user_rt rc=0 secs=1
+=== H4_crate_yarm_kernel [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-kernel --lib -- --test-threads=1 (start 10:37:22)
+H4_crate_yarm_kernel rc=0 secs=0
+=== H4_crate_yarm_ipc_abi [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-ipc-abi --lib -- --test-threads=1 (start 10:37:22)
+H4_crate_yarm_ipc_abi rc=0 secs=0
+=== H4_grader_self_test_seal [acbf79c1e16d porcelain=0]: python3 -I scripts/grade-futex-seal-witness.py --self-test (start 10:37:22)
+H4_grader_self_test_seal rc=0 secs=1
+=== H4_grader_self_test_sync [acbf79c1e16d porcelain=0]: python3 -I scripts/grade-futex-sync-witness.py --self-test (start 10:37:23)
+H4_grader_self_test_sync rc=0 secs=0
+=== H4_grader_self_test_time [acbf79c1e16d porcelain=0]: python3 -I scripts/grade-futex-time-witness.py --self-test (start 10:37:23)
+H4_grader_self_test_time rc=0 secs=1
+=== H5_lockorder_C [acbf79c1e16d porcelain=0]: bash -c env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 --nocapture > /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/H5_C.raw.log 2>&1; echo rc=$? (start 10:37:24)
+H5_lockorder_C rc=0 secs=136
+H5_pairtypes C=30 B=30 diff_lines=0
+=== G1_contract_gate [acbf79c1e16d porcelain=0]: bash scripts/check-current-contracts.sh (start 10:39:41)
+G1_contract_gate rc=0 secs=5
+=== G2_doc_enforcement [acbf79c1e16d porcelain=0]: bash scripts/check-contract-doc-enforcement.sh (start 10:39:46)
+G2_doc_enforcement rc=0 secs=0
+=== X_check_default_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm --bin kernel_boot (start 10:39:46)
+X_check_default_x86_64 rc=0 secs=3
+=== X_check_seal_kernel_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features x86-shared-region-direct-oracle,futex-seal-witness -p yarm --bin kernel_boot (start 10:39:49)
+X_check_seal_kernel_x86_64 rc=0 secs=3
+=== X_check_seal_init_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-user-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features futex-requeue-witness,futex-time-witness,futex-seal-witness,futex-seal-os,futex-seal-nr17,futex-seal-lh,futex-seal-pb,futex-seal-rb -p yarm-control-plane-servers --bin init_server (start 10:39:52)
+X_check_seal_init_x86_64 rc=0 secs=1
+=== X_check_sync_init_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-user-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features futex-requeue-witness,futex-time-witness,futex-sync-witness -p yarm-control-plane-servers --bin init_server (start 10:39:53)
+X_check_sync_init_x86_64 rc=0 secs=0
+=== X_check_time_init_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-user-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features futex-requeue-witness,futex-time-witness -p yarm-control-plane-servers --bin init_server (start 10:39:53)
+X_check_time_init_x86_64 rc=0 secs=1
+=== X_check_default_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm --bin kernel_boot (start 10:39:54)
+X_check_default_aarch64 rc=0 secs=3
+=== X_check_seal_kernel_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features aarch64-shared-region-direct-oracle,futex-seal-witness -p yarm --bin kernel_boot (start 10:39:57)
+X_check_seal_kernel_aarch64 rc=0 secs=3
+=== X_check_seal_init_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-user-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features futex-requeue-witness,futex-time-witness,futex-seal-witness,futex-seal-os,futex-seal-nr17,futex-seal-lh,futex-seal-pb,futex-seal-rb -p yarm-control-plane-servers --bin init_server (start 10:40:00)
+X_check_seal_init_aarch64 rc=0 secs=0
+=== X_check_sync_init_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-user-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features futex-requeue-witness,futex-time-witness,futex-sync-witness -p yarm-control-plane-servers --bin init_server (start 10:40:00)
+X_check_sync_init_aarch64 rc=0 secs=1
+=== X_check_time_init_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-user-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features futex-requeue-witness,futex-time-witness -p yarm-control-plane-servers --bin init_server (start 10:40:01)
+X_check_time_init_aarch64 rc=0 secs=1
+=== X_check_default_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm --bin kernel_boot (start 10:40:02)
+X_check_default_riscv64 rc=0 secs=3
+=== X_check_seal_kernel_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features riscv-shared-region-direct-oracle,futex-seal-witness -p yarm --bin kernel_boot (start 10:40:05)
+X_check_seal_kernel_riscv64 rc=0 secs=2
+=== X_check_seal_init_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-user-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features futex-requeue-witness,futex-time-witness,futex-seal-witness,futex-seal-os,futex-seal-nr17,futex-seal-lh,futex-seal-pb,futex-seal-rb -p yarm-control-plane-servers --bin init_server (start 10:40:07)
+X_check_seal_init_riscv64 rc=0 secs=1
+=== X_check_sync_init_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-user-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features futex-requeue-witness,futex-time-witness,futex-sync-witness -p yarm-control-plane-servers --bin init_server (start 10:40:08)
+X_check_sync_init_riscv64 rc=0 secs=1
+=== X_check_time_init_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-user-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features futex-requeue-witness,futex-time-witness -p yarm-control-plane-servers --bin init_server (start 10:40:09)
+X_check_time_init_riscv64 rc=0 secs=1
+=== B_build_C_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 10:40:10)
+B_build_C_x86_64 rc=0 secs=36
+=== S_gp_core_smp2_x86_64 [acbf79c1e16d porcelain=0]: env KERNEL_IMAGE=build-x86_64/kernel_boot.elf INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_gp_x86_64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_gp_x86_64.smoke.log TIMEOUT_SECS=600 scripts/qemu-x86_64-core-smoke.sh (start 10:40:46)
+S_gp_core_smp2_x86_64 rc=0 secs=604
+=== S_rt_core_smp2_x86_64 [acbf79c1e16d porcelain=0]: env KERNEL_IMAGE=build-x86_64/kernel_boot.elf INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio QEMU_SMP=2 KERNEL_CMDLINE=console=ttyS0 rdinit=/init yarm.sched_profile=rt LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rt_x86_64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rt_x86_64.smoke.log TIMEOUT_SECS=600 scripts/qemu-x86_64-core-smoke.sh (start 10:50:50)
+S_rt_core_smp2_x86_64 rc=0 secs=603
+=== S_rtb_core_smp2_x86_64 [acbf79c1e16d porcelain=0]: env KERNEL_IMAGE=build-x86_64/kernel_boot.elf INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio QEMU_SMP=2 KERNEL_CMDLINE=console=ttyS0 rdinit=/init yarm.sched_profile=rt yarm.sched_budget=on LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rtb_x86_64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rtb_x86_64.smoke.log TIMEOUT_SECS=600 scripts/qemu-x86_64-core-smoke.sh (start 11:00:53)
+S_rtb_core_smp2_x86_64 rc=0 secs=604
+=== B_build_B_x86_64 [acbf79c1e16d porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fab1-wt && env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 11:10:57)
+B_build_B_x86_64 rc=0 secs=6
+=== B_build_C_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 11:11:03)
+B_build_C_aarch64 rc=0 secs=37
+=== S_gp_core_smp2_aarch64 [acbf79c1e16d porcelain=0]: env KERNEL_IMAGE=build-aarch64/yarm-aarch64.bin INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_gp_aarch64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_gp_aarch64.smoke.log TIMEOUT_SECS=600 scripts/qemu-aarch64-core-smoke.sh (start 11:11:40)
+S_gp_core_smp2_aarch64 rc=0 secs=13
+=== S_rt_core_smp2_aarch64 [acbf79c1e16d porcelain=0]: env KERNEL_IMAGE=build-aarch64/yarm-aarch64.bin INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio QEMU_SMP=2 KERNEL_CMDLINE=console=ttyS0 rdinit=/init yarm.sched_profile=rt LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rt_aarch64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rt_aarch64.smoke.log TIMEOUT_SECS=600 scripts/qemu-aarch64-core-smoke.sh (start 11:11:53)
+S_rt_core_smp2_aarch64 rc=0 secs=12
+=== S_rtb_core_smp2_aarch64 [acbf79c1e16d porcelain=0]: env KERNEL_IMAGE=build-aarch64/yarm-aarch64.bin INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio QEMU_SMP=2 KERNEL_CMDLINE=console=ttyS0 rdinit=/init yarm.sched_profile=rt yarm.sched_budget=on LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rtb_aarch64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rtb_aarch64.smoke.log TIMEOUT_SECS=600 scripts/qemu-aarch64-core-smoke.sh (start 11:12:05)
+S_rtb_core_smp2_aarch64 rc=0 secs=12
+=== B_build_B_aarch64 [acbf79c1e16d porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fab1-wt && env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 11:12:17)
+B_build_B_aarch64 rc=0 secs=6
+=== B_build_C_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 11:12:23)
+B_build_C_riscv64 rc=0 secs=32
+=== S_gp_core_smp2_riscv64 [acbf79c1e16d porcelain=0]: env KERNEL_IMAGE=build-riscv64/yarm-riscv64.bin INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_gp_riscv64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_gp_riscv64.smoke.log TIMEOUT_SECS=300 scripts/qemu-riscv64-core-smoke.sh (start 11:12:55)
+S_gp_core_smp2_riscv64 rc=0 secs=301
+=== S_rt_core_smp2_riscv64 [acbf79c1e16d porcelain=0]: env KERNEL_IMAGE=build-riscv64/yarm-riscv64.bin INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio QEMU_SMP=2 KERNEL_CMDLINE=console=ttyS0 rdinit=/init yarm.sched_profile=rt LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rt_riscv64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rt_riscv64.smoke.log TIMEOUT_SECS=300 scripts/qemu-riscv64-core-smoke.sh (start 11:17:56)
+S_rt_core_smp2_riscv64 rc=0 secs=301
+=== S_rtb_core_smp2_riscv64 [acbf79c1e16d porcelain=0]: env KERNEL_IMAGE=build-riscv64/yarm-riscv64.bin INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio QEMU_SMP=2 KERNEL_CMDLINE=console=ttyS0 rdinit=/init yarm.sched_profile=rt yarm.sched_budget=on LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rtb_riscv64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/S_rtb_riscv64.smoke.log TIMEOUT_SECS=300 scripts/qemu-riscv64-core-smoke.sh (start 11:22:57)
+S_rtb_core_smp2_riscv64 rc=0 secs=301
+=== B_build_B_riscv64 [acbf79c1e16d porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fab1-wt && env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 11:27:58)
+B_build_B_riscv64 rc=0 secs=7
+Z2_sizes written
+=== W_seal_gp_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=360 SEAL_CELLS=os nr17 lh pb rb SEAL_PROFILE=gp LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_seal_gp_riscv64 scripts/qemu-futex-seal-witness-smoke.sh riscv64 2 (start 11:28:05)
+W_seal_gp_riscv64 rc=0 secs=402
+=== W_seal_rtb_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=360 SEAL_CELLS=os nr17 lh pb rb SEAL_PROFILE=rtb LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_seal_rtb_riscv64 scripts/qemu-futex-seal-witness-smoke.sh riscv64 2 (start 11:34:47)
+W_seal_rtb_riscv64 rc=0 secs=394
+=== W_time_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=1800 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_time_riscv64 scripts/qemu-futex-time-witness-smoke.sh riscv64 2 (start 11:41:21)
+W_time_riscv64 rc=1 secs=1875
+=== W_sync_riscv64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_sync_riscv64 scripts/qemu-futex-sync-witness-smoke.sh riscv64 2 (start 12:12:36)
+W_sync_riscv64 rc=0 secs=959
+=== W_seal_gp_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 SEAL_CELLS=os nr17 lh pb rb SEAL_PROFILE=gp LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_seal_gp_aarch64 scripts/qemu-futex-seal-witness-smoke.sh aarch64 2 (start 12:28:35)
+W_seal_gp_aarch64 rc=0 secs=137
+=== W_seal_rtb_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 SEAL_CELLS=os nr17 lh pb rb SEAL_PROFILE=rtb LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_seal_rtb_aarch64 scripts/qemu-futex-seal-witness-smoke.sh aarch64 2 (start 12:30:53)
+W_seal_rtb_aarch64 rc=0 secs=99
+=== W_time_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_time_aarch64 scripts/qemu-futex-time-witness-smoke.sh aarch64 2 (start 12:32:32)
+W_time_aarch64 rc=0 secs=127
+=== W_sync_aarch64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_sync_aarch64 scripts/qemu-futex-sync-witness-smoke.sh aarch64 2 (start 12:34:39)
+W_sync_aarch64 rc=0 secs=73
+=== W_seal_gp_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 SEAL_CELLS=os nr17 lh pb rb SEAL_PROFILE=gp LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_seal_gp_x86_64 scripts/qemu-futex-seal-witness-smoke.sh x86_64 2 (start 12:35:52)
+W_seal_gp_x86_64 rc=0 secs=993
+=== W_seal_rtb_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 SEAL_CELLS=os nr17 lh pb rb SEAL_PROFILE=rtb LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_seal_rtb_x86_64 scripts/qemu-futex-seal-witness-smoke.sh x86_64 2 (start 12:52:25)
+W_seal_rtb_x86_64 rc=0 secs=998
+=== W_time_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_time_x86_64 scripts/qemu-futex-time-witness-smoke.sh x86_64 2 (start 13:09:03)
+W_time_x86_64 rc=0 secs=988
+=== W_sync_x86_64 [acbf79c1e16d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/W_sync_x86_64 scripts/qemu-futex-sync-witness-smoke.sh x86_64 2 (start 13:25:31)
+W_sync_x86_64 rc=0 secs=950
+=== NC_hosted_ncC_duplicate_settlement [acbf79c1e16d porcelain=0]: bash -c python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-nc/nc.py ncC_duplicate_settlement && git diff --stat && env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 futex_requeue1::; rc=$?; git checkout -- src/kernel/boot/futex.rs; exit $rc (start 13:41:21)
+NC_hosted_ncC_duplicate_settlement rc=101 secs=64
+=== NC_hosted_ncB_condvar_no_reacquire [acbf79c1e16d porcelain=0]: bash -c python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-nc/nc.py ncB_condvar_no_reacquire && git diff --stat && env -u CARGO_TARGET_DIR cargo test -q -p yarm-user-rt --lib -- --test-threads=1 futex_sync_tests; rc=$?; git checkout -- crates/yarm-user-rt/src/lib.rs; exit $rc (start 13:42:25)
+NC_hosted_ncB_condvar_no_reacquire rc=101 secs=2
+=== NC_live_ncA_wakeall_in_rq_riscv64 [acbf79c1e16d porcelain=0]: bash -c python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-nc/nc.py ncA_wakeall_in_rq && git diff --stat && env -u CARGO_TARGET_DIR TIMEOUT_SECS=360 SEAL_CELLS="os nr17 lh pb rb" SEAL_PROFILE=gp LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/NCLA scripts/qemu-futex-seal-witness-smoke.sh riscv64 2; rc=$?; git checkout -- crates/yarm-control-plane-servers/src/control_plane/init/futex_seal_witness.rs; exit $rc (start 13:42:27)
+NC_live_ncA_wakeall_in_rq_riscv64 rc=1 secs=451
+=== NC_live_ncB_condvar_no_reacquire_riscv64 [acbf79c1e16d porcelain=0]: bash -c python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-nc/nc.py ncB_condvar_no_reacquire && git diff --stat && env -u CARGO_TARGET_DIR TIMEOUT_SECS=360 SEAL_CELLS="os nr17 lh pb rb" SEAL_PROFILE=rtb LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/qual/NCLB scripts/qemu-futex-seal-witness-smoke.sh riscv64 2; rc=$?; git checkout -- crates/yarm-user-rt/src/lib.rs; exit $rc (start 13:49:58)
+NC_live_ncB_condvar_no_reacquire_riscv64 rc=1 secs=405
+post-NC porcelain=0 base-porcelain=0
+fs1 qual end 2026-11-23T13:56:43Z
+FS1_QUAL_DONE

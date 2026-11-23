@@ -1,0 +1,4 @@
+[futex-seal-witness] building base riscv64 artifacts with futex-requeue-witness,futex-time-witness,futex-seal-witness
+[futex-seal-witness] rebuilding kernel_boot with riscv-shared-region-direct-oracle,futex-seal-witness
+[futex-seal-witness] booting QEMU -smp 2 with yarm.futex_requeue_witness=1
+FUTEX_SEAL_WITNESS_SEAL arch=riscv64 smp=2 profile=gp result=ungraded core_rc=0

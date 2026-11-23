@@ -1,0 +1,2 @@
+[futex-time-witness][fail] F: no A timeout was collected on an idle CPU (current=0)
+FUTEX_TIME_WITNESS_SEAL arch=riscv64 smp=2 result=fail timeout_lateness_ns_max=3668439700 a_idle_collections=0 bitset_skips=3 g_admitted_expired=3 g_woken=7 g_timed_out=22 g_windows_woke=12 g_windows_refused=0 g_skipped=10 in_window_wakes=12 e_spawn_refusals=7 e_fillers=128 e_topups=6 e_pings=6 e_proving=1 calls=43 cycles=39

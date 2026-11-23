@@ -1,0 +1,59 @@
+ARTIFACT_BINDING arch=aarch64 kernel=build-aarch64/yarm-aarch64.bin kernel_sha256=521aa3b92a554f4c38b31ecc5233b745a6cb4b1d4b5a6965db43edb9371c094c kernel_features=none kernel_resolved_features=none kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fst1-wt/target/aarch64-yarm-none/aarch64-none/kernel_boot:fresh=0 initramfs=build-aarch64/initramfs-core.cpio initramfs_sha256=a024e70ca6508ad64d96cee22a197667a1978d1f0e53b2f59133e3f1a908ba2f initramfs_features=none initramfs_compile_env=none source=clean:c3ef354ac39ae8936d69b1bd00da50b1589dffde required=none result=ok
+[info] qemu command: qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024M -smp 2 -nographic -monitor none -serial stdio -kernel build-aarch64/yarm-aarch64.bin -initrd build-aarch64/initramfs-core.cpio
+[info] aarch64 core: completion condition: full
+[err] aarch64 core: boot completion sequence not reached (status=124; 3 = QEMU exited, 124 = 180s bound)
+[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell
+[ok] U9-RX4: PM decodes the lifecycle query
+[ok] U9-RX4: PM replies successfully
+[ok] U9-RX4: terminal-outcome evaluator self-test passed (8 accepted, 27 rejected)
+[ok] U9-RX4: REPLY won the terminal of record_index=0 record_generation=1 (queued route, cap 65538) — commit=1 resume=1 one-shot revoked, no timeout win
+[ok] U9-RX4: no reply cap is lost to the u32::MAX sentinel
+[ok] U9-RX4: PM never fails to decode
+[ok] U9-RX4: no writeback rollback on the witnessed path
+[ok] U9-RX4: the reply cap is never used twice
+[ok] U9-RX4: no cap materialization failure
+[ok] U9-RX4: the blocking IpcRecv route publishes and defers (n=2156)
+[ok] U9-RX4: the broad dispatcher is skipped for a published block (n=6230)
+[ok] U9-RX4: the existing D2-recv drain resumes a replacement (n=125)
+[ok] U9-RX4: no fail-closed settlement on the blocking route
+[ok] U9-RX4: AArch64 queued-plain reply-cap + framing witness chain complete
+[ok] BAD / BOOT BLOCKERS: empty
+[ok] aarch64 Stage 195A: DebugLog split-dispatch live (NR 27 removed; queue-advancing Yield inert)
+[info] FAT smoke marker count: INIT_FAT_SPAWN_BEGIN=0
+[info] FAT smoke marker count: INIT_FAT_SPAWN_SKIPPED=1
+[info] FAT smoke marker count: INIT_FAT_SPAWN_OK=0
+[info] FAT smoke marker count: PM_IMAGE_ID_10_FAT_SRV=0
+[info] FAT smoke marker count: FAT_CONFIG_FOUND=0
+[info] FAT smoke marker count: FAT_BLOCK_BACKEND_STARTUP_CAP=0
+[info] FAT smoke marker count: FAT_MOUNT_READY=0
+[info] FAT smoke marker count: FAT_MOUNT_FAILED=0
+[info] FAT smoke marker count: VFS_MOUNT_REGISTER_FAT_OK=0
+[info] RAMFS smoke marker count: INIT_RAMFS_SPAWN_BEGIN=1
+[info] RAMFS smoke marker count: INIT_RAMFS_SPAWN_SKIPPED=0
+[info] RAMFS smoke marker count: INIT_RAMFS_SPAWN_OK=1
+[info] RAMFS smoke marker count: PM_IMAGE_ID_11_RAMFS_SRV=1
+[info] RAMFS smoke marker count: RAMFS_CONFIG_FOUND=0
+[info] RAMFS smoke marker count: RAMFS_CONFIG_DEFAULT=1
+[info] RAMFS smoke marker count: RAMFS_MOUNT_READY=1
+[info] RAMFS smoke marker count: RAMFS_MOUNT_FAILED=0
+[info] RAMFS smoke marker count: VFS_MOUNT_REGISTER_RAMFS_OK=1
+[info] EXT4 smoke marker count: INIT_EXT4_SPAWN_BEGIN=1
+[info] EXT4 smoke marker count: INIT_EXT4_SPAWN_SKIPPED=0
+[info] EXT4 smoke marker count: INIT_EXT4_SPAWN_OK=1
+[info] EXT4 smoke marker count: PM_IMAGE_ID_12_EXT4_SRV=1
+[info] EXT4 smoke marker count: EXT4_SRV_READY=2
+[ok] TERMINAL-ACQUISITION: no broad acquisition exists and no trap reached the bridge unsettled
+BOOT_COMPLETION stage=supervisor line=1409 text=USER_LOG tid=2 msg=SUP_RUN_ENTER
+BOOT_COMPLETION stage=process_manager line=1741 text=USER_LOG tid=3 msg=PM_RECV_LOOP_START recv_cap=65536
+BOOT_COMPLETION stage=init line=2279 text=USER_LOG tid=1 msg=INIT_BIN_ENTRY_START
+BOOT_COMPLETION stage=initramfs_srv line=5015 text=USER_LOG tid=10000 msg=INITRAMFS_SRV_BLOCKING_RECV_LOOP
+BOOT_COMPLETION stage=devfs_srv line=5885 text=USER_LOG tid=10001 msg=DEVFS_SRV_BLOCKING_RECV_LOOP
+BOOT_COMPLETION stage=vfs_srv line=7119 text=USER_LOG tid=10002 msg=VFS_SRV_BLOCKING_RECV_LOOP
+BOOT_COMPLETION stage=ramfs_spawn line=22159 text=USER_LOG tid=1 msg=INIT_RAMFS_SPAWN_BEGIN
+BOOT_COMPLETION stage=ramfs_mount_ready line=25891 text=USER_LOG tid=10006 msg=RAMFS_MOUNT_READY prefix=/ram fd=101 read_len=32 write_len=64 handled=6
+BOOT_COMPLETION stage=ramfs_spawn_ok line=26141 text=USER_LOG tid=1 msg=INIT_RAMFS_SPAWN_OK child_tid=10006 send_cap=65551 prefix=/ram
+BOOT_COMPLETION stage=ram_registered line=26431 text=USER_LOG tid=1 msg=VFS_MOUNT_REGISTER_RAMFS_OK prefix=/ram
+BOOT_COMPLETION stage=ext4_spawn line=26471 text=USER_LOG tid=1 msg=INIT_EXT4_SPAWN_BEGIN
+BOOT_COMPLETION stage=ext4_ready line=29611 text=USER_LOG tid=1 msg=EXT4_SRV_READY child_tid=10007
+BOOT_COMPLETION result=incomplete reason=missing ext4_spawn_ok after line 29611
+[error] aarch64 core smoke FAILED: the default-profile boot completion sequence is incomplete

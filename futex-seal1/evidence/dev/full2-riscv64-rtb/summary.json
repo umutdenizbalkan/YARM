@@ -1,0 +1,231 @@
+{
+ "lh": {
+  "early": 0,
+  "late": 7,
+  "timeout": 0,
+  "timeout_acquired": 3
+ },
+ "pb": {
+  "arms": {
+   "rq": {
+    "classes": {
+     "clean": 4
+    },
+    "clean": 4,
+    "direct_woken": [
+     1,
+     1,
+     1,
+     1
+    ],
+    "elapsed_ns_max": 1851676000,
+    "elapsed_ns_median": 1632692450,
+    "elapsed_ns_min": 1509135000,
+    "mutex_reparks": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "requeued": [
+     9,
+     9,
+     9,
+     9
+    ],
+    "rounds": 4,
+    "worker_unlock_wake_calls": [
+     10,
+     10,
+     10,
+     10
+    ],
+    "worker_unlock_woke": [
+     8,
+     8,
+     8,
+     8
+    ]
+   },
+   "wa": {
+    "classes": {
+     "clean": 4
+    },
+    "clean": 4,
+    "direct_woken": [
+     10,
+     10,
+     10,
+     10
+    ],
+    "elapsed_ns_max": 1819969600,
+    "elapsed_ns_median": 1428782950,
+    "elapsed_ns_min": 1340407800,
+    "mutex_reparks": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "requeued": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "rounds": 4,
+    "worker_unlock_wake_calls": [
+     10,
+     10,
+     10,
+     10
+    ],
+    "worker_unlock_woke": [
+     0,
+     0,
+     0,
+     0
+    ]
+   }
+  },
+  "cohort": 10,
+  "rounds": {
+   "rq": [
+    {
+     "broadcaster_unlock_wake_calls": 1,
+     "broadcaster_unlock_woke": 1,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 1,
+     "elapsed_ns": 1726102000,
+     "mutex_reparks": 0,
+     "mutex_value_changed": 0,
+     "requeued": 9,
+     "round": 1,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 8
+    },
+    {
+     "broadcaster_unlock_wake_calls": 1,
+     "broadcaster_unlock_woke": 1,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 1,
+     "elapsed_ns": 1509135000,
+     "mutex_reparks": 0,
+     "mutex_value_changed": 0,
+     "requeued": 9,
+     "round": 4,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 8
+    },
+    {
+     "broadcaster_unlock_wake_calls": 1,
+     "broadcaster_unlock_woke": 1,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 1,
+     "elapsed_ns": 1539282900,
+     "mutex_reparks": 0,
+     "mutex_value_changed": 0,
+     "requeued": 9,
+     "round": 5,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 8
+    },
+    {
+     "broadcaster_unlock_wake_calls": 1,
+     "broadcaster_unlock_woke": 1,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 1,
+     "elapsed_ns": 1851676000,
+     "mutex_reparks": 0,
+     "mutex_value_changed": 0,
+     "requeued": 9,
+     "round": 8,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 8
+    }
+   ],
+   "wa": [
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 1340407800,
+     "mutex_reparks": 0,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 2,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 0
+    },
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 1471751500,
+     "mutex_reparks": 0,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 3,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 0
+    },
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 1385814400,
+     "mutex_reparks": 0,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 6,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 0
+    },
+    {
+     "broadcaster_unlock_wake_calls": 0,
+     "broadcaster_unlock_woke": 0,
+     "class": "clean",
+     "completions": 10,
+     "direct_woken": 10,
+     "elapsed_ns": 1819969600,
+     "mutex_reparks": 0,
+     "mutex_value_changed": 0,
+     "requeued": 0,
+     "round": 7,
+     "seq_parks": 10,
+     "worker_unlock_wake_calls": 10,
+     "worker_unlock_woke": 0
+    }
+   ]
+  }
+ },
+ "rb": {
+  "deadline_ns": 60193366300,
+  "drain_tick": 2994,
+  "induced_exhaustion": 1,
+  "park_cpu": 1,
+  "park_tick": 2994,
+  "rejoin_cpu": null,
+  "rejoin_tick": 3064,
+  "release": 3056,
+  "release_lateness_ticks": 8,
+  "settled_ns": 60201288300
+ }
+}

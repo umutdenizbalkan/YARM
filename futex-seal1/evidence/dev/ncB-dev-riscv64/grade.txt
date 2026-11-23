@@ -1,0 +1,3 @@
+[futex-seal-witness][fail] RB: FSB_END not result=ok: [{'tid': '1', 'msg': 'FSB_END', 'fails': '2', 'result': 'fail'}]
+[futex-seal-witness][fail] RB: W did not return timed_out holding the mutex: [{'tid': '10026', 'msg': 'FSB_RET', 'role': 'W', 'result': 'timed_out', 'held': '1', 'own': '0', 'resume': '68162636200', 'deadline': '67397969400', 'now': '68162846500'}]
+FUTEX_SEAL_WITNESS_SEAL arch=riscv64 smp=2 profile=rtb cells=os,nr17,lh,pb,rb lh_late=7 lh_early=0 lh_timeout=0 lh_timeout_acquired=3 rb_induced=1 rb_release_lateness_ticks=19 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=fail

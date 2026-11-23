@@ -1,0 +1,6 @@
+[futex-seal-witness][fail] PB: round 1: rq arm made no NR 17 call
+[futex-seal-witness][fail] PB: round 4: rq arm made no NR 17 call
+[futex-seal-witness][fail] PB: round 5: rq arm made no NR 17 call
+[futex-seal-witness][fail] PB: round 8: rq arm made no NR 17 call
+[futex-seal-witness][fail] PB: an arm has no clean round
+FUTEX_SEAL_WITNESS_SEAL arch=riscv64 smp=2 profile=gp cells=os,nr17,lh,pb,rb lh_late=4 lh_early=0 lh_timeout=4 lh_timeout_acquired=2 rb_induced=0 pb_rq_clean=0/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=16 result=fail

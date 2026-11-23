@@ -1,0 +1,1 @@
+FUTEX_SYNC_WITNESS_SEAL arch=aarch64 smp=2 result=ok admits_L2_W=1 admits_L3_W=1 admits_L3b_W=1 admits_C1_W=2 admits_C2_W=1 admits_C3_X=1 admits_C3_C=1 c1_waits=2 ops=10

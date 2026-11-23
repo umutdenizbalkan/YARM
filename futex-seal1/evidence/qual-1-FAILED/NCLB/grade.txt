@@ -1,0 +1,4 @@
+[futex-seal-witness][fail] CORE: FSEAL_ALL_END cells != 5: []
+[futex-seal-witness][fail] RB: FSB_END not result=ok: []
+[futex-seal-witness][fail] RB: kernel budget record missing or repeated
+FUTEX_SEAL_WITNESS_SEAL arch=riscv64 smp=2 profile=rtb cells=os,nr17,lh,pb,rb lh_late=8 lh_early=0 lh_timeout=0 lh_timeout_acquired=2 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=fail

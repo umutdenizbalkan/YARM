@@ -1,0 +1,10 @@
+680ad76a83e4ed58e34fbac21cfce6786ab6700664c8b0140417690580c27179  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-evidence/fs1_qual.sh
+1e592653d2539d59b357421ade02163ab62f4910bf1e50620f36bb6bf61eea22  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/fs1-nc/nc.py
+ace28628246e68e7cfd45a609b8715ad1fcc59e7fa9ba5f5c7dbe412b5b609be  scripts/grade-futex-seal-witness.py
+28920f1f9ace6f275527d33f290e97b17f3240985151976b3dfd3df197f0a8d1  scripts/qemu-futex-seal-witness-smoke.sh
+08f3ff3548da0f40136d004c3b972a792e063850469f1248eaaf05fb3d150f37  scripts/grade-futex-sync-witness.py
+3836cfd712942851fa3bf62e7be34a16acfb13b66e7a9ee47f8e9107a40a608f  scripts/grade-futex-time-witness.py
+189216d3feec9bed9b625d6292a91154bc037b497ce6e8c18c1765c41217f6a4  scripts/qemu-futex-time-witness-smoke.sh
+d0f1ac597243274b03b61650a58cdcaf310efa8178f5163df41b00156b8e980c  scripts/qemu-futex-sync-witness-smoke.sh
+d6f5715e5f934e2adf5a9a03019a15fdd6a76763166e7b76099329815d980f9e  scripts/check-aarch64-boot-completion.py
+candidate 9d5282c4d8e132f834a5be21ee14e083d10878ff tree 2d1dc946a5b623c154cf67ed297748c3ada53d9f; baseline c4cac895211a52bb69914ebe13c5689fcef4812b (run 3; run 1 on bc5194a5 kept as qual-1-FAILED, run 2 on acbf79c1 kept as qual-2-FAILED)

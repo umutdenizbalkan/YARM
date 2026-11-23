@@ -1,0 +1,1 @@
+FUTEX_SEAL_WITNESS_SEAL arch=riscv64 smp=2 profile=rtb cells=os,nr17,lh,pb,rb lh_late=7 lh_early=0 lh_timeout=0 lh_timeout_acquired=3 rb_induced=1 rb_release_lateness_ticks=38 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=ok

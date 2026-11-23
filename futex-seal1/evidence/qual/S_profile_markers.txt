@@ -1,0 +1,30 @@
+== x86_64
+-- gp
+TIMEKEEP_SOURCE source=x86_tsc_pit_calibrated freq_hz=2101814400 res_ns=1 cross_cpu_synchronized=0 installed=1
+-- rt
+YARM_SCHED_PROFILE profile=rt route=construction
+TIMEKEEP_SOURCE source=x86_tsc_pit_calibrated freq_hz=2104788400 res_ns=1 cross_cpu_synchronized=0 installed=1
+-- rtb
+YARM_SCHED_PROFILE profile=rt route=construction
+YARM_SCHED_BUDGET req=on profile=rt result=enforced route=construction clock=global_scheduler_tick owner=cpu0 grain=1tick enforce=tick period_ns=800000000 pool=32 default=64/64
+TIMEKEEP_SOURCE source=x86_tsc_pit_calibrated freq_hz=2102261000 res_ns=1 cross_cpu_synchronized=0 installed=1
+== aarch64
+-- gp
+TIMEKEEP_SOURCE source=aarch64_cntpct freq_hz=62500000 res_ns=16 cross_cpu_synchronized=1 installed=1
+-- rt
+YARM_SCHED_PROFILE profile=rt route=construction
+TIMEKEEP_SOURCE source=aarch64_cntpct freq_hz=62500000 res_ns=16 cross_cpu_synchronized=1 installed=1
+-- rtb
+YARM_SCHED_PROFILE profile=rt route=construction
+YARM_SCHED_BUDGET req=on profile=rt result=enforced route=construction clock=global_scheduler_tick owner=cpu0 grain=1tick enforce=tick period_ns=50000000 pool=32 default=64/64
+TIMEKEEP_SOURCE source=aarch64_cntpct freq_hz=62500000 res_ns=16 cross_cpu_synchronized=1 installed=1
+== riscv64
+-- gp
+TIMEKEEP_SOURCE source=riscv_time_csr freq_hz=10000000 res_ns=100 cross_cpu_synchronized=1 installed=1
+-- rt
+YARM_SCHED_PROFILE profile=rt route=construction
+TIMEKEEP_SOURCE source=riscv_time_csr freq_hz=10000000 res_ns=100 cross_cpu_synchronized=1 installed=1
+-- rtb
+YARM_SCHED_PROFILE profile=rt route=construction
+YARM_SCHED_BUDGET req=on profile=rt result=enforced route=construction clock=global_scheduler_tick owner=cpu0 grain=1tick enforce=tick period_ns=10000000 pool=32 default=64/64
+TIMEKEEP_SOURCE source=riscv_time_csr freq_hz=10000000 res_ns=100 cross_cpu_synchronized=1 installed=1

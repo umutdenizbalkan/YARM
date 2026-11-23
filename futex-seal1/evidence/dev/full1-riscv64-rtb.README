@@ -1,0 +1,1 @@
+INCONCLUSIVE (graded fail): registration-time drain at tick 2889 left a release due at 2951, before the 1.5 s deadline settled; first_release_stamp=2 < commit_stamp=3, the waiter was replenished before settlement and not parked. Preserved; the drain moved to the collector's commit section (before the production placement decision) after this run.

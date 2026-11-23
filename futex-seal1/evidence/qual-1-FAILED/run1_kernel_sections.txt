@@ -1,0 +1,9 @@
+run1 kernel x86_64 .text B=e3b0c44298fc1c14 C=e3b0c44298fc1c14 same
+run1 kernel x86_64 .rodata B=e3b0c44298fc1c14 C=e3b0c44298fc1c14 same
+run1 kernel x86_64 .data B=e3b0c44298fc1c14 C=e3b0c44298fc1c14 same
+run1 kernel aarch64 .text B=e3b0c44298fc1c14 C=e3b0c44298fc1c14 same
+run1 kernel aarch64 .rodata B=e3b0c44298fc1c14 C=e3b0c44298fc1c14 same
+run1 kernel aarch64 .data B=e3b0c44298fc1c14 C=e3b0c44298fc1c14 same
+run1 kernel riscv64 .text B=e3b0c44298fc1c14 C=e3b0c44298fc1c14 same
+run1 kernel riscv64 .rodata B=e3b0c44298fc1c14 C=e3b0c44298fc1c14 same
+run1 kernel riscv64 .data B=e3b0c44298fc1c14 C=e3b0c44298fc1c14 same

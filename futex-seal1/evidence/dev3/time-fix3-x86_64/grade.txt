@@ -1,0 +1,1 @@
+FUTEX_TIME_WITNESS_SEAL arch=x86_64 smp=2 result=ok timeout_lateness_ns_max=525566543 a_idle_collections=16 bitset_skips=3 g_admitted_expired=0 g_woken=13 g_timed_out=19 g_windows_woke=16 g_windows_refused=0 g_skipped=3 in_window_wakes=16 e_spawn_refusals=40 e_fillers=129 e_topups=39 e_pings=39 e_proving=1 calls=56 cycles=55

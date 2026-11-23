@@ -1,0 +1,7 @@
+full2-riscv64-gp rc=0 FUTEX_SEAL_WITNESS_SEAL arch=riscv64 smp=2 profile=gp cells=os,nr17,lh,pb,rb lh_late=8 lh_early=0 lh_timeout=0 lh_timeout_acquired=2 rb_induced=0 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=ok
+full2-riscv64-rtb rc=0 FUTEX_SEAL_WITNESS_SEAL arch=riscv64 smp=2 profile=rtb cells=os,nr17,lh,pb,rb lh_late=7 lh_early=0 lh_timeout=0 lh_timeout_acquired=3 rb_induced=1 rb_release_lateness_ticks=8 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=ok
+full2-aarch64-gp rc=0 FUTEX_SEAL_WITNESS_SEAL arch=aarch64 smp=2 profile=gp cells=os,nr17,lh,pb,rb lh_late=10 lh_early=0 lh_timeout=0 lh_timeout_acquired=0 rb_induced=0 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=ok
+full2-aarch64-rtb rc=0 FUTEX_SEAL_WITNESS_SEAL arch=aarch64 smp=2 profile=rtb cells=os,nr17,lh,pb,rb lh_late=10 lh_early=0 lh_timeout=0 lh_timeout_acquired=0 rb_induced=1 rb_release_lateness_ticks=35 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=ok
+full2-x86_64-gp rc=0 FUTEX_SEAL_WITNESS_SEAL arch=x86_64 smp=2 profile=gp cells=os,nr17,lh,pb,rb lh_late=8 lh_early=0 lh_timeout=1 lh_timeout_acquired=1 rb_induced=0 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=ok
+full2-x86_64-rtb rc=0 FUTEX_SEAL_WITNESS_SEAL arch=x86_64 smp=2 profile=rtb cells=os,nr17,lh,pb,rb lh_late=10 lh_early=0 lh_timeout=0 lh_timeout_acquired=0 rb_induced=1 rb_release_lateness_ticks=0 pb_rq_clean=4/4 pb_rq_reparks=0 pb_wa_clean=4/4 pb_wa_reparks=0 result=ok
+ALLDONE
