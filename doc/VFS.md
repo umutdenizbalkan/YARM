@@ -24,6 +24,7 @@ The VFS server requires three caps before entering its resident loop:
 | 12 | `process_manager_service_recv_ep` | VFS server's own IPC receive endpoint cap |
 | 13 | `service_extra_cap_0` | send cap to `initramfs_srv` (for CPIO lookups) |
 | 14 | `service_extra_cap_1` | send cap to `devfs_srv` (for `/dev/` requests) |
+| 17 | `service_admin_recv_ep` | receive side of the mount-admin endpoint (§3.2; VFS-CORRECT1B) |
 
 These caps are delivered by the PM spawn path: the init server places the
 initramfs and devfs send caps into `SpawnV5CapArgs.service_caps[0]` and
@@ -74,7 +75,9 @@ Authoritative values from
 | `VFS_OP_IOCTL` | `14` | client → VFS | (reserved) |
 | `VFS_OP_STATX` | `22` | client → VFS | stat a path (no fd required) |
 | `VFS_OP_WRITE_INLINE` | `28` | client → VFS | inline write (FAT-only route; 1–96 bytes payload, current-open-file-offset semantics) |
-| `VFS_OP_MOUNT_REGISTER` | (kernel-frozen) | service → VFS | dynamic mount registration |
+| `VFS_OP_MOUNT_REGISTER` | `23` | — | retired by VFS-CORRECT1B: always refused, status 5 (§3.2) |
+| `VFS_OP_MOUNT_STAGE` | `29` | administrator → VFS admin endpoint | stage a mount, backend endpoint transferred (§3.2) |
+| `VFS_OP_MOUNT_COMMIT` | `30` | administrator → VFS | commit a staged mount (§3.2) |
 
 Live shared-I/O opcodes `26`, `27`, and `28` (generic) **remain unsupported** at
 the generic `VfsService` level. The exact-inline `VFS_OP_WRITE_INLINE = 28`
@@ -82,8 +85,8 @@ is FAT-only (the FAT service implements it directly; the generic router
 rejects it). See §5 for the shared-I/O status.
 
 Replies to the operations the router forwards are payload completions (§3.1); the reply
-opcode is not part of the contract (NR 7 does not carry it). `VFS_OP_MOUNT_REGISTER` keeps its
-4-byte status reply.
+opcode is not part of the contract (NR 7 does not carry it). Mount registration replies with a
+4-byte status (§3.2).
 
 ### 3.1 Request/reply transaction and completions (VFS-CORRECT1A)
 
@@ -155,10 +158,71 @@ is a hard failure for that image, as before (no fallback exists).
 300 bytes, `byte[i] = (i * 131 + 43) mod 256` (`scripts/fixtures/README.md`). Later VFS passes
 compare against it.
 
-**Not in this contract** (later passes): full-width capability migration, mount authority, fd
-namespaces, grant reclamation, shared buffers and rings, a per-request nonce (association is the
+**Not in this contract** (later passes): fd namespaces, grant reclamation, shared buffers and rings, a per-request nonce (association is the
 operation plus the fd; the one-shot reply capability and the client's sequential calls cover the
 rest), and any other service's send/reply path.
+
+### 3.2 Mount authority and capability identities (VFS-CORRECT1B)
+
+**Capability identities are full width.** A `CapId` is `generation << 16 | slot index`, a `u64`;
+a slot reused more than 65,535 times has an ID above `u32::MAX`. Every user-runtime path carries
+the whole value: startup slots (`cap_from_slot`), NR 2 receive metadata (`decode_recv_meta_v2`:
+reply capability, transferred capability and the `NO_TRANSFER_CAP` sentinel stay distinct), the
+call/reply/send wrappers, the VFS client, VFS's mount and fd routing records, the backends' own
+endpoints and PM's FILE_GRANT_RO relay into NR 29. NR 23 and NR 29 return three unpacked lanes
+(`doc/SYSCALL_ABI.md`, "Within v13 (VFS-CORRECT1B)"). A truncated ID names another generation of
+the same slot, which the kernel refuses as `InvalidCapability`.
+
+**Mount administration is a capability.** At spawn PM asks the kernel for a third endpoint for
+`image_id=6` (NR 29 `arg5`, or NR 23 `arg4`): VFS gets its RECEIVE side in startup slot 17, PM gets
+the SEND side and returns it to the spawn requester (init) as a transferred capability on the
+`PROC_OP_SPAWN_V5_CAP` reply. An ordinary client holds only VFS's public endpoint (slot 12's
+send side) and cannot reach the admin endpoint. The authority check is the kernel's: a message on
+the admin endpoint was sent by a holder of its SEND capability.
+
+A registration is two steps (`yarm_fs_servers::fs::common::mount_admin`):
+
+1. **Stage.** NR 1 (`IpcSend`) to the **admin** endpoint, opcode `VFS_OP_MOUNT_STAGE`, payload
+   `MountStageArgs` (`flags: u64`, `sender_local_cap: u64` — informational, never used for
+   routing — `prefix_len: u8`, prefix), and the backend's service endpoint as the message's
+   **transferred capability**. The kernel checks the administrator's capability (a stale or
+   wrong one refuses the send at the sender; nothing is queued) and installs a copy of the
+   backend capability in VFS's CNode under a **VFS-local** ID. The sender keeps its own copy.
+2. **Commit.** NR 6 to the **public** endpoint, opcode `VFS_OP_MOUNT_COMMIT`, payload the prefix;
+   the reply is a 4-byte status and carries no capability. VFS first drains its admin endpoint
+   (non-blocking), then matches the commit to a staged mount by the kernel-authenticated sender
+   TID and the prefix. In order: no match → 6 `NOT_STAGED`; flags outside
+   `VFS_MOUNT_FLAGS_SUPPORTED` (only `VFS_MOUNT_FLAG_READONLY = 1`) → 8 `UNSUPPORTED_FLAGS`; an
+   invalid prefix → 4, a duplicate → 1, a full table → 2; then the **handshake**, one
+   `VFS_OP_STATX` of the prefix through the staged VFS-local capability, where the kernel enforces
+   object kind, SEND right and live generation (`WrongObject`, `MissingRight`,
+   `InvalidCapability`) and a backend must answer with a valid completion → otherwise 7
+   `BACKEND`; only then is the mount inserted (0), routing through the VFS-local ID.
+
+`VFS_OP_MOUNT_REGISTER` (23), which named the backend by the **sender's** numeric slot, is refused
+with 5 `PERMISSION` whatever it names, as is a commit when VFS has no admin endpoint.
+
+**Failure cleanup.** A refused commit leaves the routing table exactly as it was; existing routes
+keep working. No system call deletes a capability, so VFS cannot hand back the copy the stage
+brought in: it moves it to a bounded **retained** record (`MAX_RETAINED_CAPS = 8`), logged with
+`VFS_MOUNT_ADMIN_REFUSED … retained_cap=` and never routed. A stage that cannot be recorded
+(malformed payload, a second stage of the same sender and prefix) is retained the same way. At most
+`MAX_STAGED_MOUNTS = 4` stages are held; VFS drains its admin endpoint only while every staged
+mount could still be retained, so each acquired capability is always either published or
+retained. Past that bound further admin messages stay queued in the kernel and commits answer 6.
+Statuses 5 to 8 are new; 0 to 4 keep their meaning.
+
+**Live witness** (`vfs-mount-witness`; optionally with the kernel's `cap-gen-witness`, which
+starts every CNode slot at generation 0x1_0001 so every ID exceeds 2^32): init's
+`init/vfs_mount_witness.rs` drives the production client against the resident VFS and ramfs,
+which seeds `/ram/vc1b-witness` (192 bytes, `byte[i] = (i * 37 + 11) mod 256`). Graded by
+`scripts/grade-vfs-mount-witness.py`; `scripts/qemu-vfs-mount-witness-smoke.sh ARCH SMP wide|narrow`
+also runs the VFS-CORRECT1A grader on the same boot.
+
+**Limits.** The retained record is never drained (eight refusals exhaust mount administration
+until VFS restarts); a stage that is never committed holds its slot; association is sender TID
+plus prefix, with no nonce; one administrator capability, no delegation or revocation of mount
+authority; unmounting does not exist.
 
 ---
 
@@ -176,9 +240,9 @@ An fd entry is created by `VFS_OP_OPENAT` on success and removed by
 
 ### Mount table
 
-- Dynamic mount registration via `VFS_OP_MOUNT_REGISTER` (typically called
-  by init for `ramfs`, `ext4`).
-- Mount-table changes are committed before the request reply.
+- Dynamic mount registration is the two-step stage/commit protocol of §3.2, by the holder of the
+  mount-admin capability (init, for `ramfs`, `ext4` and optionally FAT).
+- Mount-table changes are committed before the commit's reply; a refused commit changes nothing.
 
 ### Unknown opcode
 

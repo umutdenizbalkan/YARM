@@ -153,7 +153,7 @@ pub fn run_request_loop(service: &mut InitramfsService) -> Result<InitramfsLoopS
 }
 
 /// VFS-CORRECT1A: a FILE_GRANT_RO error completion (no capability).
-fn grant_error_reply(reply_cap: u32, status: u32, fd: u64) {
+fn grant_error_reply(reply_cap: u64, status: u32, fd: u64) {
     let (bytes, len) = VfsCompletion::err(VFS_OP_FILE_GRANT_RO, status, fd)
         .encode(&[])
         .expect("header");

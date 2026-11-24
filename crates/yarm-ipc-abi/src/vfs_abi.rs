@@ -325,6 +325,17 @@ pub const VFS_OP_WRITE_SHARED_REQUEST: u16 = 27;
 /// FS-13 reserved service opcode for a bounded helper-only inline write payload.
 /// Live VFS dispatch continues to use the legacy length-only `VFS_OP_WRITE` path.
 pub const VFS_OP_WRITE_INLINE: u16 = 28;
+/// VFS-CORRECT1B — stage a mount (step 1 of 2). Sent with NR 1 (`IpcSend`) to the VFS
+/// **mount-admin endpoint**, whose SEND capability only the mount administrator holds, carrying
+/// the backend's service endpoint as the TRANSFERRED capability (`FLAG_CAP_TRANSFER`). Payload:
+/// [`MountStageArgs`]. There is no reply: NR 1 carries none.
+pub const VFS_OP_MOUNT_STAGE: u16 = 29;
+/// VFS-CORRECT1B — commit a staged mount (step 2 of 2). Sent with NR 6 to the PUBLIC VFS
+/// endpoint; payload: the prefix bytes of the staged mount. The reply is the 4-byte status
+/// (`VFS_MOUNT_STATUS_*`) and carries no capability. A refused commit leaves the routing table as
+/// it was; the staged backend capability (a delegated copy: the sender keeps its own) moves to
+/// VFS's bounded retained record, logged and never routed.
+pub const VFS_OP_MOUNT_COMMIT: u16 = 30;
 pub const VFS_OPENAT_INLINE_PATH_MAX: usize = 96;
 pub const VFS_OPENAT_INLINE_PATH_HEADER_BYTES: usize = 25;
 pub const VFS_OPENAT_INLINE_PATH_MAX_BYTES: usize =
@@ -451,6 +462,83 @@ pub const VFS_MOUNT_STATUS_ERR_DUPLICATE: u32 = 1;
 pub const VFS_MOUNT_STATUS_ERR_FULL: u32 = 2;
 pub const VFS_MOUNT_STATUS_ERR_INVALID_CAP: u32 = 3;
 pub const VFS_MOUNT_STATUS_ERR_INVALID_PREFIX: u32 = 4;
+/// VFS-CORRECT1B: the caller has no mount-administration authority. Every `VFS_OP_MOUNT_REGISTER`
+/// (the retired numeric-capability form) gets this, as does a commit when VFS has no admin
+/// endpoint.
+pub const VFS_MOUNT_STATUS_ERR_PERMISSION: u32 = 5;
+/// VFS-CORRECT1B: no mount staged through the admin endpoint matches this commit's sender and
+/// prefix.
+pub const VFS_MOUNT_STATUS_ERR_NOT_STAGED: u32 = 6;
+/// VFS-CORRECT1B: the registration handshake with the staged backend endpoint failed: the kernel
+/// refused the call (wrong object kind, no SEND right, stale generation), or the backend gave no
+/// valid completion.
+pub const VFS_MOUNT_STATUS_ERR_BACKEND: u32 = 7;
+/// VFS-CORRECT1B: the flags carry a bit VFS does not support.
+pub const VFS_MOUNT_STATUS_ERR_UNSUPPORTED_FLAGS: u32 = 8;
+
+/// VFS-CORRECT1B — the one supported mount flag: the mount is read-only.
+pub const VFS_MOUNT_FLAG_READONLY: u64 = 1;
+/// Every flag bit VFS accepts; any other bit refuses the commit.
+pub const VFS_MOUNT_FLAGS_SUPPORTED: u64 = VFS_MOUNT_FLAG_READONLY;
+
+/// Header bytes of a [`MountStageArgs`] payload: flags (8), sender-local cap (8), prefix length (1).
+pub const VFS_MOUNT_STAGE_HEADER_BYTES: usize = 17;
+/// Maximum byte length of a [`MountStageArgs`] payload.
+pub const VFS_MOUNT_STAGE_MAX_BYTES: usize =
+    VFS_MOUNT_STAGE_HEADER_BYTES + VFS_MOUNT_REGISTER_PREFIX_MAX;
+
+/// VFS-CORRECT1B — wire layout of a `VFS_OP_MOUNT_STAGE` payload (the backend endpoint itself
+/// travels as the message's transferred capability, never in the payload).
+///
+/// ```text
+/// offset  size  field
+/// ------  ----  -----
+///      0     8  flags              LE u64 — VFS_MOUNT_FLAG_* bits
+///      8     8  sender_local_cap   LE u64 — the administrator's OWN slot for the backend
+///                                  endpoint, for the record only: VFS logs it and never
+///                                  resolves it (it names nothing in VFS's CNode)
+///     16     1  prefix_len         1..=96
+///     17     N  prefix             raw path bytes
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountStageArgs<'a> {
+    pub flags: u64,
+    pub sender_local_cap: u64,
+    pub prefix: &'a [u8],
+}
+
+impl<'a> MountStageArgs<'a> {
+    pub fn encode(self) -> Option<([u8; VFS_MOUNT_STAGE_MAX_BYTES], usize)> {
+        if self.prefix.is_empty() || self.prefix.len() > VFS_MOUNT_REGISTER_PREFIX_MAX {
+            return None;
+        }
+        let mut out = [0u8; VFS_MOUNT_STAGE_MAX_BYTES];
+        out[0..8].copy_from_slice(&self.flags.to_le_bytes());
+        out[8..16].copy_from_slice(&self.sender_local_cap.to_le_bytes());
+        out[16] = self.prefix.len() as u8;
+        out[17..17 + self.prefix.len()].copy_from_slice(self.prefix);
+        Some((out, VFS_MOUNT_STAGE_HEADER_BYTES + self.prefix.len()))
+    }
+
+    /// Exact decode: the payload is the header plus exactly `prefix_len` prefix bytes.
+    pub fn decode(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() < VFS_MOUNT_STAGE_HEADER_BYTES {
+            return None;
+        }
+        let prefix_len = bytes[16] as usize;
+        if prefix_len == 0
+            || prefix_len > VFS_MOUNT_REGISTER_PREFIX_MAX
+            || bytes.len() != VFS_MOUNT_STAGE_HEADER_BYTES + prefix_len
+        {
+            return None;
+        }
+        Some(Self {
+            flags: u64::from_le_bytes(bytes[0..8].try_into().ok()?),
+            sender_local_cap: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            prefix: &bytes[17..17 + prefix_len],
+        })
+    }
+}
 
 /// Wire layout of a `VFS_OP_MOUNT_REGISTER` request payload.
 ///

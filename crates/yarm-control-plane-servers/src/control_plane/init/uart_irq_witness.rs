@@ -160,8 +160,8 @@ const NR_IPC_RECV_TIMEOUT: usize = 5;
 const ERR_WOULD_BLOCK: usize = 7;
 const ERR_TIMED_OUT: usize = 9;
 
-pub(super) fn armed(slot5: Option<u32>) -> bool {
-    matches!(slot5, Some(SELECTOR))
+pub(super) fn armed(slot5: Option<u64>) -> bool {
+    matches!(slot5, Some(s) if s == SELECTOR as u64)
 }
 
 fn ring_word(i: usize) -> u32 {
@@ -194,7 +194,7 @@ enum Recv {
 
 /// One NR 5 with a recv-v2 metadata target, issued directly so a polling loop does not emit a log
 /// line per probe. `timeout == 0` is the non-blocking probe.
-fn recv_timeout(cap: u32, timeout: u64) -> Recv {
+fn recv_timeout(cap: u64, timeout: u64) -> Recv {
     let mut payload = [0u8; 64];
     let mut meta = MetaV2 {
         status: u64::MAX,
@@ -303,7 +303,7 @@ fn recv_timeout(cap: u32, timeout: u64) -> Recv {
 /// not of the interrupt path: the interrupt lands on the kernel's idle loop, and the receiver
 /// resumes later through the timer's idle-boundary user return.
 #[cfg(target_arch = "aarch64")]
-fn park_measuring_simd(cap: u32, timeout: u64, seed: u64) -> (Recv, u32) {
+fn park_measuring_simd(cap: u64, timeout: u64, seed: u64) -> (Recv, u32) {
     let mut payload = [0u8; 64];
     let mut meta = MetaV2 {
         status: u64::MAX,
@@ -376,7 +376,7 @@ fn park_measuring_simd(cap: u32, timeout: u64, seed: u64) -> (Recv, u32) {
 /// the blocking receive in the same asm block. Observational, like the AArch64 measurement: bits
 /// 0..1 set for sentinels that did not come back.
 #[cfg(target_arch = "x86_64")]
-fn park_measuring_simd(cap: u32, timeout: u64, seed: u64) -> (Recv, u32) {
+fn park_measuring_simd(cap: u64, timeout: u64, seed: u64) -> (Recv, u32) {
     let mut payload = [0u8; 64];
     let mut meta = MetaV2 {
         status: u64::MAX,
@@ -769,7 +769,7 @@ extern "C" fn isolation_child_body() -> ! {
 
 /// Isolation, from userspace's side: (1) a U-mode load from the window faults in a disposable
 /// child; (2) the window cannot be claimed by a user mapping (`VmAnonMap` over it is refused).
-fn isolation_probes(park: u32) -> (u32, u32, bool) {
+fn isolation_probes(park: u64) -> (u32, u32, bool) {
     // SAFETY: an anonymous-map request the kernel must refuse; nothing is mapped on refusal.
     let anon = unsafe { yarm_user_rt::syscall::vm_anon_map(ISOLATION_MAP_VA, 4096, 1) };
     let anon_refused = anon.is_err();
@@ -813,7 +813,7 @@ const SAT_QUEUE_DEPTH: u32 = 8;
 /// and the source off, receive: the queue's `SAT_QUEUE_DEPTH` events and exactly one more — the
 /// line's coalesced pending indication — all labelled with the bound line, then nothing.
 #[cfg(feature = "irq-saturation-witness")]
-fn saturation_phase(notif: u32, park: u32, bound_line: u16) -> bool {
+fn saturation_phase(notif: u64, park: u64, bound_line: u16) -> bool {
     let (bytes_start, claims_start) = (ring_word(W_BYTES), ring_word(W_CLAIMS));
     yarm_user_rt::user_log!(
         "IRQ1_UART_SAT_READY count={} bytes={} claims={}",
@@ -878,11 +878,11 @@ pub(super) fn run_once() {
     let notif = yarm_user_rt::runtime::startup_arg_slot(
         yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_0,
     )
-    .unwrap_or(0) as u32;
+    .unwrap_or(0);
     let park = yarm_user_rt::runtime::startup_arg_slot(
         yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_1,
     )
-    .unwrap_or(0) as u32;
+    .unwrap_or(0);
     if notif == 0 || park == 0 || ring_word(W_MAGIC) != RING_MAGIC {
         yarm_user_rt::user_log!(
             "IRQ1_UART_WITNESS step=provision result=missing notif={} park={}",

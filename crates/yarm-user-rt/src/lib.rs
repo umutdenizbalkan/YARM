@@ -161,8 +161,8 @@ pub mod syscall {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReceivedMessage {
         pub message: Message,
-        pub reply_cap: Option<u32>,
-        pub transferred_cap: Option<u32>,
+        pub reply_cap: Option<u64>,
+        pub transferred_cap: Option<u64>,
         pub sender_tid: u64,
     }
     #[repr(C)]
@@ -179,22 +179,22 @@ pub mod syscall {
     const _: () = assert!(core::mem::size_of::<IpcRecvMetaV2>() == 40);
 
     pub trait IpcTransport {
-        fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError>;
-        fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError>;
+        fn send(&mut self, ep_cap: u64, msg: &Message) -> core::result::Result<(), SyscallError>;
+        fn recv(&mut self, ep_cap: u64) -> core::result::Result<Option<Message>, SyscallError>;
         fn recv_with_deadline(
             &mut self,
-            ep_cap: u32,
+            ep_cap: u64,
             timeout_ticks: u64,
         ) -> core::result::Result<Option<Message>, SyscallError>;
         fn recv_v2(
             &mut self,
-            ep_cap: u32,
+            ep_cap: u64,
         ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
             match self.recv(ep_cap) {
                 Ok(Some(msg)) => Ok(Some(ReceivedMessage {
                     message: msg,
                     reply_cap: None,
-                    transferred_cap: msg.transferred_cap().map(|c| c.0 as u32),
+                    transferred_cap: msg.transferred_cap().map(|c| c.0),
                     sender_tid: msg.sender_tid.0,
                 })),
                 Ok(None) => Ok(None),
@@ -203,7 +203,7 @@ pub mod syscall {
         }
         fn ipc_reply_v2(
             &mut self,
-            reply_cap: u32,
+            reply_cap: u64,
             msg: &Message,
         ) -> core::result::Result<(), SyscallError> {
             unsafe { ipc_reply(reply_cap, msg) }
@@ -215,13 +215,13 @@ pub mod syscall {
 
     impl IpcTransport for SyscallIpcTransport {
         #[inline]
-        fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError> {
+        fn send(&mut self, ep_cap: u64, msg: &Message) -> core::result::Result<(), SyscallError> {
             // SAFETY: forwards directly to syscall wrapper.
             unsafe { ipc_send(ep_cap, msg) }
         }
 
         #[inline]
-        fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
+        fn recv(&mut self, ep_cap: u64) -> core::result::Result<Option<Message>, SyscallError> {
             // SAFETY: forwards directly to syscall wrapper.
             unsafe { ipc_recv(ep_cap) }
         }
@@ -229,7 +229,7 @@ pub mod syscall {
         #[inline]
         fn recv_with_deadline(
             &mut self,
-            ep_cap: u32,
+            ep_cap: u64,
             timeout_ticks: u64,
         ) -> core::result::Result<Option<Message>, SyscallError> {
             // SAFETY: forwards directly to syscall wrapper.
@@ -239,7 +239,7 @@ pub mod syscall {
         #[inline]
         fn recv_v2(
             &mut self,
-            ep_cap: u32,
+            ep_cap: u64,
         ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
             // SAFETY: forwards directly to syscall wrapper.
             unsafe { ipc_recv_v2(ep_cap) }
@@ -342,7 +342,7 @@ pub mod syscall {
     }
 
     #[inline]
-    pub unsafe fn ipc_send(ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError> {
+    pub unsafe fn ipc_send(ep_cap: u64, msg: &Message) -> core::result::Result<(), SyscallError> {
         let (frame, frame_len, _tx_cap, _msg_flags) = ipc_call_prepare(msg);
         let transfer_cap = msg
             .transferred_cap()
@@ -389,7 +389,7 @@ pub mod syscall {
     /// ordinary send of those `len` bytes.
     #[inline]
     pub unsafe fn ipc_send_raw_source(
-        ep_cap: u32,
+        ep_cap: u64,
         ptr: usize,
         len: usize,
     ) -> core::result::Result<(), SyscallError> {
@@ -487,7 +487,7 @@ pub mod syscall {
     #[inline]
     pub unsafe fn ipc_recv_raw_mapping(
         nr: usize,
-        ep_cap: u32,
+        ep_cap: u64,
         ptr: usize,
         len: usize,
         timeout_ticks: u64,
@@ -530,7 +530,7 @@ pub mod syscall {
     /// elapses first).
     #[inline]
     pub unsafe fn ipc_send_timeout_ticks(
-        ep_cap: u32,
+        ep_cap: u64,
         msg: &Message,
         timeout_ticks: u64,
     ) -> core::result::Result<(), SyscallError> {
@@ -628,7 +628,7 @@ pub mod syscall {
     }
 
     #[inline]
-    pub unsafe fn ipc_recv(ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
+    pub unsafe fn ipc_recv(ep_cap: u64) -> core::result::Result<Option<Message>, SyscallError> {
         match unsafe { ipc_recv_v2(ep_cap) }? {
             Some(received) => Ok(Some(received.message)),
             None => Ok(None),
@@ -637,7 +637,7 @@ pub mod syscall {
 
     #[inline]
     pub unsafe fn ipc_recv_v2(
-        ep_cap: u32,
+        ep_cap: u64,
     ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
         // Receive buffer is sized for legacy inline-request framing cases where the
         // kernel may strip a request prefix before exposing payload via out-meta.
@@ -681,8 +681,19 @@ pub mod syscall {
                 Err(err)
             };
         }
+        decode_recv_meta_v2(&meta, &payload).map(Some)
+    }
+
+    /// The pure half of [`ipc_recv_v2`]: turn the kernel's out-metadata and payload buffer into a
+    /// [`ReceivedMessage`]. `cap_id` is carried full width (VFS-CORRECT1B: it used to be cut to
+    /// 32 bits, which loses a generation above 65,535); the metadata flags say whether it is a
+    /// reply capability or a transferred one, and `SYSCALL_NO_TRANSFER_CAP` means neither.
+    fn decode_recv_meta_v2(
+        meta: &IpcRecvMetaV2,
+        payload: &[u8],
+    ) -> core::result::Result<ReceivedMessage, SyscallError> {
         let payload_len = meta.payload_len as usize;
-        if payload_len > Message::MAX_PAYLOAD || payload_len > FRAMED_MAX {
+        if payload_len > Message::MAX_PAYLOAD || payload_len > payload.len() {
             return Err(SyscallError::Internal);
         }
         let opcode = meta.opcode;
@@ -691,7 +702,7 @@ pub mod syscall {
         let returned_cap = if meta.cap_id == SYSCALL_NO_TRANSFER_CAP {
             None
         } else {
-            Some(meta.cap_id as u32)
+            Some(meta.cap_id)
         };
         let preview_len = core::cmp::min(data_len, 32);
         let _ = preview_len;
@@ -711,20 +722,15 @@ pub mod syscall {
         } else {
             0
         };
-        let msg = Message::with_header(
-            meta.sender_tid,
-            opcode,
-            flags,
-            transferred_cap.map(|c| c as u64),
-            msg_payload,
-        )
-        .map_err(|_| SyscallError::InvalidArgs)?;
-        Ok(Some(ReceivedMessage {
+        let msg =
+            Message::with_header(meta.sender_tid, opcode, flags, transferred_cap, msg_payload)
+                .map_err(|_| SyscallError::InvalidArgs)?;
+        Ok(ReceivedMessage {
             message: msg,
             reply_cap,
             transferred_cap,
             sender_tid: meta.sender_tid,
-        }))
+        })
     }
 
     // ── Stage 198E3C1: narrow userspace shared-region (IpcSendSharedRegionDirect) helpers ─────────
@@ -741,7 +747,7 @@ pub mod syscall {
     pub struct SharedRegionRecv {
         /// Receiver-local transferred cap — ALSO the cleanup token. Nonzero; differs from the sender's
         /// source cap.
-        pub receiver_cap: u32,
+        pub receiver_cap: u64,
         /// VA the two-page region is mapped at (the caller-provided window).
         pub mapped_base: usize,
         pub mapped_len: usize,
@@ -774,8 +780,8 @@ pub mod syscall {
     /// # Safety
     /// `send_ep` must be a valid SEND cap and `mem_cap` a valid transferable MemoryObject/DmaRegion.
     pub unsafe fn send_shared_region_large(
-        send_ep: u32,
-        mem_cap: u32,
+        send_ep: u64,
+        mem_cap: u64,
         offset: usize,
         region_len: usize,
     ) -> core::result::Result<(), SyscallError> {
@@ -816,8 +822,8 @@ pub mod syscall {
     /// # Safety
     /// Same contract as [`send_shared_region_large`].
     pub unsafe fn send_shared_region(
-        send_ep: u32,
-        mem_cap: u32,
+        send_ep: u64,
+        mem_cap: u64,
     ) -> core::result::Result<(), SyscallError> {
         // SAFETY: forwards to the canonical helper with the oracle's offset 0 + two-page length.
         unsafe { send_shared_region_large(send_ep, mem_cap, 0, SHARED_REGION_ORACLE_LEN) }
@@ -834,7 +840,7 @@ pub mod syscall {
     /// # Safety
     /// `map_va..map_va+map_len` must be a currently-unmapped, page-aligned two-page userspace window.
     pub unsafe fn recv_shared_region_v2(
-        recv_ep: u32,
+        recv_ep: u64,
         map_va: usize,
         map_len: usize,
     ) -> core::result::Result<Option<SharedRegionRecv>, SyscallError> {
@@ -892,7 +898,7 @@ pub mod syscall {
             return Err(SyscallError::InvalidArgs);
         }
         Ok(Some(SharedRegionRecv {
-            receiver_cap: meta.cap_id as u32,
+            receiver_cap: meta.cap_id,
             mapped_base: map_va,
             mapped_len: map_len,
             sender_tid: meta.sender_tid,
@@ -919,7 +925,7 @@ pub mod syscall {
     /// # Safety
     /// Architecture syscall ABI entry.
     pub unsafe fn release_shared_region_range(
-        cleanup_cap: u32,
+        cleanup_cap: u64,
         base: usize,
         len: usize,
     ) -> core::result::Result<usize, SyscallError> {
@@ -979,7 +985,7 @@ pub mod syscall {
     }
 
     pub unsafe fn release_shared_region_mapping(
-        cleanup_cap: u32,
+        cleanup_cap: u64,
     ) -> core::result::Result<usize, SyscallError> {
         if cleanup_cap == 0 {
             return Err(SyscallError::InvalidArgs);
@@ -1138,7 +1144,7 @@ pub mod syscall {
     /// (`InvalidArgs` on the undersize path). NOT for production IPC.
     #[inline]
     pub unsafe fn ipc_recv_v2_proof_undersized(
-        ep_cap: u32,
+        ep_cap: u64,
     ) -> core::result::Result<(), SyscallError> {
         // Deliberately tiny payload buffer: any queued message with a payload
         // larger than this drives the undersize rollback path.
@@ -1186,7 +1192,7 @@ pub mod syscall {
 
     #[inline]
     pub unsafe fn ipc_recv_with_deadline(
-        ep_cap: u32,
+        ep_cap: u64,
         timeout_ticks: u64,
     ) -> core::result::Result<Option<Message>, SyscallError> {
         let mut payload = [0u8; 2 + Message::MAX_PAYLOAD];
@@ -1286,7 +1292,7 @@ pub mod syscall {
     /// witness's own caller decides whether that invalidates the round.
     #[inline]
     pub unsafe fn ipc_recv_timeout_expiry_checking_callee_saved(
-        ep_cap: u32,
+        ep_cap: u64,
         timeout_ticks: u64,
         sentinel: u64,
     ) -> (bool, u32, u32) {
@@ -1388,7 +1394,7 @@ pub mod syscall {
     #[inline]
     pub(crate) fn ipc_call_prepare(
         msg: &Message,
-    ) -> ([u8; 2 + Message::MAX_PAYLOAD], usize, Option<u32>, u16) {
+    ) -> ([u8; 2 + Message::MAX_PAYLOAD], usize, Option<u64>, u16) {
         let payload_len = msg.len as usize;
         let frame_len = 2 + payload_len;
         let mut frame = [0u8; 2 + Message::MAX_PAYLOAD];
@@ -1397,15 +1403,15 @@ pub mod syscall {
         (
             frame,
             frame_len,
-            msg.transferred_cap().map(|c| c.0 as u32),
+            msg.transferred_cap().map(|c| c.0),
             msg.flags,
         )
     }
 
     #[inline]
     pub unsafe fn ipc_call(
-        ep_cap: u32,
-        reply_recv_cap: u32,
+        ep_cap: u64,
+        reply_recv_cap: u64,
         msg: &Message,
     ) -> core::result::Result<(), SyscallError> {
         // SAFETY: delegated verbatim to the transfer-ret variant — one implementation.
@@ -1423,8 +1429,8 @@ pub mod syscall {
     /// As [`ipc_call`].
     #[inline]
     pub unsafe fn ipc_call_with_transfer_ret(
-        ep_cap: u32,
-        reply_recv_cap: u32,
+        ep_cap: u64,
+        reply_recv_cap: u64,
         msg: &Message,
     ) -> core::result::Result<u64, SyscallError> {
         // Prepend the 2-byte opcode (LE) before the payload bytes so the receiver
@@ -1444,8 +1450,14 @@ pub mod syscall {
         if ret.error != 0 {
             return Err(decode_syscall_error(ret.error));
         }
+        // VFS-CORRECT1B: AArch64 and RISC-V report an NR 6 error as the code in `ret0` with
+        // `ret1` and `ret2` zeroed (every refusal path goes through `set_err`, and the export
+        // writes zero to x1/x2, a1/a2); every success sets `ret0 = 0`. The test used to be
+        // "`ret1`/`ret2` still hold the frame pointer and length", which a zeroed error frame
+        // never matches, so a refused call (for instance `InvalidCapability` on the send cap)
+        // was reported as sent and the caller then blocked on a reply that could never come.
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret1 == args[1] && ret.ret2 == args[2] {
+        if ret.ret0 != 0 {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(ret.ret2 as u64)
@@ -1475,7 +1487,7 @@ pub mod syscall {
         image_id: u64,
         parent_pid: u64,
         startup_args: &[u64; 18],
-    ) -> core::result::Result<(u64, u32, u32), SyscallError> {
+    ) -> core::result::Result<(u64, u64, u64), SyscallError> {
         let args = [
             image_id as usize,
             parent_pid as usize,
@@ -1486,20 +1498,163 @@ pub mod syscall {
         ];
         // SAFETY: Uses architecture syscall ABI; startup_args lifetime covers the call.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_PROCESS_NR, args) };
+        decode_spawn_return(ret)
+    }
+
+    /// VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13) — [`spawn_process_with_startup_caps`] that also provisions an
+    /// ADMIN endpoint for the child: the child receives its RECEIVE capability in startup slot 17
+    /// ([`crate::runtime::STARTUP_SLOT_SERVICE_ADMIN_RECV_EP`]); the spawner keeps the SEND
+    /// capability, whose ID is the fourth value returned. The kernel writes that ID to `out` (8
+    /// bytes, aligned) before it commits the spawn, so a failed write fails the spawn with
+    /// nothing left behind.
+    ///
+    /// Returns `(child_tid, caller_cap, spawner_cap, spawner_admin_send_cap)`.
+    #[inline]
+    pub unsafe fn spawn_process_with_startup_caps_and_admin(
+        image_id: u64,
+        parent_pid: u64,
+        startup_args: &[u64; 18],
+    ) -> core::result::Result<(u64, u64, u64, u64), SyscallError> {
+        let mut out: u64 = 0;
+        let args = [
+            image_id as usize,
+            parent_pid as usize,
+            startup_args.as_ptr() as usize,
+            18usize,
+            (&mut out as *mut u64) as usize,
+            0,
+        ];
+        // SAFETY: Uses architecture syscall ABI; `startup_args` and `out` outlive the call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_PROCESS_NR, args) };
+        let (tid, caller, spawner) = decode_spawn_return(ret)?;
+        // SAFETY: the kernel wrote `out` (or the call failed above).
+        let admin = unsafe { core::ptr::read_volatile(&out) };
+        Ok((tid, caller, spawner, admin))
+    }
+
+    /// VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13) — the result of a capability-provisioning spawn (NR 23 with
+    /// startup capabilities, NR 29): `(child_tid, caller_cap, spawner_cap)`, every capability ID
+    /// full width.
+    ///
+    /// The kernel returns `ret0` = the spawner's own copy of the child's service SEND capability
+    /// (`spawner_cap`), `ret1` = the child's TID, and `ret2` = the requester's copy (`caller_cap`):
+    /// the copy delegated into `parent_pid`'s CNode when `parent_pid != 0` and the delegation
+    /// succeeded, otherwise the spawner's own copy again. Either capability is 0 when the child
+    /// has no service endpoint. Before VFS-CORRECT1B `ret2` packed two 32-bit IDs, which cannot hold a
+    /// capability whose generation exceeds 65,535.
+    ///
+    /// A failed spawn has no TID: on x86_64 the error is in its own lane; on AArch64 and RISC-V
+    /// the kernel writes the error code to `ret0` and zero to `ret1` and `ret2`, so `ret1 == 0`
+    /// is the failure test there (a TID is never 0).
+    #[inline]
+    fn decode_spawn_return(
+        ret: crate::arch::SyscallReturn,
+    ) -> core::result::Result<(u64, u64, u64), SyscallError> {
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             return Err(decode_syscall_error(ret.error));
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 {
+        if ret.ret1 == 0 {
             return Err(decode_syscall_error(ret.ret0));
         }
-        // ret2 may pack two 32-bit cap IDs: spawner's own cap in the high 32 bits
-        // and the parent-delegated cap in the low 32 bits (set by the kernel when
-        // parent_pid != 0 and delegation occurred).
-        let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
-        let spawner_cap = (ret.ret2 >> 32) as u32;
-        Ok((ret.ret1 as u64, caller_cap, spawner_cap))
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )))]
+        if ret.ret1 == 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok((ret.ret1 as u64, ret.ret2 as u64, ret.ret0 as u64))
+    }
+
+    /// VFS-CORRECT1B — capability identities above `u32::MAX` survive every user-runtime decode.
+    #[cfg(test)]
+    mod vc1b_width_tests {
+        use super::*;
+
+        /// Generation 0x1_0001, slot 17: the shape `cap-gen-witness` issues live.
+        const WIDE: u64 = (0x1_0001u64 << 16) | 17;
+
+        fn meta(cap_id: u64, flags: usize) -> IpcRecvMetaV2 {
+            IpcRecvMetaV2 {
+                status: 0,
+                opcode: 7,
+                flags: 0,
+                payload_len: 3,
+                cap_id,
+                recv_meta_flags: flags as u64,
+                sender_tid: 42,
+            }
+        }
+
+        #[test]
+        fn vc1b_a_transferred_cap_above_u32_is_kept_whole() {
+            assert!(WIDE > u64::from(u32::MAX));
+            let r = decode_recv_meta_v2(&meta(WIDE, SYSCALL_RECV_META_TRANSFERRED_CAP), b"abc")
+                .expect("decodes");
+            assert_eq!(r.transferred_cap, Some(WIDE));
+            assert_eq!(r.reply_cap, None);
+            assert_eq!(r.message.transferred_cap().map(|c| c.0), Some(WIDE));
+            assert_eq!(
+                r.message.flags & Message::FLAG_CAP_TRANSFER,
+                Message::FLAG_CAP_TRANSFER
+            );
+            assert_ne!(
+                r.transferred_cap,
+                Some(WIDE & 0xFFFF_FFFF),
+                "not the truncated identity"
+            );
+        }
+
+        #[test]
+        fn vc1b_a_reply_cap_above_u32_is_kept_whole_and_is_not_a_transfer() {
+            let r = decode_recv_meta_v2(&meta(WIDE, SYSCALL_RECV_META_REPLY_CAP), b"abc")
+                .expect("decodes");
+            assert_eq!(r.reply_cap, Some(WIDE));
+            assert_eq!(r.transferred_cap, None);
+            assert_eq!(r.message.flags & Message::FLAG_CAP_TRANSFER, 0);
+        }
+
+        #[test]
+        fn vc1b_the_no_cap_sentinel_is_neither() {
+            let both = SYSCALL_RECV_META_REPLY_CAP | SYSCALL_RECV_META_TRANSFERRED_CAP;
+            let r =
+                decode_recv_meta_v2(&meta(SYSCALL_NO_TRANSFER_CAP, both), b"abc").expect("decodes");
+            assert_eq!((r.reply_cap, r.transferred_cap), (None, None));
+            let r = decode_recv_meta_v2(&meta(WIDE, 0), b"abc").expect("decodes");
+            assert_eq!(
+                (r.reply_cap, r.transferred_cap),
+                (None, None),
+                "no flag, no cap"
+            );
+        }
+
+        #[test]
+        fn vc1b_an_oversized_payload_length_is_refused() {
+            let mut m = meta(WIDE, 0);
+            m.payload_len = 4;
+            assert!(decode_recv_meta_v2(&m, b"abc").is_err());
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[test]
+        fn vc1b_spawn_return_lanes_are_unpacked_full_width() {
+            let ret = crate::arch::SyscallReturn {
+                ret0: (WIDE + 1) as usize,
+                ret1: 10_003,
+                ret2: (WIDE + 2) as usize,
+                ret3: 0,
+                ret4: 0,
+                ret5: 0,
+                error: 0,
+            };
+            assert_eq!(
+                decode_spawn_return(ret).unwrap(),
+                (10_003, WIDE + 2, WIDE + 1)
+            );
+        }
     }
 
     /// Spawn a new process from an ELF image already loaded into a userspace buffer.
@@ -1512,7 +1667,7 @@ pub mod syscall {
     #[inline]
     #[inline]
     pub unsafe fn ipc_reply(
-        reply_cap: u32,
+        reply_cap: u64,
         msg: &Message,
     ) -> core::result::Result<(), SyscallError> {
         let transfer_cap = msg
@@ -1561,7 +1716,7 @@ pub mod syscall {
     pub unsafe fn create_initramfs_file_slice_mo(
         name: &[u8],
         flags: u64,
-    ) -> core::result::Result<(u32, u64), SyscallError> {
+    ) -> core::result::Result<(u64, u64), SyscallError> {
         let args = [
             name.as_ptr() as usize, // arg0 = name_ptr
             name.len(),             // arg1 = name_len
@@ -1581,8 +1736,8 @@ pub mod syscall {
         if ret.ret0 != 0 {
             return Err(decode_syscall_error(ret.ret0));
         }
-        // ret1 = cap_id (u32), ret2 = file_len (usize)
-        Ok((ret.ret1 as u32, ret.ret2 as u64))
+        // ret1 = the MemoryObject capability (full width), ret2 = file_len (usize)
+        Ok((ret.ret1 as u64, ret.ret2 as u64))
     }
 
     /// Phase 3A: Spawn a process from an InitramfsFileSlice MemoryObject capability.
@@ -1596,10 +1751,10 @@ pub mod syscall {
     #[inline]
     pub unsafe fn spawn_from_memory_object(
         image_id: u64,
-        mo_cap: u32,
+        mo_cap: u64,
         parent_pid: u64,
         startup_args: &[u64; 18],
-    ) -> core::result::Result<(u64, u32, u32), SyscallError> {
+    ) -> core::result::Result<(u64, u64, u64), SyscallError> {
         let args = [
             image_id as usize,              // arg0 = image_id
             mo_cap as usize,                // arg1 = mo_cap
@@ -1610,17 +1765,7 @@ pub mod syscall {
         ];
         // SAFETY: Uses architecture syscall ABI; startup_args lifetime covers the call.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR, args) };
-        #[cfg(target_arch = "x86_64")]
-        if ret.error != 0 {
-            return Err(decode_syscall_error(ret.error));
-        }
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 {
-            return Err(decode_syscall_error(ret.ret0));
-        }
-        let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
-        let spawner_cap = (ret.ret2 >> 32) as u32;
-        Ok((ret.ret1 as u64, caller_cap, spawner_cap))
+        decode_spawn_return(ret)
     }
 
     /// Reap a terminal faulted/exited/dead task after PM has successfully spawned
@@ -2734,6 +2879,10 @@ pub mod runtime {
     pub const STARTUP_SLOT_INITRD_PTR: usize = 15;
     pub const STARTUP_SLOT_INITRD_LEN: usize = 16;
     pub const STARTUP_SLOT_PM_REQUEST_RECV_CAP: usize = 17;
+    /// VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13): slot 17 of a SPAWNED service — the RECEIVE capability of its
+    /// admin endpoint when its spawn provisioned one (NR 23 `arg4` / NR 29 `arg5`), else 0. The
+    /// same slot is PM's request receive endpoint only because PM is boot-spawned, not spawned.
+    pub const STARTUP_SLOT_SERVICE_ADMIN_RECV_EP: usize = 17;
     const STARTUP_SLOT_COUNT: usize = 18;
 
     static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] = [
@@ -2763,21 +2912,21 @@ pub mod runtime {
         /// Optional process-manager request endpoint send capability.
         ///
         /// This remains `None` until the startup ABI wires concrete cap slots.
-        pub process_manager_request_send_cap: Option<u32>,
+        pub process_manager_request_send_cap: Option<u64>,
         /// Optional process-manager reply endpoint receive capability.
         ///
         /// This remains `None` until the startup ABI wires concrete cap slots.
-        pub process_manager_reply_recv_cap: Option<u32>,
+        pub process_manager_reply_recv_cap: Option<u64>,
         /// Optional supervisor fault receive endpoint cap.
-        pub supervisor_fault_recv_ep: Option<u32>,
+        pub supervisor_fault_recv_ep: Option<u64>,
         /// Optional supervisor control send endpoint cap.
-        pub supervisor_control_send_ep: Option<u32>,
+        pub supervisor_control_send_ep: Option<u64>,
         /// Optional supervisor control receive endpoint cap.
-        pub supervisor_control_recv_ep: Option<u32>,
+        pub supervisor_control_recv_ep: Option<u64>,
         /// Optional init alert send endpoint cap.
-        pub init_alert_send_ep: Option<u32>,
+        pub init_alert_send_ep: Option<u64>,
         /// Optional init alert receive endpoint cap.
-        pub init_alert_recv_ep: Option<u32>,
+        pub init_alert_recv_ep: Option<u64>,
         /// Optional init task id conveyed during runtime handoff.
         pub init_tid: Option<u64>,
         /// Optional supervisor task id conveyed during runtime handoff.
@@ -2785,15 +2934,15 @@ pub mod runtime {
         /// Optional supervisor restart window ticks.
         pub supervisor_restart_window_ticks: Option<u64>,
         /// Optional process-manager restart-control SEND cap.
-        pub process_manager_restart_control_send_cap: Option<u32>,
+        pub process_manager_restart_control_send_cap: Option<u64>,
         /// Optional process-manager service receive endpoint cap.
         ///
         /// Passed to process_manager (TID 2) so it knows which endpoint to recv on.
-        pub process_manager_service_recv_ep: Option<u32>,
+        pub process_manager_service_recv_ep: Option<u64>,
         /// Optional extra service send cap 0 (slot 13).
-        pub service_extra_cap_0: Option<u32>,
+        pub service_extra_cap_0: Option<u64>,
         /// Optional extra service send cap 1 (slot 14).
-        pub service_extra_cap_1: Option<u32>,
+        pub service_extra_cap_1: Option<u64>,
         /// Boot initramfs pointer mapped read-only into this process's address space (slot 15).
         /// Zero/None if kernel did not provide an initrd mapping.
         pub initrd_ptr: Option<u64>,
@@ -2803,12 +2952,15 @@ pub mod runtime {
         /// Optional process-manager inbound request receive cap (slot 17).
         ///
         /// Passed to the PM server (TID 3) so it knows which endpoint to block on.
-        pub pm_request_recv_cap: Option<u32>,
+        pub pm_request_recv_cap: Option<u64>,
+        /// VFS-CORRECT1B: slot 17 read as a spawned service's admin endpoint (the same slot as
+        /// `pm_request_recv_cap`; which name applies depends on whether the task was spawned).
+        pub service_admin_recv_ep: Option<u64>,
     }
 
     impl StartupContext {
         #[inline]
-        pub const fn process_manager_caps(self) -> Option<(u32, u32)> {
+        pub const fn process_manager_caps(self) -> Option<(u64, u64)> {
             match (
                 self.process_manager_request_send_cap,
                 self.process_manager_reply_recv_cap,
@@ -2820,12 +2972,11 @@ pub mod runtime {
     }
 
     #[inline]
-    const fn cap_from_slot(raw: u64) -> Option<u32> {
-        if raw == 0 || raw > (u32::MAX as u64) {
-            None
-        } else {
-            Some(raw as u32)
-        }
+    /// A startup capability slot: 0 is "no capability"; any other value is the capability ID,
+    /// full width (VFS-CORRECT1B: a generation above 65,535 puts it above `u32::MAX`, which this
+    /// used to discard).
+    const fn cap_from_slot(raw: u64) -> Option<u64> {
+        if raw == 0 { None } else { Some(raw) }
     }
 
     #[inline]
@@ -3152,6 +3303,7 @@ pub mod runtime {
             initrd_ptr,
             initrd_len,
             pm_request_recv_cap,
+            service_admin_recv_ep: pm_request_recv_cap,
         }
     }
 }
@@ -3270,6 +3422,34 @@ mod tests {
     use crate::ipc::Message;
     use crate::runtime::{install_startup_arg_slots, startup_context};
     use crate::syscall::ipc_call_prepare;
+
+    /// VFS-CORRECT1B — startup slots carry full-width capability IDs: a generation above 65,535
+    /// puts an ID above `u32::MAX`, which `cap_from_slot` used to read as "no capability".
+    #[test]
+    fn vc1b_startup_slots_keep_capability_ids_above_u32() {
+        let original = startup_context();
+        let wide = |slot: u64| (0x1_0001u64 << 16) | slot;
+        let mut slots = [0u64; 18];
+        slots[0] = 42;
+        slots[1] = wide(1);
+        slots[2] = wide(2);
+        slots[12] = wide(12);
+        slots[17] = wide(17);
+        install_startup_arg_slots(slots);
+        let ctx = startup_context();
+        assert_eq!(ctx.process_manager_caps(), Some((wide(1), wide(2))));
+        assert_eq!(ctx.process_manager_service_recv_ep, Some(wide(12)));
+        assert_eq!(ctx.service_admin_recv_ep, Some(wide(17)));
+        assert!(wide(17) > u64::from(u32::MAX));
+        slots[17] = 0;
+        install_startup_arg_slots(slots);
+        assert_eq!(
+            startup_context().service_admin_recv_ep,
+            None,
+            "0 is no capability"
+        );
+        let _ = original;
+    }
 
     #[test]
     fn startup_process_manager_caps_require_both_slots() {

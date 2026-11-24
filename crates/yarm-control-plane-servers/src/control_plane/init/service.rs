@@ -35,7 +35,7 @@ use yarm_fs_servers::ramfs::service::RamFsMountConfig;
 use yarm_ipc_abi::blkcache_abi::{BLKCACHE_OP_REGISTER_BACKEND, RegisterBackendArgs};
 use yarm_ipc_abi::block_abi::{BLK_OP_GET_INFO, BlkGetInfoReply, BlkGetInfoRequest, BlkStatus};
 use yarm_ipc_abi::supervisor_abi::{RegisterDriverRequest, SUPERVISOR_OP_REGISTER_DRIVER};
-use yarm_ipc_abi::vfs_abi::{MountRegisterArgs, VFS_MOUNT_STATUS_OK, VFS_OP_MOUNT_REGISTER};
+
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 
@@ -272,12 +272,34 @@ fn resolve_core_image_plan(
 }
 
 fn spawn_v5_cap(
-    pm_send: u32,
-    pm_recv: u32,
+    pm_send: u64,
+    pm_recv: u64,
     image_id: u64,
     service_caps: [u64; 4],
     parent_pid: u64,
 ) -> Option<(u64, u64)> {
+    let (pid, service_send_cap, granted) =
+        spawn_v5_cap_with_grant(pm_send, pm_recv, image_id, service_caps, parent_pid)?;
+    if let Some(cap) = granted {
+        // Only the VFS spawn carries a grant; any other is unexpected and is logged, not used.
+        yarm_user_rt::user_log!(
+            "INIT_SPAWN_V5_UNEXPECTED_GRANT image_id={} cap={}",
+            image_id,
+            cap
+        );
+    }
+    Some((pid, service_send_cap))
+}
+
+/// VFS-CORRECT1B — [`spawn_v5_cap`], also returning the capability PM transferred with the reply
+/// (the VFS mount-admin SEND capability for image 6), in init's own CNode.
+fn spawn_v5_cap_with_grant(
+    pm_send: u64,
+    pm_recv: u64,
+    image_id: u64,
+    service_caps: [u64; 4],
+    parent_pid: u64,
+) -> Option<(u64, u64, Option<u64>)> {
     use yarm_ipc_abi::process_abi::{
         PROC_OP_SPAWN_V5_CAP, SpawnV5CapArgs, SpawnV5CapResult, decode_spawn_v5_reply,
     };
@@ -361,7 +383,11 @@ fn spawn_v5_cap(
                             "INIT_SPAWN_V5_REPLY_DECODE ok=1 child_tid={}",
                             result.pid
                         );
-                        return Some((result.pid, result.service_send_cap));
+                        return Some((
+                            result.pid,
+                            result.service_send_cap,
+                            received.transferred_cap,
+                        ));
                     }
                     Err(_) => {
                         yarm_user_rt::user_log!(
@@ -392,177 +418,219 @@ fn spawn_v5_reply_is_success(pid: u64, _service_send_cap: u64) -> bool {
     pid != 0
 }
 
+/// VFS-CORRECT1B — the result of one authorized mount registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MountRegistration {
+    /// `VFS_MOUNT_STATUS_*`, or `None` when no reply could be obtained (`reason` says why).
+    pub status: Option<u32>,
+    pub reason: &'static str,
+}
+
+/// VFS-CORRECT1B — register `prefix` -> `backend_send_cap` with VFS, as its mount administrator.
+///
+/// 1. **stage**: NR 1 to the VFS mount-admin endpoint (`vfs_admin_send`, the capability PM
+///    transferred to init with the VFS spawn), `VFS_OP_MOUNT_STAGE`, with the backend endpoint as
+///    the TRANSFERRED capability. The kernel delegates a copy into VFS's CNode under a VFS-local
+///    identity (init keeps its own). `backend_send_cap` goes in the payload only as a record of
+///    init's own slot; VFS never resolves it.
+/// 2. **commit**: NR 6 to the public VFS endpoint, `VFS_OP_MOUNT_COMMIT` + the prefix; the reply
+///    is the 4-byte status.
+pub(super) fn register_mount_with_vfs(
+    vfs_send_cap: u64,
+    vfs_admin_send: Option<u64>,
+    reply_recv_cap: u64,
+    backend_send_cap: u64,
+    flags: u64,
+    prefix: &[u8],
+) -> MountRegistration {
+    use yarm_ipc_abi::vfs_abi::{MountStageArgs, VFS_OP_MOUNT_COMMIT, VFS_OP_MOUNT_STAGE};
+    let fail = |reason| MountRegistration {
+        status: None,
+        reason,
+    };
+    let Some(admin) = vfs_admin_send else {
+        return fail("no_admin_cap");
+    };
+    let Some((payload, len)) = (MountStageArgs {
+        flags,
+        sender_local_cap: backend_send_cap,
+        prefix,
+    })
+    .encode() else {
+        return fail("encode");
+    };
+    let Ok(stage) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        VFS_OP_MOUNT_STAGE,
+        yarm_user_rt::ipc::Message::FLAG_CAP_TRANSFER,
+        Some(backend_send_cap),
+        &payload[..len],
+    ) else {
+        return fail("message");
+    };
+    // SAFETY: `admin` is init's own mount-admin SEND capability; the transfer is a real NR 1
+    // capability transfer of init's own backend capability.
+    if let Err(err) = unsafe { yarm_user_rt::syscall::ipc_send(admin, &stage) } {
+        yarm_user_rt::user_log!(
+            "INIT_MOUNT_STAGE_REFUSED prefix={} err={:?}",
+            alloc::string::String::from_utf8_lossy(prefix),
+            err
+        );
+        return fail("stage_refused");
+    }
+    let Ok(commit) =
+        yarm_user_rt::ipc::Message::with_header(0, VFS_OP_MOUNT_COMMIT, 0, None, prefix)
+    else {
+        return fail("message");
+    };
+    mount_admin_call(vfs_send_cap, reply_recv_cap, &commit)
+}
+
+/// One NR 6 mount-administration call to the public VFS endpoint and its 4-byte status reply.
+pub(super) fn mount_admin_call(
+    vfs_send_cap: u64,
+    reply_recv_cap: u64,
+    msg: &yarm_user_rt::ipc::Message,
+) -> MountRegistration {
+    // SAFETY: init's own VFS send and reply endpoints.
+    if unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, msg) }.is_err() {
+        return MountRegistration {
+            status: None,
+            reason: "call_refused",
+        };
+    }
+    match unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) } {
+        Ok(Some(reply)) => {
+            let p = reply.message.as_slice();
+            let status = (p.len() == 4).then(|| u32::from_le_bytes([p[0], p[1], p[2], p[3]]));
+            if let Some(cap) = reply.transferred_cap {
+                yarm_user_rt::user_log!("INIT_MOUNT_REPLY_UNEXPECTED_CAP cap={}", cap);
+            }
+            MountRegistration {
+                status,
+                reason: if status.is_some() {
+                    "reply"
+                } else {
+                    "malformed_reply"
+                },
+            }
+        }
+        _ => MountRegistration {
+            status: None,
+            reason: "no_reply",
+        },
+    }
+}
+
+/// The three registration producers (RAMFS, FAT, EXT4): each stages and commits through
+/// [`register_mount_with_vfs`] and logs its own literal markers.
+fn log_mount_failure(label: &str, r: &MountRegistration) {
+    yarm_user_rt::user_log!(
+        "VFS_MOUNT_REGISTER_{}_ERR status={} reason={}",
+        label,
+        r.status.map(i64::from).unwrap_or(-1),
+        r.reason
+    );
+}
+
 fn register_ramfs_mount_with_vfs(
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    vfs_admin_send: Option<u64>,
+    reply_recv_cap: u64,
     ramfs_send_cap: u64,
     mount_config: RamFsMountConfig,
 ) -> bool {
-    let Some((payload, len)) = (MountRegisterArgs {
-        backend_send_cap: ramfs_send_cap,
-        flags: if mount_config.readonly { 1 } else { 0 },
-        prefix: mount_config.prefix(),
-    })
-    .encode() else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=encode");
-        return false;
-    };
-    let Ok(msg) =
-        yarm_user_rt::ipc::Message::with_header(0, VFS_OP_MOUNT_REGISTER, 0, None, &payload[..len])
-    else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=message");
-        return false;
-    };
+    let prefix = mount_config.prefix();
     yarm_user_rt::user_log!(
-        "VFS_MOUNT_REGISTER_RAMFS_BEGIN prefix={}",
-        alloc::string::String::from_utf8_lossy(mount_config.prefix())
+        "VFS_MOUNT_REGISTER_RAMFS_BEGIN prefix={} init_local_backend={}",
+        alloc::string::String::from_utf8_lossy(prefix),
+        ramfs_send_cap
     );
-    let call = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
-    if call.is_err() {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=ipc-call");
-        return false;
-    }
-    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) };
-    let Ok(Some(reply_msg)) = reply else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=no-reply");
-        return false;
-    };
-    let reply_payload = reply_msg.message.as_slice();
-    if reply_payload.len() < 4 {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=short-reply");
-        return false;
-    }
-    let status = u32::from_le_bytes([
-        reply_payload[0],
-        reply_payload[1],
-        reply_payload[2],
-        reply_payload[3],
-    ]);
-    if status == VFS_MOUNT_STATUS_OK {
+    let flags = if mount_config.readonly { 1 } else { 0 };
+    let r = register_mount_with_vfs(
+        vfs_send_cap,
+        vfs_admin_send,
+        reply_recv_cap,
+        ramfs_send_cap,
+        flags,
+        prefix,
+    );
+    if r.status == Some(yarm_ipc_abi::vfs_abi::VFS_MOUNT_STATUS_OK) {
         yarm_user_rt::user_log!(
             "VFS_MOUNT_REGISTER_RAMFS_OK prefix={}",
-            alloc::string::String::from_utf8_lossy(mount_config.prefix())
+            alloc::string::String::from_utf8_lossy(prefix)
         );
         true
     } else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR status={}", status);
+        log_mount_failure("RAMFS", &r);
         false
     }
 }
 
 fn register_fat_mount_with_vfs(
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    vfs_admin_send: Option<u64>,
+    reply_recv_cap: u64,
     fat_send_cap: u64,
     mount_config: FatMountConfig,
 ) -> bool {
-    let Some((payload, len)) = (MountRegisterArgs {
-        backend_send_cap: fat_send_cap,
-        flags: if mount_config.readonly { 1 } else { 0 },
-        prefix: mount_config.prefix(),
-    })
-    .encode() else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=encode");
-        return false;
-    };
-    let Ok(msg) =
-        yarm_user_rt::ipc::Message::with_header(0, VFS_OP_MOUNT_REGISTER, 0, None, &payload[..len])
-    else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=message");
-        return false;
-    };
+    let prefix = mount_config.prefix();
     yarm_user_rt::user_log!(
         "VFS_MOUNT_REGISTER_FAT_BEGIN prefix={} device_id={}",
-        alloc::string::String::from_utf8_lossy(mount_config.prefix()),
+        alloc::string::String::from_utf8_lossy(prefix),
         mount_config.device_id
     );
-    let call = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
-    if call.is_err() {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=ipc-call");
-        return false;
-    }
-    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) };
-    let Ok(Some(reply_msg)) = reply else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=no-reply");
-        return false;
-    };
-    let reply_payload = reply_msg.message.as_slice();
-    if reply_payload.len() < 4 {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=short-reply");
-        return false;
-    }
-    let status = u32::from_le_bytes([
-        reply_payload[0],
-        reply_payload[1],
-        reply_payload[2],
-        reply_payload[3],
-    ]);
-    if status == VFS_MOUNT_STATUS_OK {
+    let flags = if mount_config.readonly { 1 } else { 0 };
+    let r = register_mount_with_vfs(
+        vfs_send_cap,
+        vfs_admin_send,
+        reply_recv_cap,
+        fat_send_cap,
+        flags,
+        prefix,
+    );
+    if r.status == Some(yarm_ipc_abi::vfs_abi::VFS_MOUNT_STATUS_OK) {
         yarm_user_rt::user_log!(
             "VFS_MOUNT_REGISTER_FAT_OK prefix={}",
-            alloc::string::String::from_utf8_lossy(mount_config.prefix())
+            alloc::string::String::from_utf8_lossy(prefix)
         );
         true
     } else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR status={}", status);
+        log_mount_failure("FAT", &r);
         false
     }
 }
 
 fn register_ext4_mount_with_vfs(
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    vfs_admin_send: Option<u64>,
+    reply_recv_cap: u64,
     ext4_send_cap: u64,
 ) -> bool {
-    let Some((payload, len)) = (MountRegisterArgs {
-        backend_send_cap: ext4_send_cap,
-        flags: 1,
-        prefix: b"/ext4",
-    })
-    .encode() else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=encode");
-        return false;
-    };
-    let Ok(msg) =
-        yarm_user_rt::ipc::Message::with_header(0, VFS_OP_MOUNT_REGISTER, 0, None, &payload[..len])
-    else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=message");
-        return false;
-    };
-    yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_BEGIN prefix=/ext4");
-    let call = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
-    if call.is_err() {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=ipc-call");
-        return false;
-    }
-    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) };
-    let Ok(Some(reply_msg)) = reply else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=no-reply");
-        return false;
-    };
-    let reply_payload = reply_msg.message.as_slice();
-    if reply_payload.len() < 4 {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=short-reply");
-        return false;
-    }
-    let status = u32::from_le_bytes([
-        reply_payload[0],
-        reply_payload[1],
-        reply_payload[2],
-        reply_payload[3],
-    ]);
-    if status == VFS_MOUNT_STATUS_OK {
+    yarm_user_rt::user_log!(
+        "VFS_MOUNT_REGISTER_EXT4_BEGIN prefix=/ext4 init_local_backend={}",
+        ext4_send_cap
+    );
+    let r = register_mount_with_vfs(
+        vfs_send_cap,
+        vfs_admin_send,
+        reply_recv_cap,
+        ext4_send_cap,
+        yarm_ipc_abi::vfs_abi::VFS_MOUNT_FLAG_READONLY,
+        b"/ext4",
+    );
+    if r.status == Some(yarm_ipc_abi::vfs_abi::VFS_MOUNT_STATUS_OK) {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4");
         true
     } else {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR status={}", status);
+        log_mount_failure("EXT4", &r);
         false
     }
 }
 
 fn crash_test_supervisor_control_send_cap(
     ctx: &yarm_user_rt::runtime::StartupContext,
-) -> Option<u32> {
+) -> Option<u64> {
     let raw = yarm_user_rt::runtime::startup_arg_slot(
         yarm_user_rt::runtime::STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP,
     )
@@ -587,7 +655,7 @@ fn crash_test_supervisor_control_send_cap(
     }
 }
 
-fn register_crash_test_with_supervisor(supervisor_send: u32, crash_tid: u64) {
+fn register_crash_test_with_supervisor(supervisor_send: u64, crash_tid: u64) {
     yarm_user_rt::user_log!("INIT_CRASH_TEST_REGISTER_BEGIN tid={}", crash_tid);
     let req = RegisterDriverRequest {
         tid: crash_tid,
@@ -1456,7 +1524,7 @@ pub(super) mod ipc_residual1_queued_cap_witness {
 
     pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
 
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         matches!(slot5, Some(13))
     }
 
@@ -1612,7 +1680,7 @@ pub(super) mod ipc_residual2_park_witness {
     /// Set by the parent when its call loop is finished, so the child stops.
     pub(super) static DONE: AtomicU32 = AtomicU32::new(0);
     /// The endpoint both roles use, published before the spawn.
-    pub(super) static EP_CAP: AtomicU32 = AtomicU32::new(0);
+    pub(super) static EP_CAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     /// U9-IPC-RESIDUAL3 §3 — what the child observed about the message STREAM, not its size.
     pub(super) static OUT_OF_ORDER: AtomicU32 = AtomicU32::new(0);
     pub(super) static DUPLICATES: AtomicU32 = AtomicU32::new(0);
@@ -1643,7 +1711,7 @@ pub(super) mod ipc_residual2_park_witness {
     /// A bound on the child's polling so a parent failure cannot spin the boot forever.
     const CHILD_ITERATIONS: u32 = 4096;
 
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         matches!(slot5, Some(14))
     }
 
@@ -1873,7 +1941,7 @@ pub(super) mod ipc_send_final_fault_witness {
 
     pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
     /// The endpoint both roles use, published before the spawn.
-    pub(super) static EP_CAP: AtomicU32 = AtomicU32::new(0);
+    pub(super) static EP_CAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     /// How many faulting sends the child issued, and how many answered `PageFault`.
     pub(super) static FAULTS: AtomicU32 = AtomicU32::new(0);
     pub(super) static FAULTS_PAGEFAULT: AtomicU32 = AtomicU32::new(0);
@@ -1900,7 +1968,7 @@ pub(super) mod ipc_send_final_fault_witness {
     /// from a DIFFERENT question and would not exercise the copy at all).
     pub(super) const UNREADABLE: usize = 0x0000_4000_0000_0000;
 
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         matches!(slot5, Some(15))
     }
 
@@ -2243,7 +2311,7 @@ pub(super) mod ipc_displace1_witness {
     /// R2's answer when it received a message instead of an error.
     const ANSWER_MESSAGE: u32 = 0x100;
 
-    static EP: AtomicU32 = AtomicU32::new(0);
+    static EP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static S_TID: AtomicU64 = AtomicU64::new(0);
     static ROUND: AtomicU32 = AtomicU32::new(0);
     static R1_ARMED: AtomicU32 = AtomicU32::new(0);
@@ -2269,7 +2337,7 @@ pub(super) mod ipc_displace1_witness {
     #[allow(unused)]
     pub(super) static mut R2_TLS: [u8; 256] = [0u8; 256];
 
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         matches!(slot5, Some(17))
     }
 
@@ -2343,7 +2411,7 @@ pub(super) mod ipc_displace1_witness {
         );
     }
 
-    fn send(ep: u32, round: u32) -> bool {
+    fn send(ep: u64, round: u32) -> bool {
         let Ok(msg) = yarm_user_rt::ipc::Message::new(0, &payload(round)) else {
             return false;
         };
@@ -2767,7 +2835,7 @@ pub(super) mod futex_requeue_witness {
         }
     }
 
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         matches!(slot5, Some(18))
     }
 
@@ -4493,6 +4561,10 @@ fn run_futex_sync_witness(s_tid: u64) {
 #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-correct-witness"))]
 #[path = "vfs_correct_witness.rs"]
 mod vfs_correct_witness;
+// VFS-CORRECT1B — the live mount-authority witness (default off).
+#[cfg(all(not(feature = "hosted-dev"), feature = "vfs-mount-witness"))]
+#[path = "vfs_mount_witness.rs"]
+mod vfs_mount_witness;
 
 /// FUTEX-SEAL1 — the live futex seal cell (`futex_seal_witness.rs`), selector 18 when init is built
 /// with `futex-seal-witness`; it takes precedence over the futex-sync and futex-time cells.
@@ -5652,7 +5724,7 @@ mod x86_sched_time {
     feature = "futex-requeue-witness",
     feature = "sched-time-witness"
 ))]
-fn run_sched_time_witness(s_tid: u64, recv_ep: Option<u32>) {
+fn run_sched_time_witness(s_tid: u64, recv_ep: Option<u64>) {
     use core::sync::atomic::Ordering::SeqCst;
     use sched_time_witness as w;
     w::R_EP.store(recv_ep.unwrap_or(0), SeqCst);
@@ -5776,7 +5848,7 @@ pub(super) mod riscv_ecall_witness {
     static RW_BACK: AtomicU32 = AtomicU32::new(0);
     static R_ARMED: AtomicU32 = AtomicU32::new(0);
     static R_GOT: AtomicU32 = AtomicU32::new(0);
-    static EP: AtomicU32 = AtomicU32::new(0);
+    static EP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
     /// What one probed `ecall` left in ring 3.
     #[derive(Clone, Copy)]
@@ -6213,7 +6285,7 @@ pub(super) mod riscv_ecall_witness {
         )
     }
 
-    fn send(ep: u32, cycle: u32) -> bool {
+    fn send(ep: u64, cycle: u32) -> bool {
         let mut body = [0u8; 8];
         body[..4].copy_from_slice(b"EA7W");
         body[4..].copy_from_slice(&cycle.to_be_bytes());
@@ -6350,7 +6422,7 @@ pub(super) mod timer5_idle_return_witness {
     /// (`timeout_ticks == 0`), which would never park the CPU and would prove nothing.
     const TIMEOUT_TICKS: u64 = 2;
 
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         matches!(slot5, Some(16))
     }
 
@@ -6449,7 +6521,7 @@ pub(super) mod xfer2_grant_witness {
 
     pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
 
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         matches!(slot5, Some(12))
     }
 
@@ -6461,7 +6533,7 @@ pub(super) mod xfer2_grant_witness {
     /// Not compiled under `recv-queue1-ordinary-grant`: that profile runs the same two cycles
     /// through NR 2 and NR 5 instead, and init has no room for both cells (see `run_once`).
     #[cfg(not(feature = "recv-queue1-ordinary-grant"))]
-    fn one_grant(mem_cap: u32, ep_cap: u32, explicit_range: bool, label: &str) -> bool {
+    fn one_grant(mem_cap: u64, ep_cap: u64, explicit_range: bool, label: &str) -> bool {
         use yarm_ipc_abi::recv_shared_v3_abi::RecvSharedV3Output;
 
         // SAFETY: `ep_cap` carries SEND; `mem_cap` is init's disposable source cap.
@@ -6504,17 +6576,11 @@ pub(super) mod xfer2_grant_witness {
         let released = if explicit_range {
             // SAFETY: the cleanup cap and the exact range the recv reported.
             unsafe {
-                yarm_user_rt::syscall::release_shared_region_range(
-                    out.transferred_cap as u32,
-                    base,
-                    len,
-                )
+                yarm_user_rt::syscall::release_shared_region_range(out.transferred_cap, base, len)
             }
         } else {
             // SAFETY: the registered-range shape.
-            unsafe {
-                yarm_user_rt::syscall::release_shared_region_mapping(out.transferred_cap as u32)
-            }
+            unsafe { yarm_user_rt::syscall::release_shared_region_mapping(out.transferred_cap) }
         };
         let release_ok = matches!(released, Ok(l) if l == len);
 
@@ -6533,9 +6599,8 @@ pub(super) mod xfer2_grant_witness {
 
         // REVOCATION: the cleanup cap is gone, so a duplicate release is refused.
         // SAFETY: intentional duplicate to observe the canonical refusal.
-        let dup = unsafe {
-            yarm_user_rt::syscall::release_shared_region_mapping(out.transferred_cap as u32)
-        };
+        let dup =
+            unsafe { yarm_user_rt::syscall::release_shared_region_mapping(out.transferred_cap) };
         let revoked_ok = dup.is_err();
 
         let all = meta_ok && perm_ok && p0 && p1 && release_ok && unmapped_ok && revoked_ok;
@@ -6594,7 +6659,7 @@ pub(super) mod xfer2_grant_witness {
     /// parent, AArch64 was observed to run the child). The smoke reads the order from the
     /// kernel's log rather than assuming it, and fails a run in which the child looked first.
     #[cfg(feature = "shared-region-lifetime-witness")]
-    fn lifetime_grant(mem_cap: u32, ep_cap: u32) -> bool {
+    fn lifetime_grant(mem_cap: u64, ep_cap: u64) -> bool {
         use yarm_ipc_abi::recv_shared_v3_abi::RecvSharedV3Output;
         const VA: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
         const LEN: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN;
@@ -6621,7 +6686,7 @@ pub(super) mod xfer2_grant_witness {
             yarm_user_rt::user_log!("SHARED_REGION_LIFETIME_WITNESS step=recv result=fail");
             return false;
         }
-        let cap = out.transferred_cap as u32;
+        let cap = out.transferred_cap;
         // SAFETY: the recv mapped the whole window readable.
         let (h0, h1) = unsafe { super::shared_region_oracle_core::validate_pages_split(VA, LEN) };
 
@@ -6803,7 +6868,7 @@ pub(super) mod xfer2_grant_witness {
     /// The smoke script that drives this asserts the feature actually reached the userspace
     /// image, so a silently-dropped feature cannot pass as a witness.
     #[cfg(feature = "recv-queue1-ordinary-grant")]
-    fn ordinary_route_grants(mem_cap: u32, ep_cap: u32) -> (bool, bool) {
+    fn ordinary_route_grants(mem_cap: u64, ep_cap: u64) -> (bool, bool) {
         const VA: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
         // The oracle's FULL two pages (BL1).
         //
@@ -6855,7 +6920,7 @@ pub(super) mod xfer2_grant_witness {
             // The mapping the frame reports: the page-rounded length in ret1 and the
             // receiver-local transfer capability in ret2. The base is the one this task asked
             // for, because the kernel maps at exactly the requested address.
-            let cap = got.ret2 as u32;
+            let cap = got.ret2;
             let meta_ok = got.ret1 as usize == LEN && cap != 0 && got.ret2 != u64::MAX;
 
             // BACKING: every byte of BOTH pages against the deterministic oracle pattern, each
@@ -6960,7 +7025,8 @@ mod shared_region_oracle_core {
     pub(super) static PARK: AtomicU32 = AtomicU32::new(0x00E1);
     pub(super) static CHILD_TID: AtomicU64 = AtomicU64::new(0);
     // Cap the parent hands the child through the shared address space (both share init's CSpace).
-    pub(super) static ENDPOINT_CAP: AtomicU32 = AtomicU32::new(0);
+    pub(super) static ENDPOINT_CAP: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
     // Child-published outcome: 0 = unrun, 1 = all checks passed, 0xF1-family = a specific failure.
     pub(super) static CHILD_RESULT: AtomicU32 = AtomicU32::new(0);
     pub(super) static PAGES_OK: AtomicU32 = AtomicU32::new(0);
@@ -6985,8 +7051,8 @@ mod shared_region_oracle_core {
     /// # Safety
     /// `ep_cap` must carry SEND and `mem_cap` must be the oracle's read-only source cap.
     pub(super) unsafe fn send_grant(
-        ep_cap: u32,
-        mem_cap: u32,
+        ep_cap: u64,
+        mem_cap: u64,
     ) -> core::result::Result<(), yarm_user_rt::syscall::SyscallError> {
         // SAFETY: forwarded verbatim; the caller upholds the capability contract.
         unsafe {
@@ -7047,15 +7113,15 @@ mod shared_region_oracle_core {
     }
 
     /// Read the oracle caps `(mem_cap, endpoint_cap)` from startup slots 13/14 (shared CSpace).
-    pub(super) fn oracle_caps() -> (u32, u32) {
+    pub(super) fn oracle_caps() -> (u64, u64) {
         let mem = yarm_user_rt::runtime::startup_arg_slot(
             yarm_user_rt::syscall::STARTUP_SLOT_SHARED_REGION_MEM_CAP,
         )
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
         let ep = yarm_user_rt::runtime::startup_arg_slot(
             yarm_user_rt::syscall::STARTUP_SLOT_SHARED_REGION_ENDPOINT_CAP,
         )
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
         (mem, ep)
     }
 
@@ -7098,7 +7164,7 @@ mod shared_region_oracle_core {
         let sender_mem_cap = yarm_user_rt::runtime::startup_arg_slot(
             yarm_user_rt::syscall::STARTUP_SLOT_SHARED_REGION_MEM_CAP,
         )
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
         let va = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
         let len = yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN;
         // SAFETY: `va..va+len` is the dedicated unmapped two-page window (compile-time VA contract).
@@ -7127,7 +7193,7 @@ mod shared_region_oracle_core {
                 let pages_ok = page0_ok && page1_ok && r.mapped_len == len;
                 PAGES_OK.store(u32::from(pages_ok), Relaxed);
                 // Fresh receiver-local cap: nonzero and distinct from the sender's source cap.
-                out.fresh_cap = r.receiver_cap != 0 && (r.receiver_cap as u32) != sender_mem_cap;
+                out.fresh_cap = r.receiver_cap != 0 && r.receiver_cap != sender_mem_cap;
                 yarm_user_rt::user_log!(
                     "SHARED_REGION_DIRECT_ORACLE_CHILD_MAPPED base=0x{:x} len={} cap={} sender_cap={} inline_ok={} page0={} page1={} fresh_cap={}",
                     r.mapped_base,
@@ -7202,7 +7268,7 @@ mod shared_region_oracle_core {
     ///
     /// # Safety
     /// `endpoint_cap`/`mem_cap` must be the provisioned oracle caps.
-    pub(super) unsafe fn parent_wait_and_send(endpoint_cap: u32, mem_cap: u32) -> SendOutcome {
+    pub(super) unsafe fn parent_wait_and_send(endpoint_cap: u64, mem_cap: u64) -> SendOutcome {
         // LIVENESS wait on CHILD_STARTED (NOT a blocked proof). Even if A resumes before B is a
         // committed waiter, correctness holds: the kernel's authoritative ack (published only after
         // B's waiter is fully committed at the oracle VA) is what gates A's DIRECT delivery — a
@@ -7434,15 +7500,15 @@ mod ipccall_direct_oracle_core {
     const MAX_ATTEMPTS: u32 = 64;
 
     /// Read the oracle request + reply endpoint caps from startup slots 13/14 (shared CSpace).
-    pub(super) fn oracle_caps() -> (u32, u32) {
+    pub(super) fn oracle_caps() -> (u64, u64) {
         let req = yarm_user_rt::runtime::startup_arg_slot(
             yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_0,
         )
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
         let rep = yarm_user_rt::runtime::startup_arg_slot(
             yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_1,
         )
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
         (req, rep)
     }
 
@@ -7605,7 +7671,7 @@ mod ipccall_direct_oracle_core {
     ///
     /// # Safety
     /// `request_ep`/`reply_ep` must be the provisioned oracle caps.
-    pub(super) unsafe fn parent_run(request_ep: u32, reply_ep: u32) -> ParentOutcome {
+    pub(super) unsafe fn parent_run(request_ep: u64, reply_ep: u64) -> ParentOutcome {
         let mut out = ParentOutcome {
             called: false,
             call_attempts: 0,
@@ -7958,15 +8024,15 @@ mod ipc_reply_timeout_oracle {
     /// canary is actually testing.
     const U_MODE_DWELL_ITERATIONS: u64 = 400_000_000;
 
-    pub(super) fn oracle_caps() -> (u32, u32) {
+    pub(super) fn oracle_caps() -> (u64, u64) {
         let req = yarm_user_rt::runtime::startup_arg_slot(
             yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_0,
         )
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
         let rep = yarm_user_rt::runtime::startup_arg_slot(
             yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_1,
         )
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
         (req, rep)
     }
 
@@ -8049,7 +8115,7 @@ mod ipc_reply_timeout_oracle {
     /// the new `ServerDies` selector on every port, so the third scenario could never have
     /// dispatched. Routing all three through the shared decoder removes the duplicate mapping
     /// and makes the run of three arm automatically.
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         match slot5 {
             Some(v) => ipc_reply_liveness_scenario_for_current_arch(v as usize).is_some(),
             None => false,
@@ -8403,7 +8469,7 @@ mod ipc_reply_timeout_oracle {
     ///
     /// # Safety
     /// `request_ep`/`reply_ep` must be the provisioned oracle caps.
-    pub(super) unsafe fn client_run(request_ep: u32, reply_ep: u32) -> ClientOutcome {
+    pub(super) unsafe fn client_run(request_ep: u64, reply_ep: u64) -> ClientOutcome {
         let mut out = ClientOutcome::default();
         let mut spun = 0u64;
         while HANDSHAKE.load(Acquire) != HANDSHAKE_READY && spun < SPIN_CAP {
@@ -8954,7 +9020,7 @@ mod aarch64_exit_current_task_oracle {
     /// Decode init's startup slot 5 through the SHARED ABI helper — the exact inverse of the
     /// encoder the kernel used to write it. Userspace never compares against a bare literal,
     /// so the two ends cannot drift apart.
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         match slot5 {
             Some(v) => matches!(
                 yarm_ipc_abi::exit_current_task_abi::exit_current_task_scenario_for_current_arch(
@@ -9150,7 +9216,7 @@ mod riscv_exit_current_task_oracle {
     /// Decode init's startup slot 5 through the SHARED ABI helper — the exact inverse of the
     /// encoder the kernel used to write it. Userspace never compares against a bare literal, so
     /// the two ends cannot drift apart.
-    pub(super) fn armed(slot5: Option<u32>) -> bool {
+    pub(super) fn armed(slot5: Option<u64>) -> bool {
         match slot5 {
             Some(v) => matches!(
                 yarm_ipc_abi::exit_current_task_abi::exit_current_task_scenario_for_current_arch(
@@ -10581,7 +10647,7 @@ pub fn run() {
     // parent_pid=1 so the kernel delegates the vfs send cap into init's own cnode,
     // allowing init to send directly to vfs_server without going through PM.
     yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_BEGIN");
-    let Some((vfs_child_tid, vfs_recv_cap)) = spawn_v5_cap(
+    let Some((vfs_child_tid, vfs_recv_cap, vfs_admin_send)) = spawn_v5_cap_with_grant(
         pm_send,
         pm_recv,
         6,
@@ -10600,6 +10666,12 @@ pub fn run() {
         vfs_recv_cap,
         initramfs_send_cap,
         devfs_send_cap
+    );
+    // VFS-CORRECT1B: the mount-admin SEND capability PM transferred with the reply (init-local).
+    yarm_user_rt::user_log!(
+        "INIT_VFS_ADMIN_CAP present={} init_local={}",
+        vfs_admin_send.is_some() as u8,
+        vfs_admin_send.unwrap_or(0)
     );
 
     // --- Spawn driver_manager (image_id=7) ---
@@ -10680,9 +10752,8 @@ pub fn run() {
         return;
     };
     yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SEND_NO_REPLY");
-    let _ = unsafe {
-        yarm_user_rt::syscall::ipc_send(init_blkcache_send_cap as u32, &register_backend_msg)
-    };
+    let _ =
+        unsafe { yarm_user_rt::syscall::ipc_send(init_blkcache_send_cap, &register_backend_msg) };
 
     // NOTE: Keep SpawnV5/PM reply traffic isolated until the full service spawn
     // chain is complete. Since ipc_call is now send-only and replies are consumed
@@ -10692,7 +10763,7 @@ pub fn run() {
     // --- VFS smoke: one real statx request through the routing stack ---
     {
         yarm_user_rt::user_log!("INIT_VFS_SMOKE_BEGIN path=/initramfs/boot-marker");
-        let vfs_send = vfs_recv_cap as u32;
+        let vfs_send = vfs_recv_cap;
         yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_BEGIN");
         // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
         match unsafe {
@@ -10708,7 +10779,7 @@ pub fn run() {
     // --- /dev smoke: prove VFS routing to devfs_srv ---
     {
         yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_BEGIN path=/dev/null");
-        let vfs_send = vfs_recv_cap as u32;
+        let vfs_send = vfs_recv_cap;
         yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_BEGIN");
         // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
         match unsafe { yarm_user_rt::vfs_client::vfs_statx(vfs_send, pm_recv, b"/dev/null") } {
@@ -10722,7 +10793,7 @@ pub fn run() {
     // --- VFS open/read smoke ---
     {
         yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_BEGIN path=/initramfs/boot-marker");
-        let vfs_send = vfs_recv_cap as u32;
+        let vfs_send = vfs_recv_cap;
         let mut read_buf = [0u8; 64];
         // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
         match unsafe {
@@ -10759,7 +10830,7 @@ pub fn run() {
 
     // VFS-CORRECT1A: the live read-path witness, through the same client wrappers and endpoints.
     #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-correct-witness"))]
-    vfs_correct_witness::run(vfs_recv_cap as u32, pm_recv);
+    vfs_correct_witness::run(vfs_recv_cap, pm_recv);
 
     yarm_user_rt::user_log!("INIT_BLKCACHE_SMOKE_BEGIN");
     let get_info_req = BlkGetInfoRequest { device_id: 0 };
@@ -10774,9 +10845,8 @@ pub fn run() {
         return;
     };
     // SAFETY: init_blkcache_send_cap is the caller-local delegated send cap.
-    let _ = unsafe {
-        yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap as u32, pm_recv, &get_info_msg)
-    };
+    let _ =
+        unsafe { yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap, pm_recv, &get_info_msg) };
     // SAFETY: pm_recv is init's startup-provided reply endpoint.
     // Use blocking ipc_recv so the reply is always consumed before optional FS
     // spawns.  A deadline-zero non-blocking poll may return None if blkcache
@@ -10887,8 +10957,19 @@ pub fn run() {
                     init_ramfs_send_cap,
                     alloc::string::String::from_utf8_lossy(ramfs_mount_config.prefix())
                 );
+                // VFS-CORRECT1B: under `vfs-mount-witness` the mount-authority cell performs this
+                // registration itself, around its refusal cases.
+                #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-mount-witness"))]
+                let _ = vfs_mount_witness::run(
+                    vfs_recv_cap,
+                    vfs_admin_send,
+                    pm_recv,
+                    init_ramfs_send_cap,
+                );
+                #[cfg(not(all(not(feature = "hosted-dev"), feature = "vfs-mount-witness")))]
                 let _ = register_ramfs_mount_with_vfs(
-                    vfs_recv_cap as u32,
+                    vfs_recv_cap,
+                    vfs_admin_send,
                     pm_recv,
                     init_ramfs_send_cap,
                     ramfs_mount_config,
@@ -10923,7 +11004,8 @@ pub fn run() {
                     fat_mount_config.device_id
                 );
                 let _ = register_fat_mount_with_vfs(
-                    vfs_recv_cap as u32,
+                    vfs_recv_cap,
+                    vfs_admin_send,
                     pm_recv,
                     init_fat_send_cap,
                     fat_mount_config,
@@ -10949,8 +11031,12 @@ pub fn run() {
                     init_ext4_send_cap,
                 );
                 yarm_user_rt::user_log!("EXT4_SRV_READY child_tid={}", ext4_child_tid);
-                let _ =
-                    register_ext4_mount_with_vfs(vfs_recv_cap as u32, pm_recv, init_ext4_send_cap);
+                let _ = register_ext4_mount_with_vfs(
+                    vfs_recv_cap,
+                    vfs_admin_send,
+                    pm_recv,
+                    init_ext4_send_cap,
+                );
             } else {
                 yarm_user_rt::user_log!("INIT_EXT4_SPAWN_FAIL ok=0 child_tid=0");
             }
@@ -11383,7 +11469,7 @@ pub fn run() {
 /// provides — so the base proof never fakes `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`
 /// and stays byte-for-byte unchanged when the sub-knob is absent.
 #[cfg(not(test))]
-fn run_ipc_recv_proof_workload(proof_send: u32, proof_recv: u32) {
+fn run_ipc_recv_proof_workload(proof_send: u64, proof_recv: u64) {
     use yarm_user_rt::ipc::Message;
     use yarm_user_rt::syscall::SyscallError;
 
@@ -11604,9 +11690,9 @@ fn run_ipc_recv_proof_fork_smoke() {
 /// missing child (e.g. fork failure) degrades to a logged give-up, never a hang.
 #[cfg(not(test))]
 fn run_ipc_recv_proof_sender_wake(
-    e1_send: u32,
-    e1_recv: u32,
-    e2_recv: u32,
+    e1_send: u64,
+    e1_recv: u64,
+    e2_recv: u64,
     e1_capacity: usize,
     init_tid: u64,
 ) {
@@ -12027,7 +12113,7 @@ const IPC_SEND_PLAIN_ORACLE_OPCODE: u16 = 0x0F9E;
 /// The child parks (never returns into init's flow). All waits are bounded so a
 /// missing child (e.g. fork failure) degrades to a logged give-up, never a hang.
 #[cfg(not(test))]
-fn run_ipc_send_plain_oracle(e1_send: u32, e1_recv: u32, coord_recv: u32, init_tid: u64) {
+fn run_ipc_send_plain_oracle(e1_send: u64, e1_recv: u64, coord_recv: u64, init_tid: u64) {
     use yarm_user_rt::ipc::Message;
 
     const COORD_POLL_MAX_ITERS: usize = 100;
@@ -12250,7 +12336,7 @@ const IPC_SEND_CAP_ORACLE_IDENTITY_PAYLOAD: [u8; 8] = *b"IDENT98B";
 /// match=1` comparison, which the seal separately requires. Returns true iff the probe send via
 /// `cprime` succeeded (the meaningful operation).
 #[cfg(not(test))]
-fn probe_ordinary_cap_object_identity(cprime: u32, recv_cap: u32) -> bool {
+fn probe_ordinary_cap_object_identity(cprime: u64, recv_cap: u64) -> bool {
     use yarm_user_rt::ipc::Message;
     const IDENTITY_DRAIN_MAX: usize = 512;
     let Ok(probe) = Message::with_header(
@@ -12340,7 +12426,7 @@ fn ordinary_cap_arch_str() -> &'static str {
 }
 
 #[cfg(not(test))]
-fn run_ipc_send_cap_oracle(e1_send: u32, e1_recv: u32, coord_recv: u32, init_tid: u64) {
+fn run_ipc_send_cap_oracle(e1_send: u64, e1_recv: u64, coord_recv: u64, init_tid: u64) {
     use yarm_user_rt::ipc::Message;
 
     const COORD_POLL_MAX_ITERS: usize = 100;
@@ -12596,11 +12682,11 @@ const IPC_SEND_REPLY_CAP_ORACLE_REPLY_PAYLOAD: [u8; 8] = *b"ONESHOT!";
 /// woken child verifies its received reply cap id is fresh (NOT the sender-local handle).
 #[cfg(not(test))]
 fn run_ipc_send_reply_cap_oracle(
-    e1_send: u32,
-    e1_recv: u32,
-    coord_recv: u32,
-    reply_cap: u32,
-    reply_recv: u32,
+    e1_send: u64,
+    e1_recv: u64,
+    coord_recv: u64,
+    reply_cap: u64,
+    reply_recv: u64,
     init_tid: u64,
 ) {
     use yarm_user_rt::ipc::Message;
@@ -12662,7 +12748,7 @@ fn run_ipc_send_reply_cap_oracle(
         yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_ENTRY");
         yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_RECV_BEGIN");
         // SAFETY: e1_recv is a kernel-provisioned RECV cap to the proof loopback.
-        let mut child_recv_reply: Option<u32> = None;
+        let mut child_recv_reply: Option<u64> = None;
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(e1_recv) } {
             Ok(Some(received)) => {
                 // A reply-cap delivery strips the 2-byte inline opcode prefix (strip
@@ -12909,7 +12995,7 @@ const IPC_SEND_ENQUEUE_ORACLE_PAYLOAD: [u8; 8] = *b"ENQ193E!";
 /// recv-drains E1 to prove the queued message is delivered byte-identical (the
 /// receiver-later dequeue path), then emits `IPC_SEND_ENQUEUE_LIVE_ORACLE_DONE result=ok`.
 #[cfg(not(test))]
-fn run_ipc_send_enqueue_oracle(e1_send: u32, e1_recv: u32, init_tid: u64) {
+fn run_ipc_send_enqueue_oracle(e1_send: u64, e1_recv: u64, init_tid: u64) {
     use yarm_user_rt::ipc::Message;
 
     const PREDRAIN_MAX: usize = 512;
@@ -13037,7 +13123,7 @@ const IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD: [u8; 8] = *b"CAPENQ6F";
 /// oracle verifies is NOT the sender-local handle — proving a sender-local CapId is never the
 /// receiver's authority.
 #[cfg(not(test))]
-fn run_ipc_send_cap_enqueue_oracle(e1_send: u32, e1_recv: u32, init_tid: u64) {
+fn run_ipc_send_cap_enqueue_oracle(e1_send: u64, e1_recv: u64, init_tid: u64) {
     use yarm_user_rt::ipc::Message;
 
     const PREDRAIN_MAX: usize = 512;

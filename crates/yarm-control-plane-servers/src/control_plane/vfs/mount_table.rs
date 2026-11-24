@@ -56,7 +56,7 @@ struct MountEntry {
     prefix: [u8; MAX_PREFIX_LEN],
     prefix_len: usize,
     label: MountLabel,
-    send_cap: u32,
+    send_cap: u64,
     flags: u32,
 }
 
@@ -68,6 +68,7 @@ struct MountEntry {
 ///
 /// `route()` performs a longest-prefix match and returns a copy of the matching
 /// send cap and label, or `None` if no entry covers the path.
+#[derive(Clone, Copy)]
 pub struct VfsMountTable {
     entries: [MountEntry; MAX_MOUNT_ENTRIES],
     count: usize,
@@ -95,7 +96,7 @@ impl VfsMountTable {
     /// this suitable for static boot mounts like `b"/initramfs/"` and `b"/dev/"`.
     /// Returns `false` if the table is full, the send cap is zero, the prefix
     /// is too long, or the prefix is already registered.
-    pub fn register(&mut self, prefix: &[u8], name: &str, send_cap: u32) -> bool {
+    pub fn register(&mut self, prefix: &[u8], name: &str, send_cap: u64) -> bool {
         if send_cap == 0 || self.count >= MAX_MOUNT_ENTRIES || prefix.len() > MAX_PREFIX_LEN {
             return false;
         }
@@ -125,13 +126,28 @@ impl VfsMountTable {
     pub fn insert_dynamic(
         &mut self,
         raw_prefix: &[u8],
-        send_cap: u32,
+        send_cap: u64,
         flags: u32,
     ) -> Result<(), MountRegisterError> {
         if send_cap == 0 {
             return Err(MountRegisterError::InvalidSendCap);
         }
+        self.insert_checked(raw_prefix, Some((send_cap, flags)))
+    }
 
+    /// VFS-CORRECT1B: would [`insert_dynamic`](Self::insert_dynamic) accept `raw_prefix` now?
+    /// The same normalization, duplicate and capacity rules; nothing is changed.
+    pub fn precheck_dynamic(&self, raw_prefix: &[u8]) -> Result<(), MountRegisterError> {
+        let mut probe = *self;
+        probe.insert_checked(raw_prefix, None)
+    }
+
+    /// The one implementation of the dynamic-insert rules. `entry: None` checks without storing.
+    fn insert_checked(
+        &mut self,
+        raw_prefix: &[u8],
+        entry_values: Option<(u64, u32)>,
+    ) -> Result<(), MountRegisterError> {
         let norm =
             super::path::normalize(raw_prefix).map_err(|_| MountRegisterError::InvalidPrefix)?;
         let base = norm.as_bytes();
@@ -161,6 +177,9 @@ impl VfsMountTable {
             return Err(MountRegisterError::TableFull);
         }
 
+        let Some((send_cap, flags)) = entry_values else {
+            return Ok(());
+        };
         let label_src = &prefix_buf[..stored_len];
         let mut entry = Self::EMPTY_ENTRY;
         entry.prefix[..stored_len].copy_from_slice(label_src);
@@ -177,9 +196,9 @@ impl VfsMountTable {
     ///
     /// Returns a copy of `(send_cap, label)` for the entry whose prefix is the
     /// longest matching prefix of `path`, or `None` if no entry matches.
-    pub(crate) fn route(&self, path: &[u8]) -> Option<(u32, MountLabel)> {
+    pub(crate) fn route(&self, path: &[u8]) -> Option<(u64, MountLabel)> {
         let mut best_len = 0usize;
-        let mut best: Option<(u32, MountLabel)> = None;
+        let mut best: Option<(u64, MountLabel)> = None;
         for entry in &self.entries[..self.count] {
             if entry.prefix_len == 0 {
                 continue;
@@ -314,7 +333,7 @@ mod tests {
         ];
         let mut table = VfsMountTable::new();
         for (i, &prefix) in PREFIXES.iter().enumerate() {
-            assert!(table.register(prefix, "x", (i + 1) as u32));
+            assert!(table.register(prefix, "x", (i + 1) as u64));
         }
         assert_eq!(table.len(), MAX_MOUNT_ENTRIES);
         assert!(!table.register(b"/z/", "z", 99));
@@ -415,7 +434,7 @@ mod tests {
             prefix[2] = b'0' + i as u8;
             prefix[3] = b'/';
             table
-                .insert_dynamic(&prefix, (i + 1) as u32, 0)
+                .insert_dynamic(&prefix, (i + 1) as u64, 0)
                 .expect("fill");
         }
         assert_eq!(table.len(), MAX_MOUNT_ENTRIES);
@@ -815,5 +834,36 @@ mod tests {
             "/ram routing cap must be identical before and after ext4 registration"
         );
         assert_eq!(cap_after, 30, "/ram must route to ramfs_srv (cap=30)");
+    }
+}
+
+/// VFS-CORRECT1B — the routing table as the mount-admin state machine sees it.
+impl yarm_fs_servers::common::mount_admin::MountTableOps for VfsMountTable {
+    fn precheck(
+        &self,
+        prefix: &[u8],
+    ) -> Result<(), yarm_fs_servers::common::mount_admin::MountTableRefusal> {
+        self.precheck_dynamic(prefix).map_err(table_refusal)
+    }
+
+    fn insert(
+        &mut self,
+        prefix: &[u8],
+        backend_cap: u64,
+        flags: u64,
+    ) -> Result<(), yarm_fs_servers::common::mount_admin::MountTableRefusal> {
+        self.insert_dynamic(prefix, backend_cap, flags as u32)
+            .map_err(table_refusal)
+    }
+}
+
+fn table_refusal(e: MountRegisterError) -> yarm_fs_servers::common::mount_admin::MountTableRefusal {
+    use yarm_fs_servers::common::mount_admin::MountTableRefusal;
+    match e {
+        MountRegisterError::TableFull => MountTableRefusal::Full,
+        MountRegisterError::DuplicatePrefix => MountTableRefusal::Duplicate,
+        MountRegisterError::InvalidSendCap
+        | MountRegisterError::PrefixTooLong
+        | MountRegisterError::InvalidPrefix => MountTableRefusal::InvalidPrefix,
     }
 }

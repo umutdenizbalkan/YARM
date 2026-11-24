@@ -82,6 +82,18 @@ if (( abi_code >= 13 )); then
   rg -q '^    pub const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;$' crates/yarm-user-rt/src/lib.rs
   rg -q 'v12 → v13 \(FUTEX-ABS-BITSET1\)' doc/SYSCALL_ABI.md
 fi
+# VFS-CORRECT1B (within v13, privileged extensions): NR 23 / NR 29 return unpacked full-width
+# lanes and take the admin-endpoint out-address; slot 17 is kernel-owned; the change note.
+rg -q 'Within v13 \(VFS-CORRECT1B\), privileged extensions only' doc/SYSCALL_ABI.md
+rg -q 'committed.spawner_service_send as usize' src/kernel/syscall/process.rs
+rg -q 'startup_args\[17\] = 0;' src/kernel/syscall/process.rs
+rg -q '^    pub const STARTUP_SLOT_SERVICE_ADMIN_RECV_EP: usize = 17;$' crates/yarm-user-rt/src/lib.rs
+rg -q '^pub const VFS_OP_MOUNT_STAGE: u16 = 29;$' crates/yarm-ipc-abi/src/vfs_abi.rs
+rg -q '^pub const VFS_OP_MOUNT_COMMIT: u16 = 30;$' crates/yarm-ipc-abi/src/vfs_abi.rs
+rg -q '### 3.2 Mount authority and capability identities \(VFS-CORRECT1B\)' doc/VFS.md
+if rg -q 'packed_ret2' src/kernel/syscall/process.rs src/kernel/syscall/spawn_image_txn.rs src/kernel/syscall_split.rs; then
+  echo "[gate] a packed spawn return lane is back"; exit 1
+fi
 rg -q "TransferRelease" doc/SYSCALL_ABI.md
 rg -q "PROC_CODEC_V2_VERSION = 2" doc/VFS.md
 rg -q "VFS_CODEC_V1_VERSION = 1" doc/VFS.md

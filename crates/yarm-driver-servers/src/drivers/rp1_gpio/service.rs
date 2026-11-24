@@ -114,7 +114,7 @@ pub fn dispatch<D: GpioDeviceOps>(driver: &D, msg: &Message) -> Option<Message> 
 /// Future transport loop for a platform-granted device. It is intentionally
 /// not called by `run()` until the RP1 discovery/grant contract exists.
 #[allow(dead_code)]
-fn serve<D: GpioDeviceOps>(driver: &D, recv_cap: u32) -> ! {
+fn serve<D: GpioDeviceOps>(driver: &D, recv_cap: u64) -> ! {
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some(received)) => {

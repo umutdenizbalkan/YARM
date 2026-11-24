@@ -194,11 +194,11 @@ fn supervisor_crash_test_restart_token_for_tid(tid: u64) -> u64 {
 pub struct SupervisorRuntimeHandoff {
     pub supervisor_tid: Option<u64>,
     pub init_tid: Option<u64>,
-    pub supervisor_fault_recv_ep: Option<u32>,
-    pub supervisor_control_send_ep: Option<u32>,
-    pub supervisor_control_recv_ep: Option<u32>,
-    pub init_alert_send_ep: Option<u32>,
-    pub init_alert_recv_ep: Option<u32>,
+    pub supervisor_fault_recv_ep: Option<u64>,
+    pub supervisor_control_send_ep: Option<u64>,
+    pub supervisor_control_recv_ep: Option<u64>,
+    pub init_alert_send_ep: Option<u64>,
+    pub init_alert_recv_ep: Option<u64>,
     pub restart_window_ticks: u64,
 }
 
@@ -2033,7 +2033,7 @@ pub fn run() {
                     yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_BEGIN");
                     match supervisor_recv_short_deadline(
                         &mut transport,
-                        supervisor.handoff.supervisor_control_recv_cap.0 as u32,
+                        supervisor.handoff.supervisor_control_recv_cap.0,
                     ) {
                         Ok(Some(msg)) => {
                             made_progress = true;
@@ -2162,7 +2162,7 @@ pub fn run() {
                     );
                     match supervisor_idle_wait(
                         &mut transport,
-                        supervisor.handoff.supervisor_control_recv_cap.0 as u32,
+                        supervisor.handoff.supervisor_control_recv_cap.0,
                     ) {
                         Ok(true) => {
                             yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=message");
@@ -2216,7 +2216,7 @@ pub fn run() {
 #[cfg(not(test))]
 fn supervisor_recv_short_deadline(
     transport: &mut impl IpcTransport,
-    cap: u32,
+    cap: u64,
 ) -> Result<Option<Message>, KernelError> {
     // SUP-L7G: legacy recv_with_deadline(..., 0) is not a try-receive in this
     // runtime; use a small positive timeout for bounded control/reply waits.
@@ -2227,7 +2227,7 @@ fn supervisor_recv_short_deadline(
 
 #[cfg(not(test))]
 #[allow(dead_code)]
-fn supervisor_try_recv_fault(cap: u32) -> Result<Option<Message>, KernelError> {
+fn supervisor_try_recv_fault(cap: u64) -> Result<Option<Message>, KernelError> {
     // SUP-L7G: NR 30 RecvSharedV3 is the live userspace nonblocking receive API.
     // It preserves sender/transfer metadata but not the message opcode in its
     // output record, so use it only on the dedicated supervisor fault endpoint,
@@ -2265,10 +2265,10 @@ fn supervisor_try_recv_fault(cap: u32) -> Result<Option<Message>, KernelError> {
 fn supervisor_fault_idle_wait(
     supervisor: &mut SupervisorService,
     transport: &mut impl IpcTransport,
-    process_manager_caps: Option<(u32, u32)>,
+    process_manager_caps: Option<(u64, u64)>,
     supervisor_tid: u64,
 ) -> usize {
-    let fault_cap = supervisor.handoff.supervisor_fault_recv_cap.0 as u32;
+    let fault_cap = supervisor.handoff.supervisor_fault_recv_cap.0;
     yarm_user_rt::user_log!(
         "SUPERVISOR_FAULT_WAIT_BEGIN timeout={}",
         SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS
@@ -2317,7 +2317,7 @@ fn supervisor_fault_idle_wait(
 #[inline]
 fn supervisor_idle_wait(
     transport: &mut impl IpcTransport,
-    control_recv_cap: u32,
+    control_recv_cap: u64,
 ) -> Result<bool, KernelError> {
     match transport.recv_with_deadline(control_recv_cap, SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS)
     {
@@ -2330,7 +2330,7 @@ fn supervisor_idle_wait(
 #[cfg(not(test))]
 fn query_restart_token_via_process_manager(
     _transport: &mut impl IpcTransport,
-    process_manager_caps: Option<(u32, u32)>,
+    process_manager_caps: Option<(u64, u64)>,
     tid: u64,
 ) -> Result<Option<u64>, KernelError> {
     let Some((req_cap, rep_cap)) = process_manager_caps else {
@@ -2397,7 +2397,7 @@ const SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK: usize = 8;
 fn supervisor_handle_fault_endpoint_message(
     supervisor: &mut SupervisorService,
     transport: &mut impl IpcTransport,
-    process_manager_caps: Option<(u32, u32)>,
+    process_manager_caps: Option<(u64, u64)>,
     supervisor_tid: u64,
     msg: Message,
 ) -> bool {
@@ -2658,7 +2658,7 @@ fn supervisor_handle_fault_endpoint_message(
 fn supervisor_replay_ready_pending_faults(
     supervisor: &mut SupervisorService,
     transport: &mut impl IpcTransport,
-    process_manager_caps: Option<(u32, u32)>,
+    process_manager_caps: Option<(u64, u64)>,
     supervisor_tid: u64,
     registered_tid: u64,
 ) -> usize {
@@ -2698,10 +2698,10 @@ fn supervisor_replay_ready_pending_faults(
 fn supervisor_drain_fault_endpoint(
     supervisor: &mut SupervisorService,
     transport: &mut impl IpcTransport,
-    process_manager_caps: Option<(u32, u32)>,
+    process_manager_caps: Option<(u64, u64)>,
     supervisor_tid: u64,
 ) -> usize {
-    let fault_cap = supervisor.handoff.supervisor_fault_recv_cap.0 as u32;
+    let fault_cap = supervisor.handoff.supervisor_fault_recv_cap.0;
     yarm_user_rt::user_log!("SUPERVISOR_FAULT_DRAIN_BEGIN");
     let mut count = 0usize;
     while count < SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK {
@@ -2754,7 +2754,7 @@ fn supervisor_drain_fault_endpoint(
 /// unavailable or no reply arrived, `Err` on IPC encoding failure.
 #[cfg(not(test))]
 fn query_lifecycle_via_process_manager(
-    process_manager_caps: Option<(u32, u32)>,
+    process_manager_caps: Option<(u64, u64)>,
     tid: u64,
 ) -> Result<Option<LifecycleQueryReply>, KernelError> {
     let Some((req_cap, rep_cap)) = process_manager_caps else {
@@ -2780,7 +2780,7 @@ fn query_lifecycle_via_process_manager(
 
 #[cfg(not(test))]
 fn send_pm_restart_v1_via_process_manager(
-    process_manager_caps: Option<(u32, u32)>,
+    process_manager_caps: Option<(u64, u64)>,
     client_request: SupervisorPmRestartClientRequest,
 ) -> SupervisorPmRestartClientResult {
     let Some((req_cap, rep_cap)) = process_manager_caps else {
@@ -3016,7 +3016,7 @@ fn send_pm_restart_v1_via_process_manager(
 #[allow(dead_code)]
 fn execute_restart_via_process_manager(
     transport: &mut impl IpcTransport,
-    process_manager_caps: Option<(u32, u32)>,
+    process_manager_caps: Option<(u64, u64)>,
     tid: u64,
     restart_token: u64,
 ) -> Result<u8, KernelError> {
@@ -3045,7 +3045,7 @@ struct RuntimeSupervisorTaskExitOps {
     token_tid: u64,
     token: u64,
     supervisor_tid: u64,
-    process_manager_caps: Option<(u32, u32)>,
+    process_manager_caps: Option<(u64, u64)>,
 }
 
 #[cfg(not(test))]

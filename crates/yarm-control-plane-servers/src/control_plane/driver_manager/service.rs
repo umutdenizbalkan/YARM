@@ -6168,7 +6168,7 @@ pub fn run() {
                     yarm_user_rt::user_log!(
                         "DRIVER_MANAGER_GOT_MSG opcode={} reply_cap={}",
                         msg.opcode,
-                        reply_cap.unwrap_or(u32::MAX)
+                        reply_cap.unwrap_or(u64::MAX)
                     );
                     match service.handle_from_sender(&mut runtime, msg, received.sender_tid) {
                         Ok(reply) => {

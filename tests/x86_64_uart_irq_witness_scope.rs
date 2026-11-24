@@ -385,7 +385,7 @@ fn the_receiver_grades_gprs_and_flags_and_only_observes_xmm() {
     assert!(RECEIVER.contains("IRQ1_UART_SIMD seq={} mode={} user_simd_mask=0x{:x}"));
     let recv = body_after(
         RECEIVER,
-        "fn recv_timeout(cap: u32, timeout: u64) -> Recv {",
+        "fn recv_timeout(cap: u64, timeout: u64) -> Recv {",
     );
     let x86_recv = recv
         .split_once("#[cfg(target_arch = \"x86_64\")]")

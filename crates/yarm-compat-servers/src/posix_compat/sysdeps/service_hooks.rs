@@ -33,9 +33,9 @@ pub struct PosixSysdepsContext<'a> {
     #[cfg(not(test))]
     runtime_transport: &'a mut dyn IpcTransport,
     #[cfg(not(test))]
-    process_manager_request_send_cap: Option<u32>,
+    process_manager_request_send_cap: Option<u64>,
     #[cfg(not(test))]
-    process_manager_reply_recv_cap: Option<u32>,
+    process_manager_reply_recv_cap: Option<u64>,
     #[cfg(not(test))]
     startup_tid: u64,
     #[cfg(test)]
@@ -76,8 +76,8 @@ impl<'a> PosixSysdepsContext<'a> {
     #[cfg(not(test))]
     pub fn register_process_manager(
         &mut self,
-        request_send_cap: u32,
-        reply_recv_cap: u32,
+        request_send_cap: u64,
+        reply_recv_cap: u64,
     ) -> Result<(), PosixErrno> {
         if request_send_cap == 0 || reply_recv_cap == 0 {
             return Err(PosixErrno::Inval);
@@ -101,8 +101,8 @@ impl<'a> PosixSysdepsContext<'a> {
     #[cfg(not(test))]
     pub fn register_vfs_manager(
         &mut self,
-        _request_send_cap: u32,
-        _reply_recv_cap: u32,
+        _request_send_cap: u64,
+        _reply_recv_cap: u64,
     ) -> Result<(), PosixErrno> {
         Err(PosixErrno::NoSys)
     }
@@ -121,8 +121,8 @@ impl<'a> PosixSysdepsContext<'a> {
     #[cfg(not(test))]
     pub fn register_socket_manager(
         &mut self,
-        _request_send_cap: u32,
-        _reply_recv_cap: u32,
+        _request_send_cap: u64,
+        _reply_recv_cap: u64,
     ) -> Result<(), PosixErrno> {
         Err(PosixErrno::NoSys)
     }
@@ -434,8 +434,8 @@ fn decode_getpid_reply(reply: &RuntimeMessage) -> Result<u64, GetPidIpcError> {
 fn getpid_via_process_manager_ipc(
     transport: &mut dyn IpcTransport,
     startup_tid: u64,
-    request_cap: u32,
-    reply_cap: u32,
+    request_cap: u64,
+    reply_cap: u64,
 ) -> Result<u64, GetPidIpcError> {
     if request_cap == 0 || reply_cap == 0 {
         return Err(GetPidIpcError::MissingBindings);
@@ -487,17 +487,17 @@ mod tests {
     }
 
     impl IpcTransport for StubTransport {
-        fn send(&mut self, _ep_cap: u32, _msg: &RuntimeMessage) -> Result<(), SyscallError> {
+        fn send(&mut self, _ep_cap: u64, _msg: &RuntimeMessage) -> Result<(), SyscallError> {
             Ok(())
         }
 
-        fn recv(&mut self, _ep_cap: u32) -> Result<Option<RuntimeMessage>, SyscallError> {
+        fn recv(&mut self, _ep_cap: u64) -> Result<Option<RuntimeMessage>, SyscallError> {
             Ok(self.reply.take())
         }
 
         fn recv_with_deadline(
             &mut self,
-            _ep_cap: u32,
+            _ep_cap: u64,
             _timeout_ticks: u64,
         ) -> Result<Option<RuntimeMessage>, SyscallError> {
             Ok(self.reply.take())

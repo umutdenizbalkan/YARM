@@ -802,8 +802,10 @@ mod stage88_tests {
         // Search for the call site specifically (not the function definition). Match on the
         // first call-site argument so the check is robust to rustfmt line-wrapping of the
         // `let _ = register_ext4_mount_with_vfs(...)` statement.
+        // VFS-CORRECT1B: the call site is the `let _ = ...(` statement (rustfmt may wrap its
+        // arguments); the definition is `fn register_ext4_mount_with_vfs(`.
         let register_pos = src
-            .find("register_ext4_mount_with_vfs(vfs_recv_cap")
+            .find("let _ = register_ext4_mount_with_vfs(")
             .expect("register_ext4_mount_with_vfs call site must be present");
         assert!(
             spawn_ok_pos < register_pos,
@@ -1313,7 +1315,7 @@ mod stage91_tests {
         let src =
             include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         // Prove the function signature includes reply_recv_cap as a parameter.
-        // The function is: fn register_ext4_mount_with_vfs(..., reply_recv_cap: u32, ...)
+        // The function is: fn register_ext4_mount_with_vfs(..., reply_recv_cap: u64, ...)
         let fn_start = src
             .find("fn register_ext4_mount_with_vfs(")
             .expect("register_ext4_mount_with_vfs must exist in init/service.rs");
@@ -1768,28 +1770,41 @@ mod stage91_tests {
         // All must use ipc_recv_v2 (blocking) on reply_recv_cap.
         let src =
             include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
-        for fn_name in &[
-            "fn register_ramfs_mount_with_vfs(",
-            "fn register_fat_mount_with_vfs(",
-            "fn register_ext4_mount_with_vfs(",
-        ] {
+        // VFS-CORRECT1B: the three producers stage and commit through `register_mount_with_vfs`,
+        // whose commit reply is received in `mount_admin_call` — the one receive of the protocol.
+        let body = |fn_name: &str| {
             let fn_start = src
                 .find(fn_name)
                 .unwrap_or_else(|| panic!("{fn_name} must be defined in init/service.rs"));
             let after_fn = &src[fn_start + 1..];
             let fn_off = after_fn.find("\nfn ").unwrap_or(usize::MAX);
-            let pub_fn_off = after_fn.find("\npub fn ").unwrap_or(usize::MAX);
-            let fn_body_end = fn_start + 1 + fn_off.min(pub_fn_off);
-            let fn_text = &src[fn_start..fn_body_end];
+            let pub_fn_off = after_fn.find("\npub(super) fn ").unwrap_or(usize::MAX);
+            &src[fn_start..fn_start + 1 + fn_off.min(pub_fn_off)]
+        };
+        for fn_name in &[
+            "fn register_ramfs_mount_with_vfs(",
+            "fn register_fat_mount_with_vfs(",
+            "fn register_ext4_mount_with_vfs(",
+        ] {
+            let fn_text = body(fn_name);
             assert!(
-                fn_text.contains("ipc_recv_v2(reply_recv_cap"),
-                "{fn_name} must use blocking ipc_recv_v2(reply_recv_cap)"
+                fn_text.contains("register_mount_with_vfs("),
+                "{fn_name} must stage and commit through register_mount_with_vfs"
             );
             assert!(
                 !fn_text.contains("ipc_recv_with_deadline(reply_recv_cap"),
                 "{fn_name} must NOT use non-blocking ipc_recv_with_deadline on reply_recv_cap"
             );
         }
+        let call = body("fn mount_admin_call(");
+        assert!(
+            call.contains("ipc_recv_v2(reply_recv_cap"),
+            "mount_admin_call must use blocking ipc_recv_v2(reply_recv_cap)"
+        );
+        assert!(
+            !call.contains("ipc_recv_with_deadline(reply_recv_cap"),
+            "mount_admin_call must NOT use non-blocking ipc_recv_with_deadline on reply_recv_cap"
+        );
     }
 
     #[test]

@@ -84,7 +84,7 @@ fn note(nr: usize, case: &str, lanes: &Lanes) {
 /// `non_aspace_cap` should be a capability the caller genuinely holds that is NOT an address
 /// space — an endpoint from the startup context, say. It witnesses NR 3's `WrongObject` branch.
 /// Pass `None` when the caller holds none and that branch is skipped rather than faked.
-pub fn run_once(non_aspace_cap: Option<u32>) {
+pub fn run_once(non_aspace_cap: Option<u64>) {
     crate::user_log!("VM_ENTRY_WITNESS_BEGIN");
 
     // ── NR 13 VmAnonMap ─────────────────────────────────────────────────────────────────────

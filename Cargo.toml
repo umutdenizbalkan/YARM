@@ -263,6 +263,13 @@ futex-time-witness = ["printk-witness-ring"]
 futex-sync-witness = []
 # VFS-CORRECT1A — init's read-path witness; accepted and inert in this package.
 vfs-correct-witness = []
+# VFS-CORRECT1B — F07 witness (default off): every capability slot of every CNode starts at
+# generation 65,537 instead of 1, so every capability ID the kernel issues exceeds 32 bits and any
+# truncating consumer on the boot path fails. Kernel only; inert in every server package.
+cap-gen-witness = []
+# VFS-CORRECT1B — F04 witness (default off): init's mount-administration cell and ramfs_srv's seed
+# file; accepted and inert in this package.
+vfs-mount-witness = []
 # FUTEX-SEAL1 — the live futex seal witness (default off): the kernel half `kernel::seal_witness`
 # (the budget sequence's one induced exhaustion and its record) on top of the FUTEX-TIME1 markers;
 # init's cell is the same-named feature of yarm-control-plane-servers.

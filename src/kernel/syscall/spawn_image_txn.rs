@@ -82,7 +82,7 @@ use crate::kernel::capabilities::{CNodeId, CapId, CapRights};
 use crate::kernel::ipc::EndpointMode;
 use crate::kernel::spawn_reservation::SpawnReservationToken;
 use crate::kernel::task::TaskClass;
-use crate::kernel::vm::Asid;
+use crate::kernel::vm::{Asid, VirtAddr};
 
 /// The user stack every image-loading spawn gets, in pages.
 ///
@@ -358,6 +358,14 @@ pub(crate) struct SpawnImageRequest<'a> {
     /// NR 26 only: emit the Stage 175 default-off `SPAWN_LIFECYCLE_*` phase markers. Kept
     /// per-caller rather than made universal so no other syscall's marker set changes.
     pub(crate) lifecycle_markers: bool,
+    /// VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13): `Some((spawner_asid, user_va))` asks for an ADMIN endpoint for
+    /// the child. The child receives its RECEIVE capability in startup slot 17; the spawner keeps
+    /// the SEND capability, whose full-width ID is written as 8 little-endian bytes at `user_va`
+    /// in the spawner's address space. The address is written once with zeroes before anything
+    /// is provisioned (a fault refuses the spawn with nothing to unwind) and once with the ID
+    /// before the commit (a fault unwinds the whole spawn), so nothing fallible follows the
+    /// commit. `None`: no admin endpoint, exactly as before.
+    pub(crate) admin_endpoint_out: Option<(Asid, u64)>,
 }
 
 /// What the caller writes into its reply frame.
@@ -367,7 +375,14 @@ pub(crate) struct SpawnImageCommitted {
     /// after the task becomes live is writing the reply.
     pub(crate) reply_tid: usize,
     pub(crate) asid: Asid,
-    pub(crate) packed_ret2: u64,
+    /// VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13): the reply's `ret0` — the spawner's own copy of the child's
+    /// service SEND capability, full width (0 when the child has no service endpoint).
+    pub(crate) spawner_service_send: u64,
+    /// The reply's `ret2` — the requester's copy: the one delegated into `parent_pid`'s CNode
+    /// when `parent_pid != 0` and the delegation succeeded, otherwise the spawner's own again.
+    /// Before VFS-CORRECT1B this lane packed both as two 32-bit halves, which cannot hold a capability
+    /// whose generation exceeds 65,535.
+    pub(crate) requester_service_send: u64,
 }
 
 /// THE image-loading spawn transaction, shared by NR 23, NR 24, NR 26 and NR 29.
@@ -397,7 +412,21 @@ pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(
         extra_send_caps,
         map_initrd_window,
         lifecycle_markers,
+        admin_endpoint_out,
     } = request;
+
+    // VFS-CORRECT1B: the admin-endpoint out-address must be writable before anything exists.
+    if let Some((spawner_asid, out_va)) = admin_endpoint_out
+        && owners
+            .copy_to_user(spawner_asid, VirtAddr(out_va), &[0u8; 8])
+            .is_err()
+    {
+        crate::yarm_log!(
+            "KSPAWN_FAIL phase=admin_out_pretouch va=0x{:x} result=refused",
+            out_va
+        );
+        return Err(SyscallError::InvalidArgs);
+    }
 
     // ── Phase 1: the TID, then the reservation — the FIRST provisional resource. ──────────
     //
@@ -575,6 +604,24 @@ pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(
         }
     };
 
+    // VFS-CORRECT1B: the optional ADMIN endpoint, through the same provisioner. Unlike the two
+    // service endpoints it is not tolerant of failure: the spawner asked for it, so a spawn that
+    // cannot provide it fails and unwinds.
+    let (service_admin_send_cap, service_admin_recv_cap) = if admin_endpoint_out.is_some() {
+        let outcome = provision_endpoint(owners, &mut ledger).ok_or(KernelError::EndpointFull);
+        let (grant, next) = advance(owners, ledger, outcome, "admin_endpoint")?;
+        ledger = next;
+        crate::yarm_log!(
+            "KSPAWN_ADMIN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
+            spawner_tid,
+            grant.send_cap.0,
+            grant.recv_cap.0
+        );
+        (grant.send_cap.0, grant.recv_cap.0)
+    } else {
+        (0u64, 0u64)
+    };
+
     // ── Phase 5: delegate the parent's send capability. ──────────────────────────────────
     //
     // The delegated copy is a descendant of `service_send_cap`, whose grant the ledger already
@@ -609,6 +656,18 @@ pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(
         service_send_cap
     };
 
+    // VFS-CORRECT1B: publish the spawner's admin SEND capability ID to the requested address. The
+    // last fallible step before the commit: a fault here unwinds the whole spawn.
+    if let Some((spawner_asid, out_va)) = admin_endpoint_out {
+        let outcome = owners.copy_to_user(
+            spawner_asid,
+            VirtAddr(out_va),
+            &service_admin_send_cap.to_le_bytes(),
+        );
+        let ((), next) = advance(owners, ledger, outcome, "admin_out_write")?;
+        ledger = next;
+    }
+
     // ── Phase 6: commit. The FIRST step that publishes a reachable task. ─────────────────
     crate::yarm_log!(
         "KSPAWN_BEFORE_SPAWN_TASK tid={} asid={} entry=0x{:x} parent_pid={} image_id={}",
@@ -631,6 +690,7 @@ pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(
             service_recv_cap,
             service_reply_recv_cap,
             extra_send_caps,
+            service_admin_recv_cap,
             // Already allocated and mapped in `asid` by the provisioner, and already covered by
             // its rollback. The commit consumes it instead of allocating a second one.
             provisioned_stack_top: Some(stack_top),
@@ -670,16 +730,11 @@ pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(
         );
     }
 
-    let packed_ret2 =
-        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-        } else {
-            caller_send_cap as u64
-        };
     Ok(SpawnImageCommitted {
         tid: spawned.tid,
         reply_tid,
         asid,
-        packed_ret2,
+        spawner_service_send: service_send_cap,
+        requester_service_send: caller_send_cap,
     })
 }

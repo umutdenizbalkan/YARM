@@ -70,6 +70,17 @@ pub const MAX_CAPABILITIES_PER_CSPACE: usize = 1024;
 #[cfg(not(feature = "hosted-dev"))]
 pub const MAX_CAPABILITIES_PER_CSPACE: usize = 512;
 
+/// The generation every slot of a new (or grown) CNode starts at.
+///
+/// VFS-CORRECT1B: under the default-off `cap-gen-witness` feature it is 65,537, so every
+/// capability ID the kernel issues is `(generation << 16) | index` with a generation above 65,535:
+/// above `u32::MAX`, and changed by any 32-bit truncation. Nothing else differs; revocation still
+/// advances the generation by one and skips 0.
+#[cfg(not(feature = "cap-gen-witness"))]
+pub const INITIAL_SLOT_GENERATION: u64 = 1;
+#[cfg(feature = "cap-gen-witness")]
+pub const INITIAL_SLOT_GENERATION: u64 = 0x1_0001;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapEntry {
     capability: Capability,
@@ -108,7 +119,7 @@ impl CNodeSlots {
         slots.resize(
             slot_capacity,
             CapSlot {
-                generation: 1,
+                generation: INITIAL_SLOT_GENERATION,
                 entry: None,
             },
         );
@@ -153,7 +164,7 @@ impl CNodeSlots {
             next.resize(
                 target_len,
                 CapSlot {
-                    generation: 1,
+                    generation: INITIAL_SLOT_GENERATION,
                     entry: None,
                 },
             );

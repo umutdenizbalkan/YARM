@@ -66,7 +66,7 @@ fn log_hex(tag: &str, k: usize, off: usize, bytes: &[u8]) {
 }
 
 /// Run the witness. `vfs_send` is init's send cap to the VFS router, `reply` its reply endpoint.
-pub(super) fn run(vfs_send: u32, reply: u32) {
+pub(super) fn run(vfs_send: u64, reply: u64) {
     let mut fails = 0u32;
     yarm_user_rt::user_log!(
         "VC1A_BEGIN fixture_len={} inline_max={}",

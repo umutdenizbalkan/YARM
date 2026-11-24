@@ -353,7 +353,7 @@ struct KernelStateIpcTransport<'a> {
 }
 
 impl IpcTransport for KernelStateIpcTransport<'_> {
-    fn send(&mut self, ep_cap: u32, msg: &yarm_user_rt::ipc::Message) -> Result<(), SyscallError> {
+    fn send(&mut self, ep_cap: u64, msg: &yarm_user_rt::ipc::Message) -> Result<(), SyscallError> {
         let cap = CapId(ep_cap as u64);
         let transfer_cap = msg.transferred_cap().map(|cap| cap.0);
         let kernel_msg = Message::with_header(
@@ -367,7 +367,7 @@ impl IpcTransport for KernelStateIpcTransport<'_> {
         self.kernel.ipc_send(cap, kernel_msg).map_err(map_kernel_error_to_syscall)
     }
 
-    fn recv(&mut self, ep_cap: u32) -> Result<Option<yarm_user_rt::ipc::Message>, SyscallError> {
+    fn recv(&mut self, ep_cap: u64) -> Result<Option<yarm_user_rt::ipc::Message>, SyscallError> {
         let cap = CapId(ep_cap as u64);
         let msg = self.kernel.ipc_recv(cap).map_err(map_kernel_error_to_syscall)?;
         msg.map(|msg| {
@@ -405,12 +405,12 @@ fn map_kernel_error_to_syscall(err: KernelError) -> SyscallError {
 }
 
 impl IpcTransport for KernelState {
-    fn send(&mut self, ep_cap: u32, msg: &yarm_user_rt::ipc::Message) -> Result<(), SyscallError> {
+    fn send(&mut self, ep_cap: u64, msg: &yarm_user_rt::ipc::Message) -> Result<(), SyscallError> {
         let mut transport = KernelStateIpcTransport { kernel: self };
         transport.send(ep_cap, msg)
     }
 
-    fn recv(&mut self, ep_cap: u32) -> Result<Option<yarm_user_rt::ipc::Message>, SyscallError> {
+    fn recv(&mut self, ep_cap: u64) -> Result<Option<yarm_user_rt::ipc::Message>, SyscallError> {
         let mut transport = KernelStateIpcTransport { kernel: self };
         transport.recv(ep_cap)
     }

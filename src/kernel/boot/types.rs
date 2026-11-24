@@ -60,6 +60,9 @@ pub struct UserImageSpec {
     pub service_reply_recv_cap: u64,
     /// Up to 4 send cap IDs in the spawner's cnode to delegate into slots 13-16.
     pub extra_send_caps: [u64; 4],
+    /// VFS-CORRECT1B: recv cap ID in the spawner's cnode of the service's ADMIN endpoint, to
+    /// delegate into startup slot 17 (0 = the spawn provisioned none).
+    pub service_admin_recv_cap: u64,
     /// U9-SPAWN-VM1: the user stack this image's provisioner already allocated and mapped in
     /// `asid`.
     ///
@@ -86,6 +89,7 @@ impl Default for UserImageSpec {
             spawner_tid: 0,
             service_recv_cap: 0,
             service_reply_recv_cap: 0,
+            service_admin_recv_cap: 0,
             extra_send_caps: [0; 4],
             provisioned_stack_top: None,
         }

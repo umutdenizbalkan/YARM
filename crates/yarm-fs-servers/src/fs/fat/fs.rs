@@ -127,8 +127,8 @@ impl BlockDevice for MemBlockDevice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpcBlockDevice {
     pub device_id: u64,
-    pub send_cap: u32,
-    pub reply_recv_cap: u32,
+    pub send_cap: u64,
+    pub reply_recv_cap: u64,
     next_write_request_id: u32,
 }
 
@@ -1155,8 +1155,8 @@ impl FatBackend {
     }
     pub fn from_ipc_block(
         device_id: u64,
-        send_cap: u32,
-        reply_recv_cap: u32,
+        send_cap: u64,
+        reply_recv_cap: u64,
     ) -> Result<Self, FatError> {
         Ok(Self {
             fs: FatFs::mount(FatBlockDevice::Ipc(IpcBlockDevice {

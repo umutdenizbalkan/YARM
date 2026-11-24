@@ -63,6 +63,10 @@ futex-time-witness = []
 futex-sync-witness = []
 # VFS-CORRECT1A — init's read-path witness; accepted and inert in this package.
 vfs-correct-witness = []
+# VFS-CORRECT1B: the kernel's generation witness; accepted and inert in this package.
+cap-gen-witness = []
+# VFS-CORRECT1B: init's and ramfs_srv's mount witness; accepted and inert in this package.
+vfs-mount-witness = []
 # FUTEX-SEAL1: accepted and inert here (init's cell; the kernel side is the root crate's feature).
 futex-seal-witness = []
 # FUTEX-SEAL1: init's per-sequence cell selectors; accepted and inert here.

@@ -819,6 +819,35 @@ fn commit_spawned_image<O: SpawnTxnOwners>(
             }
         }
     }
+    // VFS-CORRECT1B: the service's ADMIN endpoint (only when the spawn asked for one), into
+    // startup slot 17 — PM's request-receive slot when PM is boot-spawned, unused by every
+    // spawned service before this. Tolerant like the two above: on failure the slot stays 0 and
+    // the child comes up without an admin endpoint (so nothing can administer it), while the
+    // spawner's SEND copy stays in the spawner's cspace, owned by the ledger like the others.
+    if spec.spawner_tid != 0 && spec.service_admin_recv_cap != 0 {
+        match owners.delegate_capability(
+            spec.spawner_tid,
+            CapId(spec.service_admin_recv_cap),
+            spec.tid,
+            CapRights::RECEIVE,
+        ) {
+            Ok(grant) => {
+                spec.startup_args[17] = grant.dest_cap.0;
+                crate::yarm_log!(
+                    "KSPAWN_ADMIN_RECV_CAP_DELEGATED tid={} local_cap={}",
+                    spec.tid,
+                    grant.dest_cap.0
+                );
+            }
+            Err(e) => {
+                crate::yarm_log!(
+                    "KSPAWN_ADMIN_RECV_CAP_DELEGATE_FAIL tid={} err={:?}",
+                    spec.tid,
+                    e
+                );
+            }
+        }
+    }
     for i in 0..spec.extra_send_caps.len() {
         let raw_cap = spec.extra_send_caps[i];
         if raw_cap != 0 && spec.spawner_tid != 0 {

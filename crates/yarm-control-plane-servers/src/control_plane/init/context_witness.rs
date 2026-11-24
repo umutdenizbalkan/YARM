@@ -44,8 +44,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 
 pub(super) const SELECTOR: u32 = 31;
 
-pub(super) fn armed(slot5: Option<u32>) -> bool {
-    matches!(slot5, Some(SELECTOR))
+pub(super) fn armed(slot5: Option<u64>) -> bool {
+    matches!(slot5, Some(s) if s == SELECTOR as u64)
 }
 
 const NR_IPC_RECV_TIMEOUT: usize = 5;
@@ -66,7 +66,7 @@ const B_SHORT_ITERS: u64 = 4_096;
 /// Per-round B behaviour: 0 = spin (A returns on a timer tick), 1 = block after one short window
 /// (A returns through B's blocking syscall).
 static B_MODE: AtomicU32 = AtomicU32::new(0);
-static B_PARK: AtomicU32 = AtomicU32::new(0);
+static B_PARK: AtomicU64 = AtomicU64::new(0);
 /// A's six live GPR sentinels across a preemption window.
 const GPR_SENTINELS: [usize; 6] = [
     0x5A5A_0000_0000_0001,
@@ -306,7 +306,7 @@ mod arch {
 
     /// Load `pat`, block on a deadline receive, capture into `out` right after the syscall.
     /// Returns the syscall error lane (9 = timed out).
-    pub unsafe fn block_with(pat: &State, out: &mut State, park: u32, ticks: u64) -> usize {
+    pub unsafe fn block_with(pat: &State, out: &mut State, park: u64, ticks: u64) -> usize {
         let mut env = ZERO;
         let mut payload = [0u8; 64];
         let mut meta = [0u64; 5];
@@ -631,7 +631,7 @@ mod arch {
     }
 
     /// Load `pat`, block on a deadline receive (`svc`), capture right after. Returns `x0`.
-    pub unsafe fn block_with(pat: &State, out: &mut State, park: u32, ticks: u64) -> usize {
+    pub unsafe fn block_with(pat: &State, out: &mut State, park: u64, ticks: u64) -> usize {
         let mut payload = [0u8; 64];
         let mut meta = [0u64; 5];
         meta[0] = u64::MAX;
@@ -773,7 +773,7 @@ mod arch {
 
 use arch::State;
 
-fn recv_park(park: u32, ticks: u64) {
+fn recv_park(park: u64, ticks: u64) {
     // SAFETY: an ordinary deadline receive on init's private park endpoint.
     let _ = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(park, ticks) };
 }
@@ -835,7 +835,7 @@ pub(super) fn run_once() {
     let park = yarm_user_rt::runtime::startup_arg_slot(
         yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_1,
     )
-    .unwrap_or(0) as u32;
+    .unwrap_or(0);
     let a_tid = yarm_user_rt::runtime::startup_arg_slot(0).unwrap_or(0);
     #[cfg(target_arch = "x86_64")]
     let arch_name = "x86_64";

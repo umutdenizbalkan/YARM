@@ -30,11 +30,20 @@ The only sanctioned way to transfer a capability between tasks is:
 
 1. Sender: set `FLAG_CAP_TRANSFER_PLAIN` in the IPC flags word and place the local
    cap ID in the designated transfer field of the message.
-2. Kernel: stashes the cap on the pending IPC and strips it from the sender's cspace.
-3. Receiver: the cap is materialized into the receiver's cspace; available via
-   `received.transferred_cap`.
+2. Kernel: stashes the cap on the pending IPC and installs a **copy** in the receiver's
+   cspace. The sender keeps its own copy (a transfer delegates; it does not move — verified
+   live in VFS-CORRECT1B), and no system call deletes a capability, so a receiver that refuses
+   what it was sent cannot give it back: it must account for it (VFS's retained record).
+3. Receiver: the cap is materialized into the receiver's cspace under a **receiver-local** ID;
+   available via `received.transferred_cap`. That ID differs from the sender's.
 
-Do not encode cap IDs in `payload[0..4]` or similar and expect them to work.
+Do not encode cap IDs in `payload[0..4]` or similar and expect them to work: a number in a
+payload names a slot in the SENDER's cspace and means nothing (or something else) to the
+receiver.
+
+Capability IDs are `u64` (`generation << 16 | index`). Never narrow one to `u32`: a slot reused
+more than 65,535 times has an ID above `u32::MAX`, and the truncated value names a different
+generation, which the kernel refuses as `InvalidCapability`.
 
 ### 1.4 Use FLAG_CAP_TRANSFER_PLAIN for reply-with-cap
 

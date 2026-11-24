@@ -899,7 +899,7 @@ impl KernelProcessSpawnBackend {
         image_id: u64,
         parent_pid: u64,
         service_caps: [u64; 4],
-    ) -> Result<(u64, u32, u32), ProcessManagerError> {
+    ) -> Result<(u64, u64, u64), ProcessManagerError> {
         yarm_user_rt::user_log!(
             "PM_SPAWN_CAP_BEGIN image_id={} parent_pid={} caps=[{},{},{},{}]",
             image_id,
@@ -926,7 +926,45 @@ impl KernelProcessSpawnBackend {
         yarm_user_rt::user_log!("PM_SPAWN_CAP_RESULT ok={}", result.is_ok() as u8);
         result
     }
+
+    /// VFS-CORRECT1B — [`Self::spawn_with_caps`] that also provisions the child's ADMIN endpoint.
+    /// Returns `(tid, caller_cap, spawner_cap, admin_send_cap)`; the admin SEND capability is in
+    /// PM's CNode until PM transfers it to the requester.
+    fn spawn_with_caps_and_admin(
+        &self,
+        image_id: u64,
+        parent_pid: u64,
+        service_caps: [u64; 4],
+    ) -> Result<(u64, u64, u64, u64), ProcessManagerError> {
+        let mut startup_args = [0u64; 18];
+        startup_args[13] = service_caps[0];
+        startup_args[14] = service_caps[1];
+        startup_args[15] = service_caps[2];
+        startup_args[16] = service_caps[3];
+        // SAFETY: Delegates to kernel spawn_process syscall with startup_args.
+        let result = unsafe {
+            yarm_user_rt::syscall::spawn_process_with_startup_caps_and_admin(
+                image_id,
+                parent_pid,
+                &startup_args,
+            )
+            .map_err(|_| ProcessManagerError::TableFull)
+        };
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_ADMIN_RESULT image_id={} ok={} admin_send={}",
+            image_id,
+            result.is_ok() as u8,
+            result.map(|r| r.3).unwrap_or(0)
+        );
+        result
+    }
 }
+
+/// VFS-CORRECT1B — the image whose spawn PM provisions with a mount-admin endpoint: the VFS
+/// router. Mount policy stays in userspace: PM decides which service gets an admin endpoint, and
+/// it hands the endpoint's only SEND capability to the requester of that spawn (init) with a real
+/// capability transfer in the SpawnV5 reply.
+const VFS_ADMIN_IMAGE_ID: u64 = 6;
 
 #[cfg(test)]
 impl KernelProcessManagerAdapter {
@@ -1083,7 +1121,7 @@ pub struct ServiceLifecycleRecord {
     /// at slot 12.  When `parent_pid != 0` the kernel also delegates a copy into
     /// the parent's CNode; `pm_service_send_cap` always refers to the copy that
     /// stays in PM's CNode.
-    pub pm_service_send_cap: u32,
+    pub pm_service_send_cap: u64,
     pub state: ServiceState,
 }
 
@@ -1150,7 +1188,7 @@ pub struct ProcessService {
     manager: KernelProcessManagerAdapter,
     policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
     restart_token_records: [Option<RestartTokenRecord>; 64],
-    restart_control_send_cap: Option<u32>,
+    restart_control_send_cap: Option<u64>,
     /// Lifecycle table: one entry per successfully spawned service.
     lifecycle_table: LifecycleTable,
     pm_restart_mechanism_enabled: bool,
@@ -2076,6 +2114,7 @@ impl ProcessService {
                         req.image_id,
                         self.supervisor_restart_test_enabled,
                     )?;
+                    let mut admin_send_cap: Option<u64> = None;
                     let (tid, caller_cap, spawner_cap) = match source {
                         SpawnLoadSource::DirectInitrd => {
                             yarm_user_rt::user_log!(
@@ -2083,12 +2122,22 @@ impl ProcessService {
                                 req.image_id
                             );
                             let backend = KernelProcessSpawnBackend::new();
-                            let (t, c, s) = backend.spawn_with_caps(
-                                req.image_id,
-                                req.parent_pid.0,
-                                req.service_caps,
-                            )?;
-                            (t, c as u64, s)
+                            if req.image_id == VFS_ADMIN_IMAGE_ID {
+                                let (t, c, s, a) = backend.spawn_with_caps_and_admin(
+                                    req.image_id,
+                                    req.parent_pid.0,
+                                    req.service_caps,
+                                )?;
+                                admin_send_cap = (a != 0).then_some(a);
+                                (t, c, s)
+                            } else {
+                                let (t, c, s) = backend.spawn_with_caps(
+                                    req.image_id,
+                                    req.parent_pid.0,
+                                    req.service_caps,
+                                )?;
+                                (t, c, s)
+                            }
                         }
                         SpawnLoadSource::Vfs => {
                             let mut startup_args = [0u64; 18];
@@ -2156,16 +2205,14 @@ impl ProcessService {
                                     .map_err(|_| ProcessManagerError::Malformed);
                                 }
                             };
-                            (t, c as u64, s)
+                            (t, c, s)
                         }
                     };
                     // PM's own send cap: prefer spawner_cap (set when parent got a
                     // delegated copy); fall back to caller_cap when parent_pid == 0.
-                    let pm_send_cap = if spawner_cap != 0 {
-                        spawner_cap
-                    } else {
-                        caller_cap as u32
-                    };
+                    // VFS-CORRECT1B: `spawner_cap` is always PM's own copy (0 only when the child has no
+                    // service endpoint), never a packed half.
+                    let pm_send_cap = spawner_cap;
                     // Record in lifecycle table regardless of image_id so PM always
                     // has a complete view of spawned services.
                     let recorded = self.lifecycle_table.record(ServiceLifecycleRecord {
@@ -2208,6 +2255,23 @@ impl ProcessService {
                         pm_send_cap,
                         encoded.len()
                     );
+                    if let Some(admin) = admin_send_cap {
+                        // VFS-CORRECT1B: the admin SEND capability leaves PM's CNode with this
+                        // reply (NR 7 transfer); the requester receives its own local identity.
+                        yarm_user_rt::user_log!(
+                            "PM_SPAWN_V5_ADMIN_TRANSFER image_id={} pm_local_admin_send={}",
+                            req.image_id,
+                            admin
+                        );
+                        return Message::with_header(
+                            0,
+                            PROC_OP_SPAWN_V5_CAP,
+                            Message::FLAG_CAP_TRANSFER,
+                            Some(admin),
+                            &encoded,
+                        )
+                        .map_err(|_| ProcessManagerError::Malformed);
+                    }
                     Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &encoded)
                         .map_err(|_| ProcessManagerError::Malformed)
                 }
@@ -2962,9 +3026,9 @@ unsafe fn pm_vfs_spawn_inline(
     image_id: u64,
     parent_pid: u64,
     startup_args: &[u64; 18],
-    vfs_send_cap: u32,
+    vfs_send_cap: u64,
     supervisor_restart_test_enabled: bool,
-) -> Result<(u64, u32, u32), ProcessManagerError> {
+) -> Result<(u64, u64, u64), ProcessManagerError> {
     let path_label = match pm_vfs_image_path_label(image_id, supervisor_restart_test_enabled) {
         Some(path) => path,
         None => {
@@ -3080,10 +3144,10 @@ unsafe fn pm_vfs_spawn_inline(
 /// transferred one or a reply cap) came with it, plus the transferred cap.
 #[cfg(not(test))]
 unsafe fn pm_vfs_call_full(
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    reply_recv_cap: u64,
     msg: &Message,
-) -> Result<(Message, bool, Option<u32>), ProcessManagerError> {
+) -> Result<(Message, bool, Option<u64>), ProcessManagerError> {
     let op = msg.opcode;
     match unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, msg) } {
         Ok(()) => {
@@ -3151,7 +3215,7 @@ fn pm_vfs_settle(
 
 /// CLOSE `fd` through the VFS; the outcome is logged, never consumed as authority.
 #[cfg(not(test))]
-unsafe fn pm_vfs_close(vfs_send_cap: u32, reply_recv_cap: u32, fd: u64) {
+unsafe fn pm_vfs_close(vfs_send_cap: u64, reply_recv_cap: u64, fd: u64) {
     let Ok(close_msg) = build_close_message(fd) else {
         return;
     };
@@ -3178,12 +3242,12 @@ unsafe fn pm_vfs_close(vfs_send_cap: u32, reply_recv_cap: u32, fd: u64) {
 #[cfg(not(test))]
 unsafe fn pm_try_grant_ro_and_spawn(
     image_id: u64,
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    reply_recv_cap: u64,
     vfs_path: &[u8],
     parent_pid: u64,
     startup_args: &[u64; 18],
-) -> Result<(u64, u32, u32), ProcessManagerError> {
+) -> Result<(u64, u64, u64), ProcessManagerError> {
     let path_str = core::str::from_utf8(vfs_path).unwrap_or("<path>");
 
     yarm_user_rt::user_log!(
@@ -3889,7 +3953,7 @@ pub fn run() {
                     yarm_user_rt::user_log!(
                         "PM_RECV_DECODE_FAIL opcode={} reply_cap={}",
                         msg.opcode,
-                        reply_cap.unwrap_or(u32::MAX)
+                        reply_cap.unwrap_or(u64::MAX)
                     );
                     if let Some(cap) = reply_cap {
                         let err_payload = 1u64.to_le_bytes();

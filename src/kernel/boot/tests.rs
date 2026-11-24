@@ -73713,7 +73713,7 @@ mod stage198e3c1_direct_live_policy {
             f.contains("SYSCALL_RECV_META_TRANSFERRED_CAP"),
             "decode receiver-local cap"
         );
-        assert!(f.contains("receiver_cap: meta.cap_id as u32"));
+        assert!(f.contains("receiver_cap: meta.cap_id,"));
     }
 
     // release_shared_region_mapping issues TransferRelease(cap,0,0) and surfaces the canonical error.
@@ -74005,7 +74005,7 @@ mod stage198e3c1_direct_live_policy {
         // Stage 198E3C1C: full live validation — inline opcode/len, fresh distinct cap, exactly-one
         // continuation, and the userspace completion marker.
         assert!(SERVICE_SRC.contains("r.opcode == yarm_user_rt::syscall::OPCODE_SHARED_MEM"));
-        assert!(SERVICE_SRC.contains("(r.receiver_cap as u32) != sender_mem_cap"));
+        assert!(SERVICE_SRC.contains("r.receiver_cap != 0 && r.receiver_cap != sender_mem_cap"));
         assert!(SERVICE_SRC.contains("CONTINUATIONS.fetch_add(1, Relaxed)"));
         assert!(SERVICE_SRC.contains(
             "X86_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap=1 readonly=1 first_release=ok second_release=rejected wakes=1 result=ok"
@@ -74857,8 +74857,8 @@ mod stage198e3c1_direct_live_policy {
         assert!(
             SERVICE_SRC.contains("pub(super) unsafe fn child_recv_and_validate() -> RecvOutcome")
         );
-        assert!(SERVICE_SRC.contains("pub(super) unsafe fn parent_wait_and_send(endpoint_cap: u32, mem_cap: u32) -> SendOutcome"));
-        assert!(SERVICE_SRC.contains("pub(super) fn oracle_caps() -> (u32, u32)"));
+        assert!(SERVICE_SRC.contains("pub(super) unsafe fn parent_wait_and_send(endpoint_cap: u64, mem_cap: u64) -> SendOutcome"));
+        assert!(SERVICE_SRC.contains("pub(super) fn oracle_caps() -> (u64, u64)"));
         // The x86 wrapper uses the core for child validation + parent send + cap decode.
         assert!(SERVICE_SRC.contains("core_oracle::child_recv_and_validate()"));
         assert!(SERVICE_SRC.contains("core_oracle::oracle_caps()"));
@@ -86025,7 +86025,7 @@ mod stage199a2c1_aarch64_guards {
         );
         assert_eq!(
             INIT_SRC
-                .matches("unsafe fn parent_run(request_ep: u32, reply_ep: u32)")
+                .matches("unsafe fn parent_run(request_ep: u64, reply_ep: u64)")
                 .count(),
             1,
             "the parent round-trip logic must exist exactly once (arch-neutral core)"
@@ -105139,7 +105139,7 @@ mod stage200d0c1_aarch64_exit_prep {
         ));
         // No bare-literal comparison for this cell (the x86 shape this stage must not repeat).
         let armed = INIT_SRC
-            .split("pub(super) fn armed(slot5: Option<u32>) -> bool {")
+            .split("pub(super) fn armed(slot5: Option<u64>) -> bool {")
             .nth(1)
             .expect("decoder");
         let armed = armed.split("\n    }").next().unwrap();
@@ -106988,7 +106988,7 @@ mod stage200d2b1_liveness_abi {
             .nth(1)
             .expect("ipc_reply_timeout_oracle module");
         let armed = reply_oracle
-            .split("pub(super) fn armed(slot5: Option<u32>) -> bool {")
+            .split("pub(super) fn armed(slot5: Option<u64>) -> bool {")
             .nth(1)
             .expect("armed helper");
         let armed = armed.split("\n    }").next().unwrap();
@@ -126660,6 +126660,7 @@ mod stage199d_wa3a_transition_barriers {
             service_recv_cap: 0,
             service_reply_recv_cap: 0,
             extra_send_caps: [0; 4],
+            service_admin_recv_cap: 0,
             provisioned_stack_top: None,
         };
         assert!(
@@ -141683,7 +141684,7 @@ mod riscv64_production_timeout_handshake {
     /// The client body, from the same shared core.
     fn client_body() -> &'static str {
         SERVICE_SRC
-            .split("pub(super) unsafe fn client_run(request_ep: u32, reply_ep: u32) -> ClientOutcome {")
+            .split("pub(super) unsafe fn client_run(request_ep: u64, reply_ep: u64) -> ClientOutcome {")
             .nth(1)
             .expect("the client core")
             .split("\n    /// Yields the surviving caller")
@@ -162762,6 +162763,7 @@ mod u9spawn1_sp3_spawn_ledger {
                     extra_send_caps: [0u64; 4],
                     map_initrd_window: false,
                     lifecycle_markers: false,
+                    admin_endpoint_out: None,
                 },
             )
             .map(|c| c.tid)
@@ -164623,7 +164625,7 @@ mod u9spawnvm1_provision_rollback {
     /// The same column set SP-3 established, plus the two the provisioner newly owns: the count of
     /// installed user mappings, and the free-frame count that the stack and its guard page move.
     #[derive(Debug, PartialEq, Eq)]
-    struct Baseline {
+    pub(super) struct Baseline {
         tasks: usize,
         address_spaces: usize,
         free_frames: usize,
@@ -164633,7 +164635,7 @@ mod u9spawnvm1_provision_rollback {
         mappings: usize,
     }
 
-    fn baseline(k: &SharedKernel) -> Baseline {
+    pub(super) fn baseline(k: &SharedKernel) -> Baseline {
         k.with(|s| {
             let cnode = s.current_task_cnode();
             Baseline {
@@ -164693,6 +164695,7 @@ mod u9spawnvm1_provision_rollback {
                     extra_send_caps: [0u64; 4],
                     map_initrd_window: false,
                     lifecycle_markers: false,
+                    admin_endpoint_out: None,
                 },
             )
             .map(|c| c.tid)
@@ -164706,7 +164709,7 @@ mod u9spawnvm1_provision_rollback {
     /// out — draining toward `free_frames() == 0` would never terminate. Holding the tracked
     /// capacity instead and returning `allow` frames makes exactly `allow` allocations succeed and
     /// the next one fail, wherever in the provisioning that lands.
-    fn hold_every_allocatable_frame(k: &SharedKernel) -> alloc::vec::Vec<u64> {
+    pub(super) fn hold_every_allocatable_frame(k: &SharedKernel) -> alloc::vec::Vec<u64> {
         let mut held = alloc::vec::Vec::new();
         k.with(|s| {
             while let Ok(pa) = s.alloc_user_data_frame() {
@@ -164717,7 +164720,7 @@ mod u9spawnvm1_provision_rollback {
     }
 
     /// Hand `count` held frames back, so exactly that many further allocations can succeed.
-    fn release_held(k: &SharedKernel, held: &mut alloc::vec::Vec<u64>, count: usize) {
+    pub(super) fn release_held(k: &SharedKernel, held: &mut alloc::vec::Vec<u64>, count: usize) {
         k.with(|s| {
             for _ in 0..count {
                 let Some(pa) = held.pop() else { break };
@@ -164728,7 +164731,7 @@ mod u9spawnvm1_provision_rollback {
         });
     }
 
-    fn free_frames(k: &SharedKernel) -> usize {
+    pub(super) fn free_frames(k: &SharedKernel) -> usize {
         k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()))
     }
 
@@ -212521,6 +212524,7 @@ mod endpoint_rollback1 {
                     extra_send_caps: [0u64; 4],
                     map_initrd_window: false,
                     lifecycle_markers: false,
+                    admin_endpoint_out: None,
                 },
             )
             .map(|c| c.tid)
@@ -223766,5 +223770,410 @@ mod sched_time_foundation1_b_clock {
         );
         assert!(!d.reached(FutexNow::at_ns(999)));
         assert!(d.reached(FutexNow::at_ns(1_000)));
+    }
+}
+
+/// VFS-CORRECT1B — the spawn's optional ADMIN endpoint (privileged extension, ABI v13: NR 23 arg4 / NR 29 arg5).
+///
+/// The spawner names an 8-byte, 8-aligned out-address. The transaction pre-touches it before
+/// anything exists, provisions a third endpoint through the same ledger as the two service
+/// endpoints, delegates its RECEIVE side into the child's startup slot 17, writes the spawner's
+/// SEND capability ID to the out-address as the last fallible step, and unwinds everything on any
+/// failure. Without an out-address nothing changes: no third endpoint, slot 17 stays 0.
+#[cfg(test)]
+mod vc1b_spawn_admin_endpoint {
+    use super::u9spawn1_sp3_spawn_ledger::tiny_elf;
+    use super::u9spawnvm1_provision_rollback::{
+        baseline, free_frames, hold_every_allocatable_frame, release_held,
+    };
+    use super::*;
+    use crate::kernel::capabilities::{CapId, CapObject, CapRights};
+    use crate::kernel::syscall::process::{normalize_startup_args, spawn_admin_endpoint_out_for};
+    use crate::kernel::syscall::spawn_image_txn::{
+        SpawnImageCommitted, SpawnImageRequest, SpawnImageSource, run_image_spawn_transaction,
+    };
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const OUT_VA: u64 = 0x2000;
+    const UNMAPPED_VA: u64 = 0x9000;
+
+    /// A kernel with one writable user page (VA 0x2000) in a fresh address space, standing in for
+    /// the spawner's out-address.
+    fn fixture() -> (SharedKernel, Asid) {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, cap) = state.create_user_address_space().expect("aspace");
+        // A frame the allocator owns, so no later allocation in the spawn can be handed it.
+        let pa = state.alloc_user_data_frame().expect("frame");
+        state
+            .map_user_page(
+                cap,
+                VirtAddr(OUT_VA),
+                Mapping {
+                    phys: PhysAddr(pa),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map page");
+        (SharedKernel::new(state), asid)
+    }
+
+    fn run(
+        k: &SharedKernel,
+        entry: usize,
+        admin: Option<(Asid, u64)>,
+    ) -> Result<SpawnImageCommitted, crate::kernel::syscall::SyscallError> {
+        spawn(k, entry, admin)
+    }
+
+    /// `run` for the refusal cases: the error, or a panic naming the committed TID.
+    fn refused(
+        k: &SharedKernel,
+        entry: usize,
+        admin: Option<(Asid, u64)>,
+        why: &str,
+    ) -> crate::kernel::syscall::SyscallError {
+        match spawn(k, entry, admin) {
+            Ok(c) => panic!("{why}: spawn committed tid {}", c.tid),
+            Err(e) => e,
+        }
+    }
+
+    fn spawn(
+        k: &SharedKernel,
+        entry: usize,
+        admin: Option<(Asid, u64)>,
+    ) -> Result<SpawnImageCommitted, crate::kernel::syscall::SyscallError> {
+        let elf = tiny_elf();
+        k.with(|s| {
+            run_image_spawn_transaction(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                SpawnImageRequest {
+                    image_id: 6,
+                    image_path: "vfs",
+                    source: SpawnImageSource::PtLoadSegments { elf: &elf, entry },
+                    class: TaskClass::SystemServer,
+                    parent_pid: 0,
+                    startup_args: [0u64; 18],
+                    extra_send_caps: [0u64; 4],
+                    map_initrd_window: false,
+                    lifecycle_markers: false,
+                    admin_endpoint_out: admin,
+                },
+            )
+        })
+    }
+
+    fn out_word(k: &SharedKernel, asid: Asid) -> u64 {
+        let b = k
+            .with(|s| s.copy_from_user(asid, VirtAddr(OUT_VA), 8))
+            .expect("read the out word");
+        u64::from_le_bytes(b[..8].try_into().unwrap())
+    }
+
+    fn poison_out_word(k: &SharedKernel, asid: Asid) {
+        k.with(|s| s.copy_to_user(asid, VirtAddr(OUT_VA), &[0xA5u8; 8]))
+            .expect("poison");
+    }
+
+    /// The child's startup slot `index`, read back from the startup block the kernel wrote.
+    fn child_slot(k: &SharedKernel, c: &SpawnImageCommitted, index: u64) -> u64 {
+        k.with(|s| {
+            let block = s
+                .with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|t| t.tid.0 == c.tid)
+                        .map(|t| t.user_context.arg3)
+                })
+                .expect("child tcb");
+            let b = s
+                .copy_from_user(c.asid, VirtAddr(block as u64 + index * 8), 8)
+                .expect("startup block");
+            u64::from_le_bytes(b[..8].try_into().unwrap())
+        })
+    }
+
+    fn endpoint_of(cap: Option<crate::kernel::capabilities::Capability>) -> (usize, u64) {
+        match cap.expect("capability resolves").object {
+            CapObject::Endpoint { index, generation } => (index, generation),
+            other => panic!("expected an endpoint, got {other:?}"),
+        }
+    }
+
+    fn endpoints(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count()))
+    }
+
+    /// A first spawned task made current, so the next spawn has a real spawner (a nonzero TID
+    /// with its own CNode: the kernel delegates the child's startup capabilities only then), and
+    /// an out-address on that spawner's own stack.
+    fn with_real_spawner() -> (SharedKernel, SpawnImageCommitted, (Asid, u64)) {
+        let (k, _) = fixture();
+        let first = run(&k, 0x40_0000, None).expect("first spawn");
+        for _ in 0..64 {
+            if k.with(|s| s.current_tid()) == Some(first.tid) {
+                break;
+            }
+            k.with(|s| s.dispatch_next_current_cpu());
+        }
+        assert_eq!(
+            k.with(|s| s.current_tid()),
+            Some(first.tid),
+            "the spawner is current"
+        );
+        let stack_top = k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == first.tid)
+                    .map(|t| t.user_context.stack_ptr.0)
+            })
+        });
+        let out = (stack_top.expect("stack") - 64) & !7;
+        let asid = first.asid;
+        (k, first, (asid, out))
+    }
+
+    fn read_word(k: &SharedKernel, asid: Asid, va: u64) -> u64 {
+        let b = k
+            .with(|s| s.copy_from_user(asid, VirtAddr(va), 8))
+            .expect("read");
+        u64::from_le_bytes(b[..8].try_into().unwrap())
+    }
+
+    #[test]
+    fn vc1b_admin_endpoint_is_written_to_the_out_address_and_delegated_into_slot_17() {
+        let (k, spawner, (asid, out)) = with_real_spawner();
+        k.with(|s| s.copy_to_user(asid, VirtAddr(out), &[0xA5u8; 8]))
+            .expect("poison");
+        let before = endpoints(&k);
+        let c = run(&k, 0x40_0000, Some((asid, out))).expect("spawn commits");
+        let admin = read_word(&k, asid, out);
+        assert_ne!(
+            admin, 0,
+            "the out word carries the spawner's admin SEND capability"
+        );
+        assert_ne!(
+            admin,
+            u64::from_le_bytes([0xA5; 8]),
+            "the out word was written"
+        );
+        assert_ne!(
+            admin, c.spawner_service_send,
+            "admin and service endpoints are distinct"
+        );
+        assert_eq!(
+            endpoints(&k),
+            before + 3,
+            "service, reply and admin endpoints"
+        );
+
+        let spawner_cap = k.with(|s| s.task_capability(spawner.tid, CapId(admin)));
+        let spawner_cap = spawner_cap.expect("the admin ID resolves in the spawner's CNode");
+        assert!(
+            spawner_cap.has_right(CapRights::SEND),
+            "the spawner may send"
+        );
+        assert!(
+            !spawner_cap.has_right(CapRights::RECEIVE),
+            "the spawner may not receive"
+        );
+
+        let slot17 = child_slot(&k, &c, 17);
+        assert_ne!(
+            slot17, 0,
+            "slot 17 carries the child's admin RECEIVE capability"
+        );
+        let child_cap = k.with(|s| s.task_capability(c.tid, CapId(slot17)));
+        assert!(
+            child_cap
+                .map(|c| c.has_right(CapRights::RECEIVE))
+                .unwrap_or(false)
+        );
+        assert!(
+            !child_cap
+                .map(|c| c.has_right(CapRights::SEND))
+                .unwrap_or(true)
+        );
+        assert_eq!(
+            endpoint_of(child_cap),
+            endpoint_of(Some(spawner_cap)),
+            "both sides name the same endpoint object"
+        );
+        let slot12 = child_slot(&k, &c, 12);
+        assert_ne!(
+            endpoint_of(k.with(|s| s.task_capability(c.tid, CapId(slot12)))),
+            endpoint_of(Some(spawner_cap)),
+            "the public service endpoint (slot 12) is not the admin endpoint"
+        );
+    }
+
+    #[test]
+    fn vc1b_a_real_spawner_failed_publication_unwinds_the_admin_delegation_too() {
+        let (k, spawner, (asid, out)) = with_real_spawner();
+        let before = baseline(&k);
+        let caps_before = k.with(|s| {
+            let cnode = s.task_cnode(spawner.tid).expect("cnode");
+            s.with_capability_state(|cap| {
+                cap.cnode_spaces
+                    .iter()
+                    .flatten()
+                    .filter(|space| space.id == cnode)
+                    .map(|space| crate::kernel::boot::kernel_ref(&space.cspace).occupied_slots())
+                    .sum::<usize>()
+            })
+        });
+        refused(&k, 0, Some((asid, out)), "a zero entry cannot be published");
+        assert_eq!(baseline(&k), before);
+        let caps_after = k.with(|s| {
+            let cnode = s.task_cnode(spawner.tid).expect("cnode");
+            s.with_capability_state(|cap| {
+                cap.cnode_spaces
+                    .iter()
+                    .flatten()
+                    .filter(|space| space.id == cnode)
+                    .map(|space| crate::kernel::boot::kernel_ref(&space.cspace).occupied_slots())
+                    .sum::<usize>()
+            })
+        });
+        assert_eq!(
+            caps_after, caps_before,
+            "the spawner's admin SEND copy was released"
+        );
+        let stale = read_word(&k, asid, out);
+        assert!(
+            k.with(|s| s.task_capability(spawner.tid, CapId(stale)))
+                .is_none(),
+            "the ID written before the refused commit names nothing afterwards"
+        );
+    }
+
+    #[test]
+    fn vc1b_no_out_address_means_no_admin_endpoint_and_slot_17_zero() {
+        let (k, _) = fixture();
+        let before = endpoints(&k);
+        let c = run(&k, 0x40_0000, None).expect("spawn commits");
+        assert_eq!(endpoints(&k), before + 2, "only the two service endpoints");
+        assert_eq!(child_slot(&k, &c, 17), 0);
+        // A requester cannot preset slot 17 through the startup array.
+        let mut args = [0u64; 18];
+        args[17] = 0xDEAD_BEEF;
+        let (normalized, _) = normalize_startup_args(args);
+        assert_eq!(normalized[17], 0, "slot 17 is kernel-owned");
+    }
+
+    #[test]
+    fn vc1b_an_unwritable_out_address_refuses_before_anything_is_created() {
+        let (k, asid) = fixture();
+        let before = baseline(&k);
+        refused(&k, 0x40_0000, Some((asid, UNMAPPED_VA)), "pre-touch faults");
+        assert_eq!(baseline(&k), before, "nothing was created");
+    }
+
+    #[test]
+    fn vc1b_a_failed_publication_unwinds_the_admin_endpoint_and_its_capability() {
+        let (k, asid) = fixture();
+        let before = baseline(&k);
+        // Entry zero is refused at the commit — after the admin endpoint exists and after its ID
+        // was written to the out-address.
+        refused(
+            &k,
+            0,
+            Some((asid, OUT_VA)),
+            "a zero entry cannot be published",
+        );
+        assert_eq!(
+            baseline(&k),
+            before,
+            "admin endpoint, its caps and the delegation unwound"
+        );
+        let stale = out_word(&k, asid);
+        assert!(
+            k.with(|s| s.current_task_capability(CapId(stale)))
+                .is_none(),
+            "the ID written before the refused commit names nothing afterwards"
+        );
+    }
+
+    #[test]
+    fn vc1b_endpoint_capacity_for_the_admin_endpoint_fails_the_spawn_and_unwinds() {
+        let (k, asid) = fixture();
+        // Fill the endpoint table, then free exactly two slots: enough for the two service
+        // endpoints, not for the admin endpoint.
+        let mut made = alloc::vec::Vec::new();
+        k.with(|s| {
+            while let Ok((idx, _, _)) = s.create_endpoint(4) {
+                made.push(idx);
+            }
+            for idx in made.drain(made.len() - 2..) {
+                s.destroy_endpoint(idx).expect("free");
+            }
+        });
+        let before = baseline(&k);
+        let err = refused(&k, 0x40_0000, Some((asid, OUT_VA)), "no endpoint for admin");
+        assert_eq!(
+            baseline(&k),
+            before,
+            "the two service endpoints unwound too: {err:?}"
+        );
+        // The same table still funds a spawn that does not ask for one.
+        run(&k, 0x40_0000, None).expect("two endpoints fund an ordinary spawn");
+    }
+
+    #[test]
+    fn vc1b_frame_exhaustion_with_an_admin_endpoint_restores_the_baseline() {
+        let cost = {
+            let (k, asid) = fixture();
+            let before = free_frames(&k);
+            run(&k, 0x40_0000, Some((asid, OUT_VA))).expect("reference spawn");
+            before - free_frames(&k)
+        };
+        assert!(cost > 0);
+        for n in (0..cost).step_by(core::cmp::max(1, cost / 8)) {
+            let (k, asid) = fixture();
+            let mut held = hold_every_allocatable_frame(&k);
+            release_held(&k, &mut held, n);
+            let before = baseline(&k);
+            refused(&k, 0x40_0000, Some((asid, OUT_VA)), "underfunded");
+            assert_eq!(baseline(&k), before, "position {n}");
+        }
+    }
+
+    #[test]
+    fn vc1b_out_address_admission_is_pure_and_bounded() {
+        assert_eq!(
+            spawn_admin_endpoint_out_for(Some(Asid(3)), 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            spawn_admin_endpoint_out_for(Some(Asid(3)), 0x2000).unwrap(),
+            Some((Asid(3), 0x2000))
+        );
+        assert!(
+            spawn_admin_endpoint_out_for(Some(Asid(3)), 0x2004).is_err(),
+            "misaligned"
+        );
+        assert!(
+            spawn_admin_endpoint_out_for(None, 0x2000).is_err(),
+            "no address space"
+        );
+    }
+
+    /// VFS-CORRECT1B: the spawn reply's three lanes are unpacked full-width IDs, not two 32-bit halves.
+    #[test]
+    fn vc1b_spawn_reply_lanes_are_unpacked() {
+        let src = include_str!("../syscall/process.rs");
+        assert!(!src.contains("packed_ret2"), "the packed lane is gone");
+        assert_eq!(
+            src.matches("committed.spawner_service_send").count(),
+            src.matches("committed.requester_service_send").count()
+        );
+        let txn = include_str!("../syscall/spawn_image_txn.rs");
+        assert!(
+            !txn.contains("<< 32"),
+            "no capability is packed into a shared lane"
+        );
     }
 }

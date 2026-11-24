@@ -152,7 +152,7 @@ fn block_reply(
     }
 }
 
-fn return_reply(reply_cap: u32, opcode: u16, request_id: u64, status: u32) {
+fn return_reply(reply_cap: u64, opcode: u16, request_id: u64, status: u32) {
     let response = BlkCacheResponse {
         request_id,
         status,
@@ -177,13 +177,13 @@ fn first_registered_backend(table: &[BackendRecord; MAX_BACKENDS]) -> Option<Bac
 
 fn call_backend_get_info(
     backend_send_cap: u64,
-    reply_recv_cap: u32,
+    reply_recv_cap: u64,
 ) -> Result<BlkGetInfoReply, ()> {
     let req = BlkGetInfoRequest { device_id: 0 };
     let Ok(msg) = Message::with_header(0, BLK_OP_GET_INFO, 0, None, &req.encode()) else {
         return Err(());
     };
-    unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &msg) }
+    unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, reply_recv_cap, &msg) }
         .map_err(|_| ())?;
     let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) }
         .map_err(|_| ())?;
@@ -195,12 +195,12 @@ fn call_backend_get_info(
 
 fn call_backend_write(
     backend_send_cap: u64,
-    reply_recv_cap: u32,
+    reply_recv_cap: u64,
     request: &BlkWriteRequest,
 ) -> Result<BlkWriteReply, ()> {
     let payload = request.encode().map_err(|_| ())?;
     let message = Message::with_header(0, BLK_OP_WRITE, 0, None, &payload).map_err(|_| ())?;
-    unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &message) }
+    unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, reply_recv_cap, &message) }
         .map_err(|_| ())?;
     let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) }
         .map_err(|_| ())?;
@@ -209,7 +209,7 @@ fn call_backend_write(
         .ok_or(())
 }
 
-fn probe_backend_query_state(backend_id: u64, backend_send_cap: u64, reply_recv_cap: u32) {
+fn probe_backend_query_state(backend_id: u64, backend_send_cap: u64, reply_recv_cap: u64) {
     yarm_user_rt::user_log!(
         "BLKCACHE_BACKEND_QUERY_STATE_BEGIN backend_id={}",
         backend_id
@@ -227,8 +227,7 @@ fn probe_backend_query_state(backend_id: u64, backend_send_cap: u64, reply_recv_
         );
         return;
     };
-    match unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &msg) }
-    {
+    match unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, reply_recv_cap, &msg) } {
         Ok(()) => {}
         Err(e) => {
             yarm_user_rt::user_log!(

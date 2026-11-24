@@ -181,6 +181,8 @@ pub(super) fn handle_spawn_process(
     }
     let (startup_args, extra_send_caps) =
         normalized_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    // VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13): arg4 != 0 asks for an admin endpoint; see `SpawnImageRequest`.
+    let admin_endpoint_out = spawn_admin_endpoint_out(kernel, frame.arg(4))?;
     // For initramfs_srv (image_id=4) the transaction maps the boot initrd read-only into its
     // address space after the load, publishing the user VA + length in startup slots 15/16.
     const INITRAMFS_IMAGE_ID: u64 = 4;
@@ -236,9 +238,14 @@ pub(super) fn handle_spawn_process(
             extra_send_caps,
             map_initrd_window: image_id == INITRAMFS_IMAGE_ID,
             lifecycle_markers: spawn_lc,
+            admin_endpoint_out,
         },
     )?;
-    frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
+    frame.set_ok(
+        committed.spawner_service_send as usize,
+        committed.reply_tid,
+        committed.requester_service_send as usize,
+    );
     Ok(())
 }
 
@@ -361,6 +368,35 @@ fn normalized_startup_args(
     Ok(normalize_startup_args(startup_args))
 }
 
+/// VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13) — the admin-endpoint request of NR 23 (`arg4`) and NR 29 (`arg5`): 0
+/// asks for none; any other value is the user address, in the CALLER's address space, of 8
+/// writable bytes that receive the spawner's admin SEND capability ID. A misaligned address is
+/// refused. Writability is checked by the transaction before it provisions anything.
+pub(crate) fn spawn_admin_endpoint_out_for(
+    asid: Option<crate::kernel::vm::Asid>,
+    raw: usize,
+) -> Result<Option<(crate::kernel::vm::Asid, u64)>, SyscallError> {
+    if raw == 0 {
+        return Ok(None);
+    }
+    if raw % 8 != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let asid = asid.ok_or(SyscallError::InvalidArgs)?;
+    Ok(Some((asid, raw as u64)))
+}
+
+fn spawn_admin_endpoint_out(
+    kernel: &KernelState,
+    raw: usize,
+) -> Result<Option<(crate::kernel::vm::Asid, u64)>, SyscallError> {
+    if raw == 0 {
+        return Ok(None);
+    }
+    let caller = current_tid(kernel)?;
+    spawn_admin_endpoint_out_for(kernel.task_asid(caller), raw)
+}
+
 /// U9-SPAWN-TXN3 §4 — THE startup-args normalisation, stated once.
 ///
 /// Slots 2, 12 and 13..=16 are KERNEL-owned: the spawn fills them with the capabilities it
@@ -383,6 +419,9 @@ pub(crate) fn normalize_startup_args(
     startup_args[14] = 0;
     startup_args[15] = 0;
     startup_args[16] = 0;
+    // VFS-CORRECT1B: slot 17 of a spawned child is kernel-owned (the admin endpoint's RECEIVE
+    // capability when the spawn provisions one, otherwise 0); a requester cannot preset it.
+    startup_args[17] = 0;
     (startup_args, extra_send_caps)
 }
 
@@ -540,7 +579,8 @@ pub(super) fn handle_reap_faulted_task(
 /// Resolves the MemoryObject → reads initrd slice → loads ELF via load_elf_with_mo_zero_copy
 /// → spawns through the same compensated transaction as every other image-loading spawn.
 ///
-/// Returns: ret0=0, ret1=spawned_tid, ret2=packed_send_caps on success.
+/// Returns: ret0=spawner_service_send, ret1=spawned_tid, ret2=requester_service_send on success
+/// (VFS-CORRECT1B: full-width IDs; until then ret0 was 0 and ret2 packed two 32-bit IDs).
 pub(super) fn handle_spawn_from_memory_object(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
@@ -635,6 +675,8 @@ pub(super) fn handle_spawn_from_memory_object(
 
     let (startup_args, extra_send_caps) =
         normalized_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    // VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13): arg5 != 0 asks for an admin endpoint; see `SpawnImageRequest`.
+    let admin_endpoint_out = spawn_admin_endpoint_out(kernel, frame.arg(5))?;
 
     // Physical base of the initrd blob, for the zero-copy loader's feasibility check.
     let initrd_virt_raw = initrd.as_ptr() as u64;
@@ -664,6 +706,7 @@ pub(super) fn handle_spawn_from_memory_object(
             extra_send_caps,
             map_initrd_window: false,
             lifecycle_markers: false,
+            admin_endpoint_out,
         },
     )?;
     crate::yarm_log!(
@@ -671,6 +714,10 @@ pub(super) fn handle_spawn_from_memory_object(
         image_id,
         committed.tid
     );
-    frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
+    frame.set_ok(
+        committed.spawner_service_send as usize,
+        committed.reply_tid,
+        committed.requester_service_send as usize,
+    );
     Ok(())
 }

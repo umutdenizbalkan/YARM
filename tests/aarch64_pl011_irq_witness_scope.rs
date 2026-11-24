@@ -350,7 +350,7 @@ fn kernel_and_receiver_agree_on_selector_ring_and_words() {
 fn the_receiver_does_not_depend_on_simd_across_a_blocking_receive() {
     let recv = body_after(
         RECEIVER,
-        "fn recv_timeout(cap: u32, timeout: u64) -> Recv {",
+        "fn recv_timeout(cap: u64, timeout: u64) -> Recv {",
     );
     let a64 = recv
         .split_once("#[cfg(target_arch = \"aarch64\")]")

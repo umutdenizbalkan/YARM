@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 pub mod fs;
+pub mod mount_admin;
 pub mod service;
 pub mod shared_io_adapter;
 pub mod shared_io_lifecycle;

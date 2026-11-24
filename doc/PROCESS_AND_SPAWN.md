@@ -217,7 +217,7 @@ spawned task. Slot assignments are defined in
 | 14 | `service_extra_cap_1` | PM caller | extra service cap (e.g. devfs send cap) |
 | 15 | `service_extra_cap_2` | PM caller | extra service cap |
 | 16 | `service_extra_cap_3` | PM caller | extra service cap |
-| 17 | `reserved_17` | — | reserved, `0` |
+| 17 | `service_admin_recv_ep` | kernel | the RECEIVE capability of the service's ADMIN endpoint when the spawn asked for one (NR 23 `arg4` / NR 29 `arg5`), else `0`; a requester cannot preset it (VFS-CORRECT1B). PM's own boot slot 17 is its request receive endpoint |
 
 Slot 12 carries the service's own **receive** endpoint capability. This
 is the cap the service blocks on in its resident IPC loop. **Slot 12 is
@@ -235,6 +235,14 @@ Slots 13–16 carry optional extra capabilities passed by the spawn
 initiator via `SpawnV5CapArgs.service_caps[0..4]`. For `image_id=6`
 (`vfs_server`), the init server places the initramfs send cap in slot 13
 and the devfs send cap in slot 14 before calling `PROC_OP_SPAWN_V5_CAP`.
+
+Slot 17 (VFS-CORRECT1B) is the receive side of a third, per-service **admin** endpoint, which
+the kernel provisions only when the spawner passes an admin out-address; the spawner gets the
+SEND side, and its capability ID is written to that address before the spawn commits. PM asks
+for one for `image_id=6` (`vfs_server`) and returns the SEND capability to the spawn requester
+(init) as a transferred capability on the `PROC_OP_SPAWN_V5_CAP` reply. Holding the admin SEND
+capability is what authorizes a mount (`doc/VFS.md` §3.2). Every capability in the startup
+block and in the spawn reply is a full-width ID (generation above 65,535 included).
 
 ### Stack semantics
 

@@ -25,7 +25,7 @@ pub fn mmap_hook(
 
 #[cfg(not(test))]
 pub fn mmap_hook(
-    _aspace_cap: u32,
+    _aspace_cap: u64,
     _addr: usize,
     _len: usize,
     _prot: usize,
@@ -46,7 +46,7 @@ pub fn munmap_hook(
 }
 
 #[cfg(not(test))]
-pub fn munmap_hook(_aspace_cap: u32, _addr: usize, _len: usize) -> Result<(), PosixErrno> {
+pub fn munmap_hook(_aspace_cap: u64, _addr: usize, _len: usize) -> Result<(), PosixErrno> {
     Err(PosixErrno::NoSys)
 }
 
@@ -65,7 +65,7 @@ pub fn mprotect_hook(
 
 #[cfg(not(test))]
 pub fn mprotect_hook(
-    _aspace_cap: u32,
+    _aspace_cap: u64,
     _addr: usize,
     _len: usize,
     _prot: usize,
@@ -89,7 +89,7 @@ pub fn brk_hook(
 #[cfg(not(test))]
 pub fn brk_hook(
     _tid: u64,
-    _aspace_cap: u32,
+    _aspace_cap: u64,
     _requested: usize,
     _prot: usize,
 ) -> Result<usize, PosixErrno> {

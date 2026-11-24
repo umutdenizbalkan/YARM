@@ -18,15 +18,15 @@ pub trait NetmgrIpcTransport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetmgrIpcEndpoint {
-    request_send_cap: u32,
-    reply_recv_cap: u32,
+    request_send_cap: u64,
+    reply_recv_cap: u64,
     timeout_ticks: u64,
 }
 
 impl NetmgrIpcEndpoint {
     pub const fn new(
-        request_send_cap: u32,
-        reply_recv_cap: u32,
+        request_send_cap: u64,
+        reply_recv_cap: u64,
         timeout_ticks: u64,
     ) -> Option<Self> {
         if request_send_cap == 0 || reply_recv_cap == 0 {

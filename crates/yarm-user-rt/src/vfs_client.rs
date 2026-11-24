@@ -230,8 +230,8 @@ pub fn vfs_close_with<T: VfsTransport>(t: &mut T, fd: u64) -> Result<u64, VfsCli
 /// `vfs_send_cap` must be a valid SEND capability and `reply_recv_cap` a
 /// valid RECV capability, both belonging to the calling task's cnode.
 pub unsafe fn vfs_statx(
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    reply_recv_cap: u64,
     path: &[u8],
 ) -> Result<u64, VfsClientError> {
     // SAFETY: Caller guarantees both caps are valid for this task.
@@ -248,8 +248,8 @@ pub unsafe fn vfs_statx(
 /// `vfs_send_cap` must be a valid SEND capability and `reply_recv_cap` a
 /// valid RECV capability, both belonging to the calling task's cnode.
 pub unsafe fn vfs_openat(
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    reply_recv_cap: u64,
     path: &[u8],
     flags: u64,
 ) -> Result<u64, VfsClientError> {
@@ -264,8 +264,8 @@ pub unsafe fn vfs_openat(
 /// # Safety
 /// Same as [`vfs_statx`].
 pub unsafe fn vfs_read(
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    reply_recv_cap: u64,
     fd: u64,
     buf: &mut [u8],
 ) -> Result<usize, VfsClientError> {
@@ -280,8 +280,8 @@ pub unsafe fn vfs_read(
 /// # Safety
 /// Same as [`vfs_statx`].
 pub unsafe fn vfs_close(
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    reply_recv_cap: u64,
     fd: u64,
 ) -> Result<u64, VfsClientError> {
     // SAFETY: Caller guarantees both caps are valid for this task.
@@ -291,15 +291,15 @@ pub unsafe fn vfs_close(
 
 /// The production transport: NR 6 on `vfs_send_cap`, blocking `ipc_recv_v2` on `reply_recv_cap`.
 pub struct SyscallTransport {
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
+    vfs_send_cap: u64,
+    reply_recv_cap: u64,
 }
 
 impl SyscallTransport {
     /// # Safety
     /// `vfs_send_cap` must be a valid SEND capability and `reply_recv_cap` a valid RECV
     /// capability, both belonging to the calling task's cnode.
-    pub const unsafe fn new(vfs_send_cap: u32, reply_recv_cap: u32) -> Self {
+    pub const unsafe fn new(vfs_send_cap: u64, reply_recv_cap: u64) -> Self {
         Self {
             vfs_send_cap,
             reply_recv_cap,
@@ -545,8 +545,8 @@ mod tests {
     struct Scripted {
         payload: [u8; 128],
         len: usize,
-        transferred_cap: Option<u32>,
-        reply_cap: Option<u32>,
+        transferred_cap: Option<u64>,
+        reply_cap: Option<u64>,
     }
 
     impl Scripted {

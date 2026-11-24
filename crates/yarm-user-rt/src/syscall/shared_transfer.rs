@@ -48,7 +48,7 @@ impl IpcRecvMapIntent {
 #[derive(Debug, PartialEq, Eq)]
 pub struct MappedTransferRecv {
     sender_tid: u64,
-    local_transfer_cap: u32,
+    local_transfer_cap: u64,
     mapped_base: usize,
     mapped_len: usize,
     intent: IpcRecvMapIntent,
@@ -61,7 +61,7 @@ impl MappedTransferRecv {
     }
 
     #[inline]
-    pub const fn local_transfer_cap(&self) -> u32 {
+    pub const fn local_transfer_cap(&self) -> u64 {
         self.local_transfer_cap
     }
 
@@ -94,14 +94,14 @@ impl MappedTransferRecv {
 /// Exact frozen register arguments for syscall 4 (`TransferRelease`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferReleaseRequest {
-    pub local_transfer_cap: u32,
+    pub local_transfer_cap: u64,
     pub mapped_base: usize,
     pub mapped_len: usize,
 }
 
 impl TransferReleaseRequest {
     #[inline]
-    pub const fn explicit(local_transfer_cap: u32, mapped_base: usize, mapped_len: usize) -> Self {
+    pub const fn explicit(local_transfer_cap: u64, mapped_base: usize, mapped_len: usize) -> Self {
         Self {
             local_transfer_cap,
             mapped_base,
@@ -111,7 +111,7 @@ impl TransferReleaseRequest {
 
     /// Ask the kernel to use the active mapping record associated with the local cap.
     #[inline]
-    pub const fn active(local_transfer_cap: u32) -> Self {
+    pub const fn active(local_transfer_cap: u64) -> Self {
         Self::explicit(local_transfer_cap, 0, 0)
     }
 
@@ -162,7 +162,7 @@ impl TransferReleaseToken {
 
     /// Build a token for the kernel's active-mapping-record release path.
     #[inline]
-    pub const fn active(local_transfer_cap: u32) -> Self {
+    pub const fn active(local_transfer_cap: u64) -> Self {
         Self::new(TransferReleaseRequest::active(local_transfer_cap))
     }
 
@@ -203,7 +203,7 @@ impl TransferReleaseToken {
 
 #[inline]
 fn recv_with_map_intent_args(
-    ep_cap: u32,
+    ep_cap: u64,
     mapping_target: *mut u8,
     mapping_capacity: usize,
     intent: IpcRecvMapIntent,
@@ -273,7 +273,7 @@ fn decode_mapped_recv(
     if ret.ret1 == 0 || ret.ret2 as u64 == SYSCALL_NO_TRANSFER_CAP {
         return Err(SyscallError::Internal);
     }
-    let local_transfer_cap = u32::try_from(ret.ret2).map_err(|_| SyscallError::Internal)?;
+    let local_transfer_cap = ret.ret2 as u64;
     Ok(Some(MappedTransferRecv {
         sender_tid: ret.ret0 as u64,
         local_transfer_cap,
@@ -315,7 +315,7 @@ fn decode_release(ret: SyscallReturn) -> Result<TransferReleaseResult, SyscallEr
 /// shared-memory map-intent lane, so combining those layouts would be ambiguous.
 #[inline]
 pub unsafe fn ipc_recv_transfer_with_map_intent(
-    ep_cap: u32,
+    ep_cap: u64,
     mapping_target: *mut u8,
     mapping_capacity: usize,
     intent: IpcRecvMapIntent,

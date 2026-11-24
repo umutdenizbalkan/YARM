@@ -342,7 +342,7 @@ fn route_for_test(
     fd_table: &super::fd_table::VfsFdTable,
     msg: &yarm_user_rt::ipc::Message,
     client_id: u64,
-) -> Result<(u32, super::mount_table::MountLabel), u32> {
+) -> Result<(u64, super::mount_table::MountLabel), u32> {
     use yarm_ipc_abi::vfs_abi::{
         OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ,
         VFS_OP_STATX, VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC, VFS_STATUS_ERR_INVALID_PATH,
@@ -602,6 +602,89 @@ mod service_level_tests {
     }
 }
 
+/// VFS-CORRECT1B — the 4-byte mount-administration status reply. It carries no capability: a
+/// refused commit's capability stays in VFS's retained record (a transfer would only add a copy at
+/// the caller; VFS's own would remain).
+fn mount_admin_reply(reply_cap: u64, status: u32) {
+    let Ok(reply) = yarm_user_rt::ipc::Message::with_header(0, 0, 0, None, &status.to_le_bytes())
+    else {
+        return;
+    };
+    // SAFETY: the one-shot reply capability of the request being answered.
+    if let Err(err) = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) } {
+        yarm_user_rt::user_log!("VFS_MOUNT_ADMIN_REPLY_FAIL status={} err={:?}", status, err);
+    }
+}
+
+/// VFS-CORRECT1B — move every message waiting on the admin endpoint into the staged table while
+/// it has room (deadline-0 receives, so this never blocks). A message that reached this endpoint
+/// was sent by a holder of its SEND capability: that is the administrator's authority.
+fn drain_mount_admin_endpoint(
+    admin_recv: u64,
+    admin: &mut yarm_fs_servers::common::mount_admin::MountAdmin,
+) {
+    use yarm_fs_servers::common::mount_admin::StageOutcome;
+    while admin.has_room() {
+        // SAFETY: VFS's own admin RECEIVE capability.
+        let Ok(Some(m)) = (unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(admin_recv, 0) })
+        else {
+            break;
+        };
+        let cap = m.transferred_cap().map(|c| c.0);
+        match admin.stage(m.sender_tid.0, m.opcode, cap, m.as_slice()) {
+            StageOutcome::Staged(s) => yarm_user_rt::user_log!(
+                "VFS_MOUNT_STAGE_RECEIVED sender_tid={} prefix={} flags={} vfs_local_cap={} sender_local_cap={}",
+                s.sender_tid,
+                alloc::string::String::from_utf8_lossy(s.prefix()),
+                s.flags,
+                s.backend_cap,
+                s.sender_local_cap
+            ),
+            StageOutcome::Retained {
+                backend_cap,
+                reason,
+            } => yarm_user_rt::user_log!(
+                "VFS_MOUNT_STAGE_RETAINED sender_tid={} vfs_local_cap={} reason={}",
+                m.sender_tid.0,
+                backend_cap,
+                reason
+            ),
+            StageOutcome::Ignored { reason } => yarm_user_rt::user_log!(
+                "VFS_MOUNT_STAGE_IGNORED sender_tid={} reason={}",
+                m.sender_tid.0,
+                reason
+            ),
+        }
+    }
+}
+
+/// VFS-CORRECT1B — the registration handshake: one `VFS_OP_STATX` of the prefix through the
+/// staged capability, over the production client wrapper and VFS's backend reply endpoint.
+struct MountHandshake {
+    reply_recv_cap: u64,
+}
+
+impl yarm_fs_servers::common::mount_admin::BackendHandshake for MountHandshake {
+    fn handshake(
+        &mut self,
+        backend_cap: u64,
+        prefix: &[u8],
+    ) -> Result<(), yarm_fs_servers::common::mount_admin::HandshakeFault> {
+        use yarm_fs_servers::common::mount_admin::HandshakeFault;
+        use yarm_user_rt::vfs_client::VfsClientError;
+        // SAFETY: `backend_cap` is the received capability in VFS's CNode; the reply endpoint is
+        // VFS's own. The kernel refuses the call before delivering anything if the capability is
+        // stale, not an endpoint, or lacks SEND.
+        match unsafe {
+            yarm_user_rt::vfs_client::vfs_statx(backend_cap, self.reply_recv_cap, prefix)
+        } {
+            Ok(_) | Err(VfsClientError::Status(_)) => Ok(()),
+            Err(VfsClientError::Send(e)) => Err(HandshakeFault::Refused(e as usize)),
+            Err(_) => Err(HandshakeFault::NoValidCompletion),
+        }
+    }
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("VFS_SRV_ENTRY");
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
@@ -653,6 +736,15 @@ pub fn run() {
             0
         }
     );
+    // VFS-CORRECT1B: the mount-admin endpoint (startup slot 17), provisioned by PM's spawn; its
+    // only SEND capability went to the mount administrator.
+    let admin_recv_cap = ctx.service_admin_recv_ep;
+    yarm_user_rt::user_log!(
+        "VFS_MOUNT_ADMIN_RECV_CAP present={} cap={}",
+        admin_recv_cap.is_some() as u8,
+        admin_recv_cap.unwrap_or(0)
+    );
+    let mut mount_admin = yarm_fs_servers::common::mount_admin::MountAdmin::new();
     yarm_user_rt::user_log!("VFS_SRV_BLOCKING_RECV_LOOP");
 
     loop {
@@ -679,59 +771,67 @@ pub fn run() {
         );
         let client_id = msg.sender_tid.0;
 
-        // ── VFS_OP_MOUNT_REGISTER — handled locally, never forwarded ────────
+        // ── Mount administration — handled locally, never forwarded (VFS-CORRECT1B) ────────
+        //
+        // The retired numeric form (`VFS_OP_MOUNT_REGISTER`, a sender-local capability number in
+        // the payload) is refused outright: it carries no authority. A commit is accepted only
+        // for a mount staged through the admin endpoint by the same (kernel-authenticated)
+        // sender; see `yarm_fs_servers::common::mount_admin`.
         if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_MOUNT_REGISTER {
-            use super::mount_table::MountRegisterError;
-            use yarm_ipc_abi::vfs_abi::{
-                MountRegisterArgs, VFS_MOUNT_STATUS_ERR_DUPLICATE, VFS_MOUNT_STATUS_ERR_FULL,
-                VFS_MOUNT_STATUS_ERR_INVALID_CAP, VFS_MOUNT_STATUS_ERR_INVALID_PREFIX,
-                VFS_MOUNT_STATUS_OK,
+            yarm_user_rt::user_log!(
+                "VFS_MOUNT_ADMIN_REFUSED op=register sender_tid={} status={} reason=numeric_cap_is_not_authority",
+                client_id,
+                yarm_ipc_abi::vfs_abi::VFS_MOUNT_STATUS_ERR_PERMISSION
+            );
+            mount_admin_reply(
+                client_reply_cap,
+                yarm_ipc_abi::vfs_abi::VFS_MOUNT_STATUS_ERR_PERMISSION,
+            );
+            continue;
+        }
+        if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_MOUNT_COMMIT {
+            let prefix = msg.as_slice();
+            let Some(admin_recv) = admin_recv_cap else {
+                yarm_user_rt::user_log!(
+                    "VFS_MOUNT_ADMIN_REFUSED op=commit sender_tid={} status={} reason=no_admin_endpoint",
+                    client_id,
+                    yarm_ipc_abi::vfs_abi::VFS_MOUNT_STATUS_ERR_PERMISSION
+                );
+                mount_admin_reply(
+                    client_reply_cap,
+                    yarm_ipc_abi::vfs_abi::VFS_MOUNT_STATUS_ERR_PERMISSION,
+                );
+                continue;
             };
-
-            let status: u32 = match MountRegisterArgs::decode(msg.as_slice()) {
+            drain_mount_admin_endpoint(admin_recv, &mut mount_admin);
+            let mut handshake = MountHandshake {
+                reply_recv_cap: backend_reply_recv_cap,
+            };
+            let out = mount_admin.commit(client_id, prefix, &mut mount_table, &mut handshake);
+            let prefix_str = alloc::string::String::from_utf8_lossy(prefix);
+            match out.published_cap {
+                Some(cap) => yarm_user_rt::user_log!(
+                    "VFS_MOUNT_PUBLISHED prefix={} vfs_local_cap={} sender_local_cap={} entries={}",
+                    prefix_str,
+                    cap,
+                    out.staged.map(|m| m.sender_local_cap).unwrap_or(0),
+                    mount_table.len()
+                ),
                 None => {
-                    yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_DECODE_ERR");
-                    VFS_MOUNT_STATUS_ERR_INVALID_PREFIX
-                }
-                Some(args) => {
+                    let (retained, overflow) = mount_admin.retained();
                     yarm_user_rt::user_log!(
-                        "VFS_MOUNT_REGISTER_REQUEST cap={} flags={}",
-                        args.backend_send_cap,
-                        args.flags
+                        "VFS_MOUNT_ADMIN_REFUSED op=commit sender_tid={} prefix={} status={} retained_cap={} retained_total={} retained_overflow={} handshake={:?}",
+                        client_id,
+                        prefix_str,
+                        out.status,
+                        out.retained_cap.unwrap_or(0),
+                        retained.len(),
+                        overflow,
+                        out.handshake_fault
                     );
-                    let cap32 = args.backend_send_cap as u32;
-                    match mount_table.insert_dynamic(args.prefix, cap32, args.flags as u32) {
-                        Ok(()) => {
-                            yarm_user_rt::user_log!(
-                                "VFS_MOUNT_REGISTER_OK entries={}",
-                                mount_table.len()
-                            );
-                            VFS_MOUNT_STATUS_OK
-                        }
-                        Err(MountRegisterError::DuplicatePrefix) => {
-                            yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_ERR reason=duplicate");
-                            VFS_MOUNT_STATUS_ERR_DUPLICATE
-                        }
-                        Err(MountRegisterError::TableFull) => {
-                            yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_ERR reason=full");
-                            VFS_MOUNT_STATUS_ERR_FULL
-                        }
-                        Err(MountRegisterError::InvalidSendCap) => {
-                            yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_ERR reason=invalid-cap");
-                            VFS_MOUNT_STATUS_ERR_INVALID_CAP
-                        }
-                        Err(MountRegisterError::PrefixTooLong)
-                        | Err(MountRegisterError::InvalidPrefix) => {
-                            yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_ERR reason=invalid-prefix");
-                            VFS_MOUNT_STATUS_ERR_INVALID_PREFIX
-                        }
-                    }
                 }
-            };
-            let reply_opcode: u64 = if status == VFS_MOUNT_STATUS_OK { 0 } else { 1 };
-            let reply = yarm_user_rt::ipc::Message::new(reply_opcode, &status.to_le_bytes())
-                .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"));
-            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &reply) };
+            }
+            mount_admin_reply(client_reply_cap, out.status);
             continue;
         }
 
@@ -740,7 +840,7 @@ pub fn run() {
         // `route()` and `lookup()` return owned `MountLabel` copies so that
         // callers may freely mutate the tables afterward (e.g. fd_table.remove).
         // Error variants carry a canonical VFS_STATUS_ERR_* code.
-        let route: Result<(u32, super::mount_table::MountLabel), u32> = 'route: {
+        let route: Result<(u64, super::mount_table::MountLabel), u32> = 'route: {
             use yarm_ipc_abi::vfs_abi::{
                 OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_OPENAT,
                 VFS_OP_READ, VFS_OP_STATX, VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC,

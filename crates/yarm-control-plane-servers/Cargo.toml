@@ -89,6 +89,10 @@ futex-sync-witness = []
 futex-seal-witness = []
 # VFS-CORRECT1A — the live read-path witness: init's cell after its VFS smokes (no kernel side).
 vfs-correct-witness = []
+# VFS-CORRECT1B: the kernel's generation witness; accepted and inert in this package.
+cap-gen-witness = []
+# VFS-CORRECT1B — init's mount-administration witness, after the VFS-CORRECT1A cell.
+vfs-mount-witness = []
 # FUTEX-SEAL1 — with futex-seal-witness, the sequence cells to run, in this order, one file each:
 # selective-wake order (futex_seal_os.rs), NR 17 (futex_seal_nr17.rs), the late sole-wake
 # handoff (futex_seal_lh.rs), the paired broadcast (futex_seal_witness.rs), and last the RT-budget

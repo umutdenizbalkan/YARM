@@ -542,12 +542,23 @@ mod tests {
         let pub_fn_off = after_fn.find("\npub fn ").unwrap_or(usize::MAX);
         let fn_body_end = fn_start + 1 + fn_off.min(pub_fn_off);
         let fn_text = &init_src[fn_start..fn_body_end];
+        // VFS-CORRECT1B: the wrapper delegates to the one registration client, whose commit
+        // reply is received in `mount_admin_call`.
         assert!(
-            fn_text.contains("ipc_recv_v2(reply_recv_cap"),
+            fn_text.contains("register_mount_with_vfs("),
+            "register_ramfs_mount_with_vfs must use the shared registration client"
+        );
+        let call = init_src
+            .split("pub(super) fn mount_admin_call(")
+            .nth(1)
+            .expect("mount_admin_call must be defined");
+        let call = call.split("\n}\n").next().unwrap_or(call);
+        assert!(
+            call.contains("ipc_recv_v2(reply_recv_cap"),
             "register_ramfs_mount_with_vfs must use blocking ipc_recv_v2 on reply_recv_cap"
         );
         assert!(
-            !fn_text.contains("ipc_recv_with_deadline(reply_recv_cap"),
+            !call.contains("ipc_recv_with_deadline(reply_recv_cap"),
             "register_ramfs_mount_with_vfs must NOT use non-blocking ipc_recv_with_deadline"
         );
     }
@@ -564,12 +575,23 @@ mod tests {
         let pub_fn_off = after_fn.find("\npub fn ").unwrap_or(usize::MAX);
         let fn_body_end = fn_start + 1 + fn_off.min(pub_fn_off);
         let fn_text = &init_src[fn_start..fn_body_end];
+        // VFS-CORRECT1B: the wrapper delegates to the one registration client, whose commit
+        // reply is received in `mount_admin_call`.
         assert!(
-            fn_text.contains("ipc_recv_v2(reply_recv_cap"),
+            fn_text.contains("register_mount_with_vfs("),
+            "register_ext4_mount_with_vfs must use the shared registration client"
+        );
+        let call = init_src
+            .split("pub(super) fn mount_admin_call(")
+            .nth(1)
+            .expect("mount_admin_call must be defined");
+        let call = call.split("\n}\n").next().unwrap_or(call);
+        assert!(
+            call.contains("ipc_recv_v2(reply_recv_cap"),
             "register_ext4_mount_with_vfs must use blocking ipc_recv_v2 on reply_recv_cap"
         );
         assert!(
-            !fn_text.contains("ipc_recv_with_deadline(reply_recv_cap"),
+            !call.contains("ipc_recv_with_deadline(reply_recv_cap"),
             "register_ext4_mount_with_vfs must NOT use non-blocking ipc_recv_with_deadline"
         );
     }
@@ -3052,7 +3074,7 @@ mod tests {
         assert!(
             !supervisor_src.contains("recv_with_deadline(fault_cap, 0)")
                 && !supervisor_src.contains(
-                    "recv_with_deadline(supervisor.handoff.supervisor_control_recv_cap.0 as u32, 0)"
+                    "recv_with_deadline(supervisor.handoff.supervisor_control_recv_cap.0, 0)"
                 ),
             "SUP-L7G supervisor poll/drain paths must not use ambiguous deadline 0"
         );

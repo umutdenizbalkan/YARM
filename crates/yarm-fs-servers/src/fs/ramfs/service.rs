@@ -247,7 +247,36 @@ pub fn run_with_config(config: RamFsStartupConfig) -> RamFsServiceStartup {
     }
 }
 
+/// VFS-CORRECT1B — the mount witness's file, present only in ramfs (seeded under
+/// `vfs-mount-witness`): 192 bytes, `byte[i] = (i * 37 + 11) mod 256`. A read of it through the
+/// VFS proves the request reached this backend and no other.
+pub const RAMFS_WITNESS_PATH: &[u8] = b"/ram/vc1b-witness";
+pub const RAMFS_WITNESS_LEN: usize = 192;
+
+pub const fn ramfs_witness_byte(i: usize) -> u8 {
+    ((i * 37 + 11) & 0xFF) as u8
+}
+
+/// Create and fill [`RAMFS_WITNESS_PATH`] through the backend's own file operations.
+pub fn seed_witness_file(svc: &mut RamFsService) -> Result<usize, super::tree::RamFsError> {
+    let mut bytes = [0u8; RAMFS_WITNESS_LEN];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = ramfs_witness_byte(i);
+    }
+    let backend = svc.backend_mut();
+    backend.create_file(RAMFS_WITNESS_PATH)?;
+    let fd = backend.open_path(RAMFS_WITNESS_PATH)?;
+    let written = backend.write_bytes(fd, &bytes)?;
+    backend.close_fd(fd)?;
+    Ok(written)
+}
+
 fn run_resident_service_loop(svc: &mut RamFsService) {
+    #[cfg(feature = "vfs-mount-witness")]
+    match seed_witness_file(svc) {
+        Ok(n) => yarm_user_rt::user_log!("RAMFS_WITNESS_SEEDED path=/ram/vc1b-witness len={}", n),
+        Err(e) => yarm_user_rt::user_log!("RAMFS_WITNESS_SEED_FAIL err={:?}", e),
+    }
     let ctx = yarm_user_rt::runtime::startup_context();
     if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
         yarm_user_rt::user_log!("RAMFS_SRV_RECV_CAP cap={}", recv_cap);

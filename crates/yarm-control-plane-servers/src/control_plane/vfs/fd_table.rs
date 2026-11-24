@@ -12,7 +12,7 @@ struct FdEntry {
     /// Identity of the owning client (stable caller task/thread identity).
     /// Only the client whose `client_id` matches may look up or close this entry.
     client_id: u64,
-    backend_cap: u32,
+    backend_cap: u64,
     label: MountLabel,
 }
 
@@ -51,7 +51,7 @@ impl VfsFdTable {
     /// Returns `false` if the table is full.  Duplicate `(fd, client_id)`
     /// pairs are not deduplicated; callers should close before re-opening
     /// the same fd.
-    pub fn insert(&mut self, fd: u64, backend_cap: u32, name: &str, client_id: u64) -> bool {
+    pub fn insert(&mut self, fd: u64, backend_cap: u64, name: &str, client_id: u64) -> bool {
         if self.count >= MAX_FD_ENTRIES {
             return false;
         }
@@ -68,7 +68,7 @@ impl VfsFdTable {
     /// Return `(backend_cap, label)` for the entry whose `fd` **and**
     /// `client_id` both match.  Returns `None` if no such entry exists,
     /// including when another client holds the same fd number.
-    pub(crate) fn lookup(&self, fd: u64, client_id: u64) -> Option<(u32, MountLabel)> {
+    pub(crate) fn lookup(&self, fd: u64, client_id: u64) -> Option<(u64, MountLabel)> {
         for entry in &self.entries[..self.count] {
             if entry.fd == fd && entry.client_id == client_id {
                 return Some((entry.backend_cap, entry.label));
@@ -162,7 +162,7 @@ mod tests {
     fn fd_table_caps_at_max_entries() {
         let mut t = VfsFdTable::new();
         for i in 0..MAX_FD_ENTRIES {
-            assert!(t.insert(i as u64, (i + 1) as u32, "x", CLIENT_A));
+            assert!(t.insert(i as u64, (i + 1) as u64, "x", CLIENT_A));
         }
         assert_eq!(t.len(), MAX_FD_ENTRIES);
         assert!(!t.insert(999, 1, "overflow", CLIENT_A));

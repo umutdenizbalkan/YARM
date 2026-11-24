@@ -10636,6 +10636,22 @@ fn try_split_fork_into_frame(
     }
 }
 
+/// VFS-CORRECT1B — the split route's admin-endpoint request (NR 23 `arg4`, NR 29 `arg5`): the same
+/// admission as the broad route, with the caller's address space read under the task lock only.
+fn split_spawn_admin_endpoint_out(
+    shared: &SharedKernel,
+    tid: u64,
+    raw: usize,
+) -> Result<Option<(crate::kernel::vm::Asid, u64)>, crate::kernel::syscall::SyscallError> {
+    if raw == 0 {
+        return Ok(None);
+    }
+    let asid = u16::try_from(shared.task_asid_for_tid_split_read(tid))
+        .ok()
+        .map(crate::kernel::vm::Asid);
+    crate::kernel::syscall::process::spawn_admin_endpoint_out_for(asid, raw)
+}
+
 /// Read and normalise the caller's startup-args array, off-lock.
 ///
 /// Freestanding only: the off-lock user-read seam reads through the direct map, which exists
@@ -10733,6 +10749,11 @@ fn try_split_spawn_process_into_frame(
             Ok(v) => v,
             Err(e) => return fail(e),
         };
+    // VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13): arg4 != 0 asks for an admin endpoint (see `SpawnImageRequest`).
+    let admin_endpoint_out = match split_spawn_admin_endpoint_out(shared, tid, frame.arg(4)) {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
     const INITRAMFS_IMAGE_ID: u64 = 4;
     let Some(image_path) = spawn_image_path_for_image_id(image_id) else {
         if spawn_lc {
@@ -10791,10 +10812,15 @@ fn try_split_spawn_process_into_frame(
             extra_send_caps,
             map_initrd_window: image_id == INITRAMFS_IMAGE_ID,
             lifecycle_markers: spawn_lc,
+            admin_endpoint_out,
         },
     ) {
         Ok(committed) => {
-            frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
+            frame.set_ok(
+                committed.spawner_service_send as usize,
+                committed.reply_tid,
+                committed.requester_service_send as usize,
+            );
             Some(Ok(()))
         }
         Err(e) => fail(e),
@@ -10915,6 +10941,12 @@ fn try_split_spawn_from_mo_into_frame(
         Ok(v) => v,
         Err(e) => return fail(e),
     };
+    // VFS-CORRECT1B (privileged NR 23/29 extension, ABI v13): arg5 != 0 asks for an admin endpoint (see `SpawnImageRequest`).
+    let admin_endpoint_out = match split_spawn_admin_endpoint_out(shared, caller_tid, frame.arg(5))
+    {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
     let initrd_virt_raw = initrd.as_ptr() as u64;
     let initrd_phys_base = {
         let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
@@ -10943,6 +10975,7 @@ fn try_split_spawn_from_mo_into_frame(
             extra_send_caps,
             map_initrd_window: false,
             lifecycle_markers: false,
+            admin_endpoint_out,
         },
     ) {
         Ok(committed) => {
@@ -10951,7 +10984,11 @@ fn try_split_spawn_from_mo_into_frame(
                 image_id,
                 committed.tid
             );
-            frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
+            frame.set_ok(
+                committed.spawner_service_send as usize,
+                committed.reply_tid,
+                committed.requester_service_send as usize,
+            );
             Some(Ok(()))
         }
         Err(e) => fail(e),

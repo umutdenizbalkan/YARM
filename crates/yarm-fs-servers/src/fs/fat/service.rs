@@ -188,16 +188,16 @@ impl FatMountConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FatStartupConfig {
-    pub block_send_cap: Option<u32>,
-    pub reply_recv_cap: Option<u32>,
+    pub block_send_cap: Option<u64>,
+    pub reply_recv_cap: Option<u64>,
     pub mount_config: Option<FatMountConfig>,
     pub allow_sample_image: bool,
 }
 
 impl FatStartupConfig {
     pub fn production(
-        block_send_cap: Option<u32>,
-        reply_recv_cap: Option<u32>,
+        block_send_cap: Option<u64>,
+        reply_recv_cap: Option<u64>,
         device_id: u64,
     ) -> Self {
         Self {
