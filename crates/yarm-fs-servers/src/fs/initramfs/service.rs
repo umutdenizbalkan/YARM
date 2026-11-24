@@ -10,7 +10,10 @@ use super::archive::{
     INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_DRIVER_MANAGER_PATH, InitramfsBackend, InitramfsMetrics,
 };
 use super::install_boot_initrd_bytes;
-use yarm_ipc_abi::vfs_abi::{ReadWriteArgs, VFS_OP_READ};
+use yarm_ipc_abi::vfs_abi::{
+    ReadWriteArgs, VFS_OP_FILE_GRANT_RO, VFS_OP_READ, VFS_STATUS_ERR_BACKEND,
+    VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC, VFS_STATUS_ERR_UNSUPPORTED, VfsCompletion,
+};
 use yarm_srv_common::cpio::CpioArchive;
 use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_srv_common::vfs_core::VfsBackend;
@@ -57,8 +60,8 @@ fn build_runtime_backend() -> (InitramfsBackend, InitramfsBackendSource, usize) 
             yarm_user_rt::user_log!(
                 "INITRAMFS_CPIO_ENTRY_COUNT count={} cap={} truncated={}",
                 entries,
-                15,
-                (entries > 15) as u8
+                16,
+                (entries > 16) as u8
             );
             if entries == 0 {
                 let mut first6 = [0u8; 6];
@@ -147,6 +150,16 @@ pub fn run_request_loop(service: &mut InitramfsService) -> Result<InitramfsLoopS
         handled: service.handled_count(),
         metrics: service.backend().metrics(),
     })
+}
+
+/// VFS-CORRECT1A: a FILE_GRANT_RO error completion (no capability).
+fn grant_error_reply(reply_cap: u32, status: u32, fd: u64) {
+    let (bytes, len) = VfsCompletion::err(VFS_OP_FILE_GRANT_RO, status, fd)
+        .encode(&[])
+        .expect("header");
+    let reply = Message::with_header(0, 0, 0, None, &bytes[..len]).expect("completion");
+    // SAFETY: reply_cap is the one-shot reply capability of the request being answered.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
 }
 
 pub fn run() {
@@ -283,23 +296,24 @@ pub fn run() {
                                                     file_len,
                                                     cap_id
                                                 );
-                                                let reply_bytes =
-                                                    yarm_ipc_abi::vfs_abi::FileGrantRoReply {
-                                                        file_len,
-                                                        status: 0,
-                                                    }
-                                                    .encode();
-                                                // Build reply with transferred MemoryObject cap.
+                                                // VFS-CORRECT1A: a payload completion (op, status,
+                                                // file length, the request's fd) with the
+                                                // transferred MemoryObject cap.
+                                                let (reply_bytes, reply_len) = VfsCompletion::ok(
+                                                    VFS_OP_FILE_GRANT_RO,
+                                                    file_len,
+                                                    args.fd,
+                                                )
+                                                .encode(&[])
+                                                .expect("header");
                                                 let response = Message::with_header(
                                                     0,
                                                     0,
                                                     Message::FLAG_CAP_TRANSFER,
                                                     Some(cap_id as u64),
-                                                    &reply_bytes,
+                                                    &reply_bytes[..reply_len],
                                                 )
-                                                .unwrap_or_else(|_| {
-                                                    Message::new(1, &[]).expect("err msg")
-                                                });
+                                                .expect("completion fits one reply");
                                                 let _ = unsafe {
                                                     yarm_user_rt::syscall::ipc_reply(
                                                         reply_cap, &response,
@@ -312,12 +326,13 @@ pub fn run() {
                                                     args.fd,
                                                     e
                                                 );
-                                                let _ = unsafe {
-                                                    yarm_user_rt::syscall::ipc_reply(
-                                                        reply_cap,
-                                                        &Message::new(1, &[]).expect("err msg"),
-                                                    )
+                                                let status = match e {
+                                                    yarm_user_rt::syscall::SyscallError::InvalidNumber => {
+                                                        VFS_STATUS_ERR_UNSUPPORTED
+                                                    }
+                                                    _ => VFS_STATUS_ERR_BACKEND,
                                                 };
+                                                grant_error_reply(reply_cap, status, args.fd);
                                             }
                                         }
                                     }
@@ -326,28 +341,21 @@ pub fn run() {
                                             "INITRAMFS_FILE_GRANT_RO_FAIL fd={} reason=bad_fd",
                                             args.fd
                                         );
-                                        let _ = unsafe {
-                                            yarm_user_rt::syscall::ipc_reply(
-                                                reply_cap,
-                                                &Message::new(1, &[]).expect("err msg"),
-                                            )
-                                        };
+                                        grant_error_reply(
+                                            reply_cap,
+                                            VFS_STATUS_ERR_BAD_FD,
+                                            args.fd,
+                                        );
                                     }
                                 }
                             }
                             Err(_) => {
-                                let _ = unsafe {
-                                    yarm_user_rt::syscall::ipc_reply(
-                                        reply_cap,
-                                        &Message::new(1, &[]).expect("err msg"),
-                                    )
-                                };
+                                grant_error_reply(reply_cap, VFS_STATUS_ERR_CODEC, 0);
                             }
                         }
                     } else {
-                        let response = svc.handle(msg).unwrap_or_else(|_| {
-                            yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")
-                        });
+                        // VFS-CORRECT1A: router-forwarded operations are answered with a payload completion.
+                        let response = svc.handle_completion(msg);
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
                     }
                 }
@@ -695,5 +703,168 @@ mod tests {
         assert_eq!(status, 0);
         assert!(n >= 4);
         assert_eq!(&bytes[..4], b"\x7fELF");
+    }
+
+    // ── VFS-CORRECT1A: the production client against the resident handler ─────────
+
+    use yarm_ipc_abi::vfs_abi::{
+        VFS_INLINE_READ_MAX, VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_INVALID_PATH,
+        VFS_STATUS_ERR_UNSUPPORTED,
+    };
+    use yarm_user_rt::syscall::{ReceivedMessage, SyscallError};
+    use yarm_user_rt::vfs_client::{
+        VfsClientError, VfsTransport, vfs_close_with, vfs_openat_with, vfs_read_with,
+        vfs_statx_with,
+    };
+
+    const SENTINEL: u8 = 0xA5;
+
+    fn fixture_byte(i: usize) -> u8 {
+        ((i * 131 + 43) & 0xFF) as u8
+    }
+
+    fn fixture() -> Vec<u8> {
+        (0..300).map(fixture_byte).collect()
+    }
+
+    /// The bytes staged into every initramfs are the formula's bytes.
+    #[test]
+    fn vc1a_committed_fixture_matches_its_formula() {
+        let committed = include_bytes!("../../../../../scripts/fixtures/vfs-fixture.bin");
+        assert_eq!(committed.len(), 300);
+        assert_eq!(&committed[..], &fixture()[..]);
+    }
+
+    /// Requests go to `handle_completion`; the reply comes back the way NR 7 delivers it: the
+    /// payload only (opcode 0), no capability.
+    struct Loopback {
+        svc: InitramfsService,
+        reply: Option<Message>,
+        calls: usize,
+        recvs: usize,
+    }
+
+    impl VfsTransport for Loopback {
+        fn call(&mut self, msg: &Message) -> Result<(), SyscallError> {
+            self.calls += 1;
+            let reply = self.svc.handle_completion(*msg);
+            self.reply =
+                Some(Message::with_header(10000, 0, 0, None, reply.as_slice()).expect("nr7"));
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Option<ReceivedMessage>, SyscallError> {
+            self.recvs += 1;
+            Ok(self.reply.take().map(|message| ReceivedMessage {
+                message,
+                reply_cap: None,
+                transferred_cap: None,
+                sender_tid: 10000,
+            }))
+        }
+    }
+
+    fn loopback_with_fixture() -> Loopback {
+        let mut cpio = Vec::new();
+        push_entry(&mut cpio, "init", 0o100755, b"\x7fELFinit-binary");
+        push_entry(&mut cpio, "etc/vfs-fixture", 0o100644, &fixture());
+        push_entry(&mut cpio, "TRAILER!!!", 0, &[]);
+        let leaked: &'static [u8] = Box::leak(cpio.into_boxed_slice());
+        Loopback {
+            svc: InitramfsService::with_backend(InitramfsBackend::from_cpio_newc_static(leaked)),
+            reply: None,
+            calls: 0,
+            recvs: 0,
+        }
+    }
+
+    #[test]
+    fn vc1a_fixture_reads_exactly_across_inline_boundaries() {
+        let mut t = loopback_with_fixture();
+        let fd = vfs_openat_with(&mut t, b"/initramfs/etc/vfs-fixture", 0).expect("open");
+        assert_eq!(
+            vfs_statx_with(&mut t, b"/initramfs/etc/vfs-fixture"),
+            Ok(300)
+        );
+        // Successive destinations of different sizes; 200 and 512 exceed one completion.
+        let sizes = [13usize, 200, 1, 104, 64, 512];
+        let expected = [13usize, 104, 1, 104, 64, 14];
+        let mut offset = 0usize;
+        for (size, want) in sizes.iter().zip(expected.iter()) {
+            let mut region = [SENTINEL; 600];
+            let n = vfs_read_with(&mut t, fd, &mut region[..*size]).expect("read");
+            assert_eq!(n, *want, "read of {} at {}", size, offset);
+            for (k, b) in region[..n].iter().enumerate() {
+                assert_eq!(*b, fixture_byte(offset + k), "byte {}", offset + k);
+            }
+            assert!(
+                region[n..].iter().all(|&b| b == SENTINEL),
+                "tail of read {}",
+                size
+            );
+            offset += n;
+        }
+        assert_eq!(offset, 300);
+        // End of file, repeatedly; a zero-length request; end of file again.
+        let mut region = [SENTINEL; 64];
+        assert_eq!(vfs_read_with(&mut t, fd, &mut region[..50]), Ok(0));
+        assert_eq!(vfs_read_with(&mut t, fd, &mut region[..0]), Ok(0));
+        assert_eq!(vfs_read_with(&mut t, fd, &mut region[..32]), Ok(0));
+        assert!(region.iter().all(|&b| b == SENTINEL));
+        assert_eq!(vfs_close_with(&mut t, fd), Ok(0));
+        // After close the fd is gone.
+        assert_eq!(
+            vfs_read_with(&mut t, fd, &mut region[..8]),
+            Err(VfsClientError::Status(VFS_STATUS_ERR_BAD_FD))
+        );
+        assert_eq!(t.calls, t.recvs);
+    }
+
+    #[test]
+    fn vc1a_backend_cursor_advances_only_by_the_delivered_bytes() {
+        let mut t = loopback_with_fixture();
+        let fd = vfs_openat_with(&mut t, b"/initramfs/etc/vfs-fixture", 0).expect("open");
+        // A request far beyond one completion: the backend is asked for at most 104 bytes.
+        let mut big = [SENTINEL; 4096];
+        assert_eq!(vfs_read_with(&mut t, fd, &mut big), Ok(VFS_INLINE_READ_MAX));
+        let mut next = [SENTINEL; 1];
+        assert_eq!(vfs_read_with(&mut t, fd, &mut next), Ok(1));
+        assert_eq!(next[0], fixture_byte(VFS_INLINE_READ_MAX));
+    }
+
+    #[test]
+    fn vc1a_errors_travel_in_the_payload_and_a_valid_request_still_works() {
+        let mut t = loopback_with_fixture();
+        assert_eq!(
+            vfs_openat_with(&mut t, b"/initramfs/etc/vfs-missing", 0),
+            Err(VfsClientError::Status(VFS_STATUS_ERR_INVALID_PATH))
+        );
+        let mut buf = [SENTINEL; 16];
+        assert_eq!(
+            vfs_read_with(&mut t, 9999, &mut buf),
+            Err(VfsClientError::Status(VFS_STATUS_ERR_BAD_FD))
+        );
+        assert!(buf.iter().all(|&b| b == SENTINEL));
+        let fd = vfs_openat_with(&mut t, b"/initramfs/etc/vfs-fixture", 0).expect("open");
+        assert_eq!(vfs_read_with(&mut t, fd, &mut buf[..4]), Ok(4));
+        assert_eq!(&buf[..4], &fixture()[..4]);
+    }
+
+    #[test]
+    fn vc1a_a_backend_without_bytes_never_reports_a_count() {
+        // The placeholder backend (no CPIO mapped) knows file lengths but holds no bytes: the
+        // baseline reported `ReadLen(64)` for it. The completion is UNSUPPORTED instead.
+        let mut t = Loopback {
+            svc: InitramfsService::with_backend(InitramfsBackend::new(8192)),
+            reply: None,
+            calls: 0,
+            recvs: 0,
+        };
+        let fd = vfs_openat_with(&mut t, b"/initramfs/boot-marker", 0).expect("open");
+        let mut buf = [SENTINEL; 64];
+        assert_eq!(
+            vfs_read_with(&mut t, fd, &mut buf),
+            Err(VfsClientError::Status(VFS_STATUS_ERR_UNSUPPORTED))
+        );
+        assert!(buf.iter().all(|&b| b == SENTINEL));
     }
 }

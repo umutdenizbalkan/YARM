@@ -156,6 +156,7 @@ common_stage_ramfs_server_elf || true
 common_stage_fat_server_elf || true
 common_stage_ext4_server_elf || true
 common_stage_crash_test_server_elf || true
+common_stage_vfs_fixture
 common_verify_initramfs_stage_paths
 common_create_initramfs_aligned
 

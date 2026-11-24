@@ -3074,90 +3074,24 @@ unsafe fn pm_vfs_spawn_inline(
     Err(ProcessManagerError::Unsupported)
 }
 
-#[cfg(not(test))]
-unsafe fn pm_vfs_call_u64(
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
-    msg: &Message,
-) -> Result<Message, ProcessManagerError> {
-    let op = msg.opcode;
-    match unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, msg) } {
-        Ok(()) => {
-            yarm_user_rt::user_log!("PM_VFS_CALL_SENT op={} status=ok", op);
-        }
-        Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
-            // Finalized IPC contract: ipc_call is send/queue-only. A WouldBlock
-            // at this stage is treated as a normal blocking transition, then we
-            // explicitly receive the reply via the dedicated reply endpoint.
-            yarm_user_rt::user_log!("PM_VFS_CALL_BLOCKED_NORMAL op={}", op);
-        }
-        Err(e) => {
-            yarm_user_rt::user_log!("PM_VFS_CALL_FAIL op={} err={:?}", op, e);
-            return Err(ProcessManagerError::Unsupported);
-        }
-    }
-
-    yarm_user_rt::user_log!(
-        "PM_VFS_REPLY_RECV_BEGIN op={} reply_cap={}",
-        op,
-        reply_recv_cap
-    );
-    match unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) } {
-        Ok(Some(received)) => {
-            let reply = received.message;
-            let payload = reply.as_slice();
-            let preview_len = core::cmp::min(payload.len(), 32);
-            yarm_user_rt::user_log!(
-                "PM_VFS_REPLY_RAW op={} len={} opcode={} flags={} sender_tid={} transferred_cap={} bytes={:x?}",
-                op,
-                reply.len,
-                reply.opcode,
-                reply.flags,
-                received.sender_tid,
-                received.transferred_cap.unwrap_or(0),
-                &payload[..preview_len]
-            );
-            yarm_user_rt::user_log!(
-                "PM_VFS_REPLY op={} status=ok len={} opcode={} flags={}",
-                op,
-                reply.len,
-                reply.opcode,
-                reply.flags
-            );
-            Ok(reply)
-        }
-        Ok(None) => {
-            yarm_user_rt::user_log!(
-                "PM_VFS_REPLY_RECV_FAIL op={} err=timed_out_or_would_block",
-                op
-            );
-            Err(ProcessManagerError::WouldBlock)
-        }
-        Err(e) => {
-            yarm_user_rt::user_log!("PM_VFS_REPLY_RECV_FAIL op={} err={:?}", op, e);
-            Err(ProcessManagerError::Unsupported)
-        }
-    }
-}
-
-/// Phase 3A variant of `pm_vfs_call_u64` that also returns the transferred cap.
+/// One PM → VFS transaction: NR 6, then — only when NR 6 succeeded — one receive on PM's reply
+/// endpoint. VFS-CORRECT1A: any NR 6 failure (`WouldBlock` included) delivered nothing, so it is
+/// returned at once and nothing is received. Returns the reply and whether any capability (a
+/// transferred one or a reply cap) came with it, plus the transferred cap.
 #[cfg(not(test))]
 unsafe fn pm_vfs_call_full(
     vfs_send_cap: u32,
     reply_recv_cap: u32,
     msg: &Message,
-) -> Result<(Message, Option<u32>), ProcessManagerError> {
+) -> Result<(Message, bool, Option<u32>), ProcessManagerError> {
     let op = msg.opcode;
     match unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, msg) } {
         Ok(()) => {
             yarm_user_rt::user_log!("PM_VFS_CALL_SENT op={} status=ok", op);
         }
-        Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
-            yarm_user_rt::user_log!("PM_VFS_CALL_BLOCKED_NORMAL op={}", op);
-        }
         Err(e) => {
-            yarm_user_rt::user_log!("PM_VFS_CALL_FAIL op={} err={:?}", op, e);
-            return Err(ProcessManagerError::Unsupported);
+            yarm_user_rt::user_log!("PM_VFS_CALL_FAIL op={} err={:?} recv=0", op, e);
+            return Err(ProcessManagerError::InvalidTransport);
         }
     }
     match unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) } {
@@ -3169,7 +3103,8 @@ unsafe fn pm_vfs_call_full(
                 received.message.len,
                 transferred_cap.unwrap_or(0)
             );
-            Ok((received.message, transferred_cap))
+            let has_cap = transferred_cap.is_some() || received.reply_cap.is_some();
+            Ok((received.message, has_cap, transferred_cap))
         }
         Ok(None) => {
             yarm_user_rt::user_log!("PM_VFS_REPLY_FULL_FAIL op={} err=no_message", op);
@@ -3177,8 +3112,60 @@ unsafe fn pm_vfs_call_full(
         }
         Err(e) => {
             yarm_user_rt::user_log!("PM_VFS_REPLY_FULL_FAIL op={} err={:?}", op, e);
-            Err(ProcessManagerError::Unsupported)
+            Err(ProcessManagerError::InvalidTransport)
         }
+    }
+}
+
+/// VFS-CORRECT1A: validate a VFS completion for (`op`, `fd`) before PM uses its value, publishes
+/// an fd or consumes a grant. A status maps to a typed error; a malformed completion is
+/// `Malformed`. Not test-gated so the decision is the one production compiles.
+fn pm_vfs_settle(
+    op: u16,
+    fd: u64,
+    payload: &[u8],
+    has_cap: bool,
+) -> Result<u64, (ProcessManagerError, &'static str, u32)> {
+    use yarm_ipc_abi::vfs_abi::{
+        VFS_STATUS_ERR_PERMISSION, VFS_STATUS_ERR_UNSUPPORTED, VfsCompletionExpect,
+        VfsCompletionOutcome, validate_vfs_completion,
+    };
+    let expect = VfsCompletionExpect {
+        op,
+        fd,
+        requested: 0,
+    };
+    match validate_vfs_completion(expect, payload, has_cap) {
+        Ok(VfsCompletionOutcome::Ok { value, .. }) => Ok(value),
+        Ok(VfsCompletionOutcome::Status(status)) => {
+            let err = match status {
+                VFS_STATUS_ERR_UNSUPPORTED => ProcessManagerError::Unsupported,
+                VFS_STATUS_ERR_PERMISSION => ProcessManagerError::PermissionDenied,
+                _ => ProcessManagerError::Malformed,
+            };
+            Err((err, "status", status))
+        }
+        Err(_) => Err((ProcessManagerError::Malformed, "malformed", 0)),
+    }
+}
+
+/// CLOSE `fd` through the VFS; the outcome is logged, never consumed as authority.
+#[cfg(not(test))]
+unsafe fn pm_vfs_close(vfs_send_cap: u32, reply_recv_cap: u32, fd: u64) {
+    let Ok(close_msg) = build_close_message(fd) else {
+        return;
+    };
+    match unsafe { pm_vfs_call_full(vfs_send_cap, reply_recv_cap, &close_msg) } {
+        Ok((reply, has_cap, _)) => {
+            let r = pm_vfs_settle(
+                yarm_ipc_abi::vfs_abi::VFS_OP_CLOSE,
+                fd,
+                reply.as_slice(),
+                has_cap,
+            );
+            yarm_user_rt::user_log!("PM_VFS_CLOSE fd={} ok={}", fd, u32::from(r.is_ok()));
+        }
+        Err(e) => yarm_user_rt::user_log!("PM_VFS_CLOSE fd={} ok=0 err={:?}", fd, e),
     }
 }
 
@@ -3207,37 +3194,35 @@ unsafe fn pm_try_grant_ro_and_spawn(
 
     // ── 1. OPENAT via VFS to get fd ──────────────────────────────────────────
     let open_msg = build_openat_message(vfs_path, 0).map_err(|_| ProcessManagerError::Malformed)?;
-    let open_reply = match unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &open_msg) } {
-        Ok(r) => r,
-        Err(e) => {
+    let (open_reply, open_has_cap, _) =
+        match unsafe { pm_vfs_call_full(vfs_send_cap, reply_recv_cap, &open_msg) } {
+            Ok(r) => r,
+            Err(e) => {
+                yarm_user_rt::user_log!(
+                    "PM_ELF_ZC_FAIL image_id={} reason=openat_fail err={:?}",
+                    image_id,
+                    e
+                );
+                return Err(e);
+            }
+        };
+    // VFS-CORRECT1A: the fd is published only from a validated OPENAT completion.
+    let fd = match pm_vfs_settle(
+        yarm_ipc_abi::vfs_abi::VFS_OP_OPENAT,
+        0,
+        open_reply.as_slice(),
+        open_has_cap,
+    ) {
+        Ok(fd) => fd,
+        Err((err, kind, status)) => {
             yarm_user_rt::user_log!(
-                "PM_ELF_ZC_FAIL image_id={} reason=openat_fail err={:?}",
+                "PM_ELF_ZC_FAIL image_id={} reason=openat_{} status={} payload_len={}",
                 image_id,
-                e
+                kind,
+                status,
+                open_reply.as_slice().len()
             );
-            return Err(e);
-        }
-    };
-    let fd = match decode_u64(open_reply.as_slice()) {
-        Some(v) => v,
-        None => {
-            let reply_payload = open_reply.as_slice();
-            let b0 = reply_payload.first().copied().unwrap_or(0xff);
-            let b1 = reply_payload.get(1).copied().unwrap_or(0xff);
-            let b2 = reply_payload.get(2).copied().unwrap_or(0xff);
-            let b3 = reply_payload.get(3).copied().unwrap_or(0xff);
-            yarm_user_rt::user_log!(
-                "PM_ELF_ZC_FAIL image_id={} reason=bad_fd_decode opcode={} flags={} payload_len={} bytes=[{:02x},{:02x},{:02x},{:02x}]",
-                image_id,
-                open_reply.opcode,
-                open_reply.flags,
-                reply_payload.len(),
-                b0,
-                b1,
-                b2,
-                b3
-            );
-            return Err(ProcessManagerError::Malformed);
+            return Err(err);
         }
     };
     yarm_user_rt::user_log!("PM_VFS_GRANT_RO_OPENAT image_id={} fd={}", image_id, fd);
@@ -3253,7 +3238,7 @@ unsafe fn pm_try_grant_ro_and_spawn(
     )
     .map_err(|_| ProcessManagerError::Malformed)?;
 
-    let (grant_reply, transferred_cap) =
+    let (grant_reply, grant_has_cap, transferred_cap) =
         match unsafe { pm_vfs_call_full(vfs_send_cap, reply_recv_cap, &grant_msg) } {
             Ok(r) => r,
             Err(e) => {
@@ -3268,43 +3253,48 @@ unsafe fn pm_try_grant_ro_and_spawn(
                     e
                 );
                 // Close fd on error.
-                if let Ok(close_msg) = build_close_message(fd) {
-                    let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
-                }
+                unsafe { pm_vfs_close(vfs_send_cap, reply_recv_cap, fd) };
                 return Err(e);
             }
         };
 
-    // Check reply status: non-zero opcode or no transferred cap → unsupported.
-    if grant_reply.opcode != 0 || transferred_cap.is_none() {
-        yarm_user_rt::user_log!(
-            "PM_ELF_ZC_FAIL image_id={} reason=grant_ro_unsupported opcode={} has_cap={}",
-            image_id,
-            grant_reply.opcode,
-            transferred_cap.is_some()
-        );
-        yarm_user_rt::user_log!(
-            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=mo_create err=grant_ro_unsupported",
-            image_id
-        );
-        if let Ok(close_msg) = build_close_message(fd) {
-            let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+    // VFS-CORRECT1A: status, operation, fd echo and capability shape are validated before the
+    // grant is consumed. NR 7 does not carry the opcode, so the old `opcode != 0` check never saw
+    // an error; the status is in the completion.
+    let file_len = match pm_vfs_settle(
+        yarm_ipc_abi::vfs_abi::VFS_OP_FILE_GRANT_RO,
+        fd,
+        grant_reply.as_slice(),
+        grant_has_cap,
+    ) {
+        Ok(len) => len,
+        Err((err, kind, status)) => {
+            yarm_user_rt::user_log!(
+                "PM_ELF_ZC_FAIL image_id={} reason=grant_ro_{} status={} has_cap={}",
+                image_id,
+                kind,
+                status,
+                u32::from(grant_has_cap)
+            );
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=mo_create err=grant_ro_{}",
+                image_id,
+                kind
+            );
+            unsafe { pm_vfs_close(vfs_send_cap, reply_recv_cap, fd) };
+            return Err(err);
         }
-        return Err(ProcessManagerError::Unsupported);
-    }
-
-    let mo_cap = transferred_cap.unwrap();
-
-    // Decode file_len from reply payload.
-    let reply_payload = grant_reply.as_slice();
-    let file_grant_reply = yarm_ipc_abi::vfs_abi::FileGrantRoReply::decode(reply_payload);
-    let file_len = file_grant_reply.map(|r| r.file_len).unwrap_or(0);
-    if file_grant_reply.is_none() {
+    };
+    let Some(mo_cap) = transferred_cap else {
+        // A reply cap where the MemoryObject belongs: validated as a capability, but not one PM
+        // can spawn from.
         yarm_user_rt::user_log!(
-            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=reply_decode err=grant_ro_reply_decode",
+            "PM_ELF_ZC_FAIL image_id={} reason=grant_ro_no_transferred_cap",
             image_id
         );
-    }
+        unsafe { pm_vfs_close(vfs_send_cap, reply_recv_cap, fd) };
+        return Err(ProcessManagerError::Malformed);
+    };
 
     yarm_user_rt::user_log!(
         "PM_VFS_GRANT_RO_RECEIVED image_id={} len={} cap={}",
@@ -3314,9 +3304,7 @@ unsafe fn pm_try_grant_ro_and_spawn(
     );
 
     // Close fd — we have the cap now.
-    if let Ok(close_msg) = build_close_message(fd) {
-        let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
-    }
+    unsafe { pm_vfs_close(vfs_send_cap, reply_recv_cap, fd) };
 
     // ── 3. Spawn from MemoryObject cap (kernel syscall nr=29) ────────────────
     // SAFETY: mo_cap is a valid MemoryObject cap minted by the kernel.
@@ -3362,16 +3350,6 @@ unsafe fn pm_try_grant_ro_and_spawn(
             Err(ProcessManagerError::Malformed)
         }
     }
-}
-
-// decode_u64: NOT gated by #[cfg(not(test))] so unit tests can call it directly.
-fn decode_u64(payload: &[u8]) -> Option<u64> {
-    if payload.len() < 8 {
-        return None;
-    }
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&payload[..8]);
-    Some(u64::from_le_bytes(b))
 }
 
 /// Map image_id (7/8/9) → bare CPIO entry name (no leading slash).
@@ -4927,46 +4905,6 @@ mod tests {
         assert_eq!(result, data);
     }
 
-    // ── OPENAT reply decode unit tests ────────────────────────────────────────
-
-    #[test]
-    fn openat_reply_8_byte_le_fd13_decodes_correctly() {
-        // QEMU proof: VFS sends bytes=[d, 0, 0, 0, 0, 0, 0, 0] for fd=13.
-        let payload = [0x0du8, 0, 0, 0, 0, 0, 0, 0];
-        let result = decode_u64(&payload);
-        assert_eq!(result, Some(13), "fd=13 must decode from 8-byte LE payload");
-    }
-
-    #[test]
-    fn openat_reply_bad_length_returns_none() {
-        // A 7-byte payload is too short; decode_u64 must return None so the
-        // caller logs PM_VFS_SPAWN_FAIL stage=after-openat reason=bad_fd_decode.
-        let payload = [0x0du8, 0, 0, 0, 0, 0, 0];
-        let result = decode_u64(&payload);
-        assert_eq!(result, None, "7-byte payload must return None");
-    }
-
-    #[test]
-    fn openat_reply_empty_returns_none() {
-        let result = decode_u64(&[]);
-        assert_eq!(result, None, "empty payload must return None");
-    }
-
-    #[test]
-    fn openat_reply_fd_zero_decodes_to_zero() {
-        // fd=0 is a valid u64; the protocol layer may treat it as invalid but
-        // decode_u64 itself must not reject it — callers decide the contract.
-        let payload = [0u8; 8];
-        let result = decode_u64(&payload);
-        assert_eq!(result, Some(0), "fd=0 must decode to 0");
-    }
-
-    #[test]
-    fn openat_reply_extra_bytes_ignored_on_decode() {
-        // A longer-than-8-byte payload is accepted; only the first 8 bytes matter.
-        let mut payload = [0u8; 16];
-        payload[0] = 0x0d; // fd=13
-        let result = decode_u64(&payload);
-        assert_eq!(result, Some(13), "extra bytes beyond 8 must be ignored");
-    }
+    // VFS-CORRECT1A: the 8-byte OPENAT decode tests went with `decode_u64`; PM now validates a
+    // completion through `yarm_ipc_abi::vfs_abi::validate_vfs_completion` (tested there).
 }

@@ -45,9 +45,8 @@ fn run_resident_service_loop(svc: &mut Ext4Service) {
                     let Some(reply_cap) = received.reply_cap else {
                         continue;
                     };
-                    let response = svc.handle(msg).unwrap_or_else(|_| {
-                        yarm_user_rt::ipc::Message::new(1, &[]).expect("err-reply")
-                    });
+                    // VFS-CORRECT1A: router-forwarded operations are answered with a payload completion.
+                    let response = svc.handle_completion(msg);
                     let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
                 }
                 _ => {

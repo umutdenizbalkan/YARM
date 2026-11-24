@@ -261,6 +261,8 @@ riscv-ecall-witness = ["printk-witness-ring"]
 futex-time-witness = ["printk-witness-ring"]
 # FUTEX-SYNC-TIME1: accepted and inert here (init's cell; the kernel side is futex-time-witness).
 futex-sync-witness = []
+# VFS-CORRECT1A — init's read-path witness; accepted and inert in this package.
+vfs-correct-witness = []
 # FUTEX-SEAL1 — the live futex seal witness (default off): the kernel half `kernel::seal_witness`
 # (the budget sequence's one induced exhaustion and its record) on top of the FUTEX-TIME1 markers;
 # init's cell is the same-named feature of yarm-control-plane-servers.

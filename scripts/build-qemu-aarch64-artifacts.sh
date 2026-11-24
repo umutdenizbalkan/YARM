@@ -167,6 +167,7 @@ common_stage_ramfs_server_elf || true
 common_stage_fat_server_elf || true
 common_stage_ext4_server_elf || true
 common_stage_crash_test_server_elf || true
+common_stage_vfs_fixture
 common_verify_initramfs_stage_paths
 # Phase 3B: use 4096-byte-aligned packer so late-service ELFs can be zero-copy loaded.
 common_create_initramfs_aligned

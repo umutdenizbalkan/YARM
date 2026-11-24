@@ -124,6 +124,11 @@ PM may fall back from `VFS_OP_FILE_GRANT_RO` (Phase 3A/3B path) to
 This allows a Phase 3A/3B PM binary to boot on an older kernel that lacks syscall
 nr=28 or nr=29.
 
+**VFS-CORRECT1A note.** NR 7 does not carry a reply opcode, so no VFS reply status lives there:
+replies to forwarded VFS operations are payload completions (`doc/VFS.md` §3.1), and
+"Unsupported" is the completion status `VFS_STATUS_ERR_UNSUPPORTED`. Since Stage 197A there is no
+byte-copy fallback at all; PM treats every grant failure as fatal for that image.
+
 ### 3.2 Hard errors on the grant-RO path are fatal — do not silently fall back
 
 The following responses from `VFS_OP_FILE_GRANT_RO` must **never** trigger a silent

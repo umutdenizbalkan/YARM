@@ -962,6 +962,120 @@ impl<B: VfsBackend> VfsService<B> {
         self.op_sequence = self.op_sequence.saturating_add(1);
         reply.to_message()
     }
+
+    /// VFS-CORRECT1A: the reply a resident server sends over NR 7 for `request`.
+    ///
+    /// STATX, OPENAT, CLOSE and READ — the operations the router forwards — are answered with a
+    /// payload-level completion (`yarm_ipc_abi::vfs_abi::VfsCompletion`): the status, the
+    /// operation and the request's fd travel in the payload, because NR 7 does not carry the
+    /// opcode. A READ asks the backend for at most `VFS_INLINE_READ_MAX` bytes, so the backend
+    /// advances its cursor only by the bytes this one completion delivers, and the completion
+    /// carries exactly those bytes; a backend that reports a count without bytes answers
+    /// `VFS_STATUS_ERR_UNSUPPORTED`, never a success. Every other operation keeps its existing
+    /// reply (`handle_request`, or an empty opcode-1 message on error).
+    pub fn handle_completion(&mut self, request: Message) -> Message {
+        use yarm_ipc_abi::vfs_abi::{
+            VFS_INLINE_READ_MAX, VFS_STATUS_ERR_UNSUPPORTED, VfsCompletion,
+        };
+        let op = request.opcode;
+        let completion = |c: VfsCompletion, data: &[u8]| {
+            let (payload, len) = c.encode(data).unwrap_or_else(|| {
+                VfsCompletion::err(c.op, VFS_STATUS_ERR_UNSUPPORTED, c.fd)
+                    .encode(&[])
+                    .expect("header")
+            });
+            Message::with_header(0, 0, 0, None, &payload[..len]).expect("completion fits one reply")
+        };
+        match op {
+            VFS_OP_READ => {
+                let args = match ReadWriteArgs::decode(request.as_slice()) {
+                    Ok(args) => args,
+                    Err(_) => {
+                        return completion(
+                            VfsCompletion::err(op, vfs_status_for_error(VfsError::Malformed), 0),
+                            &[],
+                        );
+                    }
+                };
+                let cap = core::cmp::min(args.len, VFS_INLINE_READ_MAX as u64) as usize;
+                let mut inline = [0u8; VFS_INLINE_READ_MAX];
+                match self
+                    .backend
+                    .read_into(args.fd, cap as u64, &mut inline[..cap])
+                {
+                    Ok((count, inline_len)) if count == inline_len as u64 && inline_len <= cap => {
+                        self.op_sequence = self.op_sequence.saturating_add(1);
+                        completion(VfsCompletion::ok(op, count, args.fd), &inline[..inline_len])
+                    }
+                    Ok(_) => completion(
+                        VfsCompletion::err(op, VFS_STATUS_ERR_UNSUPPORTED, args.fd),
+                        &[],
+                    ),
+                    Err(err) => completion(
+                        VfsCompletion::err(op, vfs_status_for_error(err), args.fd),
+                        &[],
+                    ),
+                }
+            }
+            VFS_OP_STATX | VFS_OP_OPENAT | VFS_OP_CLOSE => {
+                let fd = if op == VFS_OP_CLOSE {
+                    match VfsV1Args::decode(request.as_slice()) {
+                        Ok(args) => args.arg0,
+                        Err(_) => {
+                            return completion(
+                                VfsCompletion::err(
+                                    op,
+                                    vfs_status_for_error(VfsError::Malformed),
+                                    0,
+                                ),
+                                &[],
+                            );
+                        }
+                    }
+                } else {
+                    0
+                };
+                match self.handle_request(request) {
+                    Ok(reply) => match reply.as_slice().get(..8) {
+                        Some(b) => {
+                            let mut v = [0u8; 8];
+                            v.copy_from_slice(b);
+                            completion(VfsCompletion::ok(op, u64::from_le_bytes(v), fd), &[])
+                        }
+                        None => {
+                            completion(VfsCompletion::err(op, VFS_STATUS_ERR_UNSUPPORTED, fd), &[])
+                        }
+                    },
+                    Err(err) => {
+                        completion(VfsCompletion::err(op, vfs_status_for_error(err), fd), &[])
+                    }
+                }
+            }
+            _ => self
+                .handle_request(request)
+                .unwrap_or_else(|_| Message::new(1, &[]).expect("err msg")),
+        }
+    }
+}
+
+/// VFS-CORRECT1A: the `VFS_STATUS_ERR_*` a completion carries for a backend error.
+pub const fn vfs_status_for_error(err: VfsError) -> u32 {
+    use yarm_ipc_abi::vfs_abi::{
+        VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC, VFS_STATUS_ERR_INVALID_PATH,
+        VFS_STATUS_ERR_NO_FD, VFS_STATUS_ERR_NO_MOUNT, VFS_STATUS_ERR_PERMISSION,
+        VFS_STATUS_ERR_UNSUPPORTED,
+    };
+    match err {
+        VfsError::Malformed => VFS_STATUS_ERR_CODEC,
+        VfsError::InvalidPath | VfsError::NameTooLong => VFS_STATUS_ERR_INVALID_PATH,
+        VfsError::NoFd => VFS_STATUS_ERR_NO_FD,
+        VfsError::BadFd => VFS_STATUS_ERR_BAD_FD,
+        VfsError::Unsupported => VFS_STATUS_ERR_UNSUPPORTED,
+        VfsError::PermissionDenied => VFS_STATUS_ERR_PERMISSION,
+        VfsError::MountConflict | VfsError::MountNotFound | VfsError::MountFailed => {
+            VFS_STATUS_ERR_NO_MOUNT
+        }
+    }
 }
 
 #[cfg(test)]

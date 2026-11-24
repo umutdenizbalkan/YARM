@@ -190,9 +190,8 @@ pub fn run() {
                         }
                     }
 
-                    let response = svc.handle(msg).unwrap_or_else(|_| {
-                        yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")
-                    });
+                    // VFS-CORRECT1A: router-forwarded operations are answered with a payload completion.
+                    let response = svc.handle_completion(msg);
                     if msg.opcode == VFS_OP_STATX {
                         yarm_user_rt::user_log!("DEVFS_STATX_REPLY size={}", response.len);
                     }

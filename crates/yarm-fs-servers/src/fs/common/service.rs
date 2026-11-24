@@ -37,6 +37,13 @@ impl<B: VfsBackend> FsService<B> {
         self.handled = self.handled.saturating_add(1);
         Ok(reply)
     }
+
+    /// VFS-CORRECT1A: the NR 7 reply for `request` (see `VfsService::handle_completion`).
+    pub fn handle_completion(&mut self, request: Message) -> Message {
+        let reply = self.inner.handle_completion(request);
+        self.handled = self.handled.saturating_add(1);
+        reply
+    }
 }
 
 impl<B: VfsBackend> RequestResponseService<Message, Message> for FsService<B> {

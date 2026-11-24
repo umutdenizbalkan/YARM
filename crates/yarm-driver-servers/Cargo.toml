@@ -61,6 +61,8 @@ riscv-ecall-witness = []
 futex-time-witness = []
 # FUTEX-SYNC-TIME1: accepted and inert here (init's cell; the kernel side is futex-time-witness).
 futex-sync-witness = []
+# VFS-CORRECT1A — init's read-path witness; accepted and inert in this package.
+vfs-correct-witness = []
 # FUTEX-SEAL1: accepted and inert here (init's cell; the kernel side is the root crate's feature).
 futex-seal-witness = []
 # FUTEX-SEAL1: init's per-sequence cell selectors; accepted and inert here.

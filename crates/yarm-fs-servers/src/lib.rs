@@ -877,12 +877,13 @@ mod stage89_tests {
     }
 
     #[test]
-    fn stage89_initramfs_max_inodes_is_15() {
-        // Validates that the inode table covers ext4_srv plus the gated crash-test path.
+    fn stage89_initramfs_max_inodes_is_16() {
+        // Validates that the inode table covers ext4_srv, the gated crash-test path and (since
+        // VFS-CORRECT1A) the read fixture `/initramfs/etc/vfs-fixture`.
         let src = include_str!("fs/initramfs/archive.rs");
         assert!(
-            src.contains("const MAX_INITRAMFS_INODES: usize = 15;"),
-            "MAX_INITRAMFS_INODES must be 15 after adding the gated crash-test path"
+            src.contains("const MAX_INITRAMFS_INODES: usize = 16;"),
+            "MAX_INITRAMFS_INODES must be 16 after adding the VFS read fixture"
         );
     }
 
@@ -988,20 +989,18 @@ mod stage89_tests {
 
     #[test]
     fn stage89_pm_bad_fd_decode_log_includes_diagnostic_fields() {
+        // VFS-CORRECT1A: PM publishes the OPENAT fd only from a validated completion; a rejected
+        // one is logged with its kind (status or malformed), status and payload length.
         let pm_src = include_str!(
             "../../yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
         );
         assert!(
-            pm_src.contains("reason=bad_fd_decode opcode="),
-            "PM bad_fd_decode log must include opcode field for diagnostics"
+            pm_src.contains("pm_vfs_settle(") && pm_src.contains("validate_vfs_completion("),
+            "PM must validate the OPENAT completion before using the fd"
         );
         assert!(
-            pm_src.contains("payload_len="),
-            "PM bad_fd_decode log must include payload_len field for diagnostics"
-        );
-        assert!(
-            pm_src.contains("bytes=["),
-            "PM bad_fd_decode log must include raw bytes for diagnostics"
+            pm_src.contains("reason=openat_{} status={} payload_len={}"),
+            "PM openat decode failure log must carry kind, status and payload_len"
         );
     }
 
@@ -1600,17 +1599,17 @@ mod stage91_tests {
 
     #[test]
     fn stage91_initramfs_max_inodes_covers_all_sbin_servers() {
-        // MAX_INITRAMFS_INODES = 15 must cover all registered inodes including
-        // the normal sbin servers and the gated crash-test server path.
+        // MAX_INITRAMFS_INODES = 16 must cover all registered inodes including
+        // the normal sbin servers, the gated crash-test server path and the read fixture.
         let src = include_str!("fs/initramfs/archive.rs");
         assert!(
             src.contains("MAX_INITRAMFS_INODES"),
             "archive.rs must define MAX_INITRAMFS_INODES"
         );
-        // Verify 15 is the current constant value.
+        // Verify 16 is the current constant value.
         assert!(
-            src.contains("const MAX_INITRAMFS_INODES: usize = 15"),
-            "MAX_INITRAMFS_INODES must equal 15 after reserving crash_test_srv"
+            src.contains("const MAX_INITRAMFS_INODES: usize = 16"),
+            "MAX_INITRAMFS_INODES must equal 16 after reserving the VFS read fixture"
         );
     }
 
@@ -1950,18 +1949,22 @@ mod stage92_tests {
 
     #[test]
     fn stage92_vfs_client_ipc_helpers_decode_via_received_message_field() {
-        // After switching to ipc_recv_v2, callers must pass &received.message
-        // to decode_reply_u64, not &received (which is ReceivedMessage, not Message).
-        let ipc_section_start = VFS_CLIENT_SRC
-            .find("// ── IPC helpers")
-            .expect("IPC helpers section comment must be present");
+        // After switching to ipc_recv_v2, the reply is decoded from `received.message` (a
+        // `Message`), not from the `ReceivedMessage`. VFS-CORRECT1A: the decode is the shared
+        // completion validator, and it also sees whether a capability arrived.
         let test_start = VFS_CLIENT_SRC
             .find("#[cfg(test)]")
             .unwrap_or(VFS_CLIENT_SRC.len());
-        let ipc_section = &VFS_CLIENT_SRC[ipc_section_start..test_start];
+        let non_test = &VFS_CLIENT_SRC[..test_start];
         assert!(
-            ipc_section.contains("decode_reply_u64(&received.message)"),
-            "vfs_client.rs IPC helpers must call decode_reply_u64(&received.message)"
+            non_test.contains("validate_vfs_completion(")
+                && non_test.contains("received.message.as_slice()")
+                && non_test.contains("received.transferred_cap.is_some()"),
+            "vfs_client.rs must validate received.message as a completion, with its cap shape"
+        );
+        assert!(
+            !non_test.contains("let _ = unsafe { crate::syscall::ipc_call("),
+            "vfs_client.rs must not discard the NR 6 result"
         );
     }
 

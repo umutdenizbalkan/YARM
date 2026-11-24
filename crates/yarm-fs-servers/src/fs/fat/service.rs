@@ -41,6 +41,17 @@ impl FatService {
         self.inner.backend_mut()
     }
 
+    /// VFS-CORRECT1A: the NR 7 reply for `request`. The inline write keeps its own reply; every
+    /// other operation goes through `FsService::handle_completion`.
+    pub fn handle_completion(&mut self, request: Message) -> Message {
+        if request.opcode == VFS_OP_WRITE_INLINE {
+            return self
+                .handle(request)
+                .unwrap_or_else(|_| Message::new(1, &[]).expect("err-reply"));
+        }
+        self.inner.handle_completion(request)
+    }
+
     pub fn handle(&mut self, request: Message) -> Result<Message, VfsError> {
         if request.opcode != VFS_OP_WRITE_INLINE {
             return self.inner.handle(request);
@@ -352,9 +363,8 @@ fn run_resident_service_loop(svc: &mut FatService) {
                     let Some(reply_cap) = received.reply_cap else {
                         continue;
                     };
-                    let response = svc.handle(msg).unwrap_or_else(|_| {
-                        yarm_user_rt::ipc::Message::new(1, &[]).expect("err-reply")
-                    });
+                    // VFS-CORRECT1A: router-forwarded operations are answered with a payload completion.
+                    let response = svc.handle_completion(msg);
                     let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
                 }
                 _ => {

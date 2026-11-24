@@ -35,9 +35,11 @@ pub const INITRAMFS_FAT_SRV_PATH: &[u8] = b"/initramfs/sbin/fat_srv";
 pub const INITRAMFS_RAMFS_SRV_PATH: &[u8] = b"/initramfs/sbin/ramfs_srv";
 pub const INITRAMFS_EXT4_SRV_PATH: &[u8] = b"/initramfs/sbin/ext4_srv";
 pub const INITRAMFS_CRASH_TEST_SRV_PATH: &[u8] = b"/initramfs/sbin/crash_test_srv";
+/// VFS-CORRECT1A: the read fixture (`scripts/fixtures/vfs-fixture.bin`, archive `etc/vfs-fixture`).
+pub const INITRAMFS_VFS_FIXTURE_PATH: &[u8] = b"/initramfs/etc/vfs-fixture";
 
 const MAX_INITRAMFS_HANDLES: usize = 16;
-const MAX_INITRAMFS_INODES: usize = 15;
+const MAX_INITRAMFS_INODES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InitramfsInode {
@@ -144,6 +146,10 @@ impl InitramfsBackend {
                     path: INITRAMFS_CRASH_TEST_SRV_PATH,
                     file_len: 0,
                 }),
+                Some(InitramfsInode {
+                    path: INITRAMFS_VFS_FIXTURE_PATH,
+                    file_len: 0,
+                }),
             ],
             metrics: InitramfsMetrics {
                 open_count: 0,
@@ -183,6 +189,7 @@ impl InitramfsBackend {
                 b"sbin/ramfs_srv" => INITRAMFS_RAMFS_SRV_PATH,
                 b"sbin/ext4_srv" => INITRAMFS_EXT4_SRV_PATH,
                 b"sbin/crash_test_srv" => INITRAMFS_CRASH_TEST_SRV_PATH,
+                b"etc/vfs-fixture" => INITRAMFS_VFS_FIXTURE_PATH,
                 _ => continue,
             };
             if let Some(idx) = backend.lookup_slot(path) {

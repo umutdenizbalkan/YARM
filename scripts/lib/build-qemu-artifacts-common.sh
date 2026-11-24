@@ -159,9 +159,25 @@ common_emit_build_integrity_line() {
 }
 
 common_prepare_rootfs_dirs() {
-  mkdir -p "$ROOTFS_DIR" "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
+  mkdir -p "$ROOTFS_DIR" "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys" "$ROOTFS_DIR/etc"
   mkdir -p "$(dirname "$INITRAMFS_IMAGE")"
   INITRAMFS_IMAGE_ABS="$(cd "$(dirname "$INITRAMFS_IMAGE")" && pwd)/$(basename "$INITRAMFS_IMAGE")"
+}
+
+# VFS-CORRECT1A: the read fixture (scripts/fixtures/README.md) is staged into every initramfs as
+# etc/vfs-fixture, served by initramfs_srv as /initramfs/etc/vfs-fixture.
+common_stage_vfs_fixture() {
+  local script_dir fixture
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  fixture="${script_dir}/../fixtures/vfs-fixture.bin"
+  if [[ ! -f "$fixture" ]]; then
+    echo "[error] VFS read fixture missing: $fixture"
+    return 1
+  fi
+  mkdir -p "$ROOTFS_DIR/etc"
+  cp "$fixture" "$ROOTFS_DIR/etc/vfs-fixture"
+  touch "$ROOTFS_DIR/etc/vfs-fixture"
+  echo "[ok] staged VFS read fixture: $ROOTFS_DIR/etc/vfs-fixture ($(wc -c < "$fixture") bytes)"
 }
 
 common_stage_server_init_elf() {
@@ -601,7 +617,7 @@ common_stage_crash_test_server_elf() {
 
 common_verify_initramfs_stage_paths() {
   local missing=0
-  local required_paths=("init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor" "sbin/ramfs_srv" "sbin/fat_srv" "sbin/ext4_srv")
+  local required_paths=("init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor" "sbin/ramfs_srv" "sbin/fat_srv" "sbin/ext4_srv" "etc/vfs-fixture")
   if common_supervisor_restart_test_enabled; then
     required_paths+=("sbin/crash_test_srv")
   fi

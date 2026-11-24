@@ -31,6 +31,251 @@ pub const VFS_STATUS_ERR_BAD_FD: u32 = 4;
 pub const VFS_STATUS_ERR_BACKEND: u32 = 5;
 /// READ/CLOSE payload could not be decoded.
 pub const VFS_STATUS_ERR_CODEC: u32 = 6;
+/// VFS-CORRECT1A: the operation is not supported by this backend, including a backend that has no
+/// byte source for a READ (it would report a count without bytes).
+pub const VFS_STATUS_ERR_UNSUPPORTED: u32 = 7;
+/// VFS-CORRECT1A: the backend's path policy refused the request.
+pub const VFS_STATUS_ERR_PERMISSION: u32 = 8;
+/// VFS-CORRECT1A: no file descriptor is free in the backend.
+pub const VFS_STATUS_ERR_NO_FD: u32 = 9;
+/// VFS-CORRECT1A: the router received a backend completion that failed validation; nothing of it
+/// was relayed.
+pub const VFS_STATUS_ERR_BACKEND_MALFORMED: u32 = 10;
+
+// ── VFS-CORRECT1A: payload-level completion ─────────────────────────────────────
+//
+// NR 7 (IpcReply) delivers the reply's payload bytes and at most one transferred capability; the
+// replier's `Message.opcode` does not reach the caller (the kernel rebuilds the message from the
+// payload). A status kept only in the opcode is therefore lost on the hop. Every reply to an
+// operation the router forwards (STATX, OPENAT, READ, CLOSE, FILE_GRANT_RO), and every
+// router-local error for one, is a completion carried entirely in the payload:
+//
+// ```text
+// offset  size  field
+//      0     2  magic   VFS_COMPLETION_MAGIC (LE)
+//      2     2  op      the VFS_OP_* this completes (LE)
+//      4     4  status  VFS_STATUS_OK or a VFS_STATUS_ERR_* (LE)
+//      8     8  value   OPENAT: fd; READ: byte count; STATX: the statx value; CLOSE: 0;
+//                       FILE_GRANT_RO: file length; always 0 on error (LE)
+//     16     8  fd      the request's fd (READ, CLOSE, FILE_GRANT_RO); 0 for path operations (LE)
+//     24     n  data    READ success only: exactly `value` bytes; empty otherwise
+// ```
+//
+// The reply carries a transferred capability exactly when it is a successful FILE_GRANT_RO.
+
+/// Marks a payload as a VFS completion (`b"VC"` little-endian).
+pub const VFS_COMPLETION_MAGIC: u16 = 0x4356;
+/// Bytes of the completion header before any READ data.
+pub const VFS_COMPLETION_HEADER_LEN: usize = 24;
+/// Largest NR 7 reply payload (`Message::MAX_PAYLOAD`; NR 7 prepends nothing).
+pub const VFS_REPLY_PAYLOAD_MAX: usize = 128;
+/// NR 6 (IpcCall) carries the 2-byte application opcode in front of the request payload, inside
+/// the same 128-byte limit.
+pub const VFS_CALL_OPCODE_PREFIX_LEN: usize = 2;
+/// Largest request payload one NR 6 call can carry.
+pub const VFS_REQUEST_PAYLOAD_MAX: usize = VFS_REPLY_PAYLOAD_MAX - VFS_CALL_OPCODE_PREFIX_LEN;
+/// Largest READ count one completion can carry: the reply limit less the completion header.
+pub const VFS_INLINE_READ_MAX: usize = VFS_REPLY_PAYLOAD_MAX - VFS_COMPLETION_HEADER_LEN;
+const _: () = assert!(VfsV1Args::ENCODED_LEN <= VFS_REQUEST_PAYLOAD_MAX);
+const _: () = assert!(VFS_INLINE_READ_MAX == 104);
+
+/// One decoded completion header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VfsCompletion {
+    pub op: u16,
+    pub status: u32,
+    pub value: u64,
+    pub fd: u64,
+}
+
+/// Why a payload is not a valid completion for the request it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsCompletionFault {
+    /// Shorter than the completion header.
+    Truncated,
+    /// The payload does not start with `VFS_COMPLETION_MAGIC`.
+    BadMagic,
+    /// The completion names another operation.
+    WrongOp { expected: u16, got: u16 },
+    /// The completion names another file descriptor than the request's.
+    WrongFd { expected: u64, got: u64 },
+    /// An error completion carries a nonzero value.
+    ErrorWithValue,
+    /// Bytes follow the header of a completion that carries none.
+    UnexpectedData,
+    /// A READ count that is not the number of bytes carried.
+    CountMismatch { count: u64, data_len: usize },
+    /// A READ count larger than the request asked for, or than one completion can carry.
+    CountExceedsRequest { count: u64, requested: u64 },
+    /// A capability arrived where none belongs.
+    UnexpectedCap,
+    /// A successful FILE_GRANT_RO arrived without its capability.
+    MissingCap,
+}
+
+/// What the caller expects a completion to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VfsCompletionExpect {
+    pub op: u16,
+    /// The request's fd for READ, CLOSE and FILE_GRANT_RO; 0 for STATX and OPENAT.
+    pub fd: u64,
+    /// READ only: the length the request asked for (at most `VFS_INLINE_READ_MAX`).
+    pub requested: u64,
+}
+
+/// A validated completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsCompletionOutcome<'a> {
+    /// `value` per the layout; `data` is the READ bytes (exactly `value` of them), empty otherwise.
+    Ok { value: u64, data: &'a [u8] },
+    /// The router or the backend reported this status; nothing else was carried.
+    Status(u32),
+}
+
+impl VfsCompletion {
+    pub const fn ok(op: u16, value: u64, fd: u64) -> Self {
+        Self {
+            op,
+            status: VFS_STATUS_OK,
+            value,
+            fd,
+        }
+    }
+
+    pub const fn err(op: u16, status: u32, fd: u64) -> Self {
+        Self {
+            op,
+            status,
+            value: 0,
+            fd,
+        }
+    }
+
+    /// Encode the header followed by `data`. `None` if `data` does not fit one reply.
+    pub fn encode(self, data: &[u8]) -> Option<([u8; VFS_REPLY_PAYLOAD_MAX], usize)> {
+        if data.len() > VFS_INLINE_READ_MAX {
+            return None;
+        }
+        let mut out = [0u8; VFS_REPLY_PAYLOAD_MAX];
+        out[0..2].copy_from_slice(&VFS_COMPLETION_MAGIC.to_le_bytes());
+        out[2..4].copy_from_slice(&self.op.to_le_bytes());
+        out[4..8].copy_from_slice(&self.status.to_le_bytes());
+        out[8..16].copy_from_slice(&self.value.to_le_bytes());
+        out[16..24].copy_from_slice(&self.fd.to_le_bytes());
+        out[24..24 + data.len()].copy_from_slice(data);
+        Some((out, VFS_COMPLETION_HEADER_LEN + data.len()))
+    }
+
+    /// Decode the header; the rest of `payload` is returned as the data.
+    pub fn decode(payload: &[u8]) -> Result<(Self, &[u8]), VfsCompletionFault> {
+        if payload.len() < VFS_COMPLETION_HEADER_LEN {
+            return Err(VfsCompletionFault::Truncated);
+        }
+        let u16_at = |at: usize| u16::from_le_bytes([payload[at], payload[at + 1]]);
+        let u32_at = |at: usize| {
+            u32::from_le_bytes([
+                payload[at],
+                payload[at + 1],
+                payload[at + 2],
+                payload[at + 3],
+            ])
+        };
+        let u64_at = |at: usize| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&payload[at..at + 8]);
+            u64::from_le_bytes(b)
+        };
+        if u16_at(0) != VFS_COMPLETION_MAGIC {
+            return Err(VfsCompletionFault::BadMagic);
+        }
+        Ok((
+            Self {
+                op: u16_at(2),
+                status: u32_at(4),
+                value: u64_at(8),
+                fd: u64_at(16),
+            },
+            &payload[VFS_COMPLETION_HEADER_LEN..],
+        ))
+    }
+}
+
+/// Validate a reply payload (and whether a capability came with it) against the request it answers.
+///
+/// Everything is checked before the caller copies a byte, publishes an fd or consumes a grant:
+/// the header, the operation, the fd echo, the status, the READ count against the request and the
+/// bytes actually carried, and the capability shape.
+pub fn validate_vfs_completion(
+    expect: VfsCompletionExpect,
+    payload: &[u8],
+    has_cap: bool,
+) -> Result<VfsCompletionOutcome<'_>, VfsCompletionFault> {
+    let (c, data) = VfsCompletion::decode(payload)?;
+    if c.op != expect.op {
+        return Err(VfsCompletionFault::WrongOp {
+            expected: expect.op,
+            got: c.op,
+        });
+    }
+    if c.fd != expect.fd {
+        return Err(VfsCompletionFault::WrongFd {
+            expected: expect.fd,
+            got: c.fd,
+        });
+    }
+    if c.status != VFS_STATUS_OK {
+        if c.value != 0 {
+            return Err(VfsCompletionFault::ErrorWithValue);
+        }
+        if !data.is_empty() {
+            return Err(VfsCompletionFault::UnexpectedData);
+        }
+        if has_cap {
+            return Err(VfsCompletionFault::UnexpectedCap);
+        }
+        return Ok(VfsCompletionOutcome::Status(c.status));
+    }
+    match expect.op {
+        VFS_OP_READ => {
+            let limit = core::cmp::min(expect.requested, VFS_INLINE_READ_MAX as u64);
+            if c.value > limit {
+                return Err(VfsCompletionFault::CountExceedsRequest {
+                    count: c.value,
+                    requested: expect.requested,
+                });
+            }
+            if c.value != data.len() as u64 {
+                return Err(VfsCompletionFault::CountMismatch {
+                    count: c.value,
+                    data_len: data.len(),
+                });
+            }
+            if has_cap {
+                return Err(VfsCompletionFault::UnexpectedCap);
+            }
+        }
+        VFS_OP_FILE_GRANT_RO => {
+            if !data.is_empty() {
+                return Err(VfsCompletionFault::UnexpectedData);
+            }
+            if !has_cap {
+                return Err(VfsCompletionFault::MissingCap);
+            }
+        }
+        _ => {
+            if !data.is_empty() {
+                return Err(VfsCompletionFault::UnexpectedData);
+            }
+            if has_cap {
+                return Err(VfsCompletionFault::UnexpectedCap);
+            }
+        }
+    }
+    Ok(VfsCompletionOutcome::Ok {
+        value: c.value,
+        data,
+    })
+}
 
 /// Encode a VFS control-plane status as a 4-byte little-endian payload.
 pub fn encode_vfs_status(status: u32) -> [u8; 4] {
@@ -1441,5 +1686,241 @@ mod tests {
         assert_eq!(VFS_OP_WRITE, 13);
         assert_eq!(VFS_OP_WRITE_INLINE, 28);
         assert_eq!(VFS_WRITE_INLINE_MAX_BYTES, 96);
+    }
+
+    // ── VFS-CORRECT1A: completion codec and validator ────────────────────────────
+
+    fn read_expect(fd: u64, requested: u64) -> VfsCompletionExpect {
+        VfsCompletionExpect {
+            op: VFS_OP_READ,
+            fd,
+            requested,
+        }
+    }
+
+    fn encoded(c: VfsCompletion, data: &[u8]) -> ([u8; VFS_REPLY_PAYLOAD_MAX], usize) {
+        c.encode(data).expect("encode")
+    }
+
+    #[test]
+    fn vc1a_limits_follow_the_reply_and_request_layouts() {
+        assert_eq!(VFS_REPLY_PAYLOAD_MAX, 128);
+        assert_eq!(VFS_COMPLETION_HEADER_LEN, 24);
+        assert_eq!(VFS_INLINE_READ_MAX, 128 - 24);
+        assert_eq!(VFS_REQUEST_PAYLOAD_MAX, 126);
+        // A READ request (32 bytes) plus NR 6's 2-byte opcode prefix fits one call.
+        assert!(ReadWriteArgs::new(3, 0, 4096).encode().len() + VFS_CALL_OPCODE_PREFIX_LEN <= 128);
+    }
+
+    #[test]
+    fn vc1a_completion_roundtrips_header_and_data() {
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_READ, 3, 14), b"abc");
+        assert_eq!(len, 27);
+        let (c, data) = VfsCompletion::decode(&buf[..len]).expect("decode");
+        assert_eq!(c, VfsCompletion::ok(VFS_OP_READ, 3, 14));
+        assert_eq!(data, b"abc");
+        assert_eq!(&buf[0..2], b"VC");
+    }
+
+    #[test]
+    fn vc1a_encode_refuses_data_beyond_one_reply() {
+        let data = [7u8; VFS_INLINE_READ_MAX + 1];
+        assert!(
+            VfsCompletion::ok(VFS_OP_READ, data.len() as u64, 1)
+                .encode(&data)
+                .is_none()
+        );
+        let data = [7u8; VFS_INLINE_READ_MAX];
+        let (_, len) = encoded(VfsCompletion::ok(VFS_OP_READ, data.len() as u64, 1), &data);
+        assert_eq!(len, VFS_REPLY_PAYLOAD_MAX);
+    }
+
+    #[test]
+    fn vc1a_validate_accepts_an_exact_read() {
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_READ, 4, 9), b"wxyz");
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 50), &buf[..len], false),
+            Ok(VfsCompletionOutcome::Ok {
+                value: 4,
+                data: b"wxyz"
+            })
+        );
+    }
+
+    #[test]
+    fn vc1a_validate_accepts_eof_and_zero_length() {
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_READ, 0, 9), &[]);
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 64), &buf[..len], false),
+            Ok(VfsCompletionOutcome::Ok {
+                value: 0,
+                data: &[]
+            })
+        );
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 0), &buf[..len], false),
+            Ok(VfsCompletionOutcome::Ok {
+                value: 0,
+                data: &[]
+            })
+        );
+    }
+
+    #[test]
+    fn vc1a_validate_rejects_truncated_and_foreign_payloads() {
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_READ, 2, 9), b"hi");
+        for cut in 0..VFS_COMPLETION_HEADER_LEN {
+            assert_eq!(
+                validate_vfs_completion(read_expect(9, 8), &buf[..cut], false),
+                Err(VfsCompletionFault::Truncated)
+            );
+        }
+        // The legacy 8-byte ReadLen reply and the router's legacy 4-byte status are not completions.
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 8), &64u64.to_le_bytes(), false),
+            Err(VfsCompletionFault::Truncated)
+        );
+        let mut legacy = [0u8; 80];
+        legacy[..8].copy_from_slice(&64u64.to_le_bytes());
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 64), &legacy, false),
+            Err(VfsCompletionFault::BadMagic)
+        );
+        // A completion cut inside its data: count no longer matches the bytes carried.
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 8), &buf[..len - 1], false),
+            Err(VfsCompletionFault::CountMismatch {
+                count: 2,
+                data_len: 1
+            })
+        );
+    }
+
+    #[test]
+    fn vc1a_validate_rejects_inconsistent_counts() {
+        // More bytes than the count.
+        let mut c = VfsCompletion::ok(VFS_OP_READ, 2, 9);
+        let (buf, len) = encoded(c, b"abc");
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 8), &buf[..len], false),
+            Err(VfsCompletionFault::CountMismatch {
+                count: 2,
+                data_len: 3
+            })
+        );
+        // A count with no bytes behind it (the baseline defect's shape).
+        c.value = 64;
+        let (buf, len) = encoded(c, &[]);
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 64), &buf[..len], false),
+            Err(VfsCompletionFault::CountMismatch {
+                count: 64,
+                data_len: 0
+            })
+        );
+        // More than the request asked for.
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_READ, 5, 9), b"12345");
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 4), &buf[..len], false),
+            Err(VfsCompletionFault::CountExceedsRequest {
+                count: 5,
+                requested: 4
+            })
+        );
+    }
+
+    #[test]
+    fn vc1a_validate_rejects_wrong_op_and_wrong_fd() {
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_CLOSE, 0, 9), &[]);
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 8), &buf[..len], false),
+            Err(VfsCompletionFault::WrongOp {
+                expected: VFS_OP_READ,
+                got: VFS_OP_CLOSE
+            })
+        );
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_READ, 1, 10), b"x");
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 8), &buf[..len], false),
+            Err(VfsCompletionFault::WrongFd {
+                expected: 9,
+                got: 10
+            })
+        );
+    }
+
+    #[test]
+    fn vc1a_validate_enforces_capability_shape() {
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_READ, 1, 9), b"x");
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 8), &buf[..len], true),
+            Err(VfsCompletionFault::UnexpectedCap)
+        );
+        let grant = VfsCompletionExpect {
+            op: VFS_OP_FILE_GRANT_RO,
+            fd: 9,
+            requested: 0,
+        };
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_FILE_GRANT_RO, 4096, 9), &[]);
+        assert_eq!(
+            validate_vfs_completion(grant, &buf[..len], true),
+            Ok(VfsCompletionOutcome::Ok {
+                value: 4096,
+                data: &[]
+            })
+        );
+        assert_eq!(
+            validate_vfs_completion(grant, &buf[..len], false),
+            Err(VfsCompletionFault::MissingCap)
+        );
+        let (buf, len) = encoded(
+            VfsCompletion::err(VFS_OP_FILE_GRANT_RO, VFS_STATUS_ERR_BAD_FD, 9),
+            &[],
+        );
+        assert_eq!(
+            validate_vfs_completion(grant, &buf[..len], true),
+            Err(VfsCompletionFault::UnexpectedCap)
+        );
+        assert_eq!(
+            validate_vfs_completion(grant, &buf[..len], false),
+            Ok(VfsCompletionOutcome::Status(VFS_STATUS_ERR_BAD_FD))
+        );
+    }
+
+    #[test]
+    fn vc1a_validate_reports_status_and_rejects_error_payloads() {
+        let (buf, len) = encoded(
+            VfsCompletion::err(VFS_OP_READ, VFS_STATUS_ERR_BAD_FD, 9),
+            &[],
+        );
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 8), &buf[..len], false),
+            Ok(VfsCompletionOutcome::Status(VFS_STATUS_ERR_BAD_FD))
+        );
+        let mut c = VfsCompletion::err(VFS_OP_READ, VFS_STATUS_ERR_BAD_FD, 9);
+        c.value = 3;
+        let (buf, len) = encoded(c, &[]);
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 8), &buf[..len], false),
+            Err(VfsCompletionFault::ErrorWithValue)
+        );
+        let (buf, len) = encoded(
+            VfsCompletion::err(VFS_OP_READ, VFS_STATUS_ERR_BAD_FD, 9),
+            b"x",
+        );
+        assert_eq!(
+            validate_vfs_completion(read_expect(9, 8), &buf[..len], false),
+            Err(VfsCompletionFault::UnexpectedData)
+        );
+        let open = VfsCompletionExpect {
+            op: VFS_OP_OPENAT,
+            fd: 0,
+            requested: 0,
+        };
+        let (buf, len) = encoded(VfsCompletion::ok(VFS_OP_OPENAT, 14, 0), b"!");
+        assert_eq!(
+            validate_vfs_completion(open, &buf[..len], false),
+            Err(VfsCompletionFault::UnexpectedData)
+        );
     }
 }

@@ -4488,6 +4488,12 @@ fn run_futex_sync_witness(s_tid: u64) {
     futex_sync_witness::run_once(s_tid, entry);
 }
 
+/// VFS-CORRECT1A — the live read-path witness (`vfs_correct_witness.rs`), run right after init's VFS
+/// smokes when init is built with `vfs-correct-witness`.
+#[cfg(all(not(feature = "hosted-dev"), feature = "vfs-correct-witness"))]
+#[path = "vfs_correct_witness.rs"]
+mod vfs_correct_witness;
+
 /// FUTEX-SEAL1 — the live futex seal cell (`futex_seal_witness.rs`), selector 18 when init is built
 /// with `futex-seal-witness`; it takes precedence over the futex-sync and futex-time cells.
 #[cfg(all(
@@ -10750,6 +10756,10 @@ pub fn run() {
             Err(_) => yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_CALL_RETURN ok=0 fd=0"),
         }
     }
+
+    // VFS-CORRECT1A: the live read-path witness, through the same client wrappers and endpoints.
+    #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-correct-witness"))]
+    vfs_correct_witness::run(vfs_recv_cap as u32, pm_recv);
 
     yarm_user_rt::user_log!("INIT_BLKCACHE_SMOKE_BEGIN");
     let get_info_req = BlkGetInfoRequest { device_id: 0 };
