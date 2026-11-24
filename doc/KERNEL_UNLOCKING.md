@@ -37583,3 +37583,193 @@ in all.
 **Audit findings.** F05 closed. F06 partially closed: the send/reply contract holds for the
 resident VFS read path (client, router forward, backends, PM's VFS calls); other services are not
 covered.
+
+#### VFS-CORRECT1B (from qualified `cfc14b33`)
+
+The second VFS correctness pass, on `wip/vfs-correct1b`. Capability identities are carried full
+width through every production path the mount and grant flows use (audit finding F07), and mount
+registration is authorized by a capability instead of a number (finding F04). The canonical
+contract is `doc/VFS.md` §3.2. Kernel syscall ABI v13 is unchanged in number; NR 23 and NR 29, two
+privileged extensions, changed their return lanes and gained an argument (`doc/SYSCALL_ABI.md`,
+"Within v13 (VFS-CORRECT1B)").
+
+**The baseline defects** (`cfc14b33`, `evidence/baseline/`):
+- **F07.** `CapId = generation << 16 | index` is a `u64` in the kernel, but the user runtime cut
+  every capability to `u32`: startup slots (`cap_from_slot` dropped anything above `u32::MAX`),
+  NR 2 receive metadata (`meta.cap_id as u32`), every call/send/reply wrapper, the VFS client,
+  VFS's mount and fd records, the backends' endpoints and PM's grant relay; and NR 23 / NR 29
+  packed two capabilities into `ret2` as 32-bit halves. Captured live on AArch64 SMP2 with
+  `vc1b-f07-genwitness-probe.patch` (every CNode slot starting at generation 65,537): the
+  supervisor's startup capabilities read as `None` and PM found no receive capability
+  (`PM_STARTUP_CAPS request_send=0 request_recv=0`), so the boot never reached VFS.
+- **F04.** `VFS_OP_MOUNT_REGISTER` carried the backend as a number in the payload: init sent its
+  own slot (`INIT_RAMFS_SPAWN_OK … send_cap=65551`), VFS stored it (`VFS_MOUNT_REGISTER_REQUEST
+  cap=65551`) and routed `/ram` through it in VFS's own CNode, where it named nothing. Captured with
+  `vc1b-f04-probe.patch` (init statx of `/ram/boot`): `VFS_FORWARD_CALL op=22 target=/ram/
+  send_cap=65551`, refused `InvalidCapability` by the kernel — and VFS then blocked forever on the
+  reply, because the NR 6 wrapper read the refusal as success (below). Any client holding the
+  public endpoint could register any number.
+
+**The trace** (integrated boot, AArch64 SMP2, generation witness; every ID is CNode-local):
+
+| step | where | identity |
+|---|---|---|
+| admin endpoint created at VFS's spawn | kernel, for PM (tid 3) | send 4295032851 (PM), recv 4295032852 (PM) |
+| receive side delegated | kernel → VFS slot 17 | 4295032834 (VFS) |
+| send side transferred on the SpawnV5 reply | PM → init | 4295032845 (init) |
+| ramfs service endpoint | init | 4295032848 (init) |
+| staged on the admin endpoint (NR 1, transferred) | init → VFS | 4295032844 (VFS) |
+| published and routed | VFS mount table | 4295032844, 8 `/ram/` forwards |
+| driver_manager grant | initramfs_srv → VFS → PM | 4295032835 (initramfs), relayed by VFS, 4295032853 (PM) |
+| consumed | PM → NR 29 `mo_cap` | 4295032853, `SPAWN_FROM_MO_OK image_id=7 spawned_tid=10003` |
+
+**F07 — the repair.**
+- `yarm-user-rt`: every capability parameter and field is `u64`; `ReceivedMessage` keeps the
+  reply capability, the transferred capability and `NO_TRANSFER_CAP` distinct
+  (`decode_recv_meta_v2`, now pure); `cap_from_slot` keeps any nonzero value;
+  `decode_spawn_return` reads NR 23 / NR 29's three lanes.
+- Every caller followed: init, supervisor, PM, driver_manager, VFS (mount and fd tables, router),
+  blkcache, FAT, ext4, ramfs, initramfs, netmgr, the compat servers and the witnesses.
+- Kernel: NR 23 / NR 29 return `ret0` = the spawner's service SEND capability, `ret1` = TID,
+  `ret2` = the requester's copy, unpacked (`SpawnImageCommitted::{spawner_service_send,
+  requester_service_send}`), on the broad and the split routes.
+- **Packed lanes inventory.** NR 23 and NR 29 were the only packed capability lanes; both are on
+  the required path and both are repaired. No other syscall packs a capability.
+- **The witness.** `cap-gen-witness` (kernel, default off) sets `INITIAL_SLOT_GENERATION` to
+  `0x1_0001` in `CNodeSlots::try_new` / `try_resize`, so every capability the kernel issues on that
+  boot exceeds 2^32 (generation 65,537 or later). Nothing else changes.
+
+**Within the ABI.** NR 23 / NR 29 are privileged extensions, outside the public v13 range; the
+policy allows refining them within v13, so `SYSCALL_ABI_VERSION` stays 13. NR 23 has no class or
+TID gate, so every caller sees the new lanes; every in-tree caller moved. No public syscall's
+layout changed: they always carried 64-bit IDs.
+
+**F04 — the repair.**
+- **Authority.** At VFS's spawn (`image_id=6`) PM passes an admin out-address (NR 29 `arg5`;
+  NR 23 `arg4`). The spawn transaction pre-touches it before anything exists, provisions a third
+  endpoint through the same ledger, delegates the RECEIVE side into the child's slot 17 (which a
+  requester can no longer preset), and writes the SEND ID as its last fallible step; any failure
+  unwinds all of it. PM returns the SEND capability to init as a transferred capability on the
+  `PROC_OP_SPAWN_V5_CAP` reply.
+- **Registration** is stage + commit (`mount_admin.rs`, `doc/VFS.md` §3.2): NR 1 to the admin
+  endpoint with the backend as the transferred capability, then NR 6 to the public endpoint.
+  Authority is the kernel's check on the admin endpoint; association is the kernel-authenticated
+  sender TID plus the prefix. Commit order: match → flags → prefix/duplicate/capacity → handshake
+  (one `STATX` through the received capability: the kernel's kind, SEND-right and generation
+  checks, and a valid completion) → insert. VFS routes only the VFS-local ID.
+- **Refusals.** `VFS_OP_MOUNT_REGISTER` → 5 `PERMISSION`; commit with nothing staged → 6; bad
+  flags → 8; handshake → 7; duplicate 1, full 2, invalid prefix 4.
+- **Cleanup.** A transfer copies (the sender keeps its capability; observed live, `stale_handle`
+  below) and no syscall deletes a capability, so a refused commit leaves the table unchanged and
+  moves VFS's copy to a bounded retained record (8), logged and never routed; VFS drains its admin
+  endpoint only while every staged mount could still be retained.
+- **Producers and consumers:** init's `/ram`, `/ext4` and FAT registrations (FAT optional, same
+  client), VFS, PM, the user runtime; the retired register path in VFS.
+
+**Erratum to VFS-CORRECT1A.** On AArch64 and RISC-V the NR 6 wrapper (`ipc_call`) detected an error
+as "`ret1`/`ret2` still hold the frame pointer and length", but an error frame zeroes them, so a
+refused call read as success and was followed by a receive (the F04 baseline capture shows it:
+`AARCH64_SPLIT_FINALIZE_OK nr=6 result=error code=3`, then `VFS_FORWARD_CALL_SENT op=22
+status=ok` and a blocked receive). 1A's "zero receives after a failed NR 6" held on x86_64 and in
+the hosted tests, not on those two ports for the kernel's error frames. Fixed here: an error is
+`ret0 != 0`, which every success clears.
+
+**The witness** (`vfs-mount-witness`; init, VFS and ramfs; inert elsewhere): see `doc/VFS.md` §3.2
+and `init/vfs_mount_witness.rs`. `scripts/grade-vfs-mount-witness.py` (rules CORE, ADMIN, REFUSE,
+SENDER, IDENTITY, BYTES, WIDTH, TRANSPORT; 24 self-test mutants), and
+`scripts/qemu-vfs-mount-witness-smoke.sh ARCH SMP wide|narrow`, which also runs the 1A grader on
+the same boot (the 300-byte fixture, FILE_GRANT_RO, NR 29). The two sender-side refusals use
+witness-only prefixes `/vc1b-stale` and `/vc1b-trunc`; the AArch64 core smoke's blocker scan
+excludes `INIT_MOUNT_STAGE_REFUSED` for exactly those, so a stage refusal anywhere else still
+blocks.
+
+**Found on the way.**
+- **Transfers delegate.** The first integrated boot staged a stale-generation handle expecting the
+  kernel to have moved init's copy to VFS; it had copied it, so the "stale" handle was still live
+  and `/ram` was published early. The cleanup design changed from "return the capability" to
+  "retain it" (above), and the stale case became a generation-advanced ID.
+- **Feature-gated callers.** A `cargo check` of every kernel and server feature, one target each,
+  found three feature builds the migration had broken (`recv-queue1-ordinary-grant`,
+  `riscv-uart-irq-witness` / `aarch64-pl011-irq-witness`, `context1-witness` / `context1-clobber`);
+  all fixed before the candidate. The features that still fail (12 kernel ones: `hosted-dev`,
+  `apsched-witness`, `kthread1-witness`, the `kstack-probe` family, the `sched-lock1` family,
+  `lock-witness`; `hosted-dev` in four server crates; `posix-compat`) fail identically on
+  `cfc14b33`: a bare-metal `std` refusal, an intentional `compile_error!`, a missing companion
+  feature, or a pre-existing `TaskPriority` cast / non-exhaustive `SyscallError` match.
+- **Hosted parallelism.** The kernel lib suite fails in parallel with or without this change (the
+  existing U9-SPAWN-VM1 spawn tests fail the same way); it is run serially, as before.
+
+**Commits.**
+- `408ae6e7`: the repair (F07, F04, the NR 6 erratum), the witness, the grader and the smoke script,
+  the hosted tests, `doc/VFS.md` §3.2, `doc/SYSCALL_ABI.md`, `doc/PROCESS_AND_SPAWN.md` slot 17,
+  `doc/AI_AGENT_RULES.md` §1.3, the doc gate.
+- The record commit follows it; the tested code commit is `408ae6e7` (tree `5901cfbc`).
+
+**Qualification.**
+- **Frozen inputs.** The runner, `nc.py`, both graders, the smoke script and the fixture were
+  hashed before the run (`predeclared.sha`). Every witness artifact is bound at boot to the
+  candidate's clean tree (`source=clean:5901cfbc…`).
+- **Run 1** (`qual-1`) on `408ae6e7` ran every step in order up to the first live negative control,
+  when the session's worker process restarted and killed the runner (recorded in its summary). The
+  two unfinished live controls and the epilogue ran as `qual-1-cont` against the same commit, each
+  in a fresh worktree; nothing that had completed was rerun.
+
+| step | result |
+|---|---|
+| hosted | fmt; serial lib, 6,785 passed; `--tests`, 43 binaries, 7,182 passed; crates `yarm-ipc-abi` 221, `yarm-user-rt` 155, `yarm-fs-servers` 589, `yarm-srv-common` 27, `yarm-kernel` 10; `yarm-control-plane-servers` 277 passed and 2 failed, the same 2 (`sup_l5b_…`, `sup_l6b_…`) failing on `cfc14b33`; subsets, each non-zero: `yarm-user-rt` `vc1b` 6, `yarm-fs-servers` `vc1b` 10 and `vc1a` 6, root `vc1b` 9, `u9spawn` 85, `lock_order` 4, `syscall_abi` 2, `grant_ro` 3; both graders' self-tests (24 and 19 mutants) |
+| hosted coverage | kernel (`vc1b_spawn_admin_endpoint`, a real spawner made current): the admin SEND ID written to the out-address, its RECEIVE side in the child's slot 17 on the same endpoint and distinct from slot 12, no endpoint and slot 17 = 0 without an out-address, a requester's slot 17 discarded, an unwritable out-address refused before anything exists, a refused commit unwinding the endpoint, its capabilities and the delegation (the written ID names nothing afterwards), endpoint exhaustion at the third endpoint, frame exhaustion at sampled positions, the pure admission, the unpacked lanes; user runtime: transferred and reply capabilities above 2^32 kept whole, the sentinel and a missing flag giving neither, a long payload refused, NR 23 / NR 29 lanes, startup slots above 2^32; mount admin: stage/commit publishing the received ID, commit without stage, another sender's commit, unsupported flags, duplicate and capacity, each kernel handshake refusal, retention and the drain bound, unrecordable stages, the retired register status |
+| gates | contract gate, doc enforcement (with the new VFS-CORRECT1B checks), the proc/VFS codec freeze |
+| checks | default and `cap-gen-witness` kernels; default and witness servers (user target); all three targets |
+| builds | default x86_64, AArch64 and RISC-V, C and B. B's kernels match VFS-CORRECT1A's (`ea10316e…`, `44170087…`, `d539cf7a…`); C's differ, as they must (the spawn transaction changed) |
+| core smokes | the default C artifacts, SMP2, GP, each port: pass |
+| W, 6 boots | each port SMP2, `wide` and `narrow`: both graders `result=ok` (table below) |
+| negative controls | hosted, each in its own worktree at `408ae6e7`: ncT_recv (received ID cut to 32 bits) fails `vc1b_a_transferred_cap_above_u32_is_kept_whole` (`Some(65553)`) and the reply-cap test; ncT_vfs (VFS keeps 32 bits of the backend) fails `vc1b_staged_then_committed_mount_publishes_the_vfs_local_cap` and 3 more; ncS (VFS routes the sender's number) fails the same test and 4 more; ncK (slot 17 never written) fails `vc1b_admin_endpoint_is_written_to_the_out_address_and_delegated_into_slot_17` ("slot 17 carries…", left 0). Live AArch64 wide, fresh builds: ncT_vfs — VFS staged 65548 (the low half of 4295032844), the kernel refused the handshake (`Refused(3)`, `InvalidCapability`), commit status 7, caught by IDENTITY "authorized: expected status 0, saw 7", plus BYTES and WIDTH; ncS — VFS used init's 4295032848 in its own CNode, refused the same way, caught by the same IDENTITY assertion. Worktrees restored, porcelain 0 |
+| not run | a `--workspace` run; the historical matrix; RT profiles; IPC-specific regression smokes (kernel IPC and locking are unchanged; the spawn transaction gained steps inside its existing owners, covered by `u9spawn` and `lock_order`) |
+
+Per port (W, SMP2):
+
+| port | profile | init backend | VFS-local backend | forwards | PM grant → NR 29 | truncated | 1A |
+|---|---|---|---|---|---|---|---|
+| x86_64 | wide | 4295098384 | 4295032844 | 8 | 4295032852 | refused at sender | ok, tid 10003 |
+| x86_64 | narrow | 65552 | 65548 | 8 | 65556 | n/a | ok, tid 10003 |
+| AArch64 | wide | 4295163920 | 4295032844 | 8 | 4295032852 | refused at sender | ok, tid 10003 |
+| AArch64 | narrow | 131088 | 65548 | 8 | 65556 | n/a | ok, tid 10003 |
+| RISC-V | wide | 4295294992 | 4295032844 | 8 | 4295032853 | refused at sender | ok, tid 10003 |
+| RISC-V | narrow | 327695 | 65548 | 8 | 65557 | n/a | ok, tid 10003 |
+
+On every boot: the ordinary client's register refused (5) before and after, a commit with nothing
+staged refused (6), unsupported flags refused (8), a duplicate refused (1), the stale and (wide)
+truncated handles refused by the kernel at the sender with nothing reaching VFS, the authorized
+registration published under VFS's own ID, 192 bytes read exactly (104 + 88, end of file), closed,
+the route working again after a refusal; the 1A 300-byte fixture exact; PM's image-7 grant passed
+as NR 29's `mo_cap` and driver_manager ran (five NR 29 spawns). Under `wide` every identity above
+is generation 65,537 or later and exceeds 2^32.
+
+**Boundaries — live and hosted.** Ran live: the ordinary-client refusal, unstaged commit, flags,
+duplicate, stale generation and truncation (kernel, at the sender), the handshake refusal
+(`InvalidCapability`, through the two live controls). Hosted only: wrong object kind and missing
+SEND right at the handshake (`WrongObject`, `MissingRight`: the kernel checks are exercised through
+the production state machine with each kernel answer), table capacity, retained-record capacity,
+admin-endpoint capacity and frame exhaustion in the spawn, an unwritable out-address.
+
+**Verdicts.**
+- **F07: CLOSED** on the required path — startup slots, recv-v2 metadata, call/send/reply, the VFS
+  client, VFS's mount and fd records, backend endpoints, PM's grant relay into NR 29, NR 23 / NR 29
+  lanes — proved live with every identity above 2^32 on all three ports.
+- **F04: CLOSED** — mount authority is the admin endpoint's capability, enforced by the kernel and
+  VFS; VFS routes only a receiver-local identity it received; an ordinary client is refused and the
+  route survives; a refused setup leaves routing unchanged and accounts for every capability it
+  acquired.
+
+**Verdict: QUALIFIED** on `408ae6e7`.
+
+**Left outside the qualified path.**
+- Kernel boot oracles (feature-gated, not built by default) still narrow capability IDs to `u32`:
+  `provision_init_ipc_send_reply_cap_oracle` and its siblings in `kernel/boot/mod.rs`
+  (`mem_cap: init_source_cap.0 as u32`), and the SMP1 exec-state witness. Pinned by existing
+  guards; they run with generation-1 IDs only.
+- init's own PM spawn request still discards its NR 6 result (`let _ =`), as in VFS-CORRECT1A.
+- The retained record is never drained; a stage never committed holds its slot; no unmount; one
+  mount administrator, no delegation or revocation of the authority.
+- NR 23 has no class or TID gate (pre-existing); any caller can request an admin endpoint for its
+  own child.
