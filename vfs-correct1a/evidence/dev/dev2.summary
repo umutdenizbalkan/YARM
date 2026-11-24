@@ -1,0 +1,6 @@
+x86_64 rc=0
+riscv64 rc=0
+applied ncA_count_without_copy to crates/yarm-user-rt/src/vfs_client.rs
+ncA aarch64 rc=1
+restored porcelain=0
+DEV2_DONE

@@ -1,0 +1,45 @@
+VFS-CORRECT1A baseline source capture at 1c2b8dfc4ed439d32a9cc59d0bed34c0e9196b0a
+
+## client helpers discard the NR 6 result and receive anyway (crates/yarm-user-rt/src/vfs_client.rs)
+136:    let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+137:    match unsafe { crate::syscall::ipc_recv_v2(reply_recv_cap) } {
+159:    let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+160:    match unsafe { crate::syscall::ipc_recv_v2(reply_recv_cap) } {
+182:    let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+183:    match unsafe { crate::syscall::ipc_recv_v2(reply_recv_cap) } {
+201:    let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+202:    match unsafe { crate::syscall::ipc_recv_v2(reply_recv_cap) } {
+
+## vfs_read returns the reply count and never copies (vfs_client.rs)
+168:/// Returns the number of bytes the server reports reading.  No data is
+184:        Ok(Some(ref received)) => Ok(decode_reply_u64(&received.message)? as usize),
+
+## router and PM treat an NR 6 WouldBlock (nothing delivered) as sent, then receive
+crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs:872:                yarm_user_rt::user_log!("VFS_FORWARD_CALL_BLOCKED_NORMAL op={}", msg.opcode);
+crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:3092:            yarm_user_rt::user_log!("PM_VFS_CALL_BLOCKED_NORMAL op={}", op);
+crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:3156:            yarm_user_rt::user_log!("PM_VFS_CALL_BLOCKED_NORMAL op={}", op);
+
+## NR 6 failure path: ipc_send error returns Err and removes the transfer envelope (src/kernel/syscall/ipc.rs)
+1370:    if let Err(err) = kernel.ipc_send(cap, msg) {
+
+## NR 7 rebuilds the reply from the payload only (opcode not carried)
+1509:        Message::new(sender_tid, &payload_bytes[..len]).map_err(|_| SyscallError::InvalidArgs)?
+
+## errors in opcode only: router 4-byte status with opcode 1; backends opcode 1 with empty payload
+313:fn vfs_error_reply(status: u32) -> yarm_user_rt::ipc::Message {
+314-    yarm_user_rt::ipc::Message::new(1u64, &status.to_le_bytes())
+315-        .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1u64, &[]).expect("err msg"))
+316-}
+234:                                &yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"),
+301:                                                    Message::new(1, &[]).expect("err msg")
+318:                                                        &Message::new(1, &[]).expect("err msg"),
+
+## backend READ: a reply with no inline bytes reports ReadLen(count) (common/vfs_service.rs)
+897:                if inline_len == 0 {
+898-                    VfsReply::ReadLen(read_len)
+899-                } else {
+
+## PM grant decoder ignores FileGrantRoReply.status and checks an opcode NR 7 never carries
+2103:                                .unwrap_or(0);
+2556:                    .unwrap_or(0);
+2921:            .unwrap_or(0);

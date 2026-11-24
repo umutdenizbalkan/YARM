@@ -1,0 +1,3 @@
+[vfs-correct-witness] building riscv64 artifacts with vfs-correct-witness
+[vfs-correct-witness] booting QEMU -smp 2
+VFS_CORRECT_WITNESS_SEAL arch=riscv64 smp=2 result=ok bytes=300 grants=5 late_service_tid=10003 nr29_spawns=5

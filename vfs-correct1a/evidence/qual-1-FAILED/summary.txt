@@ -1,0 +1,90 @@
+vc1a qual start 2026-11-24T06:45:11Z C=55447e80443de27b87f06759b34978483edbb591 B=1c2b8dfc sha=68934f035b1a3ca4 nc=58a381a884c8996f
+=== H1_fmt [55447e80443d porcelain=0]: cargo fmt --all -- --check (start 06:45:11)
+H1_fmt rc=0 secs=7
+=== H2_hosted_lib [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 06:45:18)
+H2_hosted_lib rc=0 secs=214
+=== H3_integration [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 06:48:52)
+H3_integration rc=0 secs=252
+=== H4_crate_yarm-ipc-abi [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-ipc-abi --lib -- --test-threads=1 (start 06:53:04)
+H4_crate_yarm-ipc-abi rc=0 secs=0
+=== H4_crate_yarm-user-rt [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-user-rt --lib -- --test-threads=1 (start 06:53:04)
+H4_crate_yarm-user-rt rc=0 secs=1
+=== H4_crate_yarm-fs-servers [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 (start 06:53:05)
+H4_crate_yarm-fs-servers rc=0 secs=0
+=== H4_crate_yarm-srv-common [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-srv-common --lib -- --test-threads=1 (start 06:53:05)
+H4_crate_yarm-srv-common rc=0 secs=0
+=== H4_crate_yarm-kernel [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-kernel --lib -- --test-threads=1 (start 06:53:05)
+H4_crate_yarm-kernel rc=0 secs=0
+=== H4_subset_ipc_abi_vc1a [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-ipc-abi --lib -- --test-threads=1 vc1a (start 06:53:05)
+H4_subset_ipc_abi_vc1a rc=0 secs=0
+=== H4_subset_user_rt_vfs_client [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-user-rt --lib -- --test-threads=1 vfs_client (start 06:53:05)
+H4_subset_user_rt_vfs_client rc=0 secs=1
+=== H4_subset_fs_servers_vc1a [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 vc1a (start 06:53:06)
+H4_subset_fs_servers_vc1a rc=0 secs=0
+=== H4_subset_fs_servers_stage92 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 stage92 (start 06:53:06)
+H4_subset_fs_servers_stage92 rc=0 secs=0
+=== H4_subset_root_syscall_abi [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 syscall_abi (start 06:53:06)
+H4_subset_root_syscall_abi rc=0 secs=0
+=== H4_subset_root_grant [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 grant_ro (start 06:53:06)
+H4_subset_root_grant rc=0 secs=0
+=== H4_grader_self_test [55447e80443d porcelain=0]: python3 -I scripts/grade-vfs-correct-witness.py --self-test (start 06:53:06)
+H4_grader_self_test rc=0 secs=0
+=== G1_contract_gate [55447e80443d porcelain=0]: bash scripts/check-current-contracts.sh (start 06:53:06)
+G1_contract_gate rc=0 secs=1
+=== G2_doc_enforcement [55447e80443d porcelain=0]: bash scripts/check-contract-doc-enforcement.sh (start 06:53:07)
+G2_doc_enforcement rc=0 secs=1
+=== G3_proc_vfs_codec_freeze [55447e80443d porcelain=0]: bash scripts/check-proc-vfs-codec-freeze.sh (start 06:53:08)
+G3_proc_vfs_codec_freeze rc=0 secs=1
+=== X_check_default_kernel_x86_64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm --bin kernel_boot (start 06:53:09)
+X_check_default_kernel_x86_64 rc=0 secs=9
+=== X_check_default_init_x86_64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm-control-plane-servers --bin init_server (start 06:53:18)
+X_check_default_init_x86_64 rc=0 secs=3
+=== X_check_witness_init_x86_64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/x86_64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features vfs-correct-witness -p yarm-control-plane-servers --bin init_server (start 06:53:21)
+X_check_witness_init_x86_64 rc=0 secs=0
+=== X_check_default_kernel_aarch64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm --bin kernel_boot (start 06:53:21)
+X_check_default_kernel_aarch64 rc=0 secs=10
+=== X_check_default_init_aarch64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm-control-plane-servers --bin init_server (start 06:53:31)
+X_check_default_init_aarch64 rc=0 secs=2
+=== X_check_witness_init_aarch64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/aarch64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features vfs-correct-witness -p yarm-control-plane-servers --bin init_server (start 06:53:33)
+X_check_witness_init_aarch64 rc=0 secs=1
+=== X_check_default_kernel_riscv64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm --bin kernel_boot (start 06:53:34)
+X_check_default_kernel_riscv64 rc=0 secs=9
+=== X_check_default_init_riscv64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features -p yarm-control-plane-servers --bin init_server (start 06:53:43)
+X_check_default_init_riscv64 rc=0 secs=2
+=== X_check_witness_init_riscv64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q --target targets/riscv64-yarm-none.json -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --features vfs-correct-witness -p yarm-control-plane-servers --bin init_server (start 06:53:45)
+X_check_witness_init_riscv64 rc=0 secs=1
+=== B_build_C_x86_64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 06:53:46)
+B_build_C_x86_64 rc=0 secs=33
+=== S_gp_core_smp2_x86_64 [55447e80443d porcelain=0]: env KERNEL_IMAGE=build-x86_64/kernel_boot.elf INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/S_gp_x86_64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/S_gp_x86_64.smoke.log TIMEOUT_SECS=900 scripts/qemu-x86_64-core-smoke.sh (start 06:54:19)
+S_gp_core_smp2_x86_64 rc=0 secs=905
+=== B_build_B_x86_64 [55447e80443d porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-basewt && env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 07:09:24)
+B_build_B_x86_64 rc=0 secs=88
+=== B_build_C_aarch64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 07:10:52)
+B_build_C_aarch64 rc=0 secs=36
+=== S_gp_core_smp2_aarch64 [55447e80443d porcelain=0]: env KERNEL_IMAGE=build-aarch64/yarm-aarch64.bin INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/S_gp_aarch64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/S_gp_aarch64.smoke.log TIMEOUT_SECS=900 scripts/qemu-aarch64-core-smoke.sh (start 07:11:28)
+S_gp_core_smp2_aarch64 rc=0 secs=13
+=== B_build_B_aarch64 [55447e80443d porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-basewt && env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 07:11:41)
+B_build_B_aarch64 rc=0 secs=81
+=== B_build_C_riscv64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 07:13:02)
+B_build_C_riscv64 rc=0 secs=33
+=== S_gp_core_smp2_riscv64 [55447e80443d porcelain=0]: env KERNEL_IMAGE=build-riscv64/yarm-riscv64.bin INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/S_gp_riscv64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/S_gp_riscv64.smoke.log TIMEOUT_SECS=900 scripts/qemu-riscv64-core-smoke.sh (start 07:13:35)
+S_gp_core_smp2_riscv64 rc=0 secs=902
+=== B_build_B_riscv64 [55447e80443d porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-basewt && env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 07:28:37)
+B_build_B_riscv64 rc=0 secs=68
+=== W_vfs_x86_64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/W_vfs_x86_64 scripts/qemu-vfs-correct-witness-smoke.sh x86_64 2 (start 07:29:45)
+W_vfs_x86_64 rc=0 secs=923
+=== W_vfs_aarch64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/W_vfs_aarch64 scripts/qemu-vfs-correct-witness-smoke.sh aarch64 2 (start 07:45:08)
+W_vfs_aarch64 rc=0 secs=32
+=== W_vfs_riscv64 [55447e80443d porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/W_vfs_riscv64 scripts/qemu-vfs-correct-witness-smoke.sh riscv64 2 (start 07:45:40)
+W_vfs_riscv64 rc=1 secs=938
+=== NC_hosted_ncA_count_without_copy [55447e80443d porcelain=0]: bash -c python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-nc/nc.py ncA_count_without_copy && git diff --stat && env -u CARGO_TARGET_DIR cargo test -q -p yarm-user-rt --lib -- --test-threads=1 vfs_client; rc=$?; git checkout -- crates/yarm-user-rt/src/vfs_client.rs; exit $rc (start 08:01:18)
+NC_hosted_ncA_count_without_copy rc=101 secs=1
+=== NC_hosted_ncB_receive_after_failed_send [55447e80443d porcelain=0]: bash -c python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-nc/nc.py ncB_receive_after_failed_send && git diff --stat && env -u CARGO_TARGET_DIR cargo test -q -p yarm-user-rt --lib -- --test-threads=1 vfs_client; rc=$?; git checkout -- crates/yarm-user-rt/src/vfs_client.rs; exit $rc (start 08:01:19)
+NC_hosted_ncB_receive_after_failed_send rc=101 secs=1
+=== NC_hosted_ncC_uncapped_backend_read [55447e80443d porcelain=0]: bash -c python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-nc/nc.py ncC_uncapped_backend_read && git diff --stat && env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 vc1a; rc=$?; git checkout -- crates/yarm-fs-servers/src/fs/common/vfs_service.rs; exit $rc (start 08:01:20)
+NC_hosted_ncC_uncapped_backend_read rc=0 secs=1
+=== NC_live_ncA_count_without_copy_aarch64 [55447e80443d porcelain=0]: bash -c python3 -I /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-nc/nc.py ncA_count_without_copy && git diff --stat && env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/qual/NCLA scripts/qemu-vfs-correct-witness-smoke.sh aarch64 2; rc=$?; git checkout -- crates/yarm-user-rt/src/vfs_client.rs; exit $rc (start 08:01:21)
+NC_live_ncA_count_without_copy_aarch64 rc=1 secs=35
+post-NC porcelain=0 base-porcelain=0
+vc1a qual end 2026-11-24T08:01:56Z
+VC1A_QUAL_DONE

@@ -1,0 +1,36 @@
+diff --git a/crates/yarm-control-plane-servers/src/control_plane/init/service.rs b/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
+index d843aa59..b409f168 100644
+--- a/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
++++ b/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
+@@ -10751,6 +10751,31 @@ pub fn run() {
+         }
+     }
+ 
++    // VFS-CORRECT1A baseline probe (evidence only; applied to 1c2b8dfc, never committed).
++    {
++        let vfs_send = vfs_recv_cap as u32;
++        match unsafe {
++            yarm_user_rt::vfs_client::vfs_openat(vfs_send, pm_recv, b"/initramfs/init", 0)
++        } {
++            Ok(fd) => {
++                let mut buf = [0xA5u8; 64];
++                let r = unsafe { yarm_user_rt::vfs_client::vfs_read(vfs_send, pm_recv, fd, &mut buf) };
++                let n: i64 = match r {
++                    Ok(n) => n as i64,
++                    Err(_) => -1,
++                };
++                let untouched = buf.iter().filter(|&&b| b == 0xA5).count();
++                yarm_user_rt::user_log!(
++                    "VC1A_BASE_READ fd={} count={} untouched={} head={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
++                    fd, n, untouched, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]
++                );
++                let c = unsafe { yarm_user_rt::vfs_client::vfs_close(vfs_send, pm_recv, fd) };
++                yarm_user_rt::user_log!("VC1A_BASE_CLOSE ok={}", u32::from(c.is_ok()));
++            }
++            Err(_) => yarm_user_rt::user_log!("VC1A_BASE_OPEN_FAIL"),
++        }
++    }
++
+     yarm_user_rt::user_log!("INIT_BLKCACHE_SMOKE_BEGIN");
+     let get_info_req = BlkGetInfoRequest { device_id: 0 };
+     let get_info_payload = get_info_req.encode();

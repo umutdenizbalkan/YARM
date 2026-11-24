@@ -1,0 +1,6 @@
+7bb0e40633f09a59f9f45f936b2832abc18b4432dd0d9d9285a3c930e0ee165e  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-evidence/vc1a_qual.sh
+58a381a884c8996f14d0759231f3bcfc6790b79054031a45e476fbe3289ee34e  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-nc/nc.py
+310d5ef26b7ca7f1a28e3500bb81f3fc95dc9020057462cbcfc84f7dbfa1448a  scripts/grade-vfs-correct-witness.py
+b526ac8b81dc647893433dcd97016b62b13cd9a08c45b2d95883086e65e26f84  scripts/qemu-vfs-correct-witness-smoke.sh
+97056678793b338e860d6ebb2ffa74d2f86005ddf2415958836ba0626e00f008  scripts/fixtures/vfs-fixture.bin
+candidate 5bd969689922779ac16465b2237abfca0a8044dc tree 9dd02db2f6fcc9be33b85cf70a32b2ec27b070a5; baseline 1c2b8dfc4ed439d32a9cc59d0bed34c0e9196b0a (run 2)

@@ -1,0 +1,5 @@
+[vfs-correct-witness][fail] CORE: VC1A_END 7 fail
+[vfs-correct-witness][fail] BYTES: wrong destination bytes: differ from the fixture at offset 0 (300 read, fixture 300)
+[vfs-correct-witness][fail] ERRORS: a valid request did not work after the errors
+[vfs-correct-witness][fail] INIT: wrong destination bytes: /initramfs/init head differs from rootfs/init
+VFS_CORRECT_WITNESS_SEAL arch=aarch64 smp=2 result=fail bytes=300 grants=5 late_service_tid=10003 nr29_spawns=5

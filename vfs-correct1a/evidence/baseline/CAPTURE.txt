@@ -1,0 +1,9 @@
+VFS-CORRECT1A baseline capture (1c2b8dfc + vc1a-baseline-probe.patch, AArch64 SMP2 core smoke)
+USER_LOG tid=10000 msg=INITRAMFS_READ fd=15 requested=64
+USER_LOG tid=10002 msg=VFS_BACKEND_REPLY_RAW op=12 len=80 opcode=0 flags=0 sender_tid=10000 transferred_cap=0
+USER_LOG tid=1 msg=VC1A_BASE_READ fd=15 count=64 untouched=64 head=a5a5a5a5a5a5a5a5
+USER_LOG tid=1 msg=VC1A_BASE_CLOSE ok=1
+expected first 64 bytes of /initramfs/init (build-aarch64/rootfs/init):
+7f454c460201010000000000000000000200b70001000000a42e4000000000004000000000000000f82802000000000000000000400038000200400008000600
+rootfs/init sha256 9857c5db0a6bedcd804e480c59f9a46244390957259760569947d3c3ef25b3f9
+initramfs sha256 c4e13aaeea8332382faa73e2ffb3bd767c38a1538a41801ba7e05462516618dc

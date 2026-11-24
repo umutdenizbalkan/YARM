@@ -1,0 +1,80 @@
+applied ncA_count_without_copy to crates/yarm-user-rt/src/vfs_client.rs
+ crates/yarm-user-rt/src/vfs_client.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1513:5
+     |
+1513 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1512:5
+     |
+1512 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+
+running 29 tests
+....................... 23/29
+vfs_client::tests::vc1a_large_destination_asks_for_one_inline_reply_and_accepts_a_short_read --- FAILED
+.. 26/29
+vfs_client::tests::vc1a_read_copies_exactly_the_count_and_leaves_the_tail --- FAILED
+..
+failures:
+
+---- vfs_client::tests::vc1a_large_destination_asks_for_one_inline_reply_and_accepts_a_short_read stdout ----
+
+thread 'vfs_client::tests::vc1a_large_destination_asks_for_one_inline_reply_and_accepts_a_short_read' (7601) panicked at crates/yarm-user-rt/src/vfs_client.rs:692:9:
+assertion failed: buf[..VFS_INLINE_READ_MAX].iter().all(|&b| b == 0x3C)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:150:5
+   3: yarm_user_rt::vfs_client::tests::vc1a_large_destination_asks_for_one_inline_reply_and_accepts_a_short_read
+             at ./src/vfs_client.rs:692:9
+   4: yarm_user_rt::vfs_client::tests::vc1a_large_destination_asks_for_one_inline_reply_and_accepts_a_short_read::{closure#0}
+             at ./src/vfs_client.rs:687:83
+   5: <yarm_user_rt::vfs_client::tests::vc1a_large_destination_asks_for_one_inline_reply_and_accepts_a_short_read::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   6: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- vfs_client::tests::vc1a_read_copies_exactly_the_count_and_leaves_the_tail stdout ----
+
+thread 'vfs_client::tests::vc1a_read_copies_exactly_the_count_and_leaves_the_tail' (7604) panicked at crates/yarm-user-rt/src/vfs_client.rs:678:9:
+assertion `left == right` failed
+  left: [165, 165, 165, 165, 165]
+ right: [104, 101, 108, 108, 111]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<&[u8], &[u8; 5]>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_user_rt::vfs_client::tests::vc1a_read_copies_exactly_the_count_and_leaves_the_tail
+             at ./src/vfs_client.rs:678:9
+   5: yarm_user_rt::vfs_client::tests::vc1a_read_copies_exactly_the_count_and_leaves_the_tail::{closure#0}
+             at ./src/vfs_client.rs:674:64
+   6: <yarm_user_rt::vfs_client::tests::vc1a_read_copies_exactly_the_count_and_leaves_the_tail::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    vfs_client::tests::vc1a_large_destination_asks_for_one_inline_reply_and_accepts_a_short_read
+    vfs_client::tests::vc1a_read_copies_exactly_the_count_and_leaves_the_tail
+
+test result: FAILED. 27 passed; 2 failed; 0 ignored; 0 measured; 120 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `-p yarm-user-rt --lib`

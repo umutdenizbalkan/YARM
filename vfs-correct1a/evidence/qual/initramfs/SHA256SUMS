@@ -1,0 +1,6 @@
+a024e70ca6508ad64d96cee22a197667a1978d1f0e53b2f59133e3f1a908ba2f  B-aarch64-initramfs-core.cpio
+73ad78c15627d3ac93fed10036f309d9cfa28469dbcf03ba8f0253d4360aab70  B-riscv64-initramfs-core.cpio
+94efa924949234c2baccc64574b3737c45d183427692dabcdbaa5ebaba3224fa  B-x86_64-initramfs-core.cpio
+a0424591cab11c56be3adb960b81655d9c46cbdaa9f1aa07037a5646828bf9d0  C-aarch64-initramfs-core.cpio
+e51d43f98f2b759fe6c1c7e8423f14d54271a28e9bc9a4a849468e3b5406b61b  C-riscv64-initramfs-core.cpio
+514551f5f5cd14da3a13f732edfd8eb3e0a01d98ed6edead7183dfc1a3594e74  C-x86_64-initramfs-core.cpio
