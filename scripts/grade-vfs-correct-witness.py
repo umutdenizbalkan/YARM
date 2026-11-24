@@ -24,7 +24,8 @@ Rules (each failure names its rule):
   INIT      VC1A_INIT_HEAD n=64, and its VC1A_INIT_DATA equals the first 64 bytes of --init-rootfs.
   GRANT     PM obtained the read-only grant for image 7 (PM_VFS_GRANT_RO_RECEIVED image_id=7),
             spawned it through NR 29 (PM_SPAWN_FROM_MO_DONE image_id=7 tid=T), and T ran
-            (DRIVER_MANAGER_ENTRY logged by tid T after the spawn).
+            (DRIVER_MANAGER_ENTRY logged by tid T after PM received the grant; PM logs its DONE
+            line only after NR 29 returns, and the child may already have run by then).
   TRANSPORT no VFS_FORWARD_CALL_FAIL, PM_VFS_CALL_FAIL, VFS_BACKEND_COMPLETION_MALFORMED,
             PM_ELF_ZC_FAIL or BOOT_FATAL line anywhere in the boot.
 Exit status 0 = sealed, 1 = not sealed. --self-test checks the rules on synthetic boots.
@@ -167,8 +168,14 @@ def grade(log, fixture, init_head, core_rc):
         fail("GRANT", f"PM_SPAWN_FROM_MO_DONE image_id=7: {len(spawn7)}")
     else:
         tid = spawn7[0].get("tid")
+        # PM logs PM_SPAWN_FROM_MO_DONE only after NR 29 returns, and the kernel may dispatch the
+        # child first (RISC-V and AArch64 boots do), so the anchor is the grant PM received
+        # before it made the NR 29 call, not PM's DONE line.
+        if got and got[0] > spawn7[0]["_at"]:
+            fail("GRANT", "the image 7 grant was logged after its spawn")
+        anchor = got[0] if got else spawn7[0]["_at"]
         runs = [x for x in user_lines(log, "DRIVER_MANAGER_ENTRY")
-                if x["_tid"] == tid and x["_at"] > spawn7[0]["_at"]]
+                if x["_tid"] == tid and x["_at"] > anchor]
         if not runs:
             fail("GRANT", f"driver_manager (tid {tid}) never logged DRIVER_MANAGER_ENTRY")
         facts["late_service_tid"] = tid
@@ -245,10 +252,20 @@ def self_test():
     must_fail(synthetic(fix, bytes(64)), "INIT")
     must_fail([l for l in good if "PM_VFS_GRANT_RO_RECEIVED" not in l], "GRANT")
     must_fail([l for l in good if "DRIVER_MANAGER_ENTRY" not in l], "GRANT", "never logged")
+    # The child may run before PM logs its DONE line (qualification run 1, RISC-V): passes.
+    entry = "USER_LOG tid=10003 msg=DRIVER_MANAGER_ENTRY"
+    early = [l for l in good if l != entry]
+    early.insert(1, entry)
+    f, _ = grade(early, fix, head, 0)
+    assert not f, f
+    # ... but not before PM received the grant, and not by another tid.
+    must_fail([entry] + [l for l in good if l != entry], "GRANT", "never logged")
+    must_fail([l.replace("tid=10003 msg=DRIVER_MANAGER_ENTRY", "tid=10004 msg=DRIVER_MANAGER_ENTRY")
+               for l in good], "GRANT", "never logged")
     must_fail(good + ["USER_LOG tid=10002 msg=VFS_FORWARD_CALL_FAIL op=12 err=WouldBlock"], "TRANSPORT")
     must_fail(good + ["USER_LOG tid=10002 msg=VFS_BACKEND_COMPLETION_MALFORMED op=12 fd=14"], "TRANSPORT")
     must_fail(good + ["USER_LOG tid=1 msg=VC1A_END fails=0 result=ok"], "CORE")
-    print("VFS_CORRECT_WITNESS_GRADER_SELF_TEST result=ok mutants=17")
+    print("VFS_CORRECT_WITNESS_GRADER_SELF_TEST result=ok mutants=19")
 
 
 def main():

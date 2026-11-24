@@ -831,6 +831,56 @@ mod tests {
         assert_eq!(next[0], fixture_byte(VFS_INLINE_READ_MAX));
     }
 
+    /// The resident handler's own cap, without the client in front of it: the client never asks
+    /// for more than 104 bytes, so only a raw request reaches the server's limit. A READ asking
+    /// for 4096 bytes is answered with exactly 104 bytes, and the backend's cursor advanced by
+    /// exactly those 104 (the next READ starts at byte 104).
+    #[test]
+    fn vc1a_resident_handler_caps_an_oversized_read_before_the_backend() {
+        use yarm_ipc_abi::vfs_abi::{
+            VFS_OP_READ, VfsCompletionExpect, VfsCompletionOutcome, validate_vfs_completion,
+        };
+        let mut t = loopback_with_fixture();
+        let fd = vfs_openat_with(&mut t, b"/initramfs/etc/vfs-fixture", 0).expect("open");
+        let raw_read = |svc: &mut InitramfsService, len: u64| {
+            svc.handle_completion(
+                read_message(ReadWriteRequest {
+                    fd,
+                    buf_ptr: 0,
+                    len,
+                })
+                .expect("read"),
+            )
+        };
+        let first = raw_read(&mut t.svc, 4096);
+        let expect = VfsCompletionExpect {
+            op: VFS_OP_READ,
+            fd,
+            requested: VFS_INLINE_READ_MAX as u64,
+        };
+        match validate_vfs_completion(expect, first.as_slice(), false) {
+            Ok(VfsCompletionOutcome::Ok { value, data }) => {
+                assert_eq!(value, VFS_INLINE_READ_MAX as u64);
+                assert_eq!(data, &fixture()[..VFS_INLINE_READ_MAX]);
+            }
+            other => panic!("oversized READ: {:?}", other),
+        }
+        let second = raw_read(&mut t.svc, 1);
+        match validate_vfs_completion(
+            VfsCompletionExpect {
+                requested: 1,
+                ..expect
+            },
+            second.as_slice(),
+            false,
+        ) {
+            Ok(VfsCompletionOutcome::Ok { value: 1, data }) => {
+                assert_eq!(data, &[fixture_byte(VFS_INLINE_READ_MAX)]);
+            }
+            other => panic!("READ after the capped one: {:?}", other),
+        }
+    }
+
     #[test]
     fn vc1a_errors_travel_in_the_payload_and_a_valid_request_still_works() {
         let mut t = loopback_with_fixture();
