@@ -1,0 +1,20 @@
+diff --git a/crates/yarm-control-plane-servers/src/control_plane/init/service.rs b/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
+index 3347a6ca..f22fcaea 100644
+--- a/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
++++ b/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
+@@ -10893,6 +10893,15 @@ pub fn run() {
+                     init_ramfs_send_cap,
+                     ramfs_mount_config,
+                 );
++                // VFS-CORRECT1B baseline probe (F04): route one request through the new mount.
++                yarm_user_rt::user_log!(
++                    "VC1B_BASE_RAM_PROBE init_local_ramfs_send={}",
++                    init_ramfs_send_cap
++                );
++                let r = unsafe {
++                    yarm_user_rt::vfs_client::vfs_statx(vfs_recv_cap as u32, pm_recv, b"/ram/boot")
++                };
++                yarm_user_rt::user_log!("VC1B_BASE_RAM_STATX result={:?}", r);
+             } else {
+                 yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_FAIL ok=0 child_tid=0");
+             }

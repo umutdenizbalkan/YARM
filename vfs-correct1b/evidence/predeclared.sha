@@ -1,0 +1,8 @@
+f382b40cad9d6f3539fe803cd9be49b1f0e85631b33c87b368d9118a78921572  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-evidence/vc1b_qual.sh
+9d03181170e7e7be496a19257eeda45df7295c3ed1861503e3c82c13db17b237  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-nc/nc.py
+35406263144c7faa71724d36dcb3e59a50f0235fd71dbe2a5ccde93608dfe125  scripts/grade-vfs-mount-witness.py
+310d5ef26b7ca7f1a28e3500bb81f3fc95dc9020057462cbcfc84f7dbfa1448a  scripts/grade-vfs-correct-witness.py
+23f7db43a1b3d88e32fd27f9d69022f5d41f639928d5ae206bbe0e1f0cb2d413  scripts/qemu-vfs-mount-witness-smoke.sh
+97056678793b338e860d6ebb2ffa74d2f86005ddf2415958836ba0626e00f008  scripts/fixtures/vfs-fixture.bin
+candidate 408ae6e798747359fbabbd98b13e2a767ac2e5e0 tree 5901cfbc101e7d8dc26d747c939dca9f702dca6f
+# added after qual-1 was interrupted (worker restart), before qual-1-cont: 79efb962e606a96dec582a843976c77d03591ea057559c311315e0705425f8f0  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-evidence/vc1b_qual_cont.sh

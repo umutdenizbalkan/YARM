@@ -1,0 +1,1 @@
+VFS_MOUNT_WITNESS_SEAL arch=x86_64 smp=2 wide=0 result=ok grant_cap=65556 init_admin=65549 init_backend=65552 ram_forwards=8 stale_handle=stage_refused:131088 truncated_handle=not_applicable:65552 vfs_admin_recv=65538 vfs_local_backend=65548

@@ -1,0 +1,29 @@
+applied ncS_sender_slot to crates/yarm-fs-servers/src/fs/common/mount_admin.rs
+diff --git a/crates/yarm-fs-servers/src/fs/common/mount_admin.rs b/crates/yarm-fs-servers/src/fs/common/mount_admin.rs
+index 3bbc8801..8d987992 100644
+--- a/crates/yarm-fs-servers/src/fs/common/mount_admin.rs
++++ b/crates/yarm-fs-servers/src/fs/common/mount_admin.rs
+@@ -238,7 +238,7 @@ impl MountAdmin {
+             sender_tid,
+             flags: args.flags,
+             sender_local_cap: args.sender_local_cap,
+-            backend_cap,
++            backend_cap: args.sender_local_cap,
+             prefix,
+             prefix_len: args.prefix.len() as u8,
+         };
+[vfs-mount-witness] building aarch64 artifacts with cap-gen-witness,vfs-correct-witness,vfs-mount-witness
+[vfs-mount-witness] booting QEMU -smp 2
+[vfs-mount-witness][fail] CORE: core smoke rc=1
+[vfs-mount-witness][fail] CORE: VC1B_END fails=3 result=fail
+[vfs-mount-witness][fail] IDENTITY: authorized: expected status 0, saw ['7']
+[vfs-mount-witness][fail] IDENTITY: 0 VFS_MOUNT_PUBLISHED prefix=/ram lines
+[vfs-mount-witness][fail] BYTES: 0 VC1B_READ lines
+[vfs-mount-witness][fail] BYTES: wrong destination bytes: differ from the ramfs witness formula
+[vfs-mount-witness][fail] BYTES: close []
+[vfs-mount-witness][fail] BYTES: route did not recover after the refusal
+[vfs-mount-witness][fail] WIDTH: VFS-local backend cap None is not a full-width identity above 2^32
+VFS_MOUNT_WITNESS_SEAL arch=aarch64 smp=2 wide=1 result=fail generation=None grant_cap=4295032852 init_admin=4295032845 init_backend=4295032848 stale_handle=stage_refused:4295098384 truncated_handle=stage_refused:65552 vfs_admin_recv=4295032834
+[vfs-correct-witness][fail] CORE: core smoke rc=1
+VFS_CORRECT_WITNESS_SEAL arch=aarch64 smp=2 result=fail bytes=300 grants=5 late_service_tid=10003 nr29_spawns=5
+VFS_MOUNT_WITNESS_SEAL arch=aarch64 smp=2 profile=wide result=fail mount_rc=1 correct_rc=1

@@ -1,0 +1,49 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1668:5
+     |
+1668 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1667:5
+     |
+1667 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-none` target may not support the standard library
+  = note: `std` is required by `ext4_srv` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-none` target may not support the standard library
+  = note: `std` is required by `fat_srv` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error: cannot resolve a prelude import
+
+error: no global memory allocator found but one is required; link to std or add `#[global_allocator]` to a static item that implements the GlobalAlloc trait
+
+error: `#[panic_handler]` function required, but not found
+
+For more information about this error, try `rustc --explain E0463`.
+error: could not compile `yarm-fs-servers` (bin "fat_srv") due to 4 previous errors
+error: could not compile `yarm-fs-servers` (bin "ext4_srv") due to 4 previous errors
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-none` target may not support the standard library
+  = note: `std` is required by `devfs_srv` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-none` target may not support the standard library
+  = note: `std` is required by `ramfs_srv` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error: could not compile `yarm-fs-servers` (bin "ramfs_srv") due to 4 previous errors
+error: could not compile `yarm-fs-servers` (bin "devfs_srv") due to 4 previous errors

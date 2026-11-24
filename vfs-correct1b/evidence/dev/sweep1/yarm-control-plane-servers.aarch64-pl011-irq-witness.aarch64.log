@@ -1,0 +1,389 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1668:5
+     |
+1668 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1667:5
+     |
+1667 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+ --> crates/yarm-user-rt/src/arch/aarch64.rs:8:13
+  |
+8 |     let mut x0 = args[0];
+  |         ----^^
+  |         |
+  |         help: remove this `mut`
+  |
+  = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+ --> crates/yarm-user-rt/src/arch/aarch64.rs:9:13
+  |
+9 |     let mut x1 = args[1];
+  |         ----^^
+  |         |
+  |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:10:13
+   |
+10 |     let mut x2 = args[2];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:11:13
+   |
+11 |     let mut x3 = args[3];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:12:13
+   |
+12 |     let mut x4 = args[4];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:13:13
+   |
+13 |     let mut x5 = args[5];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:63:13
+   |
+63 |     let mut x0 = args[0];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:64:13
+   |
+64 |     let mut x1 = args[1];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:65:13
+   |
+65 |     let mut x2 = args[2];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:66:13
+   |
+66 |     let mut x3 = args[3];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:67:13
+   |
+67 |     let mut x4 = args[4];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates/yarm-user-rt/src/arch/aarch64.rs:68:13
+   |
+68 |     let mut x5 = args[5];
+   |         ----^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused import: `alloc::vec::Vec`
+ --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:4:5
+  |
+4 | use alloc::vec::Vec;
+  |     ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `build_read_message` and `build_statx_message`
+  --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:42:48
+   |
+42 |     build_close_message, build_openat_message, build_read_message, build_statx_message,
+   |                                                ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:164:26
+    |
+ 41 | pub(super) const SELECTOR: u32 = 30;
+    | ------------------------------ constant defined here
+...
+164 |     matches!(slot5, Some(SELECTOR))
+    |              -----       ^^^^^^^^
+    |              |           |
+    |              |           expected `u64`, found `u32`
+    |              |           `SELECTOR` is interpreted as a constant, not a new binding
+    |              this expression has type `Option<u64>`
+    |
+help: introduce a new binding instead
+    |
+164 -     matches!(slot5, Some(SELECTOR))
+164 +     matches!(slot5, Some(other_selector))
+    |
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:336:13
+    |
+336 |             inout("v0") v0,
+    |             ^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:337:13
+    |
+337 |             inout("v1") v1,
+    |             ^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:338:13
+    |
+338 |             inout("v16") v2,
+    |             ^^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:339:13
+    |
+339 |             inout("v17") v3,
+    |             ^^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:487:13
+    |
+487 |             inout("v0") v0,
+    |             ^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:488:13
+    |
+488 |             inout("v1") v1,
+    |             ^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:489:13
+    |
+489 |             inout("v16") v2,
+    |             ^^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:490:13
+    |
+490 |             inout("v17") v3,
+    |             ^^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:677:13
+    |
+677 |             inout("v0") v0,
+    |             ^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:678:13
+    |
+678 |             inout("v1") v1,
+    |             ^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:679:13
+    |
+679 |             inout("v16") v2,
+    |             ^^^^^^^^^^^^^^^
+
+error: register class `vreg` requires the `neon` target feature
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:680:13
+    |
+680 |             inout("v17") v3,
+    |             ^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:790:30
+    |
+790 |         let _ = recv_timeout(park, 2);
+    |                 ------------ ^^^^ expected `u64`, found `u32`
+    |                 |
+    |                 arguments to this function are incorrect
+    |
+note: function defined here
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:197:4
+    |
+197 | fn recv_timeout(cap: u64, timeout: u64) -> Recv {
+    |    ^^^^^^^^^^^^ --------
+help: you can convert a `u32` to a `u64`
+    |
+790 |         let _ = recv_timeout(park.into(), 2);
+    |                                  +++++++
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:794:30
+    |
+794 |         let _ = recv_timeout(park, 2);
+    |                 ------------ ^^^^ expected `u64`, found `u32`
+    |                 |
+    |                 arguments to this function are incorrect
+    |
+note: function defined here
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:197:4
+    |
+197 | fn recv_timeout(cap: u64, timeout: u64) -> Recv {
+    |    ^^^^^^^^^^^^ --------
+help: you can convert a `u32` to a `u64`
+    |
+794 |         let _ = recv_timeout(park.into(), 2);
+    |                                  +++++++
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:908:30
+    |
+908 |         let _ = recv_timeout(park, 2);
+    |                 ------------ ^^^^ expected `u64`, found `u32`
+    |                 |
+    |                 arguments to this function are incorrect
+    |
+note: function defined here
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:197:4
+    |
+197 | fn recv_timeout(cap: u64, timeout: u64) -> Recv {
+    |    ^^^^^^^^^^^^ --------
+help: you can convert a `u32` to a `u64`
+    |
+908 |         let _ = recv_timeout(park.into(), 2);
+    |                                  +++++++
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:978:54
+    |
+978 |                     let (r, m) = park_measuring_simd(park, IDLE_PARK_TICKS, seed);
+    |                                  ------------------- ^^^^ expected `u64`, found `u32`
+    |                                  |
+    |                                  arguments to this function are incorrect
+    |
+note: function defined here
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:306:4
+    |
+306 | fn park_measuring_simd(cap: u64, timeout: u64, seed: u64) -> (Recv, u32) {
+    |    ^^^^^^^^^^^^^^^^^^^ --------
+help: you can convert a `u32` to a `u64`
+    |
+978 |                     let (r, m) = park_measuring_simd(park.into(), IDLE_PARK_TICKS, seed);
+    |                                                          +++++++
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:982:34
+    |
+982 |                     recv_timeout(park, IDLE_PARK_TICKS)
+    |                     ------------ ^^^^ expected `u64`, found `u32`
+    |                     |
+    |                     arguments to this function are incorrect
+    |
+note: function defined here
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:197:4
+    |
+197 | fn recv_timeout(cap: u64, timeout: u64) -> Recv {
+    |    ^^^^^^^^^^^^ --------
+help: you can convert a `u32` to a `u64`
+    |
+982 |                     recv_timeout(park.into(), IDLE_PARK_TICKS)
+    |                                      +++++++
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:998:32
+    |
+998 |             match recv_timeout(notif, 0) {
+    |                   ------------ ^^^^^ expected `u64`, found `u32`
+    |                   |
+    |                   arguments to this function are incorrect
+    |
+note: function defined here
+   --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:197:4
+    |
+197 | fn recv_timeout(cap: u64, timeout: u64) -> Recv {
+    |    ^^^^^^^^^^^^ --------
+help: you can convert a `u32` to a `u64`
+    |
+998 |             match recv_timeout(notif.into(), 0) {
+    |                                     +++++++
+
+error[E0308]: mismatched types
+    --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:1017:42
+     |
+1017 |         let once = matches!(recv_timeout(notif, 0), Recv::Empty);
+     |                             ------------ ^^^^^ expected `u64`, found `u32`
+     |                             |
+     |                             arguments to this function are incorrect
+     |
+note: function defined here
+    --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:197:4
+     |
+ 197 | fn recv_timeout(cap: u64, timeout: u64) -> Recv {
+     |    ^^^^^^^^^^^^ --------
+help: you can convert a `u32` to a `u64`
+     |
+1017 |         let once = matches!(recv_timeout(notif.into(), 0), Recv::Empty);
+     |                                               +++++++
+
+error[E0308]: mismatched types
+    --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:1087:34
+     |
+1087 |         if matches!(recv_timeout(park, POST_PARK_TICKS), Recv::TimedOut) {
+     |                     ------------ ^^^^ expected `u64`, found `u32`
+     |                     |
+     |                     arguments to this function are incorrect
+     |
+note: function defined here
+    --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:197:4
+     |
+ 197 | fn recv_timeout(cap: u64, timeout: u64) -> Recv {
+     |    ^^^^^^^^^^^^ --------
+help: you can convert a `u32` to a `u64`
+     |
+1087 |         if matches!(recv_timeout(park.into(), POST_PARK_TICKS), Recv::TimedOut) {
+     |                                      +++++++
+
+error[E0308]: mismatched types
+    --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:1090:34
+     |
+1090 |         if matches!(recv_timeout(notif, 0), Recv::Message { .. }) {
+     |                     ------------ ^^^^^ expected `u64`, found `u32`
+     |                     |
+     |                     arguments to this function are incorrect
+     |
+note: function defined here
+    --> crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs:197:4
+     |
+ 197 | fn recv_timeout(cap: u64, timeout: u64) -> Recv {
+     |    ^^^^^^^^^^^^ --------
+help: you can convert a `u32` to a `u64`
+     |
+1090 |         if matches!(recv_timeout(notif.into(), 0), Recv::Message { .. }) {
+     |                                       +++++++
+
+warning: unused variable: `d`
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:6556:21
+     |
+6556 |         let Ok(Some(d)) = got else {
+     |                     ^ help: if this is intentional, prefix it with an underscore: `_d`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `yarm-control-plane-servers` (lib) due to 22 previous errors; 3 warnings emitted

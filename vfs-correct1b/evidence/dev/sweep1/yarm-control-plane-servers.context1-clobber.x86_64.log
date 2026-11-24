@@ -1,0 +1,81 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1668:5
+     |
+1668 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1667:5
+     |
+1667 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `arch::State`
+   --> crates/yarm-control-plane-servers/src/control_plane/init/context_witness.rs:774:5
+    |
+774 | use arch::State;
+    |     ^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::vec::Vec`
+ --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:4:5
+  |
+4 | use alloc::vec::Vec;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused imports: `build_read_message` and `build_statx_message`
+  --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:42:48
+   |
+42 |     build_close_message, build_openat_message, build_read_message, build_statx_message,
+   |                                                ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> crates/yarm-control-plane-servers/src/control_plane/init/context_witness.rs:48:26
+   |
+45 | pub(super) const SELECTOR: u32 = 31;
+   | ------------------------------ constant defined here
+...
+48 |     matches!(slot5, Some(SELECTOR))
+   |              -----       ^^^^^^^^
+   |              |           |
+   |              |           expected `u64`, found `u32`
+   |              |           `SELECTOR` is interpreted as a constant, not a new binding
+   |              this expression has type `Option<u64>`
+   |
+help: introduce a new binding instead
+   |
+48 -     matches!(slot5, Some(SELECTOR))
+48 +     matches!(slot5, Some(other_selector))
+   |
+
+error[E0308]: mismatched types
+    --> crates/yarm-control-plane-servers/src/control_plane/init/context_witness.rs:778:68
+     |
+ 778 |     let _ = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(park, ticks) };
+     |                      --------------------------------------------- ^^^^ expected `u64`, found `u32`
+     |                      |
+     |                      arguments to this function are incorrect
+     |
+note: function defined here
+    --> crates/yarm-user-rt/src/lib.rs:1194:19
+     |
+1194 |     pub unsafe fn ipc_recv_with_deadline(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^
+help: you can convert a `u32` to a `u64`
+     |
+ 778 |     let _ = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(park.into(), ticks) };
+     |                                                                        +++++++
+
+warning: unused variable: `d`
+    --> crates/yarm-control-plane-servers/src/control_plane/init/service.rs:6556:21
+     |
+6556 |         let Ok(Some(d)) = got else {
+     |                     ^ help: if this is intentional, prefix it with an underscore: `_d`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `yarm-control-plane-servers` (lib) due to 2 previous errors; 4 warnings emitted

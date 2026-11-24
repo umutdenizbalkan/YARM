@@ -1,0 +1,40 @@
+VFS-CORRECT1B baseline captures (baseline cfc14b33c537084e2add72df5f1743b0a50f5622, AArch64 SMP2 core smoke)
+
+== F04: f04-aarch64 (baseline + vc1b-f04-probe.patch: init statx /ram/boot after registering /ram)
+USER_LOG tid=10001 msg=DEVFS_SRV_RECV_CAP cap=65536
+USER_LOG tid=10002 msg=VFS_ROUTE_INIT initramfs_send=65538 devfs_send=65539
+USER_LOG tid=10002 msg=VFS_SRV_RECV_CAP cap=65536
+USER_LOG tid=10002 msg=VFS_BACKEND_REPLY_CAP cap=65537 shared_with_main_recv=0
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=22 target=initramfs send_cap=65538 reply_cap=65537
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL_SENT op=22 status=ok
+USER_LOG tid=10002 msg=VFS_BACKEND_REPLY_RECV_BEGIN op=22 reply_cap=65537
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=22 target=devfs send_cap=65539 reply_cap=65537
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL_SENT op=22 status=ok
+USER_LOG tid=10002 msg=VFS_BACKEND_REPLY_RECV_BEGIN op=22 reply_cap=65537
+USER_LOG tid=1 msg=INIT_RAMFS_SPAWN_OK child_tid=10006 send_cap=65551 prefix=/ram
+USER_LOG tid=10002 msg=VFS_MOUNT_REGISTER_REQUEST cap=65551 flags=0
+USER_LOG tid=10002 msg=VFS_MOUNT_REGISTER_OK entries=3
+USER_LOG tid=1 msg=VC1B_BASE_RAM_PROBE init_local_ramfs_send=65551
+core smoke rc: 1 (boot blocked: VFS waits forever on the reply to a refused call; VC1B_BASE_RAM_STATX never logged)
+
+== F07: f07-aarch64 (baseline + vc1b-f07-genwitness-probe.patch: every slot starts at generation 65537)
+USER_LOG tid=1 msg=INIT_NO_PM_CAPS
+USER_LOG tid=1 msg=STARTUP_INSTALL_FINAL task_id=1 pm_send=4295032832 pm_reply=4295032833 slots_len=18
+USER_LOG tid=2 msg=STARTUP_INSTALL_FINAL task_id=2 pm_send=4295032832 pm_reply=4295032836 slots_len=18
+USER_LOG tid=2 msg=SUP_HANDOFF_CONTROL_RECV cap=None
+USER_LOG tid=2 msg=SUP_HANDOFF_CONTROL_SEND cap=None
+USER_LOG tid=2 msg=SUP_HANDOFF_FAULT_RECV cap=None
+USER_LOG tid=2 msg=supervisor.srv runtime handoff incomplete: startup_task_id=2, err=InvalidCapability; TODO: provide endpoint caps via startup BootInfo/runtime args
+USER_LOG tid=3 msg=PM_NO_RECV_CAP
+USER_LOG tid=3 msg=PM_STARTUP_CAPS request_send=0 request_recv=0 reply_recv=0
+USER_LOG tid=3 msg=STARTUP_INSTALL_FINAL task_id=3 pm_send=0 pm_reply=4295032833 slots_len=18
+core smoke rc: 1
+
+== F04 key lines (the /ram request)
+AARCH64_SPLIT_FINALIZE_OK nr=6 result=ok
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=22 target=/ram/ send_cap=65551 reply_cap=65537
+IPCCALL_DIRECT_REFUSED_PRE_LOCK tid=10002 send_cap=65551 reason=send_cap err=InvalidCapability copies=0 enqueues=0 mutations=0 result=ok
+AARCH64_SPLIT_FINALIZE_OK nr=6 result=error code=3
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL_SENT op=22 status=ok
+USER_LOG tid=10002 msg=VFS_BACKEND_REPLY_RECV_BEGIN op=22 reply_cap=65537
+D2_RECV_WAITER_TASK_BLOCKED tid=10002 wait_gen=37

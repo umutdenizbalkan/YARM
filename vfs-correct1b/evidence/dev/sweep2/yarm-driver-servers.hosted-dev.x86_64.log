@@ -1,0 +1,47 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1668:5
+     |
+1668 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1667:5
+     |
+1667 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-user-none` target may not support the standard library
+  = note: `std` is required by `rp1_gpio_srv` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error: cannot resolve a prelude import
+
+error: `#[panic_handler]` function required, but not found
+
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-user-none` target may not support the standard library
+  = note: `std` is required by `uart_srv` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-user-none` target may not support the standard library
+  = note: `std` is required by `virtio_blk_srv` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+For more information about this error, try `rustc --explain E0463`.
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-user-none` target may not support the standard library
+  = note: `std` is required by `blkcache_srv` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error: could not compile `yarm-driver-servers` (bin "uart_srv") due to 3 previous errors
+error: could not compile `yarm-driver-servers` (bin "rp1_gpio_srv") due to 3 previous errors
+error: could not compile `yarm-driver-servers` (bin "blkcache_srv") due to 3 previous errors
+error: could not compile `yarm-driver-servers` (bin "virtio_blk_srv") due to 3 previous errors

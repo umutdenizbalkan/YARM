@@ -1,0 +1,79 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1668:5
+     |
+1668 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1667:5
+     |
+1667 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/vfs/fd_table.rs:165:40
+    |
+165 |             assert!(t.insert(i as u64, (i + 1) as u32, "x", CLIENT_A));
+    |                       ------           ^^^^^^^^^^^^^^ expected `u64`, found `u32`
+    |                       |
+    |                       arguments to this method are incorrect
+    |
+note: method defined here
+   --> crates/yarm-control-plane-servers/src/control_plane/vfs/fd_table.rs:54:12
+    |
+ 34 | impl VfsFdTable {
+...
+ 54 |     pub fn insert(&mut self, fd: u64, backend_cap: u64, name: &str, client_id: u64) -> bool {
+    |            ^^^^^^                     ----------------
+help: you can convert a `u32` to a `u64`
+    |
+165 |             assert!(t.insert(i as u64, ((i + 1) as u32).into(), "x", CLIENT_A));
+    |                                        +              ++++++++
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/vfs/mount_table.rs:336:49
+    |
+336 |             assert!(table.register(prefix, "x", (i + 1) as u32));
+    |                           --------              ^^^^^^^^^^^^^^ expected `u64`, found `u32`
+    |                           |
+    |                           arguments to this method are incorrect
+    |
+note: method defined here
+   --> crates/yarm-control-plane-servers/src/control_plane/vfs/mount_table.rs:99:12
+    |
+ 77 | impl VfsMountTable {
+...
+ 99 |     pub fn register(&mut self, prefix: &[u8], name: &str, send_cap: u64) -> bool {
+    |            ^^^^^^^^                                       -------------
+help: you can convert a `u32` to a `u64`
+    |
+336 |             assert!(table.register(prefix, "x", ((i + 1) as u32).into()));
+    |                                                 +              ++++++++
+
+error[E0308]: mismatched types
+   --> crates/yarm-control-plane-servers/src/control_plane/vfs/mount_table.rs:437:42
+    |
+437 |                 .insert_dynamic(&prefix, (i + 1) as u32, 0)
+    |                  --------------          ^^^^^^^^^^^^^^ expected `u64`, found `u32`
+    |                  |
+    |                  arguments to this method are incorrect
+    |
+note: method defined here
+   --> crates/yarm-control-plane-servers/src/control_plane/vfs/mount_table.rs:126:12
+    |
+ 77 | impl VfsMountTable {
+...
+126 |     pub fn insert_dynamic(
+    |            ^^^^^^^^^^^^^^
+...
+129 |         send_cap: u64,
+    |         -------------
+help: you can convert a `u32` to a `u64`
+    |
+437 |                 .insert_dynamic(&prefix, ((i + 1) as u32).into(), 0)
+    |                                          +              ++++++++
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `yarm-control-plane-servers` (lib test) due to 3 previous errors

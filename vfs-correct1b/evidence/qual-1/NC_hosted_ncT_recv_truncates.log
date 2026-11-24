@@ -1,0 +1,93 @@
+applied ncT_recv_truncates to crates/yarm-user-rt/src/lib.rs
+diff --git a/crates/yarm-user-rt/src/lib.rs b/crates/yarm-user-rt/src/lib.rs
+index dfe54424..8f8c4890 100644
+--- a/crates/yarm-user-rt/src/lib.rs
++++ b/crates/yarm-user-rt/src/lib.rs
+@@ -702,7 +702,7 @@ pub mod syscall {
+         let returned_cap = if meta.cap_id == SYSCALL_NO_TRANSFER_CAP {
+             None
+         } else {
+-            Some(meta.cap_id)
++            Some(meta.cap_id & 0xFFFF_FFFF)
+         };
+         let preview_len = core::cmp::min(data_len, 32);
+         let _ = preview_len;
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1668:5
+     |
+1668 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1667:5
+     |
+1667 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+
+running 6 tests
+syscall::vc1b_width_tests::vc1b_a_reply_cap_above_u32_is_kept_whole_and_is_not_a_transfer --- FAILED
+syscall::vc1b_width_tests::vc1b_a_transferred_cap_above_u32_is_kept_whole --- FAILED
+....
+failures:
+
+---- syscall::vc1b_width_tests::vc1b_a_reply_cap_above_u32_is_kept_whole_and_is_not_a_transfer stdout ----
+
+thread 'syscall::vc1b_width_tests::vc1b_a_reply_cap_above_u32_is_kept_whole_and_is_not_a_transfer' (17599) panicked at crates/yarm-user-rt/src/lib.rs:1615:13:
+assertion `left == right` failed
+  left: Some(65553)
+ right: Some(4295032849)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<core::option::Option<u64>, core::option::Option<u64>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_user_rt::syscall::vc1b_width_tests::vc1b_a_reply_cap_above_u32_is_kept_whole_and_is_not_a_transfer
+             at ./src/lib.rs:1615:13
+   5: yarm_user_rt::syscall::vc1b_width_tests::vc1b_a_reply_cap_above_u32_is_kept_whole_and_is_not_a_transfer::{closure#0}
+             at ./src/lib.rs:1612:76
+   6: <yarm_user_rt::syscall::vc1b_width_tests::vc1b_a_reply_cap_above_u32_is_kept_whole_and_is_not_a_transfer::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- syscall::vc1b_width_tests::vc1b_a_transferred_cap_above_u32_is_kept_whole stdout ----
+
+thread 'syscall::vc1b_width_tests::vc1b_a_transferred_cap_above_u32_is_kept_whole' (17600) panicked at crates/yarm-user-rt/src/lib.rs:1597:13:
+assertion `left == right` failed
+  left: Some(65553)
+ right: Some(4295032849)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<core::option::Option<u64>, core::option::Option<u64>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_user_rt::syscall::vc1b_width_tests::vc1b_a_transferred_cap_above_u32_is_kept_whole
+             at ./src/lib.rs:1597:13
+   5: yarm_user_rt::syscall::vc1b_width_tests::vc1b_a_transferred_cap_above_u32_is_kept_whole::{closure#0}
+             at ./src/lib.rs:1593:60
+   6: <yarm_user_rt::syscall::vc1b_width_tests::vc1b_a_transferred_cap_above_u32_is_kept_whole::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    syscall::vc1b_width_tests::vc1b_a_reply_cap_above_u32_is_kept_whole_and_is_not_a_transfer
+    syscall::vc1b_width_tests::vc1b_a_transferred_cap_above_u32_is_kept_whole
+
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 149 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p yarm-user-rt --lib`

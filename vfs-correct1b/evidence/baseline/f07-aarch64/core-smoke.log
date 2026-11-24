@@ -1,0 +1,19 @@
+ARTIFACT_BINDING arch=aarch64 kernel=build-aarch64/yarm-aarch64.bin kernel_sha256=b5560f7eaebd72c79f7a8539c8f8900c63b90122ef4fd814655a5b95a02d3054 kernel_features=cap-gen-witness kernel_resolved_features=cap-gen-witness kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1a-wt/target/aarch64-yarm-none/aarch64-none/kernel_boot:fresh=0 initramfs=build-aarch64/initramfs-core.cpio initramfs_sha256=3feddf736d145ffb3d0ed64e4bf31083773bcb4a7b236dbe2e0293046182bb10 initramfs_features=cap-gen-witness initramfs_compile_env=none source=dirty:1defea8d0a160893ac3ff71506721e352f59876c:43cf98e6afae6c3028ce0a02 required=kernel=cap-gen-witness result=ok
+[info] qemu command: qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024M -smp 2 -nographic -monitor none -serial stdio -kernel build-aarch64/yarm-aarch64.bin -initrd build-aarch64/initramfs-core.cpio
+[info] aarch64 core: completion condition: idle
+[ok] aarch64 core: terminal idle (SCHED_ENTER_IDLE_HLT) reached — QEMU stopped intentionally
+[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell
+[error] U9-RX4: PM decodes the lifecycle query -- expected exactly 1, got 0: PM_LIFECYCLE_QUERY_RECV tid=2
+[error] U9-RX4: PM replies successfully -- expected exactly 1, got 0: PM_LIFECYCLE_QUERY_REPLY tid=2 found=1
+[ok] U9-RX4: terminal-outcome evaluator self-test passed (8 accepted, 27 rejected)
+[error] U9-RX4: PM receives tid 2's query exactly once, with a reply cap -- got 0
+[ok] U9-RX4: no reply cap is lost to the u32::MAX sentinel
+[ok] U9-RX4: PM never fails to decode
+[ok] U9-RX4: no writeback rollback on the witnessed path
+[ok] U9-RX4: the reply cap is never used twice
+[ok] U9-RX4: no cap materialization failure
+[error] U9-RX4: the blocking IpcRecv route publishes and defers -- expected at least 1, got 0: IPC_RECV_BLOCK_SPLIT_DONE
+[ok] U9-RX4: the broad dispatcher is skipped for a published block (n=1137)
+[error] U9-RX4: the existing D2-recv drain resumes a replacement -- expected at least 1, got 0: D2_RECV_GENUINE_DISPATCH_DONE result=switch
+[ok] U9-RX4: no fail-closed settlement on the blocking route
+[error] U9-RX4 AArch64 reply-cap witness FAILED

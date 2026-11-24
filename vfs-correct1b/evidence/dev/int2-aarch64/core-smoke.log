@@ -1,0 +1,22 @@
+ARTIFACT_BINDING arch=aarch64 kernel=build-aarch64/yarm-aarch64.bin kernel_sha256=5df1180c535b4ca6af259c0eb095b49596f0a09b709c9e2c8f4068ad13ca196c kernel_features=cap-gen-witness,vfs-correct-witness,vfs-mount-witness kernel_resolved_features=cap-gen-witness,vfs-correct-witness,vfs-mount-witness kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-wt/target/aarch64-yarm-none/aarch64-none/kernel_boot:fresh=0 initramfs=build-aarch64/initramfs-core.cpio initramfs_sha256=47e207cd8d3076e30671585e6011123605a23654e452d2ba710dc00af526da2c initramfs_features=cap-gen-witness,vfs-correct-witness,vfs-mount-witness initramfs_compile_env=none source=dirty:1defea8d0a160893ac3ff71506721e352f59876c:3957885e0dc45b699a3d3227 required=none result=ok
+[info] qemu command: qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024M -smp 2 -nographic -monitor none -serial stdio -kernel build-aarch64/yarm-aarch64.bin -initrd build-aarch64/initramfs-core.cpio
+[info] aarch64 core: completion condition: idle
+[ok] aarch64 core: terminal idle (VC1B_END) reached — QEMU stopped intentionally
+[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell
+[ok] U9-RX4: PM decodes the lifecycle query
+[ok] U9-RX4: PM replies successfully
+[ok] U9-RX4: terminal-outcome evaluator self-test passed (8 accepted, 27 rejected)
+[ok] U9-RX4: REPLY won the terminal of record_index=0 record_generation=1 (queued route, cap 4295032834) — commit=1 resume=1 one-shot revoked, no timeout win
+[ok] U9-RX4: no reply cap is lost to the u32::MAX sentinel
+[ok] U9-RX4: PM never fails to decode
+[ok] U9-RX4: no writeback rollback on the witnessed path
+[ok] U9-RX4: the reply cap is never used twice
+[ok] U9-RX4: no cap materialization failure
+[ok] U9-RX4: the blocking IpcRecv route publishes and defers (n=296)
+[ok] U9-RX4: the broad dispatcher is skipped for a published block (n=384)
+[ok] U9-RX4: the existing D2-recv drain resumes a replacement (n=269)
+[ok] U9-RX4: no fail-closed settlement on the blocking route
+[ok] U9-RX4: AArch64 queued-plain reply-cap + framing witness chain complete
+[error] BAD / BOOT BLOCKERS found:
+43227:USER_LOG tid=1 msg=INIT_MOUNT_STAGE_REFUSED prefix=/ram err=InvalidCapability
+43285:USER_LOG tid=1 msg=INIT_MOUNT_STAGE_REFUSED prefix=/ram err=InvalidCapability

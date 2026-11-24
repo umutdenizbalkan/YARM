@@ -1,0 +1,104 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 42e6c702..453cd258 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -263,6 +263,13 @@ futex-time-witness = ["printk-witness-ring"]
+ futex-sync-witness = []
+ # VFS-CORRECT1A — init's read-path witness; accepted and inert in this package.
+ vfs-correct-witness = []
++# VFS-CORRECT1B — F07 witness (default off): every capability slot of every CNode starts at
++# generation 65,537 instead of 1, so every capability ID the kernel issues exceeds 32 bits and any
++# truncating consumer on the boot path fails. Kernel only; inert in every server package.
++cap-gen-witness = []
++# VFS-CORRECT1B — F04 witness (default off): init's mount-administration cell and ramfs_srv's seed
++# file; accepted and inert in this package.
++vfs-mount-witness = []
+ # FUTEX-SEAL1 — the live futex seal witness (default off): the kernel half `kernel::seal_witness`
+ # (the budget sequence's one induced exhaustion and its record) on top of the FUTEX-TIME1 markers;
+ # init's cell is the same-named feature of yarm-control-plane-servers.
+diff --git a/crates/yarm-control-plane-servers/Cargo.toml b/crates/yarm-control-plane-servers/Cargo.toml
+index 1f42b0df..9102d0f2 100644
+--- a/crates/yarm-control-plane-servers/Cargo.toml
++++ b/crates/yarm-control-plane-servers/Cargo.toml
+@@ -89,6 +89,10 @@ futex-sync-witness = []
+ futex-seal-witness = []
+ # VFS-CORRECT1A — the live read-path witness: init's cell after its VFS smokes (no kernel side).
+ vfs-correct-witness = []
++# VFS-CORRECT1B: the kernel's generation witness; accepted and inert in this package.
++cap-gen-witness = []
++# VFS-CORRECT1B — init's mount-administration witness, after the VFS-CORRECT1A cell.
++vfs-mount-witness = []
+ # FUTEX-SEAL1 — with futex-seal-witness, the sequence cells to run, in this order, one file each:
+ # selective-wake order (futex_seal_os.rs), NR 17 (futex_seal_nr17.rs), the late sole-wake
+ # handoff (futex_seal_lh.rs), the paired broadcast (futex_seal_witness.rs), and last the RT-budget
+diff --git a/crates/yarm-driver-servers/Cargo.toml b/crates/yarm-driver-servers/Cargo.toml
+index b3833b0b..00231642 100644
+--- a/crates/yarm-driver-servers/Cargo.toml
++++ b/crates/yarm-driver-servers/Cargo.toml
+@@ -63,6 +63,10 @@ futex-time-witness = []
+ futex-sync-witness = []
+ # VFS-CORRECT1A — init's read-path witness; accepted and inert in this package.
+ vfs-correct-witness = []
++# VFS-CORRECT1B: the kernel's generation witness; accepted and inert in this package.
++cap-gen-witness = []
++# VFS-CORRECT1B: init's and ramfs_srv's mount witness; accepted and inert in this package.
++vfs-mount-witness = []
+ # FUTEX-SEAL1: accepted and inert here (init's cell; the kernel side is the root crate's feature).
+ futex-seal-witness = []
+ # FUTEX-SEAL1: init's per-sequence cell selectors; accepted and inert here.
+diff --git a/crates/yarm-fs-servers/Cargo.toml b/crates/yarm-fs-servers/Cargo.toml
+index 6266e1a5..bc90e405 100644
+--- a/crates/yarm-fs-servers/Cargo.toml
++++ b/crates/yarm-fs-servers/Cargo.toml
+@@ -63,6 +63,11 @@ futex-time-witness = []
+ futex-sync-witness = []
+ # VFS-CORRECT1A — init's read-path witness; accepted and inert in this package.
+ vfs-correct-witness = []
++# VFS-CORRECT1B: the kernel's generation witness; accepted and inert in this package.
++cap-gen-witness = []
++# VFS-CORRECT1B — ramfs_srv seeds /ram/vc1b-witness (192 bytes, byte[i] = (i * 37 + 11) mod 256)
++# for init's mount witness.
++vfs-mount-witness = []
+ # FUTEX-SEAL1: accepted and inert here (init's cell; the kernel side is the root crate's feature).
+ futex-seal-witness = []
+ # FUTEX-SEAL1: init's per-sequence cell selectors; accepted and inert here.
+diff --git a/src/kernel/capabilities.rs b/src/kernel/capabilities.rs
+index 811415a8..d004c807 100644
+--- a/src/kernel/capabilities.rs
++++ b/src/kernel/capabilities.rs
+@@ -70,6 +70,17 @@ pub const MAX_CAPABILITIES_PER_CSPACE: usize = 1024;
+ #[cfg(not(feature = "hosted-dev"))]
+ pub const MAX_CAPABILITIES_PER_CSPACE: usize = 512;
+ 
++/// The generation every slot of a new (or grown) CNode starts at.
++///
++/// VFS-CORRECT1B: under the default-off `cap-gen-witness` feature it is 65,537, so every
++/// capability ID the kernel issues is `(generation << 16) | index` with a generation above 65,535:
++/// above `u32::MAX`, and changed by any 32-bit truncation. Nothing else differs; revocation still
++/// advances the generation by one and skips 0.
++#[cfg(not(feature = "cap-gen-witness"))]
++pub const INITIAL_SLOT_GENERATION: u64 = 1;
++#[cfg(feature = "cap-gen-witness")]
++pub const INITIAL_SLOT_GENERATION: u64 = 0x1_0001;
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ struct CapEntry {
+     capability: Capability,
+@@ -108,7 +119,7 @@ impl CNodeSlots {
+         slots.resize(
+             slot_capacity,
+             CapSlot {
+-                generation: 1,
++                generation: INITIAL_SLOT_GENERATION,
+                 entry: None,
+             },
+         );
+@@ -153,7 +164,7 @@ impl CNodeSlots {
+             next.resize(
+                 target_len,
+                 CapSlot {
+-                    generation: 1,
++                    generation: INITIAL_SLOT_GENERATION,
+                     entry: None,
+                 },
+             );

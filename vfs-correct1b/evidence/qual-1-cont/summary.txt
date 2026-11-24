@@ -1,0 +1,10 @@
+vc1b qual qual-1-cont start 2026-11-24T17:17:08Z C=408ae6e7 B=cfc14b33 runner=79efb962e606a96d nc=9d03181170e7e7be
+candidate tree 5901cfbc101e7d8dc26d747c939dca9f702dca6f
+continuation of qual-1: the live negative controls and the epilogue only
+=== NC_live_ncT_vfs_truncates_aarch64_cont [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-nc-wt/NC_live_ncT_vfs_truncates_aarch64_cont at 408ae6e79874]: ncT_vfs_truncates; env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-evidence/qual-1-cont/NCL_T scripts/qemu-vfs-mount-witness-smoke.sh aarch64 2 wide (start 17:17:34)
+NC_live_ncT_vfs_truncates_aarch64_cont rc=1 secs=133 mutated_files=crates/yarm-fs-servers/src/fs/common/mount_admin.rs 
+=== NC_live_ncS_sender_slot_aarch64_cont [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-nc-wt/NC_live_ncS_sender_slot_aarch64_cont at 408ae6e79874]: ncS_sender_slot; env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-evidence/qual-1-cont/NCL_S scripts/qemu-vfs-mount-witness-smoke.sh aarch64 2 wide (start 17:19:47)
+NC_live_ncS_sender_slot_aarch64_cont rc=1 secs=101 mutated_files=crates/yarm-fs-servers/src/fs/common/mount_admin.rs 
+post-NC porcelain=0 base-porcelain=0 candidate=408ae6e79874
+vc1b qual qual-1-cont end 2026-11-24T17:21:28Z
+VC1B_QUAL_DONE

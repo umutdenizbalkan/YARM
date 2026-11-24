@@ -1,0 +1,5 @@
+d359fdc2de594ea9d63e53ea645e4a669ab38318492938950e61dbeb9b11b57e  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-evidence/qual-1/W_narrow_aarch64/boot.log
+7d3fe8daa6a7fa2ae48ba7f53d9926c9f81ddfc6aa937e6af232ce672b285b4a  build-aarch64/yarm-aarch64.bin
+8563057795003c3c9a02a87b71bc2bb40314c365eb589e1b72de6d1816ab451c  build-aarch64/initramfs-core.cpio
+2477895b62bc927892dc03371abb909afec7fbd604c544b44ea369413f517b29  build-aarch64/rootfs/init
+97056678793b338e860d6ebb2ffa74d2f86005ddf2415958836ba0626e00f008  scripts/fixtures/vfs-fixture.bin

@@ -1,0 +1,5 @@
+f4d70b46641e050926510f5549709526f4818c87ed80de82284c936fad14eb87  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-evidence/qual-1/W_narrow_riscv64/boot.log
+9492c73842013c6df07e518723340d28be8e2491492ef51b2e6cd0f02d1323a8  build-riscv64/yarm-riscv64.bin
+1cc253f37e8c9d219ce3ad7d5d8f7612eac7245325dbcb27e6d1297d45b23f94  build-riscv64/initramfs-core.cpio
+d904d7ac163e0c2d55e3f9fd67f0c0cd31407969f07927d0eb13fa294bc71264  build-riscv64/rootfs/init
+97056678793b338e860d6ebb2ffa74d2f86005ddf2415958836ba0626e00f008  scripts/fixtures/vfs-fixture.bin

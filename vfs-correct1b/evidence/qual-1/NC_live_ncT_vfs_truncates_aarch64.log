@@ -1,0 +1,15 @@
+applied ncT_vfs_truncates to crates/yarm-fs-servers/src/fs/common/mount_admin.rs
+diff --git a/crates/yarm-fs-servers/src/fs/common/mount_admin.rs b/crates/yarm-fs-servers/src/fs/common/mount_admin.rs
+index 3bbc8801..7fd10531 100644
+--- a/crates/yarm-fs-servers/src/fs/common/mount_admin.rs
++++ b/crates/yarm-fs-servers/src/fs/common/mount_admin.rs
+@@ -238,7 +238,7 @@ impl MountAdmin {
+             sender_tid,
+             flags: args.flags,
+             sender_local_cap: args.sender_local_cap,
+-            backend_cap,
++            backend_cap: backend_cap & 0xFFFF_FFFF,
+             prefix,
+             prefix_len: args.prefix.len() as u8,
+         };
+[vfs-mount-witness] building aarch64 artifacts with cap-gen-witness,vfs-correct-witness,vfs-mount-witness

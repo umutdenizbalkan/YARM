@@ -1,0 +1,93 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1668:5
+     |
+1668 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1667:5
+     |
+1667 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::vec::Vec`
+ --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:4:5
+  |
+4 | use alloc::vec::Vec;
+  |     ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `build_read_message` and `build_statx_message`
+  --> crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs:42:48
+   |
+42 |     build_close_message, build_openat_message, build_read_message, build_statx_message,
+   |                                                ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-user-none` target may not support the standard library
+  = note: `std` is required by `supervisor` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-user-none` target may not support the standard library
+  = note: `std` is required by `driver_manager` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error: cannot resolve a prelude import
+
+error: no global memory allocator found but one is required; link to std or add `#[global_allocator]` to a static item that implements the GlobalAlloc trait
+
+error: `#[panic_handler]` function required, but not found
+
+For more information about this error, try `rustc --explain E0463`.
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-user-none` target may not support the standard library
+  = note: `std` is required by `crash_test_srv` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `x86_64-yarm-user-none` target may not support the standard library
+  = note: `std` is required by `init_server` because it does not declare `#![no_std]`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error: could not compile `yarm-control-plane-servers` (bin "supervisor") due to 4 previous errors
+error: could not compile `yarm-control-plane-servers` (bin "driver_manager") due to 4 previous errors
+error: could not compile `yarm-control-plane-servers` (bin "init_server") due to 4 previous errors
+error: cannot find macro `eprintln` in this scope
+  --> crates/yarm-control-plane-servers/src/bin/crash_test_srv.rs:30:5
+   |
+30 |     eprintln!("CRASH_TEST_SRV_EXIT_NOW");
+   |     ^^^^^^^^
+
+error: cannot find macro `eprintln` in this scope
+  --> crates/yarm-control-plane-servers/src/bin/crash_test_srv.rs:29:5
+   |
+29 |     eprintln!("CRASH_TEST_SRV_DELAY_DONE");
+   |     ^^^^^^^^
+
+error: cannot find macro `eprintln` in this scope
+  --> crates/yarm-control-plane-servers/src/bin/crash_test_srv.rs:25:5
+   |
+25 |     eprintln!("CRASH_TEST_SRV_DELAY_BEGIN");
+   |     ^^^^^^^^
+
+error: cannot find macro `eprintln` in this scope
+  --> crates/yarm-control-plane-servers/src/bin/crash_test_srv.rs:24:5
+   |
+24 |     eprintln!("CRASH_TEST_SRV_READY");
+   |     ^^^^^^^^
+
+error: cannot find macro `eprintln` in this scope
+  --> crates/yarm-control-plane-servers/src/bin/crash_test_srv.rs:23:5
+   |
+23 |     eprintln!("CRASH_TEST_SRV_ENTRY");
+   |     ^^^^^^^^
+
+error: could not compile `yarm-control-plane-servers` (bin "crash_test_srv") due to 9 previous errors
