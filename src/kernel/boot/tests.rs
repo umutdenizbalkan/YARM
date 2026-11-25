@@ -27699,7 +27699,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -28218,7 +28218,7 @@ mod stage45 {
     const RECV_V3_VERSION: u32 = 3;
     // The NR 30 record reports the syscall ABI version: v12 since SCHED-TIME-FOUNDATION1, v13
     // since FUTEX-ABS-BITSET1 (NR 9/10's absolute deadline and wake-mask flags).
-    const RECV_V3_ABI_VERSION: u32 = 13;
+    const RECV_V3_ABI_VERSION: u32 = 14;
     const RECV_V3_STATUS_OK: u32 = 0;
     const RECV_V3_NO_TRANSFER_CAP: u64 = u64::MAX;
 
@@ -36986,7 +36986,7 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -39074,7 +39074,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39201,7 +39201,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39376,7 +39376,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39533,7 +39533,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39669,7 +39669,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39832,7 +39832,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40014,7 +40014,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40238,7 +40238,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40474,7 +40474,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40606,7 +40606,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40783,7 +40783,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40979,7 +40979,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            26,
+            27,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -41420,7 +41420,7 @@ mod stage148_decomposition_map {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 26,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 27,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41864,7 +41864,7 @@ mod stage150_ipc_abi_extraction {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 26,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 27,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -42095,7 +42095,7 @@ mod stage151_ipc_abi_boundary_audit {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 26,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 27,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -42231,7 +42231,7 @@ mod stage152_syscall_decomposition_completeness_audit {
         );
     }
 
-    // 5. Syscall::VARIANT_COUNT == 26 preserved.
+    // 5. Syscall::VARIANT_COUNT == 27 preserved.
     #[test]
     fn stage152_variant_count_is_23() {
         assert!(
@@ -77932,7 +77932,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -78465,7 +78465,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -78625,7 +78625,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -78695,7 +78695,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -79282,7 +79282,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -79517,7 +79517,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -79822,7 +79822,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -79881,7 +79881,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -80394,7 +80394,7 @@ mod stage197b_nr27_removed_zc_mandatory {
             Err(SyscallError::InvalidNumber)
         ));
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(Syscall::VARIANT_COUNT, 26);
+        assert_eq!(Syscall::VARIANT_COUNT, 27);
         // Needles are split so these assertions do not match themselves via include_str!.
         let variant_decl = concat!("InitramfsRead", "Chunk = ");
         let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
@@ -80854,7 +80854,7 @@ mod stage197b_riscv_typed_idle_outcome {
     #[test]
     fn baseline_and_cohort_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
         assert!(matches!(
             crate::kernel::syscall::Syscall::decode(27),
             Err(crate::kernel::syscall::SyscallError::InvalidNumber)
@@ -102977,8 +102977,9 @@ mod stage200d0a_exit_foundation {
     #[test]
     fn d03_nr27_and_free_numbers_remain_unassigned() {
         // FUTEX-REQUEUE1 (ABI v11) assigned 17, the lowest number of the reserved gap;
-        // SCHED-TIME-FOUNDATION1 (ABI v12) the next three, 18, 19 and 20.
-        for free in [21usize, 22, 24, 25, 26, 27] {
+        // SCHED-TIME-FOUNDATION1 (ABI v12) the next three, 18, 19 and 20; VFS-CORRECT1C (ABI v14)
+        // the next, 21.
+        for free in [22usize, 24, 25, 26, 27] {
             assert!(
                 Syscall::decode(free).is_err(),
                 "number {free} must remain unassigned"
@@ -103002,8 +103003,8 @@ mod stage200d0a_exit_foundation {
     /// enum's own declaration count parsed from source.
     #[test]
     fn d04_variant_list_is_exhaustive_and_derived() {
-        assert_eq!(Syscall::VARIANT_COUNT, 26);
-        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 26);
+        assert_eq!(Syscall::VARIANT_COUNT, 27);
+        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 27);
         assert!(
             SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
         );
@@ -104007,7 +104008,7 @@ mod stage200d0b3_x86_exit_corrected {
         assert!(b.contains("EXIT_TASK_RESTORE_OWNER_PREPARED"));
         assert!(b.contains("EXIT_TASK_ABSENCE_VALIDATED arch=x86_64"));
         // No new task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
     }
 
     // ── feature gating (22) ─────────────────────────────────────────────────────────
@@ -105214,7 +105215,7 @@ mod stage200d0c1_aarch64_exit_prep {
             "offline-CPU refusal is preserved by the transaction"
         );
         // No general-purpose task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
     }
 
     // ── U3 (canonical 203C): the validation reacquisition retirement ────────────────
@@ -106446,7 +106447,7 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(txn.contains("Some(bound) => bound == asid,"));
         assert!(c.contains("identity=tid_asid"));
         assert!(c.contains("frame_source=0"));
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 26);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
     }
 
     // ── 29–32: runner static contract and feature-off ───────────────────────────────
@@ -215650,7 +215651,7 @@ mod futex_requeue1 {
             SYSCALL_ABI_VERSION, SYSCALL_FUTEX_CMP_REQUEUE_NR, Syscall, SyscallError,
         };
         // SCHED-TIME-FOUNDATION1 moved the ABI to v12 (NR 18 / 19 assigned); NR 17 is unchanged.
-        assert_eq!(SYSCALL_ABI_VERSION, 13);
+        assert_eq!(SYSCALL_ABI_VERSION, 14);
         assert_eq!(
             Syscall::decode(SYSCALL_FUTEX_CMP_REQUEUE_NR),
             Ok(Syscall::FutexCmpRequeue)
@@ -224174,6 +224175,233 @@ mod vc1b_spawn_admin_endpoint {
         assert!(
             !txn.contains("<< 32"),
             "no capability is packed into a shared lane"
+        );
+    }
+}
+
+/// VFS-CORRECT1C — NR 21 `IpcCallerSession` (ABI v14): the process behind a reply capability,
+/// and a process's liveness.
+mod vc1c_ipc_caller_session {
+    use super::*;
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::session::handle_ipc_caller_session;
+    use crate::kernel::task::ThreadGroupId;
+    use crate::kernel::trapframe::TrapFrame;
+
+    fn process(state: &mut KernelState, tid: u64, class: TaskClass) {
+        let (asid, _cap) = state.create_user_address_space().expect("asid");
+        state
+            .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
+                tid,
+                entry: 0x4000,
+                asid: Some(asid),
+                class,
+                startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+                ..Default::default()
+            })
+            .expect("process");
+    }
+
+    /// A reply capability for a call from `caller`, minted where the current task (the server)
+    /// can use it, as NR 6 does.
+    fn reply_cap_from(state: &mut KernelState, caller: u64) -> CapId {
+        let (_eid, _send, recv) = state.create_endpoint(4).expect("endpoint");
+        // The endpoint is created in the current task's CNode (the server's, once one runs).
+        let owner = state.current_tid().unwrap_or(0);
+        let caller_recv = state
+            .grant_capability_task_to_task(owner, recv, caller)
+            .expect("caller's reply endpoint");
+        state
+            .create_reply_cap_for_caller(ThreadId(caller), caller_recv, None)
+            .expect("reply cap")
+    }
+
+    fn incarnation(state: &KernelState, tid: u64) -> u64 {
+        state.with_tcbs(|t| {
+            t.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.process_incarnation)
+                .expect("tcb")
+        })
+    }
+
+    #[test]
+    fn vc1c_nr21_names_the_callers_process_shared_by_its_threads() {
+        let mut state = Bootstrap::init().expect("init");
+        process(&mut state, 7, TaskClass::App);
+        process(&mut state, 9, TaskClass::App);
+        let t = state
+            .spawn_user_thread(7, 0x1000, 0x8000_0000, 0x4010)
+            .expect("thread");
+        let inc7 = incarnation(&state, 7);
+        assert_ne!(inc7, 0);
+        assert_eq!(state.thread_group_id(t), Some(ThreadGroupId(7)));
+        assert_eq!(
+            incarnation(&state, t),
+            inc7,
+            "a thread shares its process's incarnation"
+        );
+
+        let r = reply_cap_from(&mut state, 7);
+        assert_eq!(state.reply_cap_caller_session(r), Ok((7, inc7, 7)));
+        let r = reply_cap_from(&mut state, t);
+        assert_eq!(state.reply_cap_caller_session(r), Ok((7, inc7, t)));
+        let r = reply_cap_from(&mut state, 9);
+        let (g, inc9, c) = state.reply_cap_caller_session(r).expect("9");
+        assert_eq!((g, c), (9, 9));
+        assert_ne!(inc9, inc7, "two processes never share an incarnation");
+    }
+
+    #[test]
+    fn vc1c_nr21_refuses_a_used_or_non_reply_capability() {
+        let mut state = Bootstrap::init().expect("init");
+        process(&mut state, 7, TaskClass::App);
+        let r = reply_cap_from(&mut state, 7);
+        assert!(state.reply_cap_caller_session(r).is_ok());
+        state
+            .ipc_reply(r, Message::new(0, b"done").expect("reply"))
+            .expect("reply");
+        assert!(
+            state.reply_cap_caller_session(r).is_err(),
+            "once answered it names nobody"
+        );
+        let (_eid, send, _recv) = state.create_endpoint(4).expect("endpoint");
+        assert_eq!(
+            state.reply_cap_caller_session(send),
+            Err(KernelError::WrongObject)
+        );
+        assert!(state.reply_cap_caller_session(CapId(0xFFFF_0FFF)).is_err());
+    }
+
+    #[test]
+    fn vc1c_nr21_caller_that_exits_is_named_no_more() {
+        let mut state = Bootstrap::init().expect("init");
+        process(&mut state, 7, TaskClass::App);
+        let r = reply_cap_from(&mut state, 7);
+        state.exit_task(7, 0).expect("exit");
+        assert!(state.reply_cap_caller_session(r).is_err());
+    }
+
+    #[test]
+    fn vc1c_nr21_live_threads_counts_only_that_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        process(&mut state, 7, TaskClass::App);
+        let t = state
+            .spawn_user_thread(7, 0x1000, 0x8000_0000, 0x4010)
+            .expect("thread");
+        let inc7 = incarnation(&state, 7);
+        assert_eq!(state.session_live_threads(7, inc7), 2);
+        assert_eq!(
+            state.session_live_threads(7, inc7 + 1),
+            0,
+            "another incarnation"
+        );
+        state.exit_task(t, 0).expect("thread exits");
+        assert_eq!(
+            state.session_live_threads(7, inc7),
+            1,
+            "the process lives on"
+        );
+        state.exit_task(7, 0).expect("last thread exits");
+        assert_eq!(state.session_live_threads(7, inc7), 0, "gone for good");
+    }
+
+    /// A server task `1` of `class`, current, with process `7` (and a thread of it) beside it.
+    fn server_world(class: TaskClass) -> (KernelState, u64) {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task_with_class(1, class).expect("server");
+        process(&mut s, 7, TaskClass::App);
+        let _ = s
+            .spawn_user_thread(7, 0x1000, 0x8000_0000, 0x4010)
+            .expect("thread");
+        s.enqueue_current_cpu(1).expect("enqueue");
+        s.dispatch_next_task().expect("dispatch");
+        while s.current_tid() != Some(1) {
+            s.yield_current().expect("switch to the server");
+        }
+        let inc = incarnation(&s, 7);
+        (s, inc)
+    }
+
+    /// Every production NR 21 is served by the split route: it must answer exactly as the broad
+    /// handler does, op for op and refusal for refusal.
+    #[test]
+    fn vc1c_nr21_split_route_answers_exactly_as_the_broad_handler() {
+        let (mut s, inc7) = server_world(TaskClass::SystemServer);
+        let reply = reply_cap_from(&mut s, 7);
+        let (_eid, send, recv) = s.create_endpoint(4).expect("endpoint");
+        let cases: [[usize; 6]; 9] = [
+            [0, reply.0 as usize, 0, 0, 0, 0],
+            [0, send.0 as usize, 0, 0, 0, 0],
+            [0, recv.0 as usize, 0, 0, 0, 0],
+            [0, 0xFFFF_0FFF, 0, 0, 0, 0],
+            [1, 7, inc7 as usize, 0, 0, 0],
+            [1, 7, inc7 as usize + 1, 0, 0, 0],
+            [1, 99, 1, 0, 0, 0],
+            [2, 0, 0, 0, 0, 0],
+            [usize::MAX, 0, 0, 0, 0, 0],
+        ];
+        let k = crate::runtime::SharedKernel::new(s);
+        for args in cases {
+            let mut b = TrapFrame::new(21, args);
+            let broad = k.with(|s| handle_ipc_caller_session(s, &mut b));
+            let mut f = TrapFrame::new(21, args);
+            let split = crate::kernel::syscall::session::ipc_caller_session_split(&k, 1, &mut f);
+            assert_eq!(split, broad, "{args:?}");
+            if split.is_ok() {
+                assert_eq!(
+                    (f.ret0(), f.ret1(), f.ret2()),
+                    (b.ret0(), b.ret1(), b.ret2()),
+                    "{args:?}"
+                );
+            }
+        }
+        let mut f = TrapFrame::new(21, [0, reply.0 as usize, 0, 0, 0, 0]);
+        crate::kernel::syscall::session::ipc_caller_session_split(&k, 1, &mut f).expect("op 0");
+        assert_eq!((f.ret0(), f.ret1(), f.ret2()), (7, inc7 as usize, 7));
+        // An App caller is refused op 1 on the split route too.
+        let (s2, inc) = server_world(TaskClass::App);
+        let k2 = crate::runtime::SharedKernel::new(s2);
+        let mut f = TrapFrame::new(21, [1, 7, inc as usize, 0, 0, 0]);
+        assert_eq!(
+            crate::kernel::syscall::session::ipc_caller_session_split(&k2, 1, &mut f),
+            Err(SyscallError::MissingRight)
+        );
+    }
+
+    #[test]
+    fn vc1c_nr21_op1_is_system_server_only_and_other_ops_are_invalid() {
+        let (mut s, inc7) = server_world(TaskClass::App);
+        let mut f = TrapFrame::new(21, [1, 7, inc7 as usize, 0, 0, 0]);
+        assert_eq!(
+            crate::kernel::syscall::dispatch(&mut s, &mut f),
+            Err(SyscallError::MissingRight)
+        );
+        let (mut s, inc7) = server_world(TaskClass::SystemServer);
+        let mut f = TrapFrame::new(21, [1, 7, inc7 as usize, 0, 0, 0]);
+        assert_eq!(crate::kernel::syscall::dispatch(&mut s, &mut f), Ok(()));
+        assert_eq!((f.ret0(), f.ret1()), (2, 1), "two live threads");
+        let mut f = TrapFrame::new(21, [1, 7, inc7 as usize + 1, 0, 0, 0]);
+        assert_eq!(handle_ipc_caller_session(&mut s, &mut f), Ok(()));
+        assert_eq!(
+            (f.ret0(), f.ret1()),
+            (0, 1),
+            "no such incarnation: none live"
+        );
+        for op in [2usize, 3, usize::MAX] {
+            let mut f = TrapFrame::new(21, [op, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                crate::kernel::syscall::dispatch(&mut s, &mut f),
+                Err(SyscallError::InvalidArgs)
+            );
+        }
+        // op 0 through the dispatcher: a non-reply capability is the wrong object.
+        let (_eid, send, _recv) = s.create_endpoint(4).expect("endpoint");
+        let mut f = TrapFrame::new(21, [0, send.0 as usize, 0, 0, 0, 0]);
+        assert_eq!(
+            crate::kernel::syscall::dispatch(&mut s, &mut f),
+            Err(SyscallError::WrongObject)
         );
     }
 }

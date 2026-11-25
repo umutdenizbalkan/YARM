@@ -707,6 +707,12 @@ BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_CO
 # (`reply_copies=0 caller_wakes=0 mutations=0`). One that copied a payload, woke the caller or
 # mutated state stays a blocker, because that would be a partial reply wearing a refusal's marker.
 BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=WrongObject|IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=[0-9]+ record_generation=[0-9]+ replier_tid=[0-9]+ terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295|INIT_MOUNT_STAGE_REFUSED prefix=/vc1b-(stale|trunc) err=InvalidCapability'
+# VFS-CORRECT1C: a witness smoke may name the exact lines its own fault injection produces (the
+# fd witness's one stale-capability client reply). Empty on every ordinary boot; the witness's
+# grader then requires exactly those lines, once each.
+if [[ -n "${WITNESS_BLOCKER_EXCLUDE_REGEX:-}" ]]; then
+  BLOCKER_EXCLUDE_REGEX="$BLOCKER_EXCLUDE_REGEX|$WITNESS_BLOCKER_EXCLUDE_REGEX"
+fi
 
 if [[ -f "$LOGFILE" ]]; then
   blocker_lines="$(tr '\r' '\n' <"$LOGFILE" | rg -a -n "$BLOCKER_REGEX" || true)"

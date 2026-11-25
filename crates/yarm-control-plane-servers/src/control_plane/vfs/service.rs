@@ -17,11 +17,6 @@ use yarm_srv_common::vfs_reply::VfsReply;
 #[cfg(all(test, feature = "legacy-tests"))]
 use yarm_user_rt::capability::CapId;
 
-/// Trace gate for hot-path VFS bulk-read forwarding logs.
-/// Set to `true` only when debugging Phase 2B transfer-buffer bulk reads.
-/// Default `false`: VFS_FORWARD_BULK_READ and VFS_ROUTE_BULK_REPLY are suppressed.
-const VFS_BULK_READ_TRACE: bool = false;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsLoopSummary {
     pub fd: u64,
@@ -310,298 +305,6 @@ pub fn run_with_kernel_ipc(
     run_request_loop_over_kernel_ipc(runtime, &mut vfs, path_id)
 }
 
-/// VFS-CORRECT1A: a router-local error is a payload completion naming the operation, the status
-/// and the request's fd — NR 7 does not carry the opcode, so a status kept there would be lost.
-fn vfs_error_reply(op: u16, status: u32, fd: u64) -> yarm_user_rt::ipc::Message {
-    let (bytes, len) = yarm_ipc_abi::vfs_abi::VfsCompletion::err(op, status, fd)
-        .encode(&[])
-        .expect("completion header");
-    yarm_user_rt::ipc::Message::with_header(0, 0, 0, None, &bytes[..len]).expect("completion")
-}
-
-/// VFS-CORRECT1A: the fd and length a forwarded request names (0 for path operations).
-fn vfs_request_identity(msg: &yarm_user_rt::ipc::Message) -> (u64, u64) {
-    use yarm_ipc_abi::vfs_abi::{
-        FileGrantRoArgs, ReadWriteArgs, VFS_OP_CLOSE, VFS_OP_FILE_GRANT_RO, VFS_OP_READ,
-        VFS_OP_READ_BULK,
-    };
-    match msg.opcode {
-        VFS_OP_READ | VFS_OP_CLOSE | VFS_OP_READ_BULK => ReadWriteArgs::decode(msg.as_slice())
-            .map(|a| (a.fd, a.len))
-            .unwrap_or((0, 0)),
-        VFS_OP_FILE_GRANT_RO => FileGrantRoArgs::decode(msg.as_slice())
-            .map(|a| (a.fd, 0))
-            .unwrap_or((0, 0)),
-        _ => (0, 0),
-    }
-}
-
-#[cfg(test)]
-fn route_for_test(
-    mount_table: &super::mount_table::VfsMountTable,
-    fd_table: &super::fd_table::VfsFdTable,
-    msg: &yarm_user_rt::ipc::Message,
-    client_id: u64,
-) -> Result<(u64, super::mount_table::MountLabel), u32> {
-    use yarm_ipc_abi::vfs_abi::{
-        OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ,
-        VFS_OP_STATX, VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC, VFS_STATUS_ERR_INVALID_PATH,
-        VFS_STATUS_ERR_NO_MOUNT, VFS_STATUS_ERR_UNKNOWN_OP,
-    };
-    match msg.opcode {
-        VFS_OP_STATX | VFS_OP_OPENAT => {
-            let raw_path: Option<&[u8]> = if msg.opcode == VFS_OP_STATX {
-                StatxInlinePath::decode(msg.as_slice()).map(|s| s.path)
-            } else {
-                OpenAtInlinePath::decode(msg.as_slice()).map(|s| s.path)
-            };
-            let raw_path = raw_path.ok_or(VFS_STATUS_ERR_INVALID_PATH)?;
-            let norm = super::path::normalize(raw_path).map_err(|_| VFS_STATUS_ERR_INVALID_PATH)?;
-            let path = norm.as_bytes();
-            mount_table.route(path).ok_or(VFS_STATUS_ERR_NO_MOUNT)
-        }
-        VFS_OP_READ | VFS_OP_CLOSE | yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK => {
-            let args = ReadWriteArgs::decode(msg.as_slice()).map_err(|_| VFS_STATUS_ERR_CODEC)?;
-            fd_table
-                .lookup(args.fd, client_id)
-                .ok_or(VFS_STATUS_ERR_BAD_FD)
-        }
-        _ => Err(VFS_STATUS_ERR_UNKNOWN_OP),
-    }
-}
-
-#[cfg(test)]
-mod service_level_tests {
-    use super::*;
-    use yarm_fs_servers::common::vfs_ipc::{
-        CloseRequest, ReadWriteRequest, close_message, openat_inline_message, read_message,
-    };
-    use yarm_ipc_abi::vfs_abi::{VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_NO_MOUNT};
-
-    #[derive(Default)]
-    struct BackendReleaseCounter {
-        closes: usize,
-    }
-
-    fn close_via_service_for_test(
-        fd_table: &mut super::super::fd_table::VfsFdTable,
-        client_id: u64,
-        fd: u64,
-        backend: &mut BackendReleaseCounter,
-    ) -> Result<(), u32> {
-        // Mirrors service behavior: close routes via fd ownership first,
-        // then backend close/release happens once on success, and only then
-        // the fd table entry is removed.
-        if fd_table.lookup(fd, client_id).is_none() {
-            return Err(VFS_STATUS_ERR_BAD_FD);
-        }
-        backend.closes += 1;
-        fd_table.remove(fd, client_id);
-        Ok(())
-    }
-
-    #[test]
-    fn vfs_service_open_routes_normalized_paths_to_expected_mount() {
-        let mut mounts = super::super::mount_table::VfsMountTable::new();
-        assert!(mounts.register(b"/", "root", 1));
-        assert!(mounts.register(b"/dev/", "devfs", 2));
-        let fds = super::super::fd_table::VfsFdTable::new();
-
-        let m = openat_inline_message(0, b"//dev///null", 0, 0).expect("msg");
-        let (cap, _) = route_for_test(&mounts, &fds, &m, 10).expect("route");
-        assert_eq!(cap, 2);
-
-        let m = openat_inline_message(0, b"/dev", 0, 0).expect("msg");
-        let (cap, _) = route_for_test(&mounts, &fds, &m, 10).expect("route");
-        assert_eq!(cap, 2);
-
-        let m = openat_inline_message(0, b"/sbin/init", 0, 0).expect("msg");
-        let (cap, _) = route_for_test(&mounts, &fds, &m, 10).expect("route");
-        assert_eq!(cap, 1);
-
-        let m = openat_inline_message(0, b"/device", 0, 0).expect("msg");
-        let (cap, _) = route_for_test(&mounts, &fds, &m, 10).expect("route");
-        assert_eq!(cap, 1); // root mount catches non-/dev paths.
-
-        let mut mounts2 = super::super::mount_table::VfsMountTable::new();
-        assert!(mounts2.register(b"/dev/", "devfs", 2));
-        let m = openat_inline_message(0, b"/sbin/init", 0, 0).expect("msg");
-        assert!(matches!(
-            route_for_test(&mounts2, &fds, &m, 10),
-            Err(VFS_STATUS_ERR_NO_MOUNT)
-        ));
-    }
-
-    #[test]
-    fn vfs_service_rejects_cross_client_fd_read_and_close() {
-        let mounts = super::super::mount_table::VfsMountTable::new();
-        let mut fds = super::super::fd_table::VfsFdTable::new();
-        assert!(fds.insert(7, 11, "devfs", 100));
-        let read = read_message(ReadWriteRequest {
-            fd: 7,
-            buf_ptr: 0,
-            len: 1,
-        })
-        .expect("read");
-        let close = close_message(CloseRequest { fd: 7 }).expect("close");
-        assert!(matches!(
-            route_for_test(&mounts, &fds, &read, 200),
-            Err(VFS_STATUS_ERR_BAD_FD)
-        ));
-        assert!(matches!(
-            route_for_test(&mounts, &fds, &close, 200),
-            Err(VFS_STATUS_ERR_BAD_FD)
-        ));
-        assert!(route_for_test(&mounts, &fds, &read, 100).is_ok());
-    }
-
-    #[test]
-    fn vfs_service_rejects_read_after_close_and_double_close() {
-        let mounts = super::super::mount_table::VfsMountTable::new();
-        let mut fds = super::super::fd_table::VfsFdTable::new();
-        assert!(fds.insert(9, 12, "root", 300));
-        fds.remove(9, 300);
-        let read = read_message(ReadWriteRequest {
-            fd: 9,
-            buf_ptr: 0,
-            len: 1,
-        })
-        .expect("read");
-        let close = close_message(CloseRequest { fd: 9 }).expect("close");
-        assert!(matches!(
-            route_for_test(&mounts, &fds, &read, 300),
-            Err(VFS_STATUS_ERR_BAD_FD)
-        ));
-        assert!(matches!(
-            route_for_test(&mounts, &fds, &close, 300),
-            Err(VFS_STATUS_ERR_BAD_FD)
-        ));
-    }
-
-    #[test]
-    fn vfs_service_fd_reuse_does_not_cross_client_leak() {
-        let mounts = super::super::mount_table::VfsMountTable::new();
-        let mut fds = super::super::fd_table::VfsFdTable::new();
-        assert!(fds.insert(3, 10, "initramfs", 1));
-        fds.remove(3, 1);
-        assert!(fds.insert(3, 20, "devfs", 2));
-        let read = read_message(ReadWriteRequest {
-            fd: 3,
-            buf_ptr: 0,
-            len: 1,
-        })
-        .expect("read");
-        assert!(matches!(
-            route_for_test(&mounts, &fds, &read, 1),
-            Err(VFS_STATUS_ERR_BAD_FD)
-        ));
-        assert!(route_for_test(&mounts, &fds, &read, 2).is_ok());
-    }
-
-    #[test]
-    fn vfs_service_close_invokes_backend_release_once() {
-        let mounts = super::super::mount_table::VfsMountTable::new();
-        let mut fds = super::super::fd_table::VfsFdTable::new();
-        let mut backend = BackendReleaseCounter::default();
-
-        assert!(fds.insert(11, 50, "initramfs", 1000));
-        assert_eq!(backend.closes, 0);
-
-        close_via_service_for_test(&mut fds, 1000, 11, &mut backend).expect("close ok");
-        assert_eq!(backend.closes, 1);
-        assert!(fds.lookup(11, 1000).is_none());
-
-        let read = read_message(ReadWriteRequest {
-            fd: 11,
-            buf_ptr: 0,
-            len: 1,
-        })
-        .expect("read");
-        assert!(matches!(
-            route_for_test(&mounts, &fds, &read, 1000),
-            Err(VFS_STATUS_ERR_BAD_FD)
-        ));
-    }
-
-    #[test]
-    fn vfs_service_double_close_does_not_release_twice() {
-        let mut fds = super::super::fd_table::VfsFdTable::new();
-        let mut backend = BackendReleaseCounter::default();
-
-        assert!(fds.insert(12, 51, "devfs", 2000));
-        close_via_service_for_test(&mut fds, 2000, 12, &mut backend).expect("first close");
-        assert_eq!(backend.closes, 1);
-
-        let err = close_via_service_for_test(&mut fds, 2000, 12, &mut backend)
-            .expect_err("second close must fail");
-        assert_eq!(err, VFS_STATUS_ERR_BAD_FD);
-        assert_eq!(backend.closes, 1);
-    }
-
-    #[test]
-    fn vfs_service_cross_client_close_does_not_release_backend() {
-        let mut fds = super::super::fd_table::VfsFdTable::new();
-        let mut backend = BackendReleaseCounter::default();
-
-        assert!(fds.insert(13, 52, "devfs", 3000));
-        let err = close_via_service_for_test(&mut fds, 4000, 13, &mut backend)
-            .expect_err("wrong client close");
-        assert_eq!(err, VFS_STATUS_ERR_BAD_FD);
-        assert_eq!(backend.closes, 0);
-        assert!(fds.lookup(13, 3000).is_some());
-
-        close_via_service_for_test(&mut fds, 3000, 13, &mut backend).expect("owner close");
-        assert_eq!(backend.closes, 1);
-    }
-
-    #[test]
-    fn vfs_service_bulk_read_routes_via_fd_table() {
-        // VFS_OP_READ_BULK should route via fd table just like VFS_OP_READ.
-        use yarm_ipc_abi::vfs_abi::{BulkReadArgs, VFS_OP_READ_BULK};
-        let mounts = super::super::mount_table::VfsMountTable::new();
-        let mut fds = super::super::fd_table::VfsFdTable::new();
-        assert!(fds.insert(7, 11, "initramfs", 100));
-
-        // Build a VFS_OP_READ_BULK message using BulkReadArgs (32-byte payload).
-        let encoded = BulkReadArgs::new(7, 4096, 0).encode();
-        let bulk_msg = yarm_user_rt::ipc::Message::with_header(
-            100, // sender TID = client_id
-            VFS_OP_READ_BULK,
-            0,
-            None,
-            &encoded,
-        )
-        .expect("bulk msg");
-
-        // Same client can route.
-        assert!(route_for_test(&mounts, &fds, &bulk_msg, 100).is_ok());
-        // Different client is rejected.
-        assert!(matches!(
-            route_for_test(&mounts, &fds, &bulk_msg, 200),
-            Err(VFS_STATUS_ERR_BAD_FD)
-        ));
-    }
-
-    #[test]
-    fn vfs_service_bulk_read_after_close_rejected() {
-        use yarm_ipc_abi::vfs_abi::{BulkReadArgs, VFS_OP_READ_BULK};
-        let mounts = super::super::mount_table::VfsMountTable::new();
-        let mut fds = super::super::fd_table::VfsFdTable::new();
-        assert!(fds.insert(9, 12, "initramfs", 300));
-        fds.remove(9, 300);
-
-        let encoded = BulkReadArgs::new(9, 4096, 0).encode();
-        let bulk_msg =
-            yarm_user_rt::ipc::Message::with_header(300, VFS_OP_READ_BULK, 0, None, &encoded)
-                .expect("bulk msg");
-
-        assert!(matches!(
-            route_for_test(&mounts, &fds, &bulk_msg, 300),
-            Err(VFS_STATUS_ERR_BAD_FD)
-        ));
-    }
-}
-
 /// VFS-CORRECT1B — the 4-byte mount-administration status reply. It carries no capability: a
 /// refused commit's capability stays in VFS's retained record (a transfer would only add a copy at
 /// the caller; VFS's own would remain).
@@ -685,6 +388,125 @@ impl yarm_fs_servers::common::mount_admin::BackendHandshake for MountHandshake {
     }
 }
 
+/// VFS-CORRECT1C — the router's kernel: NR 6 + NR 4 to a backend on VFS's backend reply
+/// endpoint, NR 7 to the client, NR 21 for the caller's session and a session's liveness.
+struct KernelRouterIo {
+    backend_reply_recv_cap: u64,
+}
+
+impl super::router::RouterIo for KernelRouterIo {
+    fn call_backend(
+        &mut self,
+        backend: yarm_fs_servers::common::fd_space::BackendRef,
+        label: &str,
+        request: &yarm_user_rt::ipc::Message,
+    ) -> super::router::CallResult {
+        use super::router::CallResult;
+        yarm_user_rt::user_log!(
+            "VFS_FORWARD_CALL op={} target={} send_cap={} reply_cap={} instance={}",
+            request.opcode,
+            label,
+            backend.cap,
+            self.backend_reply_recv_cap,
+            backend.instance
+        );
+        // SAFETY: VFS's own capabilities: the backend endpoint it routes to, its reply endpoint.
+        if let Err(err) = unsafe {
+            yarm_user_rt::syscall::ipc_call(backend.cap, self.backend_reply_recv_cap, request)
+        } {
+            // VFS-CORRECT1A: any NR 6 failure — `WouldBlock` included — delivered nothing.
+            yarm_user_rt::user_log!("VFS_FORWARD_CALL_FAIL op={} err={:?}", request.opcode, err);
+            return CallResult::NotDelivered;
+        }
+        // SAFETY: VFS's own backend reply endpoint.
+        match unsafe { yarm_user_rt::syscall::ipc_recv_v2(self.backend_reply_recv_cap) } {
+            Ok(Some(received)) => {
+                yarm_user_rt::user_log!(
+                    "VFS_BACKEND_REPLY op={} len={} sender_tid={} transferred_cap={}",
+                    request.opcode,
+                    received.message.len,
+                    received.sender_tid,
+                    received.transferred_cap.unwrap_or(0)
+                );
+                CallResult::Reply {
+                    message: received.message,
+                    has_cap: received.transferred_cap.is_some() || received.reply_cap.is_some(),
+                    transferred_cap: received.transferred_cap,
+                }
+            }
+            Ok(None) => {
+                yarm_user_rt::user_log!(
+                    "VFS_BACKEND_REPLY_RECV_FAIL op={} err=would_block_or_timeout",
+                    request.opcode
+                );
+                CallResult::NoReply
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!(
+                    "VFS_BACKEND_REPLY_RECV_FAIL op={} err={:?} reply_cap={}",
+                    request.opcode,
+                    err,
+                    self.backend_reply_recv_cap
+                );
+                CallResult::NoReply
+            }
+        }
+    }
+
+    fn reply_client(&mut self, reply_cap: u64, reply: &yarm_user_rt::ipc::Message) -> bool {
+        // SAFETY: the one-shot reply capability of the request being answered.
+        match unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, reply) } {
+            Ok(()) => true,
+            Err(err) => {
+                yarm_user_rt::user_log!(
+                    "VFS_CLIENT_REPLY_REFUSED reply_cap={} err={:?}",
+                    reply_cap,
+                    err
+                );
+                false
+            }
+        }
+    }
+
+    fn caller_session(
+        &mut self,
+        reply_cap: u64,
+    ) -> Option<(yarm_fs_servers::common::fd_space::SessionId, u64)> {
+        match yarm_user_rt::syscall::ipc_caller_session(reply_cap) {
+            Ok((thread_group_id, incarnation, tid)) => Some((
+                yarm_fs_servers::common::fd_space::SessionId {
+                    thread_group_id,
+                    incarnation,
+                },
+                tid,
+            )),
+            Err(err) => {
+                yarm_user_rt::user_log!(
+                    "VFS_CALLER_SESSION_FAIL reply_cap={} err={:?}",
+                    reply_cap,
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    fn session_alive(&mut self, s: yarm_fs_servers::common::fd_space::SessionId) -> Option<bool> {
+        match yarm_user_rt::syscall::ipc_session_live_threads(s.thread_group_id, s.incarnation) {
+            Ok(n) => Some(n > 0),
+            Err(err) => {
+                yarm_user_rt::user_log!(
+                    "VFS_SESSION_ALIVE_FAIL tgid={} incarnation={} err={:?}",
+                    s.thread_group_id,
+                    s.incarnation,
+                    err
+                );
+                None
+            }
+        }
+    }
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("VFS_SRV_ENTRY");
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
@@ -717,8 +539,6 @@ pub fn run() {
     }
     yarm_user_rt::user_log!("VFS_MOUNT_TABLE_READY entries={}", mount_table.len());
 
-    let mut fd_table = super::fd_table::VfsFdTable::new();
-
     let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
         yarm_user_rt::user_log!("VFS_SRV_NO_RECV_CAP_RESIDENT_YIELD");
         loop {
@@ -745,6 +565,21 @@ pub fn run() {
         admin_recv_cap.unwrap_or(0)
     );
     let mut mount_admin = yarm_fs_servers::common::mount_admin::MountAdmin::new();
+    let mut router = super::router::Router::new();
+    #[cfg(feature = "vfs-fd-witness")]
+    {
+        router.fail_reply_path = Some(b"/ram/vc1c-failreply");
+    }
+    let mut io = KernelRouterIo {
+        backend_reply_recv_cap,
+    };
+    yarm_user_rt::user_log!(
+        "VFS_FD_SPACE_READY max_descriptors={} max_per_session={} first_fd={} fail_reply_injection={}",
+        yarm_fs_servers::common::fd_space::MAX_DESCRIPTORS,
+        yarm_fs_servers::common::fd_space::MAX_FDS_PER_SESSION,
+        yarm_fs_servers::common::fd_space::FIRST_CLIENT_FD,
+        router.fail_reply_path.is_some() as u8
+    );
     yarm_user_rt::user_log!("VFS_SRV_BLOCKING_RECV_LOOP");
 
     loop {
@@ -835,338 +670,11 @@ pub fn run() {
             continue;
         }
 
-        // ── Route by path prefix (STATX/OPENAT) or fd table (READ/CLOSE) ───
-        // Path-based ops are normalized before mount lookup.
-        // `route()` and `lookup()` return owned `MountLabel` copies so that
-        // callers may freely mutate the tables afterward (e.g. fd_table.remove).
-        // Error variants carry a canonical VFS_STATUS_ERR_* code.
-        let route: Result<(u64, super::mount_table::MountLabel), u32> = 'route: {
-            use yarm_ipc_abi::vfs_abi::{
-                OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_OPENAT,
-                VFS_OP_READ, VFS_OP_STATX, VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC,
-                VFS_STATUS_ERR_INVALID_PATH, VFS_STATUS_ERR_NO_MOUNT, VFS_STATUS_ERR_UNKNOWN_OP,
-            };
-            match msg.opcode {
-                VFS_OP_STATX | VFS_OP_OPENAT => {
-                    let raw_path: Option<&[u8]> = if msg.opcode == VFS_OP_STATX {
-                        StatxInlinePath::decode(msg.as_slice()).map(|s| s.path)
-                    } else {
-                        OpenAtInlinePath::decode(msg.as_slice()).map(|s| s.path)
-                    };
-                    let raw_path = match raw_path {
-                        Some(p) => p,
-                        None => break 'route Err(VFS_STATUS_ERR_INVALID_PATH),
-                    };
-                    let norm = match super::path::normalize(raw_path) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            yarm_user_rt::user_log!("VFS_PATH_NORM_REJECT reason={}", e.as_str());
-                            break 'route Err(VFS_STATUS_ERR_INVALID_PATH);
-                        }
-                    };
-                    let path = norm.as_bytes();
-                    let path_str = core::str::from_utf8(path).unwrap_or("?");
-                    if let Some((send_cap, label)) = mount_table.route(path) {
-                        yarm_user_rt::user_log!(
-                            "VFS_ROUTE_LOOKUP path={} target={}",
-                            path_str,
-                            label.as_str()
-                        );
-                        Ok((send_cap, label))
-                    } else {
-                        yarm_user_rt::user_log!("VFS_ROUTE_NO_MOUNT path={}", path_str);
-                        Err(VFS_STATUS_ERR_NO_MOUNT)
-                    }
-                }
-                VFS_OP_READ | VFS_OP_CLOSE | yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK => {
-                    match ReadWriteArgs::decode(msg.as_slice()) {
-                        Ok(args) => {
-                            if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id) {
-                                if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
-                                    if VFS_BULK_READ_TRACE {
-                                        // Decode full BulkReadArgs to log requested_len.
-                                        let requested =
-                                            yarm_ipc_abi::vfs_abi::BulkReadArgs::decode(
-                                                msg.as_slice(),
-                                            )
-                                            .map(|b| b.requested_len)
-                                            .unwrap_or(0);
-                                        yarm_user_rt::user_log!(
-                                            "VFS_FORWARD_BULK_READ op={} fd={} requested={} target={} mode=transfer_buffer",
-                                            msg.opcode,
-                                            args.fd,
-                                            requested,
-                                            label.as_str()
-                                        );
-                                    }
-                                } else {
-                                    yarm_user_rt::user_log!(
-                                        "VFS_ROUTE_FD_LOOKUP fd={} target={}",
-                                        args.fd,
-                                        label.as_str()
-                                    );
-                                }
-                                Ok((send_cap, label))
-                            } else {
-                                if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
-                                    yarm_user_rt::user_log!(
-                                        "VFS_BULK_READ_DENIED fd={} reason=ownership client_id={}",
-                                        args.fd,
-                                        client_id
-                                    );
-                                } else {
-                                    yarm_user_rt::user_log!("VFS_ROUTE_BAD_FD fd={}", args.fd);
-                                }
-                                Err(VFS_STATUS_ERR_BAD_FD)
-                            }
-                        }
-                        Err(_) => {
-                            yarm_user_rt::user_log!("VFS_ROUTE_CODEC_ERR");
-                            Err(VFS_STATUS_ERR_CODEC)
-                        }
-                    }
-                }
-                yarm_ipc_abi::vfs_abi::VFS_OP_FILE_GRANT_RO => {
-                    // Phase 3A: route FILE_GRANT_RO via fd-table lookup to the backend.
-                    // FileGrantRoArgs has the same wire layout (32 bytes, arg0=fd) as VfsV1Args.
-                    match yarm_ipc_abi::vfs_abi::FileGrantRoArgs::decode(msg.as_slice()) {
-                        Ok(args) => {
-                            if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id) {
-                                yarm_user_rt::user_log!(
-                                    "VFS_FILE_GRANT_RO_FORWARD fd={} target={}",
-                                    args.fd,
-                                    label.as_str()
-                                );
-                                Ok((send_cap, label))
-                            } else {
-                                yarm_user_rt::user_log!(
-                                    "VFS_FILE_GRANT_RO_BAD_FD fd={} client_id={}",
-                                    args.fd,
-                                    client_id
-                                );
-                                Err(VFS_STATUS_ERR_BAD_FD)
-                            }
-                        }
-                        Err(_) => {
-                            yarm_user_rt::user_log!("VFS_FILE_GRANT_RO_CODEC_ERR");
-                            Err(VFS_STATUS_ERR_CODEC)
-                        }
-                    }
-                }
-                op => {
-                    yarm_user_rt::user_log!("VFS_ROUTE_UNKNOWN_OP op={}", op);
-                    Err(VFS_STATUS_ERR_UNKNOWN_OP)
-                }
-            }
-        };
-
-        let (backend_send_cap, target_label) = match route {
-            Ok(pair) => pair,
-            Err(status) => {
-                yarm_user_rt::user_log!("VFS_ROUTE_ERR status={}", status);
-                let (req_fd, _) = vfs_request_identity(&msg);
-                let err = vfs_error_reply(msg.opcode, status, req_fd);
-                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
-                continue;
-            }
-        };
-
-        let forwarded_msg = msg;
-        let (req_fd, req_len) = vfs_request_identity(&msg);
-
-        yarm_user_rt::user_log!(
-            "VFS_FORWARD_CALL op={} target={} send_cap={} reply_cap={}",
-            forwarded_msg.opcode,
-            target_label.as_str(),
-            backend_send_cap,
-            backend_reply_recv_cap
-        );
-        match unsafe {
-            yarm_user_rt::syscall::ipc_call(
-                backend_send_cap,
-                backend_reply_recv_cap,
-                &forwarded_msg,
-            )
-        } {
-            Ok(()) => {
-                yarm_user_rt::user_log!("VFS_FORWARD_CALL_SENT op={} status=ok", msg.opcode);
-            }
-            // VFS-CORRECT1A: any NR 6 failure — `WouldBlock` included — delivered nothing; the
-            // client is answered at once and the backend reply endpoint is not received on.
-            Err(err) => {
-                yarm_user_rt::user_log!("VFS_FORWARD_CALL_FAIL op={} err={:?}", msg.opcode, err);
-                let err = vfs_error_reply(
-                    msg.opcode,
-                    yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND,
-                    req_fd,
-                );
-                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
-                continue;
-            }
-        }
-
-        yarm_user_rt::user_log!(
-            "VFS_BACKEND_REPLY_RECV_BEGIN op={} reply_cap={}",
-            msg.opcode,
-            backend_reply_recv_cap
-        );
-        let backend_reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(backend_reply_recv_cap) };
-
-        match backend_reply {
-            Ok(Some(received)) => {
-                let response = received.message;
-                yarm_user_rt::user_log!(
-                    "VFS_BACKEND_REPLY_RAW op={} len={} opcode={} flags={} sender_tid={} transferred_cap={}",
-                    msg.opcode,
-                    response.len,
-                    response.opcode,
-                    response.flags,
-                    received.sender_tid,
-                    received.transferred_cap.unwrap_or(0)
-                );
-                yarm_user_rt::user_log!(
-                    "VFS_BACKEND_REPLY op={} status=ok len={} opcode={} flags={}",
-                    msg.opcode,
-                    response.len,
-                    response.opcode,
-                    response.flags
-                );
-                use yarm_ipc_abi::vfs_abi::{
-                    VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ_BULK,
-                    VFS_STATUS_ERR_BACKEND_MALFORMED, VfsCompletionExpect, VfsCompletionOutcome,
-                    validate_vfs_completion,
-                };
-                // VFS-CORRECT1A: validate the backend completion before the fd table changes or
-                // anything is relayed. A malformed one is not relayed: the client is told so.
-                if msg.opcode != VFS_OP_READ_BULK {
-                    let expect = VfsCompletionExpect {
-                        op: msg.opcode,
-                        fd: req_fd,
-                        requested: req_len,
-                    };
-                    let has_cap =
-                        received.transferred_cap.is_some() || received.reply_cap.is_some();
-                    let outcome = match validate_vfs_completion(
-                        expect,
-                        response.as_slice(),
-                        has_cap,
-                    ) {
-                        Ok(VfsCompletionOutcome::Ok { value, .. }) => Some(value),
-                        Ok(VfsCompletionOutcome::Status(status)) => {
-                            yarm_user_rt::user_log!(
-                                "VFS_BACKEND_STATUS op={} fd={} status={}",
-                                msg.opcode,
-                                req_fd,
-                                status
-                            );
-                            None
-                        }
-                        Err(fault) => {
-                            yarm_user_rt::user_log!(
-                                "VFS_BACKEND_COMPLETION_MALFORMED op={} fd={} fault={:?} has_cap={}",
-                                msg.opcode,
-                                req_fd,
-                                fault,
-                                has_cap
-                            );
-                            let err = vfs_error_reply(
-                                msg.opcode,
-                                VFS_STATUS_ERR_BACKEND_MALFORMED,
-                                req_fd,
-                            );
-                            let _ =
-                                unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
-                            continue;
-                        }
-                    };
-                    if msg.opcode == VFS_OP_OPENAT {
-                        if let Some(fd) = outcome {
-                            // target_label is owned (Copy), no borrow conflict.
-                            if fd_table.insert(
-                                fd,
-                                backend_send_cap,
-                                target_label.as_str(),
-                                client_id,
-                            ) {
-                                yarm_user_rt::user_log!(
-                                    "VFS_FD_TRACK fd={} backend={}",
-                                    fd,
-                                    backend_send_cap
-                                );
-                            }
-                        }
-                    } else if msg.opcode == VFS_OP_CLOSE {
-                        // Log before remove; target_label is owned so no borrow conflict.
-                        yarm_user_rt::user_log!(
-                            "VFS_FD_CLOSE fd={} target={} ok={}",
-                            req_fd,
-                            target_label.as_str(),
-                            u32::from(outcome.is_some())
-                        );
-                        if outcome.is_some() {
-                            fd_table.remove(req_fd, client_id);
-                        }
-                    }
-                }
-                if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
-                    if VFS_BULK_READ_TRACE {
-                        yarm_user_rt::user_log!(
-                            "VFS_ROUTE_BULK_REPLY op={} status=0 len={}",
-                            msg.opcode,
-                            response.len
-                        );
-                    }
-                } else if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_FILE_GRANT_RO {
-                    // Phase 3A: cap is transparently forwarded by ipc_reply via response.transferred_cap.
-                    yarm_user_rt::user_log!(
-                        "VFS_FILE_GRANT_RO_RELAY op={} has_cap={}",
-                        msg.opcode,
-                        response.transferred_cap().is_some()
-                    );
-                } else {
-                    yarm_user_rt::user_log!(
-                        "VFS_ROUTE_REPLY op={} status=0 len={}",
-                        msg.opcode,
-                        response.len
-                    );
-                }
-                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &response) };
-            }
-            Ok(None) => {
-                yarm_user_rt::user_log!(
-                    "VFS_BACKEND_REPLY_RECV_FAIL op={} err=would_block_or_timeout",
-                    msg.opcode
-                );
-                yarm_user_rt::user_log!(
-                    "VFS_ROUTE_REPLY status={} len=24",
-                    yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND
-                );
-                let err = vfs_error_reply(
-                    msg.opcode,
-                    yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND,
-                    req_fd,
-                );
-                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
-            }
-            Err(err) => {
-                yarm_user_rt::user_log!(
-                    "VFS_BACKEND_REPLY_RECV_FAIL op={} err={:?} reply_cap={}",
-                    msg.opcode,
-                    err,
-                    backend_reply_recv_cap
-                );
-                yarm_user_rt::user_log!(
-                    "VFS_ROUTE_REPLY status={} len=24",
-                    yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND
-                );
-                let err = vfs_error_reply(
-                    msg.opcode,
-                    yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND,
-                    req_fd,
-                );
-                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
-            }
-        }
+        // ── Everything else: the router (VFS-CORRECT1C) ───────────────────────────────────
+        //
+        // The caller's session comes from the kernel (NR 21), the client fd namespace is VFS's
+        // own, paths are canonicalized once, and the backend sees only its own handles.
+        router.handle(&mut io, &mount_table, &msg, client_reply_cap);
     }
 }
 

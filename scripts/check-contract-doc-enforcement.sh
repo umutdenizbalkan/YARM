@@ -82,6 +82,14 @@ if (( abi_code >= 13 )); then
   rg -q '^    pub const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;$' crates/yarm-user-rt/src/lib.rs
   rg -q 'v12 → v13 \(FUTEX-ABS-BITSET1\)' doc/SYSCALL_ABI.md
 fi
+# The v14 assignment (VFS-CORRECT1C): NR 21 IpcCallerSession in the kernel, the user runtime and
+# the documented table; the change note.
+if (( abi_code >= 14 )); then
+  rg -q '^pub const SYSCALL_IPC_CALLER_SESSION_NR: usize = 21;$' src/kernel/syscall.rs
+  rg -q '^    pub const SYSCALL_IPC_CALLER_SESSION_NR: usize = 21;$' crates/yarm-user-rt/src/lib.rs
+  rg -q '^\| `21` \| `IpcCallerSession` \| public' doc/SYSCALL_ABI.md
+  rg -q 'v13 → v14 \(VFS-CORRECT1C\)' doc/SYSCALL_ABI.md
+fi
 # VFS-CORRECT1B (within v13, privileged extensions): NR 23 / NR 29 return unpacked full-width
 # lanes and take the admin-endpoint out-address; slot 17 is kernel-owned; the change note.
 rg -q 'Within v13 \(VFS-CORRECT1B\), privileged extensions only' doc/SYSCALL_ABI.md

@@ -270,6 +270,9 @@ cap-gen-witness = []
 # VFS-CORRECT1B — F04 witness (default off): init's mount-administration cell and ramfs_srv's seed
 # file; accepted and inert in this package.
 vfs-mount-witness = []
+# VFS-CORRECT1C — init's fd-namespace witness, VFS's fail-reply injection and ramfs_srv's seed
+# files; accepted and inert in this package.
+vfs-fd-witness = []
 # FUTEX-SEAL1 — the live futex seal witness (default off): the kernel half `kernel::seal_witness`
 # (the budget sequence's one induced exhaustion and its record) on top of the FUTEX-TIME1 markers;
 # init's cell is the same-named feature of yarm-control-plane-servers.

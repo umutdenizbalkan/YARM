@@ -156,6 +156,8 @@ impl KernelState {
                 .ok_or(ReservationRefusal::TaskMissing)?;
             // A fork child is its own process: it leads its own thread group.
             tcb.thread_group_id = ThreadGroupId(publication.tid);
+            // VFS-CORRECT1C: a fork child is a new process, identified by its own incarnation.
+            tcb.process_incarnation = tcb.incarnation;
             tcb.asid = Some(publication.asid);
             tcb.tls_ptr = publication.tls_ptr;
             tcb.user_entry = publication.user_entry;

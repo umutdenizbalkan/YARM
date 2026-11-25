@@ -224,19 +224,114 @@ until VFS restarts); a stage that is never committed holds its slot; association
 plus prefix, with no nonce; one administrator capability, no delegation or revocation of mount
 authority; unmounting does not exist.
 
+### 3.3 Client fd namespace, sessions and canonical paths (VFS-CORRECT1C)
+
+The resident router is `crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs`; the
+descriptor model is `yarm_fs_servers::fs::common::fd_space`. Every request except mount
+administration is handled in this order.
+
+**1. Who is asking: the session.** A session is a **process**, named by the kernel as
+`(thread_group_id, process_incarnation)` through NR 21 `IpcCallerSession` op 0 on the request's
+reply capability (`doc/SYSCALL_ABI.md`, ABI v14). Every thread of a process shares it; a process
+incarnation is never reused, so a recycled TID or thread-group id names a different session. A
+request whose reply capability names no live caller is refused with 8 `PERMISSION` and nothing is
+forwarded. The NR 6 sender TID is no longer an identity for anything but mount administration
+(§3.2).
+
+**2. Housekeeping.** Before routing, VFS retries at most one undelivered backend close (below) and
+asks the kernel, for every other session holding descriptors, whether it still has a live thread
+(NR 21 op 1; VFS is a `SystemServer`). A session with none is **reclaimed**: its descriptors are
+removed and every backend handle only they referred to is closed at the instance that opened it.
+Reclamation is therefore driven by the next request from any client, not by an exit notification.
+
+**3. Descriptors and open file descriptions.** A client fd is chosen by VFS: the lowest number
+`>= 3` the session does not hold. It names a descriptor (session, fd), which refers to an open
+file description (OFD): the exact backend instance — the mount registration's instance id, unique
+for the life of VFS, plus VFS's own full-width endpoint capability — and the backend's handle. A
+backend handle never reaches a client and a client fd never reaches a backend. Capacity:
+`MAX_DESCRIPTORS = 32` in total, `MAX_FDS_PER_SESSION = 16`.
+
+| op | client → VFS | VFS → backend | backend completion validated against | client completion |
+|---|---|---|---|---|
+| `STATX` | path | the canonical path, `dirfd` 0, flags and mask as sent | op, fd 0 | value as returned, fd 0 |
+| `OPENAT` | path | the canonical path, `dirfd` 0, flags and mode as sent | op, fd 0 | value = the new **client fd**, fd 0 |
+| `READ` | client fd, len | backend handle, same len | op, **the forwarded handle**, len | the same bytes and count, fd = client fd |
+| `FILE_GRANT_RO` | client fd | backend handle, other fields as sent | op, the forwarded handle, cap present | value as returned, fd = client fd, the capability transferred on |
+| `CLOSE` | client fd | backend handle, only when no other descriptor refers to the OFD | op, the forwarded handle | value as returned (or 0), fd = client fd |
+
+A completion that names any other fd — a backend echoing a client fd, say — is malformed (10).
+An fd the session does not hold, or one whose instance is no longer the registration in the mount
+table, answers 4 `BAD_FD` and is not forwarded.
+
+**4. Open is recoverable.** OPENAT reserves the descriptor and OFD **before** the backend is asked:
+a full session or table answers 9 `NO_FD` and nothing is opened anywhere. Then:
+
+- the backend refuses (a valid error completion) → the reservation is released, the status
+  relayed;
+- NR 6 fails (nothing delivered) → released, 5 `BACKEND`;
+- the backend opened handle H → the descriptor is committed and the client told its fd; if that
+  NR 7 is refused (the client cannot be told), the open is **rolled back**: the descriptor goes
+  and H is closed at the same instance (`VFS_OPEN_ROLLBACK`);
+- no reply, or a malformed one → released, 5 or 10, and the open is counted as
+  `unknown_backend_opens`: the backend may hold a handle nobody can name. It is never closed by
+  guess, because the number may already belong to someone else.
+
+**5. Close and its failures.** CLOSE removes the descriptor first; a failed backend close still
+releases the client's fd (as POSIX `close`). The backend close itself settles as: answered →
+done (a refusal's status is relayed); NR 6 failed → **pending**, retried later against the same
+instance and handle (at most one per request; `MAX_PENDING_CLOSES = 8`, overflow counted); sent but
+no valid answer → **quarantined**, never retried, counted. The same settlement covers the rollback
+close and reclamation closes. A session that exits mid-operation cannot: VFS is single-threaded,
+so a reservation lives only inside one request.
+
+**6. Canonical paths.** For STATX and OPENAT the path is normalized once (`vfs::path::normalize`:
+repeated `/` collapse, `.` is dropped, `..` pops a component and stays at `/`, a trailing `/` is
+dropped, at most 96 bytes, absolute only); that one result selects the mount (longest prefix, on
+whole components: `/ram/bx` is not under `/ram/b/`, `/ram/b` is its root) and is the path the
+backend receives, re-encoded with the other fields preserved. A canonical path is never longer
+than the one decoded, so the wire limit holds. Symlinks do not exist here.
+
+**7. `dirfd`, `dup`, `fork`, `exec`.** Paths must be absolute, so `dirfd` takes no part; a
+nonzero one is logged (`VFS_DIRFD_IGNORED`) and not forwarded. `dup` is not implemented
+(`VFS_OP_DUP` answers 1 `UNKNOWN_OP`; the OFD keeps a reference count for it). A fork child is a
+new process and so a **new session with no descriptors**: it does not inherit its parent's fds,
+and the parent's numbers resolve nothing in it. An `exec` gives the process a new incarnation, so
+its old session is reclaimed. `VFS_OP_READ_BULK` (24) is retired: 7 `UNSUPPORTED`. Other fd-bearing
+opcodes (`WRITE`, `IOCTL`, `FCNTL`, `POLL`, `EPOLL_*`, `SENDFILE`, shared I/O) answer 1.
+
+**Backend restart.** No path removes or replaces a mount yet. If one did, the new registration gets
+a new instance id; an old descriptor's instance is no longer in the table, so it answers `BAD_FD`
+and is never forwarded — even to a restarted backend that hands out the same handle numbers.
+`Router::instance_gone` then marks its OFDs stale and drops its pending closes (hosted tests only).
+
+**Live witness** (`vfs-fd-witness`; `scripts/qemu-vfs-fd-witness-smoke.sh ARCH SMP wide|narrow`,
+graded by `scripts/grade-vfs-fd-witness.py` and, on the same boot, the VFS-CORRECT1A grader):
+init's `init/vfs_fd_witness.rs` spawns a second ramfs, mounts it at `/ram/b`, and drives the
+two-backend handle collision, canonical spellings and mount boundaries, the full session, a failed
+client reply (VFS's one injection under this feature: an OPENAT of `/ram/vc1c-failreply` is
+answered first through a stale reply capability), a second thread, and a fork child that exits
+holding two descriptors. Each ramfs seeds its files with bytes of its own TID and answers a STATX of
+`…/vc1c-stat` with its handle counts.
+
+**Limits.** Reclamation waits for the next request; a quarantined or unknown backend open stays
+open at the backend for its life; descriptors are not shared across processes (no fd passing, no
+`dup`); a late reply to a request VFS gave up on could still arrive on its backend reply endpoint
+(completion validation rejects one for another operation or fd); grant capabilities a client never
+releases are VFS-LIFETIME1's.
+
 ---
 
 ## 4. Fd / mount table semantics
 
 ### Fd table
 
-An fd entry is created by `VFS_OP_OPENAT` on success and removed by
-`VFS_OP_CLOSE` from the **owning client**.
+The client fd namespace of §3.3: descriptors are per **session** (process), numbered by VFS,
+and refer to open file descriptions bound to one backend instance and handle.
 
-- A `VFS_OP_READ` or `VFS_OP_CLOSE` for an fd not owned by the calling
-  client returns `VFS_STATUS_ERR_BAD_FD`.
-- `VFS_OP_CLOSE` only evicts the calling client's own entry; another
-  client's open is unaffected.
+- A `VFS_OP_READ`, `VFS_OP_CLOSE` or `VFS_OP_FILE_GRANT_RO` for an fd the calling session does not
+  hold returns `VFS_STATUS_ERR_BAD_FD`, and nothing is forwarded.
+- `VFS_OP_CLOSE` removes only the calling session's descriptor; another session's file with the
+  same number is unaffected.
 
 ### Mount table
 
@@ -392,6 +487,15 @@ The VFS server resident loop emits:
   validation; the client got status 10.
 - Live witness (init built with `vfs-correct-witness`, `scripts/qemu-vfs-correct-witness-smoke.sh`):
   `VC1A_*`, graded by `scripts/grade-vfs-correct-witness.py`.
+- VFS-CORRECT1C (§3.3): `VFS_FD_SPACE_READY`, `VFS_FD_OPEN tgid= incarnation= tid= client_fd=
+  instance= target= backend_handle=`, `VFS_FD_CLOSE … outcome=`, `VFS_FD_BAD op= fd= reason=`,
+  `VFS_FD_NO_FREE reason=session_full|table_full`, `VFS_OPEN_ROLLBACK`,
+  `VFS_OPEN_BACKEND_STATE_UNKNOWN`, `VFS_CLOSE_RETRY`, `VFS_SESSION_RECLAIM`,
+  `VFS_SESSION_UNKNOWN`, `VFS_CALLER_SESSION_FAIL`, `VFS_SESSION_ALIVE_FAIL`,
+  `VFS_CLIENT_REPLY_REFUSED`, `VFS_DIRFD_IGNORED`, `VFS_ROUTE_LOOKUP path=<canonical> target=
+  instance= canonical=0|1`, and `VFS_FD_STATE why= descriptors= ofds= sessions= pending_retry=
+  quarantined= pending_overflow= unknown_backend_opens=` after each change. The live witness
+  (`vfs-fd-witness`) logs `VC1C_*`, graded by `scripts/grade-vfs-fd-witness.py`.
 
 Optional-FS strict smoke markers (do not rename or remove — see
 `doc/KERNEL_UNLOCKING.md` §3):

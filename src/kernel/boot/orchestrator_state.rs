@@ -2582,6 +2582,54 @@ impl KernelState {
             .map(|tcb| tcb.thread_group_id.0)
     }
 
+    /// VFS-CORRECT1C (NR 21) split-read: `(thread_group_id, process_incarnation)` of the task
+    /// whose identity is exactly `{tid, asid}` (`Asid(0)` matches any address space, as a reply
+    /// record minted for a task without one does), under only the task lock (rank 2).
+    ///
+    /// # Safety
+    /// Same requirements as `task_class_from_raw`.
+    pub(crate) unsafe fn caller_session_from_raw(
+        state: *const KernelState,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Option<(u64, u64)> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+        let _guard = lock_ref.lock();
+        let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
+            kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+        tcbs.iter()
+            .flatten()
+            .find(|t| {
+                t.tid.0 == tid && (asid == crate::kernel::vm::Asid(0) || t.asid == Some(asid))
+            })
+            .map(|t| (t.thread_group_id.0, t.process_incarnation))
+    }
+
+    /// VFS-CORRECT1C (NR 21 op 1) split-read: the live threads of the process
+    /// `(thread_group_id, process_incarnation)`, under only the task lock (rank 2). The same
+    /// predicate as [`KernelState::session_live_threads`].
+    ///
+    /// # Safety
+    /// Same requirements as `task_class_from_raw`.
+    pub(crate) unsafe fn session_live_threads_from_raw(
+        state: *const KernelState,
+        thread_group_id: u64,
+        process_incarnation: u64,
+    ) -> u64 {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+        let _guard = lock_ref.lock();
+        let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
+            kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+        tcbs.iter()
+            .flatten()
+            .filter(|t| {
+                t.thread_group_id.0 == thread_group_id
+                    && t.process_incarnation == process_incarnation
+                    && crate::kernel::task::session_thread_is_live(t.status)
+            })
+            .count() as u64
+    }
+
     /// Stage 5B split-read: check whether `tid` is the thread-group leader under
     /// only the task lock (rank 2). Returns `false` if the task does not exist.
     ///

@@ -1661,6 +1661,9 @@ pub fn handle_riscv_trap_entry_shared(
             // birth (non-switching, NR 10's shape).
             || nr == crate::kernel::syscall::SYSCALL_CLOCK_GETTIME_NR
             || nr == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
+            // VFS-CORRECT1C: IpcCallerSession (NR 21), split from birth (non-switching, NR 18's
+            // shape). Absent here it would be settled as an unassigned number on this port.
+            || nr == crate::kernel::syscall::SYSCALL_IPC_CALLER_SESSION_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
             // SCHED-TIME-FOUNDATION1 C: ClockNanosleep (NR 20), the FutexWait family's second
             // switching member (same park tail, same deferral).

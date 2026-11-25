@@ -33,9 +33,13 @@ control_plane_vfs_paths=(
 for control_plane_vfs in "${control_plane_vfs_paths[@]}"; do
   [[ -e "$control_plane_vfs" ]] || continue
   # allow explicit backend names in control-plane test scaffolding, but not in production path.
-  if awk '/#\[cfg\(test\)\]/{exit} {print}' "$control_plane_vfs" | rg -n "$concrete_re" >/dev/null; then
+  # The production path ends at the test module (a test cfg followed by `mod …tests`).
+  # VFS-CORRECT1C: it used to end at the first `#[cfg(test)]`, a helper above `run()`, so
+  # `run()` itself was never scanned; that helper is retired and the cut is now the module.
+  vfs_production() { awk 'prev ~ /#\[cfg\((all\()?test/ && /^mod [a-z_]*tests/ {exit} {print; prev=$0}' "$1"; }
+  if vfs_production "$control_plane_vfs" | rg -n "$concrete_re" >/dev/null; then
     echo "[fail] concrete service names found in control-plane VFS production shim: $control_plane_vfs"
-    awk '/#\[cfg\(test\)\]/{exit} {print}' "$control_plane_vfs" | rg -n "$concrete_re"
+    vfs_production "$control_plane_vfs" | rg -n "$concrete_re"
     bad=1
   fi
 done

@@ -4466,6 +4466,8 @@ pub(crate) fn publish_spawned_image_locked(
         .find(|tcb| tcb.tid.0 == publication.tid)
         .ok_or(crate::kernel::spawn_reservation::ReservationRefusal::TaskMissing)?;
     tcb.thread_group_id = ThreadGroupId(publication.tid);
+    // VFS-CORRECT1C: an image spawn starts a new process, identified by this incarnation.
+    tcb.process_incarnation = tcb.incarnation;
     tcb.asid = Some(publication.asid);
     tcb.user_entry = Some(VirtAddr(publication.entry as u64));
     tcb.user_stack_top = Some(publication.stack_top);

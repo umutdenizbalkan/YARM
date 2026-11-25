@@ -58,6 +58,10 @@ struct MountEntry {
     label: MountLabel,
     send_cap: u64,
     flags: u32,
+    /// VFS-CORRECT1C: this registration's instance id, unique for the life of this VFS. An open
+    /// file is bound to it, not only to the prefix, so a later registration (a restarted backend)
+    /// is never addressed through an old descriptor.
+    instance: u64,
 }
 
 /// Table-driven VFS mount router.
@@ -72,6 +76,7 @@ struct MountEntry {
 pub struct VfsMountTable {
     entries: [MountEntry; MAX_MOUNT_ENTRIES],
     count: usize,
+    next_instance: u64,
 }
 
 impl VfsMountTable {
@@ -81,13 +86,21 @@ impl VfsMountTable {
         label: MountLabel::EMPTY,
         send_cap: 0,
         flags: 0,
+        instance: 0,
     };
 
     pub const fn new() -> Self {
         Self {
             entries: [Self::EMPTY_ENTRY; MAX_MOUNT_ENTRIES],
             count: 0,
+            next_instance: 1,
         }
+    }
+
+    fn take_instance(&mut self) -> u64 {
+        let id = self.next_instance;
+        self.next_instance += 1;
+        id
     }
 
     /// Register a trusted (pre-validated) boot mount.
@@ -112,6 +125,7 @@ impl VfsMountTable {
         entry.prefix_len = prefix.len();
         entry.label = MountLabel::from_str(name);
         entry.send_cap = send_cap;
+        entry.instance = self.take_instance();
         self.entries[self.count] = entry;
         self.count += 1;
         true
@@ -187,6 +201,7 @@ impl VfsMountTable {
         entry.label = MountLabel::from_bytes(label_src);
         entry.send_cap = send_cap;
         entry.flags = flags;
+        entry.instance = self.take_instance();
         self.entries[self.count] = entry;
         self.count += 1;
         Ok(())
@@ -196,19 +211,54 @@ impl VfsMountTable {
     ///
     /// Returns a copy of `(send_cap, label)` for the entry whose prefix is the
     /// longest matching prefix of `path`, or `None` if no entry matches.
+    #[cfg(test)]
     pub(crate) fn route(&self, path: &[u8]) -> Option<(u64, MountLabel)> {
+        self.route_instance(path)
+            .map(|(cap, _, label)| (cap, label))
+    }
+
+    /// VFS-CORRECT1C: [`Self::route`] plus the matched registration's instance id, as
+    /// `(send_cap, instance, label)`.
+    pub(crate) fn route_instance(&self, path: &[u8]) -> Option<(u64, u64, MountLabel)> {
         let mut best_len = 0usize;
-        let mut best: Option<(u64, MountLabel)> = None;
+        let mut best: Option<(u64, u64, MountLabel)> = None;
         for entry in &self.entries[..self.count] {
             if entry.prefix_len == 0 {
                 continue;
             }
             if Self::matches_entry(path, entry) && entry.prefix_len > best_len {
                 best_len = entry.prefix_len;
-                best = Some((entry.send_cap, entry.label));
+                best = Some((entry.send_cap, entry.instance, entry.label));
             }
         }
         best
+    }
+
+    /// VFS-CORRECT1C: the endpoint capability and label of registration `instance`, if it is
+    /// still in the table. An open file names its instance; the router forwards only while that
+    /// registration is the one in the table.
+    pub(crate) fn instance(&self, instance: u64) -> Option<(u64, MountLabel)> {
+        self.entries[..self.count]
+            .iter()
+            .find(|e| e.prefix_len != 0 && e.instance == instance)
+            .map(|e| (e.send_cap, e.label))
+    }
+
+    /// VFS-CORRECT1C, hosted only: a backend restart — the entry for `prefix` (stored form) gets
+    /// a new endpoint capability and a NEW instance id. Returns `(old_instance, new_instance)`.
+    /// No live path replaces a mount yet; this models one for the router's restart tests.
+    #[cfg(test)]
+    pub(crate) fn replace_backend(&mut self, prefix: &[u8], send_cap: u64) -> Option<(u64, u64)> {
+        let i = (0..self.count).find(|&i| {
+            let e = &self.entries[i];
+            e.prefix_len == prefix.len() && &e.prefix[..e.prefix_len] == prefix
+        })?;
+        let new = self.take_instance();
+        let e = &mut self.entries[i];
+        let old = e.instance;
+        e.instance = new;
+        e.send_cap = send_cap;
+        Some((old, new))
     }
 
     fn matches_entry(path: &[u8], entry: &MountEntry) -> bool {

@@ -65,6 +65,7 @@ use crate::kernel::vm::{Asid, VirtAddr};
 pub(crate) struct SpawnBaseline {
     status: TaskStatus,
     thread_group_id: ThreadGroupId,
+    process_incarnation: u64,
     asid: Option<Asid>,
     user_entry: Option<VirtAddr>,
     user_stack_top: Option<VirtAddr>,
@@ -80,6 +81,7 @@ impl SpawnBaseline {
         Self {
             status: tcb.status,
             thread_group_id: tcb.thread_group_id,
+            process_incarnation: tcb.process_incarnation,
             asid: tcb.asid,
             user_entry: tcb.user_entry,
             user_stack_top: tcb.user_stack_top,
@@ -93,6 +95,7 @@ impl SpawnBaseline {
     fn replay(self, tcb: &mut ThreadControlBlock) {
         tcb.status = self.status;
         tcb.thread_group_id = self.thread_group_id;
+        tcb.process_incarnation = self.process_incarnation;
         tcb.asid = self.asid;
         tcb.user_entry = self.user_entry;
         tcb.user_stack_top = self.user_stack_top;

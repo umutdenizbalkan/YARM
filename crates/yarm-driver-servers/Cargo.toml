@@ -67,6 +67,8 @@ vfs-correct-witness = []
 cap-gen-witness = []
 # VFS-CORRECT1B: init's and ramfs_srv's mount witness; accepted and inert in this package.
 vfs-mount-witness = []
+# VFS-CORRECT1C: init's, VFS's and ramfs_srv's fd witness; accepted and inert in this package.
+vfs-fd-witness = []
 # FUTEX-SEAL1: accepted and inert here (init's cell; the kernel side is the root crate's feature).
 futex-seal-witness = []
 # FUTEX-SEAL1: init's per-sequence cell selectors; accepted and inert here.

@@ -4562,6 +4562,12 @@ fn run_futex_sync_witness(s_tid: u64) {
 #[path = "vfs_correct_witness.rs"]
 mod vfs_correct_witness;
 // VFS-CORRECT1B — the live mount-authority witness (default off).
+/// VFS-CORRECT1C — the live fd-namespace witness (`vfs_fd_witness.rs`), run after init's ordinary
+/// `/ram` registration: a second ramfs at `/ram/b`, then collision, canonical paths, the full
+/// table, the failed-reply rollback, a second thread and a fork child.
+#[cfg(all(not(feature = "hosted-dev"), feature = "vfs-fd-witness"))]
+#[path = "vfs_fd_witness.rs"]
+mod vfs_fd_witness;
 #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-mount-witness"))]
 #[path = "vfs_mount_witness.rs"]
 mod vfs_mount_witness;
@@ -10973,6 +10979,14 @@ pub fn run() {
                     pm_recv,
                     init_ramfs_send_cap,
                     ramfs_mount_config,
+                );
+                #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-fd-witness"))]
+                let _ = vfs_fd_witness::run(
+                    vfs_recv_cap,
+                    vfs_admin_send,
+                    pm_send,
+                    pm_recv,
+                    ramfs_child_tid,
                 );
             } else {
                 yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_FAIL ok=0 child_tid=0");

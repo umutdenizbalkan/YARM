@@ -6458,6 +6458,12 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_clock_into_frame(shared, cpu, frame, syscall);
     }
 
+    // VFS-CORRECT1C: IpcCallerSession (NR 21) — born split, non-switching, read-only. Every
+    // refusal is settled here, in the broad handler's order.
+    if matches!(syscall, Syscall::IpcCallerSession) {
+        return try_split_ipc_caller_session_into_frame(shared, cpu, frame);
+    }
+
     // U9-IPC-RESIDUAL2 §2: IpcCall (NR 6) is no longer serviced from here. It became a SWITCHING
     // class the moment its full-endpoint arm started parking the caller, so it is tried in
     // `try_split_dispatch_into_frame` alongside the other four, whose contract admits a caller
@@ -7171,6 +7177,42 @@ fn try_split_clock_into_frame(
         _ => crate::kernel::syscall::clock::clock_set_realtime_split(shared, tid, frame),
     };
     Some(r.map_err(TrapHandleError::Syscall))
+}
+
+/// VFS-CORRECT1C — NR 21 `IpcCallerSession` off the broad lock (`syscall::session`).
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_ipc_caller_session_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    let tid = match split_caller(shared, cpu) {
+        SplitCaller::Running(tid) => tid,
+        SplitCaller::NoCurrentTask => {
+            crate::yarm_log!(
+                "SYSCALL_SPLIT_NO_CURRENT nr={} cpu={} settlement=task_missing broad_lock=0",
+                crate::kernel::syscall::SYSCALL_IPC_CALLER_SESSION_NR,
+                cpu.0
+            );
+            return Some(Err(TrapHandleError::Syscall(SyscallError::from(
+                crate::kernel::boot::KernelError::TaskMissing,
+            ))));
+        }
+    };
+    Some(
+        crate::kernel::syscall::session::ipc_caller_session_split(shared, tid, frame)
+            .map_err(TrapHandleError::Syscall),
+    )
+}
+
+/// Hosted-dev: NR 21 takes the broad path; its split owner is arch-neutral and tested directly.
+#[cfg(feature = "hosted-dev")]
+fn try_split_ipc_caller_session_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
 }
 
 /// Hosted-dev: the clock syscalls take the broad path; their owners are arch-neutral and tested
@@ -11046,6 +11088,9 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // SCHED-TIME-FOUNDATION1 B: NR 18 / NR 19 — split from birth; the caller never
         // task-switches. `try_split_clock_into_frame` settles every refusal.
         Syscall::ClockGetTime | Syscall::ClockSetRealtime => Some(syscall),
+        // VFS-CORRECT1C: NR 21 — split from birth; read-only, the caller never task-switches.
+        // `try_split_ipc_caller_session_into_frame` settles every refusal.
+        Syscall::IpcCallerSession => Some(syscall),
         // U9-MO2 §4: CreateInitramfsFileSliceMo (NR 28) — the smallest live production class
         // still reaching a terminal broad acquisition. Its object is BORROWED initrd backing, so
         // its compensation never touches the frame allocator; every owner it needs already exists
@@ -12506,9 +12551,10 @@ mod tests {
     /// the fatal `Err` channel every arch entry point halts on.
     #[test]
     fn u9tf_an_unowned_syscall_settles_exactly_as_the_broad_arm_did() {
-        // 21 is inside `SYSCALL_COUNT` (32) and is not an assigned number. (SCHED-TIME-FOUNDATION1
-        // C re-derivation: this used 20, which is now `ClockNanosleep`.)
-        const UNASSIGNED_NR: usize = 21;
+        // 22 is inside `SYSCALL_COUNT` (32) and is not an assigned number. (SCHED-TIME-FOUNDATION1
+        // C re-derivation: this used 20, which is now `ClockNanosleep`; VFS-CORRECT1C: then 21,
+        // which is now `IpcCallerSession`.)
+        const UNASSIGNED_NR: usize = 22;
         assert!(UNASSIGNED_NR < crate::kernel::syscall::SYSCALL_COUNT);
 
         // The production owner, over this frame.

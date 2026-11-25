@@ -271,11 +271,85 @@ pub fn seed_witness_file(svc: &mut RamFsService) -> Result<usize, super::tree::R
     Ok(written)
 }
 
+/// VFS-CORRECT1C — the fd witness's files, seeded by EVERY ramfs instance under
+/// `vfs-fd-witness`. Init mounts a second instance at `/ram/b/`, so `/ram/vc1c-file` is served by
+/// the first and `/ram/b/vc1c-file` by the second; both instances hold both files, with bytes
+/// that depend on the serving instance's own TID, so the bytes a client reads name the backend
+/// that served them.
+pub const RAMFS_FD_WITNESS_FILES: [&[u8]; 3] = [
+    b"/ram/vc1c-file",
+    b"/ram/b/vc1c-file",
+    b"/ram/vc1c-failreply",
+];
+pub const RAMFS_FD_WITNESS_LEN: usize = 96;
+/// A STATX of any path ending in this answers `(next handle << 16) | open handles` (witness
+/// accounting only; nothing is opened).
+pub const RAMFS_FD_WITNESS_STAT_SUFFIX: &[u8] = b"/vc1c-stat";
+
+pub const fn ramfs_fd_witness_byte(tid: u64, file: usize, i: usize) -> u8 {
+    ((tid as usize)
+        .wrapping_mul(29)
+        .wrapping_add(file * 83)
+        .wrapping_add(i * 11)
+        .wrapping_add(5)
+        & 0xFF) as u8
+}
+
+/// Create `/ram/b` and the three witness files through the backend's own file operations.
+pub fn seed_fd_witness_files(
+    svc: &mut RamFsService,
+    tid: u64,
+) -> Result<(), super::tree::RamFsError> {
+    let backend = svc.backend_mut();
+    backend.mkdir_path(b"/ram/b")?;
+    for (file, path) in RAMFS_FD_WITNESS_FILES.iter().enumerate() {
+        let mut bytes = [0u8; RAMFS_FD_WITNESS_LEN];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ramfs_fd_witness_byte(tid, file, i);
+        }
+        backend.create_file(path)?;
+        let fd = backend.open_path(path)?;
+        backend.write_bytes(fd, &bytes)?;
+        backend.close_fd(fd)?;
+    }
+    Ok(())
+}
+
+/// The witness stat hook: `Some(reply)` for a STATX of a `…/vc1c-stat` path.
+pub fn fd_witness_stat_reply(svc: &RamFsService, msg: &Message) -> Option<Message> {
+    use yarm_ipc_abi::vfs_abi::{StatxInlinePath, VFS_OP_STATX, VfsCompletion};
+    if msg.opcode != VFS_OP_STATX {
+        return None;
+    }
+    let args = StatxInlinePath::decode(msg.as_slice())?;
+    if !args.path.ends_with(RAMFS_FD_WITNESS_STAT_SUFFIX) {
+        return None;
+    }
+    let (next, live) = svc.backend().handle_stats();
+    let (bytes, len) = VfsCompletion::ok(VFS_OP_STATX, (next << 16) | live as u64, 0).encode(&[])?;
+    Message::with_header(0, 0, 0, None, &bytes[..len]).ok()
+}
+
 fn run_resident_service_loop(svc: &mut RamFsService) {
     #[cfg(feature = "vfs-mount-witness")]
     match seed_witness_file(svc) {
         Ok(n) => yarm_user_rt::user_log!("RAMFS_WITNESS_SEEDED path=/ram/vc1b-witness len={}", n),
         Err(e) => yarm_user_rt::user_log!("RAMFS_WITNESS_SEED_FAIL err={:?}", e),
+    }
+    #[cfg(feature = "vfs-fd-witness")]
+    {
+        let tid =
+            yarm_user_rt::runtime::startup_arg_slot(yarm_user_rt::runtime::STARTUP_SLOT_TASK_ID)
+                .unwrap_or(0);
+        let r = seed_fd_witness_files(svc, tid);
+        let (next, live) = svc.backend().handle_stats();
+        yarm_user_rt::user_log!(
+            "RAMFS_FD_WITNESS_SEEDED tid={} ok={} next_handle={} open_handles={}",
+            tid,
+            r.is_ok() as u8,
+            next,
+            live
+        );
     }
     let ctx = yarm_user_rt::runtime::startup_context();
     if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
@@ -289,8 +363,37 @@ fn run_resident_service_loop(svc: &mut RamFsService) {
                     let Some(reply_cap) = received.reply_cap else {
                         continue;
                     };
+                    #[cfg(feature = "vfs-fd-witness")]
+                    if let Some(r) = fd_witness_stat_reply(svc, &msg) {
+                        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &r) };
+                        continue;
+                    }
                     // VFS-CORRECT1A: router-forwarded operations are answered with a payload completion.
                     let response = svc.handle_completion(msg);
+                    #[cfg(feature = "vfs-fd-witness")]
+                    if matches!(
+                        msg.opcode,
+                        yarm_ipc_abi::vfs_abi::VFS_OP_OPENAT | yarm_ipc_abi::vfs_abi::VFS_OP_CLOSE
+                    ) {
+                        let (next, live) = svc.backend().handle_stats();
+                        let handle =
+                            yarm_ipc_abi::vfs_abi::VfsCompletion::decode(response.as_slice())
+                                .map(|(c, _)| {
+                                    if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_OPENAT {
+                                        c.value
+                                    } else {
+                                        c.fd
+                                    }
+                                })
+                                .unwrap_or(u64::MAX);
+                        yarm_user_rt::user_log!(
+                            "RAMFS_FD_COUNT op={} handle={} next_handle={} open_handles={}",
+                            msg.opcode,
+                            handle,
+                            next,
+                            live
+                        );
+                    }
                     let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
                 }
                 _ => {
@@ -622,5 +725,66 @@ mod tests {
         }
         assert!(doc.contains("memory-only"));
         assert!(doc.contains("VFS_OP_WRITE"));
+    }
+
+    #[test]
+    fn vc1c_two_instances_seed_the_same_handles_and_their_own_bytes() {
+        use super::{
+            RAMFS_FD_WITNESS_FILES, RAMFS_FD_WITNESS_LEN, fd_witness_stat_reply,
+            ramfs_fd_witness_byte, run_request_loop, seed_fd_witness_files,
+            service_from_startup_config,
+        };
+        use yarm_ipc_abi::vfs_abi::{VFS_OP_READ, VfsCompletion};
+        let mut a = service_from_startup_config(super::RamFsStartupConfig::default_compat())
+            .unwrap()
+            .0;
+        let mut b = service_from_startup_config(super::RamFsStartupConfig::default_compat())
+            .unwrap()
+            .0;
+        run_request_loop(&mut a).unwrap();
+        run_request_loop(&mut b).unwrap();
+        seed_fd_witness_files(&mut a, 10006).unwrap();
+        seed_fd_witness_files(&mut b, 10013).unwrap();
+        assert_eq!(a.backend().handle_stats(), b.backend().handle_stats());
+        // The stat hook reports (next << 16) | open, and opens nothing.
+        let stat = statx_inline_message(0, b"/ram/b/vc1c-stat", 0, 0).unwrap();
+        let (next, live) = b.backend().handle_stats();
+        let r = fd_witness_stat_reply(&b, &stat).unwrap();
+        let (c, _) = VfsCompletion::decode(r.as_slice()).unwrap();
+        assert_eq!(c.value, (next << 16) | live as u64);
+        assert_eq!(b.backend().handle_stats(), (next, live));
+        // Same path, same handle number, different bytes on each instance.
+        let open = openat_inline_message(0, RAMFS_FD_WITNESS_FILES[1], 0, 0).unwrap();
+        let ha = VfsCompletion::decode(a.handle_completion(open).as_slice())
+            .unwrap()
+            .0
+            .value;
+        let hb = VfsCompletion::decode(b.handle_completion(open).as_slice())
+            .unwrap()
+            .0
+            .value;
+        assert_eq!(ha, hb, "two instances, one handle number");
+        let read = |svc: &mut super::RamFsService, h| {
+            let m = svc.handle_completion(
+                read_message(ReadWriteRequest {
+                    fd: h,
+                    buf_ptr: 0,
+                    len: 8,
+                })
+                .unwrap(),
+            );
+            let (c, d) = VfsCompletion::decode(m.as_slice()).unwrap();
+            assert_eq!(c.op, VFS_OP_READ);
+            d.to_vec()
+        };
+        let want = |tid| {
+            (0..8)
+                .map(|i| ramfs_fd_witness_byte(tid, 1, i))
+                .collect::<alloc::vec::Vec<_>>()
+        };
+        assert_eq!(read(&mut a, ha), want(10006));
+        assert_eq!(read(&mut b, hb), want(10013));
+        assert_ne!(want(10006), want(10013));
+        assert!(RAMFS_FD_WITNESS_LEN <= 104);
     }
 }

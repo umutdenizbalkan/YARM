@@ -20616,6 +20616,38 @@ impl SharedKernel {
         }
     }
 
+    /// VFS-CORRECT1C (NR 21) — `(thread_group_id, process_incarnation)` of the exact task
+    /// incarnation `identity`, under the task read (rank 2) only.
+    pub(crate) fn caller_session_split_read(
+        &self,
+        identity: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> Option<(u64, u64)> {
+        // SAFETY: stable KernelState storage; the raw reader takes only the task lock.
+        unsafe {
+            KernelState::caller_session_from_raw(
+                self.state_ptr() as *const _,
+                identity.tid.0,
+                identity.asid,
+            )
+        }
+    }
+
+    /// VFS-CORRECT1C (NR 21 op 1) — the live threads of a process, under the task read only.
+    pub(crate) fn session_live_threads_split_read(
+        &self,
+        thread_group_id: u64,
+        process_incarnation: u64,
+    ) -> u64 {
+        // SAFETY: as in `caller_session_split_read`.
+        unsafe {
+            KernelState::session_live_threads_from_raw(
+                self.state_ptr() as *const _,
+                thread_group_id,
+                process_incarnation,
+            )
+        }
+    }
+
     /// Stage 199A2B2E: GENERATION-BEARING off-lock cnode resolution. Resolves the
     /// `CNodeId` for the process owning the EXACT `{tid, asid}` incarnation (identity
     /// verified under the task read, cnode resolved under the capability read). A

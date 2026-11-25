@@ -383,6 +383,13 @@ pub struct ThreadControlBlock {
     /// placement planned under rank 2 and committed after the lock was dropped is bound to the
     /// incarnation it was planned for.
     pub incarnation: u64,
+    /// VFS-CORRECT1C — the identity of the PROCESS this thread belongs to: the `incarnation` of the
+    /// thread that created the process (an image spawn or a fork), copied unchanged into every
+    /// thread `SpawnThread` adds to it. Like `incarnation` it is never reused, so
+    /// `(thread_group_id, process_incarnation)` names one process for the life of the kernel even
+    /// though both numeric TIDs and thread-group ids are reused. Servers learn it only through
+    /// NR 21 (`IpcCallerSession`), bound to a live reply capability.
+    pub process_incarnation: u64,
     /// RT-SCHED1A — the scheduling priority CONFIGURED for this exact incarnation
     /// (`task_enqueue::configure_priority_locked`), any of the 32 levels. `None` keeps the
     /// general-purpose class rule (`task_enqueue::priority_for_class`). Read by every enqueue plan
@@ -1229,8 +1236,10 @@ impl ThreadControlBlock {
     }
 
     pub fn new(tid: ThreadId, asid: Option<Asid>) -> Self {
+        let incarnation = next_incarnation();
         Self {
-            incarnation: next_incarnation(),
+            incarnation,
+            process_incarnation: incarnation,
             sched_priority: None,
             sched_priority_sealed: false,
             sched_budget: None,
@@ -1505,4 +1514,13 @@ mod tests {
 
         assert_eq!(tcb.thread_group_id, ThreadGroupId(70_000));
     }
+}
+
+/// VFS-CORRECT1C — does a thread in `status` still count toward its process's session (NR 21
+/// op 1)? Exited, dead, faulted and bare-reservation threads do not.
+pub(crate) const fn session_thread_is_live(status: TaskStatus) -> bool {
+    !matches!(
+        status,
+        TaskStatus::Exited(_) | TaskStatus::Dead | TaskStatus::Faulted | TaskStatus::Reserved
+    )
 }

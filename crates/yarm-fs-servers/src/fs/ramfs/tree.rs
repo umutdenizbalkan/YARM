@@ -281,6 +281,11 @@ impl RamFsBackend {
         Ok(fd)
     }
 
+    /// VFS-CORRECT1C witness accounting: `(next handle, open handles)`.
+    pub fn handle_stats(&self) -> (u64, usize) {
+        (self.next_fd, self.fds.len())
+    }
+
     pub fn close_fd(&mut self, fd: u64) -> Result<(), RamFsError> {
         let idx = self
             .fds

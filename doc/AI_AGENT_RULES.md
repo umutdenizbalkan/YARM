@@ -45,6 +45,12 @@ Capability IDs are `u64` (`generation << 16 | index`). Never narrow one to `u32`
 more than 65,535 times has an ID above `u32::MAX`, and the truncated value names a different
 generation, which the kernel refuses as `InvalidCapability`.
 
+A server that keys state on its client must not key it on the sender TID (reused after the thread
+exits, and different for each thread of one process): it asks the kernel for the process behind
+the request's reply capability (NR 21 `IpcCallerSession`, VFS-CORRECT1C;
+`doc/PROCESS_AND_SPAWN.md` §7). And a server must never hand a client a number that is another
+server's (VFS translates client fds to backend handles and back, `doc/VFS.md` §3.3).
+
 ### 1.4 Use FLAG_CAP_TRANSFER_PLAIN for reply-with-cap
 
 `FLAG_CAP_TRANSFER_PLAIN = 1 << 2`

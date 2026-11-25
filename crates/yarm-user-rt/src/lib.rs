@@ -87,6 +87,8 @@ pub mod syscall {
     pub const SYSCALL_CLOCK_SET_REALTIME_NR: usize = 19;
     /// SCHED-TIME-FOUNDATION1 (ABI v12): `ClockNanosleep` (NR 20). Must match `kernel::syscall`.
     pub const SYSCALL_CLOCK_NANOSLEEP_NR: usize = 20;
+    /// VFS-CORRECT1C (ABI v14) — NR 21 `IpcCallerSession`: see [`ipc_caller_session`].
+    pub const SYSCALL_IPC_CALLER_SESSION_NR: usize = 21;
     /// NR 20 flag: the request is an absolute time on its clock (`kernel::syscall::clock`).
     pub const TIMER_ABSTIME: usize = 1;
     /// The clock ids (`kernel::timekeeping`).
@@ -2096,6 +2098,61 @@ pub mod syscall {
             requeued: ret.ret1 as u32,
             capacity_limited: ret.ret2 & FUTEX_REQUEUE_STATUS_CAPACITY_LIMITED != 0,
         })
+    }
+
+    /// VFS-CORRECT1C (ABI v14) — the authenticated identity of the process behind `reply_cap`, a
+    /// reply capability this task received with a request (NR 21 op 0). Returns
+    /// `(thread_group_id, process_incarnation, caller_tid)`. The pair `(thread_group_id,
+    /// process_incarnation)` is shared by every thread of the calling process and is never
+    /// reused; the TID alone is neither.
+    pub fn ipc_caller_session(
+        reply_cap: u64,
+    ) -> core::result::Result<(u64, u64, u64), SyscallError> {
+        // SAFETY: Uses architecture syscall ABI; no user memory is passed.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_IPC_CALLER_SESSION_NR,
+                [0, reply_cap as usize, 0, 0, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        if ret.ret1 == 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok((ret.ret0 as u64, ret.ret1 as u64, ret.ret2 as u64))
+    }
+
+    /// VFS-CORRECT1C (ABI v14) — how many threads of the process `(thread_group_id,
+    /// process_incarnation)` are still live (NR 21 op 1; `SystemServer` only). 0: it has exited.
+    pub fn ipc_session_live_threads(
+        thread_group_id: u64,
+        process_incarnation: u64,
+    ) -> core::result::Result<u64, SyscallError> {
+        // SAFETY: Uses architecture syscall ABI; no user memory is passed.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_IPC_CALLER_SESSION_NR,
+                [
+                    1,
+                    thread_group_id as usize,
+                    process_incarnation as usize,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        if ret.ret1 == 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(ret.ret0 as u64)
     }
 
     /// SCHED-TIME-FOUNDATION1 — read `clock` (`CLOCK_MONOTONIC` or `CLOCK_REALTIME`) with NR 18.

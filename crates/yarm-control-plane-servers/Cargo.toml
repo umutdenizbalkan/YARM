@@ -93,6 +93,11 @@ vfs-correct-witness = []
 cap-gen-witness = []
 # VFS-CORRECT1B — init's mount-administration witness, after the VFS-CORRECT1A cell.
 vfs-mount-witness = []
+# VFS-CORRECT1C — init's fd-namespace witness (a second ramfs at /ram/b, the two-backend handle
+# collision, rollback, sessions, canonical paths) and VFS's one fault injection: an OPENAT of
+# /ram/vc1c-failreply is answered first through a stale reply capability, so the client reply
+# really fails and the open is rolled back.
+vfs-fd-witness = []
 # FUTEX-SEAL1 — with futex-seal-witness, the sequence cells to run, in this order, one file each:
 # selective-wake order (futex_seal_os.rs), NR 17 (futex_seal_nr17.rs), the late sole-wake
 # handoff (futex_seal_lh.rs), the paired broadcast (futex_seal_witness.rs), and last the RT-budget

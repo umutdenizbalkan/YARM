@@ -90,6 +90,8 @@ impl SpawnThreadArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParentThreadFacts {
     pub(crate) thread_group_id: ThreadGroupId,
+    /// VFS-CORRECT1C — the process the new thread joins (see `ThreadControlBlock`).
+    pub(crate) process_incarnation: u64,
     pub(crate) asid: Option<Asid>,
     pub(crate) class: TaskClass,
 }
@@ -111,6 +113,7 @@ pub(crate) fn parent_facts_locked(
     let parent = tcbs[idx].as_ref().ok_or(KernelError::TaskMissing)?;
     Ok(ParentThreadFacts {
         thread_group_id: parent.thread_group_id,
+        process_incarnation: parent.process_incarnation,
         asid: parent.asid,
         class: classes
             .get(idx)
@@ -287,6 +290,7 @@ pub(crate) fn initialize_thread_incarnation_locked(
         .and_then(Option::as_mut)
         .ok_or(KernelError::TaskMissing)?;
     tcb.thread_group_id = parent.thread_group_id;
+    tcb.process_incarnation = parent.process_incarnation;
     tcb.asid = parent.asid;
     tcb.tls_ptr = Some(VirtAddr(args.tls_base as u64));
     tcb.user_entry = Some(VirtAddr(args.user_entry as u64));

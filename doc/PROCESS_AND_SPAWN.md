@@ -408,6 +408,25 @@ Boot logs emit `YARM_TID_POLICY ...`; wrap events emit
 `YARM_TID_ALLOC_WRAP ...`. CI gate:
 `scripts/check-tid-allocation-policy.sh`.
 
+### Process identity: thread group and process incarnation (VFS-CORRECT1C)
+
+A TID names a thread, and only while it lives. A **process** is named by the pair
+`(thread_group_id, process_incarnation)`:
+
+- every TCB has a unique `incarnation` (never reused for the life of the kernel) and a
+  `process_incarnation`;
+- a new process — a spawned image (`exec_state`), a fork child (`fork_owners`) — gets
+  `thread_group_id = its own tid` and `process_incarnation = its own incarnation`;
+- a thread (`SpawnThread`, `spawn_thread_core`) copies both from its parent, so all threads of a
+  process share the pair; a failed spawn restores both from the reservation baseline.
+
+So a recycled TID, or a thread-group id reused by a later process, never matches an earlier
+process's pair. Servers read it with NR 21 `IpcCallerSession` (`doc/SYSCALL_ABI.md`): op 0 names
+the process behind a request's reply capability, op 1 (`SystemServer` only) counts its live
+threads (0 once it has exited, for good). What a server keys on that identity — VFS's descriptors
+(`doc/VFS.md` §3.3) — is server policy. A fork child is a new process: it shares nothing a server
+keyed on its parent's pair.
+
 ---
 
 ## 8. Init server boot contract (core profile)

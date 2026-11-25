@@ -6796,6 +6796,70 @@ impl KernelState {
         Ok(cap_id)
     }
 
+    /// VFS-CORRECT1C (NR 21 `IpcCallerSession`, op 0) — the PROCESS waiting on `reply_cap`.
+    ///
+    /// `reply_cap` must be a reply capability in the CURRENT task's CNode whose record is still
+    /// `Available`: its caller is then blocked in this exact NR 6 call, alive, and cannot have had
+    /// its numeric TID reused. Returns `(thread_group_id, process_incarnation, caller_tid)`. A
+    /// record already consumed, cancelled or reserved, or a caller whose incarnation no longer
+    /// matches (`caller_asid`), is `InvalidCapability`; a capability that is not a reply
+    /// capability is `WrongObject`.
+    pub(crate) fn reply_cap_caller_session(
+        &self,
+        reply_cap: CapId,
+    ) -> Result<(u64, u64, u64), KernelError> {
+        let capability = self.resolve_send_cap_task_local(reply_cap)?;
+        // The split route's order: the object kind, then the right.
+        if !matches!(capability.object, CapObject::Reply { .. }) {
+            return Err(KernelError::WrongObject);
+        }
+        if !capability.has_right(CapRights::SEND) {
+            return Err(KernelError::MissingRight);
+        }
+        let slot = self
+            .resolve_reply_index(capability.object)
+            .map_err(|_| KernelError::InvalidCapability)?;
+        let record = self
+            .with_ipc_state(|ipc| ipc.reply_caps[slot])
+            .ok_or(KernelError::InvalidCapability)?;
+        if !record.reservation.is_invokable() {
+            return Err(KernelError::InvalidCapability);
+        }
+        let caller = record.caller_tid.0;
+        let caller_asid = record.caller_asid;
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| {
+                    t.tid.0 == caller
+                        && (caller_asid == crate::kernel::vm::Asid(0)
+                            || t.asid == Some(caller_asid))
+                })
+                .map(|t| (t.thread_group_id.0, t.process_incarnation, caller))
+                .ok_or(KernelError::InvalidCapability)
+        })
+    }
+
+    /// VFS-CORRECT1C (NR 21, op 1) — how many threads of the process `(thread_group_id,
+    /// process_incarnation)` are still live (not exited, dead, faulted or a bare reservation).
+    /// 0 means the process is gone for good: an incarnation is never reused.
+    pub(crate) fn session_live_threads(
+        &self,
+        thread_group_id: u64,
+        process_incarnation: u64,
+    ) -> u64 {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .filter(|t| {
+                    t.thread_group_id.0 == thread_group_id
+                        && t.process_incarnation == process_incarnation
+                        && crate::kernel::task::session_thread_is_live(t.status)
+                })
+                .count() as u64
+        })
+    }
+
     /// Return the reply endpoint recorded in the `ReplyCapRecord` for `reply_cap`
     /// (resolved in the **current** task's cnode) without consuming or modifying the record.
     ///
