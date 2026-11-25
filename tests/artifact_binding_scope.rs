@@ -454,7 +454,9 @@ fn every_core_smoke_binds_its_artifacts_before_it_boots_them() {
         ),
         (
             RV_CORE,
-            "artifact_binding_check riscv64 \"$QEMU_SMOKE_STRICT\" \"$KERNEL_IMAGE\" \"$INITRAMFS_IMAGE\" ${ARTIFACT_REQUIRE:-} || exit 1",
+            // RISCV-STRICT1: the RISC-V smoke keeps the verified binding line, to derive the
+            // booted workload from it; a refusal still exits before anything boots (below).
+            "rv_binding_out=\"$(artifact_binding_check riscv64 \"$QEMU_SMOKE_STRICT\" \"$KERNEL_IMAGE\" \"$INITRAMFS_IMAGE\" ${ARTIFACT_REQUIRE:-})\" || rv_binding_rc=$?",
         ),
     ] {
         assert_eq!(src.matches(call).count(), 1, "{call}");
@@ -463,6 +465,11 @@ fn every_core_smoke_binds_its_artifacts_before_it_boots_them() {
             "bound before QEMU: {call}"
         );
     }
+    assert!(before(
+        RV_CORE,
+        "|| rv_binding_rc=$?\nprintf '%s\\n' \"$rv_binding_out\"\n(( rv_binding_rc == 0 )) || exit 1\n",
+        "-kernel \"$KERNEL_IMAGE\""
+    ));
     assert!(X86_CORE.contains("artifact_required+=(\"initramfs:timer-contract-witness\")"));
     assert!(X86_CORE.contains("timer contract witness absent"));
 }

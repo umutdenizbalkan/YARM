@@ -198310,7 +198310,11 @@ mod bl5b4_riscv_terminal_fault_service_obligation {
         assert!(SMOKE.contains("SpawnV5 call(s) in the terminal-fault cell"));
         assert!(SMOKE.contains("service-chain marker WITHOUT a spawn in the terminal-fault cell"));
         assert!(SMOKE.contains("rv_nr23_owed=0; rv_nr29_owed=0"));
-        assert!(SMOKE.contains("rv_nr23_owed=3; rv_nr29_owed=5"));
+        // RISCV-STRICT1: the ordinary image still owes three and five; only the bound fd-witness
+        // image owes one more NR 29 (its second ramfs).
+        assert!(SMOKE.contains("rv_nr23_owed=3; rv_nr29_owed=$((5 + rv_workload_nr29))"));
+        assert!(SMOKE.contains("core|vfs-mount-witness) rv_workload_nr29=0 ;;"));
+        assert!(SMOKE.contains("vfs-fd-witness) rv_workload_nr29=1 ;;"));
     }
 }
 

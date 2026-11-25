@@ -206,7 +206,31 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/artifact-binding.sh"
 # BUILD-GATES1: provenance is checked in every mode; a runner that built its own kernel names the
 # features it built it with (`ARTIFACT_REQUIRE="kernel=<features>"`).
 # shellcheck disable=SC2086
-artifact_binding_check riscv64 "$QEMU_SMOKE_STRICT" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" ${ARTIFACT_REQUIRE:-} || exit 1
+rv_binding_rc=0
+rv_binding_out="$(artifact_binding_check riscv64 "$QEMU_SMOKE_STRICT" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" ${ARTIFACT_REQUIRE:-})" || rv_binding_rc=$?
+printf '%s\n' "$rv_binding_out"
+(( rv_binding_rc == 0 )) || exit 1
+
+# RISCV-STRICT1: the obligations below are the obligations of the image THIS run bound. The
+# workload is derived from the verified binding's own features -- never from a caller's variable --
+# by scripts/riscv64-workload-obligations.py: `core` (every image but the two below, graded exactly
+# as before), `vfs-fd-witness` (one more NR 29 for the second ramfs, one NR 12 fork, two NR 16
+# exits, each tied to its own task) or `vfs-mount-witness` (init registers /ram through the
+# authorized path, so its positive evidence replaces the ordinary registration marker). A binding
+# whose kernel and initramfs disagree, or that carries both witnesses, is refused here.
+RV_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+rv_workload_out="$(python3 -I "$RV_SCRIPT_DIR/riscv64-workload-obligations.py" profile \
+  --binding "$(grep -m1 '^ARTIFACT_BINDING ' <<<"$rv_binding_out" || true)")" || {
+  printf '%s\n' "$rv_workload_out"
+  echo "[fail] RISCV-STRICT1: cannot derive the booted workload from the artifact binding"
+  exit 1
+}
+printf '%s\n' "$rv_workload_out"
+RISCV_WORKLOAD="${rv_workload_out##*profile=}"
+if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$RISCV_WORKLOAD" != "core" ]]; then
+  echo "[fail] RISCV-STRICT1: the terminal-fault cell cannot run the $RISCV_WORKLOAD image (init faults before either witness)"
+  exit 1
+fi
 
 LOGFILE=${LOGFILE:-qemu-riscv64-core.log}
 rm -f "$LOGFILE"
@@ -586,12 +610,40 @@ rv_is_service_chain() {
   for p in "${RISCV_SERVICE_CHAIN_PATTERNS[@]}"; do [[ "$p" == "$1" ]] && return 0; done
   return 1
 }
+riscv64_registration_obligation() {
+# RISCV-STRICT1 -- the /ram registration this image owes. Every image but the mount witness owes
+# init's ordinary registration marker, exactly as before. The mount witness's init registers /ram
+# ITSELF, through the authorized stage + commit (init/vfs_mount_witness.rs), so that marker is never
+# printed there; it owes the POSITIVE evidence of that path instead: exactly one /ram publication,
+# the VFS-local backend capability VFS received (not the sender's number) on every /ram/ forward,
+# and the exact 192-byte read -- the mount grader's own CORE, IDENTITY and BYTES rules. Adds to the
+# global `failures`.
+local log="$1" out rc=0
+if [[ "${RISCV_WORKLOAD:-core}" != "vfs-mount-witness" ]]; then
+  if ! rg -n -F "VFS_MOUNT_REGISTER_RAMFS_OK" "$log" >/dev/null 2>&1; then
+    echo "[fail] required marker missing: VFS_MOUNT_REGISTER_RAMFS_OK"
+    failures=$((failures + 1))
+  fi
+  return 0
+fi
+out="$(python3 -I "${RV_SCRIPT_DIR:-scripts}/riscv64-workload-obligations.py" mount "$log")" || rc=$?
+printf '%s\n' "$out"
+if (( rc != 0 )); then
+  echo "[fail] RISC-V mount-witness registration evidence is incomplete (the authorized /ram path)"
+  failures=$((failures + 1))
+fi
+}
+# END riscv64_registration_obligation
 for pat in "${REQUIRED_PATTERNS[@]}"; do
   if [[ "$riscv_service_chain_owed" == "0" ]] && rv_is_service_chain "$pat"; then
     if rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
       echo "[fail] service-chain marker WITHOUT a spawn in the terminal-fault cell: $pat"
       failures=$((failures + 1))
     fi
+    continue
+  fi
+  if [[ "$pat" == "VFS_MOUNT_REGISTER_RAMFS_OK" ]]; then
+    riscv64_registration_obligation "$LOGFILE"
     continue
   fi
   if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
@@ -934,10 +986,23 @@ fi
 # SpawnFromMemoryObject dispatches, and none where init faulted before it.
 # (Defaulted: this census also runs on its own, extracted, where no derivation preceded it; an
 # ordinary boot owes the full chain.)
+#
+# RISCV-STRICT1: and the census is the booted image's (`RISCV_WORKLOAD`, derived from the artifact
+# binding; `core` when unset). The fd witness's init spawns ONE more ramfs through NR 29, so it owes
+# six; which task that sixth spawn produced is checked below, with the witness's other extras.
+case "${RISCV_WORKLOAD:-core}" in
+  core|vfs-mount-witness) rv_workload_nr29=0 ;;
+  vfs-fd-witness) rv_workload_nr29=1 ;;
+  *)
+    echo "[fail] RISCV-STRICT1: unknown workload '${RISCV_WORKLOAD}'"
+    failures=$((failures + 1))
+    rv_workload_nr29=0
+    ;;
+esac
 if [[ "${riscv_service_chain_owed:-1}" == "0" ]]; then
   rv_nr23_owed=0; rv_nr29_owed=0
 else
-  rv_nr23_owed=3; rv_nr29_owed=5
+  rv_nr23_owed=3; rv_nr29_owed=$((5 + rv_workload_nr29))
 fi
 if (( riscv_split_nr23 != rv_nr23_owed )); then
   echo "[fail] RISC-V SpawnProcess split count is ${riscv_split_nr23}, expected ${rv_nr23_owed}"
@@ -999,8 +1064,31 @@ if (( riscv_split_nr0 != riscv_yield_committed || riscv_split_nr0_unpaired != 0 
   failures=$((failures + 1))
 fi
 echo "[info] RISC-V NR 0 (Yield) split dispatches: ${riscv_split_nr0}, each paired with its committed yield"
-if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr20 + riscv_split_nr5 + riscv_split_nr2 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 + riscv_split_nr0 )); then
-  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr20=${riscv_split_nr20} nr5=${riscv_split_nr5} nr2=${riscv_split_nr2} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29} nr0=${riscv_split_nr0})"
+# RISCV-STRICT1: the fd witness's workload owes three dispatches no other image does -- its fork
+# (NR 12, `result=ok` in init's own frame) and the exits of its second thread and its fork child
+# (NR 16, each a committed queue advance that never captures the exiting frame). They join the sum
+# ONLY for that image, and only once scripts/riscv64-workload-obligations.py has tied each one to
+# its own task, syscall and disposition (and the sixth NR 29 to the second ramfs): a total that is
+# merely right still fails. In every other image an NR 12 or NR 16 is outside the retired set, as
+# before.
+riscv_split_nr12=0
+riscv_split_nr16=0
+if [[ "${RISCV_WORKLOAD:-core}" == "vfs-fd-witness" ]]; then
+  riscv_split_nr12=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=12 " "$LOGFILE" 2>/dev/null || echo 0)
+  riscv_split_nr16=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=16 " "$LOGFILE" 2>/dev/null || echo 0)
+  riscv_split_nr12=${riscv_split_nr12:-0}
+  riscv_split_nr16=${riscv_split_nr16:-0}
+  rv_fd_rc=0
+  rv_fd_out="$(python3 -I "${RV_SCRIPT_DIR:-scripts}/riscv64-workload-obligations.py" fd "$LOGFILE")" || rv_fd_rc=$?
+  printf '%s\n' "$rv_fd_out"
+  if (( rv_fd_rc != 0 )); then
+    echo "[fail] RISC-V fd-witness workload is not reconciled: its extra spawn, fork and exits are not each its own task's (nr29=${riscv_split_nr29} nr12=${riscv_split_nr12} nr16=${riscv_split_nr16})"
+    failures=$((failures + 1))
+  fi
+fi
+echo "[info] RISCV-STRICT1: workload=${RISCV_WORKLOAD:-core} nr29_owed=${rv_nr29_owed} nr12=${riscv_split_nr12} nr16=${riscv_split_nr16}"
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr20 + riscv_split_nr5 + riscv_split_nr2 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 + riscv_split_nr0 + riscv_split_nr12 + riscv_split_nr16 )); then
+  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr20=${riscv_split_nr20} nr5=${riscv_split_nr5} nr2=${riscv_split_nr2} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29} nr0=${riscv_split_nr0} nr12=${riscv_split_nr12} nr16=${riscv_split_nr16} workload=${RISCV_WORKLOAD:-core})"
   failures=$((failures + 1))
 fi
 rm -f "$LOGFILE"

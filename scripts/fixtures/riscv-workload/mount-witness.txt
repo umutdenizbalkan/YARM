@@ -1,0 +1,202 @@
+# RISCV-STRICT1 workload fixture: vfs-mount-witness
+# source: IPC-D2-RULE1 run 2 (ccf582fe), wip/ipc-d2-rule1-evidence 3b209df1, ipc-d2-rule1/evidence/qual-2/W_1b_strict_smp2_riscv64/boot.log (strict SMP2 wide 1B witness)
+# source sha256: eaa8e416666c4e01a5ae542736572e46e4d4e5f5d0786caf1d2732a4900b16ae
+# selection: rv1-tools/extract_fixture.py (evidence branch); every kept line is verbatim, CR removed.
+# omitted: nr=2 dispatch lines after the first 40: 200 nr=5 dispatch lines after the first 40: 18018
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu=0 result=ok
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032836
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=1 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=23 cpu=0 result=ok
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10000 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=1 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=23 cpu=0 result=ok
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10001 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=1 captured=1 committed=0 a0=4295032833
+KSPAWN_ADMIN_EP_CREATED spawner_tid=3 send_cap=4295032851 recv_cap=4295032852
+KSPAWN_ADMIN_RECV_CAP_DELEGATED tid=10002 local_cap=4295032834
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=23 cpu=0 result=ok
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=10002 msg=VFS_MOUNT_TABLE_READY entries=2
+USER_LOG tid=10002 msg=VFS_MOUNT_ADMIN_RECV_CAP present=1 cap=4295032834
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032832
+USER_LOG tid=1 msg=INIT_VFS_ADMIN_CAP present=1 init_local=4295032845
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=1 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10000 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=25 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10000 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=3 msg=PM_VFS_GRANT_RO_RECEIVED image_id=7 len=40848 cap=4295032853
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10000 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+SPAWN_FROM_MO_ENTER image_id=7 mo_cap=4295032853 parent_pid=0
+SPAWN_FROM_MO_OK image_id=7 spawned_tid=10003
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 cpu=0 result=ok
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=10003 msg=DRIVER_MANAGER_ENTRY
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10003 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=1 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032833
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10000 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032833
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=25 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10000 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=3 msg=PM_VFS_GRANT_RO_RECEIVED image_id=8 len=55456 cap=4295032859
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032833
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10000 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+SPAWN_FROM_MO_ENTER image_id=8 mo_cap=4295032859 parent_pid=1
+SPAWN_FROM_MO_OK image_id=8 spawned_tid=10004
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 cpu=0 result=ok
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=3 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10004 captured=1 committed=0 a0=4295032832
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=1 captured=1 committed=0 a0=4295032833
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=25 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=3 msg=PM_VFS_GRANT_RO_RECEIVED image_id=9 len=29576 cap=4295032865
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+SPAWN_FROM_MO_ENTER image_id=9 mo_cap=4295032865 parent_pid=1
+SPAWN_FROM_MO_OK image_id=9 spawned_tid=10005
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 cpu=0 result=ok
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=1 cpu=0 result=post_work_committed finalized=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=22 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=4295032835
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=22 target=devfs send_cap=4295032836 reply_cap=4295032833 instance=2
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=22 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=25 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=3 msg=PM_VFS_GRANT_RO_RECEIVED image_id=11 len=82696 cap=4295032871
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+SPAWN_FROM_MO_ENTER image_id=11 mo_cap=4295032871 parent_pid=1
+SPAWN_FROM_MO_OK image_id=11 spawned_tid=10006
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 cpu=0 result=ok
+USER_LOG tid=1 msg=INIT_RAMFS_SPAWN_OK child_tid=10006 send_cap=4295098384 prefix=/ram
+USER_LOG tid=1 msg=VC1B_BEGIN admin_present=1 init_admin_cap=4295032845 init_ramfs_cap=4295098384
+USER_LOG tid=10002 msg=VFS_MOUNT_ADMIN_REFUSED op=register sender_tid=1 status=5 reason=numeric_cap_is_not_authority
+USER_LOG tid=1 msg=VC1B_CASE name=ordinary_register expect=5 status=5 reason=reply
+USER_LOG tid=10002 msg=VFS_MOUNT_ADMIN_REFUSED op=commit sender_tid=1 prefix=/ram status=6 retained_cap=0 retained_total=0 retained_overflow=0 handshake=None
+USER_LOG tid=1 msg=VC1B_CASE name=ordinary_commit expect=6 status=6 reason=reply
+USER_LOG tid=10002 msg=VFS_MOUNT_STAGE_RECEIVED sender_tid=1 prefix=/ram flags=8 vfs_local_cap=4295032842 sender_local_cap=4295098384
+USER_LOG tid=10002 msg=VFS_MOUNT_ADMIN_REFUSED op=commit sender_tid=1 prefix=/ram status=8 retained_cap=4295032842 retained_total=1 retained_overflow=0 handshake=None
+USER_LOG tid=1 msg=VC1B_CASE name=unsupported_flags expect=8 status=8 reason=reply
+USER_LOG tid=1 msg=VC1B_CASE name=stale_handle expect=stage_refused status=-1 reason=stage_refused cap=4295163920 applicable=1
+USER_LOG tid=1 msg=VC1B_CASE name=truncated_handle expect=stage_refused status=-1 reason=stage_refused cap=131088 applicable=1
+USER_LOG tid=10002 msg=VFS_MOUNT_STAGE_RECEIVED sender_tid=1 prefix=/initramfs flags=0 vfs_local_cap=4295032843 sender_local_cap=4295098384
+USER_LOG tid=10002 msg=VFS_MOUNT_ADMIN_REFUSED op=commit sender_tid=1 prefix=/initramfs status=1 retained_cap=4295032843 retained_total=2 retained_overflow=0 handshake=None
+USER_LOG tid=1 msg=VC1B_CASE name=duplicate expect=1 status=1 reason=reply
+USER_LOG tid=10002 msg=VFS_MOUNT_STAGE_RECEIVED sender_tid=1 prefix=/ram flags=0 vfs_local_cap=4295032844 sender_local_cap=4295098384
+USER_LOG tid=10002 msg=VFS_MOUNT_PUBLISHED prefix=/ram vfs_local_cap=4295032844 sender_local_cap=4295098384 entries=3
+USER_LOG tid=1 msg=VC1B_CASE name=authorized expect=0 status=0 reason=reply
+USER_LOG tid=1 msg=VC1B_IDENTITY init_local_backend=4295098384
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=/ram/ send_cap=4295032844 reply_cap=4295032833 instance=3
+USER_LOG tid=1 msg=VC1B_OPEN ok=1 fd=3
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=/ram/ send_cap=4295032844 reply_cap=4295032833 instance=3
+USER_LOG tid=1 msg=VC1B_READ k=0 size=200 n=104 off=0 bytes_ok=1 tail_ok=1
+USER_LOG tid=1 msg=VC1B_DATA k=0 off=0 hex=0b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186
+USER_LOG tid=1 msg=VC1B_DATA k=0 off=32 hex=abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc0126
+USER_LOG tid=1 msg=VC1B_DATA k=0 off=64 hex=4b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6
+USER_LOG tid=1 msg=VC1B_DATA k=0 off=96 hex=eb10355a7fa4c9ee
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=/ram/ send_cap=4295032844 reply_cap=4295032833 instance=3
+USER_LOG tid=1 msg=VC1B_READ k=1 size=200 n=88 off=104 bytes_ok=1 tail_ok=1
+USER_LOG tid=1 msg=VC1B_DATA k=1 off=104 hex=13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698e
+USER_LOG tid=1 msg=VC1B_DATA k=1 off=136 hex=b3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e
+USER_LOG tid=1 msg=VC1B_DATA k=1 off=168 hex=53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=/ram/ send_cap=4295032844 reply_cap=4295032833 instance=3
+USER_LOG tid=1 msg=VC1B_READ k=2 size=64 n=0 off=192 bytes_ok=1 tail_ok=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=/ram/ send_cap=4295032844 reply_cap=4295032833 instance=3
+USER_LOG tid=1 msg=VC1B_CLOSE ok=1 total=192
+USER_LOG tid=10002 msg=VFS_MOUNT_ADMIN_REFUSED op=register sender_tid=1 status=5 reason=numeric_cap_is_not_authority
+USER_LOG tid=1 msg=VC1B_CASE name=ordinary_register_after expect=5 status=5 reason=reply
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=/ram/ send_cap=4295032844 reply_cap=4295032833 instance=3
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=12 target=/ram/ send_cap=4295032844 reply_cap=4295032833 instance=3
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=/ram/ send_cap=4295032844 reply_cap=4295032833 instance=3
+USER_LOG tid=1 msg=VC1B_RECOVER ok=1
+USER_LOG tid=1 msg=VC1B_END fails=0 result=ok
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=10 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=25 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+USER_LOG tid=3 msg=PM_VFS_GRANT_RO_RECEIVED image_id=12 len=63216 cap=4295032877
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=11 target=initramfs send_cap=4295032835 reply_cap=4295032833 instance=1
+SPAWN_FROM_MO_ENTER image_id=12 mo_cap=4295032877 parent_pid=1
+SPAWN_FROM_MO_OK image_id=12 spawned_tid=10007
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 cpu=0 result=ok
+USER_LOG tid=1 msg=VFS_MOUNT_REGISTER_EXT4_BEGIN prefix=/ext4 init_local_backend=4295032849
+USER_LOG tid=10002 msg=VFS_MOUNT_STAGE_RECEIVED sender_tid=1 prefix=/ext4 flags=1 vfs_local_cap=4295032846 sender_local_cap=4295032849
+USER_LOG tid=10002 msg=VFS_MOUNT_PUBLISHED prefix=/ext4 vfs_local_cap=4295032846 sender_local_cap=4295032849 entries=4
+USER_LOG tid=1 msg=VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 cpu=0 result=queue_advance_committed outgoing=1 captured=1 committed=1 a0=1

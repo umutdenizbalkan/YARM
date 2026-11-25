@@ -15,3 +15,12 @@ the reply that carried it. Later VFS passes compare against the same bytes. Rege
 ```sh
 python3 -c "open('scripts/fixtures/vfs-fixture.bin','wb').write(bytes(((i*131+43)&0xFF) for i in range(300)))"
 ```
+
+# Hosted-test fixtures (never staged)
+
+These directories are read by hosted tests and scripts only; no build stages them into an image.
+
+| directory | read by | contents |
+|---|---|---|
+| `d2-publish-race/` | `scripts/check-d2-publish-race.py --self-test`, `tests/d2_publish_race_checker.rs` | IPC-D2-RULE1: verbatim extracts of the six archived split-route publish races |
+| `riscv-workload/` | `tests/riscv_split_census.rs` | RISCV-STRICT1: the lines the RISC-V core smoke's split census and `/ram` registration obligation read, from three archived strict SMP2 boots (default core, `wide` fd witness, `wide` 1B witness); provenance and sampling in each header |
