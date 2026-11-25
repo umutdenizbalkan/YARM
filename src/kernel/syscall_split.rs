@@ -6461,7 +6461,7 @@ fn try_split_dispatch_nonswitching_into_frame(
     // VFS-CORRECT1C: IpcCallerSession (NR 21) — born split, non-switching, read-only. Every
     // refusal is settled here, in the broad handler's order.
     if matches!(syscall, Syscall::IpcCallerSession) {
-        return try_split_ipc_caller_session_into_frame(shared, cpu, frame);
+        return try_split_caller_session_into_frame(shared, cpu, frame);
     }
 
     // U9-IPC-RESIDUAL2 §2: IpcCall (NR 6) is no longer serviced from here. It became a SWITCHING
@@ -7181,7 +7181,7 @@ fn try_split_clock_into_frame(
 
 /// VFS-CORRECT1C — NR 21 `IpcCallerSession` off the broad lock (`syscall::session`).
 #[cfg(not(feature = "hosted-dev"))]
-fn try_split_ipc_caller_session_into_frame(
+fn try_split_caller_session_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
@@ -7207,7 +7207,7 @@ fn try_split_ipc_caller_session_into_frame(
 
 /// Hosted-dev: NR 21 takes the broad path; its split owner is arch-neutral and tested directly.
 #[cfg(feature = "hosted-dev")]
-fn try_split_ipc_caller_session_into_frame(
+fn try_split_caller_session_into_frame(
     _shared: &SharedKernel,
     _cpu: CpuId,
     _frame: &mut TrapFrame,
@@ -11089,7 +11089,7 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // task-switches. `try_split_clock_into_frame` settles every refusal.
         Syscall::ClockGetTime | Syscall::ClockSetRealtime => Some(syscall),
         // VFS-CORRECT1C: NR 21 — split from birth; read-only, the caller never task-switches.
-        // `try_split_ipc_caller_session_into_frame` settles every refusal.
+        // `try_split_caller_session_into_frame` settles every refusal.
         Syscall::IpcCallerSession => Some(syscall),
         // U9-MO2 §4: CreateInitramfsFileSliceMo (NR 28) — the smallest live production class
         // still reaching a terminal broad acquisition. Its object is BORROWED initrd backing, so
@@ -12275,6 +12275,8 @@ mod tests {
                 // SCHED-TIME-FOUNDATION1 B: NR 18 / 19, split from birth.
                 || nr == crate::kernel::syscall::SYSCALL_CLOCK_GETTIME_NR
                 || nr == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
+                // VFS-CORRECT1C: NR 21 `IpcCallerSession`, split from birth.
+                || nr == crate::kernel::syscall::SYSCALL_IPC_CALLER_SESSION_NR
                 || nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
                 || nr == SYSCALL_SPAWN_PROCESS_NR

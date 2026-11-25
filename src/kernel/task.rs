@@ -1303,6 +1303,15 @@ impl ThreadControlBlock {
     }
 }
 
+/// VFS-CORRECT1C — does a thread in `status` still count toward its process's session (NR 21
+/// op 1)? Exited, dead, faulted and bare-reservation threads do not.
+pub(crate) const fn session_thread_is_live(status: TaskStatus) -> bool {
+    !matches!(
+        status,
+        TaskStatus::Exited(_) | TaskStatus::Dead | TaskStatus::Faulted | TaskStatus::Reserved
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1514,13 +1523,4 @@ mod tests {
 
         assert_eq!(tcb.thread_group_id, ThreadGroupId(70_000));
     }
-}
-
-/// VFS-CORRECT1C — does a thread in `status` still count toward its process's session (NR 21
-/// op 1)? Exited, dead, faulted and bare-reservation threads do not.
-pub(crate) const fn session_thread_is_live(status: TaskStatus) -> bool {
-    !matches!(
-        status,
-        TaskStatus::Exited(_) | TaskStatus::Dead | TaskStatus::Faulted | TaskStatus::Reserved
-    )
 }

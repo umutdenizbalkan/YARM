@@ -118580,6 +118580,9 @@ mod stage199d_riscv_canonical_admission {
             // SCHED-TIME-FOUNDATION1 C: NR 20 `ClockNanosleep`, the FutexWait family's second
             // switching member — NR 9's own park tail and deferral, so NR 9's drain finalizes it.
             "SYSCALL_CLOCK_NANOSLEEP_NR",
+            // VFS-CORRECT1C: NR 21 `IpcCallerSession`, admitted from birth (non-switching,
+            // NR 18's shape); without it the port would settle it as an unassigned number.
+            "SYSCALL_IPC_CALLER_SESSION_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -118592,8 +118595,8 @@ mod stage199d_riscv_canonical_admission {
         // is what stops a twenty-first arriving without its own justification.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            24,
-            "exactly twenty-three literal NRs (FUTEX-REQUEUE1 added FutexCmpRequeue, \
+            25,
+            "exactly twenty-four literal NRs (FUTEX-REQUEUE1 added FutexCmpRequeue, VFS-CORRECT1C IpcCallerSession, \
              SCHED-TIME-FOUNDATION1 ClockGetTime and ClockSetRealtime) plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, (U9-RECV-FINAL §1) IpcRecv, IpcSend, \
              (U9-MO2 §4) CreateInitramfsFileSliceMo, \
