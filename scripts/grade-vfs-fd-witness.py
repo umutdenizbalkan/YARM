@@ -43,10 +43,11 @@ Rules (each failure names its rule):
              has pending_retry=0 quarantined=0 unknown_backend_opens=0.
   WIDTH      (--wide only) every VFS_FORWARD_CALL send_cap and reply_cap exceeds 2^32 with a
              generation (id >> 16) above 65535.
-  RACE       every D2_PUBLISH_RACE_UNWIND (the split receive route's documented queue-publication
-             race, reachable here because the witness's thread and fork child run on CPU 1) names
-             VFS, is paired with D2_RECV_WAITER_RACE_UNWIND for VFS, and no
-             IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED appears.
+  RACE       no D2_PUBLISH_RACE_UNWIND, D2_RECV_WAITER_RACE_UNWIND or
+             IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED: the race pair is a stop-ship marker
+             (doc/AI_AGENT_RULES.md §14.3) and every core smoke rejects it. The failure names who
+             raced and whether each pair is complete, so a rejected boot says which receiver it
+             was.
   TRANSPORT  none of VFS_FORWARD_CALL_FAIL, VFS_BACKEND_COMPLETION_MALFORMED,
              VFS_CALLER_SESSION_FAIL, VFS_SESSION_UNKNOWN, VFS_SESSION_ALIVE_FAIL,
              VFS_OPEN_BACKEND_STATE_UNKNOWN, PM_VFS_CALL_FAIL, BOOT_FATAL.
@@ -369,9 +370,9 @@ def grade(log, core_rc, want_wide):
     races = tagged(log, "D2_PUBLISH_RACE_UNWIND")
     pairs = tagged(log, "D2_RECV_WAITER_RACE_UNWIND")
     facts["publish_race_unwinds"] = len(races)
-    if any(r.get("tid") != vfs_tid for r in races) or len(pairs) != len(races) \
-            or any(p.get("tid") != vfs_tid for p in pairs):
-        fail("RACE", f"race unwinds {[(r.get('tid')) for r in races]} pairs {[(p.get('tid')) for p in pairs]} (VFS {vfs_tid})")
+    if races or pairs:
+        fail("RACE", f"stop-ship: race unwinds tids {[r.get('tid') for r in races]} "
+                     f"pairs tids {[p.get('tid') for p in pairs]} (VFS {vfs_tid})")
     if any("IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED" in line for line in log):
         fail("RACE", "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED")
 
@@ -507,11 +508,10 @@ def self_test():
     for bad in FORBIDDEN:
         must_fail(good + [f"USER_LOG tid=10002 msg={bad} op=10"], "TRANSPORT", bad)
     race = ["D2_PUBLISH_RACE_UNWIND endpoint=split tid=10002", "D2_RECV_WAITER_RACE_UNWIND tid=10002"]
-    f, facts = grade(good + race, 0, True)
-    assert not f and facts["publish_race_unwinds"] == 1, f
+    must_fail(good + race, "RACE", "stop-ship")
     must_fail(good + race[:1], "RACE")
-    must_fail(good + [x.replace("10002", "10001") for x in race], "RACE")
-    must_fail(good + race + ["IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED tid=10002"], "RACE")
+    must_fail(good + race[1:], "RACE")
+    must_fail(good + ["IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED tid=10002"], "RACE")
     print("VFS_FD_WITNESS_GRADER_SELF_TEST result=ok")
 
 

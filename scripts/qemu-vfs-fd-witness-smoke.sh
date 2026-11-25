@@ -70,16 +70,15 @@ if (( fail )); then
 fi
 cp "$ROOTFS_INIT" "$LOGDIR/rootfs-init.bin" 2>/dev/null || true
 
-# Lines this witness produces on purpose, which the core smoke's generic blocker scan would flag:
-#  1. its one injected fault: VFS answers one OPENAT through a stale reply capability (the same
-#     slot, the next generation); the kernel refuses that reply pre-lock and VFS logs the refusal.
-#     grade-vfs-fd-witness.py requires each line exactly once.
-#  2. the split receive route's queue-publication race (doc/IPC.md §8.7): the witness's second
-#     thread and fork child run on CPU 1 and call VFS while VFS blocks on CPU 0, which no ordinary
-#     boot does (every client and server there is pinned to the bootstrap CPU). The route unwinds
-#     exactly and VFS's receive retries. The grader accounts for every occurrence (VFS only, each
-#     paired with its D2_RECV_WAITER_RACE_UNWIND, no IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED).
-INJECTED='IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=18446744073709551615 record_generation=18446744073709551615 replier_tid=[0-9]+ reason=reply_cap err=InvalidCapability reply_copies=0 caller_wakes=0$|VFS_CLIENT_REPLY_REFUSED reply_cap=[0-9]+ err=InvalidCapability$|D2_PUBLISH_RACE_UNWIND endpoint=split tid=[0-9]+$'
+# Lines this witness produces on purpose, which the AArch64 core smoke's generic blocker scan would
+# flag: its one injected fault. VFS answers one OPENAT through a stale reply capability (the same
+# slot, the next generation); the kernel refuses that reply pre-lock and VFS logs the refusal.
+# grade-vfs-fd-witness.py requires each line exactly once. Nothing else is passed: in particular
+# D2_PUBLISH_RACE_UNWIND stays a hard blocker of every core smoke (doc/AI_AGENT_RULES.md §14.3),
+# and the grader's RACE rule rejects it too. At SMP >= 2 the witness's second thread and fork
+# child can run on another CPU than VFS and reach the split receive route's queue-publication
+# race; such a boot fails, and the stage record reports it.
+INJECTED='IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=18446744073709551615 record_generation=18446744073709551615 replier_tid=[0-9]+ reason=reply_cap err=InvalidCapability reply_copies=0 caller_wakes=0$|VFS_CLIENT_REPLY_REFUSED reply_cap=[0-9]+ err=InvalidCapability$'
 note "booting QEMU -smp $SMP"
 env \
   KERNEL_IMAGE="$DEST" \

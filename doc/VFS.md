@@ -313,6 +313,13 @@ answered first through a stale reply capability), a second thread, and a fork ch
 holding two descriptors. Each ramfs seeds its files with bytes of its own TID and answers a STATX of
 `…/vc1c-stat` with its handle counts.
 
+The witness passes at SMP1 under the unmodified core smokes. At SMP2 its thread and fork child
+can run on another CPU while VFS blocks in its receive. They then reach the split receive route's
+queue-publication race (`doc/IPC.md` §8.7). The route unwinds exactly and the message is still
+received. But the `D2_PUBLISH_RACE_UNWIND` it logs is a stop-ship marker
+(`doc/AI_AGENT_RULES.md` §14.3), so every core smoke rejects that boot, and so does the
+grader's RACE rule. No exclusion admits it.
+
 **Limits.** Reclamation waits for the next request; a quarantined or unknown backend open stays
 open at the backend for its life; descriptors are not shared across processes (no fd passing, no
 `dup`); a late reply to a request VFS gave up on could still arrive on its backend reply endpoint
