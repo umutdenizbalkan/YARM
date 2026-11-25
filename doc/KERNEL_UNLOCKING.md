@@ -38182,3 +38182,178 @@ negative controls above.
 
 **Not run**, because no code changed: the qualification matrix (live fd witness, core smokes,
 1B witness, feature sweep).
+
+#### IPC-D2-RULE1 (from qualified `4b7b71e0`)
+
+This pass adopts the route-specific replacement for the `d2_publish_race_unwinds` rule that
+IPC-D2-PUBLISH1's brief (above, `9515a943`; evidence `a4cbcce4`) proposed, and qualifies it. It
+changes the rule, one checker, the smoke scripts, the source guards and the fd grader. No kernel or
+server code changes.
+
+**The rule** (`doc/AI_AGENT_RULES.md` §14.3, copied into `KERNEL_TEST_RULES.md` Stage 106 rule 1,
+this file §3 and §8, and `doc/IPC.md` §8.7):
+- **Broad route: stop-ship, always.** `D2_PUBLISH_RACE_UNWIND endpoint=<index>` is the serialized
+  arm (`KernelState::recv_block_unwind_race`), the only call of `note_d2_publish_race_unwind`.
+  The counter stays 0. A new source guard,
+  `d2rule1_broad_counter_has_one_increment_and_the_split_arm_none`, pins one increment, in that
+  arm, and none in the split lane.
+- **Split route: legal only when attributed one-to-one.** An `endpoint=split` race must:
+  - consume exactly one wait of the receiver's current receive;
+  - pair with exactly one `D2_RECV_WAITER_RACE_UNWIND`;
+  - have one unwind, `via=exact … priority=exact`, settling `queue_non_empty` / `restored` on the
+    receive's endpoint;
+  - deliver one record. That record is the receiver's first `IPC_RECV_REPLY_CAP_RESPONDER_BOUND`
+    after the settle and before its next wait or receive. Its (index, generation) must be queued
+    once as `IPCCALL_QUEUED_SPLIT_OK` on the same endpoint and bound once in the boot. No other
+    race may claim it.
+  - **Replies.** A call owes exactly one `resolution=commit` reply terminal. A second commit is a
+    defect, and a release with no commit is `unverified`. The requirement applies only to
+    operations that owe a reply.
+- **Orphans, both directions.** A companion with no race, and a `queue_non_empty` settle with no
+  race, are defects. So is a second publication that shares one recovery.
+- **Independent failures.** `IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED`, and displacement of a different
+  receiver (`old_tid≠new_tid`), fail with or without a race.
+- **Causal evidence only.** Cross-CPU links are record identities, never print order or
+  proximity. Each thread's own lines are in program order, because one printk sequence numbers
+  every record. A trace that cannot attribute a race is **unverified**, and unverified fails. The
+  causes are:
+  - a missing enqueue line;
+  - a message with no receive-side identity (a queued send or queued reply, which owe no reply);
+  - release-only;
+  - evidence missing under `PRINTK_RECORDS_LOST`.
+
+**One checker.** `scripts/check-d2-publish-race.py` prints a verdict of `ok`, `defect` or
+`unverified`, with exit 0, 1 or 2. These gates call it and fail on any verdict but `ok`, strict or
+not:
+- the three core smokes;
+- the x86_64 and AArch64 optional-fs smokes;
+- the fd grader's RACE rule, which loads the same module.
+
+No reject pattern names the marker any more. The source guards
+`stage114_smoke_scripts_still_reject_d2_race_unwind_marker` and the stage-115 smoke guard now
+require the checker. `tests/d2_publish_race_checker.rs` runs the self-test and replays the
+fixtures. The RISC-V capacity-rejection test runs the checker on three race lines and requires
+each to be rejected.
+
+**Controls** (`--self-test`, 62 cases):
+- **Retained.** IPC-D2-PUBLISH1's 33 controls, 11 per archived log: broad spelling; unpaired and
+  doubled pair; non-exact unwind; `unwound` settle; enqueue removed; delivery removed or doubled;
+  reply removed; fail-closed; block removed.
+- **New, per log:** an orphan companion, a duplicate publication sharing one recovery, and a
+  duplicate terminal commit.
+- **Synthetic, 20 cases.** Two interleaved calls to the same endpoint (records (3,50) and (5,60),
+  receiver 100, senders 201 and 202). Each case is built so that one call's evidence would satisfy
+  the other's check if the checker matched by proximity. The cases are:
+  - the legal pair (ok), each race bound to its own record;
+  - call 2's commit removed (call 1's must not answer it);
+  - race 2 delivering call 1's record;
+  - call 2 enqueued on another endpoint;
+  - call 2's enqueue removed (unverified);
+  - race 2 without its own wait;
+  - a duplicate publication sharing one recovery;
+  - an orphan companion and an orphan settle;
+  - a duplicate commit;
+  - a different receiver displaced (defect), and the receiver superseding itself (ok);
+  - a lone fail-closed receive;
+  - a broad race, and a race naming no route;
+  - release-only, and a queued send (unverified);
+  - a race with nothing queued;
+  - lost records (unverified);
+  - no race at all (ok).
+
+The fixtures, `scripts/fixtures/d2-publish-race/<port>.txt`, are verbatim extracts of the archived
+1C logs with their provenance and hashes.
+
+**Repairs found by qualification** (`ccf582fe`):
+- **Strict x86_64 witness boots.** Under `QEMU_SMOKE_STRICT=1` the x86_64 core smoke requires a
+  `timer-contract-witness` initramfs. The fd and mount witness scripts now add that feature for
+  strict x86_64 builds; run 1 refused every strict x86_64 witness at artifact binding.
+- **x86_64 core-smoke tick parse.** `printf … | head -n1` under `pipefail` exited 141 (SIGPIPE).
+  This was already true on `4b7b71e0`. A here-string replaces it; isolated, the old form gives rc
+  141 and the new one rc 0.
+
+**Qualification** (`wip/ipc-d2-rule1-evidence`; `predeclared.sha` hashes each run's inputs before it
+starts; nothing rerun in place).
+- Run 1 (`f6b2dce3`): superseded, disposition kept. It found the two repairs above.
+- Run 2 (`ccf582fe`, tree `29a4bfa8`): every step.
+
+| step | result |
+|---|---|
+| hosted | fmt; lib 6,792 passed, 0 failed, 3 ignored; `--tests` 44 binaries, 7,193 passed. Crates: `yarm-ipc-abi` 221, `yarm-user-rt` 155, `yarm-fs-servers` 600, `yarm-srv-common` 27, `yarm-kernel` 10, `yarm-control-plane-servers` 273 passed and 2 failed (`sup_l5b_…`, `sup_l6b_…`, the same two that fail on `4b7b71e0`). Subsets, each non-zero: `d2` 336, `direct` 341, `recv` 424, `sched` 326, `timeout` 203, `smoke` 69, `teardown` 46, `stage114` 34, `stage115` 23, `ipc_displace1` 19, `stage116` 18, `u9rx3` 10, `lock_order` 4, `d2rule1` 1; checker test 3, RISC-V rejection 12 |
+| self-tests | checker `cases=62 synthetic=20 fixtures=3`; fd, mount (24 mutants) and correct (19 mutants) graders |
+| gates | contract, doc enforcement, proc/VFS codec freeze, service arch boundary, service domain ownership, shell syntax |
+| checks | default kernel and servers, three targets |
+| replay of the six archived events | below |
+| gate controls, each port, non-strict | `legit` passes. `publish_race` fails at the core smoke on the checker's verdict. `failed_closed` fails at the core smoke (x86_64 and RISC-V on the checker; AArch64 on U9-RX4's fail-closed gate first). `no_unwind`, `dup_delivery`, `missing_delivery`, `renamed_failed_closed` and `renamed_settled` fail at the witness grader. Every fixture replayed exactly |
+| live, strict, SMP2 | below |
+| not run | a `--workspace` run; the historical matrix; the feature sweep (no feature-gated code changed); RT profiles |
+
+**Replay** (VFS-CORRECT1C run 3, `R_race_smp2_<port>`, evidence `35267905`; each log's hash
+matches that branch's manifest). The checker gives `ok` on every log and attributes every race as
+the brief's table does: the same lines, wait generations, records and senders:
+- x86_64: 3 races (56556, 56928, 57530);
+- AArch64: 1 race (106359);
+- RISC-V: 2 races (130220, 142091).
+
+All six are recovered. **The 1C verdicts are unchanged** and are copied verbatim under
+`replay/<port>/`:
+- **x86_64 and AArch64:** the fd grader, given 1C's original core-smoke rc, still fails CORE and
+  only CORE. Those core smokes rejected the marker.
+- **RISC-V:** it passes, because its non-strict 1C smoke exited 0.
+
+Given rc 0, every fd rule passes on all three logs.
+
+**Live, `QEMU_SMOKE_STRICT=1`, SMP2, run 2:**
+
+| port | step | rc | D2 verdict | races (recovered) | split parks CPU 0 / 1 | graders |
+|---|---|---|---|---|---|---|
+| x86_64 | default core smoke | 0 | ok | 0 | 677 / 0 | timer contract sealed |
+| x86_64 | fd witness a | 0 | ok | 0 — recovery **not** exercised | 1,620 / 7 | fd ok, correct ok |
+| x86_64 | fd witness b | 0 | ok | 2 (2) | 1,620 / 7 | fd ok, correct ok |
+| x86_64 | 1B witness | 0 | ok | 0 | 988 / 0 | mount ok, correct ok |
+| AArch64 | default core smoke | 0 | ok | 0 | 151 / 0 | |
+| AArch64 | fd witness a | 0 | ok | 3 (3) | 792 / 7 | fd ok, correct ok |
+| AArch64 | fd witness b | 0 | ok | 2 (2) | 784 / 7 | fd ok, correct ok |
+| AArch64 | 1B witness | 0 | ok | 0 | 283 / 0 | mount ok, correct ok |
+| RISC-V | default core smoke | 0 | ok | 0 | 13,597 / 0 | no printed failure |
+| RISC-V | fd witness a | **1** | ok | 3 (3) | 23,008 / 7 | fd and correct fail CORE only |
+| RISC-V | fd witness b | **1** | ok | 2 (2) | 21,871 / 7 | fd and correct fail CORE only |
+| RISC-V | 1B witness | **1** | ok | 0 | 18,298 / 0 | mount and correct fail CORE only |
+
+Not strict: the IPC-DISPLACE1 witness, `ok` on each port, with a D2 verdict of `ok` and 0 races,
+16 cross-CPU rounds and 1 CPU-1 park (x86_64, AArch64, RISC-V).
+
+Every race on every live boot is VFS (TID 10002) on CPU 0 receiving a CALL queued by a task on
+CPU 1. The senders are the fork child 10009 and the thread 10008. Each race is recovered:
+restored, delivered once and committed. No boot logged a broad-route race, a fail-closed receive
+or a displacement.
+
+**Open strict verdicts (RISC-V).** Each of the three failing steps fails only at the strict RISC-V core
+smoke. On each of those boots, the D2 verdict is `ok` and every fd, correct and mount rule passes.
+The printed `[fail]` lines are:
+- **fd witness a and b:**
+  - `RISC-V SpawnFromMemoryObject split count is 6, expected 5`. The extra spawn is the witness's
+    second ramfs.
+  - `RISC-V split-dispatch serviced a syscall outside the retired set`. The census omits the
+    witness's NR 12 (the fork) and NR 16 (the exits). On boot a the total is 23,039 and the listed
+    syscalls sum to 23,036, so 3 dispatches fall outside the set.
+- **1B witness:** `required marker missing: VFS_MOUNT_REGISTER_RAMFS_OK`. VFS-CORRECT1B's own
+  delivered RISC-V boots show the same failure.
+
+VFS-CORRECT1C recorded all three as advisory, because it ran them non-strict. None of them is a
+D2 check, and none changes under this pass. Fixing them would mean changing the RISC-V core smoke's
+census and marker requirements, which is outside this pass's scope.
+
+**Verdict.** RULE: **ADOPTED**, and qualified on x86_64 and AArch64. The checker accepts every
+archived and live recovery, and rejects every control. **Not delivered:** RISC-V's strict SMP2
+witness verdicts remain open for the reasons above. Those are census checks in the RISC-V core
+smoke that the witness workload trips. They are not the D2 rule, which grades `ok` on those same
+boots. Following the pass's instruction, dev stays at `4b7b71e0`. The work is on
+`wip/ipc-d2-rule1`.
+
+**Left outside.**
+- **The RISC-V census checks.** Whether the spawn count and retired-set checks should know the
+  witness profiles belongs to a pass that owns the RISC-V core smoke.
+- **VFS-LIFETIME1.** Queued, and not started.
+- **`scripts/qemu-x86_64-ap-generic-return-smoke.sh`.** It fails `bash -n` on `4b7b71e0` too.
+  The shell-syntax gate does not cover it, and it is untouched here.
