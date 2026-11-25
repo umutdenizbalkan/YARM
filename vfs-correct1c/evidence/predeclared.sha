@@ -1,0 +1,38 @@
+C=6e3b35649be443220f12cccb5f9428b9d29913f1 tree=4992f2c877bf2fd7c4ddb8bc27efc2f26621ca23 written=2026-11-25T02:35:18Z
+78f488546bff5e1f1b0a22207cb8e1eb1f714ccb4f7dfa5b202905a0f428fbed  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/vc1c_qual.sh
+0d41effc94db30f27fb245eb1ea86c950d1b4e75ea5846636b4cbab032626d25  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/feature_sweep.sh
+3639ab42c7f3dc7224b5a3684e2aafe4a91664ecbff88b88091327fae4128fb8  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc/nc.py
+60b50d89136294fb300798ce2ee6db37df1dcb6f8fee878b380b5185b002d226  scripts/grade-vfs-fd-witness.py
+35406263144c7faa71724d36dcb3e59a50f0235fd71dbe2a5ccde93608dfe125  scripts/grade-vfs-mount-witness.py
+310d5ef26b7ca7f1a28e3500bb81f3fc95dc9020057462cbcfc84f7dbfa1448a  scripts/grade-vfs-correct-witness.py
+e569c6956d54625c6ff25bb3b6c5ee5c138cb8c51a8100c211046e4b545cc891  scripts/qemu-vfs-fd-witness-smoke.sh
+23f7db43a1b3d88e32fd27f9d69022f5d41f639928d5ae206bbe0e1f0cb2d413  scripts/qemu-vfs-mount-witness-smoke.sh
+1a56e6460f9966304441583e063250e8e00d100ec6b77e11bdcffe346b0fbee4  scripts/qemu-aarch64-core-smoke.sh
+97056678793b338e860d6ebb2ffa74d2f86005ddf2415958836ba0626e00f008  scripts/fixtures/vfs-fixture.bin
+run 2: C=23e78dea3d818e1fc182d5ffbf38f52206b50882 tree=b9325c8331c504dd7c3488fca5b22beae1790d06 written=2026-11-25T02:46:30Z; inputs re-hashed:
+78f488546bff5e1f1b0a22207cb8e1eb1f714ccb4f7dfa5b202905a0f428fbed  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/vc1c_qual.sh
+0d41effc94db30f27fb245eb1ea86c950d1b4e75ea5846636b4cbab032626d25  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/feature_sweep.sh
+3639ab42c7f3dc7224b5a3684e2aafe4a91664ecbff88b88091327fae4128fb8  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc/nc.py
+60b50d89136294fb300798ce2ee6db37df1dcb6f8fee878b380b5185b002d226  scripts/grade-vfs-fd-witness.py
+35406263144c7faa71724d36dcb3e59a50f0235fd71dbe2a5ccde93608dfe125  scripts/grade-vfs-mount-witness.py
+310d5ef26b7ca7f1a28e3500bb81f3fc95dc9020057462cbcfc84f7dbfa1448a  scripts/grade-vfs-correct-witness.py
+e569c6956d54625c6ff25bb3b6c5ee5c138cb8c51a8100c211046e4b545cc891  scripts/qemu-vfs-fd-witness-smoke.sh
+23f7db43a1b3d88e32fd27f9d69022f5d41f639928d5ae206bbe0e1f0cb2d413  scripts/qemu-vfs-mount-witness-smoke.sh
+1a56e6460f9966304441583e063250e8e00d100ec6b77e11bdcffe346b0fbee4  scripts/qemu-aarch64-core-smoke.sh
+97056678793b338e860d6ebb2ffa74d2f86005ddf2415958836ba0626e00f008  scripts/fixtures/vfs-fixture.bin
+run 3: C=d9becda16831ea0b58d70ce924a4c28855440f67 tree=5c4a84d6a6210d46c5a3b5e3c46fe19fec98e51c written=2026-11-25T04:57:19Z; fd witness predeclared at SMP1 (W_fd_*_smp1_*, NCL_* at SMP1); R_race_smp2_<port> are FINDING steps (rc recorded as it falls; rc=1 expected when the race occurs; never a pass); inputs re-hashed:
+88340f635a6da5a7be621d2df497c747b8f32b53327b88d7d81cf7c55f33b682  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/vc1c_qual.sh
+0d41effc94db30f27fb245eb1ea86c950d1b4e75ea5846636b4cbab032626d25  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/feature_sweep.sh
+3639ab42c7f3dc7224b5a3684e2aafe4a91664ecbff88b88091327fae4128fb8  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc/nc.py
+06a83a5084f123b8b6fa55ec3cd706fc6e11b123faf4c565a408023145abc2f4  scripts/grade-vfs-fd-witness.py
+35406263144c7faa71724d36dcb3e59a50f0235fd71dbe2a5ccde93608dfe125  scripts/grade-vfs-mount-witness.py
+310d5ef26b7ca7f1a28e3500bb81f3fc95dc9020057462cbcfc84f7dbfa1448a  scripts/grade-vfs-correct-witness.py
+213ef7beb644405bb063f1652f2873f03eaa1fc3db69a7a61724c8f24e990903  scripts/qemu-vfs-fd-witness-smoke.sh
+23f7db43a1b3d88e32fd27f9d69022f5d41f639928d5ae206bbe0e1f0cb2d413  scripts/qemu-vfs-mount-witness-smoke.sh
+cbbfc9890027fd3959b36c2945697eeb129a73907ac88c6e37b81a11e1a3faee  scripts/qemu-aarch64-core-smoke.sh
+a4fea550e36e54418dae7c32d289084bbb593661482a80629179b634374a4e6e  scripts/qemu-x86_64-core-smoke.sh
+3c6acbddd4ad6181082c4ea0eaf73a30756983e239eeded5e339f5d62e3c1b0d  scripts/qemu-riscv64-core-smoke.sh
+97056678793b338e860d6ebb2ffa74d2f86005ddf2415958836ba0626e00f008  scripts/fixtures/vfs-fixture.bin
+run 4: C=76c74efbaf7b275a86d2c6dcdddd445da894e333 tree=3ac5677c3ad55e1044abebe0d6b536316b834fc0 written=2026-11-25T08:51:19Z; test-only commit after run 3; steps: hosted H1/H2/H3/H5 nr21, ncK (must fail), artifact identity of every run-3 live image (must all match); inputs:
+c0709f4f118537bba39c417edd8fbff86f30e19c801fd8b6601f27bfaeee4106  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/vc1c_qual4.sh
+3639ab42c7f3dc7224b5a3684e2aafe4a91664ecbff88b88091327fae4128fb8  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc/nc.py

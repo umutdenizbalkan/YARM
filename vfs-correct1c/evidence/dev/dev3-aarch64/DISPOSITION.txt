@@ -1,0 +1,1 @@
+dev3: all but FORK pass on the grader (and CANON's label mapping, a grader fix). Fork child used the parent's cap numbers, which are invalid in its fresh CNode (IPCCALL_DIRECT_REFUSED_PRE_LOCK send_cap=... err=InvalidCapability, which is also why the core smoke failed). Fixed in the cell: the child maps its caps by rank.

@@ -1,0 +1,2 @@
+[ok] checked 23 service binaries for arch/kernel/syscall boundary violations
+[ok] service/kernel architecture boundary checks passed

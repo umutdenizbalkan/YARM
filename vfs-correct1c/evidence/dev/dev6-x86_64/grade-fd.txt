@@ -1,0 +1,2 @@
+FAIL CORE: expected one VC1C_BEGIN and one seal, saw 1/0
+VFS_FD_WITNESS_SEAL arch=x86_64 smp=2 wide=1 result=fail fails=1

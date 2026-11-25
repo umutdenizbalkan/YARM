@@ -1,0 +1,123 @@
+nc ncR_no_rollback_close: applied
+diff --git a/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs b/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs
+index 6a5bf068..5ef6954e 100644
+--- a/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs
++++ b/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs
+@@ -590,7 +590,7 @@ impl Router {
+         }
+         // The client was not told: nothing may keep the backend handle.
+         let closed = match self.fds.close(session, fd) {
+-            Ok(Some(c)) => {
++            Ok(Some(c)) if false => {
+                 let r = self.backend_close(io, mounts, c);
+                 self.fds.close_settled(c, r.outcome);
+                 Some(r.outcome)
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1670:5
+     |
+1670 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1669:5
+     |
+1669 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+
+running 24 tests
+........ 8/24
+control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle --- FAILED
+... 12/24
+control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend --- FAILED
+..... 18/24
+control_plane::vfs::router::tests::vc1c_rollback_close_not_delivered_is_retried_at_the_same_instance --- FAILED
+.....
+failures:
+
+---- control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle' (10822) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:623:5:
+assertion `left == right` failed: the rollback closed the handle the backend opened
+  left: 1
+ right: 0
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:447:23
+   3: core::panicking::assert_failed::<usize, usize>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle
+             at ./src/control_plane/vfs/router_tests.rs:623:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:609:62
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend' (10826) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:656:5:
+assertion `left == right` failed
+  left: 1
+ right: 0
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<usize, usize>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend
+             at ./src/control_plane/vfs/router_tests.rs:656:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:640:62
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_rollback_close_not_delivered_is_retried_at_the_same_instance stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_rollback_close_not_delivered_is_retried_at_the_same_instance' (10832) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:681:5:
+assertion `left == right` failed
+  left: (0, 1, 0)
+ right: (0, 0, 1)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<(usize, usize, usize), (usize, usize, usize)>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_rollback_close_not_delivered_is_retried_at_the_same_instance
+             at ./src/control_plane/vfs/router_tests.rs:681:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_rollback_close_not_delivered_is_retried_at_the_same_instance::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:661:71
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_rollback_close_not_delivered_is_retried_at_the_same_instance::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle
+    control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend
+    control_plane::vfs::router::tests::vc1c_rollback_close_not_delivered_is_retried_at_the_same_instance
+
+test result: FAILED. 21 passed; 3 failed; 0 ignored; 0 measured; 251 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p yarm-control-plane-servers --lib`

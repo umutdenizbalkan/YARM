@@ -1,0 +1,23 @@
+ARTIFACT_BINDING arch=aarch64 kernel=build-aarch64/yarm-aarch64.bin kernel_sha256=e98374dbdf3bae643877a4dcb26fab0d4bfd6355f188293081ea9cd9b15f932a kernel_features=cap-gen-witness,vfs-correct-witness,vfs-fd-witness kernel_resolved_features=cap-gen-witness,vfs-correct-witness,vfs-fd-witness kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc-wt/NC_live_ncH_handle_as_fd_aarch64/target/aarch64-yarm-none/aarch64-none/kernel_boot:fresh=0 initramfs=build-aarch64/initramfs-core.cpio initramfs_sha256=6870585385e9d13de8e67fd6647a3a2580d48af28dd2dcb95de5ec47f672a5b4 initramfs_features=cap-gen-witness,vfs-correct-witness,vfs-fd-witness initramfs_compile_env=none source=dirty:5c4a84d6a6210d46c5a3b5e3c46fe19fec98e51c:61ef8fbd0328cbeae72388b2 required=kernel=cap-gen-witness,vfs-correct-witness,vfs-fd-witness,initramfs=cap-gen-witness,vfs-correct-witness,vfs-fd-witness result=ok
+[info] qemu command: qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024M -smp 1 -nographic -monitor none -serial stdio -kernel build-aarch64/yarm-aarch64.bin -initrd build-aarch64/initramfs-core.cpio
+[info] aarch64 core: completion condition: idle
+[err] aarch64 core: terminal idle marker never observed within 180s (hang?)
+[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell
+[ok] U9-RX4: PM decodes the lifecycle query
+[ok] U9-RX4: PM replies successfully
+[ok] U9-RX4: terminal-outcome evaluator self-test passed (8 accepted, 27 rejected)
+[ok] U9-RX4: REPLY won the terminal of record_index=0 record_generation=1 (queued route, cap 4295032834) — commit=1 resume=1 one-shot revoked, no timeout win
+[ok] U9-RX4: no reply cap is lost to the u32::MAX sentinel
+[ok] U9-RX4: PM never fails to decode
+[ok] U9-RX4: no writeback rollback on the witnessed path
+[ok] U9-RX4: the reply cap is never used twice
+[ok] U9-RX4: no cap materialization failure
+[ok] U9-RX4: the blocking IpcRecv route publishes and defers (n=1800)
+[ok] U9-RX4: the broad dispatcher is skipped for a published block (n=5356)
+[ok] U9-RX4: the existing D2-recv drain resumes a replacement (n=24)
+[ok] U9-RX4: no fail-closed settlement on the blocking route
+[ok] U9-RX4: AArch64 queued-plain reply-cap + framing witness chain complete
+[error] BAD / BOOT BLOCKERS found:
+9677:USER_LOG tid=3 msg=PM_ELF_ZC_REQUIRED_FAIL image_id=7 err=Malformed
+9697:USER_LOG tid=3 msg=BOOT_FATAL_ZC_ELF_LOAD_FAILED image_id=7 err=Malformed
+9717:USER_LOG tid=3 msg=PM_VFS_SPAWN_FAIL image_id=7 err=Malformed

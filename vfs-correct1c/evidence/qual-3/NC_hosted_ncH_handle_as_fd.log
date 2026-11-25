@@ -1,0 +1,446 @@
+nc ncH_handle_as_fd: applied
+diff --git a/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs b/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs
+index 6a5bf068..3ecdb5f3 100644
+--- a/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs
++++ b/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs
+@@ -583,7 +583,7 @@ impl Router {
+         } else {
+             reply_cap
+         };
+-        let reply = completion(VfsCompletion::ok(VFS_OP_OPENAT, fd, 0), &[], None);
++        let reply = completion(VfsCompletion::ok(VFS_OP_OPENAT, handle, 0), &[], None);
+         if io.reply_client(target_cap, &reply) {
+             self.log_state("open");
+             return;
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1670:5
+     |
+1670 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1669:5
+     |
+1669 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+
+running 24 tests
+control_plane::vfs::router::tests::vc1c_ambiguous_close_is_quarantined_and_never_retried --- FAILED
+control_plane::vfs::router::tests::vc1c_backend_completion_is_validated_against_the_forwarded_handle --- FAILED
+control_plane::vfs::router::tests::vc1c_backend_refusal_releases_the_reservation --- FAILED
+control_plane::vfs::router::tests::vc1c_backend_refused_close_still_releases_the_descriptor --- FAILED
+control_plane::vfs::router::tests::vc1c_backend_restart_never_addresses_the_new_backends_reused_handle --- FAILED
+control_plane::vfs::router::tests::vc1c_bad_fd_and_double_close_are_not_forwarded --- FAILED
+control_plane::vfs::router::tests::vc1c_dirfd_is_not_forwarded --- FAILED
+control_plane::vfs::router::tests::vc1c_exited_session_is_reclaimed_live_one_is_not --- FAILED
+control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle --- FAILED
+control_plane::vfs::router::tests::vc1c_file_grant_ro_translates_the_fd_and_keeps_the_capability --- FAILED
+control_plane::vfs::router::tests::vc1c_full_session_refuses_no_fd_without_opening_at_the_backend --- FAILED
+.... 15/24
+control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on --- FAILED
+... 19/24
+control_plane::vfs::router::tests::vc1c_separate_sessions_same_number_resolve_only_their_own_file --- FAILED
+control_plane::vfs::router::tests::vc1c_threads_of_one_session_share_descriptors --- FAILED
+control_plane::vfs::router::tests::vc1c_two_backends_same_handle_two_fds_right_bytes_close_one_keep_other --- FAILED
+..
+failures:
+
+---- control_plane::vfs::router::tests::vc1c_ambiguous_close_is_quarantined_and_never_retried stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_ambiguous_close_is_quarantined_and_never_retried' (9696) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:697:5:
+assertion `left == right` failed
+  left: Err(4)
+ right: Err(5)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<core::result::Result<(), u32>, core::result::Result<(), u32>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_ambiguous_close_is_quarantined_and_never_retried
+             at ./src/control_plane/vfs/router_tests.rs:697:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_ambiguous_close_is_quarantined_and_never_retried::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:693:59
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_ambiguous_close_is_quarantined_and_never_retried::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_backend_completion_is_validated_against_the_forwarded_handle stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_backend_completion_is_validated_against_the_forwarded_handle' (9697) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:453:5:
+assertion `left == right` failed
+  left: Err(4)
+ right: Err(10)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<core::result::Result<alloc::vec::Vec<u8>, u32>, core::result::Result<alloc::vec::Vec<u8>, u32>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_completion_is_validated_against_the_forwarded_handle
+             at ./src/control_plane/vfs/router_tests.rs:453:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_completion_is_validated_against_the_forwarded_handle::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:449:71
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_completion_is_validated_against_the_forwarded_handle::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_backend_refusal_releases_the_reservation stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_backend_refusal_releases_the_reservation' (9698) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:605:5:
+assertion `left == right` failed
+  left: Ok(100)
+ right: Ok(3)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<core::result::Result<u64, u32>, core::result::Result<u64, u32>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_refusal_releases_the_reservation
+             at ./src/control_plane/vfs/router_tests.rs:605:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_refusal_releases_the_reservation::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:597:51
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_refusal_releases_the_reservation::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_backend_refused_close_still_releases_the_descriptor stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_backend_refused_close_still_releases_the_descriptor' (9699) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:730:5:
+assertion `left == right` failed
+  left: Err(4)
+ right: Err(5)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<core::result::Result<(), u32>, core::result::Result<(), u32>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_refused_close_still_releases_the_descriptor
+             at ./src/control_plane/vfs/router_tests.rs:730:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_refused_close_still_releases_the_descriptor::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:726:62
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_refused_close_still_releases_the_descriptor::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_backend_restart_never_addresses_the_new_backends_reused_handle stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_backend_restart_never_addresses_the_new_backends_reused_handle' (9700) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:817:5:
+assertion `left != right` failed
+  left: 100
+ right: 100
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<u64, u64>
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_restart_never_addresses_the_new_backends_reused_handle
+             at ./src/control_plane/vfs/router_tests.rs:817:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_restart_never_addresses_the_new_backends_reused_handle::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:804:73
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_backend_restart_never_addresses_the_new_backends_reused_handle::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_bad_fd_and_double_close_are_not_forwarded stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_bad_fd_and_double_close_are_not_forwarded' (9701) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:515:21:
+called `Result::unwrap()` on an `Err` value: 4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed::unwrap_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/result.rs:1874:9
+   3: core::result::unwrap_failed::<u32>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1876:5
+   4: <core::result::Result<(), u32>>::unwrap
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_bad_fd_and_double_close_are_not_forwarded
+             at ./src/control_plane/vfs/router_tests.rs:515:21
+   6: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_bad_fd_and_double_close_are_not_forwarded::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:510:52
+   7: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_bad_fd_and_double_close_are_not_forwarded::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_dirfd_is_not_forwarded stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_dirfd_is_not_forwarded' (9702) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:882:34:
+called `Result::unwrap()` on an `Err` value: 4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed::unwrap_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/result.rs:1874:9
+   3: core::result::unwrap_failed::<u32>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1876:5
+   4: <core::result::Result<alloc::vec::Vec<u8>, u32>>::unwrap
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_dirfd_is_not_forwarded
+             at ./src/control_plane/vfs/router_tests.rs:882:34
+   6: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_dirfd_is_not_forwarded::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:876:33
+   7: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_dirfd_is_not_forwarded::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_exited_session_is_reclaimed_live_one_is_not stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_exited_session_is_reclaimed_live_one_is_not' (9703) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:796:36:
+called `Result::unwrap()` on an `Err` value: 4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed::unwrap_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/result.rs:1874:9
+   3: core::result::unwrap_failed::<u32>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1876:5
+   4: <core::result::Result<alloc::vec::Vec<u8>, u32>>::unwrap
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_exited_session_is_reclaimed_live_one_is_not
+             at ./src/control_plane/vfs/router_tests.rs:796:36
+   6: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_exited_session_is_reclaimed_live_one_is_not::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:782:54
+   7: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_exited_session_is_reclaimed_live_one_is_not::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle' (9704) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:636:34:
+called `Result::unwrap()` on an `Err` value: 4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed::unwrap_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/result.rs:1874:9
+   3: core::result::unwrap_failed::<u32>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1876:5
+   4: <core::result::Result<alloc::vec::Vec<u8>, u32>>::unwrap
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle
+             at ./src/control_plane/vfs/router_tests.rs:636:34
+   6: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:609:62
+   7: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_file_grant_ro_translates_the_fd_and_keeps_the_capability stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_file_grant_ro_translates_the_fd_and_keeps_the_capability' (9705) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:472:5:
+assertion `left == right` failed
+  left: (25, 4, 0, 100)
+ right: (25, 0, 200, 100)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<(u16, u32, u64, u64), (u16, u32, u64, u64)>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_file_grant_ro_translates_the_fd_and_keeps_the_capability
+             at ./src/control_plane/vfs/router_tests.rs:472:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_file_grant_ro_translates_the_fd_and_keeps_the_capability::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:461:67
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_file_grant_ro_translates_the_fd_and_keeps_the_capability::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_full_session_refuses_no_fd_without_opening_at_the_backend stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_full_session_refuses_no_fd_without_opening_at_the_backend' (9706) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:563:25:
+called `Result::unwrap()` on an `Err` value: 4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed::unwrap_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/result.rs:1874:9
+   3: core::result::unwrap_failed::<u32>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1876:5
+   4: <core::result::Result<(), u32>>::unwrap
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_full_session_refuses_no_fd_without_opening_at_the_backend
+             at ./src/control_plane/vfs/router_tests.rs:563:25
+   6: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_full_session_refuses_no_fd_without_opening_at_the_backend::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:546:68
+   7: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_full_session_refuses_no_fd_without_opening_at_the_backend::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on' (9711) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:867:25:
+called `Result::unwrap()` on an `Err` value: 4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed::unwrap_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/result.rs:1874:9
+   3: core::result::unwrap_failed::<u32>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1876:5
+   4: <core::result::Result<(), u32>>::unwrap
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on
+             at ./src/control_plane/vfs/router_tests.rs:867:25
+   6: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:846:67
+   7: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_separate_sessions_same_number_resolve_only_their_own_file stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_separate_sessions_same_number_resolve_only_their_own_file' (9715) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:762:34:
+called `Result::unwrap()` on an `Err` value: 4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed::unwrap_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/result.rs:1874:9
+   3: core::result::unwrap_failed::<u32>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1876:5
+   4: <core::result::Result<alloc::vec::Vec<u8>, u32>>::unwrap
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_separate_sessions_same_number_resolve_only_their_own_file
+             at ./src/control_plane/vfs/router_tests.rs:762:34
+   6: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_separate_sessions_same_number_resolve_only_their_own_file::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:757:68
+   7: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_separate_sessions_same_number_resolve_only_their_own_file::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_threads_of_one_session_share_descriptors stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_threads_of_one_session_share_descriptors' (9716) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:751:41:
+called `Result::unwrap()` on an `Err` value: 4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed::unwrap_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/result.rs:1874:9
+   3: core::result::unwrap_failed::<u32>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1876:5
+   4: <core::result::Result<alloc::vec::Vec<u8>, u32>>::unwrap
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_threads_of_one_session_share_descriptors
+             at ./src/control_plane/vfs/router_tests.rs:751:41
+   6: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_threads_of_one_session_share_descriptors::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:738:51
+   7: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_threads_of_one_session_share_descriptors::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_two_backends_same_handle_two_fds_right_bytes_close_one_keep_other stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_two_backends_same_handle_two_fds_right_bytes_close_one_keep_other' (9717) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:419:5:
+assertion `left != right` failed: two open files, two client fds
+  left: 100
+ right: 100
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:447:23
+   3: core::panicking::assert_failed::<u64, u64>
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_two_backends_same_handle_two_fds_right_bytes_close_one_keep_other
+             at ./src/control_plane/vfs/router_tests.rs:419:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_two_backends_same_handle_two_fds_right_bytes_close_one_keep_other::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:398:76
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_two_backends_same_handle_two_fds_right_bytes_close_one_keep_other::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    control_plane::vfs::router::tests::vc1c_ambiguous_close_is_quarantined_and_never_retried
+    control_plane::vfs::router::tests::vc1c_backend_completion_is_validated_against_the_forwarded_handle
+    control_plane::vfs::router::tests::vc1c_backend_refusal_releases_the_reservation
+    control_plane::vfs::router::tests::vc1c_backend_refused_close_still_releases_the_descriptor
+    control_plane::vfs::router::tests::vc1c_backend_restart_never_addresses_the_new_backends_reused_handle
+    control_plane::vfs::router::tests::vc1c_bad_fd_and_double_close_are_not_forwarded
+    control_plane::vfs::router::tests::vc1c_dirfd_is_not_forwarded
+    control_plane::vfs::router::tests::vc1c_exited_session_is_reclaimed_live_one_is_not
+    control_plane::vfs::router::tests::vc1c_failed_client_reply_closes_the_exact_backend_handle
+    control_plane::vfs::router::tests::vc1c_file_grant_ro_translates_the_fd_and_keeps_the_capability
+    control_plane::vfs::router::tests::vc1c_full_session_refuses_no_fd_without_opening_at_the_backend
+    control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on
+    control_plane::vfs::router::tests::vc1c_separate_sessions_same_number_resolve_only_their_own_file
+    control_plane::vfs::router::tests::vc1c_threads_of_one_session_share_descriptors
+    control_plane::vfs::router::tests::vc1c_two_backends_same_handle_two_fds_right_bytes_close_one_keep_other
+
+test result: FAILED. 9 passed; 15 failed; 0 ignored; 0 measured; 251 filtered out; finished in 0.14s
+
+error: test failed, to rerun pass `-p yarm-control-plane-servers --lib`

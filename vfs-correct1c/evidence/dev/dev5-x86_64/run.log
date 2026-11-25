@@ -1,0 +1,2 @@
+[vfs-fd-witness] building x86_64 artifacts with cap-gen-witness,vfs-correct-witness,vfs-fd-witness
+[vfs-fd-witness] booting QEMU -smp 2

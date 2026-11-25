@@ -1,0 +1,5 @@
+d3e0c556dcbe299353443758705c2e3b1b9bf4a389948a960cf02b554439b770  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/W_1b_wide_x86_64/boot.log
+62a773fce85848c40e915a6677d99fa2d26c5519043d83e5f6b354758346f010  build-x86_64/kernel_boot.elf
+71d717608dd2283536ea96e1b7d6d0e3a23824aa2ac93569f3b6de59e709f7ef  build-x86_64/initramfs-core.cpio
+f77894fdeaafbebdfe62725f22f9ce08d1bac24f6f6213907307d43c5926d5eb  build-x86_64/rootfs/init
+97056678793b338e860d6ebb2ffa74d2f86005ddf2415958836ba0626e00f008  scripts/fixtures/vfs-fixture.bin

@@ -1,0 +1,8 @@
+rg: src/services/network: No such file or directory (os error 2)
+rg: src/services/ui: No such file or directory (os error 2)
+rg: src/services/control_plane: No such file or directory (os error 2)
+rg: src/services/compatibility: No such file or directory (os error 2)
+rg: src/services/fs: No such file or directory (os error 2)
+rg: src/services/network: No such file or directory (os error 2)
+rg: src/services/drivers: No such file or directory (os error 2)
+[ok] service domain ownership checks passed

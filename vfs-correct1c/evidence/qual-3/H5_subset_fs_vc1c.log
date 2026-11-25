@@ -1,0 +1,153 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1670:5
+     |
+1670 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1669:5
+     |
+1669 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `super::shared_io_lifecycle::VfsSharedIoLifecycleError`
+   --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:713:13
+    |
+713 |         use super::shared_io_lifecycle::VfsSharedIoLifecycleError;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `super::*`
+    --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:2291:9
+     |
+2291 |     use super::*;
+     |         ^^^^^^^^
+
+warning: unused import: `super::*`
+    --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:2544:9
+     |
+2544 |     use super::*;
+     |         ^^^^^^^^
+
+warning: unused import: `DEV_NULL_PATH_PTR`
+  --> crates/yarm-fs-servers/src/fs/devfs/service.rs:13:42
+   |
+13 | use super::nodes::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR};
+   |                                          ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `statx_inline_message`
+    --> crates/yarm-fs-servers/src/lib.rs:1207:72
+     |
+1207 |         ReadWriteRequest, VfsBackend, VfsError, openat_inline_message, statx_inline_message,
+     |                                                                        ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `INITRAMFS_BLKCACHE_PATH`, `INITRAMFS_DRIVER_MANAGER_PATH`, and `INITRAMFS_VIRTIO_BLK_PATH`
+    --> crates/yarm-fs-servers/src/lib.rs:1213:9
+     |
+1213 |         INITRAMFS_BLKCACHE_PATH, INITRAMFS_DRIVER_MANAGER_PATH, INITRAMFS_EXT4_SRV_PATH,
+     |         ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1214 |         INITRAMFS_FAT_SRV_PATH, INITRAMFS_RAMFS_SRV_PATH, INITRAMFS_VIRTIO_BLK_PATH,
+     |                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::fs::common::vfs_service::VfsService`
+    --> crates/yarm-fs-servers/src/lib.rs:2071:9
+     |
+2071 |     use crate::fs::common::vfs_service::VfsService;
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+    --> crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs:1920:17
+     |
+1920 |         let mut backing = vec![0u8; 64];
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs:1931:17
+     |
+1931 |         let mut backing = vec![0u8; 64];
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:3778:17
+     |
+3778 |         let mut backing = vec![0u8; 4096];
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:3843:17
+     |
+3843 |         let mut backing = vec![0u8; 16];
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:3869:17
+     |
+3869 |         let mut backing = vec![0u8; 64];
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:3881:17
+     |
+3881 |         let mut backing = vec![0u8; 64];
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:3893:17
+     |
+3893 |         let mut backing = vec![0u8; 64];
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:4643:17
+     |
+4643 |         let mut backing = vec![0u8; 4096];
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/yarm-fs-servers/src/fs/common/vfs_service.rs:4748:17
+     |
+4748 |         let mut backing = vec![0u8; 4096];
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `svc`
+    --> crates/yarm-fs-servers/src/lib.rs:1082:13
+     |
+1082 |         let svc = service_from_startup_config(FatStartupConfig::hosted_sample())
+     |             ^^^ help: if this is intentional, prefix it with an underscore: `_svc`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `off`
+    --> crates/yarm-fs-servers/src/lib.rs:1327:19
+     |
+1327 |             .map(|off| {
+     |                   ^^^ help: if this is intentional, prefix it with an underscore: `_off`
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 589 filtered out; finished in 0.00s
+

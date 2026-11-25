@@ -1,0 +1,3 @@
+FAIL CORE: core smoke rc=1
+FAIL CORE: expected one VC1C_BEGIN and one seal, saw 0/0
+VFS_FD_WITNESS_SEAL arch=aarch64 smp=1 wide=1 result=fail fails=2

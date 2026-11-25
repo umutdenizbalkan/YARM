@@ -1,0 +1,38 @@
+vc1c qual qual-4 start 2026-11-25T08:51:20Z C=76c74efbaf7b275a86d2c6dcdddd445da894e333 runner=c0709f4f118537bb
+candidate tree 3ac5677c3ad55e1044abebe0d6b536316b834fc0; diff vs run-3 C3: src/kernel/boot/tests.rs 
+=== H1_fmt [76c74efbaf7b porcelain=0]: cargo fmt --all -- --check (start 08:51:20)
+H1_fmt rc=0 secs=7 free=12G
+=== H2_hosted_lib [76c74efbaf7b porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 08:51:27)
+H2_hosted_lib rc=0 secs=175 free=12G
+=== H3_integration [76c74efbaf7b porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 08:54:22)
+H3_integration rc=0 secs=277 free=12G
+=== H5_subset_root_vc1c_nr21 [76c74efbaf7b porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 vc1c_nr21 (start 08:58:59)
+H5_subset_root_vc1c_nr21 rc=0 secs=0 free=12G
+=== NC_hosted_ncK_split_names_tid [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc-wt/NC_hosted_ncK_split_names_tid at 76c74efbaf7b] (start 08:59:00)
+NC_hosted_ncK_split_names_tid rc=101 secs=86 mutated_files=src/kernel/syscall/session.rs 
+=== A_build_default_x86_64 [76c74efbaf7b porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 09:00:26)
+A_build_default_x86_64 rc=0 secs=90 free=12G
+IDENTITY default x86_64 kernel c4=68bf124cd709d000aa5414f1b8b5cd8cb193f67a7abbe343d2a2c2a2122924df run3=68bf124cd709d000aa5414f1b8b5cd8cb193f67a7abbe343d2a2c2a2122924df same=1 initramfs c4=4201f76d13cd4d843bf7a64260ae971cb7f64a115841fc26334b404a0e2a9d41 run3=4201f76d13cd4d843bf7a64260ae971cb7f64a115841fc26334b404a0e2a9d41 same=1
+=== A_build_fdwide_x86_64 [76c74efbaf7b porcelain=0]: env -u CARGO_TARGET_DIR BOOTSTRAP_FEATURE_ARGS=--no-default-features --features cap-gen-witness,vfs-correct-witness,vfs-fd-witness scripts/build-qemu-x86_64-artifacts.sh (start 09:01:56)
+A_build_fdwide_x86_64 rc=0 secs=41 free=12G
+IDENTITY fdwide x86_64 build-x86_64/kernel_boot.elf c4=152f06a95a94371589683fcc92ed3612bd54d20b2e4149d90529f2d7a6a5f91e run3=152f06a95a94371589683fcc92ed3612bd54d20b2e4149d90529f2d7a6a5f91e same=1
+IDENTITY fdwide x86_64 build-x86_64/initramfs-core.cpio c4=c42ab80faa5f02b1ab13d7ae6cedaa2bf1036604e324f4fb495a77a9cba35e3b run3=c42ab80faa5f02b1ab13d7ae6cedaa2bf1036604e324f4fb495a77a9cba35e3b same=1
+IDENTITY fdwide x86_64 build-x86_64/rootfs/init c4=ea6a7b2f0da17497cd129f71bc46bcf0b8df1271701ab00e8d8fe38b404b0988 run3=ea6a7b2f0da17497cd129f71bc46bcf0b8df1271701ab00e8d8fe38b404b0988 same=1
+=== A_build_default_aarch64 [76c74efbaf7b porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 09:02:37)
+A_build_default_aarch64 rc=0 secs=91 free=12G
+IDENTITY default aarch64 kernel c4=df158632db8a006948c9ac9aa9664360ae62062d0aca1ade4f6cd2c8723bd65e run3=df158632db8a006948c9ac9aa9664360ae62062d0aca1ade4f6cd2c8723bd65e same=1 initramfs c4=fa7a9572bcecc6411bd757de702c8a224becf4cc78497c15bbf8f70fc967cc9b run3=fa7a9572bcecc6411bd757de702c8a224becf4cc78497c15bbf8f70fc967cc9b same=1
+=== A_build_fdwide_aarch64 [76c74efbaf7b porcelain=0]: env -u CARGO_TARGET_DIR BOOTSTRAP_FEATURE_ARGS=--no-default-features --features cap-gen-witness,vfs-correct-witness,vfs-fd-witness scripts/build-qemu-aarch64-artifacts.sh (start 09:04:08)
+A_build_fdwide_aarch64 rc=0 secs=36 free=12G
+IDENTITY fdwide aarch64 build-aarch64/yarm-aarch64.bin c4=e98374dbdf3bae643877a4dcb26fab0d4bfd6355f188293081ea9cd9b15f932a run3=e98374dbdf3bae643877a4dcb26fab0d4bfd6355f188293081ea9cd9b15f932a same=1
+IDENTITY fdwide aarch64 build-aarch64/initramfs-core.cpio c4=ffbf6cf2c7496d8c8cdcd65b39043bac7d764475858afeda7f1827a4e1582b03 run3=ffbf6cf2c7496d8c8cdcd65b39043bac7d764475858afeda7f1827a4e1582b03 same=1
+IDENTITY fdwide aarch64 build-aarch64/rootfs/init c4=20b5069f4b22b91f61b7a2196b9d3086c5e1bed87164ab91f2860878c504cff8 run3=20b5069f4b22b91f61b7a2196b9d3086c5e1bed87164ab91f2860878c504cff8 same=1
+=== A_build_default_riscv64 [76c74efbaf7b porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 09:04:45)
+A_build_default_riscv64 rc=0 secs=75 free=12G
+IDENTITY default riscv64 kernel c4=625638cf044db39bda9f4ddb991da41f9084db1f9c6c8679565034fad14f0159 run3=625638cf044db39bda9f4ddb991da41f9084db1f9c6c8679565034fad14f0159 same=1 initramfs c4=6d43a68095e98718339b01e39670a3bfbae1b954117204acac1ab6f04cdfbd89 run3=6d43a68095e98718339b01e39670a3bfbae1b954117204acac1ab6f04cdfbd89 same=1
+=== A_build_fdwide_riscv64 [76c74efbaf7b porcelain=0]: env -u CARGO_TARGET_DIR BOOTSTRAP_FEATURE_ARGS=--no-default-features --features cap-gen-witness,vfs-correct-witness,vfs-fd-witness scripts/build-qemu-riscv64-artifacts.sh (start 09:06:00)
+A_build_fdwide_riscv64 rc=0 secs=35 free=12G
+IDENTITY fdwide riscv64 build-riscv64/yarm-riscv64.bin c4=fd80133a5cad3263a3d3d2057ae00b0073db25bc75cacb734e33cebab990cbb7 run3=fd80133a5cad3263a3d3d2057ae00b0073db25bc75cacb734e33cebab990cbb7 same=1
+IDENTITY fdwide riscv64 build-riscv64/initramfs-core.cpio c4=3c06afafd0658825ac3469b6518dcb48635b0ad18ed33847b20ac3c8b6547a88 run3=3c06afafd0658825ac3469b6518dcb48635b0ad18ed33847b20ac3c8b6547a88 same=1
+IDENTITY fdwide riscv64 build-riscv64/rootfs/init c4=76a1193ec05715e2eac639f180147e12ad8fa477a0773f91f3084c6cfceb721d run3=76a1193ec05715e2eac639f180147e12ad8fa477a0773f91f3084c6cfceb721d same=1
+vc1c qual qual-4 end 2026-11-25T09:06:35Z
+VC1C_QUAL_DONE

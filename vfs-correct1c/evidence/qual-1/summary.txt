@@ -1,0 +1,62 @@
+vc1c qual qual-1 start 2026-11-25T02:35:18Z C=6e3b35649be443220f12cccb5f9428b9d29913f1 B=fbc8ff49 FROM=H1 runner=78f488546bff5e1f nc=3639ab42c7f3dc72
+candidate tree 4992f2c877bf2fd7c4ddb8bc27efc2f26621ca23
+=== H1_fmt [6e3b35649be4 porcelain=0]: cargo fmt --all -- --check (start 02:35:18)
+H1_fmt rc=0 secs=6 free=14G
+=== H2_hosted_lib [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 02:35:24)
+H2_hosted_lib rc=101 secs=121 free=13G
+=== H3_integration [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 02:37:25)
+H3_integration rc=101 secs=231 free=13G
+=== H4_crate_yarm-ipc-abi [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-ipc-abi --lib -- --test-threads=1 (start 02:41:16)
+H4_crate_yarm-ipc-abi rc=0 secs=0 free=13G
+=== H4_crate_yarm-user-rt [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-user-rt --lib -- --test-threads=1 (start 02:41:16)
+H4_crate_yarm-user-rt rc=0 secs=2 free=13G
+=== H4_crate_yarm-fs-servers [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 (start 02:41:18)
+H4_crate_yarm-fs-servers rc=0 secs=7 free=13G
+=== H4_crate_yarm-srv-common [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-srv-common --lib -- --test-threads=1 (start 02:41:25)
+H4_crate_yarm-srv-common rc=0 secs=0 free=13G
+=== H4_crate_yarm-kernel [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-kernel --lib -- --test-threads=1 (start 02:41:25)
+H4_crate_yarm-kernel rc=0 secs=0 free=13G
+=== H4_crate_yarm-control-plane-servers [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-control-plane-servers --lib -- --test-threads=1 (start 02:41:25)
+H4_crate_yarm-control-plane-servers rc=101 secs=8 free=13G
+=== H5_subset_cp_vc1c [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-control-plane-servers --lib -- --test-threads=1 vc1c (start 02:41:33)
+H5_subset_cp_vc1c rc=0 secs=0 free=13G
+=== H5_subset_fs_vc1c [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 vc1c (start 02:41:33)
+H5_subset_fs_vc1c rc=0 secs=0 free=13G
+=== H5_subset_root_vc1c_nr21 [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 vc1c_nr21 (start 02:41:33)
+H5_subset_root_vc1c_nr21 rc=0 secs=0 free=13G
+=== H5_subset_root_syscall_abi [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 syscall_abi (start 02:41:33)
+H5_subset_root_syscall_abi rc=0 secs=0 free=13G
+=== H5_subset_root_variant_count [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 variant_count (start 02:41:33)
+H5_subset_root_variant_count rc=0 secs=0 free=13G
+=== H5_subset_root_spawn_ledger [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u9spawn (start 02:41:33)
+H5_subset_root_spawn_ledger rc=101 secs=6 free=13G
+=== H5_subset_root_fork [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 fork (start 02:41:39)
+H5_subset_root_fork rc=0 secs=2 free=13G
+=== H5_subset_root_lock_order [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 lock_order (start 02:41:41)
+H5_subset_root_lock_order rc=0 secs=0 free=13G
+=== H5_subset_fs_vc1b [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 vc1b (start 02:41:41)
+H5_subset_fs_vc1b rc=0 secs=0 free=13G
+=== H5_subset_fs_vc1a [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 vc1a (start 02:41:41)
+H5_subset_fs_vc1a rc=0 secs=0 free=13G
+=== H6_grader_self_test_fd [6e3b35649be4 porcelain=0]: python3 -I scripts/grade-vfs-fd-witness.py --self-test (start 02:41:41)
+H6_grader_self_test_fd rc=0 secs=1 free=13G
+=== H6_grader_self_test_mount [6e3b35649be4 porcelain=0]: python3 -I scripts/grade-vfs-mount-witness.py --self-test (start 02:41:42)
+H6_grader_self_test_mount rc=0 secs=0 free=13G
+=== H6_grader_self_test_correct [6e3b35649be4 porcelain=0]: python3 -I scripts/grade-vfs-correct-witness.py --self-test (start 02:41:42)
+H6_grader_self_test_correct rc=0 secs=0 free=13G
+=== G1_contract_gate [6e3b35649be4 porcelain=0]: bash scripts/check-current-contracts.sh (start 02:41:42)
+G1_contract_gate rc=0 secs=0 free=13G
+=== G2_doc_enforcement [6e3b35649be4 porcelain=0]: bash scripts/check-contract-doc-enforcement.sh (start 02:41:42)
+G2_doc_enforcement rc=0 secs=1 free=13G
+=== G3_proc_vfs_codec_freeze [6e3b35649be4 porcelain=0]: bash scripts/check-proc-vfs-codec-freeze.sh (start 02:41:43)
+G3_proc_vfs_codec_freeze rc=0 secs=0 free=13G
+=== G4_service_arch_boundary [6e3b35649be4 porcelain=0]: bash scripts/check-service-arch-boundary.sh (start 02:41:43)
+G4_service_arch_boundary rc=0 secs=0 free=13G
+=== G5_service_domain_ownership [6e3b35649be4 porcelain=0]: bash scripts/check-service-domain-ownership.sh (start 02:41:43)
+G5_service_domain_ownership rc=0 secs=0 free=13G
+=== G6_arch_boundary_baseline_scan_width [6e3b35649be4 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-wt && awk '/#\[cfg\(test\)\]/{exit} {print}' crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs | wc -l; cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-wt && awk 'prev ~ /#\[cfg\((all\()?test/ && /^mod [a-z_]*tests/ {exit} {print; prev=$0}' crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs | wc -l (start 02:41:43)
+G6_arch_boundary_baseline_scan_width rc=0 secs=1 free=13G
+=== X_check_default_kernel_x86_64 [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/x86_64-yarm-none.json -p yarm --bin kernel_boot (start 02:41:44)
+X_check_default_kernel_x86_64 rc=0 secs=7 free=13G
+=== X_check_genwitness_kernel_x86_64 [6e3b35649be4 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/x86_64-yarm-none.json --features cap-gen-witness -p yarm --bin kernel_boot (start 02:41:51)
+=== DISPOSITION (written after stopping the runner, 2026-11-25): run 1 on 6e3b3564 stopped during X_check by hand. H2/H3 failed 6 kernel source guards the candidate tripped (a function name containing `try_split_ipc_call`; the RISC-V whitelist literal count; the stage-29 exhaustive whitelist; a production fn after task.rs's test module); H5_subset_root_spawn_ledger is the last of those. H4 control-plane failed only the 2 known sup_l5b / sup_l6b tests. Fixed in the next commit; run 2 qualifies that commit from the start. Nothing here is reused.

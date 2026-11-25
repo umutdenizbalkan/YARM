@@ -1,0 +1,27 @@
+[vfs-correct-witness][fail] CORE: core smoke rc=1
+[vfs-correct-witness][fail] CORE: expected one VC1A_BEGIN and one VC1A_END, saw 0/0
+[vfs-correct-witness][fail] READS: expected 6 reads, saw 0
+[vfs-correct-witness][fail] READS: read 0: 0 lines
+[vfs-correct-witness][fail] READS: read 1: 0 lines
+[vfs-correct-witness][fail] READS: read 2: 0 lines
+[vfs-correct-witness][fail] READS: read 3: 0 lines
+[vfs-correct-witness][fail] READS: read 4: 0 lines
+[vfs-correct-witness][fail] READS: read 5: 0 lines
+[vfs-correct-witness][fail] BYTES: wrong destination bytes: differ from the fixture at offset 0 (0 read, fixture 300)
+[vfs-correct-witness][fail] EOF: eof 0 (size 50): []
+[vfs-correct-witness][fail] EOF: eof 1 (size 0): []
+[vfs-correct-witness][fail] EOF: eof 2 (size 32): []
+[vfs-correct-witness][fail] EOF: STATX: []
+[vfs-correct-witness][fail] CLOSE: []
+[vfs-correct-witness][fail] ERRORS: read_after_close: expected status 4, got []
+[vfs-correct-witness][fail] ERRORS: missing_path: expected status 2, got []
+[vfs-correct-witness][fail] ERRORS: no_mount: expected status 3, got []
+[vfs-correct-witness][fail] ERRORS: bad_fd: expected status 4, got []
+[vfs-correct-witness][fail] ERRORS: an error left the destination modified
+[vfs-correct-witness][fail] ERRORS: a valid request did not work after the errors
+[vfs-correct-witness][fail] INIT: []
+[vfs-correct-witness][fail] GRANT: no PM_VFS_GRANT_RO_RECEIVED for image 7
+[vfs-correct-witness][fail] GRANT: PM_SPAWN_FROM_MO_DONE image_id=7: 0
+[vfs-correct-witness][fail] TRANSPORT: 1 PM_ELF_ZC_FAIL line(s): USER_LOG tid=3 msg=PM_ELF_ZC_FAIL image_id=7 reason=grant_ro_status status=4 has_cap=0
+[vfs-correct-witness][fail] TRANSPORT: 1 BOOT_FATAL line(s): USER_LOG tid=3 msg=BOOT_FATAL_ZC_ELF_LOAD_FAILED image_id=7 err=Malformed
+VFS_CORRECT_WITNESS_SEAL arch=aarch64 smp=1 result=fail bytes=0 grants=0 nr29_spawns=0

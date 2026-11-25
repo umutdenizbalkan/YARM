@@ -1,0 +1,22 @@
+ARTIFACT_BINDING arch=aarch64 kernel=build-aarch64/yarm-aarch64.bin kernel_sha256=6ea471f0d7720c621079c2f3fb7e1e4cfa51b3f77f75fa14b9a91882a63be004 kernel_features=cap-gen-witness,vfs-correct-witness,vfs-fd-witness kernel_resolved_features=cap-gen-witness,vfs-correct-witness,vfs-fd-witness kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-wt/target/aarch64-yarm-none/aarch64-none/kernel_boot:fresh=1 initramfs=build-aarch64/initramfs-core.cpio initramfs_sha256=63c5b1014a30ac67f4e7fc62c88719db7601fd09e246ae54a3c78f5eab6d9a0f initramfs_features=cap-gen-witness,vfs-correct-witness,vfs-fd-witness initramfs_compile_env=none source=dirty:05fc5c57806cdd0801ba959ef75f6b0b7f8bfbc3:812e0c07f94b7df3572d6298 required=kernel=cap-gen-witness,vfs-correct-witness,vfs-fd-witness,initramfs=cap-gen-witness,vfs-correct-witness,vfs-fd-witness result=ok
+[info] qemu command: qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024M -smp 2 -nographic -monitor none -serial stdio -kernel build-aarch64/yarm-aarch64.bin -initrd build-aarch64/initramfs-core.cpio
+[info] aarch64 core: completion condition: idle
+[ok] aarch64 core: terminal idle (VC1C_FD_WITNESS_SEAL) reached — QEMU stopped intentionally
+[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell
+[ok] U9-RX4: PM decodes the lifecycle query
+[ok] U9-RX4: PM replies successfully
+[ok] U9-RX4: terminal-outcome evaluator self-test passed (8 accepted, 27 rejected)
+[ok] U9-RX4: REPLY won the terminal of record_index=0 record_generation=1 (queued route, cap 4295032834) — commit=1 resume=1 one-shot revoked, no timeout win
+[ok] U9-RX4: no reply cap is lost to the u32::MAX sentinel
+[ok] U9-RX4: PM never fails to decode
+[ok] U9-RX4: no writeback rollback on the witnessed path
+[ok] U9-RX4: the reply cap is never used twice
+[ok] U9-RX4: no cap materialization failure
+[ok] U9-RX4: the blocking IpcRecv route publishes and defers (n=826)
+[ok] U9-RX4: the broad dispatcher is skipped for a published block (n=3020)
+[ok] U9-RX4: the existing D2-recv drain resumes a replacement (n=766)
+[ok] U9-RX4: no fail-closed settlement on the blocking route
+[ok] U9-RX4: AArch64 queued-plain reply-cap + framing witness chain complete
+[error] BAD / BOOT BLOCKERS found:
+194857:D2_PUBLISH_RACE_UNWIND endpoint=split tid=10002
+195529:D2_PUBLISH_RACE_UNWIND endpoint=split tid=10002

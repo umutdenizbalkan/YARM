@@ -1,0 +1,1 @@
+dev5-x86_64: interrupted by a worker restart (no rc). Before that: collision..failreply all ok; the spawned thread faulted (USER_INSTRUCTION_FAULT at a movaps in vfs_openat: entered with rsp 16-aligned, the x86_64 ABI wants rsp = 8 mod 16) and init spun on yields. Fixed in the cell (x86 stack top - 8; bounded sleep wait) before dev6.

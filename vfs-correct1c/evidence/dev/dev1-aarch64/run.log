@@ -1,0 +1,5 @@
+[vfs-fd-witness] building aarch64 artifacts with cap-gen-witness,vfs-correct-witness,vfs-fd-witness
+[vfs-fd-witness] booting QEMU -smp 2
+python3: can't open file '/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-wt/scripts/grade-vfs-fd-witness.py': [Errno 2] No such file or directory
+VFS_FD_WITNESS_SMOKE arch=aarch64 smp=2 profile=wide result=fail reason=grader_self_test:scripts/grade-vfs-fd-witness.py
+rc=1

@@ -1,0 +1,19 @@
+[vfs-fd-witness] building x86_64 artifacts with cap-gen-witness,vfs-correct-witness,vfs-fd-witness
+[vfs-fd-witness] booting QEMU -smp 2
+fact init_tid=1
+fact ramfs_a=10006
+fact ramfs_b=10007
+fact backend_handle_a=105
+fact backend_handle_b=105
+fact client_fd_a=3
+fact client_fd_b=4
+fact instance_a=3
+fact instance_b=4
+fact fork_child=10009
+fact vfs_state_end={'descriptors': '0', 'ofds': '0', 'sessions': '0'}
+fact publish_race_unwinds=1
+FAIL CORE: core smoke rc=1
+VFS_FD_WITNESS_SEAL arch=x86_64 smp=2 wide=1 result=fail fails=1
+[vfs-correct-witness][fail] CORE: core smoke rc=1
+VFS_CORRECT_WITNESS_SEAL arch=x86_64 smp=2 result=fail bytes=300 grants=6 late_service_tid=10003 nr29_spawns=6
+VFS_FD_WITNESS_SMOKE arch=x86_64 smp=2 profile=wide result=fail fd_rc=1 correct_rc=1

@@ -1,0 +1,167 @@
+nc ncP_original_spelling: applied
+diff --git a/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs b/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs
+index 6a5bf068..7bf0493c 100644
+--- a/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs
++++ b/crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs
+@@ -446,7 +446,7 @@ impl Router {
+             dirfd: 0,
+             flags: args.flags,
+             mask_or_buf: args.mask_or_buf,
+-            path: norm.as_bytes(),
++            path: args.path,
+         }
+         .encode()
+         .expect("a canonical path is never longer than the one decoded");
+@@ -521,7 +521,7 @@ impl Router {
+             dirfd: 0,
+             flags: args.flags,
+             mode: args.mode,
+-            path: norm.as_bytes(),
++            path: args.path,
+         }
+         .encode()
+         .expect("a canonical path is never longer than the one decoded");
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1670:5
+     |
+1670 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1669:5
+     |
+1669 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `norm`
+   --> crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs:434:14
+    |
+434 |         let (norm, backend, label) =
+    |              ^^^^ help: if this is intentional, prefix it with an underscore: `_norm`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+
+running 24 tests
+............ 12/24
+control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend --- FAILED
+. 14/24
+control_plane::vfs::router::tests::vc1c_mount_component_boundaries --- FAILED
+control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on --- FAILED
+....... 23/24
+control_plane::vfs::router::tests::vc1c_wire_limit_is_respected --- FAILED
+
+failures:
+
+---- control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend' (10265) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:654:5:
+assertion `left == right` failed
+  left: (2, 0)
+ right: (5, 0)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<(u32, u64), (u32, u64)>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend
+             at ./src/control_plane/vfs/router_tests.rs:654:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:640:62
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_mount_component_boundaries stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_mount_component_boundaries' (10267) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:894:5:
+assertion `left == right` failed
+  left: Err(2)
+ right: Ok(0)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<core::result::Result<u64, u32>, core::result::Result<u64, u32>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_mount_component_boundaries
+             at ./src/control_plane/vfs/router_tests.rs:894:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_mount_component_boundaries::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:886:37
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_mount_component_boundaries::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on' (10268) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:856:59:
+called `Result::unwrap()` on an `Err` value: 2
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed::unwrap_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/result.rs:1874:9
+   3: core::result::unwrap_failed::<u32>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1876:5
+   4: <core::result::Result<u64, u32>>::unwrap
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on
+             at ./src/control_plane/vfs/router_tests.rs:856:59
+   6: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:846:67
+   7: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::vfs::router::tests::vc1c_wire_limit_is_respected stdout ----
+
+thread 'control_plane::vfs::router::tests::vc1c_wire_limit_is_respected' (10276) panicked at crates/yarm-control-plane-servers/src/control_plane/vfs/router_tests.rs:920:5:
+assertion `left == right` failed
+  left: Err(2)
+ right: Ok(200)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:452:17
+   3: core::panicking::assert_failed::<core::result::Result<u64, u32>, core::result::Result<u64, u32>>
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panicking.rs:407:5
+   4: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_wire_limit_is_respected
+             at ./src/control_plane/vfs/router_tests.rs:920:5
+   5: yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_wire_limit_is_respected::{closure#0}
+             at ./src/control_plane/vfs/router_tests.rs:910:34
+   6: <yarm_control_plane_servers::control_plane::vfs::router::tests::vc1c_wire_limit_is_respected::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    control_plane::vfs::router::tests::vc1c_injected_fail_reply_rolls_back_then_answers_backend
+    control_plane::vfs::router::tests::vc1c_mount_component_boundaries
+    control_plane::vfs::router::tests::vc1c_open_and_statx_forward_the_canonical_path_they_routed_on
+    control_plane::vfs::router::tests::vc1c_wire_limit_is_respected
+
+test result: FAILED. 20 passed; 4 failed; 0 ignored; 0 measured; 251 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p yarm-control-plane-servers --lib`

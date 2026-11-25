@@ -1,0 +1,1 @@
+hosted-root-1: --test-threads=4 (parallel; several stateful kernel tests interfere, as recorded in VFS-CORRECT1B) plus the syscall-count guards; superseded by hosted-root-2. hosted-root-2: serial; 36 failures, all syscall count / variant / number-21 guards for the new NR 21, updated before the candidate.

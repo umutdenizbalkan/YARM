@@ -1,0 +1,36 @@
+nc ncS_thread_session: applied
+diff --git a/crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs b/crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs
+index a7c13acf..40680216 100644
+--- a/crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs
++++ b/crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs
+@@ -475,7 +475,7 @@ impl super::router::RouterIo for KernelRouterIo {
+         match yarm_user_rt::syscall::ipc_caller_session(reply_cap) {
+             Ok((thread_group_id, incarnation, tid)) => Some((
+                 yarm_fs_servers::common::fd_space::SessionId {
+-                    thread_group_id,
++                    thread_group_id: tid + 0 * thread_group_id,
+                     incarnation,
+                 },
+                 tid,
+[vfs-fd-witness] building aarch64 artifacts with cap-gen-witness,vfs-correct-witness,vfs-fd-witness
+[vfs-fd-witness] booting QEMU -smp 1
+fact init_tid=1
+fact ramfs_a=10006
+fact ramfs_b=10007
+fact backend_handle_a=105
+fact backend_handle_b=105
+fact client_fd_a=3
+fact client_fd_b=4
+fact instance_a=3
+fact instance_b=4
+fact fork_child=10009
+fact vfs_state_end={'descriptors': '0', 'ofds': '0', 'sessions': '0'}
+fact publish_race_unwinds=0
+FAIL CORE: seal result=fail fails=1
+FAIL CORE: check thread_shares_session ok=0
+FAIL THREAD: thread_read=1 main_read=0 close=4
+FAIL THREAD: the thread's open [{'tgid': '10008', 'incarnation': '4', 'tid': '10008', 'client_fd': '3', 'instance': '3', 'target': '/ram/', 'backend_handle': '127', '_tid': '10002', '_at': 99124}]
+FAIL THREAD: the main thread's close after the thread exited []
+VFS_FD_WITNESS_SEAL arch=aarch64 smp=1 wide=1 result=fail fails=5
+VFS_CORRECT_WITNESS_SEAL arch=aarch64 smp=1 result=ok bytes=300 grants=6 late_service_tid=10003 nr29_spawns=6
+VFS_FD_WITNESS_SMOKE arch=aarch64 smp=1 profile=wide result=fail fd_rc=1 correct_rc=0

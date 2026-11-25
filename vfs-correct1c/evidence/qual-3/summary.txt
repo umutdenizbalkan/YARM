@@ -1,0 +1,175 @@
+vc1c qual qual-3 start 2026-11-25T04:57:25Z C=d9becda16831ea0b58d70ce924a4c28855440f67 B=fbc8ff49 FROM=H1 runner=88340f635a6da5a7 nc=3639ab42c7f3dc72
+candidate tree 5c4a84d6a6210d46c5a3b5e3c46fe19fec98e51c
+=== H1_fmt [d9becda16831 porcelain=0]: cargo fmt --all -- --check (start 04:57:25)
+H1_fmt rc=0 secs=6 free=13G
+=== H2_hosted_lib [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 04:57:31)
+H2_hosted_lib rc=0 secs=114 free=13G
+=== H3_integration [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --tests --no-fail-fast -- --test-threads=1 (start 04:59:25)
+H3_integration rc=0 secs=235 free=13G
+=== H4_crate_yarm-ipc-abi [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-ipc-abi --lib -- --test-threads=1 (start 05:03:20)
+H4_crate_yarm-ipc-abi rc=0 secs=0 free=13G
+=== H4_crate_yarm-user-rt [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-user-rt --lib -- --test-threads=1 (start 05:03:20)
+H4_crate_yarm-user-rt rc=0 secs=1 free=13G
+=== H4_crate_yarm-fs-servers [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 (start 05:03:21)
+H4_crate_yarm-fs-servers rc=0 secs=0 free=13G
+=== H4_crate_yarm-srv-common [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-srv-common --lib -- --test-threads=1 (start 05:03:21)
+H4_crate_yarm-srv-common rc=0 secs=0 free=13G
+=== H4_crate_yarm-kernel [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-kernel --lib -- --test-threads=1 (start 05:03:21)
+H4_crate_yarm-kernel rc=0 secs=0 free=13G
+=== H4_crate_yarm-control-plane-servers [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-control-plane-servers --lib -- --test-threads=1 (start 05:03:21)
+H4_crate_yarm-control-plane-servers rc=101 secs=0 free=13G
+=== H5_subset_cp_vc1c [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-control-plane-servers --lib -- --test-threads=1 vc1c (start 05:03:21)
+H5_subset_cp_vc1c rc=0 secs=1 free=13G
+=== H5_subset_fs_vc1c [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 vc1c (start 05:03:22)
+H5_subset_fs_vc1c rc=0 secs=0 free=13G
+=== H5_subset_root_vc1c_nr21 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 vc1c_nr21 (start 05:03:22)
+H5_subset_root_vc1c_nr21 rc=0 secs=0 free=13G
+=== H5_subset_root_syscall_abi [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 syscall_abi (start 05:03:22)
+H5_subset_root_syscall_abi rc=0 secs=0 free=13G
+=== H5_subset_root_variant_count [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 variant_count (start 05:03:22)
+H5_subset_root_variant_count rc=0 secs=0 free=13G
+=== H5_subset_root_spawn_ledger [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 u9spawn (start 05:03:22)
+H5_subset_root_spawn_ledger rc=0 secs=5 free=13G
+=== H5_subset_root_fork [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 fork (start 05:03:27)
+H5_subset_root_fork rc=0 secs=2 free=13G
+=== H5_subset_root_lock_order [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 lock_order (start 05:03:29)
+H5_subset_root_lock_order rc=0 secs=1 free=13G
+=== H5_subset_fs_vc1b [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 vc1b (start 05:03:30)
+H5_subset_fs_vc1b rc=0 secs=0 free=13G
+=== H5_subset_fs_vc1a [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q -p yarm-fs-servers --lib -- --test-threads=1 vc1a (start 05:03:30)
+H5_subset_fs_vc1a rc=0 secs=0 free=13G
+=== H6_grader_self_test_fd [d9becda16831 porcelain=0]: python3 -I scripts/grade-vfs-fd-witness.py --self-test (start 05:03:30)
+H6_grader_self_test_fd rc=0 secs=0 free=13G
+=== H6_grader_self_test_mount [d9becda16831 porcelain=0]: python3 -I scripts/grade-vfs-mount-witness.py --self-test (start 05:03:30)
+H6_grader_self_test_mount rc=0 secs=0 free=13G
+=== H6_grader_self_test_correct [d9becda16831 porcelain=0]: python3 -I scripts/grade-vfs-correct-witness.py --self-test (start 05:03:30)
+H6_grader_self_test_correct rc=0 secs=0 free=13G
+=== G1_contract_gate [d9becda16831 porcelain=0]: bash scripts/check-current-contracts.sh (start 05:03:30)
+G1_contract_gate rc=0 secs=1 free=13G
+=== G2_doc_enforcement [d9becda16831 porcelain=0]: bash scripts/check-contract-doc-enforcement.sh (start 05:03:31)
+G2_doc_enforcement rc=0 secs=0 free=13G
+=== G3_proc_vfs_codec_freeze [d9becda16831 porcelain=0]: bash scripts/check-proc-vfs-codec-freeze.sh (start 05:03:31)
+G3_proc_vfs_codec_freeze rc=0 secs=1 free=13G
+=== G4_service_arch_boundary [d9becda16831 porcelain=0]: bash scripts/check-service-arch-boundary.sh (start 05:03:32)
+G4_service_arch_boundary rc=0 secs=0 free=13G
+=== G5_service_domain_ownership [d9becda16831 porcelain=0]: bash scripts/check-service-domain-ownership.sh (start 05:03:32)
+G5_service_domain_ownership rc=0 secs=0 free=13G
+=== G6_arch_boundary_baseline_scan_width [d9becda16831 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-wt && awk '/#\[cfg\(test\)\]/{exit} {print}' crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs | wc -l; cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-wt && awk 'prev ~ /#\[cfg\((all\()?test/ && /^mod [a-z_]*tests/ {exit} {print; prev=$0}' crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs | wc -l (start 05:03:32)
+G6_arch_boundary_baseline_scan_width rc=0 secs=0 free=13G
+=== X_check_default_kernel_x86_64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/x86_64-yarm-none.json -p yarm --bin kernel_boot (start 05:03:32)
+X_check_default_kernel_x86_64 rc=0 secs=25 free=13G
+=== X_check_genwitness_kernel_x86_64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/x86_64-yarm-none.json --features cap-gen-witness -p yarm --bin kernel_boot (start 05:03:57)
+X_check_genwitness_kernel_x86_64 rc=0 secs=8 free=13G
+=== X_check_default_servers_x86_64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/x86_64-yarm-user-none.json -p yarm-control-plane-servers -p yarm-fs-servers --bins (start 05:04:05)
+X_check_default_servers_x86_64 rc=0 secs=20 free=13G
+=== X_check_fd_witness_servers_x86_64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/x86_64-yarm-user-none.json --features vfs-fd-witness,vfs-correct-witness -p yarm-control-plane-servers -p yarm-fs-servers --bins (start 05:04:25)
+X_check_fd_witness_servers_x86_64 rc=0 secs=3 free=13G
+=== X_check_mount_witness_servers_x86_64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/x86_64-yarm-user-none.json --features vfs-mount-witness,vfs-correct-witness -p yarm-control-plane-servers -p yarm-fs-servers --bins (start 05:04:28)
+X_check_mount_witness_servers_x86_64 rc=0 secs=3 free=13G
+=== X_check_default_kernel_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/aarch64-yarm-none.json -p yarm --bin kernel_boot (start 05:04:31)
+X_check_default_kernel_aarch64 rc=0 secs=27 free=12G
+=== X_check_genwitness_kernel_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/aarch64-yarm-none.json --features cap-gen-witness -p yarm --bin kernel_boot (start 05:04:58)
+X_check_genwitness_kernel_aarch64 rc=0 secs=9 free=12G
+=== X_check_default_servers_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/aarch64-yarm-user-none.json -p yarm-control-plane-servers -p yarm-fs-servers --bins (start 05:05:07)
+X_check_default_servers_aarch64 rc=0 secs=20 free=12G
+=== X_check_fd_witness_servers_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/aarch64-yarm-user-none.json --features vfs-fd-witness,vfs-correct-witness -p yarm-control-plane-servers -p yarm-fs-servers --bins (start 05:05:27)
+X_check_fd_witness_servers_aarch64 rc=0 secs=3 free=12G
+=== X_check_mount_witness_servers_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/aarch64-yarm-user-none.json --features vfs-mount-witness,vfs-correct-witness -p yarm-control-plane-servers -p yarm-fs-servers --bins (start 05:05:30)
+X_check_mount_witness_servers_aarch64 rc=0 secs=3 free=12G
+=== X_check_default_kernel_riscv64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/riscv64-yarm-none.json -p yarm --bin kernel_boot (start 05:05:33)
+X_check_default_kernel_riscv64 rc=0 secs=23 free=12G
+=== X_check_genwitness_kernel_riscv64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/riscv64-yarm-none.json --features cap-gen-witness -p yarm --bin kernel_boot (start 05:05:56)
+X_check_genwitness_kernel_riscv64 rc=0 secs=9 free=12G
+=== X_check_default_servers_riscv64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/riscv64-yarm-user-none.json -p yarm-control-plane-servers -p yarm-fs-servers --bins (start 05:06:05)
+X_check_default_servers_riscv64 rc=0 secs=17 free=12G
+=== X_check_fd_witness_servers_riscv64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/riscv64-yarm-user-none.json --features vfs-fd-witness,vfs-correct-witness -p yarm-control-plane-servers -p yarm-fs-servers --bins (start 05:06:22)
+X_check_fd_witness_servers_riscv64 rc=0 secs=3 free=12G
+=== X_check_mount_witness_servers_riscv64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR cargo check -q -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --no-default-features --target targets/riscv64-yarm-user-none.json --features vfs-mount-witness,vfs-correct-witness -p yarm-control-plane-servers -p yarm-fs-servers --bins (start 05:06:25)
+X_check_mount_witness_servers_riscv64 rc=0 secs=3 free=12G
+=== B_build_C_x86_64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 05:06:29)
+B_build_C_x86_64 rc=0 secs=70 free=13G
+=== S_gp_core_smp2_x86_64 [d9becda16831 porcelain=0]: env KERNEL_IMAGE=build-x86_64/kernel_boot.elf INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/S_gp_x86_64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/S_gp_x86_64.smoke.log TIMEOUT_SECS=900 scripts/qemu-x86_64-core-smoke.sh (start 05:07:39)
+S_gp_core_smp2_x86_64 rc=0 secs=904 free=13G
+=== B_build_B_x86_64 [d9becda16831 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-wt && env -u CARGO_TARGET_DIR scripts/build-qemu-x86_64-artifacts.sh (start 05:22:43)
+B_build_B_x86_64 rc=0 secs=76 free=13G
+=== B_build_C_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 05:24:00)
+B_build_C_aarch64 rc=0 secs=76 free=13G
+=== S_gp_core_smp2_aarch64 [d9becda16831 porcelain=0]: env KERNEL_IMAGE=build-aarch64/yarm-aarch64.bin INITRAMFS_IMAGE=build-aarch64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/S_gp_aarch64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/S_gp_aarch64.smoke.log TIMEOUT_SECS=900 scripts/qemu-aarch64-core-smoke.sh (start 05:25:16)
+S_gp_core_smp2_aarch64 rc=0 secs=13 free=13G
+=== B_build_B_aarch64 [d9becda16831 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-wt && env -u CARGO_TARGET_DIR scripts/build-qemu-aarch64-artifacts.sh (start 05:25:29)
+B_build_B_aarch64 rc=0 secs=77 free=13G
+=== B_build_C_riscv64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 05:26:46)
+B_build_C_riscv64 rc=0 secs=66 free=13G
+=== S_gp_core_smp2_riscv64 [d9becda16831 porcelain=0]: env KERNEL_IMAGE=build-riscv64/yarm-riscv64.bin INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio QEMU_SMP=2 LOGFILE=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/S_gp_riscv64.boot.log SMOKE_LOG=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/S_gp_riscv64.smoke.log TIMEOUT_SECS=900 scripts/qemu-riscv64-core-smoke.sh (start 05:27:52)
+S_gp_core_smp2_riscv64 rc=0 secs=902 free=13G
+=== B_build_B_riscv64 [d9becda16831 porcelain=0]: bash -c cd /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1b-wt && env -u CARGO_TARGET_DIR scripts/build-qemu-riscv64-artifacts.sh (start 05:42:54)
+B_build_B_riscv64 rc=0 secs=66 free=13G
+=== W_fd_wide_smp1_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/W_fd_wide_smp1_aarch64 scripts/qemu-vfs-fd-witness-smoke.sh aarch64 1 wide (start 05:44:00)
+W_fd_wide_smp1_aarch64 rc=0 secs=108 free=13G
+=== W_1b_wide_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/W_1b_wide_aarch64 scripts/qemu-vfs-mount-witness-smoke.sh aarch64 2 wide (start 05:45:48)
+W_1b_wide_aarch64 rc=0 secs=50 free=13G
+=== W_fd_wide_smp1_x86_64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/W_fd_wide_smp1_x86_64 scripts/qemu-vfs-fd-witness-smoke.sh x86_64 1 wide (start 05:46:39)
+W_fd_wide_smp1_x86_64 rc=0 secs=1588 free=13G
+=== W_1b_wide_x86_64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/W_1b_wide_x86_64 scripts/qemu-vfs-mount-witness-smoke.sh x86_64 2 wide (start 06:13:07)
+W_1b_wide_x86_64 rc=0 secs=942 free=13G
+=== W_fd_wide_smp1_riscv64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/W_fd_wide_smp1_riscv64 scripts/qemu-vfs-fd-witness-smoke.sh riscv64 1 wide (start 06:28:49)
+W_fd_wide_smp1_riscv64 rc=0 secs=1754 free=13G
+=== W_1b_wide_riscv64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=900 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/W_1b_wide_riscv64 scripts/qemu-vfs-mount-witness-smoke.sh riscv64 2 wide (start 06:58:03)
+W_1b_wide_riscv64 rc=0 secs=1016 free=12G
+=== W_fd_narrow_smp1_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/W_fd_narrow_smp1_aarch64 scripts/qemu-vfs-fd-witness-smoke.sh aarch64 1 narrow (start 07:15:00)
+W_fd_narrow_smp1_aarch64 rc=0 secs=112 free=12G
+=== R_race_smp2_aarch64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/R_race_smp2_aarch64 scripts/qemu-vfs-fd-witness-smoke.sh aarch64 2 wide (start 07:16:52)
+R_race_smp2_aarch64 rc=1 secs=107 free=12G
+=== R_race_smp2_x86_64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/R_race_smp2_x86_64 scripts/qemu-vfs-fd-witness-smoke.sh x86_64 2 wide (start 07:18:39)
+R_race_smp2_x86_64 rc=1 secs=1589 free=12G
+=== R_race_smp2_riscv64 [d9becda16831 porcelain=0]: env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/R_race_smp2_riscv64 scripts/qemu-vfs-fd-witness-smoke.sh riscv64 2 wide (start 07:45:08)
+R_race_smp2_riscv64 rc=1 secs=1744 free=12G
+=== NC_hosted_ncH_handle_as_fd [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc-wt/NC_hosted_ncH_handle_as_fd at d9becda16831]: ncH_handle_as_fd; env -u CARGO_TARGET_DIR cargo test -q -p yarm-control-plane-servers --lib -- --test-threads=1 vc1c (start 08:14:26)
+NC_hosted_ncH_handle_as_fd rc=101 secs=8 mutated_files=crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs 
+=== NC_hosted_ncP_original_spelling [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc-wt/NC_hosted_ncP_original_spelling at d9becda16831]: ncP_original_spelling; env -u CARGO_TARGET_DIR cargo test -q -p yarm-control-plane-servers --lib -- --test-threads=1 vc1c (start 08:14:34)
+NC_hosted_ncP_original_spelling rc=101 secs=7 mutated_files=crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs 
+=== NC_hosted_ncR_no_rollback_close [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc-wt/NC_hosted_ncR_no_rollback_close at d9becda16831]: ncR_no_rollback_close; env -u CARGO_TARGET_DIR cargo test -q -p yarm-control-plane-servers --lib -- --test-threads=1 vc1c (start 08:14:41)
+NC_hosted_ncR_no_rollback_close rc=101 secs=8 mutated_files=crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs 
+=== NC_hosted_ncK_split_names_tid [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc-wt/NC_hosted_ncK_split_names_tid at d9becda16831]: ncK_split_names_tid; env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 vc1c_nr21 (start 08:14:49)
+NC_hosted_ncK_split_names_tid rc=0 secs=83 mutated_files=src/kernel/syscall/session.rs 
+=== NC_live_ncH_handle_as_fd_aarch64 [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc-wt/NC_live_ncH_handle_as_fd_aarch64 at d9becda16831]: ncH_handle_as_fd; env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/NCL_H scripts/qemu-vfs-fd-witness-smoke.sh aarch64 1 wide (start 08:16:14)
+NC_live_ncH_handle_as_fd_aarch64 rc=1 secs=286 mutated_files=crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs 
+=== NC_live_ncP_original_spelling_aarch64 [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc-wt/NC_live_ncP_original_spelling_aarch64 at d9becda16831]: ncP_original_spelling; env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/NCL_P scripts/qemu-vfs-fd-witness-smoke.sh aarch64 1 wide (start 08:21:00)
+NC_live_ncP_original_spelling_aarch64 rc=1 secs=123 mutated_files=crates/yarm-control-plane-servers/src/control_plane/vfs/router.rs 
+=== NC_live_ncS_thread_session_aarch64 [worktree /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-nc-wt/NC_live_ncS_thread_session_aarch64 at d9becda16831]: ncS_thread_session; env -u CARGO_TARGET_DIR TIMEOUT_SECS=1500 LOGDIR=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/NCL_S scripts/qemu-vfs-fd-witness-smoke.sh aarch64 1 wide (start 08:23:03)
+NC_live_ncS_thread_session_aarch64 rc=1 secs=120 mutated_files=crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs 
+post-NC porcelain=0 base-porcelain=0 candidate=d9becda16831
+=== F_feature_sweep [d9becda16831 porcelain=0]: bash /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/feature_sweep.sh /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-wt /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/vc1c-evidence/qual-3/F_feature_sweep (start 08:25:03)
+F_feature_sweep rc=0 secs=1389 free=3.9G
+vc1c qual qual-3 end 2026-11-25T08:48:20Z
+VC1C_QUAL_DONE
+DISPOSITION (written after VC1C_QUAL_DONE; nothing above was edited or rerun):
+- Every step ran on d9becda1 (tree 5c4a84d6), worktree clean throughout (post-NC porcelain=0).
+- H4_crate_yarm-control-plane-servers rc=101: 273 passed, 2 failed — sup_l5b_crash_test_binary_
+  and_staging_are_test_gated and sup_l6b_runtime_handoff_markers_and_guardrails_are_wired, the two
+  failures known on fbc8ff49. Every other hosted, gate, check and build step rc=0.
+- R_race_smp2_<port> are the predeclared FINDING steps. aarch64 rc=1 (1 race pair, VFS) and x86_64
+  rc=1 (3, VFS): the unmodified core smokes reject D2_PUBLISH_RACE_UNWIND; the fd grader fails only
+  CORE and RACE, every fd rule passes, and the 1A checks are met (300 bytes, 6 grants, 6 NR 29).
+  riscv64 rc=1 (2, VFS): grader RACE; the RISC-V core smoke printed "[fail] rejected pattern
+  present: D2_PUBLISH_RACE_UNWIND" but exits 0 outside QEMU_SMOKE_STRICT=1 (below).
+- The RISC-V core smoke is non-strict in every witness smoke here (no QEMU_SMOKE_STRICT): failed
+  checks print and the script exits 0. Attributed, per boot:
+  * W_fd_wide_smp1_riscv64 (2 checks): SpawnFromMemoryObject split count 6, expected 5 (the
+    witness spawns the second ramfs); split dispatches outside the census: NR 12 x1 (the witness's
+    fork) and NR 16 x2 (the exits of the fork child and the second thread).
+  * R_race_smp2_riscv64 (3 checks): the race marker, plus the same two, plus NR 6 x1 among the
+    unlisted dispatches.
+  * W_1b_wide_riscv64 (1 check): required marker missing VFS_MOUNT_REGISTER_RAMFS_OK, the same
+    single check VFS-CORRECT1B's own delivered RISC-V witness boots show (qual-1 W_wide_riscv64 and
+    W_narrow_riscv64 on wip/vfs-correct1b-evidence).
+  * S_gp_core_smp2_riscv64 (default boot): no failed check.
+- NC_hosted_ncK_split_names_tid rc=0: the control was NOT caught. Every split-route case called
+  NR 21 from the leader thread (TID == thread-group id). Test-only repair 76c74efb; qual-4 reruns
+  the control and proves every artifact booted here is byte-identical at 76c74efb.
+- NC_live_ncH rc=1 but the witness never ran: PM's boot-time image spawn through VFS failed under
+  the mutation (FILE_GRANT_RO named the backend handle, refused), BOOT_FATAL_ZC_ELF_LOAD_FAILED.
+  NC_live_ncP rc=1 on CANON (the baseline's three initramfs spellings, statx=2 open=2).
+  NC_live_ncS rc=1 on THREAD (the thread's open made its own session tgid=10008).
+- F_feature_sweep rc=0: the kernel features that fail (12) are exactly VFS-CORRECT1B's base_rc=101
+  list; the server features match VFS-CORRECT1B's sweep, plus vfs-fd-witness rc=0 in three crates.

@@ -1,0 +1,1 @@
+dev1: built before NR 21 had a split route; every production syscall is served by the split dispatcher, which settled NR 21 as InvalidNumber, so VFS refused every request (VFS_SESSION_UNKNOWN). Fixed by the NR 21 split route + AArch64/RISC-V gates.

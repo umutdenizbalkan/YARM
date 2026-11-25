@@ -1,0 +1,1 @@
+dev6-riscv64: all fd rules ok and core smoke ok; the grader's FORK rule wrongly required the child's VFS cap number to differ from the parent's (it need not); rule corrected, regrade result=ok.

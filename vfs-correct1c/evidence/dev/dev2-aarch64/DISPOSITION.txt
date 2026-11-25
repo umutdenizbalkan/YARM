@@ -1,0 +1,1 @@
+dev2: first working boot. Collision, boundaries, full table, failreply, thread passed; canonical checks failed on the cell's own STATX size decode (type bits at 60); fork skipped (no alert endpoint in this profile); core smoke flagged the two injected-reply lines. All three fixed in the cell / smoke before dev3.

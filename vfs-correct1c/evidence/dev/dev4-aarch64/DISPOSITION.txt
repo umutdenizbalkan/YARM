@@ -1,0 +1,1 @@
+dev4: fd grader all rules ok (core rc excluded); core smoke failed on 2x D2_PUBLISH_RACE_UNWIND for VFS (documented split-recv race reached because the fork child runs on CPU1). Accounted for in the fd smoke/grader (RACE rule) before dev5.

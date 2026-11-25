@@ -1,0 +1,1 @@
+dev6-x86_64: built with the stack top - 8 attempt; the kernel refused spawn_thread (unaligned top), init waited 3000 sleeps, timed out before the seal. 1A grader ok on that boot. Fixed with the call trampoline before dev7.

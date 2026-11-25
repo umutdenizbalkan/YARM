@@ -1,0 +1,47 @@
+VFS-CORRECT1C baseline captures (baseline fbc8ff493be9afbc0a95c635a2c2e74d26904b40, AArch64 SMP2 core smoke, init + vc1c-baseline-probe.patch)
+
+== probe-aarch64.run1
+VC1C_BASE_BEGIN
+VC1C_BASE_F14 path=/initramfs/etc/vfs-fixture statx=Ok(300) open=Ok(16)
+VC1C_BASE_F14 path=/initramfs//etc/vfs-fixture statx=Err(Status(2)) open=Err(Status(2))
+VC1C_BASE_F14 path=/initramfs/etc/./vfs-fixture statx=Err(Status(2)) open=Err(Status(2))
+VC1C_BASE_F14 path=/ram/../initramfs/etc/vfs-fixture statx=Err(Status(2)) open=Err(Status(2))
+VC1C_BASE_F01 initramfs_fd=17 devfs_fd=17 same=1
+VC1C_BASE_F01 read1=Ok(8) head=0xc03dba37b431ae2b
+VC1C_BASE_F01 close1=Ok(0) read_after_close=Ok(0) head=0x0000000000000000
+VC1C_BASE_F01 close2=Ok(0)
+VC1C_BASE_F02 open_refused n=28 err=Status(9)
+VC1C_BASE_F02 opened=28 leaked_fd=0 closed_ok=28
+VC1C_BASE_F03 thread_open=Ok(32)
+VFS_ROUTE_BAD_FD fd=32
+VFS_ROUTE_BAD_FD fd=32
+VC1C_BASE_F03 thread_tid=10007 fd=32 main_read=Err(Status(4)) main_close=Err(Status(4))
+VC1C_BASE_END
+core smoke rc: 0
+[ok] aarch64 core: clean terminal idle (VC1C_BASE_END) after all required marker
+
+== probe-aarch64
+VC1C_BASE_BEGIN
+VC1C_BASE_F14 path=/initramfs/etc/vfs-fixture statx=Ok(300) open=Ok(16)
+VC1C_BASE_F14 path=/initramfs//etc/vfs-fixture statx=Err(Status(2)) open=Err(Status(2))
+VC1C_BASE_F14 path=/initramfs/etc/./vfs-fixture statx=Err(Status(2)) open=Err(Status(2))
+VC1C_BASE_F14 path=/ram/../initramfs/etc/vfs-fixture statx=Err(Status(2)) open=Err(Status(2))
+VC1C_BASE_F01 initramfs_fd=17 devfs_fd=17 same=1
+VC1C_BASE_F01 read1=Ok(8) head=0xc03dba37b431ae2b
+VC1C_BASE_F01 close1=Ok(0) read_after_close=Ok(0) head=0x0000000000000000
+VC1C_BASE_F01 close2=Ok(0)
+VFS_ROUTE_BAD_FD fd=112
+VC1C_BASE_F02 untracked_open n=33 path=/ram/boot fd=112 read=Err(Status(4))
+VFS_ROUTE_BAD_FD fd=112
+VC1C_BASE_F02 opened=33 leaked_fd=112 closed_ok=32
+VC1C_BASE_F03 thread_open=Ok(29)
+VFS_ROUTE_BAD_FD fd=29
+VFS_ROUTE_BAD_FD fd=29
+VC1C_BASE_F03 thread_tid=10007 fd=29 main_read=Err(Status(4)) main_close=Err(Status(4))
+VC1C_BASE_END
+core smoke rc: 0
+[ok] aarch64 core: clean terminal idle (VC1C_BASE_END) after all required marker
+
+== run 1: the VFS table around the F01 collision (fd 17 tracked twice for client tid 1: initramfs 65539, devfs 65540)
+USER_LOG tid=10002 msg=VFS_FD_TRACK fd=17 backend=65539
+USER_LOG tid=10002 msg=VFS_FD_TRACK fd=17 backend=65540

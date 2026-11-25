@@ -1,0 +1,1 @@
+dev8-aarch64: SMP1 wide on the uncommitted fix of the race exclusion (exclusion withdrawn, RACE rule rejects any race pair); core smoke rc=0, fd grader ok (0 race unwinds), 1A grader ok. Passing dev boot (pre-commit tree; superseded by qual-3).

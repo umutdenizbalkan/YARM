@@ -1,0 +1,1 @@
+dev7-x86_64: the call trampoline; core smoke rc=0, fd grader ok, 1A grader ok. Passing dev boot (pre-commit tree; superseded by qual-1).

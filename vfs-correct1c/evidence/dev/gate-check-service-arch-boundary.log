@@ -1,0 +1,12 @@
+[fail] concrete service names found in control-plane VFS production shim: crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs
+686:    use yarm_fs_servers::devfs::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
+687:    use yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
+688:    use yarm_fs_servers::ramfs::RamFsBackend;
+831:        let mut devfs = FsService::with_backend(DevFsBackend::default());
+870:        let mut ramfs = FsService::with_backend(RamFsBackend::new());
+909:                InitramfsBackend::new(4096),
+954:                DevFsBackend::default(),
+1046:                RamFsBackend::new(),
+1107:            // Initramfs: read succeeds (bounded by file length) and write is rejected.
+1109:                InitramfsBackend::new(4096),
+[ok] checked 23 service binaries for arch/kernel/syscall boundary violations

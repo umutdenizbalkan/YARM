@@ -1,0 +1,159 @@
+diff --git a/crates/yarm-control-plane-servers/src/control_plane/init/service.rs b/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
+index e612ff60..d1ff6929 100644
+--- a/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
++++ b/crates/yarm-control-plane-servers/src/control_plane/init/service.rs
+@@ -4565,6 +4565,8 @@ mod vfs_correct_witness;
+ #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-mount-witness"))]
+ #[path = "vfs_mount_witness.rs"]
+ mod vfs_mount_witness;
++#[path = "vc1c_probe.rs"]
++mod vc1c_probe;
+ 
+ /// FUTEX-SEAL1 — the live futex seal cell (`futex_seal_witness.rs`), selector 18 when init is built
+ /// with `futex-seal-witness`; it takes precedence over the futex-sync and futex-time cells.
+@@ -10974,6 +10976,7 @@ pub fn run() {
+                     init_ramfs_send_cap,
+                     ramfs_mount_config,
+                 );
++                vc1c_probe::run(vfs_recv_cap, pm_recv);
+             } else {
+                 yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_FAIL ok=0 child_tid=0");
+             }
+diff --git a/crates/yarm-control-plane-servers/src/control_plane/init/vc1c_probe.rs b/crates/yarm-control-plane-servers/src/control_plane/init/vc1c_probe.rs
+new file mode 100644
+index 00000000..9af4fe9e
+--- /dev/null
++++ b/crates/yarm-control-plane-servers/src/control_plane/init/vc1c_probe.rs
+@@ -0,0 +1,132 @@
++// VFS-CORRECT1C baseline probe (scratch, never committed): captures F01, F02, F03 and F14 on the
++// baseline resident VFS from an ordinary client (init). At this baseline the fd a client sees is
++// the backend's own handle number, so the probe can steer a collision.
++use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
++use yarm_user_rt::vfs_client::{vfs_close, vfs_openat, vfs_read, vfs_statx};
++
++const FIXTURE: &[u8] = b"/initramfs/etc/vfs-fixture";
++
++static T_FD: AtomicU64 = AtomicU64::new(0);
++static T_DONE: AtomicU64 = AtomicU64::new(0);
++static mut T_STACK: [u8; 16384] = [0; 16384];
++static mut T_TLS: [u8; 256] = [0; 256];
++static mut VFS: u64 = 0;
++static mut REPLY: u64 = 0;
++
++extern "C" fn thread_body() -> ! {
++    // SAFETY: init's caps, shared by its threads; the main thread waits on T_DONE.
++    let r = unsafe { vfs_openat(VFS, REPLY, FIXTURE, 0) };
++    yarm_user_rt::user_log!("VC1C_BASE_F03 thread_open={:?}", r);
++    T_FD.store(r.unwrap_or(u64::MAX), SeqCst);
++    T_DONE.store(1, SeqCst);
++    loop {
++        let _ = yarm_user_rt::syscall::yield_now();
++    }
++}
++
++fn hex8(b: &[u8]) -> u64 {
++    let mut v = 0u64;
++    for (i, x) in b.iter().take(8).enumerate() {
++        v |= (*x as u64) << (8 * i);
++    }
++    v
++}
++
++pub(super) fn run(vfs: u64, reply: u64) {
++    yarm_user_rt::user_log!("VC1C_BASE_BEGIN");
++    // ── F14: the mount is chosen from the normalized path, the original spelling is forwarded.
++    for p in [
++        FIXTURE,
++        b"/initramfs//etc/vfs-fixture".as_slice(),
++        b"/initramfs/etc/./vfs-fixture".as_slice(),
++        b"/ram/../initramfs/etc/vfs-fixture".as_slice(),
++    ] {
++        let st = unsafe { vfs_statx(vfs, reply, p) };
++        let op = unsafe { vfs_openat(vfs, reply, p, 0) };
++        yarm_user_rt::user_log!(
++            "VC1C_BASE_F14 path={} statx={:?} open={:?}",
++            core::str::from_utf8(p).unwrap_or("?"),
++            st,
++            op
++        );
++        if let Ok(fd) = op {
++            let _ = unsafe { vfs_close(vfs, reply, fd) };
++        }
++    }
++    // ── F01: two backends, one client fd. ──
++    let fd_i = unsafe { vfs_openat(vfs, reply, FIXTURE, 0) }.unwrap_or(0);
++    let mut fd_d = 0u64;
++    for _ in 0..200 {
++        let f = unsafe { vfs_openat(vfs, reply, b"/dev/null", 0) }.unwrap_or(0);
++        if f == fd_i || f == 0 {
++            fd_d = f;
++            break;
++        }
++        let _ = unsafe { vfs_close(vfs, reply, f) };
++        if f > fd_i {
++            break;
++        }
++    }
++    yarm_user_rt::user_log!("VC1C_BASE_F01 initramfs_fd={} devfs_fd={} same={}", fd_i, fd_d, (fd_i == fd_d) as u8);
++    let mut b = [0u8; 8];
++    let r1 = unsafe { vfs_read(vfs, reply, fd_i, &mut b) };
++    yarm_user_rt::user_log!("VC1C_BASE_F01 read1={:?} head=0x{:016x}", r1, hex8(&b));
++    let c1 = unsafe { vfs_close(vfs, reply, fd_i) };
++    let mut b2 = [0u8; 8];
++    let r2 = unsafe { vfs_read(vfs, reply, fd_i, &mut b2) };
++    yarm_user_rt::user_log!("VC1C_BASE_F01 close1={:?} read_after_close={:?} head=0x{:016x}", c1, r2, hex8(&b2));
++    let c2 = unsafe { vfs_close(vfs, reply, fd_i) };
++    yarm_user_rt::user_log!("VC1C_BASE_F01 close2={:?}", c2);
++    // ── F02: a full VFS table; the backend opens and the client receives an untracked fd. ──
++    let mut held = [0u64; 48];
++    let mut n = 0usize;
++    let mut leaked = 0u64;
++    while n < held.len() {
++        let p = match n % 3 { 0 => b"/dev/null".as_slice(), 1 => FIXTURE, _ => b"/ram/boot".as_slice() };
++        match unsafe { vfs_openat(vfs, reply, p, 0) } {
++            Ok(fd) => {
++                let mut x = [0u8; 1];
++                let r = unsafe { vfs_read(vfs, reply, fd, &mut x) };
++                held[n] = fd;
++                n += 1;
++                if matches!(r, Err(_)) && p != b"/dev/null".as_slice() {
++                    leaked = fd;
++                    yarm_user_rt::user_log!("VC1C_BASE_F02 untracked_open n={} path={} fd={} read={:?}", n, core::str::from_utf8(p).unwrap_or("?"), fd, r);
++                    break;
++                }
++            }
++            Err(e) => {
++                yarm_user_rt::user_log!("VC1C_BASE_F02 open_refused n={} err={:?}", n, e);
++                break;
++            }
++        }
++    }
++    let mut closed_ok = 0;
++    for fd in &held[..n] {
++        if unsafe { vfs_close(vfs, reply, *fd) }.is_ok() {
++            closed_ok += 1;
++        }
++    }
++    yarm_user_rt::user_log!("VC1C_BASE_F02 opened={} leaked_fd={} closed_ok={}", n, leaked, closed_ok);
++    // ── F03: one thread opens, another thread of the same process reads. ──
++    // SAFETY: probe-only statics.
++    unsafe {
++        VFS = vfs;
++        REPLY = reply;
++    }
++    let stack = core::ptr::addr_of_mut!(T_STACK) as usize;
++    let tls = core::ptr::addr_of_mut!(T_TLS) as usize;
++    let top = (stack + 16384) & !0xF;
++    let tid = unsafe { yarm_user_rt::syscall::spawn_thread(tls, top, thread_body as usize) }.unwrap_or(0);
++    let mut spins = 0u64;
++    while T_DONE.load(SeqCst) == 0 && spins < 5_000_000 {
++        let _ = yarm_user_rt::syscall::yield_now();
++        spins += 1;
++    }
++    let tfd = T_FD.load(SeqCst);
++    let mut b3 = [0u8; 8];
++    let r3 = unsafe { vfs_read(vfs, reply, tfd, &mut b3) };
++    let c3 = unsafe { vfs_close(vfs, reply, tfd) };
++    yarm_user_rt::user_log!("VC1C_BASE_F03 thread_tid={} fd={} main_read={:?} main_close={:?}", tid, tfd, r3, c3);
++    yarm_user_rt::user_log!("VC1C_BASE_END");
++}

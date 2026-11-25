@@ -1,0 +1,396 @@
+error: feature `hosted-dev` cannot be enabled for bare-metal targets (target_os="none"); build with --no-default-features for x86_64-yarm-none
+  --> src/lib.rs:10:1
+   |
+10 | / compile_error!(
+11 | |     "feature `hosted-dev` cannot be enabled for bare-metal targets (target_os=\"none\"); build with --no-default-features for x86_...
+12 | | );
+   | |_^
+
+error[E0433]: cannot find module or crate `std` in this scope
+ --> src/kernel/boot/orchestrator_state.rs:7:5
+  |
+7 | use std::cell::Cell;
+  |     ^^^ use of unresolved module or unlinked crate `std`
+  |
+  = help: if you wanted to use a crate named `std`, use `cargo add std` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `std`
+ --> src/kernel/boot/orchestrator_state.rs:9:5
+  |
+9 | use std::thread_local;
+  |     ^^^ use of unresolved module or unlinked crate `std`
+  |
+  = help: if you wanted to use a crate named `std`, use `cargo add std` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find `std` in the crate root
+  --> src/arch/kthread.rs:43:12
+   |
+43 |     crate::std::thread_local! {
+   |            ^^^ could not find `std` in the crate root
+   |
+note: found an item that was configured out
+  --> src/lib.rs:15:18
+   |
+14 | #[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
+   |                                      -------------------- the item is gated here
+15 | pub extern crate std;
+   |                  ^^^
+
+error[E0433]: cannot find `hosted` in `x86_cpu_identity`
+   --> src/arch/x86_64/smp.rs:794:40
+    |
+794 |         crate::arch::x86_cpu_identity::hosted::map()
+    |                                        ^^^^^^ could not find `hosted` in `x86_cpu_identity`
+    |
+note: found an item that was configured out
+   --> src/arch/x86_cpu_identity.rs:166:9
+    |
+165 | #[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
+    |                                      -------------------- the item is gated here
+166 | pub mod hosted {
+    |         ^^^^^^
+
+error[E0433]: cannot find `hosted` in `x86_cpu_identity`
+   --> src/arch/x86_64/smp.rs:808:40
+    |
+808 |         crate::arch::x86_cpu_identity::hosted::map().apic_for(cpu.0)
+    |                                        ^^^^^^ could not find `hosted` in `x86_cpu_identity`
+    |
+note: found an item that was configured out
+   --> src/arch/x86_cpu_identity.rs:166:9
+    |
+165 | #[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
+    |                                      -------------------- the item is gated here
+166 | pub mod hosted {
+    |         ^^^^^^
+
+error[E0433]: cannot find `hosted` in `x86_cpu_identity`
+   --> src/kernel/boot/scheduler_state.rs:123:63
+    |
+123 |             if let Some(cpu) = crate::arch::x86_cpu_identity::hosted::executing_cpu_id() {
+    |                                                               ^^^^^^ could not find `hosted` in `x86_cpu_identity`
+    |
+note: found an item that was configured out
+   --> src/arch/x86_cpu_identity.rs:166:9
+    |
+165 | #[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
+    |                                      -------------------- the item is gated here
+166 | pub mod hosted {
+    |         ^^^^^^
+
+error[E0433]: cannot find `hosted` in `x86_cpu_identity`
+    --> src/runtime.rs:4494:44
+     |
+4494 |             crate::arch::x86_cpu_identity::hosted::executing_cpu_id()
+     |                                            ^^^^^^ could not find `hosted` in `x86_cpu_identity`
+     |
+note: found an item that was configured out
+    --> src/arch/x86_cpu_identity.rs:166:9
+     |
+ 165 | #[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
+     |                                      -------------------- the item is gated here
+ 166 | pub mod hosted {
+     |         ^^^^^^
+
+error[E0425]: cannot find value `IRQ_ENABLED` in this scope
+  --> src/arch/kthread.rs:49:9
+   |
+49 |         IRQ_ENABLED.get()
+   |         ^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `IRQ_ENABLED` in this scope
+  --> src/arch/kthread.rs:53:9
+   |
+53 |         IRQ_ENABLED.set(true);
+   |         ^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `IRQ_ENABLED` in this scope
+  --> src/arch/kthread.rs:57:9
+   |
+57 |         IRQ_ENABLED.replace(false)
+   |         ^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `LOCK_ORDER_LAST_RANK` in this scope
+   --> src/kernel/boot/orchestrator_state.rs:124:13
+    |
+124 |             LOCK_ORDER_LAST_RANK.with(|last| {
+    |             ^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+warning: unused imports: `QueueAdvanceOutcome` and `QueueAdvanceRefusal`
+  --> src/kernel/boot/mod.rs:41:50
+   |
+41 |     IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome, QueueAdvanceRefusal,
+   |                                                  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `DetachOutcome` and `enqueue_reply_into_endpoint_locked`
+  --> src/kernel/boot/mod.rs:69:34
+   |
+69 |     BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ParkedDeathHandoff,
+   |                                  ^^^^^^^^^^^^^
+...
+74 |     complete_server_death_over, enqueue_reply_into_endpoint_locked, log_parked_death_handoff,
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `orchestrator_state::x86_smp_unlock_audit_claimed`
+  --> src/kernel/boot/mod.rs:85:16
+   |
+85 | pub(crate) use orchestrator_state::x86_smp_unlock_audit_claimed;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+  --> src/kernel/boot/scheduler_state.rs:10:27
+   |
+10 | use crate::kernel::task::{TaskClass, TaskStatus};
+   |                           ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+ --> src/kernel/boot/task_policy_state.rs:6:5
+  |
+6 | use crate::kernel::ipc::ThreadId;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+ --> src/kernel/boot/thread_state.rs:8:47
+  |
+8 |     KernelExecutionContext, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
+  |                                               ^^^^^^^^^
+
+warning: unused import: `crate::kernel::vm::Asid`
+  --> src/kernel/boot/thread_state.rs:12:5
+   |
+12 | use crate::kernel::vm::Asid;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc_state::rt_detach_server_link`
+    --> src/kernel/boot/mod.rs:5677:16
+     |
+5677 | pub(crate) use ipc_state::rt_detach_server_link;
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapObject`
+  --> src/kernel/recv_waiter_split.rs:94:42
+   |
+94 | use crate::kernel::capabilities::{CapId, CapObject};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+ --> src/kernel/syscall.rs:9:17
+  |
+9 | use super::vm::{PAGE_SIZE, VirtAddr};
+  |                 ^^^^^^^^^
+
+warning: unused imports: `IpcSendPayloadShape`, `classify_ipc_send_payload_shape`, and `frame_ipc_send_message`
+   --> src/kernel/syscall.rs:338:5
+    |
+338 |     IpcSendPayloadShape, classify_ipc_send_payload_shape, frame_ipc_send_message,
+    |     ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::ipc_abi::transfer_cap_arg_present`
+   --> src/kernel/syscall.rs:344:16
+    |
+344 | pub(crate) use self::ipc_abi::transfer_cap_arg_present;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc::REPLY_CAP_QUEUEING_SUPPORTED`
+   --> src/kernel/syscall.rs:347:16
+    |
+347 | pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ipc::split_inline_payload_from_frame`
+   --> src/kernel/syscall.rs:349:16
+    |
+349 | pub(crate) use ipc::split_inline_payload_from_frame;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SYSCALL_NO_TRANSFER_CAP`
+  --> src/kernel/syscall/recv_shared_v3.rs:12:26
+   |
+12 |     SYSCALL_ABI_VERSION, SYSCALL_NO_TRANSFER_CAP, SyscallError, current_tid,
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CapRights`
+  --> src/kernel/syscall/recv_shared_v3.rs:16:42
+   |
+16 | use crate::kernel::capabilities::{CapId, CapRights};
+   |                                          ^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::Message`
+  --> src/kernel/syscall/recv_shared_v3.rs:17:5
+   |
+17 | use crate::kernel::ipc::Message;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CachePolicy`, `Mapping`, `PAGE_SIZE`, `PageFlags`, `PhysAddr`, and `VirtAddr`
+  --> src/kernel/syscall/recv_shared_v3.rs:20:25
+   |
+20 | use crate::kernel::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                         ^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^  ^^^^^^^^
+
+warning: unused import: `PAGE_SIZE`
+  --> src/kernel/syscall/vm.rs:28:40
+   |
+28 | use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+   |                                        ^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+    --> src/runtime.rs:2836:13
+     |
+2836 |         use crate::kernel::task::TaskClass;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskClass`
+    --> src/runtime.rs:6546:35
+     |
+6546 |         use crate::kernel::task::{TaskClass, TaskStatus};
+     |                                   ^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+    --> src/runtime.rs:6990:13
+     |
+6990 |         use crate::kernel::task::TaskClass;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `SYSCALL_ARG_CAP`, `SYSCALL_ARG_LEN`, and `SYSCALL_ARG_PTR`
+     --> src/runtime.rs:10050:55
+      |
+10050 |             OPCODE_SHARED_MEM, RecvQueuedSplitPhaseA, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0,
+      |                                                       ^^^^^^^^^^^^^^^
+10051 |             SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError,
+      |                                          ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::ipc::ThreadId`
+     --> src/runtime.rs:17519:13
+      |
+17519 |         use crate::kernel::ipc::ThreadId;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:17521:13
+      |
+17521 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernel::task::TaskClass`
+     --> src/runtime.rs:17566:13
+      |
+17566 |         use crate::kernel::task::TaskClass;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> src/kernel/direct_ack_census.rs:53:29
+   |
+53 |     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |                             ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+53 -     let _ = WAITERS_CURRENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+53 +     let _ = WAITERS_CURRENT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+   |
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3659:17
+     |
+3659 |     let pml4e = d6_read_pte(pml4_phys, (va >> 39) & 0x1FF, virt_offset)?;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+    --> src/kernel/boot/exec_state.rs:3658:1
+     |
+3658 | unsafe fn d6_x86_walk_4level(va: u64, pml4_phys: u64, virt_offset: u64) -> Option<u64> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+     = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3661:16
+     |
+3661 |     let pdpe = d6_read_pte(pdp_phys, (va >> 30) & 0x1FF, virt_offset)?;
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3666:15
+     |
+3666 |     let pde = d6_read_pte(pd_phys, (va >> 21) & 0x1FF, virt_offset)?;
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `kernel::boot::exec_state::d6_read_pte` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3671:5
+     |
+3671 |     d6_read_pte(pt_phys, (va >> 12) & 0x1FF, virt_offset)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `core::ptr::read_volatile` is unsafe and requires unsafe block
+    --> src/kernel/boot/exec_state.rs:3680:17
+     |
+3680 |     let entry = core::ptr::read_volatile(virt as *const u64);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+    --> src/kernel/boot/exec_state.rs:3676:1
+     |
+3676 | unsafe fn d6_read_pte(table_phys: u64, idx: u64, virt_offset: u64) -> Option<u64> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning: unused variable: `deadline`
+    --> src/kernel/boot/ipc_state.rs:5700:30
+     |
+5700 |                     let Some(deadline) = tcb.ipc_timeout_deadline else {
+     |                              ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_deadline`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `tid`
+    --> src/kernel/boot/orchestrator_state.rs:1463:51
+     |
+1463 |     fn run_unlock_graduated_proof_with(&mut self, tid: u64, cnode: CNodeId) {
+     |                                                   ^^^ help: if this is intentional, prefix it with an underscore: `_tid`
+
+warning: unused variable: `cpu`
+    --> src/kernel/boot/thread_state.rs:1087:9
+     |
+1087 |         cpu: crate::kernel::scheduler::CpuId,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: value assigned to `stash_bound_receiver_tid` is never read
+   --> src/kernel/syscall/ipc.rs:464:78
+    |
+464 |     let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
+    |                                                                              ^^^^ this value is reassigned later and never used
+...
+509 |             stash_bound_receiver_tid = bound_tid;
+    |             ------------------------------------ `stash_bound_receiver_tid` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `cpu`
+    --> src/runtime.rs:8193:9
+     |
+8193 |         cpu: CpuId,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cpu`
+
+warning: unused variable: `virt`
+     --> src/runtime.rs:16856:9
+      |
+16856 |         virt: crate::kernel::vm::VirtAddr,
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_virt`
+
+Some errors have detailed explanations: E0133, E0425, E0432, E0433.
+For more information about an error, try `rustc --explain E0133`.
+error: could not compile `yarm` (lib) due to 12 previous errors; 38 warnings emitted
