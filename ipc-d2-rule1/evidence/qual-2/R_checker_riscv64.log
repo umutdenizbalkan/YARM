@@ -1,0 +1,3 @@
+D2_PUBLISH_RACE_CHECK verdict=ok races=2 split=2 broad=0 recovered=2 defects=0 unverified=0 lost_records=0
+  race line=130220 tid=10002 route=split wait_gen=266 record=('1', '139') sender=10008 recovered=1
+  race line=142091 tid=10002 route=split wait_gen=289 record=('1', '151') sender=10009 recovered=1

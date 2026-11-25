@@ -1,0 +1,72 @@
+warning: unused attribute
+    --> crates/yarm-user-rt/src/lib.rs:1670:5
+     |
+1670 |     #[inline]
+     |     ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> crates/yarm-user-rt/src/lib.rs:1669:5
+     |
+1669 |     #[inline]
+     |     ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+
+running 275 tests
+....................................................................................... 87/275
+....................................................................................... 174/275
+.......... 184/275
+control_plane::tests::sup_l5b_crash_test_binary_and_staging_are_test_gated --- FAILED
+.. 187/275
+control_plane::tests::sup_l6b_runtime_handoff_markers_and_guardrails_are_wired --- FAILED
+....................................................................................... 275/275
+
+failures:
+
+---- control_plane::tests::sup_l5b_crash_test_binary_and_staging_are_test_gated stdout ----
+
+thread 'control_plane::tests::sup_l5b_crash_test_binary_and_staging_are_test_gated' (14813) panicked at crates/yarm-control-plane-servers/src/control_plane/mod.rs:2766:13:
+crash_test_srv must contain CRASH_TEST_SRV_FAULT_NOW
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: yarm_control_plane_servers::control_plane::tests::sup_l5b_crash_test_binary_and_staging_are_test_gated
+             at ./src/control_plane/mod.rs:2766:13
+   3: yarm_control_plane_servers::control_plane::tests::sup_l5b_crash_test_binary_and_staging_are_test_gated::{closure#0}
+             at ./src/control_plane/mod.rs:2751:62
+   4: <yarm_control_plane_servers::control_plane::tests::sup_l5b_crash_test_binary_and_staging_are_test_gated::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   5: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- control_plane::tests::sup_l6b_runtime_handoff_markers_and_guardrails_are_wired stdout ----
+
+thread 'control_plane::tests::sup_l6b_runtime_handoff_markers_and_guardrails_are_wired' (14816) panicked at crates/yarm-control-plane-servers/src/control_plane/mod.rs:3164:13:
+PM source must contain PM_VFS_SPAWN_LOAD_REPLY image_id={} status=ok len={}
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/std/src/panicking.rs:676:5
+   1: core::panicking::panic_fmt
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/panicking.rs:80:14
+   2: yarm_control_plane_servers::control_plane::tests::sup_l6b_runtime_handoff_markers_and_guardrails_are_wired
+             at ./src/control_plane/mod.rs:3164:13
+   3: yarm_control_plane_servers::control_plane::tests::sup_l6b_runtime_handoff_markers_and_guardrails_are_wired::{closure#0}
+             at ./src/control_plane/mod.rs:3099:66
+   4: <yarm_control_plane_servers::control_plane::tests::sup_l6b_runtime_handoff_markers_and_guardrails_are_wired::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   5: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/5b7b37aefcb5b2fba3c2392bc9065b9e4602d494/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    control_plane::tests::sup_l5b_crash_test_binary_and_staging_are_test_gated
+    control_plane::tests::sup_l6b_runtime_handoff_markers_and_guardrails_are_wired
+
+test result: FAILED. 273 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+error: test failed, to rerun pass `-p yarm-control-plane-servers --lib`

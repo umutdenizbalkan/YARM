@@ -1,0 +1,17 @@
+[ipc-displace1-grade][fail] kernel exact unwinds of R2: 15 (want 16)
+[ipc-displace1-grade][fail] round 1: order block=30298 owner_refusal=30658 refusal=30668 unwind=31564 settle=30706 delivery=30878
+[ipc-displace1-grade][fail] round 2: order block=31200 owner_refusal=31556 refusal=31560 unwind=32340 settle=31570 delivery=31676
+[ipc-displace1-grade][fail] round 3: order block=31992 owner_refusal=32332 refusal=32336 unwind=33288 settle=32344 delivery=32462
+[ipc-displace1-grade][fail] round 4: order block=32942 owner_refusal=33280 refusal=33284 unwind=34260 settle=33292 delivery=33432
+[ipc-displace1-grade][fail] round 5: order block=33722 owner_refusal=34252 refusal=34256 unwind=35044 settle=34264 delivery=34380
+[ipc-displace1-grade][fail] round 6: order block=34692 owner_refusal=35036 refusal=35040 unwind=35830 settle=35048 delivery=35178
+[ipc-displace1-grade][fail] round 7: order block=35484 owner_refusal=35822 refusal=35826 unwind=36622 settle=35834 delivery=35956
+[ipc-displace1-grade][fail] round 8: order block=36276 owner_refusal=36614 refusal=36618 unwind=37572 settle=36626 delivery=36748
+[ipc-displace1-grade][fail] round 9: order block=37056 owner_refusal=37564 refusal=37568 unwind=38540 settle=37576 delivery=37698
+[ipc-displace1-grade][fail] round 10: order block=38006 owner_refusal=38532 refusal=38536 unwind=39318 settle=38544 delivery=38656
+[ipc-displace1-grade][fail] round 11: order block=38976 owner_refusal=39310 refusal=39314 unwind=40118 settle=39322 delivery=39476
+[ipc-displace1-grade][fail] round 12: order block=39768 owner_refusal=40108 refusal=40112 unwind=40918 settle=40122 delivery=40256
+[ipc-displace1-grade][fail] round 13: order block=40560 owner_refusal=40908 refusal=40912 unwind=41688 settle=40922 delivery=41020
+[ipc-displace1-grade][fail] round 14: order block=41340 owner_refusal=41680 refusal=41684 unwind=42596 settle=41692 delivery=41960
+[ipc-displace1-grade][fail] round 15: order block=42250 owner_refusal=42588 refusal=42592 unwind=43530 settle=42600 delivery=42890
+IPC_DISPLACE1_WITNESS_SEAL arch=aarch64 smp=2 rounds=16 r1=10009 r2=10008 s=1 endpoint=6/1 blocks=16 refusals=16 deliveries_r1=16 wakes_r1=16 r1_wake_cpus=0 r1_cpus=0 r2_cpus=1 cross_cpu_rounds=15 witness=fail core_smoke=ok result=fail

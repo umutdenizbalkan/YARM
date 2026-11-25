@@ -1,0 +1,3 @@
+[vfs-mount-witness] building x86_64 artifacts with cap-gen-witness,vfs-correct-witness,vfs-mount-witness
+[vfs-mount-witness] booting QEMU -smp 2
+VFS_MOUNT_WITNESS_SEAL arch=x86_64 smp=2 profile=wide result=fail reason=no_boot_log

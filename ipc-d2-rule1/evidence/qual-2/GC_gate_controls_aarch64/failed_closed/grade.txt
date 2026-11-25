@@ -1,0 +1,4 @@
+[ipc-displace1-grade][core] [error] U9-RX4: no fail-closed settlement on the blocking route -- expected 0, got 1: IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED
+[ipc-displace1-grade][fail] 1 fail-closed receive settlement(s): [{'cpu': '0', 'tid': '10008', 'phase': 'publish', 'outcome': 'incarnation_moved', 'reason': 'receiver_already_waiting'}]
+[ipc-displace1-grade][fail] the standard core smoke rejected this boot (see [core] lines)
+IPC_DISPLACE1_WITNESS_SEAL arch=aarch64 smp=2 rounds=16 r1=10009 r2=10008 s=1 endpoint=6/1 blocks=16 refusals=16 deliveries_r1=16 wakes_r1=16 r1_wake_cpus=0 r1_cpus=0 r2_cpus=1 cross_cpu_rounds=16 witness=fail core_smoke=rejected(rc=1) result=fail

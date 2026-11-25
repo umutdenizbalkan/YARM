@@ -1,0 +1,12 @@
+[ipc-displace1-grade][fail] kernel exact unwinds of R2: 15 (want 16)
+[ipc-displace1-grade][fail] R2's settlement was not QueueFull through its own frame: {'cpu': '1', 'tid': '10008', 'asid': '1', 'reason': 'receiver_already_waiting', 'answer': '6', 'outcome': 'incarnation_moved', 'resumable': '0'}
+[ipc-displace1-grade][fail] round 7: order block=19487 owner_refusal=19769 refusal=19771 unwind=20527 settle=19777 delivery=19879
+[ipc-displace1-grade][fail] round 8: order block=20143 owner_refusal=20515 refusal=20519 unwind=21079 settle=20533 delivery=20581
+[ipc-displace1-grade][fail] round 9: order block=20787 owner_refusal=21073 refusal=21075 unwind=21689 settle=21083 delivery=21141
+[ipc-displace1-grade][fail] round 10: order block=21341 owner_refusal=21679 refusal=21685 unwind=22277 settle=21695 delivery=21761
+[ipc-displace1-grade][fail] round 11: order block=21955 owner_refusal=22269 refusal=22273 unwind=22831 settle=22281 delivery=22331
+[ipc-displace1-grade][fail] round 12: order block=22539 owner_refusal=22823 refusal=22827 unwind=23405 settle=22835 delivery=22885
+[ipc-displace1-grade][fail] round 13: order block=23093 owner_refusal=23393 refusal=23399 unwind=23939 settle=23411 delivery=23463
+[ipc-displace1-grade][fail] round 14: order block=23677 owner_refusal=23933 refusal=23935 unwind=24457 settle=23943 delivery=24007
+[ipc-displace1-grade][fail] round 15: order block=24201 owner_refusal=24453 refusal=24455 unwind=25067 settle=24463 delivery=24531
+IPC_DISPLACE1_WITNESS_SEAL arch=x86_64 smp=2 rounds=16 r1=10009 r2=10008 s=1 endpoint=6/1 blocks=16 refusals=16 deliveries_r1=16 wakes_r1=16 r1_wake_cpus=0 r1_cpus=0 r2_cpus=1 cross_cpu_rounds=15 witness=fail core_smoke=ok result=fail

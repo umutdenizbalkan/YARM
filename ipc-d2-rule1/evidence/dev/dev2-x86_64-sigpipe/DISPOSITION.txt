@@ -1,0 +1,1 @@
+dev2-x86_64-sigpipe: strict SMP2 fd witness with timer-contract-witness added (uncommitted). fd witness sealed ok (1 race, recovered); the strict x86_64 core smoke exited 141 at its tick parse (printf | head under pipefail, pre-existing at 4b7b71e0) before grading. Superseded by dev3.

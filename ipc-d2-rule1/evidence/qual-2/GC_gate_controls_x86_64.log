@@ -1,0 +1,8 @@
+GATEFIX arch=x86_64 variant=legit replayed_exact=1 core_rc=0 core_smoke=ok witness=ok result=ok core_reasons=[]
+GATEFIX arch=x86_64 variant=failed_closed replayed_exact=1 core_rc=1 core_smoke=rejected(rc=1) witness=fail result=fail core_reasons=[[fail] STOP-SHIP: x86_64 D2 publish-race check verdict is not ok (rc=1)]
+GATEFIX arch=x86_64 variant=publish_race replayed_exact=1 core_rc=1 core_smoke=rejected(rc=1) witness=fail result=fail core_reasons=[[fail] STOP-SHIP: x86_64 D2 publish-race check verdict is not ok (rc=1)]
+GATEFIX arch=x86_64 variant=no_unwind replayed_exact=1 core_rc=0 core_smoke=ok witness=fail result=fail core_reasons=[]
+GATEFIX arch=x86_64 variant=dup_delivery replayed_exact=1 core_rc=0 core_smoke=ok witness=fail result=fail core_reasons=[]
+GATEFIX arch=x86_64 variant=missing_delivery replayed_exact=1 core_rc=0 core_smoke=ok witness=fail result=fail core_reasons=[]
+GATEFIX arch=x86_64 variant=renamed_failed_closed replayed_exact=1 core_rc=0 core_smoke=ok witness=fail result=fail core_reasons=[]
+GATEFIX arch=x86_64 variant=renamed_settled replayed_exact=1 core_rc=0 core_smoke=ok witness=fail result=fail core_reasons=[]

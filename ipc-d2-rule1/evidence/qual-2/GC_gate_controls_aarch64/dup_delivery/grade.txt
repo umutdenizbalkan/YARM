@@ -1,0 +1,18 @@
+[ipc-displace1-grade][fail] round 3: R1 resumed 2 times (want exactly 1)
+[ipc-displace1-grade][fail] kernel deliveries to R1: 17 (want 16)
+[ipc-displace1-grade][fail] round 2: order block=31204 owner_refusal=31560 refusal=31564 unwind=31568 settle=31574 delivery=30882
+[ipc-displace1-grade][fail] round 3: order block=31996 owner_refusal=32336 refusal=32340 unwind=32344 settle=32348 delivery=31680
+[ipc-displace1-grade][fail] round 4: order block=32948 owner_refusal=33286 refusal=33290 unwind=33294 settle=33298 delivery=32466
+[ipc-displace1-grade][fail] round 5: order block=33728 owner_refusal=34258 refusal=34262 unwind=34266 settle=34270 delivery=33438
+[ipc-displace1-grade][fail] round 6: order block=34698 owner_refusal=35042 refusal=35046 unwind=35050 settle=35054 delivery=34386
+[ipc-displace1-grade][fail] round 7: order block=35490 owner_refusal=35828 refusal=35832 unwind=35836 settle=35840 delivery=35184
+[ipc-displace1-grade][fail] round 8: order block=36282 owner_refusal=36620 refusal=36624 unwind=36628 settle=36632 delivery=35962
+[ipc-displace1-grade][fail] round 9: order block=37062 owner_refusal=37570 refusal=37574 unwind=37578 settle=37582 delivery=36754
+[ipc-displace1-grade][fail] round 10: order block=38012 owner_refusal=38538 refusal=38542 unwind=38546 settle=38550 delivery=37704
+[ipc-displace1-grade][fail] round 11: order block=38982 owner_refusal=39316 refusal=39320 unwind=39324 settle=39328 delivery=38662
+[ipc-displace1-grade][fail] round 12: order block=39774 owner_refusal=40114 refusal=40118 unwind=40124 settle=40128 delivery=39482
+[ipc-displace1-grade][fail] round 13: order block=40566 owner_refusal=40914 refusal=40918 unwind=40924 settle=40928 delivery=40262
+[ipc-displace1-grade][fail] round 14: order block=41346 owner_refusal=41686 refusal=41690 unwind=41694 settle=41698 delivery=41026
+[ipc-displace1-grade][fail] round 15: order block=42256 owner_refusal=42594 refusal=42598 unwind=42602 settle=42606 delivery=41966
+[ipc-displace1-grade][fail] round 16: order block=43186 owner_refusal=43528 refusal=43532 unwind=43536 settle=43540 delivery=42896
+IPC_DISPLACE1_WITNESS_SEAL arch=aarch64 smp=2 rounds=16 r1=10009 r2=10008 s=1 endpoint=6/1 blocks=16 refusals=16 deliveries_r1=17 wakes_r1=16 r1_wake_cpus=0 r1_cpus=0 r2_cpus=1 cross_cpu_rounds=16 witness=fail core_smoke=ok result=fail

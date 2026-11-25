@@ -1,0 +1,4 @@
+[ipc-displace1-witness] building base x86_64 artifacts with ipc-displace1-witness
+[ipc-displace1-witness] rebuilding kernel_boot with x86-shared-region-direct-oracle
+[ipc-displace1-witness] booting QEMU -smp 2 with yarm.ipc_displace1_witness=1
+IPC_DISPLACE1_WITNESS_SEAL arch=x86_64 smp=2 result=fail reason=no_boot_log

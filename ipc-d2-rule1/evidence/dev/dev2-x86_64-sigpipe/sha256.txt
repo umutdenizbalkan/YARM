@@ -1,0 +1,5 @@
+a67896f5ad5bfa280c1397256a2462ecff4384dcf330b8ec5f4fef9512160c19  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-dev/dev2-x86_64/boot.log
+1f39bee6bfdffade70489ff946f68cd02a065c37a130ef7f9b6e73c76ef3a16e  build-x86_64/kernel_boot.elf
+a7ffae2c15618423971fc65caab06d852e2b59a53f39f9a18e7180ae57916b65  build-x86_64/initramfs-core.cpio
+81203d05d560d43071d0e2e7aae68f9695987b443db1af9748686eea0badc382  build-x86_64/rootfs/init
+97056678793b338e860d6ebb2ffa74d2f86005ddf2415958836ba0626e00f008  scripts/fixtures/vfs-fixture.bin

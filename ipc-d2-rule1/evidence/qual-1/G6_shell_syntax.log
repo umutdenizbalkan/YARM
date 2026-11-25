@@ -1,0 +1,6 @@
+ok scripts/qemu-x86_64-core-smoke.sh
+ok scripts/qemu-aarch64-core-smoke.sh
+ok scripts/qemu-riscv64-core-smoke.sh
+ok scripts/qemu-x86_64-optional-fs-smoke.sh
+ok scripts/qemu-aarch64-optional-fs-smoke.sh
+ok scripts/qemu-vfs-fd-witness-smoke.sh

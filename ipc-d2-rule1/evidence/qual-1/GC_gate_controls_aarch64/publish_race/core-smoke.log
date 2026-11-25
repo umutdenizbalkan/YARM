@@ -1,0 +1,23 @@
+ARTIFACT_BINDING arch=aarch64 kernel=build-aarch64/yarm-aarch64.bin kernel_sha256=259258d56cf3350d6de084049f64aac29e2cdc927b4e278fa779e252142b2d12 kernel_features=aarch64-shared-region-direct-oracle kernel_resolved_features=aarch64-shared-region-direct-oracle,shared-region-direct-oracle kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2p1-wt/target/aarch64-yarm-none/aarch64-none/kernel_boot:fresh=0 initramfs=build-aarch64/initramfs-core.cpio initramfs_sha256=41d7ae235c0dce8d80eabcce978e7fe4d1fa50eaa2627c5c7c6f6d4eab061f0c initramfs_features=ipc-displace1-witness initramfs_compile_env=none source=clean:99d73a76a573a754cb9966b9a28623a7ca4aa536 required=kernel=aarch64-shared-region-direct-oracle,initramfs=ipc-displace1-witness result=ok
+[info] qemu command: qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024M -smp 2 -nographic -monitor none -serial stdio -kernel build-aarch64/yarm-aarch64.bin -initrd build-aarch64/initramfs-core.cpio -append console=ttyS0 rdinit=/init yarm.ipc_displace1_witness=1
+[info] aarch64 core: completion condition: idle
+[ok] aarch64 core: terminal idle (IPCD1_WITNESS_DONE) reached — QEMU stopped intentionally
+[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell
+[ok] U9-RX4: PM decodes the lifecycle query
+[ok] U9-RX4: PM replies successfully
+[ok] U9-RX4: terminal-outcome evaluator self-test passed (8 accepted, 27 rejected)
+[ok] U9-RX4: REPLY won the terminal of record_index=0 record_generation=1 (queued route, cap 65538) — commit=1 resume=1 one-shot revoked, no timeout win
+[ok] U9-RX4: no reply cap is lost to the u32::MAX sentinel
+[ok] U9-RX4: PM never fails to decode
+[ok] U9-RX4: no writeback rollback on the witnessed path
+[ok] U9-RX4: the reply cap is never used twice
+[ok] U9-RX4: no cap materialization failure
+[ok] U9-RX4: the blocking IpcRecv route publishes and defers (n=177)
+[ok] U9-RX4: the broad dispatcher is skipped for a published block (n=379)
+[ok] U9-RX4: the existing D2-recv drain resumes a replacement (n=137)
+[ok] U9-RX4: no fail-closed settlement on the blocking route
+[ok] U9-RX4: AArch64 queued-plain reply-cap + framing witness chain complete
+D2_PUBLISH_RACE_CHECK verdict=defect races=1 split=1 broad=0 recovered=0 defects=1 unverified=0 lost_records=0
+  race line=15556 tid=10008 route=split wait_gen=1 record=None sender=None recovered=0
+  DEFECT S4: line 15556 tid=10008: settled receiver_already_waiting, not queue_non_empty
+[fail] STOP-SHIP: aarch64 D2 publish-race check verdict is not ok (rc=1)

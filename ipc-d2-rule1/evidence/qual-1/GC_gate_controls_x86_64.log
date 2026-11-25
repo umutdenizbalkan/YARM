@@ -1,0 +1,10 @@
+grep: /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log: No such file or directory
+grep: /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log: No such file or directory
+cp: cannot stat '/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log': No such file or directory
+awk: cannot open "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log" (No such file or directory)
+awk: cannot open "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log" (No such file or directory)
+awk: cannot open "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log" (No such file or directory)
+awk: cannot open "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log" (No such file or directory)
+awk: cannot open "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log" (No such file or directory)
+awk: cannot open "/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log" (No such file or directory)
+sed: can't read /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/d2r1-evidence/qual-1/I_ipcd1_strict_smp2_x86_64/boot.log: No such file or directory
