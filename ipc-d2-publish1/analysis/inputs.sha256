@@ -1,0 +1,4 @@
+# inputs: VFS-CORRECT1C evidence 35267905, vfs-correct1c/evidence/qual-3/R_race_smp2_<port>/boot.log.gz
+8446673217c48600e9421fa8b0e4c373401110290b35265f603b8ca5ec88030c  R_race_smp2_aarch64/boot.log.gz
+d3bf9f4720249a9d9bb87514454e701cb78a0ff500c1414660a34251dca2bee2  R_race_smp2_riscv64/boot.log.gz
+eaad3c0f62e019a8a2e29e26c70e2917cee60aeb0e7ec1cf2b6cd11ec189c154  R_race_smp2_x86_64/boot.log.gz

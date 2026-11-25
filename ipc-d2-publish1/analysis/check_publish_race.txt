@@ -1,0 +1,4 @@
+CHECK_PUBLISH_RACE log=R_race_smp2_aarch64/boot.norm.log events=1 result=ok
+CHECK_PUBLISH_RACE log=R_race_smp2_riscv64/boot.norm.log events=2 result=ok
+CHECK_PUBLISH_RACE log=R_race_smp2_x86_64/boot.norm.log events=3 result=ok
+rc=0

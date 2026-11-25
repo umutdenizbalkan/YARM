@@ -1,0 +1,2 @@
+CHECK_PUBLISH_RACE_SELF_TEST result=ok logs=3 events=6 mutants_per_log=11
+rc=0

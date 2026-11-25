@@ -1,0 +1,16 @@
+# split parks per CPU: default SMP2 core smokes (VFS-CORRECT1C run 3) and the SMP2 fd witness boots
+== S_gp_aarch64.boot.log
+    144 IPC_RECV_BLOCK_SPLIT_DONE cpu=0
+== S_gp_riscv64.boot.log
+  14029 IPC_RECV_BLOCK_SPLIT_DONE cpu=0
+== S_gp_x86_64.smoke.log
+  16975 IPC_RECV_BLOCK_SPLIT_DONE cpu=0
+== R_race_smp2_aarch64
+    775 IPC_RECV_BLOCK_SPLIT_DONE cpu=0
+      7 IPC_RECV_BLOCK_SPLIT_DONE cpu=1
+== R_race_smp2_riscv64
+  21492 IPC_RECV_BLOCK_SPLIT_DONE cpu=0
+      7 IPC_RECV_BLOCK_SPLIT_DONE cpu=1
+== R_race_smp2_x86_64
+   1621 IPC_RECV_BLOCK_SPLIT_DONE cpu=0
+      7 IPC_RECV_BLOCK_SPLIT_DONE cpu=1
