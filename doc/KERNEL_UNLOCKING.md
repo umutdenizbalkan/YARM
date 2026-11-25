@@ -37773,3 +37773,237 @@ admin-endpoint capacity and frame exhaustion in the spawn, an unwritable out-add
   mount administrator, no delegation or revocation of the authority.
 - NR 23 has no class or TID gate (pre-existing); any caller can request an admin endpoint for its
   own child.
+
+#### VFS-CORRECT1C (from qualified `fbc8ff49`)
+
+The third VFS correctness pass, on `wip/vfs-correct1c`. The resident VFS gets its own client fd
+namespace (audit finding F01), opens that a failure cannot leak (F02), descriptors owned by
+processes rather than threads (F03), and one canonical path per request (F14). The canonical
+contract is `doc/VFS.md` §3.3; the kernel ABI is v14 with NR 21 `IpcCallerSession`
+(`doc/SYSCALL_ABI.md`, "v13 → v14").
+
+**The baseline defects** (`fbc8ff49`, AArch64 SMP2, `evidence/baseline/`, init with
+`vc1c-baseline-probe.patch`):
+- **F01.** The fd a client saw was the backend's own handle. initramfs and devfs both answered
+  17 (`initramfs_fd=17 devfs_fd=17 same=1`); VFS tracked fd 17 twice for one client
+  (`VFS_FD_TRACK fd=17 backend=65539`, then `backend=65540`); after closing the first, a READ of
+  17 was served by `/dev/null` (`read_after_close=Ok(0)`).
+- **F02.** VFS forwarded OPENAT before checking its own table and returned the backend's handle
+  whether or not it could track it: past 32 entries an open of `/ram/boot` returned fd 112 that
+  VFS answered `BAD_FD` to (`untracked_open n=33 … fd=112 read=Err(Status(4))`) — a handle open
+  at ramfs that no one could close.
+- **F03.** Descriptors were keyed by the sender TID: a second thread's fd was `BAD_FD` to the
+  main thread of the same process (`thread_open=Ok(29) … main_read=Err(Status(4))`), and a TID
+  reused by another process would have inherited them.
+- **F14.** The mount was chosen from the normalized path but the original spelling was forwarded:
+  `/initramfs//etc/vfs-fixture`, `/initramfs/etc/./vfs-fixture` and
+  `/ram/../initramfs/etc/vfs-fixture` routed to initramfs and were refused there, status 2.
+
+**F03 — identity: the smallest kernel mechanism.**
+- TCBs gain `process_incarnation`: a new process (spawn, fork) gets its own unique incarnation;
+  a thread copies its parent's; the spawn baseline replays it on failure.
+- **NR 21 `IpcCallerSession`** (public, ABI v13 → v14; 21 was the lowest reserved number):
+  op 0 reads the caller behind a reply capability in the caller's own CNode — it must be a reply
+  capability whose record is still `Available`, so its caller is blocked in exactly that NR 6
+  call — and returns `(thread_group_id, process_incarnation, caller_tid)`; op 1 (`SystemServer`)
+  returns a process's live-thread count. Errors: `WrongObject` (not a reply capability),
+  `MissingRight`, `InvalidCapability` (used, cancelled, or the caller gone), `InvalidArgs`.
+- It is **born split**: every production syscall is served by the split dispatcher, which
+  settles an unclaimed number as `InvalidNumber` (found on the first dev boot: VFS refused every
+  request). The split owner reads the reply capability (capability rank), its record (IPC rank)
+  and the caller's TCB (task rank) in turn; the AArch64 ABI import / finalize gates and the
+  RISC-V whitelist admit it. A hosted test pins the split route to the broad handler's answers,
+  op for op and refusal for refusal.
+- Policy stays in VFS: what a session owns, when it is reclaimed.
+
+**F01 / F02 — the router** (`control_plane/vfs/router.rs`, model
+`fs/common/fd_space.rs`). Per request: session (NR 21; none → 8 `PERMISSION`, nothing
+forwarded); housekeeping (one undelivered close retried at its instance; every other session
+asked for liveness, a dead one reclaimed); route; validate the backend completion against the op
+and the handle forwarded; rebuild the client completion with the client fd. Descriptors are per
+session (lowest free ≥ 3; 32 in all, 16 per session) and name an OFD = exact backend instance
+(mount registrations now carry an instance id) + VFS's full-width endpoint + backend handle.
+OPENAT reserves first (full: 9 `NO_FD`, no backend call), then releases on refusal, commits on
+success, and rolls back — closes the exact handle at the same instance — when the client reply
+fails. Undelivered closes go pending (retried, same instance); sent-but-unanswered ones are
+quarantined (never retried, the number may be reused); malformed or missing open replies are
+counted, never closed by guess. `READ_BULK` is retired (7); dup is not implemented; a fork child
+is a new session with no descriptors; an old fd whose instance is no longer the registration in
+the table answers `BAD_FD` and is never forwarded. The retired `fd_table.rs` is deleted.
+
+**F14 — canonical paths.** STATX / OPENAT normalize once; that result selects the mount (longest
+prefix on whole components) and is re-encoded as the backend's path, with flags, mode and mask
+kept and `dirfd` 0 (absolute paths only; a nonzero `dirfd` is logged, not forwarded).
+
+**Inventory of fd-bearing routes.** OPENAT (returns a client fd), READ, CLOSE, FILE_GRANT_RO
+(translated); STATX (path); READ_BULK (retired, 7); WRITE, IOCTL, DUP, FCNTL, POLL, EPOLL_*,
+SENDFILE and the shared-I/O opcodes (not routed, 1). Mount administration is unchanged (§3.2).
+
+**The witness** (`vfs-fd-witness`; init, VFS, ramfs; inert elsewhere). init spawns a second
+ramfs and mounts it at `/ram/b` through the 1B client. Each ramfs seeds three 96-byte files with
+bytes of its own TID and answers a STATX of `…/vc1c-stat` with its handle counts, so init counts
+backend handles in band and the bytes read name the backend that served them. Cases: the
+collision; eight non-canonical spellings plus the baseline's three initramfs ones; boundaries
+(`/ram/bx`, `/ram/b`, `/rbx`); the full session; a failed client reply (VFS's one injection: an
+OPENAT of `/ram/vc1c-failreply` answered first through a stale reply capability); a second thread
+that opens, reads and exits before the main thread reads on and closes; a fork child that opens
+two files (init's fd numbers), reads its own bytes, gets `BAD_FD` for init's third fd and exits
+without closing. Graded by `scripts/grade-vfs-fd-witness.py` (rules CORE, COLLISION, CANON,
+BOUNDARY, FULL, FAILREPLY, THREAD, FORK, FINAL, WIDTH, RACE, TRANSPORT; a synthetic self-test: 31 mutated logs, each rejected by the rule it targets)
+through `scripts/qemu-vfs-fd-witness-smoke.sh ARCH SMP wide|narrow`, with the 1A grader on the same
+boot.
+
+**Found on the way.**
+- **The split dispatcher owns every number** (above).
+- **A fork child's capabilities get new numbers.** It inherits the parent's inheritable
+  capabilities delegated in slot order into a fresh CNode; the first child used init's numbers
+  and was refused. The cell maps them by rank, probing slots silently with NR 21 op 0
+  (`WrongObject` = occupied). init holds one receive endpoint, which the child shares, so the
+  parent sleeps (`CLOCK_MONOTONIC`) while the child runs; the grader checks the child exited
+  first.
+- **x86_64 thread entry.** A thread starts with the 16-byte-aligned stack top in `rsp`; a Rust
+  function expects `rsp ≡ 8` (entered by a call), and its aligned SSE spill faulted
+  (`USER_INSTRUCTION_FAULT` at a `movaps` in `vfs_openat`). An unaligned top is refused by the
+  kernel; the cell enters through a `call` trampoline. The existing thread witnesses use the same
+  aligned top and have not hit an aligned spill at entry.
+- **The split receive route's queue-publication race** (`doc/IPC.md` §8.7) is reachable from
+  this witness at SMP2. Its thread and fork child can run on CPU 1 and call VFS while VFS is
+  between blocking and publishing its receive on CPU 0. No ordinary boot does this: there every
+  client and server runs on the bootstrap CPU. The route unwinds exactly and the message is
+  received. But `D2_PUBLISH_RACE_UNWIND` is a stop-ship marker in any smoke log
+  (`doc/AI_AGENT_RULES.md` §14.3).
+  - Run 2 on `23e78dea` was stopped. The fd smoke had passed the marker through the AArch64
+    blocker exclusion (3 occurrences, all VFS, each paired), and the unmodified x86_64 core smoke
+    rejected it (1 occurrence).
+  - That exclusion weakened a gate, so it is withdrawn. The smoke now excuses only the injected
+    stale-reply lines, the AArch64 hook refuses a regex naming a race or fail-closed marker, and
+    the grader's RACE rule rejects any race pair.
+  - The fd witness qualifies at SMP1. Its SMP2 boots are recorded per port as a finding (below),
+    and the marker is reported, not excused.
+- **The arch-boundary gate** stopped scanning `vfs/service.rs` at the first `#[cfg(test)]`, a
+  helper above `run()`: `run()` was never scanned (338 of the file's lines were). With that helper
+  retired it would have scanned three; it now scans to the test module (681 lines, `run()`
+  included).
+
+**Commits.**
+- `6e3b3564`: the repair, NR 21, the witness, grader and smoke, hosted tests, docs. Run 1 found
+  six source guards it tripped.
+- `23e78dea`: those guard findings (a name containing `try_split_ipc_call`; the RISC-V whitelist
+  count; the stage-29 exhaustive list; a production fn after `task.rs`'s test module). No
+  behaviour change. Run 2 stopped on the race marker (above).
+- `d9becda1`: the race exclusion withdrawn (smoke, AArch64 hook, grader RACE rule, `doc/VFS.md`).
+  Run 3 qualified it, except that control ncK was not caught (below).
+- `76c74efb`: the NR 21 split test also calls from a non-leader thread. Test-only
+  (`src/kernel/boot/tests.rs`). Run 4 reran the hosted steps and ncK, and rebuilt every artifact
+  run 3 booted. **The tested code commit is `76c74efb` (tree `3ac5677c`).**
+- The record commit follows it and touches only this file.
+
+**Qualification** (`evidence/`; `predeclared.sha` hashes each run's inputs before it starts;
+sequential; nothing rerun in place; every failed or stopped run kept with its disposition).
+- Run 1 (`6e3b3564`): stopped at the source guards.
+- Run 2 (`23e78dea`): stopped at `W_fd_wide_x86_64`.
+- Run 3 (`d9becda1`): every step.
+- Run 4 (`76c74efb`): hosted, ncK, artifact identity.
+
+| step | result |
+|---|---|
+| hosted (run 3; run 4 for lib and `--tests`) | fmt; serial lib, 6,791 passed, 0 failed, 3 ignored; `--tests`, 43 binaries, 7,188 passed; crates `yarm-ipc-abi` 221, `yarm-user-rt` 155, `yarm-fs-servers` 600, `yarm-srv-common` 27, `yarm-kernel` 10; `yarm-control-plane-servers` 273 passed and 2 failed, the same 2 (`sup_l5b_…`, `sup_l6b_…`) that fail on `fbc8ff49`; subsets, each non-zero: control-plane `vc1c` 24, fs `vc1c` 11, `vc1b` 10, `vc1a` 6, root `vc1c_nr21` 6, `syscall_abi` 2, `variant_count` 13, `u9spawn` 85, `fork` 93, `lock_order` 4; the three graders' self-tests |
+| gates | contract gate, doc enforcement, proc/VFS codec freeze, service arch boundary (it now scans 681 lines of `vfs/service.rs`; `fbc8ff49`'s gate scanned 338), service domain ownership |
+| checks | default and `cap-gen-witness` kernels; default, fd-witness and mount-witness servers; all three targets |
+| builds | default x86_64, AArch64 and RISC-V, C and B |
+| core smokes | default C artifacts, SMP2, each port: pass. The RISC-V smoke reports no failed check |
+| fd witness, `wide`, SMP1, each port | both graders `result=ok`, core smoke rc 0 (table below) |
+| fd witness, `narrow`, SMP1, AArch64 | both graders ok |
+| VFS-CORRECT1B witness rerun, `wide`, SMP2, each port | `result=ok`: 1A's 300 bytes, 6 grants, 6 NR 29 spawns; 1B's 192 bytes; every identity generation 65,537 or later |
+| fd witness, `wide`, SMP2, each port (finding) | rc 1 on every port: the race marker (AArch64 1, x86_64 3, RISC-V 2; each VFS's and paired); every other fd rule and the 1A checks pass |
+| negative controls, hosted | each in its own worktree. ncH (the backend handle returned as the client fd): 15 of 24 `vc1c` router tests fail. ncP (the original spelling forwarded): 4 fail. ncR (no rollback close): 3 fail. ncK (the split route names the TID): run 3, **not caught**, 6 passed; run 4 on `76c74efb`, caught (below) |
+| negative controls, live (AArch64, SMP1, `wide`) | ncP: CANON, the baseline's three initramfs spellings refused at initramfs (`statx=2 open=2`). ncS (VFS keys sessions by the sender TID): THREAD, the thread's open made session `tgid=10008`, the main thread's read and close of it refused. ncH: the boot fails before the witness, because PM's boot-time image spawn through VFS asks FILE_GRANT_RO for the fd it was given, the backend handle, and VFS refuses it (`BOOT_FATAL_ZC_ELF_LOAD_FAILED`). A catch, but not by the witness's COLLISION rule |
+| feature sweep | kernel and server features, one `cargo check` each: the 12 kernel features that fail are exactly VFS-CORRECT1B's base failures; the server results match VFS-CORRECT1B's sweep; `vfs-fd-witness` passes in all three crates |
+| artifact identity (run 4) | built from `76c74efb`, each port: the default kernel and core initramfs, and the `wide` fd-witness kernel, initramfs and init, are byte-identical to run 3's (15 of 15 SHA-256 equal). The VFS-CORRECT1B witness images and the `narrow` fd-witness images were not rebuilt; they compile no test code either. ncK fails `vc1c_nr21_split_route_answers_exactly_as_the_broad_handler`: for the second thread (TID 10000) the split route says `(10000, 22, 10000)` and the broad handler `(7, 22, 10000)`. Hosted lib and `--tests` pass on `76c74efb` |
+| not run | a `--workspace` run; the historical matrix; RT profiles; strict-mode (`QEMU_SMOKE_STRICT=1`) RISC-V witness smokes |
+
+Per port (fd witness, `wide`, SMP1, run 3):
+
+| port | backend handles A / B | client fds A / B | instances | rollback | full session | fork child reclaimed | end |
+|---|---|---|---|---|---|---|---|
+| x86_64 | 105 / 105 | 3 / 4 | 3 / 4 | handle 126 closed, backend opens 1 → 1 | 16 opened, 17th `NO_FD`, backend 1 → 17 → 1 | 2 descriptors, 2 backend closes | 0 descriptors, 0 OFDs, 0 sessions, 0 pending, 0 quarantined, 0 unknown opens |
+| AArch64 | 105 / 105 | 3 / 4 | 3 / 4 | same | same | same | same |
+| RISC-V | 105 / 105 | 3 / 4 | 3 / 4 | same | same | same | same |
+
+On every boot:
+- **Collision.** After closing A, a read of A is refused (4 `BAD_FD`), and B still reads its own
+  bytes.
+- **Canonical paths.** Every non-canonical spelling reaches the backend its canonical form names,
+  and reads that backend's own byte. The three baseline initramfs spellings answer 0. `/ram/bx`
+  answers 2, `/ram/b` answers 0, and `/rbx` answers 3.
+- **Thread.** The second thread (TID 10008) opens, reads and exits. The main thread then reads its
+  descriptor and closes it.
+- **Fork child.** The child (TID 10009) is reclaimed as session `incarnation=14`. Its two backend
+  handles at `/ram/b` are closed, and the backend's open count returns to where it was.
+- **Final state.** Both backends end with their starting open counts.
+
+**Resources.** Backend handles:
+- After the failed reply, the rolled-back handle was closed at the same instance, and the backend
+  open count came back to 1.
+- After the full session, the count returned from 17 to 1.
+- After the fork child's exit, its 2 handles were closed by reclamation.
+- At the end, VFS held no descriptor, OFD or session, with no pending, quarantined or unknown
+  backend open.
+
+The mount-admin retained records are separate and are not fd resources. They are VFS-CORRECT1B's
+bounded record of mount capabilities that a refused commit brought in.
+- **fd witness:** no refusals and nothing retained. Three mounts were published (`/ram`, `/ram/b`,
+  `/ext4`).
+- **1B rerun, each port:** `retained_total=2`, `retained_overflow=0`. These come from the
+  status-8 and status-1 commits, as in VFS-CORRECT1B's own qualification.
+
+**The RISC-V core smoke is advisory here.** Without `QEMU_SMOKE_STRICT=1` it prints failed checks
+and still exits 0. The fd witness boots fail two of its checks, and the run-3 disposition
+attributes both to the witness's workload:
+- **Spawn census:** 6 `SpawnFromMemoryObject` where a default boot has 5. The extra one is the
+  second ramfs.
+- **Split-dispatch census:** NR 12 ×1 (the fork) and NR 16 ×2 (the child's and the thread's exits)
+  are outside the syscalls a default boot dispatches.
+
+The VFS-CORRECT1B rerun fails one check, `VFS_MOUNT_REGISTER_RAMFS_OK` missing, which VFS-CORRECT1B's
+own delivered RISC-V boots also show. The default boot fails none.
+
+**Verdicts.**
+- **F01: CLOSED.** A client fd is VFS's own number, per session. Two backends that answer the
+  same handle (105) give two descriptors, and closing one leaves the other. Proved live on three
+  ports. The live negative control breaks the boot itself.
+- **F02: CLOSED.** OPENAT reserves before it forwards and refuses a full session without a
+  backend call. A failed client reply closes the exact handle at the exact instance, live, with
+  the backend count restored. Undelivered and unanswered closes are handled as pending and
+  quarantined (hosted).
+- **F03: CLOSED.** Descriptors belong to a process, named by the kernel (NR 21) as thread-group
+  id and incarnation:
+  - threads share a session;
+  - a fork child is a new session with none of the parent's descriptors;
+  - a dead session is reclaimed;
+  - a restarted backend's reused handle is never addressed (hosted, instance check);
+  - `dup` is not implemented.
+
+  Proved live on three ports at SMP1. The thread and fork case at SMP2 reaches the stop-ship race
+  marker (above) and is not counted.
+- **F14: CLOSED.** One normalization routes and is forwarded. Live, the baseline's three
+  spellings and eight more resolve on three ports, and mount boundaries fall on whole components.
+
+**Verdict: QUALIFIED** on `76c74efb`: run 4, with run 3's live results carried over because the
+images are byte-identical. **Open finding:** at SMP2 the fd witness reaches
+`D2_PUBLISH_RACE_UNWIND`. `doc/AI_AGENT_RULES.md` §14.3 makes that marker stop-ship, every core
+smoke rejects it, and this stage excuses it nowhere. Whether the split receive route's race
+should stay stop-ship once a server receives from clients on other CPUs is that rule's owner's
+decision, not this stage's.
+
+**Left outside.**
+- **Grant reclamation is VFS-LIFETIME1's.** A FILE_GRANT_RO capability that a client never
+  releases stays with that client.
+- **Reclamation timing.** Reclamation waits for the next request. A quarantined or unknown backend
+  open stays open at the backend for its life.
+- **Unsupported operations.** No descriptor passing, no `dup`, no relative paths (`dirfd` is
+  logged, never forwarded). `READ_BULK` is retired. WRITE, IOCTL, FCNTL, POLL and the rest are
+  not routed.
+- **Late replies.** A late reply to a request VFS gave up on can still arrive on its backend reply
+  endpoint, and completion validation rejects it.
+- **RISC-V strictness.** The RISC-V witness smokes ran non-strict (above).
