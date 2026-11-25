@@ -224312,10 +224312,16 @@ mod vc1c_ipc_caller_session {
 
     /// A server task `1` of `class`, current, with process `7` (and a thread of it) beside it.
     fn server_world(class: TaskClass) -> (KernelState, u64) {
+        let (s, inc, _thread) = server_world_with_thread(class);
+        (s, inc)
+    }
+
+    /// As `server_world`, also naming process `7`'s second thread, whose TID is not its process's.
+    fn server_world_with_thread(class: TaskClass) -> (KernelState, u64, u64) {
         let mut s = Bootstrap::init().expect("init");
         s.register_task_with_class(1, class).expect("server");
         process(&mut s, 7, TaskClass::App);
-        let _ = s
+        let thread = s
             .spawn_user_thread(7, 0x1000, 0x8000_0000, 0x4010)
             .expect("thread");
         s.enqueue_current_cpu(1).expect("enqueue");
@@ -224324,18 +224330,21 @@ mod vc1c_ipc_caller_session {
             s.yield_current().expect("switch to the server");
         }
         let inc = incarnation(&s, 7);
-        (s, inc)
+        (s, inc, thread)
     }
 
     /// Every production NR 21 is served by the split route: it must answer exactly as the broad
     /// handler does, op for op and refusal for refusal.
     #[test]
     fn vc1c_nr21_split_route_answers_exactly_as_the_broad_handler() {
-        let (mut s, inc7) = server_world(TaskClass::SystemServer);
+        let (mut s, inc7, thread) = server_world_with_thread(TaskClass::SystemServer);
+        assert_ne!(thread, 7, "the second thread's TID is not its process's");
         let reply = reply_cap_from(&mut s, 7);
+        let thread_reply = reply_cap_from(&mut s, thread);
         let (_eid, send, recv) = s.create_endpoint(4).expect("endpoint");
-        let cases: [[usize; 6]; 9] = [
+        let cases: [[usize; 6]; 10] = [
             [0, reply.0 as usize, 0, 0, 0, 0],
+            [0, thread_reply.0 as usize, 0, 0, 0, 0],
             [0, send.0 as usize, 0, 0, 0, 0],
             [0, recv.0 as usize, 0, 0, 0, 0],
             [0, 0xFFFF_0FFF, 0, 0, 0, 0],
@@ -224363,6 +224372,14 @@ mod vc1c_ipc_caller_session {
         let mut f = TrapFrame::new(21, [0, reply.0 as usize, 0, 0, 0, 0]);
         crate::kernel::syscall::session::ipc_caller_session_split(&k, 1, &mut f).expect("op 0");
         assert_eq!((f.ret0(), f.ret1(), f.ret2()), (7, inc7 as usize, 7));
+        // A call from the second thread names its process, not the thread: the session is the
+        // process, and only the third value is the caller's own TID.
+        let mut f = TrapFrame::new(21, [0, thread_reply.0 as usize, 0, 0, 0, 0]);
+        crate::kernel::syscall::session::ipc_caller_session_split(&k, 1, &mut f).expect("op 0");
+        assert_eq!(
+            (f.ret0(), f.ret1(), f.ret2()),
+            (7, inc7 as usize, thread as usize)
+        );
         // An App caller is refused op 1 on the split route too.
         let (s2, inc) = server_world(TaskClass::App);
         let k2 = crate::runtime::SharedKernel::new(s2);
