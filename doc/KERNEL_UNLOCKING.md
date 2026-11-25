@@ -38357,3 +38357,107 @@ boots. Following the pass's instruction, dev stays at `4b7b71e0`. The work is on
 - **VFS-LIFETIME1.** Queued, and not started.
 - **`scripts/qemu-x86_64-ap-generic-return-smoke.sh`.** It fails `bash -n` on `4b7b71e0` too.
   The shell-syntax gate does not cover it, and it is untouched here.
+
+#### RISCV-STRICT1 (from `6d6ae30d`; tested candidate `ccf582fe`)
+
+This pass closes the three strict RISC-V verdicts that IPC-D2-RULE1 left open
+(evidence `3b209df1`). The RISC-V core smoke now grades the obligations of the image it actually
+bound. No kernel, server or grader code changes.
+
+**The workload comes from the bound artifacts.** `scripts/riscv64-workload-obligations.py profile`
+reads the smoke's own verified `ARTIFACT_BINDING` line, right after the binding check and before
+QEMU starts. It derives one of three workloads:
+- `vfs-fd-witness`, when the bound kernel and initramfs were both built with that feature;
+- `vfs-mount-witness`, likewise;
+- `core`, for every other image.
+
+No caller sets it. The derivation refuses a failed binding, a kernel and initramfs that disagree,
+or one image carrying both witnesses. A witness image in the terminal-fault cell is refused too.
+
+**The ordinary image is graded exactly as before:**
+- three NR 23 and five NR 29;
+- `VFS_MOUNT_REGISTER_RAMFS_OK` required;
+- NR 12 and NR 16 outside the retired set.
+
+The terminal-fault cell still owes no spawn chain.
+
+**fd witness.** Its extras are attributed from the saved boots (six fd boots: VFS-CORRECT1C's SMP1
+and SMP2, IPC-D2-RULE1 run 2's a and b, and this pass's run 2 a and b, all the same) and encoded as follows. NR 12 and NR 16 join the sum only for
+this image, and only once each is tied to its task. A total that is merely right still fails.
+- **Sixth NR 29.** Six `SPAWN_FROM_MO_OK`, two of them image 11:
+  - one is the ordinary ramfs (TID 10006: `INIT_RAMFS_SPAWN_OK`, `VC1C_BEGIN tid_a`);
+  - the other is the witness's second ramfs (TID 10007: `VC1C_SECOND_RAMFS tid_b mount_status=0`).
+  - The seal names both.
+- **One NR 12.** `result=ok` on CPU 0, finalized once. It is the boot's only `FORK_TXN_COMMITTED`:
+  `parent_tid=1 child_tid=10009`, init forking the witness's child.
+- **Two NR 16.** Each is `result=queue_advance_committed outgoing=T captured=0 committed=0`. An
+  exiting task's frame is never captured (U9-EXIT1 §3). The two are the second thread (10008) and
+  the fork child (10009). For each T the smoke requires exactly one of each:
+  - `EXIT_TASK_SYSCALL_DISPATCHED nr=16 … result=ok`;
+  - `EXIT_TASK_LIFECYCLE_TRANSITION … syscall_returns=0`;
+  - `EXIT_TASK_CLAIM_RETIRED … code=0`;
+  - the exit switch deferred on that dispatch's own CPU.
+
+**1B (mount) witness.** Its init registers `/ram` through the authorized stage and commit
+(`init/vfs_mount_witness.rs` replaces `register_ramfs_mount_with_vfs`), so the ordinary marker is
+never printed. It owes positive evidence instead, graded by the unmodified mount grader loaded as a
+module. Its rules are:
+- **CORE**, with the smoke's own rc taken as 0: the witness finished, `fails=0`.
+- **IDENTITY:** exactly one `/ram` publication. Its cap is the one VFS received, not the sender's
+  number, and every `/ram/` forward uses it.
+- **BYTES:** the exact 192 bytes.
+
+The ordinary marker appearing in this image is itself a failure.
+
+**Tests** (`tests/riscv_split_census.rs`, 10 new cases). They use fixtures extracted from the three
+archived failures and the default boot (`scripts/fixtures/riscv-workload/`). Each image passes its
+own obligations. Graded as the ordinary image, the archived witness boots fail exactly as recorded.
+These are rejected:
+- a missing spawn, an extra spawn, and a sixth spawn of another task;
+- NR 16 → NR 3 and NR 12 → NR 13 at the same total, and NR 12 swapped for an NR 16;
+- an exit of another task, a captured exit, an exit as an early return, a fork with a handled
+  error, a fork by another parent, an exit deferred on another CPU, and a non-zero exit code;
+- a missing `/ram` publication, the sender's number published, a forward on another cap, a short
+  read, and the ordinary marker in a mount image;
+- each profile on each wrong image, and an unknown workload.
+
+The derivation is tested on binding lines. The helper's self-test has 43 cases. Two source guards
+moved with the code:
+- the RISC-V binding call keeps its output;
+- the terminal-fault guard pins the new owed expression.
+
+**Qualification** (evidence `wip/riscv-strict1-evidence`).
+- Run 1 was stopped 30 s in: its start point skipped the scope check.
+- Run 2 (`f119fcf6`, tree `523cd74e`) ran every step.
+
+| step | result |
+|---|---|
+| scope | since `ccf582fe`: the RISC-V core smoke, the helper, its fixtures and README, three hosted test files, this record |
+| hosted | fmt; lib 6,792 passed, 0 failed, 3 ignored (serial); `--tests` 44 binaries, 7,203 passed; `riscv_split_census` 15; `artifact_binding_scope` 6; RISC-V capacity rejection 12; RISC-V regular scope 12; lib `riscv` subset 466; helper 43; D2 checker 62; fd, mount, correct graders |
+| gates | contract, doc enforcement, proc/VFS codec freeze, service arch boundary, service domain ownership, shell syntax |
+| identity | rebuilt from `f119fcf6`, all 24 images IPC-D2-RULE1 run 2 booted are byte-identical: the default kernel and initramfs on each port, and the `wide` fd and `wide` 1B kernel, initramfs and init on each port |
+| replay | the archived boots through this smoke against the byte-identical bound images: fd a, fd b and 1B rc 0, every grader ok; default rc 0. Original verdicts kept unchanged: fd a and b core rc 1 (spawn 6 vs 5, split total), 1B core rc 1 (marker missing) |
+| wrong image | each rc 1: the fd boot on the default image fails exactly the two original checks; the default boot on the fd image fails (5 vs 6, witness records absent); the default and fd boots on the 1B image fail |
+| live, strict, SMP2, RISC-V | below |
+| non-strict, RISC-V | the IPC-DISPLACE1 witness `ok`, with D2 `ok`, 0 races and 16 cross-CPU rounds; gate controls as in IPC-D2-RULE1 |
+| carried forward | x86_64 and AArch64, from IPC-D2-RULE1 run 2: identical images, and unchanged smoke scripts and graders |
+| not run | the other RISC-V witness cells that call this smoke (futex, IPC residual and oracle cells). They bind images with neither witness feature, so they are graded as `core`; the hosted tests show the `core` checks unchanged |
+
+| boot | rc | printed failures | D2 | races (recovered) | split parks CPU 0 / 1 | graders |
+|---|---|---|---|---|---|---|
+| default core | 0 | none | ok | 0, recovery not exercised | 13,360 / 0 | |
+| fd witness a | 0 | none | ok | 1 (1) | 23,088 / 7 | fd ok, correct ok |
+| fd witness b | 0 | none | ok | 2 (2) | 23,377 / 7 | fd ok, correct ok |
+| 1B witness | 0 | none | ok | 0, recovery not exercised | 19,183 / 0 | mount ok, correct ok |
+
+Every race is VFS (TID 10002) on CPU 0 receiving a call queued from CPU 1, by the fork child
+10009 or the thread 10008.
+
+**Verdict: QUALIFIED** on `f119fcf6`. Every strict verdict passes on all three ports: RISC-V live
+here, and x86_64 and AArch64 carried forward.
+
+**Observed, unchanged.** When a boot log ends mid-line, the first line the smoke prints next is
+joined to it, so a `^\[fail\]` grep can miss it. The failure is still counted. IPC-D2-RULE1's
+smoke does the same.
+
+**Left outside.** VFS-LIFETIME1, which is queued: grant reclamation.
