@@ -1,0 +1,10 @@
+doc/KERNEL_UNLOCKING.md
+scripts/fixtures/README.md
+scripts/fixtures/riscv-workload/core.txt
+scripts/fixtures/riscv-workload/fd-witness.txt
+scripts/fixtures/riscv-workload/mount-witness.txt
+scripts/qemu-riscv64-core-smoke.sh
+scripts/riscv64-workload-obligations.py
+src/kernel/boot/tests.rs
+tests/artifact_binding_scope.rs
+tests/riscv_split_census.rs

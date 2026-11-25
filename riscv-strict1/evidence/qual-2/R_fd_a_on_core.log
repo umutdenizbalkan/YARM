@@ -1,0 +1,8 @@
+replayed_exact=1
+ARTIFACT_BINDING arch=riscv64 kernel=build-riscv64/yarm-riscv64.bin kernel_sha256=9e03c2dbabec5b2f162629480ee992073506d076f25f34be9728ed0e36a84c91 kernel_features=none kernel_resolved_features=none kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rv1-wt/target/riscv64gc-unknown-none-elf/release/kernel_boot:fresh=0 initramfs=build-riscv64/initramfs-core.cpio initramfs_sha256=6d43a68095e98718339b01e39670a3bfbae1b954117204acac1ab6f04cdfbd89 initramfs_features=none initramfs_compile_env=none source=clean:523cd74ea0358ee60d0770d2ba0a18ee5ec4d3d7 required=none result=ok
+RISCV_WORKLOAD profile=core
+[fail] RISC-V SpawnFromMemoryObject split count is 6, expected 5
+[info] RISCV-STRICT1: workload=core nr29_owed=5 nr12=0 nr16=0
+[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=23039 nr15=1 nr10=0 nr9=1 nr20=9 nr5=22338 nr2=677 nr1=1 nr23=3 nr29=6 nr0=0 nr12=0 nr16=0 workload=core)
+[fail] qemu-riscv64-core-smoke: 2 check(s) failed (qemu_status=0)
+core_rc=1

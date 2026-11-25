@@ -1,0 +1,17 @@
+== W_fd_strict_smp2_riscv64_a core_rc=1
+[fail] RISC-V SpawnFromMemoryObject split count is 6, expected 5
+[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=23039 nr15=1 nr10=0 nr9=1 nr20=9 nr5=22338 nr2=677 nr1=1 nr23=3 nr29=6 nr0=0)
+[fail] qemu-riscv64-core-smoke: 2 check(s) failed (qemu_status=124)
+VFS_CORRECT_WITNESS_SEAL arch=riscv64 smp=2 result=fail bytes=300 grants=6 late_service_tid=10003 nr29_spawns=6
+VFS_FD_WITNESS_SEAL arch=riscv64 smp=2 wide=1 result=fail fails=1
+== W_fd_strict_smp2_riscv64_b core_rc=1
+[fail] RISC-V SpawnFromMemoryObject split count is 6, expected 5
+[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=21902 nr15=1 nr10=0 nr9=1 nr20=9 nr5=21204 nr2=674 nr1=1 nr23=3 nr29=6 nr0=0)
+[fail] qemu-riscv64-core-smoke: 2 check(s) failed (qemu_status=124)
+VFS_CORRECT_WITNESS_SEAL arch=riscv64 smp=2 result=fail bytes=300 grants=6 late_service_tid=10003 nr29_spawns=6
+VFS_FD_WITNESS_SEAL arch=riscv64 smp=2 wide=1 result=fail fails=1
+== W_1b_strict_smp2_riscv64 core_rc=1
+[fail] required marker missing: VFS_MOUNT_REGISTER_RAMFS_OK
+[fail] qemu-riscv64-core-smoke: 1 check(s) failed (qemu_status=124)
+VFS_CORRECT_WITNESS_SEAL arch=riscv64 smp=2 result=fail bytes=300 grants=5 late_service_tid=10003 nr29_spawns=5
+VFS_MOUNT_WITNESS_SEAL arch=riscv64 smp=2 wide=1 result=fail generation=65537 grant_cap=4295032853 init_admin=4295032845 init_backend=4295098384 ram_forwards=8 stale_handle=stage_refused:4295163920 truncated_handle=stage_refused:131088 vfs_admin_recv=4295032834 vfs_local_backend=4295032844

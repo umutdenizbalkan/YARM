@@ -1,0 +1,4 @@
+ok scripts/qemu-riscv64-core-smoke.sh
+ok scripts/qemu-vfs-fd-witness-smoke.sh
+ok scripts/qemu-vfs-mount-witness-smoke.sh
+ok scripts/ipc-displace1-gate-controls.sh

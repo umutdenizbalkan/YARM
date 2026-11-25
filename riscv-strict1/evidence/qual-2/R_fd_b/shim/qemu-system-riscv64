@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+cat /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rv1-evidence/qual-2/archive/W_fd_strict_smp2_riscv64_b/boot.log
+exit 0

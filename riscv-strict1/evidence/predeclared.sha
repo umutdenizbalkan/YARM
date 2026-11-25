@@ -1,0 +1,19 @@
+run 1: C=f119fcf608de5fd09427fd4efde30d4547a0bcbb tree=523cd74ea0358ee60d0770d2ba0a18ee5ec4d3d7 written=2026-11-25T19:42:44Z; inputs:
+86e9977860a3d0e2db98cfe3833afc065bccba9135c62da52c3209db9cf7b8b0  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rv1-evidence/rv1_qual.sh
+8090671c80dc829e330b224a35b975d56793a4d885212bee48ba1e49effd6585  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rv1-evidence/extract_fixture.py
+4ce24570e76ff67d6d2f92be91eb8ea4c0cdf5b5ac15f7d711eb290332ec7218  scripts/riscv64-workload-obligations.py
+a08901cecb1df7ca656b52b6a1931b688effc42ab299103d0b32b7c295966e20  scripts/fixtures/riscv-workload/core.txt
+b14a2aa77e08b99e207bce71e80e785ff414de99c19e961130233a86ed3c2e87  scripts/fixtures/riscv-workload/fd-witness.txt
+b5ff105028a73a42302d9cf132db3460f67af952651f9820bdb3199988b6bf8f  scripts/fixtures/riscv-workload/mount-witness.txt
+0bcbbcdc85da527eee250f965c674c133f4e6584246e318359af0182ca9b0b2a  scripts/qemu-riscv64-core-smoke.sh
+b63efb97f1de6a517986906d0f83bc3107e7065ab7f4108a3efe59cc2070534e  scripts/qemu-vfs-fd-witness-smoke.sh
+9e4cb8fc3d7a9ede6a6afe32febc19c11d93bebc9028b9dc75a798a451895574  scripts/qemu-vfs-mount-witness-smoke.sh
+506b345719c508073d2966d7b2d7d2999db0389842a3372ab1bf448f7fc96668  scripts/qemu-ipc-displace1-witness-smoke.sh
+0ff5f73765ee0f07ee799693df724bfb5fe952f726b766afbf491a12aa6b6cc7  scripts/ipc-displace1-gate-controls.sh
+44c78dd2f788e80b42b1361fb476654af5de2184c00fc1f40be9b371c0e17be6  scripts/grade-vfs-fd-witness.py
+35406263144c7faa71724d36dcb3e59a50f0235fd71dbe2a5ccde93608dfe125  scripts/grade-vfs-mount-witness.py
+310d5ef26b7ca7f1a28e3500bb81f3fc95dc9020057462cbcfc84f7dbfa1448a  scripts/grade-vfs-correct-witness.py
+962f4451cfd2a2adbe2b7d7a7fbb59dc6641a0714b1fa7bfb2f1c9eb3f7c798e  scripts/grade-ipc-displace1-witness.py
+9a8a8a7fcebf47981d9d23ced3c1cda2968e0284b10461f1d7536d50f9f6ebdf  scripts/check-d2-publish-race.py
+c6ea48c3363b06ea6d928a6b867a5dc62bacbc6fde6a87aadd862b7a79282da2  tests/riscv_split_census.rs
+run 2: C=f119fcf608de5fd09427fd4efde30d4547a0bcbb (same commit, runner and inputs as run 1; run 1 stopped, see its disposition) written=2026-11-25T19:43:20Z

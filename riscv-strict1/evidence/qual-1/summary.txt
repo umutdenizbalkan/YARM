@@ -1,0 +1,9 @@
+rv1 qual qual-1 start 2026-11-25T19:42:44Z C=f119fcf608de5fd09427fd4efde30d4547a0bcbb P=ccf582feb8fef6f129195adcff75a5076851be19 E=3b209df1a01a84a03efe2e6c5aa6bde360cb7d87 FROM=H1 runner=86e9977860a3d0e2
+candidate tree 523cd74ea0358ee60d0770d2ba0a18ee5ec4d3d7
+=== H1_fmt [f119fcf608de porcelain=0]: cargo fmt --all -- --check (start 19:42:44)
+H1_fmt rc=0 secs=7 free=7.2G
+=== H2_hosted_lib [f119fcf608de porcelain=0]: env -u CARGO_TARGET_DIR cargo test -q --lib -- --test-threads=1 (start 19:42:51)
+
+DISPOSITION: stopped by hand 30 s in, during H2_hosted_lib, because FROM=H1 skipped the first step
+(X_scope, the diff-scope check, which precedes H1). Only H1_fmt (rc=0) completed. Not a
+qualification; superseded by qual-2 on the same commit and runner, started with FROM=X.

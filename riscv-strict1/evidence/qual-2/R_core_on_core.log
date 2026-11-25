@@ -1,0 +1,5 @@
+replayed_exact=1
+ARTIFACT_BINDING arch=riscv64 kernel=build-riscv64/yarm-riscv64.bin kernel_sha256=9e03c2dbabec5b2f162629480ee992073506d076f25f34be9728ed0e36a84c91 kernel_features=none kernel_resolved_features=none kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rv1-wt/target/riscv64gc-unknown-none-elf/release/kernel_boot:fresh=0 initramfs=build-riscv64/initramfs-core.cpio initramfs_sha256=6d43a68095e98718339b01e39670a3bfbae1b954117204acac1ab6f04cdfbd89 initramfs_features=none initramfs_compile_env=none source=clean:523cd74ea0358ee60d0770d2ba0a18ee5ec4d3d7 required=none result=ok
+RISCV_WORKLOAD profile=core
+[info] RISCV-STRICT1: workload=core nr29_owed=5 nr12=0 nr16=0
+core_rc=0

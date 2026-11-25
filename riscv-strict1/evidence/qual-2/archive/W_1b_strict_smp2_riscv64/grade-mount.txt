@@ -1,0 +1,2 @@
+[vfs-mount-witness][fail] CORE: core smoke rc=1
+VFS_MOUNT_WITNESS_SEAL arch=riscv64 smp=2 wide=1 result=fail generation=65537 grant_cap=4295032853 init_admin=4295032845 init_backend=4295098384 ram_forwards=8 stale_handle=stage_refused:4295163920 truncated_handle=stage_refused:131088 vfs_admin_recv=4295032834 vfs_local_backend=4295032844

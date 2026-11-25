@@ -1,0 +1,10 @@
+replayed_exact=1
+ARTIFACT_BINDING arch=riscv64 kernel=build-riscv64/yarm-riscv64.bin kernel_sha256=a37ac423d0aaccde7c6634b39bf78c86aee6b13a0c1eecd6d74ee2b51a913b67 kernel_features=cap-gen-witness,vfs-correct-witness,vfs-mount-witness kernel_resolved_features=cap-gen-witness,vfs-correct-witness,vfs-mount-witness kernel_nofp=pass kernel_cargo=/tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rv1-wt/target/riscv64gc-unknown-none-elf/release/kernel_boot:fresh=0 initramfs=build-riscv64/initramfs-core.cpio initramfs_sha256=0aa4aba72ddab339ee253470078d54315479e7198174059753efed21c564252d initramfs_features=cap-gen-witness,vfs-correct-witness,vfs-mount-witness initramfs_compile_env=none source=clean:523cd74ea0358ee60d0770d2ba0a18ee5ec4d3d7 required=kernel=cap-gen-witness,vfs-correct-witness,vfs-mount-witness,initramfs=cap-gen-witness,vfs-correct-witness,vfs-mount-witness result=ok
+RISCV_WORKLOAD profile=vfs-mount-witness
+[fail] RISC-V vfs-mount-witness obligation: REGISTRATION: the ordinary VFS_MOUNT_REGISTER_RAMFS_OK appears in a mount-witness image, whose init registers /ram only through the authorized path
+RISCV_WORKLOAD_OBLIGATIONS workload=vfs-mount-witness result=fail fails=2
+[fail] RISC-V mount-witness registration evidence is incomplete (the authorized /ram path)
+D2_PUBLISH_RACE_CHECK verdict=ok races=0 split=0 broad=0 recovered=0 defects=0 unverified=0 lost_records=0
+[info] RISCV-STRICT1: workload=vfs-mount-witness nr29_owed=5 nr12=0 nr16=0
+[fail] qemu-riscv64-core-smoke: 1 check(s) failed (qemu_status=0)
+core_rc=1

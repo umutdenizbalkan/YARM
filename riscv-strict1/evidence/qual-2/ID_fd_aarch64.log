@@ -1,0 +1,3 @@
+identical build-aarch64/yarm-aarch64.bin e98374dbdf3bae643877a4dcb26fab0d4bfd6355f188293081ea9cd9b15f932a
+identical build-aarch64/initramfs-core.cpio ffbf6cf2c7496d8c8cdcd65b39043bac7d764475858afeda7f1827a4e1582b03
+identical build-aarch64/rootfs/init 20b5069f4b22b91f61b7a2196b9d3086c5e1bed87164ab91f2860878c504cff8

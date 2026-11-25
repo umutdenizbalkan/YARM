@@ -1,0 +1,3 @@
+identical build-riscv64/yarm-riscv64.bin a37ac423d0aaccde7c6634b39bf78c86aee6b13a0c1eecd6d74ee2b51a913b67
+identical build-riscv64/initramfs-core.cpio 0aa4aba72ddab339ee253470078d54315479e7198174059753efed21c564252d
+identical build-riscv64/rootfs/init b38f43537c11631e7d9b6ac21dad10f3778d351943036154031b09ff490d1562

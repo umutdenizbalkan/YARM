@@ -1,0 +1,5 @@
+hosted-tests-pre.log: a development `cargo test --tests` run with the default (parallel) test
+threads before qualification. It reports 33 lib failures in tests that share global scheduler and
+address-space state (ap_sched*, arch::hal, exec_state, overtaken); the qualification runs the lib
+serially (--test-threads=1), as IPC-D2-RULE1 and earlier passes did, where all 6,792 pass
+(qual-2/H2_hosted_lib.log). Not a qualification result.

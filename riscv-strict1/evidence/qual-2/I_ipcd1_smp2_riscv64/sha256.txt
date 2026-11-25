@@ -1,0 +1,3 @@
+54ff12f2f8bf4ecff967b40da56a6878e59e43bec4153aa053c3538ffa4ace2f  /tmp/claude-0/-home-user-YARM/e3c47cf0-be59-5ee6-a6fa-73064b3ba043/scratchpad/rv1-evidence/qual-2/I_ipcd1_smp2_riscv64/boot.log
+0b44bf5ec8ffc98cb979a0ebb91e278d64ae72df36c5e453a6771c5bfb883f0c  build-riscv64/yarm-riscv64.bin
+6e6f46f0c190b4d64a46d5704594937d98fd50995b63cda556c2452ba5b4234d  build-riscv64/initramfs-core.cpio
