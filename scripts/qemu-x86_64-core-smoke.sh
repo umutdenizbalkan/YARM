@@ -776,7 +776,10 @@ if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
 
   tick_lines=$(rg -a -o "(YARM_SCHED_TICK|TIMER_SPLIT_TICK_OK|TIMER_SPLIT_IDLE_ADVANCE_COMMITTED|TIMER_SPLIT_PREEMPT_COMMITTED) cpu=[0-9]+ tick=[0-9]+" <<<"$norm_log" || true)
   tick_count=$(printf '%s\n' "$tick_lines" | rg -c "tick=" 2>/dev/null || echo 0)
-  first_tick=$(printf '%s\n' "$tick_lines" | head -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
+  # Here-string, not `printf | head`: under pipefail an early-exiting `head` SIGPIPEs the writer,
+  # and a long boot's tick list exceeds the pipe buffer (IPC-D2-RULE1: a strict SMP2 witness boot
+  # exited 141 here before grading anything).
+  first_tick=$(head -n1 <<<"$tick_lines" | awk -F'tick=' '{print $2}' | awk '{print $1}')
   last_tick=$(printf '%s\n' "$tick_lines" | tail -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
   if [[ -z "$first_tick" || -z "$last_tick" || "$tick_count" -lt 2 ]]; then
     echo "[warn] strict smoke: need at least two serviced timer interrupts (got ${tick_count:-0})"

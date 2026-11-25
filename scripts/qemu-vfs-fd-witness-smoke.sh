@@ -48,6 +48,12 @@ case "$PROFILE" in
   narrow) FEATURES=vfs-correct-witness,vfs-fd-witness; WIDE_ARG= ;;
   *) echo "[vfs-fd-witness][fail] unknown profile: $PROFILE"; exit 1 ;;
 esac
+# IPC-D2-RULE1: a strict x86_64 core smoke grades the timer-contract witness, so it refuses any
+# initramfs built without `timer-contract-witness` (scripts/qemu-x86_64-core-smoke.sh, BL5c). A
+# strict x86_64 witness run builds it too; every other port and every non-strict run is unchanged.
+if [[ "${QEMU_SMOKE_STRICT:-0}" == "1" && "$ARCH" == "x86_64" ]]; then
+  FEATURES="$FEATURES,timer-contract-witness"
+fi
 LOGDIR=${LOGDIR:-/tmp/vfs-fd-witness-$ARCH-smp$SMP-$PROFILE}
 TIMEOUT_SECS=${TIMEOUT_SECS:-480}
 mkdir -p "$LOGDIR"
