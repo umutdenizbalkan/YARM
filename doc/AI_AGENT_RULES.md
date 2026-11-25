@@ -1026,8 +1026,32 @@ acceptance table. Declaring without smoke is a hard violation of §13.
 
 ### 14.3 D2-specific invariants
 
-- `d2_publish_race_unwinds` MUST be 0 until the SharedKernel seam split
-  lands. Treat any non-zero value in a smoke log as a stop-ship bug.
+- `D2_PUBLISH_RACE_UNWIND` is route-specific (IPC-D2-RULE1). Every gate grades it with ONE
+  checker, `scripts/check-d2-publish-race.py`, and fails on any verdict but `ok`, whatever
+  `QEMU_SMOKE_STRICT` says.
+  - **Broad route: stop-ship, always.** The serialized broad arm (`endpoint=<index>`) is the only
+    increment of `d2_publish_race_unwinds`, so that counter MUST stay 0. The race cannot occur
+    inside one `&mut KernelState` borrow.
+  - **Split route: legal only if attributed one-to-one** in the receiver's own program order (one
+    printk sequence; cross-CPU print order and proximity are never evidence). An
+    `endpoint=split` race must:
+    - consume exactly one wait of the receiver's current receive;
+    - have exactly one companion `D2_RECV_WAITER_RACE_UNWIND`;
+    - have exactly one exact unwind (`via=exact … priority=exact`);
+    - settle `queue_non_empty` / `restored`;
+    - then deliver one record, linked across CPUs by its (index, generation): queued once on that
+      endpoint as a CALL, and bound once in the boot.
+  - **Replies.** A call owes exactly one `resolution=commit` reply terminal. The reply requirement
+    applies only to operations that owe one.
+  - **Defects.** Orphans in either direction (a companion with no race, a `queue_non_empty`
+    settle with no race) are defects. So is a duplicate publication sharing one recovery, or a
+    duplicate commit.
+  - **Unverified.** A trace that cannot attribute a race is `unverified`, which is a failure:
+    lost printk records, a message with no receive-side identity (queued send or reply), or a
+    call released and never committed.
+  - **Independent failures.** `IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED` and displacement of another
+    receiver are failures independently of any race.
+  - **No exclusion** may excuse the marker.
 - One live receiver per endpoint (IPC-DISPLACE1, `doc/IPC.md` §8.7): the publish primitive
   refuses a different receiver with zero mutation; `D2_RECV_WAITER_DISPLACED` now only ever
   reports the same receiver superseding its own older record. Never restore overwrite.

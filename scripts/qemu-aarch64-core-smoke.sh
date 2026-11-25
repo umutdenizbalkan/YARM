@@ -668,7 +668,7 @@ if [[ "$u9rx4_fail" -eq 1 ]]; then
 fi
 echo "[ok] U9-RX4: AArch64 queued-plain reply-cap + framing witness chain complete"
 
-BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_COMPLETE_FAILED|CapabilityFull|VM_FULL|YARM_FIRST_USER_FAIL|MemoryObjectMissing|ELF_MISSING|PrivilegeViolation|failed to bootstrap first user task|panic|InvalidCapability|WrongObject|StaleCapability|MissingRight|UserMemoryFault|PM_RECV_DECODE_FAIL|bad_len expected=16 got=8|CAP_LOOKUP tid=1 cap=0|empty-elf|Malformed|Syscall\\(Internal\\)|memory allocation of|DELEGATE_FAIL|delegation.*fail|IPC_REPLY_FAST_REVOKE_FAIL|PM_PANIC|INIT_PANIC|DEVFS_PANIC|VFS_PANIC|INITRAMFS_PANIC|INITRAMFS_CPIO_EMPTY|D2_PUBLISH_RACE_UNWIND'
+BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_COMPLETE_FAILED|CapabilityFull|VM_FULL|YARM_FIRST_USER_FAIL|MemoryObjectMissing|ELF_MISSING|PrivilegeViolation|failed to bootstrap first user task|panic|InvalidCapability|WrongObject|StaleCapability|MissingRight|UserMemoryFault|PM_RECV_DECODE_FAIL|bad_len expected=16 got=8|CAP_LOOKUP tid=1 cap=0|empty-elf|Malformed|Syscall\\(Internal\\)|memory allocation of|DELEGATE_FAIL|delegation.*fail|IPC_REPLY_FAST_REVOKE_FAIL|PM_PANIC|INIT_PANIC|DEVFS_PANIC|VFS_PANIC|INITRAMFS_PANIC|INITRAMFS_CPIO_EMPTY'
 # XARCH-SRV-PARITY: the supervisor's lifecycle SELF-query (query PM for the
 # supervisor's own tid, before entering the event loop) returns WrongObject
 # uniformly on x86_64, aarch64, AND riscv64 — the supervisor logs it and continues
@@ -717,6 +717,21 @@ if [[ -n "${WITNESS_BLOCKER_EXCLUDE_REGEX:-}" ]]; then
     exit 1
   fi
   BLOCKER_EXCLUDE_REGEX="$BLOCKER_EXCLUDE_REGEX|$WITNESS_BLOCKER_EXCLUDE_REGEX"
+fi
+
+# IPC-D2-RULE1 (doc/AI_AGENT_RULES.md §14.3): D2_PUBLISH_RACE_UNWIND is graded by the ONE checker,
+# scripts/check-d2-publish-race.py, unconditionally (independent of QEMU_SMOKE_STRICT). A broad-route
+# race, a fail-closed receive, a prohibited displacement, or a split race that is not attributed
+# one-to-one to its wait, its message, its exact restored unwind, one delivery and (for a call) one
+# committed reply is stop-ship; a trace that cannot be attributed is "unverified" and fails too.
+if [[ -f "$LOGFILE" ]]; then
+  d2_rc=0
+  d2_out="$(python3 -I "$(dirname "${BASH_SOURCE[0]}")/check-d2-publish-race.py" "$LOGFILE" 2>&1)" || d2_rc=$?
+  printf '%s\n' "$d2_out"
+  if [[ $d2_rc -ne 0 ]]; then
+    echo "[fail] STOP-SHIP: aarch64 D2 publish-race check verdict is not ok (rc=$d2_rc)"
+    exit 1
+  fi
 fi
 
 if [[ -f "$LOGFILE" ]]; then

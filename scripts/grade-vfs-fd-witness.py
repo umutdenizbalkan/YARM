@@ -43,19 +43,30 @@ Rules (each failure names its rule):
              has pending_retry=0 quarantined=0 unknown_backend_opens=0.
   WIDTH      (--wide only) every VFS_FORWARD_CALL send_cap and reply_cap exceeds 2^32 with a
              generation (id >> 16) above 65535.
-  RACE       no D2_PUBLISH_RACE_UNWIND, D2_RECV_WAITER_RACE_UNWIND or
-             IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED: the race pair is a stop-ship marker
-             (doc/AI_AGENT_RULES.md §14.3) and every core smoke rejects it. The failure names who
-             raced and whether each pair is complete, so a rejected boot says which receiver it
-             was.
+  RACE       the one D2 publish-race checker (scripts/check-d2-publish-race.py, IPC-D2-RULE1,
+             doc/AI_AGENT_RULES.md §14.3) gives the boot verdict ok: no broad-route race, no
+             fail-closed receive, no prohibited displacement, and every split queue-publication race
+             attributed one-to-one to its wait, its queued call, its exact restored unwind, one
+             delivery and one committed reply. Facts: publish_race_unwinds, races_recovered.
   TRANSPORT  none of VFS_FORWARD_CALL_FAIL, VFS_BACKEND_COMPLETION_MALFORMED,
              VFS_CALLER_SESSION_FAIL, VFS_SESSION_UNKNOWN, VFS_SESSION_ALIVE_FAIL,
              VFS_OPEN_BACKEND_STATE_UNKNOWN, PM_VFS_CALL_FAIL, BOOT_FATAL.
 Exit status 0 = sealed, 1 = not sealed. --self-test checks the rules on synthetic boots.
 """
 import argparse
+import importlib.util
+import os
 import re
 import sys
+
+
+def _d2_checker():
+    """scripts/check-d2-publish-race.py, loaded by path (this grader runs under `python3 -I`)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-d2-publish-race.py")
+    spec = importlib.util.spec_from_file_location("check_d2_publish_race", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 LEN = 96
 WIDE = 1 << 32
@@ -366,15 +377,13 @@ def grade(log, core_rc, want_wide):
         if not fwd or narrow:
             fail("WIDTH", f"{len(narrow)} of {len(fwd)} forwards use a narrow identity")
 
-    # RACE
-    races = tagged(log, "D2_PUBLISH_RACE_UNWIND")
-    pairs = tagged(log, "D2_RECV_WAITER_RACE_UNWIND")
-    facts["publish_race_unwinds"] = len(races)
-    if races or pairs:
-        fail("RACE", f"stop-ship: race unwinds tids {[r.get('tid') for r in races]} "
-                     f"pairs tids {[p.get('tid') for p in pairs]} (VFS {vfs_tid})")
-    if any("IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED" in line for line in log):
-        fail("RACE", "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED")
+    # RACE — the one checker every gate uses
+    rep = _d2_checker().check_lines(log)
+    facts["publish_race_unwinds"] = len(rep.events)
+    facts["races_recovered"] = sum(1 for e in rep.events if e.get("recovered"))
+    if rep.verdict() != "ok":
+        fail("RACE", f"D2 publish-race verdict={rep.verdict()}: "
+             + "; ".join((rep.defects + rep.unverified)[:4]))
 
     # TRANSPORT
     for bad in FORBIDDEN:
@@ -508,10 +517,15 @@ def self_test():
     for bad in FORBIDDEN:
         must_fail(good + [f"USER_LOG tid=10002 msg={bad} op=10"], "TRANSPORT", bad)
     race = ["D2_PUBLISH_RACE_UNWIND endpoint=split tid=10002", "D2_RECV_WAITER_RACE_UNWIND tid=10002"]
-    must_fail(good + race, "RACE", "stop-ship")
+    must_fail(good + race, "RACE", "verdict=defect")
     must_fail(good + race[:1], "RACE")
     must_fail(good + race[1:], "RACE")
     must_fail(good + ["IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED tid=10002"], "RACE")
+    must_fail(good + ["D2_PUBLISH_RACE_UNWIND endpoint=10 tid=10002", "D2_RECV_WAITER_RACE_UNWIND tid=10002"], "RACE")
+    legal = _d2_checker()._synthetic()
+    f, facts = grade(good + legal, 0, True)
+    assert not f and facts["publish_race_unwinds"] == 2 and facts["races_recovered"] == 2, (f, facts)
+    must_fail(good + [x for x in legal if "resolution=commit" not in x or "record_index=5 " not in x], "RACE")
     print("VFS_FD_WITNESS_GRADER_SELF_TEST result=ok")
 
 

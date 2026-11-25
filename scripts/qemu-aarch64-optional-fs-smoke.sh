@@ -133,14 +133,15 @@ if [[ -f "$LOGFILE" ]]; then
     echo "[ok] KSPAWN_EXTRA_CAP_DELEGATE_FAIL count=0"
   fi
 
-  # D2_PUBLISH_RACE_UNWIND: D2 endpoint-recv waiter-publish no-lost-wakeup
-  # unwind. Per doc/AI_AGENT_RULES.md §14.3 / doc/KERNEL_UNLOCKING.md §3 this
-  # must be 0 — any occurrence is a stop-ship bug, not just a strict-mode warning.
-  if rg -a -q "D2_PUBLISH_RACE_UNWIND" "$LOGFILE" 2>/dev/null; then
-    echo "[fail] STOP-SHIP: D2_PUBLISH_RACE_UNWIND observed"
+  # D2_PUBLISH_RACE_UNWIND (IPC-D2-RULE1, doc/AI_AGENT_RULES.md §14.3): graded by the one
+  # checker. A non-ok verdict (defect or unverified) is stop-ship, not just a strict-mode warning.
+  d2_rc=0
+  python3 -I "$(dirname "${BASH_SOURCE[0]}")/check-d2-publish-race.py" "$LOGFILE" || d2_rc=$?
+  if [[ $d2_rc -ne 0 ]]; then
+    echo "[fail] STOP-SHIP: D2 publish-race check verdict is not ok (rc=$d2_rc)"
     smoke_fail=1
   else
-    echo "[ok] D2_PUBLISH_RACE_UNWIND count=0"
+    echo "[ok] D2 publish-race check verdict=ok"
   fi
 
   # PM_VFS_SPAWN_FAIL: PM failed to load/spawn a server from VFS.

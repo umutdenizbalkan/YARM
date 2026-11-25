@@ -516,10 +516,8 @@ REJECT_PATTERNS=(
   # failure here means the bitmap silently fell back to the single-hart
   # default instead of reflecting the real topology.
   'RISCV_DTB_CPU_SCAN_FAILED'
-  # D2 endpoint-recv waiter-publish no-lost-wakeup unwind. Per
-  # doc/AI_AGENT_RULES.md §14.3 / doc/KERNEL_UNLOCKING.md §3 this must be 0 —
-  # any occurrence is a stop-ship bug.
-  'D2_PUBLISH_RACE_UNWIND'
+  # D2_PUBLISH_RACE_UNWIND is NOT a reject pattern: IPC-D2-RULE1 grades it with the one checker,
+  # scripts/check-d2-publish-race.py, below, and a non-ok verdict fails this smoke unconditionally.
   # Stage 184 follow-up (RISC-V startup handoff): a task that reached userspace
   # with a zeroed startup register hand-off. PM_NO_RECV_CAP means PM never got a
   # request-recv cap (the pre-fix failure that stalled the whole service chain);
@@ -648,6 +646,19 @@ missing_dtb_count=${missing_dtb_count:-0}
 if (( missing_dtb_count > 1 )); then
   echo "[fail] repeated source=missing_dtb loop (count=$missing_dtb_count)"
   failures=$((failures + 1))
+fi
+
+# IPC-D2-RULE1 (doc/AI_AGENT_RULES.md §14.3): the one D2 publish-race checker, unconditionally
+# (independent of QEMU_SMOKE_STRICT, as D7-B always intended for this marker). A broad-route race, a
+# fail-closed receive, a prohibited displacement, or a split race that is not attributed one-to-one
+# to its wait, its message, its exact restored unwind, one delivery and (for a call) one committed
+# reply is stop-ship; a trace that cannot be attributed is "unverified" and fails too.
+d2_rc=0
+d2_out="$(python3 -I "$(dirname "${BASH_SOURCE[0]}")/check-d2-publish-race.py" "$LOGFILE" 2>&1)" || d2_rc=$?
+printf '%s\n' "$d2_out"
+if [[ $d2_rc -ne 0 ]]; then
+  echo "[fail] STOP-SHIP: riscv64 D2 publish-race check verdict is not ok (rc=$d2_rc)"
+  exit 1
 fi
 
 for pat in "${REJECT_PATTERNS[@]}"; do

@@ -458,8 +458,22 @@ HARD_BLOCKER_PATTERNS=(
   "PM_PANIC"
   "INIT_PANIC"
   "^PANIC "
-  "D2_PUBLISH_RACE_UNWIND"
 )
+
+# IPC-D2-RULE1 (doc/AI_AGENT_RULES.md §14.3): D2_PUBLISH_RACE_UNWIND is graded by the ONE checker,
+# scripts/check-d2-publish-race.py, unconditionally (independent of QEMU_SMOKE_STRICT). A broad-route
+# race, a fail-closed receive, a prohibited displacement, or a split race that is not attributed
+# one-to-one to its wait, its message, its exact restored unwind, one delivery and (for a call) one
+# committed reply is stop-ship; a trace that cannot be attributed is "unverified" and fails too.
+if [[ -f "$LOGFILE" ]]; then
+  d2_rc=0
+  d2_out="$(python3 -I "$(dirname "${BASH_SOURCE[0]}")/check-d2-publish-race.py" "$LOGFILE" 2>&1)" || d2_rc=$?
+  printf '%s\n' "$d2_out"
+  if [[ $d2_rc -ne 0 ]]; then
+    echo "[fail] STOP-SHIP: x86_64 D2 publish-race check verdict is not ok (rc=$d2_rc)"
+    exit 1
+  fi
+fi
 
 hard_blocker_found=0
 for blocker in "${HARD_BLOCKER_PATTERNS[@]}"; do

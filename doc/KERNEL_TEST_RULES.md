@@ -5381,9 +5381,16 @@ in `doc/KERNEL_UNLOCKING.md` passed on all three runs.
 1. **D2 routing is proven by telemetry.** `d2_recv_waiter_publishes`
    increments once per blocked endpoint recv; immediate dequeues must not
    increment it. `d2_publish_race_unwinds` must be 0 in every test and
-   smoke run until the SharedKernel seam split lands — a non-zero value
-   before then indicates the publish recheck disagreed with the Phase-1
-   dequeue under the same global borrow, which is a bug.
+   smoke run: only the serialized broad arm increments it, and a non-zero
+   value means the publish recheck disagreed with the Phase-1 dequeue under
+   the same global borrow, which is a bug. (IPC-D2-RULE1) A split-route
+   `D2_PUBLISH_RACE_UNWIND` is the legal queue-publication race once the
+   seam split landed (U9-RX3 onward). Every smoke and witness grades it with
+   `scripts/check-d2-publish-race.py`, which accepts it only when the race
+   is attributed one-to-one to its wait, its queued call, its exact restored
+   unwind, one delivery and one committed reply (`doc/AI_AGENT_RULES.md`
+   §14.3). A test of the race must force it and assert those final states.
+   It must never rely on the marker's absence.
    (IPC-DISPLACE1-MARKER1) The `D2_PUBLISH_RACE_UNWIND` marker counts that
    race only. A refusal that unwinds through the same exact inverse
    (receiver already waiting, ownership busy, deadline reservation) must not

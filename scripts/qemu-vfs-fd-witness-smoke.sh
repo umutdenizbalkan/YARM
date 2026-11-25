@@ -73,11 +73,12 @@ cp "$ROOTFS_INIT" "$LOGDIR/rootfs-init.bin" 2>/dev/null || true
 # Lines this witness produces on purpose, which the AArch64 core smoke's generic blocker scan would
 # flag: its one injected fault. VFS answers one OPENAT through a stale reply capability (the same
 # slot, the next generation); the kernel refuses that reply pre-lock and VFS logs the refusal.
-# grade-vfs-fd-witness.py requires each line exactly once. Nothing else is passed: in particular
-# D2_PUBLISH_RACE_UNWIND stays a hard blocker of every core smoke (doc/AI_AGENT_RULES.md §14.3),
-# and the grader's RACE rule rejects it too. At SMP >= 2 the witness's second thread and fork
-# child can run on another CPU than VFS and reach the split receive route's queue-publication
-# race; such a boot fails, and the stage record reports it.
+# grade-vfs-fd-witness.py requires each line exactly once. Nothing else is passed. In particular
+# D2_PUBLISH_RACE_UNWIND is graded, in every core smoke and in this witness's grader, by the one
+# checker (scripts/check-d2-publish-race.py, IPC-D2-RULE1, doc/AI_AGENT_RULES.md §14.3), never
+# excused: at SMP >= 2 the witness's second thread and fork child can run on another CPU than VFS
+# and reach the split receive route's queue-publication race, which passes only when the checker
+# attributes it one-to-one and finds it recovered.
 INJECTED='IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=18446744073709551615 record_generation=18446744073709551615 replier_tid=[0-9]+ reason=reply_cap err=InvalidCapability reply_copies=0 caller_wakes=0$|VFS_CLIENT_REPLY_REFUSED reply_cap=[0-9]+ err=InvalidCapability$'
 note "booting QEMU -smp $SMP"
 env \

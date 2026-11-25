@@ -34200,15 +34200,25 @@ mod stage114_d3_vm_brk_shrink_live {
     #[test]
     fn stage114_smoke_scripts_still_reject_d2_race_unwind_marker() {
         // Hard rule 11: Stage 114 must not weaken smoke scripts.
+        //
+        // IPC-D2-RULE1: the marker is graded by the ONE checker, `check-d2-publish-race.py`,
+        // and its verdict is fatal unconditionally — never behind `QEMU_SMOKE_STRICT`. This
+        // guard pins that every smoke runs it and fails on any non-zero verdict.
         for script in [
             include_str!("../../../scripts/qemu-x86_64-core-smoke.sh"),
+            include_str!("../../../scripts/qemu-aarch64-core-smoke.sh"),
             include_str!("../../../scripts/qemu-x86_64-optional-fs-smoke.sh"),
             include_str!("../../../scripts/qemu-aarch64-optional-fs-smoke.sh"),
             include_str!("../../../scripts/qemu-riscv64-core-smoke.sh"),
         ] {
             assert!(
-                script.contains("D2_PUBLISH_RACE_UNWIND"),
-                "every smoke script must still reject D2_PUBLISH_RACE_UNWIND"
+                script.contains("check-d2-publish-race.py"),
+                "every smoke script must run the D2 publish-race checker"
+            );
+            assert!(
+                script.contains("STOP-SHIP:")
+                    && script.contains("D2 publish-race check verdict is not ok"),
+                "every smoke script must fail on a non-ok D2 publish-race verdict"
             );
         }
     }
@@ -34388,6 +34398,37 @@ mod stage115_d2_d6_seam_analysis {
         assert!(
             !code.contains("recv_block_unwind_race_split("),
             "the TID-only unwind must not return"
+        );
+    }
+
+    #[test]
+    fn d2rule1_broad_counter_has_one_increment_and_the_split_arm_none() {
+        // IPC-D2-RULE1: `d2_publish_race_unwinds` keeps its zero invariant because only the
+        // serialized broad arm increments it. The split lane's `QueueNonEmpty` arm logs the race
+        // pair (graded by the checker) and must never count it as a broad race.
+        let ipc_src = include_str!("ipc_state.rs");
+        assert_eq!(
+            ipc_src
+                .matches("self.note_d2_publish_race_unwind();")
+                .count(),
+            1,
+            "exactly one call site increments d2_publish_race_unwinds"
+        );
+        let broad = ipc_src
+            .split("fn recv_block_unwind_race(")
+            .nth(1)
+            .expect("the broad unwind exists");
+        let broad = &broad[..broad.find("\n    }\n").expect("its body ends")];
+        assert!(
+            broad.contains("self.note_d2_publish_race_unwind();"),
+            "the increment is the broad unwind's"
+        );
+        let split_src = include_str!("../syscall_split.rs");
+        assert!(split_src.contains("D2_PUBLISH_RACE_UNWIND endpoint=split tid={}"));
+        assert!(
+            !split_src.contains("note_d2_publish_race_unwind")
+                && !split_src.contains("d2_publish_race_unwinds"),
+            "the split route must not touch the broad counter"
         );
     }
 
@@ -34669,7 +34710,8 @@ mod stage115_d2_d6_seam_analysis {
     #[test]
     fn stage115_smoke_scripts_still_check_d2_publish_race_unwind() {
         // Hard rule 13: smoke scripts must not be weakened. Each must still
-        // reject D2_PUBLISH_RACE_UNWIND. (RISC-V is confirmed in smoke matrix.)
+        // grade D2_PUBLISH_RACE_UNWIND, now through the one IPC-D2-RULE1 checker.
+        // (RISC-V is confirmed in smoke matrix.)
         for (name, script) in [
             (
                 "qemu-x86_64-core-smoke.sh",
@@ -34689,10 +34731,21 @@ mod stage115_d2_d6_seam_analysis {
             ),
         ] {
             assert!(
-                script.contains("D2_PUBLISH_RACE_UNWIND"),
-                "smoke script {} must still reject D2_PUBLISH_RACE_UNWIND",
+                script.contains("check-d2-publish-race.py"),
+                "smoke script {} must still grade D2_PUBLISH_RACE_UNWIND with the checker",
                 name
             );
+            // No raw-marker rule may coexist with the checker: a blanket reject would fail the
+            // legal split race, and an exclusion would admit an unattributed one.
+            for line in script.lines() {
+                let code = line.split('#').next().unwrap_or("");
+                assert!(
+                    !code.contains("D2_PUBLISH_RACE_UNWIND"),
+                    "smoke script {} must not match the raw marker outside the checker: {}",
+                    name,
+                    line
+                );
+            }
         }
     }
 

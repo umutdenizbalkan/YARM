@@ -1767,10 +1767,24 @@ caller:
 | deadline reservation refused | no | `reason=deadline_reservation` | no |
 
 The settle line is written by `recv_settle_after_unwind` after the unwind's outcome is known,
-so a settled refusal is never reported before the unwind authorizes it. The smoke gates are
-unchanged: the race pair is still a hard blocker and `FAILED_CLOSED` still a zero gate
-(U9-RX4). Before MARKER1 both fired on every competing-receiver refusal, which made any boot
-that exercised the refusal fail its core smoke.
+so a settled refusal is never reported before the unwind authorizes it. `FAILED_CLOSED` is
+still a zero gate (U9-RX4). Before MARKER1 both markers fired on every competing-receiver
+refusal, which made any boot that exercised the refusal fail its core smoke.
+
+**Grading the race (IPC-D2-RULE1).** The race pair is no longer a blanket hard blocker. Every
+smoke and witness grader runs `scripts/check-d2-publish-race.py`:
+- **Broad route (`endpoint=<index>`): always stop-ship.** It is the only increment of
+  `d2_publish_race_unwinds`, which stays 0.
+- **Split race (`endpoint=split`): accepted only when attributed one-to-one** to:
+  - one wait of the receiver;
+  - one companion;
+  - one exact, restored unwind settled `queue_non_empty`;
+  - one delivery of a record queued on that endpoint;
+  - for a call, one committed reply.
+- **The evidence.** Within the receiver, its own printk program order. Across CPUs, record
+  identity only.
+- **Orphans, duplicates and fail-closed receives** are defects. A race the trace cannot attribute
+  is `unverified`, and also fails. The rule is `doc/AI_AGENT_RULES.md` §14.3.
 
 **Live witness.** `scripts/qemu-ipc-displace1-witness-smoke.sh <arch> <smp>` boots the
 shared-region oracle kernel and an `ipc-displace1-witness` initramfs with

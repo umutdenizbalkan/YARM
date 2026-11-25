@@ -10438,8 +10438,10 @@ re-enqueue after `dispatch_next_task` must remain intact. See
 ### Other policy flags
 
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` remains `false`.
-- `d2_publish_race_unwinds` MUST be 0 until the SharedKernel seam split
-  lands. Treat any non-zero value as a stop-ship bug.
+- `d2_publish_race_unwinds` (the broad arm's counter) MUST be 0, and a broad-route race is
+  stop-ship. A split-route `D2_PUBLISH_RACE_UNWIND` is legal only as the checker attributes it
+  (IPC-D2-RULE1; `doc/AI_AGENT_RULES.md` §14.3; `scripts/check-d2-publish-race.py`). The SharedKernel
+  seam split this rule waited for landed with U9-RX3 / U9-RX4 / U9-RECV-FINAL / U9-RECV-BLOCK1.
 
 ---
 
@@ -17105,8 +17107,9 @@ smoke.
   `Milestone status` line near the top of §1. Only an environment that has
   actually executed the smoke checklist may flip it (see `AI_AGENT_RULES.md`
   §13 / `KERNEL_TEST_RULES.md` Stage 101.1).
-- **D2-specific.** `d2_publish_race_unwinds` MUST be 0 until the
-  SharedKernel seam split lands. The publish primitive preserves canonical
+- **D2-specific.** `d2_publish_race_unwinds` (broad arm only) MUST be 0; a split-route race is
+  graded by `scripts/check-d2-publish-race.py` (IPC-D2-RULE1, `doc/AI_AGENT_RULES.md` §14.3).
+  The publish primitive preserves canonical
   overwrite semantics (`D2_RECV_WAITER_DISPLACED` is observability, not a
   behavior change).
 - **D3/D6 fences.** `with_vm_user_spaces_split_mut` and

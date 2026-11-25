@@ -217,9 +217,56 @@ fn existing_full_oom_and_fatal_rejections_remain_active() {
             "UNLOCK_GRADUATED_FALLBACK class=IpcCall",
             "graduated fallback",
         ),
-        ("D2_PUBLISH_RACE_UNWIND tid=3", "publish-race unwind"),
     ] {
         assert_rejected(line, &format!("{what} rejection must remain active"));
+    }
+}
+
+/// IPC-D2-RULE1 — `D2_PUBLISH_RACE_UNWIND` is no longer a reject PATTERN: the smoke runs the one
+/// checker, `scripts/check-d2-publish-race.py`, and fails unconditionally on a non-ok verdict.
+/// Behavioural, like the rest of this file: the checker itself is run on the lines a pattern used
+/// to catch, and must still reject them (a broad-route race, a race naming no route, a split race
+/// with no attributable recovery).
+#[test]
+fn publish_race_lines_are_rejected_by_the_one_checker() {
+    assert!(
+        SMOKE.contains("check-d2-publish-race.py")
+            && SMOKE.contains("D2 publish-race check verdict is not ok"),
+        "the RISC-V core smoke must run the D2 publish-race checker and fail on a non-ok verdict"
+    );
+    assert!(
+        reject_patterns()
+            .iter()
+            .all(|p| !p.contains("D2_PUBLISH_RACE_UNWIND")),
+        "the marker is graded by the checker, not by a blanket reject pattern"
+    );
+    for log in [
+        "D2_PUBLISH_RACE_UNWIND tid=3\n",
+        "D2_PUBLISH_RACE_UNWIND endpoint=10 tid=3\nD2_RECV_WAITER_RACE_UNWIND tid=3\n",
+        "D2_PUBLISH_RACE_UNWIND endpoint=split tid=3\nD2_RECV_WAITER_RACE_UNWIND tid=3\n",
+    ] {
+        let mut child = Command::new("python3")
+            .args([
+                "-I",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/scripts/check-d2-publish-race.py"
+                ),
+                "/dev/stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("python3 must be available — the smoke script itself depends on it");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(log.as_bytes())
+            .expect("write");
+        let status = child.wait().expect("checker ran");
+        assert!(!status.success(), "the checker must reject {log:?}");
     }
 }
 
