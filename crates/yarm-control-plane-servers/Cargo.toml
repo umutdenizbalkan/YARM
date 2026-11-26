@@ -98,6 +98,13 @@ vfs-mount-witness = []
 # /ram/vc1c-failreply is answered first through a stale reply capability, so the client reply
 # really fails and the open is rolled back.
 vfs-fd-witness = []
+# VFS-LIFETIME1 — the file-grant lifetime witness (default off): init's cycle driver
+# (control plane), PM's refusal image 14, initramfs's and VFS's handoff injections; the kernel
+# half is the root crate's feature. NC `keep-relay`: VFS omits its release of relayed grants;
+# NC `revoke` is kernel-side (inert here).
+vfs-lifetime-witness = []
+vfs-lifetime-nc-keep-relay = ["vfs-lifetime-witness"]
+vfs-lifetime-nc-revoke = ["vfs-lifetime-witness"]
 # FUTEX-SEAL1 — with futex-seal-witness, the sequence cells to run, in this order, one file each:
 # selective-wake order (futex_seal_os.rs), NR 17 (futex_seal_nr17.rs), the late sole-wake
 # handoff (futex_seal_lh.rs), the paired broadcast (futex_seal_witness.rs), and last the RT-budget

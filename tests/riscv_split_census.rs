@@ -213,6 +213,7 @@ fn a_record_cut_by_the_timeout_is_not_counted() {
 const FIX_CORE: &str = include_str!("../scripts/fixtures/riscv-workload/core.txt");
 const FIX_FD: &str = include_str!("../scripts/fixtures/riscv-workload/fd-witness.txt");
 const FIX_MOUNT: &str = include_str!("../scripts/fixtures/riscv-workload/mount-witness.txt");
+const FIX_LIFE: &str = include_str!("../scripts/fixtures/riscv-workload/lifetime-witness.txt");
 const HELPER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/scripts/riscv64-workload-obligations.py"
@@ -705,4 +706,63 @@ fn the_obligations_helper_self_test_passes() {
         String::from_utf8_lossy(&out.stdout)
             .contains("RISCV_WORKLOAD_OBLIGATIONS_SELF_TEST result=ok")
     );
+}
+
+// ── VFS-LIFETIME1: the lifetime witness's census ─────────────────────────────────────────────
+
+const NR29_REFUSED: &str = "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 cpu=0 result=handled_err code=2";
+
+#[test]
+fn vl1_the_lifetime_image_passes_its_own_obligations() {
+    let (n, out) = smoke_of(FIX_LIFE, "vfs-lifetime-witness");
+    assert_eq!(n, 0, "{out}");
+    assert!(
+        out.contains("RISCV-STRICT1: workload=vfs-lifetime-witness nr29_owed=10 nr12=1 nr16=1"),
+        "{out}"
+    );
+    assert!(out.contains("nr29_refused=1") && out.contains("fork_child="), "{out}");
+}
+
+#[test]
+fn vl1_the_lifetime_image_fails_as_any_other_image() {
+    for w in ["core", "vfs-fd-witness", "vfs-mount-witness"] {
+        let (n, out) = census_of(FIX_LIFE, w);
+        assert!(n > 0, "the lifetime boot passed as {w}:\n{out}");
+    }
+    for (log, w) in [(FIX_CORE, "core"), (FIX_FD, "vfs-fd-witness")] {
+        let (n, out) = census_of(log, "vfs-lifetime-witness");
+        assert!(n > 0, "the {w} boot passed as the lifetime image:\n{out}");
+    }
+}
+
+#[test]
+fn vl1_the_one_refused_spawn_is_owed_exactly_and_only_as_the_fixture_use() {
+    // A second refusal, a refusal with another error, and a refused spawn that is not PM's
+    // image-14 use each fail, even where the totals still add up.
+    let twice = edit(FIX_LIFE, |v| {
+        let i = at(v, NR29_REFUSED);
+        let line = v[i].clone();
+        v.insert(i, line);
+    });
+    assert!(census_of(&twice, "vfs-lifetime-witness").0 > 0);
+    let other = edit(FIX_LIFE, |v| {
+        let i = at(v, NR29_REFUSED);
+        v[i] = v[i].replace("code=2", "code=9");
+    });
+    assert!(census_of(&other, "vfs-lifetime-witness").0 > 0);
+    let unattributed = edit(FIX_LIFE, |v| {
+        let i = at(v, "VL1_GRANT_USE tid=3 image_id=14 ");
+        v.remove(i);
+    });
+    assert!(census_of(&unattributed, "vfs-lifetime-witness").0 > 0);
+    let lost_launch = edit(FIX_LIFE, |v| {
+        let i = at(v, "msg=VL1_CYCLE label=success_2 ");
+        v.remove(i);
+    });
+    assert!(census_of(&lost_launch, "vfs-lifetime-witness").0 > 0);
+    let stray_exit = edit(FIX_LIFE, |v| {
+        let i = at(v, "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=16 ");
+        v[i] = v[i].replace("outgoing=", "outgoing=9");
+    });
+    assert!(census_of(&stray_exit, "vfs-lifetime-witness").0 > 0);
 }

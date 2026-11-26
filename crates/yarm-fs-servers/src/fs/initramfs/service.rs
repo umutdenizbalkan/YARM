@@ -11,7 +11,7 @@ use super::archive::{
 };
 use super::install_boot_initrd_bytes;
 use yarm_ipc_abi::vfs_abi::{
-    ReadWriteArgs, VFS_OP_FILE_GRANT_RO, VFS_OP_READ, VFS_STATUS_ERR_BACKEND,
+    ReadWriteArgs, VFS_OP_CLOSE, VFS_OP_FILE_GRANT_RO, VFS_OP_READ, VFS_STATUS_ERR_BACKEND,
     VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC, VFS_STATUS_ERR_UNSUPPORTED, VfsCompletion,
 };
 use yarm_srv_common::cpio::CpioArchive;
@@ -209,6 +209,17 @@ pub fn run() {
     if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
         yarm_user_rt::user_log!("INITRAMFS_SRV_RECV_CAP cap={}", recv_cap);
         yarm_user_rt::user_log!("INITRAMFS_SRV_BLOCKING_RECV_LOOP");
+        // VFS-LIFETIME1: grant slots whose release a queued transfer deferred, retried per request.
+        let mut grant_releases: yarm_user_rt::grant_release::PendingReleases<8> =
+            yarm_user_rt::grant_release::PendingReleases::new();
+        // VFS-LIFETIME1: delivered grants, held until the handle they were made for is closed.
+        let mut held_grants: yarm_user_rt::grant_release::HeldGrants<u64, 16> =
+            yarm_user_rt::grant_release::HeldGrants::new();
+        // VFS-LIFETIME1 witness: FILE_GRANT_ROs of the 300-byte fixture served so far. The first
+        // is replied through a stale reply capability (hop 1 undelivered), the second echoes the
+        // wrong fd (hop 1 delivered, rejected by VFS); every later one is ordinary.
+        #[cfg(feature = "vfs-lifetime-witness")]
+        let mut vl1_fixture_grants: u32 = 0;
         loop {
             // SAFETY: recv_cap is a kernel-provided startup receive endpoint.
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
@@ -222,6 +233,15 @@ pub fn run() {
                         msg.opcode,
                         reply_cap
                     );
+                    if grant_releases.parked() != 0 {
+                        let settled =
+                            grant_releases.retry(yarm_user_rt::grant_release::relinquish_now);
+                        yarm_user_rt::user_log!(
+                            "INITRAMFS_GRANT_RELEASE_RETRY settled={} parked={}",
+                            settled,
+                            grant_releases.parked()
+                        );
+                    }
                     if msg.opcode == VFS_OP_READ {
                         let payload = msg.as_slice();
                         if let Ok(args) = ReadWriteArgs::decode(payload) {
@@ -296,13 +316,33 @@ pub fn run() {
                                                     file_len,
                                                     cap_id
                                                 );
+                                                #[cfg(feature = "vfs-lifetime-witness")]
+                                                let vl1_inject = if cpio_name == b"etc/vfs-fixture"
+                                                {
+                                                    vl1_fixture_grants += 1;
+                                                    vl1_fixture_grants
+                                                } else {
+                                                    0
+                                                };
+                                                #[cfg(not(feature = "vfs-lifetime-witness"))]
+                                                let vl1_inject = 0u32;
+                                                let echo_fd = if vl1_inject == 2 {
+                                                    args.fd.wrapping_add(1)
+                                                } else {
+                                                    args.fd
+                                                };
+                                                let target_reply_cap = if vl1_inject == 1 {
+                                                    reply_cap.wrapping_add(1 << 16)
+                                                } else {
+                                                    reply_cap
+                                                };
                                                 // VFS-CORRECT1A: a payload completion (op, status,
                                                 // file length, the request's fd) with the
                                                 // transferred MemoryObject cap.
                                                 let (reply_bytes, reply_len) = VfsCompletion::ok(
                                                     VFS_OP_FILE_GRANT_RO,
                                                     file_len,
-                                                    args.fd,
+                                                    echo_fd,
                                                 )
                                                 .encode(&[])
                                                 .expect("header");
@@ -314,11 +354,55 @@ pub fn run() {
                                                     &reply_bytes[..reply_len],
                                                 )
                                                 .expect("completion fits one reply");
-                                                let _ = unsafe {
+                                                let delivered = unsafe {
                                                     yarm_user_rt::syscall::ipc_reply(
-                                                        reply_cap, &response,
+                                                        target_reply_cap,
+                                                        &response,
                                                     )
-                                                };
+                                                }
+                                                .is_ok();
+                                                // VFS-LIFETIME1: undelivered, this slot is the
+                                                // only one and goes now, with its object. Delivered,
+                                                // it is held until this handle is CLOSED: VFS's copy
+                                                // derives from it and may still be in flight here,
+                                                // and the close comes only after the client has its
+                                                // own. A full table releases at once instead.
+                                                let held = delivered
+                                                    && held_grants.hold(args.fd, cap_id as u64);
+                                                if held {
+                                                    yarm_user_rt::user_log!(
+                                                        "INITRAMFS_GRANT_HELD cap={} handle={} held={} inject={}",
+                                                        cap_id,
+                                                        args.fd,
+                                                        held_grants.held(),
+                                                        vl1_inject
+                                                    );
+                                                } else {
+                                                    let step = grant_releases.release(
+                                                        cap_id as u64,
+                                                        yarm_user_rt::grant_release::relinquish_now,
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "INITRAMFS_GRANT_RELEASE cap={} why={} step={:?} inject={}",
+                                                        cap_id,
+                                                        if delivered {
+                                                            "table_full"
+                                                        } else {
+                                                            "undelivered"
+                                                        },
+                                                        step,
+                                                        vl1_inject
+                                                    );
+                                                }
+                                                if vl1_inject == 1 {
+                                                    // The injected reply went nowhere: VFS is
+                                                    // still waiting, and is told the truth.
+                                                    grant_error_reply(
+                                                        reply_cap,
+                                                        VFS_STATUS_ERR_BACKEND,
+                                                        args.fd,
+                                                    );
+                                                }
                                             }
                                             Err(e) => {
                                                 yarm_user_rt::user_log!(
@@ -354,9 +438,26 @@ pub fn run() {
                             }
                         }
                     } else {
+                        // VFS-LIFETIME1: a CLOSE ends every grant held for its handle.
+                        let closing = (msg.opcode == VFS_OP_CLOSE)
+                            .then(|| ReadWriteArgs::decode(msg.as_slice()).ok())
+                            .flatten()
+                            .map(|a| a.fd);
                         // VFS-CORRECT1A: router-forwarded operations are answered with a payload completion.
                         let response = svc.handle_completion(msg);
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                        if let Some(handle) = closing {
+                            held_grants.close(handle, |cap| {
+                                let step = grant_releases
+                                    .release(cap, yarm_user_rt::grant_release::relinquish_now);
+                                yarm_user_rt::user_log!(
+                                    "INITRAMFS_GRANT_RELEASE cap={} why=closed handle={} step={:?}",
+                                    cap,
+                                    handle,
+                                    step
+                                );
+                            });
+                        }
                     }
                 }
                 _ => {

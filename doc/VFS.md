@@ -323,8 +323,55 @@ grader's RACE rule. No exclusion admits it.
 **Limits.** Reclamation waits for the next request; a quarantined or unknown backend open stays
 open at the backend for its life; descriptors are not shared across processes (no fd passing, no
 `dup`); a late reply to a request VFS gave up on could still arrive on its backend reply endpoint
-(completion validation rejects one for another operation or fd); grant capabilities a client never
-releases are VFS-LIFETIME1's.
+(completion validation rejects one for another operation or fd); a grant a client never releases
+is held as long as the client lives (§3.4).
+
+### 3.4 File-grant lifetime (VFS-LIFETIME1, audit finding F08)
+
+Every FILE_GRANT_RO creates a fresh read-only `InitramfsFileSlice` MemoryObject (NR 28 in
+initramfs). Until this pass every holder on the path kept its copy for good: initramfs its source
+capability after replying, VFS its copy after relaying, PM its copy after NR 29. Each launch left one
+registry entry, three capability slots and two delegation links behind.
+
+Each holder now gives up exactly its own copy with NR 22 `CapRelinquish` (`doc/SYSCALL_ABI.md`).
+That syscall removes one slot and re-parents the copies delivered from it, so a release never
+reaches downstream. Rights, other holders' mappings and the remaining ancestors' revoke authority
+are unchanged. The object leaves the registry with its last reference.
+
+| holder | commit point | released by |
+|---|---|---|
+| initramfs (source) | reply undelivered | at once (`INITRAMFS_GRANT_RELEASE why=undelivered`) |
+| initramfs (source) | delivered: when the backend handle the grant was made for is CLOSED | the CLOSE (`why=closed`) |
+| VFS (relay) | backend completion rejected (wrong op or fd, malformed, an error status carrying a cap) | at once (`VFS_GRANT_RELEASE why=rejected_*`) |
+| VFS (relay) | client reply undelivered | at once (`why=reply_refused`) |
+| VFS (relay) | delivered: when VFS closes the backend descriptor (client CLOSE, session reclaim, close retry) | `backend_close` (`why=closed`) |
+| PM (recipient) | NR 29 returned, successful or not (the child references nothing of the grant) | at once (`PM_GRANT_RELEASE why=spawned\|spawn_refused`) |
+| PM / any client | completion rejected after the kernel installed its capability | at once (`why=rejected_completion`; `vfs_client::vfs_file_grant_ro`) |
+| a holder that exits | process teardown | PM's reap (NR 31) releases the dead CNode's grant references (`REAP_GRANT_REFS_RELEASED`) |
+
+A delivered reply is not the relays' commit point. The receiver's copy can still be in flight when
+the replier's NR 7 returns, because the delivery is a post-work item. The client's CLOSE comes only
+after the client holds its own copy. So the source and the relay release after it, and the order is
+fixed by the protocol rather than by timing. PM closes its fd before NR 29, so by the time PM uses
+a grant it is the only holder.
+
+`WouldBlock` (a queued transfer still names the slot) parks a release for retry at the holder's
+next request (`grant_release::PendingReleases`). `InvalidCapability` is final, since the slot is
+already gone. A CapId carries its slot's generation, so a retried release never reaches a newer
+occupant of a reused slot. A full table (16 held grants per relay) releases at once instead.
+
+**Limits.**
+- A process that exits holding a grant keeps it until reaped. The exit (U9-EXIT1) does no general
+  capability revoke, and only PM's restart path reaps; an unsupervised fork child is never reaped
+  today. This is general zombie retention, not specific to grants.
+- The reap releases only borrowed-backing (file-slice) references. Allocator-owned objects in a
+  reaped CNode keep the earlier behaviour.
+- Releasing a slot in the instant between a receiver taking its transfer envelope and minting its
+  copy cancels that delivery, as the sender's exit would. The relays here never do so, because
+  they release only after the client's CLOSE.
+
+The live evidence is `scripts/qemu-vfs-lifetime-witness-smoke.sh`, graded by
+`scripts/grade-vfs-lifetime-witness.py`, with two negative controls.
 
 ---
 

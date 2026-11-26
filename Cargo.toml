@@ -273,6 +273,17 @@ vfs-mount-witness = []
 # VFS-CORRECT1C — init's fd-namespace witness, VFS's fail-reply injection and ramfs_srv's seed
 # files; accepted and inert in this package.
 vfs-fd-witness = []
+# VFS-LIFETIME1 — the file-grant lifetime witness (default off). Kernel half: the grant ledger
+# (`kernel::boot::grant_ledger`) printed after every NR 22, NR 28 and at every NR 29 use; init's
+# cycle driver, PM's refusal image 14 and the initramfs / VFS handoff injections are the
+# same-named feature of the server packages.
+vfs-lifetime-witness = ["printk-witness-ring"]
+# VFS-LIFETIME1 negative controls (each implies the witness). `keep-relay`: VFS omits its release
+# of relayed grants (server side; inert here) — the resource-count check must fail.
+# `revoke`: NR 22 revokes the slot recursively instead of relinquishing it, invalidating every
+# holder downstream — the recipient-use check must fail.
+vfs-lifetime-nc-keep-relay = ["vfs-lifetime-witness"]
+vfs-lifetime-nc-revoke = ["vfs-lifetime-witness"]
 # FUTEX-SEAL1 — the live futex seal witness (default off): the kernel half `kernel::seal_witness`
 # (the budget sequence's one induced exhaustion and its record) on top of the FUTEX-TIME1 markers;
 # init's cell is the same-named feature of yarm-control-plane-servers.

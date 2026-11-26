@@ -6464,6 +6464,12 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_caller_session_into_frame(shared, cpu, frame);
     }
 
+    // VFS-LIFETIME1: CapRelinquish (NR 22) — born split, non-switching. The transaction
+    // (`boot::cap_relinquish`) raises every refusal before its one capability mutation.
+    if matches!(syscall, Syscall::CapRelinquish) {
+        return try_split_cap_relinquish_into_frame(shared, cpu, frame);
+    }
+
     // U9-IPC-RESIDUAL2 §2: IpcCall (NR 6) is no longer serviced from here. It became a SWITCHING
     // class the moment its full-endpoint arm started parking the caller, so it is tried in
     // `try_split_dispatch_into_frame` alongside the other four, whose contract admits a caller
@@ -7203,6 +7209,98 @@ fn try_split_caller_session_into_frame(
         crate::kernel::syscall::session::ipc_caller_session_split(shared, tid, frame)
             .map_err(TrapHandleError::Syscall),
     )
+}
+
+/// VFS-LIFETIME1 — NR 22 `CapRelinquish` off the broad lock: the same transaction the broad
+/// adapter runs (`boot::cap_relinquish::run_relinquish`) over the `SharedKernel` seams.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_cap_relinquish_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::boot::cap_relinquish::{
+        SplitRelinquishOwners, log_relinquish, run_relinquish,
+    };
+    let tid = match split_caller(shared, cpu) {
+        SplitCaller::Running(tid) => tid,
+        SplitCaller::NoCurrentTask => {
+            crate::yarm_log!(
+                "SYSCALL_SPLIT_NO_CURRENT nr={} cpu={} settlement=task_missing broad_lock=0",
+                crate::kernel::syscall::SYSCALL_CAP_RELINQUISH_NR,
+                cpu.0
+            );
+            return Some(Err(TrapHandleError::Syscall(SyscallError::from(
+                crate::kernel::boot::KernelError::TaskMissing,
+            ))));
+        }
+    };
+    let cap = crate::kernel::capabilities::CapId(
+        frame.arg(crate::kernel::syscall::SYSCALL_ARG_CAP) as u64,
+    );
+    // VFS-LIFETIME1 negative control `vfs-lifetime-nc-revoke` (default off, never shipped): the
+    // WRONG release — a recursive revoke of the slot, which also destroys every capability
+    // delegated from it. The witness's recipient-use check must fail under it.
+    #[cfg(feature = "vfs-lifetime-nc-revoke")]
+    if cap.0 != 0 {
+        let revoked = shared.revoke_capability_no_vm_split(cpu, tid, cap);
+        crate::yarm_log!(
+            "VL1_NC_REVOKE tid={} cap={} result={:?}",
+            tid,
+            cap.0,
+            revoked.as_ref().map(|_| ()).map_err(|_| ())
+        );
+        crate::kernel::boot::grant_ledger::print_ledger_split(shared, "nr22_nc_revoke", tid, 0);
+        return Some(match revoked {
+            Ok(_) => {
+                frame.set_ok(0, 0, crate::kernel::syscall::CAP_RELINQUISH_STATUS_DONE);
+                Ok(())
+            }
+            Err(_) => Err(TrapHandleError::Syscall(SyscallError::InvalidCapability)),
+        });
+    }
+    let result = run_relinquish(&SplitRelinquishOwners { shared }, tid, cap);
+    log_relinquish(tid, cap, &result);
+    // VFS-LIFETIME1 witness: the ledger after every NR 22, refused ones included
+    // (`CapRelinquish(0)` is init's checkpoint probe).
+    #[cfg(feature = "vfs-lifetime-witness")]
+    crate::kernel::boot::grant_ledger::print_ledger_split(
+        shared,
+        if result.is_ok() {
+            "nr22_ok"
+        } else {
+            "nr22_refused"
+        },
+        tid,
+        match &result {
+            Ok(crate::kernel::boot::cap_relinquish::RelinquishOutcome {
+                object: crate::kernel::capabilities::CapObject::MemoryObject { id },
+                ..
+            }) => *id,
+            _ => 0,
+        },
+    );
+    Some(match result {
+        Ok(outcome) => {
+            frame.set_ok(
+                outcome.reparented,
+                usize::from(outcome.reclaimed),
+                crate::kernel::syscall::CAP_RELINQUISH_STATUS_DONE,
+            );
+            Ok(())
+        }
+        Err(refusal) => Err(TrapHandleError::Syscall(refusal.syscall_error())),
+    })
+}
+
+/// Hosted-dev: NR 22 takes the broad path; its split owner is arch-neutral and tested directly.
+#[cfg(feature = "hosted-dev")]
+fn try_split_cap_relinquish_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
 }
 
 /// Hosted-dev: NR 21 takes the broad path; its split owner is arch-neutral and tested directly.
@@ -10302,6 +10400,13 @@ fn try_split_create_initramfs_mo_into_frame(
                 file_data_offset,
                 file_len
             );
+            #[cfg(feature = "vfs-lifetime-witness")]
+            crate::kernel::boot::grant_ledger::print_ledger_split(
+                shared,
+                "nr28_create",
+                tid,
+                mo_id,
+            );
             frame.set_ok(0, cap_id.0 as usize, file_len);
             Some(Ok(()))
         }
@@ -10945,6 +11050,11 @@ fn try_split_spawn_from_mo_into_frame(
     }) else {
         return fail(SyscallError::WrongObject);
     };
+    // VFS-LIFETIME1 witness: who still holds this grant at the moment PM uses it.
+    #[cfg(feature = "vfs-lifetime-witness")]
+    crate::kernel::boot::grant_ledger::print_grant_use_split(
+        shared, caller_tid, image_id, mo_cap_raw, mo_id,
+    );
     let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() else {
         return fail(SyscallError::InvalidArgs);
     };
@@ -11091,6 +11201,9 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // VFS-CORRECT1C: NR 21 — split from birth; read-only, the caller never task-switches.
         // `try_split_caller_session_into_frame` settles every refusal.
         Syscall::IpcCallerSession => Some(syscall),
+        // VFS-LIFETIME1: NR 22 — split from birth; the caller never task-switches.
+        // `try_split_cap_relinquish_into_frame` settles every refusal.
+        Syscall::CapRelinquish => Some(syscall),
         // U9-MO2 §4: CreateInitramfsFileSliceMo (NR 28) — the smallest live production class
         // still reaching a terminal broad acquisition. Its object is BORROWED initrd backing, so
         // its compensation never touches the frame allocator; every owner it needs already exists
@@ -12277,6 +12390,8 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
                 // VFS-CORRECT1C: NR 21 `IpcCallerSession`, split from birth.
                 || nr == crate::kernel::syscall::SYSCALL_IPC_CALLER_SESSION_NR
+                // VFS-LIFETIME1: NR 22 `CapRelinquish`, split from birth.
+                || nr == crate::kernel::syscall::SYSCALL_CAP_RELINQUISH_NR
                 || nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
                 || nr == SYSCALL_SPAWN_PROCESS_NR
@@ -12556,7 +12671,8 @@ mod tests {
         // 22 is inside `SYSCALL_COUNT` (32) and is not an assigned number. (SCHED-TIME-FOUNDATION1
         // C re-derivation: this used 20, which is now `ClockNanosleep`; VFS-CORRECT1C: then 21,
         // which is now `IpcCallerSession`.)
-        const UNASSIGNED_NR: usize = 22;
+        // VFS-LIFETIME1: then 22, which is now `CapRelinquish`.
+        const UNASSIGNED_NR: usize = 25;
         assert!(UNASSIGNED_NR < crate::kernel::syscall::SYSCALL_COUNT);
 
         // The production owner, over this frame.

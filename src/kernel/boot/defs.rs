@@ -57,8 +57,10 @@ pub(crate) enum MemoryObjectKind {
 /// always [`Self::AllocatorOwned`]: they called `free_frame(object.phys)` with no reference to
 /// the kind. That is latent corruption rather than a leak — an initramfs slice's physical
 /// address is inside the boot initrd, memory the allocator never handed out, so freeing it
-/// would insert someone else's memory into the free list. It has never fired only because no
-/// `InitramfsFileSlice` object is reclaimed in production today.
+/// would insert someone else's memory into the free list. It never fired while no
+/// `InitramfsFileSlice` object was reclaimed in production. Since VFS-LIFETIME1 every file grant's
+/// slice IS reclaimed (its last holder's NR 22, or the reap of a holder that died with it), so this
+/// distinction is now what keeps those reclaims off the allocator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryBacking {
     /// The frame allocator handed this extent out and must get it back — exactly once, and

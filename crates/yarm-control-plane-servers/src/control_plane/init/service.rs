@@ -4568,6 +4568,11 @@ mod vfs_correct_witness;
 #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-fd-witness"))]
 #[path = "vfs_fd_witness.rs"]
 mod vfs_fd_witness;
+/// VFS-LIFETIME1 — the live file-grant lifetime witness (`vfs_lifetime_witness.rs`), run after
+/// init's ordinary `/ram` registration, under `vfs-lifetime-witness`.
+#[cfg(all(not(feature = "hosted-dev"), feature = "vfs-lifetime-witness"))]
+#[path = "vfs_lifetime_witness.rs"]
+mod vfs_lifetime_witness;
 #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-mount-witness"))]
 #[path = "vfs_mount_witness.rs"]
 mod vfs_mount_witness;
@@ -10988,6 +10993,8 @@ pub fn run() {
                     pm_recv,
                     ramfs_child_tid,
                 );
+                #[cfg(all(not(feature = "hosted-dev"), feature = "vfs-lifetime-witness"))]
+                let _ = vfs_lifetime_witness::run(vfs_recv_cap, pm_send, pm_recv);
             } else {
                 yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_FAIL ok=0 child_tid=0");
             }

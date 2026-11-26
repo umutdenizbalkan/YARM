@@ -614,15 +614,21 @@ impl ReapOwners for BroadReapOwners<'_> {
         // NOTIF-LIFETIME1: the dropped space's Notification references go back after rank 4.
         let mut notification_refs =
             crate::kernel::boot::notification_lifetime::CspaceNotificationRefs::new();
+        let mut memory_refs = crate::kernel::boot::cnode_state::CspaceMemoryRefs::new();
         let removed = self.kernel.with_capability_state_mut(|capability| {
             crate::kernel::boot::cnode_state::reap_process_cspace_locked(
                 capability,
                 pid,
                 cnode,
                 &mut notification_refs,
+                &mut memory_refs,
             )
         });
         self.kernel.release_notification_refs(&notification_refs);
+        // VFS-LIFETIME1: then the dropped space's grant-object references, at rank 6.
+        self.kernel.with_memory_state_mut(|memory| {
+            crate::kernel::boot::cnode_state::release_reaped_grant_refs_locked(memory, &memory_refs)
+        });
         removed
     }
 
@@ -827,16 +833,22 @@ impl ReapOwners for SharedReapOwners<'_> {
         // NOTIF-LIFETIME1: the dropped space's Notification references go back after rank 4.
         let mut notification_refs =
             crate::kernel::boot::notification_lifetime::CspaceNotificationRefs::new();
+        let mut memory_refs = crate::kernel::boot::cnode_state::CspaceMemoryRefs::new();
         let removed = self.shared.with_capability_state_split_mut(|capability| {
             crate::kernel::boot::cnode_state::reap_process_cspace_locked(
                 capability,
                 pid,
                 cnode,
                 &mut notification_refs,
+                &mut memory_refs,
             )
         });
         self.shared
             .release_notification_refs_split(&notification_refs);
+        // VFS-LIFETIME1: then the dropped space's grant-object references, at rank 6.
+        self.shared.with_memory_split_mut(|memory| {
+            crate::kernel::boot::cnode_state::release_reaped_grant_refs_locked(memory, &memory_refs)
+        });
         removed
     }
 

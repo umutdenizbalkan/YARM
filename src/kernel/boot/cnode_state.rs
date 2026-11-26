@@ -272,11 +272,19 @@ impl KernelState {
         }
 
         let mut notification_refs = super::notification_lifetime::CspaceNotificationRefs::new();
+        let mut memory_refs = CspaceMemoryRefs::new();
         let (removed_cnode_space, removed_process_record) =
             self.with_capability_state_mut(|capability| {
-                reap_process_cspace_locked(capability, pid, cnode, &mut notification_refs)
+                reap_process_cspace_locked(
+                    capability,
+                    pid,
+                    cnode,
+                    &mut notification_refs,
+                    &mut memory_refs,
+                )
             });
         self.release_notification_refs(&notification_refs);
+        self.with_memory_state_mut(|memory| release_reaped_grant_refs_locked(memory, &memory_refs));
 
         crate::yarm_log!(
             "YARM_PROC_CNODE_CLEANUP_NOALLOC pid={} cnode={} slots={} removed_links={} removed_cspace={} removed_record={}",
@@ -415,11 +423,17 @@ pub(crate) fn link_names_process(source_pid: u64, dest_pid: u64, pid: u64) -> bo
 /// NOTIF-LIFETIME1: dropping the space drops every capability still in it, so each Notification
 /// capability it held is recorded in `notification_refs` for the caller to give back at rank 3.
 /// The walk covers this one space's slots and nothing else.
+///
+/// VFS-LIFETIME1: likewise every MemoryObject capability it held is recorded in `memory_refs`, so
+/// the caller can give the references back at rank 6 ([`release_reaped_grant_refs_locked`]). A
+/// grant held by a process that died holding it is released by this teardown — before, the
+/// space went and its object stayed registered with a reference nothing named.
 pub(crate) fn reap_process_cspace_locked(
     capability: &mut CapabilitySubsystem,
     pid: u64,
     cnode: CNodeId,
     notification_refs: &mut super::notification_lifetime::CspaceNotificationRefs,
+    memory_refs: &mut CspaceMemoryRefs,
 ) -> (bool, bool) {
     let mut removed_cnode_space = false;
     let mut removed_process_record = false;
@@ -433,6 +447,7 @@ pub(crate) fn reap_process_cspace_locked(
             for cap in cspace.live_cap_ids() {
                 if let Some(held) = cspace.get(cap) {
                     notification_refs.note(&held);
+                    memory_refs.note(held.object);
                 }
             }
         }
@@ -448,4 +463,90 @@ pub(crate) fn reap_process_cspace_locked(
         removed_process_record = true;
     }
     (removed_cnode_space, removed_process_record)
+}
+
+/// VFS-LIFETIME1 — the MemoryObject references a reaped CNode held, by object, for release at
+/// rank 6 after the rank-4 removal. Bounded: an object past the table is counted in `overflow`
+/// and keeps its reference (the pre-repair behaviour), never released by guess.
+#[derive(Debug, Clone)]
+pub(crate) struct CspaceMemoryRefs {
+    refs: [(u64, u32); 32],
+    len: usize,
+    pub(crate) overflow: usize,
+}
+
+impl CspaceMemoryRefs {
+    pub(crate) const fn new() -> Self {
+        Self {
+            refs: [(0, 0); 32],
+            len: 0,
+            overflow: 0,
+        }
+    }
+
+    pub(crate) fn note(&mut self, object: CapObject) {
+        let CapObject::MemoryObject { id } = object else {
+            return;
+        };
+        if let Some(entry) = self.refs[..self.len].iter_mut().find(|(i, _)| *i == id) {
+            entry.1 = entry.1.saturating_add(1);
+        } else if self.len < self.refs.len() {
+            self.refs[self.len] = (id, 1);
+            self.len += 1;
+        } else {
+            self.overflow += 1;
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
+        self.refs[..self.len].iter().copied()
+    }
+}
+
+impl Default for CspaceMemoryRefs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// VFS-LIFETIME1 — rank 6: give back the references a reaped CNode's grant objects held, and
+/// reclaim each that nothing else references. Only BORROWED-backing objects (initramfs file
+/// slices: the backing is the boot initrd, so a reclaim removes the registry entry and touches no
+/// allocator) are released here. Allocator-owned objects keep the reap's earlier behaviour.
+/// Returns `(references released, objects reclaimed)`.
+pub(crate) fn release_reaped_grant_refs_locked(
+    memory: &mut super::MemorySubsystem,
+    refs: &CspaceMemoryRefs,
+) -> (u32, u32) {
+    let mut released = 0u32;
+    let mut reclaimed = 0u32;
+    for (id, count) in refs.iter() {
+        let borrowed = memory.memory_objects.iter().flatten().any(|object| {
+            object.id == id && object.kind.backing() == super::MemoryBacking::Borrowed
+        });
+        if !borrowed {
+            continue;
+        }
+        let object = CapObject::MemoryObject { id };
+        for _ in 0..count {
+            KernelState::adjust_memory_object_cap_refcount_locked(memory, object, -1);
+        }
+        released = released.saturating_add(count);
+        KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object);
+        if !memory.memory_objects.iter().flatten().any(|o| o.id == id) {
+            reclaimed += 1;
+        }
+    }
+    released_log(released, reclaimed);
+    (released, reclaimed)
+}
+
+fn released_log(released: u32, reclaimed: u32) {
+    if released != 0 {
+        crate::yarm_log!(
+            "REAP_GRANT_REFS_RELEASED released={} reclaimed={}",
+            released,
+            reclaimed
+        );
+    }
 }

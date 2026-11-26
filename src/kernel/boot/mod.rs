@@ -75,8 +75,10 @@ pub(crate) use ipc_state::{
     publish_recv_waiter_locked, reclaim_reply_authority_with, release_reply_terminal_locked,
     reserve_direct_reply_record_locked, take_claimable_server_death_locked,
 };
+pub(crate) mod cap_relinquish;
 pub(crate) mod cleared_current;
 pub(crate) mod exit_claim;
+pub(crate) mod grant_ledger;
 pub(crate) mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;
@@ -10416,6 +10418,9 @@ pub struct Bootstrap;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[path = "cap_relinquish_tests/tests.rs"]
+mod cap_relinquish_tests;
 #[cfg(test)]
 #[path = "d2_settle_tests/tests.rs"]
 mod d2_settle_tests;

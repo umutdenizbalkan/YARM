@@ -23,4 +23,4 @@ These directories are read by hosted tests and scripts only; no build stages the
 | directory | read by | contents |
 |---|---|---|
 | `d2-publish-race/` | `scripts/check-d2-publish-race.py --self-test`, `tests/d2_publish_race_checker.rs` | IPC-D2-RULE1: verbatim extracts of the six archived split-route publish races |
-| `riscv-workload/` | `tests/riscv_split_census.rs` | RISCV-STRICT1: the lines the RISC-V core smoke's split census and `/ram` registration obligation read, from three archived strict SMP2 boots (default core, `wide` fd witness, `wide` 1B witness); provenance and sampling in each header |
+| `riscv-workload/` | `tests/riscv_split_census.rs` | RISCV-STRICT1: the lines the RISC-V core smoke's split census and `/ram` registration obligation read, from three archived strict SMP2 boots (default core, `wide` fd witness, `wide` 1B witness); VFS-LIFETIME1 adds `lifetime-witness.txt` (a dev SMP2 lifetime-witness boot, with its `VL1_` records); provenance and sampling in each header |

@@ -66,6 +66,12 @@ pub(crate) trait RouterIo {
     fn caller_session(&mut self, reply_cap: u64) -> Option<(SessionId, u64)>;
     /// NR 21 op 1: `Some(false)` only when the kernel says the session has no live thread.
     fn session_alive(&mut self, session: SessionId) -> Option<bool>;
+    /// VFS-LIFETIME1 — NR 22: give up VFS's own copy of a granted capability, keeping every
+    /// other holder (the client's copy survives, re-parented).
+    fn relinquish(
+        &mut self,
+        cap: u64,
+    ) -> Result<yarm_user_rt::syscall::CapRelinquishOutcome, yarm_user_rt::syscall::SyscallError>;
 }
 
 /// A validated backend answer, owned (the reply message is gone once this is built).
@@ -98,6 +104,31 @@ pub(crate) struct Router {
     /// kernel refuses — so the client reply really fails and the open is rolled back — and then
     /// through the real one with `BACKEND`.
     pub(crate) fail_reply_path: Option<&'static [u8]>,
+    /// VFS-LIFETIME1: VFS's copies of relayed grants whose release a queued transfer deferred;
+    /// retried at the next request.
+    pub(crate) grant_releases: yarm_user_rt::grant_release::PendingReleases<8>,
+    /// `vfs-lifetime-witness` fault injection: backend grants of exactly this length (the
+    /// 300-byte fixture) are counted; the first is relayed through a stale reply capability (hop 2
+    /// undelivered, then the client is told `BACKEND`), the second with the wrong fd echoed (hop 2
+    /// delivered, rejected by the client). Later ones are ordinary.
+    pub(crate) grant_injection_len: Option<u64>,
+    pub(crate) grant_injection_seen: u32,
+    pending_grant_injection: Option<GrantInjection>,
+    /// `vfs-lifetime-nc-keep-relay` negative control: VFS keeps its copy of every delivered
+    /// relayed grant (the leak VFS-LIFETIME1 closes). Never set outside that control.
+    pub(crate) keep_relayed_grants: bool,
+    /// VFS-LIFETIME1: relayed grants VFS delivered, held until the backend descriptor they were
+    /// made for (instance, backend handle) is closed — by the client's CLOSE, the session's
+    /// reclaim, or a close retry.
+    pub(crate) held_grants: yarm_user_rt::grant_release::HeldGrants<(u64, u64), 16>,
+    /// The backend descriptor of the grant `grant()` is about to relay.
+    grant_key: Option<(u64, u64)>,
+}
+
+/// What the witness does to the next relayed grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantInjection {
+    StaleReply { fd: u64 },
 }
 
 fn completion(c: VfsCompletion, data: &[u8], cap: Option<u64>) -> Message {
@@ -128,6 +159,13 @@ impl Router {
             fds: FdSpace::new(),
             unknown_backend_opens: 0,
             fail_reply_path: None,
+            grant_injection_len: None,
+            grant_injection_seen: 0,
+            pending_grant_injection: None,
+            keep_relayed_grants: false,
+            held_grants: yarm_user_rt::grant_release::HeldGrants::new(),
+            grant_key: None,
+            grant_releases: yarm_user_rt::grant_release::PendingReleases::new(),
         }
     }
 
@@ -191,7 +229,13 @@ impl Router {
                 error(op, VFS_STATUS_ERR_UNKNOWN_OP, 0)
             }
         };
-        if !io.reply_client(reply_cap, &reply) {
+        let injection = self.pending_grant_injection.take();
+        let target_cap = match injection {
+            Some(GrantInjection::StaleReply { .. }) => reply_cap.wrapping_add(1 << 16),
+            None => reply_cap,
+        };
+        let delivered = io.reply_client(target_cap, &reply);
+        if !delivered {
             yarm_user_rt::user_log!(
                 "VFS_CLIENT_REPLY_FAIL op={} tgid={} has_cap={}",
                 op,
@@ -199,11 +243,74 @@ impl Router {
                 reply.transferred_cap().is_some() as u8
             );
         }
+        // VFS-LIFETIME1: refused, VFS's copy of a relayed grant is the last one downstream of
+        // the backend and goes now. Delivered, it is held until the backend descriptor closes:
+        // the client's copy derives from it and may still be in flight when NR 7 returns, and the
+        // client closes only after it has its own. A full table releases at once instead.
+        let grant_key = self.grant_key.take();
+        if let Some(cap) = reply.transferred_cap() {
+            if delivered && self.keep_relayed_grants {
+                yarm_user_rt::user_log!("VFS_GRANT_KEEP_NC cap={}", cap.0);
+            } else if delivered
+                && let Some(key) = grant_key
+                && self.held_grants.hold(key, cap.0)
+            {
+                yarm_user_rt::user_log!(
+                    "VFS_GRANT_HELD cap={} instance={} backend_handle={} held={}",
+                    cap.0,
+                    key.0,
+                    key.1,
+                    self.held_grants.held()
+                );
+            } else {
+                self.release_grant(
+                    io,
+                    cap.0,
+                    if delivered {
+                        "table_full"
+                    } else {
+                        "reply_refused"
+                    },
+                );
+            }
+        }
+        if let Some(GrantInjection::StaleReply { fd }) = injection {
+            // The injected reply went nowhere: the client is still waiting, and is told the truth.
+            let told = io.reply_client(
+                reply_cap,
+                &error(VFS_OP_FILE_GRANT_RO, VFS_STATUS_ERR_BACKEND, fd),
+            );
+            yarm_user_rt::user_log!(
+                "VFS_GRANT_INJECT kind=stale_reply delivered={} then_backend_error={}",
+                delivered as u8,
+                told as u8
+            );
+        }
+    }
+
+    /// VFS-LIFETIME1 — release VFS's copy of a grant, parking it if a queued transfer defers it.
+    fn release_grant<I: RouterIo>(&mut self, io: &mut I, cap: u64, why: &str) {
+        let step = self.grant_releases.release(cap, |c| io.relinquish(c));
+        yarm_user_rt::user_log!(
+            "VFS_GRANT_RELEASE cap={} why={} step={:?} parked={}",
+            cap,
+            why,
+            step,
+            self.grant_releases.parked()
+        );
     }
 
     // ── housekeeping ───────────────────────────────────────────────────────────────────────
 
     fn housekeeping<I: RouterIo>(&mut self, io: &mut I, mounts: &VfsMountTable, caller: SessionId) {
+        if self.grant_releases.parked() != 0 {
+            let settled = self.grant_releases.retry(|c| io.relinquish(c));
+            yarm_user_rt::user_log!(
+                "VFS_GRANT_RELEASE_RETRY settled={} parked={}",
+                settled,
+                self.grant_releases.parked()
+            );
+        }
         if let Some(c) = self.fds.next_retry() {
             let r = self.backend_close(io, mounts, c);
             yarm_user_rt::user_log!(
@@ -297,6 +404,7 @@ impl Router {
                         expect.fd,
                         s
                     );
+                    Self::release_rejected(io, transferred_cap, "status");
                     Forwarded::Status(s)
                 }
                 Err(fault) => {
@@ -307,15 +415,54 @@ impl Router {
                         fault,
                         has_cap
                     );
+                    Self::release_rejected(io, transferred_cap, "malformed");
                     Forwarded::Malformed
                 }
             },
         }
     }
 
+    /// VFS-LIFETIME1 — a backend completion VFS rejected may still have installed a capability
+    /// in VFS's CNode (the kernel materializes it before VFS validates the reply). Nobody else
+    /// will ever be given it, so VFS releases it here; no transfer derives from it, so the release
+    /// is never deferred.
+    fn release_rejected<I: RouterIo>(io: &mut I, cap: Option<u64>, why: &str) {
+        if let Some(cap) = cap {
+            let result = io.relinquish(cap);
+            yarm_user_rt::user_log!(
+                "VFS_GRANT_RELEASE cap={} why=rejected_{} result={:?}",
+                cap,
+                why,
+                result.map(|o| o.reclaimed)
+            );
+        }
+    }
+
     /// Close `c.handle` at exactly `c.backend`. The registration must still be the one in the
     /// table (same instance, same capability); otherwise there is nothing open there any more.
     fn backend_close<I: RouterIo>(
+        &mut self,
+        io: &mut I,
+        mounts: &VfsMountTable,
+        c: BackendClose,
+    ) -> Closed {
+        let closed = self.backend_close_forward(io, mounts, c);
+        // VFS-LIFETIME1: the descriptor is gone at VFS whatever the backend answered, so every
+        // grant VFS relayed for it goes too (the client's copies survive).
+        let key = (c.backend.instance, c.handle);
+        let mut caps = [0u64; 16];
+        let mut n = 0;
+        self.held_grants.close(key, |cap| {
+            caps[n] = cap;
+            n += 1;
+        });
+        for cap in &caps[..n] {
+            self.release_grant(io, *cap, "closed");
+        }
+        closed
+    }
+
+    fn backend_close_forward<I: RouterIo>(
         &mut self,
         io: &mut I,
         mounts: &VfsMountTable,
@@ -677,16 +824,37 @@ impl Router {
             fd: handle,
             requested: 0,
         };
+        self.grant_key = None;
         match Self::forward(io, backend, label.as_str(), &req, expect) {
             Forwarded::Ok { value, cap, .. } => {
+                if cap.is_some() {
+                    self.grant_key = Some((backend.instance, handle));
+                }
                 yarm_user_rt::user_log!(
                     "VFS_FILE_GRANT_RO_RELAY client_fd={} backend_handle={} has_cap={}",
                     args.fd,
                     handle,
                     cap.is_some() as u8
                 );
+                let mut echo_fd = args.fd;
+                if cap.is_some() && self.grant_injection_len == Some(value as u64) {
+                    self.grant_injection_seen += 1;
+                    match self.grant_injection_seen {
+                        1 => {
+                            self.pending_grant_injection =
+                                Some(GrantInjection::StaleReply { fd: args.fd })
+                        }
+                        2 => echo_fd = args.fd.wrapping_add(1),
+                        _ => {}
+                    }
+                    yarm_user_rt::user_log!(
+                        "VFS_GRANT_INJECT_ARM seen={} len={}",
+                        self.grant_injection_seen,
+                        value
+                    );
+                }
                 completion(
-                    VfsCompletion::ok(VFS_OP_FILE_GRANT_RO, value, args.fd),
+                    VfsCompletion::ok(VFS_OP_FILE_GRANT_RO, value, echo_fd),
                     &[],
                     cap,
                 )

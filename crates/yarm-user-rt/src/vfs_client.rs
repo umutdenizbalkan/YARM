@@ -23,9 +23,10 @@
 use crate::ipc::Message;
 use crate::syscall::{ReceivedMessage, SyscallError};
 use yarm_ipc_abi::vfs_abi::{
-    BulkReadArgs, OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_INLINE_READ_MAX,
-    VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_READ_BULK, VFS_OP_STATX, VfsCompletionExpect,
-    VfsCompletionFault, VfsCompletionOutcome, VfsV1Args, validate_vfs_completion,
+    BulkReadArgs, FileGrantRoArgs, OpenAtInlinePath, ReadWriteArgs, StatxInlinePath,
+    VFS_INLINE_READ_MAX, VFS_OP_CLOSE, VFS_OP_FILE_GRANT_RO, VFS_OP_OPENAT, VFS_OP_READ,
+    VFS_OP_READ_BULK, VFS_OP_STATX, VfsCompletionExpect, VfsCompletionFault, VfsCompletionOutcome,
+    VfsV1Args, validate_vfs_completion,
 };
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -219,6 +220,40 @@ pub fn vfs_close_with<T: VfsTransport>(t: &mut T, fd: u64) -> Result<u64, VfsCli
     settled_value(expect(VFS_OP_CLOSE, fd, 0), &received)
 }
 
+/// VFS-LIFETIME1 — FILE_GRANT_RO `fd`: the file length and the read-only MemoryObject capability
+/// now in the caller's CNode. The caller owns that capability and releases it (NR 22) when done.
+/// A completion this function rejects may still have installed one — the kernel materializes a
+/// transferred capability before the reply is validated — so on every error that carried one,
+/// `release` is called with it and nothing is returned that the caller could forget.
+pub fn vfs_file_grant_ro_with<T: VfsTransport>(
+    t: &mut T,
+    fd: u64,
+    mut release: impl FnMut(u64),
+) -> Result<(u64, u64), VfsClientError> {
+    let msg = Message::with_header(
+        0,
+        VFS_OP_FILE_GRANT_RO,
+        0,
+        None,
+        &FileGrantRoArgs::new(fd).encode(),
+    )
+    .map_err(|_| VfsClientError::MessageFailed)?;
+    let received = transact(t, &msg)?;
+    let cap = received.transferred_cap;
+    match settled_value(expect(VFS_OP_FILE_GRANT_RO, fd, 0), &received) {
+        Ok(len) => match cap {
+            Some(cap) => Ok((len, cap)),
+            None => Err(VfsClientError::Malformed(VfsCompletionFault::MissingCap)),
+        },
+        Err(e) => {
+            if let Some(cap) = cap {
+                release(cap);
+            }
+            Err(e)
+        }
+    }
+}
+
 // ── IPC helpers (unsafe — require live kernel capabilities) ───────────────────
 
 /// Send a `VFS_OP_STATX` request for `path` to `vfs_send_cap` and return
@@ -287,6 +322,24 @@ pub unsafe fn vfs_close(
     // SAFETY: Caller guarantees both caps are valid for this task.
     let mut t = unsafe { SyscallTransport::new(vfs_send_cap, reply_recv_cap) };
     vfs_close_with(&mut t, fd)
+}
+
+/// [`vfs_file_grant_ro_with`] over the production transport; a rejected completion's capability
+/// is released through NR 22.
+///
+/// # Safety
+/// `vfs_send_cap` must be a valid SEND capability and `reply_recv_cap` a valid RECV capability,
+/// both belonging to the calling task's cnode.
+pub unsafe fn vfs_file_grant_ro(
+    vfs_send_cap: u64,
+    reply_recv_cap: u64,
+    fd: u64,
+) -> Result<(u64, u64), VfsClientError> {
+    // SAFETY: Caller guarantees both caps are valid for this task.
+    let mut t = unsafe { SyscallTransport::new(vfs_send_cap, reply_recv_cap) };
+    vfs_file_grant_ro_with(&mut t, fd, |cap| {
+        let _ = crate::grant_release::relinquish_now(cap);
+    })
 }
 
 /// The production transport: NR 6 on `vfs_send_cap`, blocking `ipc_recv_v2` on `reply_recv_cap`.
@@ -861,6 +914,48 @@ mod tests {
                 got: VFS_OP_FILE_GRANT_RO
             }))
         );
+    }
+
+    // ── VFS-LIFETIME1: the grant client owns, or releases, what it received ───────
+
+    #[test]
+    fn vl1_grant_client_returns_the_capability_or_releases_a_rejected_one() {
+        let mut r = Scripted::completion(VfsCompletion::ok(VFS_OP_FILE_GRANT_RO, 300, 14), &[]);
+        r.transferred_cap = Some(9);
+        let mut t = ScriptTransport::new(Ok(())).reply(r);
+        let mut released = None;
+        assert_eq!(
+            vfs_file_grant_ro_with(&mut t, 14, |c| released = Some(c)),
+            Ok((300, 9))
+        );
+        assert_eq!(
+            released, None,
+            "a returned capability is the caller's, not released"
+        );
+        // The wrong fd echoed, with a capability installed: rejected AND released.
+        let mut r = Scripted::completion(VfsCompletion::ok(VFS_OP_FILE_GRANT_RO, 300, 15), &[]);
+        r.transferred_cap = Some(11);
+        let mut t = ScriptTransport::new(Ok(())).reply(r);
+        assert_eq!(
+            vfs_file_grant_ro_with(&mut t, 14, |c| released = Some(c)),
+            Err(VfsClientError::Malformed(VfsCompletionFault::WrongFd {
+                expected: 14,
+                got: 15
+            }))
+        );
+        assert_eq!(released, Some(11));
+        released = None;
+        // An error completion with no capability releases nothing.
+        let r = Scripted::completion(
+            VfsCompletion::err(VFS_OP_FILE_GRANT_RO, VFS_STATUS_ERR_BAD_FD, 14),
+            &[],
+        );
+        let mut t = ScriptTransport::new(Ok(())).reply(r);
+        assert_eq!(
+            vfs_file_grant_ro_with(&mut t, 14, |c| released = Some(c)),
+            Err(VfsClientError::Status(VFS_STATUS_ERR_BAD_FD))
+        );
+        assert_eq!(released, None);
     }
 
     // ── Phase 2B build_bulk_read_message tests ────────────────────────────────

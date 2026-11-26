@@ -1,16 +1,16 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# YARM Syscall ABI v14 (Frozen Contract)
+# YARM Syscall ABI v15 (Frozen Contract)
 
-- ABI Version: `14`
-- Public syscall count: `22` (`0..=21`)
+- ABI Version: `15`
+- Public syscall count: `23` (`0..=22`)
 - Kernel dispatch table count: `32` (`SYSCALL_COUNT`, slots `0..=31`)
 
-## Public ABI v14 syscall numbers
+## Public ABI v15 syscall numbers
 
 `SYSCALL_COUNT` in the kernel is the dispatch-table size, not the public ABI
-count. The current public ABI v14 surface is the contiguous user-callable range
-`0..=21` (**22 slots**). Some public slots still enforce capability or control
+count. The current public ABI v15 surface is the contiguous user-callable range
+`0..=22` (**23 slots**). Some public slots still enforce capability or control
 plane policy and can return `MissingRight`; that does not make them private
 kernel-extension slots.
 
@@ -38,64 +38,81 @@ kernel-extension slots.
 | `19` | `ClockSetRealtime` | public control-plane ABI (`arg0=ts_ptr`, 8-aligned `Timespec`, UTC since the Unix epoch); policy-gated: only a `SystemServer` caller may initialize `CLOCK_REALTIME`, others receive `MissingRight` — SCHED-TIME-FOUNDATION1, ABI v12 |
 | `20` | `ClockNanosleep` | public (`arg0=clock_id`; `arg1=flags`: bit 0 `TIMER_ABSTIME`; `arg2=req_ptr`, 8-aligned `Timespec`; `arg3=rem_ptr`, `0` or 8-aligned, never written) — blocks until a `CLOCK_MONOTONIC` deadline; returns `0`. SCHED-TIME-FOUNDATION1, ABI v12 |
 | `21` | `IpcCallerSession` | public (`arg0=op`: `0` = the process behind the reply capability `arg1` — `ret0` thread-group id, `ret1` process incarnation, `ret2` caller TID; `1` = live thread count of the process `arg1` (thread-group id), `arg2` (incarnation) in `ret0`, `ret1 = 1`, `SystemServer` only) — VFS-CORRECT1C (ABI v14) |
+| `22` | `CapRelinquish` | public (`arg0=cap`, a MemoryObject capability in the caller's own CNode) — gives up exactly that slot; capabilities delegated from it survive, re-parented to the slot's own delegation parent (or made roots); `ret0` re-parented count, `ret1 = 1` if the object left the registry, `ret2 = 1` (`CAP_RELINQUISH_STATUS_DONE`) — VFS-LIFETIME1 (ABI v15) |
 
 ## ABI slot status matrix
 
 Status terms used by this matrix:
 
-- **public v14**: part of the stable user-callable syscall ABI for version `14`.
-- **privileged extension**: implemented dispatch-table slot outside the public v14
+- **public v15**: part of the stable user-callable syscall ABI for version `15`.
+- **privileged extension**: implemented dispatch-table slot outside the public v15
   range; intended for PM/SystemServer/bootstrap plumbing and not counted in the
   public ABI surface.
-- **reserved gap**: not assigned and not dispatched in v14. Calls currently fail
+- **reserved gap**: not assigned and not dispatched in v15. Calls currently fail
   with `InvalidNumber`; assignment to a public user ABI requires a future ABI
   version as described below.
 - **deprecated**: still dispatched for compatibility, but discouraged, with a
-  documented replacement and removal plan. **No public v14 syscall is currently
+  documented replacement and removal plan. **No public v15 syscall is currently
   deprecated.**
 - **removed/invalid**: not dispatched by this kernel ABI.
 
 | Slot/range | Name | Status | Caller class | Notes |
 |------------|------|--------|--------------|-------|
-| `0` | `Yield` | public v14 | any user task | Stable public syscall. |
-| `1` | `IpcSend` | public v14 | any user task with endpoint rights | Capability/right checks apply. |
-| `2` | `IpcRecv` | public v14 | any user task with endpoint rights | Capability/right checks apply. |
-| `3` | `VmMap` | public v14 | any user task with mapping capability | Capability-targeted VM mapping. |
-| `4` | `TransferRelease` | public v14 | transfer receiver | Releases auto-mapped shared-memory transfer. |
-| `5` | `IpcRecvTimeout` | public v14 | any user task with endpoint rights | Bounded receive/probe variant. |
-| `6` | `IpcCall` | public v14 | any user task with endpoint rights | Request send with kernel-minted reply-cap transfer. |
-| `7` | `IpcReply` | public v14 | reply-cap holder | Consumes one-shot reply capability. |
-| `8` | `ControlPlaneSetCnodeSlots` | public v14 | policy-gated user/control-plane callers | Public ABI slot; kernel policy may return `MissingRight`. |
-| `9` | `FutexWait` | public v14 | any user task | Futex address validation applies. |
-| `10` | `FutexWake` | public v14 | any user task | Futex address validation applies. |
-| `11` | `SpawnThread` | public v14 | any user task | Spawns a thread in the current process/thread group. |
-| `12` | `Fork` | public v14 | any user task | CoW process fork. |
-| `13` | `VmAnonMap` | public v14 | any user task | Wired anonymous mapping syscall; not reserved or deprecated. |
-| `14` | `VmBrk` | public v14 | thread-group leader | Staged per-task brk contract. |
-| `15` | `DebugLog` | public v14 | any user task | Debug logging aid; semantics are best-effort. |
-| `16` | `ExitCurrentTask` | public v14 | any user task | Terminates the calling task; non-returning trap disposition, so no success return-register contract. |
-| `17` | `FutexCmpRequeue` | public v14 | any user task | Futex address validation applies to both words; split from birth on every port. |
-| `18` | `ClockGetTime` | public v14 | any user task | Coherent clock read; split from birth on every port. |
-| `19` | `ClockSetRealtime` | public v14 | `SystemServer` only | Realtime epoch initialization; others receive `MissingRight`; split from birth. |
-| `20` | `ClockNanosleep` | public v14 | any user task | Sleep on a monotonic deadline; a switching class parked through the FutexWait park tail on every port. |
-| `21` | `IpcCallerSession` | public v14 | any user task holding a reply capability (op 0); `SystemServer` (op 1) | Authenticated session identity for servers; broad route. |
-| `22` | — | reserved gap | none | `Syscall::decode` rejects this with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
-| `23` | `SpawnProcess` | privileged extension | privileged/bootstrap control-plane use | Implemented kernel dispatch slot; not part of public v14 count. |
+| `0` | `Yield` | public v15 | any user task | Stable public syscall. |
+| `1` | `IpcSend` | public v15 | any user task with endpoint rights | Capability/right checks apply. |
+| `2` | `IpcRecv` | public v15 | any user task with endpoint rights | Capability/right checks apply. |
+| `3` | `VmMap` | public v15 | any user task with mapping capability | Capability-targeted VM mapping. |
+| `4` | `TransferRelease` | public v15 | transfer receiver | Releases auto-mapped shared-memory transfer. |
+| `5` | `IpcRecvTimeout` | public v15 | any user task with endpoint rights | Bounded receive/probe variant. |
+| `6` | `IpcCall` | public v15 | any user task with endpoint rights | Request send with kernel-minted reply-cap transfer. |
+| `7` | `IpcReply` | public v15 | reply-cap holder | Consumes one-shot reply capability. |
+| `8` | `ControlPlaneSetCnodeSlots` | public v15 | policy-gated user/control-plane callers | Public ABI slot; kernel policy may return `MissingRight`. |
+| `9` | `FutexWait` | public v15 | any user task | Futex address validation applies. |
+| `10` | `FutexWake` | public v15 | any user task | Futex address validation applies. |
+| `11` | `SpawnThread` | public v15 | any user task | Spawns a thread in the current process/thread group. |
+| `12` | `Fork` | public v15 | any user task | CoW process fork. |
+| `13` | `VmAnonMap` | public v15 | any user task | Wired anonymous mapping syscall; not reserved or deprecated. |
+| `14` | `VmBrk` | public v15 | thread-group leader | Staged per-task brk contract. |
+| `15` | `DebugLog` | public v15 | any user task | Debug logging aid; semantics are best-effort. |
+| `16` | `ExitCurrentTask` | public v15 | any user task | Terminates the calling task; non-returning trap disposition, so no success return-register contract. |
+| `17` | `FutexCmpRequeue` | public v15 | any user task | Futex address validation applies to both words; split from birth on every port. |
+| `18` | `ClockGetTime` | public v15 | any user task | Coherent clock read; split from birth on every port. |
+| `19` | `ClockSetRealtime` | public v15 | `SystemServer` only | Realtime epoch initialization; others receive `MissingRight`; split from birth. |
+| `20` | `ClockNanosleep` | public v15 | any user task | Sleep on a monotonic deadline; a switching class parked through the FutexWait park tail on every port. |
+| `21` | `IpcCallerSession` | public v15 | any user task holding a reply capability (op 0); `SystemServer` (op 1) | Authenticated session identity for servers; broad route. |
+| `22` | `CapRelinquish` | public v15 | any user task holding a MemoryObject capability | Single-slot release of the caller's own copy; delegated copies survive. Split route on every port. |
+| `23` | `SpawnProcess` | privileged extension | privileged/bootstrap control-plane use | Implemented kernel dispatch slot; not part of public v15 count. |
 | `24` | *(retired)* | — | — | `SpawnProcessFromUserBuf`, removed in U9-SPAWN2 §1. The number stays **unassigned and non-reusable**; see `RETIRED_SYSCALL_NUMBERS`. |
 | `25` | — | reserved gap | none | `Syscall::decode` rejects this with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
 | `26` | *(retired)* | — | — | `SpawnFromInitramfsFile`, removed in U9-ASPACE1 §2. The number stays **unassigned and non-reusable**; see `RETIRED_SYSCALL_NUMBERS`. |
 | `27` | — | reserved gap (removed) | none | Formerly `InitramfsReadChunk` (Phase 2A/2B byte-copy bridge), removed in Stage 197A. `Syscall::decode` rejects `27` with `InvalidNumber`; the number is unused and reusable by a future ABI. |
-| `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v14 count. |
-| `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v14 count. |
+| `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v15 count. |
+| `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v15 count. |
 | `30` | `RecvSharedV3` | non-blocking recv extension | any user task | Stage 42+43: non-blocking `recv_shared_v3` (NR 30); `timeout_ticks=0` only; no mapped receive. See `KERNEL_LOCKING.md §58`. |
 | `31` | `ReapFaultedTask` | privileged PM restart-cleanup extension | PM TID `3` only | SUP-L7K-A: reaps an old terminal Faulted/Exited/Dead task after PM has successfully spawned and recorded a restart replacement. `arg0=target_tid`; self-target returns `InvalidArgs`; non-PM returns `MissingRight`; Running/Runnable/Blocked targets return `WrongObject`; missing targets are treated as already gone and return success. Uses the no-allocation terminal-task reap cleanup path (`reap_faulted_task_noalloc_cleanup`) for VM/task/cnode release; not a kill-running-task syscall. |
 | `32+` | — | removed/invalid | none | Outside `SYSCALL_COUNT = 32`; not dispatched. |
 
 ## ABI versioning and deprecation policy
 
-The v14 contract is frozen for the public ABI slots listed above. Freezing means
-call numbers and incompatible user-visible semantics do not change inside v14;
+The v15 contract is frozen for the public ABI slots listed above. Freezing means
+call numbers and incompatible user-visible semantics do not change inside v15;
 it does not prevent compatible implementation fixes or documentation updates.
+
+**v14 → v15 (VFS-LIFETIME1).** NR `22` `CapRelinquish` is assigned (it was a reserved public
+gap). It removes exactly one slot of the caller's own CNode that names a MemoryObject, without
+revoking anything delegated from it: each delegated child is re-parented to the released slot's own
+delegation parent, or becomes a root when the slot had none. Rights, other holders' mappings and the
+remaining ancestors' revocation authority are unchanged; the object's capability reference count
+drops by one, and the object leaves the registry when no capability, mapping or pin remains. This is
+how a file-grant holder that only relays or consumes a grant gives its copy up: initramfs and VFS
+when the descriptor the grant was made for closes, PM after NR 29 (`doc/VFS.md` §3.4). `TransferRelease` (NR 4) and the recursive revoke are
+unchanged. Errors (nothing is changed on any of them): a stale or already-released id is
+`InvalidCapability`; a capability that is not a MemoryObject, has derived children in the same
+CNode, or backs an active transfer mapping is `WrongObject`; a pending transfer that still names
+the slot as its source, or a delegation table that changed during the call, is `WouldBlock` (retry
+later); a full kernel heap is `QueueFull`. On AArch64 / RISC-V `ret2 == 0` is the error test.
+`SYSCALL_ABI_VERSION` and `RECV_V3_ABI_VERSION` are `15`. Every other number, layout and contract
+is v14's.
 
 **v13 → v14 (VFS-CORRECT1C).** NR `21` `IpcCallerSession` is assigned (it was a reserved
 public gap). A server holding a reply capability for an NR 6 request learns the requesting
@@ -147,23 +164,23 @@ other number, layout and contract is v10's. The bump also formally covers FUTEX-
 NR 10 argument redesign (slot 2 became `flags`; the `observed` argument was removed), which was
 made while the version still read `10`.
 
-Changes that require an ABI v15 bump include:
+Changes that require an ABI v16 bump include:
 
 - renumbering any public syscall;
 - changing public syscall argument layout, return layout, error behavior, or
   side effects incompatibly;
-- assigning a reserved public gap (`22` or `25`) to a user-visible public
+- assigning a reserved public gap (`25`) to a user-visible public
   syscall;
 - changing public struct layout, encoded metadata bytes, flag bits, sentinel
   values, or existing flag meanings incompatibly;
-- removing or making invalid a public v14 syscall that is still documented as
+- removing or making invalid a public v15 syscall that is still documented as
   callable.
 
-Changes allowed within v14 include:
+Changes allowed within v15 include:
 
 - bug fixes that preserve the documented public behavior;
 - documentation clarifications and reserved-slot documentation;
-- adding or refining privileged extension slots outside the public v14 range,
+- adding or refining privileged extension slots outside the public v15 range,
   provided they do not change existing public syscall behavior;
 - tightening access checks for privileged-only extension syscalls;
 - compatible additions that do not change existing public argument/return
@@ -178,9 +195,9 @@ Reserved/deprecated terminology:
   and planned removal gate.
 - **Removed/invalid** means not dispatched by this kernel ABI.
 
-The public tail slots `13..=15` are assigned and dispatched in v14:
+The public tail slots `13..=15` are assigned and dispatched in v15:
 `13` is `VmAnonMap`, `14` is `VmBrk`, and `15` is `DebugLog`.
-They are not reserved gaps and are covered by the public ABI v14 matrix above.
+They are not reserved gaps and are covered by the public ABI v15 matrix above.
 
 ## Per-architecture broad-lock dispatch matrix
 
@@ -195,6 +212,7 @@ evidence: `doc/KERNEL_UNLOCK_AUDIT.md` §2.
 | `17` | `FutexCmpRequeue` | off-lock | off-lock | off-lock | ungated — split from birth (FUTEX-REQUEUE1) |
 | `18` | `ClockGetTime` | off-lock | off-lock | off-lock | ungated — split from birth (SCHED-TIME-FOUNDATION1) |
 | `19` | `ClockSetRealtime` | off-lock | off-lock | off-lock | ungated — split from birth (SCHED-TIME-FOUNDATION1) |
+| `22` | `CapRelinquish` | off-lock | off-lock | off-lock | ungated — split from birth (VFS-LIFETIME1) |
 | `8` | `ControlPlaneSetCnodeSlots` | off-lock | broad | broad | ungated |
 | `2` | `IpcRecv` — kernel-task queued-plain case only | off-lock | broad | broad | ungated |
 | `14` | `VmBrk` — page-crossing shrink case only | off-lock | broad | broad | ungated |
@@ -210,13 +228,12 @@ cell; it is not where the defect is retired.
 AArch64 admits a syscall to the split seam only through its selective ABI import
 (`src/arch/trap_entry.rs:1384`), so NR 8 / NR 2 / NR 14 never reach it. RISC-V uses a
 purpose-built bridge (`src/arch/riscv64/trap.rs:417`) whose gate admits a fixed whitelist of numbers
-(the split-from-birth NR 17, NR 18 and NR 19 among them).
+(the split-from-birth NR 17, NR 18, NR 19 and NR 22 among them).
 
 ## Reserved and gap slots
 
-- `22`: reserved/unassigned in ABI v14 (`21` became `IpcCallerSession` in v14; `17` became `FutexCmpRequeue` in v11; `18` `ClockGetTime`, `19` `ClockSetRealtime` and `20` `ClockNanosleep` in v12). `Syscall::decode` rejects this
-  numbers with `InvalidNumber`. (`16` is now `ExitCurrentTask` — see above.)
-- `25`: reserved/unassigned in ABI v14. `Syscall::decode` rejects this number
+- `22`: `CapRelinquish` since ABI v15 (VFS-LIFETIME1). The former public gap is closed: `21` became `IpcCallerSession` in v14; `17` became `FutexCmpRequeue` in v11; `18` `ClockGetTime`, `19` `ClockSetRealtime` and `20` `ClockNanosleep` in v12. (`16` is now `ExitCurrentTask` — see above.)
+- `25`: reserved/unassigned in ABI v15. `Syscall::decode` rejects this number
   with `InvalidNumber`.
 - `30`: `RecvSharedV3` — Stage 42+43 live non-blocking recv_shared_v3 extension (NR 30).
 - `31`: `ReapFaultedTask` — SUP-L7K-A PM-only terminal-task cleanup extension.
@@ -778,7 +795,7 @@ context-management stage first.
 
 `VmAnonMap` semantics:
 
-- The syscall is public v14 and wired; it is not reserved or deprecated.
+- The syscall is public v15 and wired; it is not reserved or deprecated.
 - The kernel validates the `(addr, len, prot)` triple, rejects zero length and
   non-page-aligned addresses, rounds length up to page size, allocates anonymous
   MemoryObjects page-by-page, and maps them into the current address space.
@@ -809,6 +826,22 @@ context-management stage first.
 - `args[1]`: mapped virtual base address (page-aligned)
 - `args[2]`: mapped length in bytes (rounded up to page size by kernel)
 - `args[3..5]`: reserved (must be `0`)
+
+### `CapRelinquish` argument layout and contract (VFS-LIFETIME1, ABI v15)
+
+- `args[0]`: a capability id in the caller's own CNode that names a MemoryObject
+- `args[1..5]`: reserved (pass `0`)
+- Success: `ret0` = delegated children re-parented, `ret1` = `1` if the object left the registry,
+  `ret2` = `CAP_RELINQUISH_STATUS_DONE` (`1`).
+- Ownership: only the named slot goes. A child delegated from it (an IPC transfer recipient's copy)
+  keeps its slot, rights and mappings; its delegation link now starts at the released slot's own
+  parent, so the source's NR 4 revoke still reaches it. With no parent the child becomes a root.
+- Commit point: the slot clear and the link edits happen together under the capability lock,
+  after a re-check that the slot and every planned link are unchanged; the reference drop and any
+  registry removal follow under the memory lock. A refusal changes nothing.
+- Retries and slot reuse: a `CapId` carries its slot generation, so a retried release of a slot that
+  is already gone (or reused) returns `InvalidCapability` and never touches the newer occupant.
+- Refusals: see the v14 → v15 note. `WouldBlock` is the only one a caller retries.
 
 ### `ControlPlaneSetCnodeSlots` argument layout
 

@@ -13,7 +13,7 @@ use crate::kernel::boot::TrapHandleError;
 /// FUTEX-ABS-BITSET1 — v13: NR 9 `FUTEX_FLAG_TIMED` names an ABSOLUTE `CLOCK_MONOTONIC` deadline
 /// (it named a relative tick timeout in v12), and NR 9 / NR 10 gain `FUTEX_FLAG_BITSET` and the
 /// mask in slot 4 (`doc/SYSCALL_ABI.md`).
-pub const SYSCALL_ABI_VERSION: u16 = 14;
+pub const SYSCALL_ABI_VERSION: u16 = 15;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
@@ -58,6 +58,12 @@ pub const SYSCALL_IPC_CALLER_SESSION_NR: usize = 21;
 pub const IPC_CALLER_SESSION_OP_CALLER: usize = 0;
 /// NR 21 op: live thread count of the process `(arg1 = thread_group_id, arg2 = incarnation)`.
 pub const IPC_CALLER_SESSION_OP_ALIVE: usize = 1;
+/// VFS-LIFETIME1 (ABI v15): release ONE MemoryObject capability slot the caller holds
+/// (`arg0`), keeping every delegated child — re-parented to the slot's own delegation parent —
+/// and every other holder. Not a revoke: see `kernel::boot::cap_relinquish`.
+pub const SYSCALL_CAP_RELINQUISH_NR: usize = 22;
+/// NR 22 success marker in `ret2` (an error leaves `ret1`/`ret2` zero on AArch64 and RISC-V).
+pub const CAP_RELINQUISH_STATUS_DONE: usize = 1;
 
 /// Stage 200D-0A — the exit status recorded for a task that ended itself via NR 16.
 ///
@@ -453,6 +459,8 @@ pub enum Syscall {
     ClockNanosleep = SYSCALL_CLOCK_NANOSLEEP_NR,
     /// VFS-CORRECT1C (ABI v14): the authenticated process identity behind a reply capability.
     IpcCallerSession = SYSCALL_IPC_CALLER_SESSION_NR,
+    /// VFS-LIFETIME1 (ABI v15): release one MemoryObject slot, keeping its delegated children.
+    CapRelinquish = SYSCALL_CAP_RELINQUISH_NR,
 }
 
 /// Stage 200D-0A — the CANONICAL list of every `Syscall` variant.
@@ -487,6 +495,7 @@ pub const ALL_SYSCALL_VARIANTS: &[Syscall] = &[
     Syscall::ClockSetRealtime,
     Syscall::ClockNanosleep,
     Syscall::IpcCallerSession,
+    Syscall::CapRelinquish,
     Syscall::SpawnProcess,
     Syscall::CreateInitramfsFileSliceMo,
     Syscall::SpawnFromMemoryObject,
@@ -532,6 +541,7 @@ impl Syscall {
             SYSCALL_CLOCK_SET_REALTIME_NR => Ok(Self::ClockSetRealtime),
             SYSCALL_CLOCK_NANOSLEEP_NR => Ok(Self::ClockNanosleep),
             SYSCALL_IPC_CALLER_SESSION_NR => Ok(Self::IpcCallerSession),
+            SYSCALL_CAP_RELINQUISH_NR => Ok(Self::CapRelinquish),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -2596,6 +2606,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::ControlPlaneSetCnodeSlots => handle_control_plane_set_cnode_slots(kernel, frame),
         Syscall::VmMap => handle_vm_map(kernel, frame),
         Syscall::TransferRelease => handle_transfer_release(kernel, frame),
+        Syscall::CapRelinquish => self::cap::handle_cap_relinquish(kernel, frame),
         Syscall::FutexWait => handle_futex_wait(kernel, frame),
         Syscall::FutexWake => handle_futex_wake(kernel, frame),
         Syscall::FutexCmpRequeue => handle_futex_cmp_requeue(kernel, frame),
@@ -2796,7 +2807,7 @@ mod tests {
         // FUTEX-REQUEUE1: v11 — NR 17 assigned from the reserved gap (doc/SYSCALL_ABI.md).
         // SCHED-TIME-FOUNDATION1: v12 — NR 18, NR 19 and NR 20 assigned next.
         // FUTEX-ABS-BITSET1: v13 — NR 9 absolute monotonic deadlines; NR 9 / NR 10 wake masks.
-        assert_eq!(SYSCALL_ABI_VERSION, 14);
+        assert_eq!(SYSCALL_ABI_VERSION, 15);
         {
             use crate::kernel::boot::futex as fx;
             assert_eq!(fx::FUTEX_FLAG_SHARED, 1);
@@ -5945,7 +5956,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 2 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "D4 step 2 must not change syscall variant count"
         );
         assert!(
@@ -6011,7 +6022,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 3 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "D4 step 3 must not change syscall variant count"
         );
         assert!(
@@ -6080,7 +6091,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 4 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "D4 step 4 must not change syscall variant count"
         );
         assert!(

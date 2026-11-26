@@ -89,6 +89,10 @@ pub mod syscall {
     pub const SYSCALL_CLOCK_NANOSLEEP_NR: usize = 20;
     /// VFS-CORRECT1C (ABI v14) — NR 21 `IpcCallerSession`: see [`ipc_caller_session`].
     pub const SYSCALL_IPC_CALLER_SESSION_NR: usize = 21;
+    /// VFS-LIFETIME1 (ABI v15) — NR 22 `CapRelinquish`: see [`cap_relinquish`].
+    pub const SYSCALL_CAP_RELINQUISH_NR: usize = 22;
+    /// NR 22 success marker in `ret2`. Must match `kernel::syscall`.
+    pub const CAP_RELINQUISH_STATUS_DONE: usize = 1;
     /// NR 20 flag: the request is an absolute time on its clock (`kernel::syscall::clock`).
     pub const TIMER_ABSTIME: usize = 1;
     /// The clock ids (`kernel::timekeeping`).
@@ -2100,6 +2104,39 @@ pub mod syscall {
         })
     }
 
+    /// VFS-LIFETIME1 (ABI v15) — what NR 22 released.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CapRelinquishOutcome {
+        /// Delegated children of the slot whose link now names the slot's own parent (or none).
+        pub reparented: u32,
+        /// The MemoryObject left the kernel registry with this release.
+        pub reclaimed: bool,
+    }
+
+    /// VFS-LIFETIME1 (ABI v15) — release ONE MemoryObject capability slot this process holds
+    /// (NR 22), keeping every other holder: the slot's delegated children survive, re-parented to
+    /// its own delegation parent. Not a revoke (NR 4 is). `InvalidCapability` means the slot is
+    /// already gone (a stale generation can never name a newer capability), which callers treat
+    /// as released; `WouldBlock` means a queued transfer still derives from it — retry later;
+    /// `WrongObject` means it is not a releasable MemoryObject slot.
+    pub fn cap_relinquish(cap: u64) -> core::result::Result<CapRelinquishOutcome, SyscallError> {
+        // SAFETY: Uses architecture syscall ABI; no user memory is passed.
+        let ret = unsafe {
+            crate::arch::raw_syscall(SYSCALL_CAP_RELINQUISH_NR, [cap as usize, 0, 0, 0, 0, 0])
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        if ret.ret2 != CAP_RELINQUISH_STATUS_DONE {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(CapRelinquishOutcome {
+            reparented: ret.ret0 as u32,
+            reclaimed: ret.ret1 != 0,
+        })
+    }
+
     /// VFS-CORRECT1C (ABI v14) — the authenticated identity of the process behind `reply_cap`, a
     /// reply capability this task received with a request (NR 21 op 0). Returns
     /// `(thread_group_id, process_incarnation, caller_tid)`. The pair `(thread_group_id,
@@ -3467,6 +3504,8 @@ pub mod process {
     }
 }
 
+/// VFS-LIFETIME1: releasing a file-grant copy (NR 22), with deferred retries.
+pub mod grant_release;
 pub mod vfs_client;
 
 // FUTEX-SYNC-TIME1: the timed mutex / condition variable, over deterministic and emulated futex

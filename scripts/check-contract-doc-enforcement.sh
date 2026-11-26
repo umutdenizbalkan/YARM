@@ -90,6 +90,17 @@ if (( abi_code >= 14 )); then
   rg -q '^\| `21` \| `IpcCallerSession` \| public' doc/SYSCALL_ABI.md
   rg -q 'v13 → v14 \(VFS-CORRECT1C\)' doc/SYSCALL_ABI.md
 fi
+# The v15 assignment (VFS-LIFETIME1): NR 22 CapRelinquish in the kernel, the user runtime and the
+# documented table, split-routed on RISC-V; its success marker; the change note.
+if (( abi_code >= 15 )); then
+  rg -q '^pub const SYSCALL_CAP_RELINQUISH_NR: usize = 22;$' src/kernel/syscall.rs
+  rg -q '^pub const CAP_RELINQUISH_STATUS_DONE: usize = 1;$' src/kernel/syscall.rs
+  rg -q '^    pub const SYSCALL_CAP_RELINQUISH_NR: usize = 22;$' crates/yarm-user-rt/src/lib.rs
+  rg -q '^    pub const CAP_RELINQUISH_STATUS_DONE: usize = 1;$' crates/yarm-user-rt/src/lib.rs
+  rg -q 'SYSCALL_CAP_RELINQUISH_NR' src/arch/riscv64/trap.rs
+  rg -q '^\| `22` \| `CapRelinquish` \| public' doc/SYSCALL_ABI.md
+  rg -q 'v14 → v15 \(VFS-LIFETIME1\)' doc/SYSCALL_ABI.md
+fi
 # VFS-CORRECT1B (within v13, privileged extensions): NR 23 / NR 29 return unpacked full-width
 # lanes and take the admin-endpoint out-address; slot 17 is kernel-owned; the change note.
 rg -q 'Within v13 \(VFS-CORRECT1B\), privileged extensions only' doc/SYSCALL_ABI.md

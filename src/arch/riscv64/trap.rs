@@ -1664,6 +1664,9 @@ pub fn handle_riscv_trap_entry_shared(
             // VFS-CORRECT1C: IpcCallerSession (NR 21), split from birth (non-switching, NR 18's
             // shape). Absent here it would be settled as an unassigned number on this port.
             || nr == crate::kernel::syscall::SYSCALL_IPC_CALLER_SESSION_NR
+            // VFS-LIFETIME1: CapRelinquish (NR 22), split from birth (non-switching, NR 21's
+            // shape). Absent here it would be settled as an unassigned number on this port.
+            || nr == crate::kernel::syscall::SYSCALL_CAP_RELINQUISH_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
             // SCHED-TIME-FOUNDATION1 C: ClockNanosleep (NR 20), the FutexWait family's second
             // switching member (same park tail, same deferral).
@@ -2060,6 +2063,7 @@ pub fn handle_riscv_trap_entry_shared(
                         );
                         crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr={} result=ok", nr);
                     }
+                    riscv_drain_split_complete_post_work(shared, cpu, frame, nr)?;
                     riscv_foundation_oracle_returning_trap(shared, cpu, oracle_entering);
                     return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                 }
@@ -2077,6 +2081,7 @@ pub fn handle_riscv_trap_entry_shared(
                         );
                         crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr={} result=handled_err", nr);
                     }
+                    riscv_drain_split_complete_post_work(shared, cpu, frame, nr)?;
                     riscv_foundation_oracle_returning_trap(shared, cpu, oracle_entering);
                     return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                 }
@@ -3777,4 +3782,42 @@ mod tests {
         assert_eq!(last_restored_tls_base(CpuId(1)), Some(0xAAA0_0000));
         assert_eq!(last_restored_tls_base(CpuId(0)), Some(0xBBB0_0000));
     }
+}
+
+/// VFS-LIFETIME1 — a split route that COMPLETES the caller's syscall may still have stashed a
+/// blocked-waiter delivery: NR 7's direct reply with a capability is produced by the route and
+/// executed by `drain_dispatch_post_work`. The shared x86_64 + AArch64 bridge falls through to
+/// that drain before the caller returns ("no early return"); these two arms returned first, so
+/// the receiver's capability was minted only by a LATER trap on this CPU, after the replier's
+/// next syscall had already run. Live: initramfs's NR 22 released the source of a grant whose
+/// delivery to VFS was still stashed, and the delayed delivery then failed to materialize. Drained
+/// here, the delivery completes inside the trap that produced it, as on the other two ports. An
+/// empty stash (every other split syscall) costs one load and changes nothing. It is the SAME
+/// channel the post-lock phase drains — the wrapper's second drain POINT, not a second channel: a
+/// split `Complete` never sets the active flag and never reaches the post-lock phase.
+fn riscv_drain_split_complete_post_work(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    nr: usize,
+) -> Result<(), TrapHandleError> {
+    let cpu_idx = cpu.0 as usize;
+    // SAFETY: local-CPU trap path, interrupts disabled — the stash's own access discipline.
+    if cpu_idx >= MAX_CPUS
+        || !unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].is_occupied() }
+    {
+        return Ok(());
+    }
+    let disposition = shared.drain_dispatch_post_work(cpu, Some(&mut *frame))?;
+    crate::yarm_log!(
+        "RISCV_SPLIT_COMPLETE_POST_WORK_DRAINED nr={} cpu={} disposition={}",
+        nr,
+        cpu.0,
+        match disposition {
+            crate::kernel::dispatch_post_work::DispatchPostWorkDisposition::NoCallerAction =>
+                "no_caller_action",
+            _ => "unexpected",
+        }
+    );
+    Ok(())
 }

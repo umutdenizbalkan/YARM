@@ -13,6 +13,12 @@ image. Two VFS witness images do more, or less, by design:
   vfs-mount-witness  init (init/vfs_mount_witness.rs) registers /ram ITSELF, through the authorized
                      stage + commit, instead of the ordinary registration, so the ordinary
                      `VFS_MOUNT_REGISTER_RAMFS_OK` is never printed. Nothing else changes.
+  vfs-lifetime-witness
+                     init (init/vfs_lifetime_witness.rs, VFS-LIFETIME1) launches ramfs_srv four more
+                     times through PM (four more NR 29, `result=ok`), drives five failed grant
+                     handoffs through PM's witness image 14, of which exactly ONE reaches NR 29 and is
+                     refused there (`result=handled_err code=2`, InvalidArgs: the fixture is not an
+                     ELF), and forks once (NR 12); the fork child exits (NR 16). Nothing else changes.
 
 The workload is never chosen by a caller. It is derived from the boot's verified ARTIFACT_BINDING
 line (scripts/artifact-provenance.py `verify`): the features the bound kernel and initramfs were
@@ -26,6 +32,15 @@ Subcommands (each prints `[fail] …` lines and exits 1 on any failure, 0 otherw
       SPAWN  exactly six SPAWN_FROM_MO_OK, two of them image 11: one is the ordinary ramfs
              (INIT_RAMFS_SPAWN_OK child_tid, VC1C_BEGIN tid_a), the other is the witness's second
              ramfs (VC1C_SECOND_RAMFS tid_b mount_status=0), and VC1C_FD_WITNESS_SEAL names both.
+  life LOG                  the lifetime witness's extra obligations, each tied to its own task:
+      SPAWN  exactly nine SPAWN_FROM_MO_OK (the core five and the witness's four image-11 launches,
+             each a VL1_CYCLE spawned=1 naming that tid); exactly nine NR 29 `result=ok` and ONE
+             `result=handled_err code=2`, which follows the only VL1_GRANT_USE image_id=14 and
+             precedes the next of PM's five VL1_PM_SPAWN_REFUSED_EXPECTED (one per failed
+             handoff); init's VL1_WITNESS_DONE driver_ok=1.
+      FORK / EXIT  as the fd witness's, for the one fork child (VL1_FORK_PARENT_WAKE child=C,
+             which logged VL1_CHILD_EXIT): one NR 12 `result=ok` finalized once, one
+             FORK_TXN_COMMITTED of C by init, one NR 16 for C with its exit records.
       FORK   exactly one NR 12 dispatch, `result=ok`, finalized once; exactly one
              FORK_TXN_COMMITTED, by init (VC1C_BEGIN's tid) of the witness's fork child
              (VC1C_FORK_PARENT child=C, which logged VC1C_CHILD_EXIT).
@@ -50,7 +65,7 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FD, MOUNT = "vfs-fd-witness", "vfs-mount-witness"
+FD, MOUNT, LIFE = "vfs-fd-witness", "vfs-mount-witness", "vfs-lifetime-witness"
 CORE_IMAGE_SPAWNS = 5          # the ordinary census: images 7, 8, 9, 11, 12
 MOUNT_RULES = ("CORE", "IDENTITY", "BYTES")
 DISPATCH = "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 "
@@ -72,13 +87,14 @@ def profile(binding):
     if f.get("arch") != "riscv64" or f.get("result") != "ok":
         return None, [f"the binding is not a verified riscv64 boot set ({f.get('arch')}, {f.get('result')})"]
     k, i = feats(f.get("kernel_features")), feats(f.get("initramfs_features"))
-    for w in (FD, MOUNT):
+    for w in (FD, MOUNT, LIFE):
         if (w in k) != (w in i):
             return None, [f"the bound kernel and initramfs disagree on {w} "
                           f"(kernel={f.get('kernel_features')} initramfs={f.get('initramfs_features')})"]
-    if FD in i and MOUNT in i:
-        return None, [f"one image carries both {FD} and {MOUNT}; neither workload's obligations apply"]
-    return (FD if FD in i else MOUNT if MOUNT in i else "core"), []
+    carried = [w for w in (FD, MOUNT, LIFE) if w in i]
+    if len(carried) > 1:
+        return None, [f"one image carries {' and '.join(carried)}; no one workload's obligations apply"]
+    return (carried[0] if carried else "core"), []
 
 
 def load(path):
@@ -200,6 +216,103 @@ def fd(lines):
     return fails, facts
 
 
+def fork_exit(lines, init, c, fails):
+    """The one fork child C of init: its NR 12 and its NR 16, each with their own records."""
+    d12 = [x for x in lines if x.startswith(DISPATCH + "nr=12 ")]
+    if len(d12) != 1 or not re.fullmatch(DISPATCH + r"nr=12 cpu=\d+ result=ok", d12[0].strip() if d12 else ""):
+        fails.append(f"FORK: NR 12 dispatches {d12}, expected exactly one `result=ok`")
+    fin = [x for x in lines if x.strip() == "RISCV_SPLIT_FINALIZE_OK nr=12 result=ok"]
+    if len(fin) != 1:
+        fails.append(f"FORK: {len(fin)} NR 12 finalizations, expected 1")
+    txn = kernel(lines, "FORK_TXN_COMMITTED ")
+    if [(x.get("parent_tid"), x.get("child_tid")) for x in txn] != [(init, c)]:
+        fails.append(f"FORK: committed forks {[(x.get('parent_tid'), x.get('child_tid')) for x in txn]}, "
+                     f"expected exactly init {init} forking the witness child {c}")
+    d16 = [x for x in lines if x.startswith(DISPATCH + "nr=16 ")]
+    outs = []
+    for x in d16:
+        m = re.fullmatch(DISPATCH + r"nr=16 cpu=(\d+) result=queue_advance_committed outgoing=(\d+) "
+                         r"captured=0 committed=0 a0=\d+", x.strip())
+        if not m:
+            fails.append(f"EXIT: NR 16 dispatch with another disposition: {x.strip()}")
+            continue
+        outs.append((m.group(2), m.group(1)))
+    if len(d16) != 1 or [o for o, _ in outs] != [c]:
+        fails.append(f"EXIT: NR 16 dispatches for {[o for o, _ in outs]} ({len(d16)} lines), expected "
+                     f"exactly the fork child {c}")
+    for tid, cpu in outs:
+        if tid != c:
+            continue
+        sd = [x for x in kernel(lines, "EXIT_TASK_SYSCALL_DISPATCHED ") if x.get("tid") == tid]
+        lt = [x for x in kernel(lines, "EXIT_TASK_LIFECYCLE_TRANSITION ") if x.get("tid") == tid]
+        cr = [x for x in kernel(lines, "EXIT_TASK_CLAIM_RETIRED ") if x.get("tid") == tid]
+        df = [x for x in kernel(lines, "QUEUE_ADVANCING_DISPATCH_DEFERRED ")
+              if x.get("tid") == tid and x.get("reason") == "exit_current_task_switch_required"]
+        if len(sd) != 1 or (sd[0].get("nr"), sd[0].get("result")) != ("16", "ok"):
+            fails.append(f"EXIT: tid {tid}: {len(sd)} EXIT_TASK_SYSCALL_DISPATCHED nr=16 result=ok")
+        if len(lt) != 1 or (lt[0].get("syscall_returns"), lt[0].get("result")) != ("0", "ok"):
+            fails.append(f"EXIT: tid {tid}: lifecycle transition {lt}")
+        if len(cr) != 1 or cr[0].get("code") != "0":
+            fails.append(f"EXIT: tid {tid}: exit claim {cr}, expected one with code=0")
+        if len(df) != 1 or df[0].get("cpu") != cpu:
+            fails.append(f"EXIT: tid {tid}: the exit switch was deferred on {[x.get('cpu') for x in df]}, "
+                         f"not once on the dispatch's CPU {cpu}")
+    return len(d12), len(d16)
+
+
+LIFE_LAUNCHES = 4          # success_1..3 and after: image 11 each
+LIFE_FAILED = 5            # the failed handoffs: PM refuses image 14 once each
+NR29_REFUSED = "2"         # InvalidArgs: the fixture is not an ELF
+
+
+def life(lines):
+    fails, facts = [], {}
+    begin = one(user(lines, "VL1_BEGIN"), "VL1_BEGIN", fails)
+    done = one(user(lines, "VL1_WITNESS_DONE"), "VL1_WITNESS_DONE", fails)
+    wake = one(user(lines, "VL1_FORK_PARENT_WAKE"), "VL1_FORK_PARENT_WAKE", fails)
+    cex = one(user(lines, "VL1_CHILD_EXIT"), "VL1_CHILD_EXIT", fails)
+    if None in (begin, done, wake, cex):
+        return [f"WITNESS: {x}" for x in fails], facts
+    init, c = begin[0], wake[1].get("child")
+    facts.update(init=init, fork_child=c)
+    if done[0] != init or done[1].get("driver_ok") != "1":
+        fails.append(f"WITNESS: VL1_WITNESS_DONE {done} is not init's driver_ok=1")
+    if wake[0] != init or cex[0] != c:
+        fails.append(f"WITNESS: the fork parent {wake[0]} / child exit {cex[0]} are not init {init} / child {c}")
+    # SPAWN
+    oks = kernel(lines, "SPAWN_FROM_MO_OK ")
+    cycles = [f for t, f in user(lines, "VL1_CYCLE") if t == init and f.get("spawned") == "1"]
+    launched = sorted(f.get("tid") for f in cycles)
+    witness_ok = sorted(o.get("spawned_tid") for o in oks
+                        if o.get("image_id") == "11" and o.get("spawned_tid") in launched)
+    if len(oks) != CORE_IMAGE_SPAWNS + LIFE_LAUNCHES:
+        fails.append(f"SPAWN: {len(oks)} successful NR 29 spawns, expected "
+                     f"{CORE_IMAGE_SPAWNS + LIFE_LAUNCHES} (the core image's {CORE_IMAGE_SPAWNS} and the witness's "
+                     f"{LIFE_LAUNCHES} launches)")
+    if len(launched) != LIFE_LAUNCHES or witness_ok != launched:
+        fails.append(f"SPAWN: the witness's launches {launched} are not each an image-11 NR 29 spawn ({witness_ok})")
+    d29 = [x.strip() for x in lines if x.startswith(DISPATCH + "nr=29 ")]
+    ok29 = [x for x in d29 if re.fullmatch(DISPATCH + r"nr=29 cpu=\d+ result=ok", x)]
+    err29 = [i for i, x in enumerate(lines) if x.startswith(DISPATCH + "nr=29 ") and "result=handled_err" in x]
+    if len(ok29) != CORE_IMAGE_SPAWNS + LIFE_LAUNCHES or len(err29) != 1 or len(d29) != len(ok29) + 1:
+        fails.append(f"SPAWN: NR 29 dispatches ok={len(ok29)} handled_err={len(err29)} total={len(d29)}, expected "
+                     f"{CORE_IMAGE_SPAWNS + LIFE_LAUNCHES} ok and exactly one refusal")
+    else:
+        j = err29[0]
+        if not lines[j].strip().endswith(f"result=handled_err code={NR29_REFUSED}"):
+            fails.append(f"SPAWN: the NR 29 refusal is not InvalidArgs: {lines[j].strip()}")
+        use = [i for i, x in enumerate(lines) if "VL1_GRANT_USE " in x and "image_id=14 " in x]
+        exp = [i for i, x in enumerate(lines) if "msg=VL1_PM_SPAWN_REFUSED_EXPECTED " in x]
+        after = [i for i in exp if i > j]
+        if len(exp) != LIFE_FAILED or len(use) != 1 or not after or not (use[0] < j < after[0]):
+            fails.append(f"SPAWN: the NR 29 refusal (line {j}) is not PM's refused image-14 use "
+                         f"(use {use}; PM's expected refusals {exp}, one per failed handoff "
+                         f"expected: {LIFE_FAILED})")
+    n12, n16 = fork_exit(lines, init, c, fails)
+    facts.update(nr12=n12, nr16=n16, nr29_ok=len(oks), nr29_refused=len(err29))
+    return fails, facts
+
+
 def mount_grader():
     spec = importlib.util.spec_from_file_location(
         "grade_vfs_mount_witness", os.path.join(HERE, "grade-vfs-mount-witness.py"))
@@ -263,6 +376,39 @@ def _fd_synthetic():
     return L
 
 
+def _life_synthetic():
+    D = DISPATCH
+    u = lambda tid, m: f"USER_LOG tid={tid} msg={m}"
+    L = []
+    for i, t in ((7, 10003), (8, 10004), (9, 10005), (11, 10006), (12, 10007)):
+        L += [f"SPAWN_FROM_MO_OK image_id={i} spawned_tid={t}", f"{D}nr=29 cpu=0 result=ok"]
+    L.append(u(1, "VL1_BEGIN success_cycles=3 fixture_len=300"))
+    for lab, t in (("success_1", 10010), ("success_2", 10011), ("success_3", 10012)):
+        L += [f"SPAWN_FROM_MO_OK image_id=11 spawned_tid={t}", f"{D}nr=29 cpu=0 result=ok",
+              u(1, f"VL1_CYCLE label={lab} image_id=11 spawned=1 tid={t}")]
+    for lab in ("hop1_undelivered", "hop1_rejected", "hop2_undelivered", "hop2_rejected"):
+        L += [u(3, "VL1_PM_SPAWN_REFUSED_EXPECTED image_id=14 err=Malformed"),
+              u(1, f"VL1_CYCLE label={lab} image_id=14 spawned=0 tid=0")]
+    L += ["VL1_GRANT_USE tid=3 image_id=14 cap=5 mo_id=40 cap_refcount=1 map_refcount=0",
+          f"{D}nr=29 cpu=0 result=handled_err code=2",
+          u(3, "VL1_PM_SPAWN_REFUSED_EXPECTED image_id=14 err=InvalidArgs"),
+          u(1, "VL1_CYCLE label=nr29_refused image_id=14 spawned=0 tid=0"),
+          "FORK_TXN_COMMITTED parent_tid=1 child_tid=10016 parent_asid=1 child_asid=14 cpu=1 inherited_caps=20 wp_runs=2",
+          f"{D}nr=12 cpu=0 result=ok",
+          "RISCV_SPLIT_FINALIZE_OK nr=12 result=ok",
+          u(10016, "VL1_CHILD_EXIT holding=1"),
+          "EXIT_TASK_SYSCALL_DISPATCHED nr=16 tid=10016 asid=14 target=self result=ok",
+          "EXIT_TASK_CLAIM_RETIRED tid=10016 asid=14 pid=10016 code=0 token=1 caller_records=0 replier_records=0 links=0 joiners=0 server_death=0",
+          "EXIT_TASK_LIFECYCLE_TRANSITION tid=10016 asid=14 syscall_returns=0 result=ok",
+          "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=exit_current_task_switch_required tid=10016 cpu=1",
+          f"{D}nr=16 cpu=1 result=queue_advance_committed outgoing=10016 captured=0 committed=0 a0=0",
+          u(1, "VL1_FORK_PARENT_WAKE child=10016 slept=1"),
+          "SPAWN_FROM_MO_OK image_id=11 spawned_tid=10017", f"{D}nr=29 cpu=0 result=ok",
+          u(1, "VL1_CYCLE label=after image_id=11 spawned=1 tid=10017"),
+          u(1, "VL1_WITNESS_DONE driver_ok=1")]
+    return L
+
+
 def self_test():
     n = 0
 
@@ -282,7 +428,9 @@ def self_test():
                           ("vfs-correct-witness,vfs-fd-witness", "vfs-correct-witness,vfs-fd-witness", "ok", FD),
                           ("none", wf, "ok", None), (wf, "none", "ok", None),
                           (wf + ",vfs-mount-witness", wf + ",vfs-mount-witness", "ok", None),
-                          (wf, wf, "fail", None)):
+                          (wf, wf, "fail", None),
+                          (LIFE, LIFE, "ok", LIFE), ("none", LIFE, "ok", None),
+                          (LIFE + ",vfs-fd-witness", LIFE + ",vfs-fd-witness", "ok", None)):
         p, f = profile(B.format(k=k, i=i, r=r))
         assert p == want and bool(f) == (want is None), (k, i, r, p, f)
         n += 1
@@ -348,6 +496,28 @@ def self_test():
         expect(False, mount(lines), why)
     # The two workloads are exclusive: neither boot satisfies the other's obligations.
     expect(False, fd(syn), "a mount-witness boot graded as an fd boot")
+
+    lg = _life_synthetic()
+    expect(True, life(lg), "the lifetime witness's own obligations")
+
+    def lmut(fn):
+        x = list(lg)
+        fn(x)
+        return x
+    for why, fn in (
+        ("a launch that did not spawn", drop("spawned_tid=10012")),
+        ("an extra spawn", lambda x: x.append("SPAWN_FROM_MO_OK image_id=11 spawned_tid=10020")),
+        ("a second NR 29 refusal", lambda x: x.append(f"{DISPATCH}nr=29 cpu=0 result=handled_err code=2")),
+        ("the refusal is another error", sub(DISPATCH + "nr=29 cpu=0 result=handled_err", "code=2", "code=9")),
+        ("the refusal is not image 14's use", sub("VL1_GRANT_USE", "image_id=14", "image_id=11")),
+        ("no fork", drop(DISPATCH + "nr=12")),
+        ("child exit of another task", sub("msg=VL1_CHILD_EXIT", "tid=10016", "tid=10017")),
+        ("driver failed", sub("VL1_WITNESS_DONE", "driver_ok=1", "driver_ok=0")),
+        ("not a lifetime boot", lambda x: x.__delitem__(slice(0, len(x)))),
+    ):
+        expect(False, life(lmut(fn)), why)
+    expect(False, life(good), "an fd-witness boot graded as a lifetime boot")
+    expect(False, fd(lg), "a lifetime boot graded as an fd boot")
     print(f"RISCV_WORKLOAD_OBLIGATIONS_SELF_TEST result=ok cases={n}")
 
 
@@ -367,6 +537,8 @@ def main(argv):
         return report(FD, *fd(load(argv[1])))
     if argv[:1] == ["mount"] and len(argv) == 2:
         return report(MOUNT, *mount(load(argv[1])))
+    if argv[:1] == ["life"] and len(argv) == 2:
+        return report(LIFE, *life(load(argv[1])))
     print(__doc__)
     return 2
 

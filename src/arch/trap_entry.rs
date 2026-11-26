@@ -4182,6 +4182,8 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         || raw_nr == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
         // VFS-CORRECT1C: IpcCallerSession (NR 21) — non-switching, split from birth.
         || raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALLER_SESSION_NR
+        // VFS-LIFETIME1: CapRelinquish (NR 22) — non-switching, split from birth.
+        || raw_nr == crate::kernel::syscall::SYSCALL_CAP_RELINQUISH_NR
         // U9-QA §2: FutexWait (NR 9) — the one SWITCHING pre-lock class. Without its ABI in the
         // frame the split dispatcher sees `nr = 0` and declines, which is why AArch64 kept taking
         // the in-lock deferral while x86_64 and RISC-V had moved to the pre-lock route. This is
@@ -4463,6 +4465,7 @@ fn finalize_split_handled_syscall(
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_CLOCK_GETTIME_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_CLOCK_SET_REALTIME_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALLER_SESSION_NR
+        || frame.syscall_num() == crate::kernel::syscall::SYSCALL_CAP_RELINQUISH_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
         // SCHED-TIME-FOUNDATION1 C: NR 20 parks through the FutexWait family.
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_CLOCK_NANOSLEEP_NR

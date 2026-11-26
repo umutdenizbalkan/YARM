@@ -395,6 +395,14 @@ struct KernelRouterIo {
 }
 
 impl super::router::RouterIo for KernelRouterIo {
+    fn relinquish(
+        &mut self,
+        cap: u64,
+    ) -> Result<yarm_user_rt::syscall::CapRelinquishOutcome, yarm_user_rt::syscall::SyscallError>
+    {
+        yarm_user_rt::grant_release::relinquish_now(cap)
+    }
+
     fn call_backend(
         &mut self,
         backend: yarm_fs_servers::common::fd_space::BackendRef,
@@ -569,6 +577,14 @@ pub fn run() {
     #[cfg(feature = "vfs-fd-witness")]
     {
         router.fail_reply_path = Some(b"/ram/vc1c-failreply");
+    }
+    #[cfg(feature = "vfs-lifetime-witness")]
+    {
+        router.grant_injection_len = Some(300);
+    }
+    #[cfg(feature = "vfs-lifetime-nc-keep-relay")]
+    {
+        router.keep_relayed_grants = true;
     }
     let mut io = KernelRouterIo {
         backend_reply_recv_cap,

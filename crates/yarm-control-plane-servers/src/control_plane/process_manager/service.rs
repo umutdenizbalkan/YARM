@@ -74,8 +74,19 @@ fn resolve_spawn_load_source_with_restart_test(
     if supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID {
         return Ok(SpawnLoadSource::Vfs);
     }
+    #[cfg(feature = "vfs-lifetime-witness")]
+    if image_id == VL1_REFUSAL_IMAGE_ID {
+        return Ok(SpawnLoadSource::Vfs);
+    }
     Err(ProcessManagerError::Unsupported)
 }
+
+/// VFS-LIFETIME1 witness (`vfs-lifetime-witness`, default off): an image id whose FILE_GRANT_RO
+/// is the 300-byte VFS fixture — a real grant of a file that is not an ELF, so NR 29 refuses it
+/// after PM received it. The witness's failed-handoff cycles go through this id; PM logs their
+/// refusal as expected instead of `BOOT_FATAL_ZC_ELF_LOAD_FAILED`.
+#[cfg(feature = "vfs-lifetime-witness")]
+pub(crate) const VL1_REFUSAL_IMAGE_ID: u64 = 14;
 
 const MAX_EXEC_LOAD_SEGMENTS: usize = 8;
 const MAX_EXEC_STACK_BYTES: usize = 4096;
@@ -3095,6 +3106,15 @@ unsafe fn pm_vfs_spawn_inline(
                 );
                 return Ok((tid, caller_cap, spawner_cap));
             }
+            #[cfg(feature = "vfs-lifetime-witness")]
+            Err(e) if image_id == VL1_REFUSAL_IMAGE_ID => {
+                yarm_user_rt::user_log!(
+                    "VL1_PM_SPAWN_REFUSED_EXPECTED image_id={} err={:?}",
+                    image_id,
+                    e
+                );
+                return Err(e);
+            }
             Err(e) => {
                 // Stage 197A: the MemoryObject zero-copy grant load is MANDATORY for every
                 // gated late service — there is no byte-copy fallback. Any failure (backend
@@ -3233,6 +3253,22 @@ unsafe fn pm_vfs_close(vfs_send_cap: u64, reply_recv_cap: u64, fd: u64) {
     }
 }
 
+/// VFS-LIFETIME1 — PM's release of its copy of a file grant (NR 22). PM is the recipient: once
+/// NR 29 has returned — successfully or not — the child references nothing of the grant (the
+/// loader maps or copies the initrd pages themselves), and a completion PM rejected may still
+/// have installed a capability. Either way PM keeps nothing.
+#[cfg(not(test))]
+fn pm_release_grant(image_id: u64, cap: u64, why: &str) {
+    let result = yarm_user_rt::grant_release::relinquish_now(cap);
+    yarm_user_rt::user_log!(
+        "PM_GRANT_RELEASE image_id={} cap={} why={} result={:?}",
+        image_id,
+        cap,
+        why,
+        result.map(|o| (o.reparented, o.reclaimed))
+    );
+}
+
 /// Phase 3A: Try VFS_OP_FILE_GRANT_RO and spawn from MemoryObject cap.
 ///
 /// Returns `Ok((tid, caller_cap, spawner_cap))` on success.
@@ -3345,6 +3381,9 @@ unsafe fn pm_try_grant_ro_and_spawn(
                 image_id,
                 kind
             );
+            if let Some(cap) = transferred_cap {
+                pm_release_grant(image_id, cap, "rejected_completion");
+            }
             unsafe { pm_vfs_close(vfs_send_cap, reply_recv_cap, fd) };
             return Err(err);
         }
@@ -3375,6 +3414,15 @@ unsafe fn pm_try_grant_ro_and_spawn(
     let result = unsafe {
         yarm_user_rt::syscall::spawn_from_memory_object(image_id, mo_cap, parent_pid, startup_args)
     };
+    pm_release_grant(
+        image_id,
+        mo_cap,
+        if result.is_ok() {
+            "spawned"
+        } else {
+            "spawn_refused"
+        },
+    );
     match result {
         Ok((tid, caller_cap, spawner_cap)) => {
             // PM_ELF_ZC_DONE is emitted by the kernel (yarm_log!) inside handle_spawn_from_memory_object.
@@ -3446,6 +3494,8 @@ fn pm_vfs_image_path_label(
         11 => Some(b"/initramfs/sbin/ramfs_srv"),
         12 => Some(b"/initramfs/sbin/ext4_srv"),
         CRASH_TEST_SRV_IMAGE_ID if supervisor_restart_test_enabled => Some(CRASH_TEST_SRV_PATH),
+        #[cfg(feature = "vfs-lifetime-witness")]
+        VL1_REFUSAL_IMAGE_ID => Some(b"/initramfs/etc/vfs-fixture"),
         _ => None,
     }
 }
@@ -3463,6 +3513,8 @@ fn pm_image_cpio_name_for_gate(
         11 => Some(b"sbin/ramfs_srv"),
         12 => Some(b"sbin/ext4_srv"),
         CRASH_TEST_SRV_IMAGE_ID if supervisor_restart_test_enabled => Some(b"sbin/crash_test_srv"),
+        #[cfg(feature = "vfs-lifetime-witness")]
+        VL1_REFUSAL_IMAGE_ID => Some(b"etc/vfs-fixture"),
         _ => None,
     }
 }

@@ -970,8 +970,13 @@ if (( riscv_split_nr23 != riscv_split_nr23_ok )); then
   echo "[fail] RISC-V SpawnProcess split serviced a switching disposition (nr23=${riscv_split_nr23} ok=${riscv_split_nr23_ok})"
   failures=$((failures + 1))
 fi
-if (( riscv_split_nr29 != riscv_split_nr29_ok )); then
-  echo "[fail] RISC-V SpawnFromMemoryObject split serviced a switching disposition (nr29=${riscv_split_nr29} ok=${riscv_split_nr29_ok})"
+# VFS-LIFETIME1: the lifetime witness's one refused NR 29 (PM's image 14, the fixture, not an ELF)
+# is the only non-`ok` NR 29 any image owes; scripts/riscv64-workload-obligations.py `life` ties it
+# to that use. Every other image, and every other NR 29 of this one, is `result=ok` as before.
+rv_nr29_refusal_owed=0
+[[ "${RISCV_WORKLOAD:-core}" == "vfs-lifetime-witness" ]] && rv_nr29_refusal_owed=1
+if (( riscv_split_nr29 != riscv_split_nr29_ok + rv_nr29_refusal_owed )); then
+  echo "[fail] RISC-V SpawnFromMemoryObject split serviced a switching disposition (nr29=${riscv_split_nr29} ok=${riscv_split_nr29_ok} refusal_owed=${rv_nr29_refusal_owed})"
   failures=$((failures + 1))
 fi
 # And the counts are the boot's own spawn census: three NR 23 and five NR 29, matching
@@ -993,6 +998,8 @@ fi
 case "${RISCV_WORKLOAD:-core}" in
   core|vfs-mount-witness) rv_workload_nr29=0 ;;
   vfs-fd-witness) rv_workload_nr29=1 ;;
+  # VFS-LIFETIME1: four more launches and the one refused image-14 use.
+  vfs-lifetime-witness) rv_workload_nr29=5 ;;
   *)
     echo "[fail] RISCV-STRICT1: unknown workload '${RISCV_WORKLOAD}'"
     failures=$((failures + 1))
@@ -1083,6 +1090,22 @@ if [[ "${RISCV_WORKLOAD:-core}" == "vfs-fd-witness" ]]; then
   printf '%s\n' "$rv_fd_out"
   if (( rv_fd_rc != 0 )); then
     echo "[fail] RISC-V fd-witness workload is not reconciled: its extra spawn, fork and exits are not each its own task's (nr29=${riscv_split_nr29} nr12=${riscv_split_nr12} nr16=${riscv_split_nr16})"
+    failures=$((failures + 1))
+  fi
+fi
+# VFS-LIFETIME1: the lifetime witness's fork (NR 12) and its fork child's exit (NR 16), joined to
+# the sum only once the `life` obligations tie each to that child (and the refused NR 29 to PM's
+# image-14 use).
+if [[ "${RISCV_WORKLOAD:-core}" == "vfs-lifetime-witness" ]]; then
+  riscv_split_nr12=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=12 " "$LOGFILE" 2>/dev/null || echo 0)
+  riscv_split_nr16=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=16 " "$LOGFILE" 2>/dev/null || echo 0)
+  riscv_split_nr12=${riscv_split_nr12:-0}
+  riscv_split_nr16=${riscv_split_nr16:-0}
+  rv_life_rc=0
+  rv_life_out="$(python3 -I "${RV_SCRIPT_DIR:-scripts}/riscv64-workload-obligations.py" life "$LOGFILE")" || rv_life_rc=$?
+  printf '%s\n' "$rv_life_out"
+  if (( rv_life_rc != 0 )); then
+    echo "[fail] RISC-V lifetime-witness workload is not reconciled: its launches, refused spawn, fork and exit are not each its own task's (nr29=${riscv_split_nr29} nr12=${riscv_split_nr12} nr16=${riscv_split_nr16})"
     failures=$((failures + 1))
   fi
 fi

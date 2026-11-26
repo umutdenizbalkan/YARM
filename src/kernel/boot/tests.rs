@@ -27699,7 +27699,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -28218,7 +28218,7 @@ mod stage45 {
     const RECV_V3_VERSION: u32 = 3;
     // The NR 30 record reports the syscall ABI version: v12 since SCHED-TIME-FOUNDATION1, v13
     // since FUTEX-ABS-BITSET1 (NR 9/10's absolute deadline and wake-mask flags).
-    const RECV_V3_ABI_VERSION: u32 = 14;
+    const RECV_V3_ABI_VERSION: u32 = 15;
     const RECV_V3_STATUS_OK: u32 = 0;
     const RECV_V3_NO_TRANSFER_CAP: u64 = u64::MAX;
 
@@ -37039,7 +37039,7 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -39127,7 +39127,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39254,7 +39254,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39429,7 +39429,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39586,7 +39586,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39722,7 +39722,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39885,7 +39885,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40067,7 +40067,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40291,7 +40291,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40527,7 +40527,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40659,7 +40659,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40836,7 +40836,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -41032,7 +41032,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            27,
+            28,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -41473,7 +41473,7 @@ mod stage148_decomposition_map {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 27,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 28,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41917,7 +41917,7 @@ mod stage150_ipc_abi_extraction {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 27,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 28,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -42148,7 +42148,7 @@ mod stage151_ipc_abi_boundary_audit {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 27,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 28,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -77985,7 +77985,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -78518,7 +78518,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -78678,7 +78678,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -78748,7 +78748,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -79335,7 +79335,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -79570,7 +79570,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -79875,7 +79875,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -79934,7 +79934,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -80447,7 +80447,7 @@ mod stage197b_nr27_removed_zc_mandatory {
             Err(SyscallError::InvalidNumber)
         ));
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(Syscall::VARIANT_COUNT, 27);
+        assert_eq!(Syscall::VARIANT_COUNT, 28);
         // Needles are split so these assertions do not match themselves via include_str!.
         let variant_decl = concat!("InitramfsRead", "Chunk = ");
         let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
@@ -80907,7 +80907,7 @@ mod stage197b_riscv_typed_idle_outcome {
     #[test]
     fn baseline_and_cohort_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
         assert!(matches!(
             crate::kernel::syscall::Syscall::decode(27),
             Err(crate::kernel::syscall::SyscallError::InvalidNumber)
@@ -103031,8 +103031,8 @@ mod stage200d0a_exit_foundation {
     fn d03_nr27_and_free_numbers_remain_unassigned() {
         // FUTEX-REQUEUE1 (ABI v11) assigned 17, the lowest number of the reserved gap;
         // SCHED-TIME-FOUNDATION1 (ABI v12) the next three, 18, 19 and 20; VFS-CORRECT1C (ABI v14)
-        // the next, 21.
-        for free in [22usize, 24, 25, 26, 27] {
+        // the next, 21; VFS-LIFETIME1 (ABI v15) the next, 22.
+        for free in [24usize, 25, 26, 27] {
             assert!(
                 Syscall::decode(free).is_err(),
                 "number {free} must remain unassigned"
@@ -103056,8 +103056,8 @@ mod stage200d0a_exit_foundation {
     /// enum's own declaration count parsed from source.
     #[test]
     fn d04_variant_list_is_exhaustive_and_derived() {
-        assert_eq!(Syscall::VARIANT_COUNT, 27);
-        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 27);
+        assert_eq!(Syscall::VARIANT_COUNT, 28);
+        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 28);
         assert!(
             SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
         );
@@ -104061,7 +104061,7 @@ mod stage200d0b3_x86_exit_corrected {
         assert!(b.contains("EXIT_TASK_RESTORE_OWNER_PREPARED"));
         assert!(b.contains("EXIT_TASK_ABSENCE_VALIDATED arch=x86_64"));
         // No new task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
     }
 
     // ── feature gating (22) ─────────────────────────────────────────────────────────
@@ -105268,7 +105268,7 @@ mod stage200d0c1_aarch64_exit_prep {
             "offline-CPU refusal is preserved by the transaction"
         );
         // No general-purpose task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
     }
 
     // ── U3 (canonical 203C): the validation reacquisition retirement ────────────────
@@ -106500,7 +106500,7 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(txn.contains("Some(bound) => bound == asid,"));
         assert!(c.contains("identity=tid_asid"));
         assert!(c.contains("frame_source=0"));
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 27);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 28);
     }
 
     // ── 29–32: runner static contract and feature-off ───────────────────────────────
@@ -118636,6 +118636,9 @@ mod stage199d_riscv_canonical_admission {
             // VFS-CORRECT1C: NR 21 `IpcCallerSession`, admitted from birth (non-switching,
             // NR 18's shape); without it the port would settle it as an unassigned number.
             "SYSCALL_IPC_CALLER_SESSION_NR",
+            // VFS-LIFETIME1: NR 22 `CapRelinquish`, admitted from birth (non-switching, NR 21's
+            // shape).
+            "SYSCALL_CAP_RELINQUISH_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -118648,8 +118651,9 @@ mod stage199d_riscv_canonical_admission {
         // is what stops a twenty-first arriving without its own justification.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            25,
-            "exactly twenty-four literal NRs (FUTEX-REQUEUE1 added FutexCmpRequeue, VFS-CORRECT1C IpcCallerSession, \
+            26,
+            "exactly twenty-five literal NRs (FUTEX-REQUEUE1 added FutexCmpRequeue, VFS-CORRECT1C IpcCallerSession, \
+             VFS-LIFETIME1 CapRelinquish, \
              SCHED-TIME-FOUNDATION1 ClockGetTime and ClockSetRealtime) plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, (U9-RECV-FINAL §1) IpcRecv, IpcSend, \
              (U9-MO2 §4) CreateInitramfsFileSliceMo, \
@@ -135697,15 +135701,19 @@ mod u4_cross_arch_queue_advancing_dispatch {
 
         /// One channel, one drain: U6 adds no second post-work stash, no second drain call site
         /// and no new global side table.
+        ///
+        /// VFS-LIFETIME1: the RISC-V wrapper has exactly ONE more drain point of the SAME channel,
+        /// for a split route's `Complete` (which skips the post-lock phase): the shared bridge
+        /// drains after a `Complete` too, and RISC-V returned first, leaving a stashed delivery to
+        /// a later trap. That second call lives only in `riscv_drain_split_complete_post_work`.
         #[test]
         fn u6_adds_no_second_channel_and_no_second_drain() {
-            for src in [TRAP_ENTRY, RISCV_TRAP] {
-                assert_eq!(
-                    src.matches("drain_dispatch_post_work(").count(),
-                    1,
-                    "each wrapper drains the one channel exactly once"
-                );
-            }
+            assert_eq!(
+                TRAP_ENTRY.matches("drain_dispatch_post_work(").count(),
+                1,
+                "the shared wrapper drains the one channel exactly once"
+            );
+            vl1_riscv_drain_points(RISCV_TRAP);
             assert_eq!(
                 RUNTIME
                     .matches("DISPATCH_POST_WORK_STASH[cpu_idx].take()")
@@ -135717,6 +135725,39 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 !RUNTIME.contains("BLOCKING_SEND_STASH")
                     && !MOD_SRC.contains("BLOCKING_SEND_STASH"),
                 "U6 must not introduce a second stash"
+            );
+        }
+
+        /// VFS-LIFETIME1 — the RISC-V wrapper's drain points of the one channel: exactly two calls,
+        /// the post-lock phase's (first in the file, after the active-flag clear) and the split
+        /// `Complete` exit's, inside `riscv_drain_split_complete_post_work`, which drains only an
+        /// occupied stash.
+        fn vl1_riscv_drain_points(src: &str) {
+            assert_eq!(
+                src.matches("drain_dispatch_post_work(").count(),
+                2,
+                "RISC-V: the post-lock drain and the split-Complete drain, one channel"
+            );
+            let helper = src
+                .split("fn riscv_drain_split_complete_post_work(")
+                .nth(1)
+                .expect("the split-Complete drain helper");
+            let helper = helper.split("\n}\n").next().expect("its body");
+            assert_eq!(helper.matches("drain_dispatch_post_work(").count(), 1);
+            assert!(helper.contains("DISPATCH_POST_WORK_STASH[cpu_idx].is_occupied()"));
+            let first = src.find("drain_dispatch_post_work(").expect("first");
+            let clear = src
+                .find("RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR")
+                .expect("clear");
+            assert!(
+                clear < first,
+                "the first drain in the file is the post-lock phase's"
+            );
+            assert_eq!(
+                src.matches("riscv_drain_split_complete_post_work(shared, cpu, frame, nr)?;")
+                    .count(),
+                2,
+                "both split Complete arms (Ok and the syscall error) drain before returning"
             );
         }
 
@@ -136440,13 +136481,12 @@ mod u4_cross_arch_queue_advancing_dispatch {
                         "no broad fallback: {forbidden}"
                     );
                 }
-                for src in [TRAP_ENTRY, RISCV_TRAP] {
-                    assert_eq!(
-                        src.matches("drain_dispatch_post_work(").count(),
-                        1,
-                        "still exactly one drain per wrapper"
-                    );
-                }
+                assert_eq!(
+                    TRAP_ENTRY.matches("drain_dispatch_post_work(").count(),
+                    1,
+                    "still exactly one drain in the shared wrapper"
+                );
+                super::vl1_riscv_drain_points(RISCV_TRAP);
                 assert!(
                     MOD_SRC.contains(
                         "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")\n}"
@@ -215711,7 +215751,7 @@ mod futex_requeue1 {
             SYSCALL_ABI_VERSION, SYSCALL_FUTEX_CMP_REQUEUE_NR, Syscall, SyscallError,
         };
         // SCHED-TIME-FOUNDATION1 moved the ABI to v12 (NR 18 / 19 assigned); NR 17 is unchanged.
-        assert_eq!(SYSCALL_ABI_VERSION, 14);
+        assert_eq!(SYSCALL_ABI_VERSION, 15);
         assert_eq!(
             Syscall::decode(SYSCALL_FUTEX_CMP_REQUEUE_NR),
             Ok(Syscall::FutexCmpRequeue)

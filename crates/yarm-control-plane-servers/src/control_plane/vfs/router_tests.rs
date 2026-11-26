@@ -127,6 +127,9 @@ struct FakeIo {
     dead: BTreeSet<(u64, u64)>,
     refuse_reply: BTreeSet<u64>,
     replies: Vec<(u64, Message)>,
+    /// VFS-LIFETIME1: every NR 22 VFS asked for, and the answer to give.
+    relinquished: Vec<u64>,
+    relinquish_answer: VecDeque<Result<(), yarm_user_rt::syscall::SyscallError>>,
 }
 
 impl RouterIo for FakeIo {
@@ -189,6 +192,21 @@ impl RouterIo for FakeIo {
     fn session_alive(&mut self, s: SessionId) -> Option<bool> {
         Some(!self.dead.contains(&(s.thread_group_id, s.incarnation)))
     }
+
+    fn relinquish(
+        &mut self,
+        cap: u64,
+    ) -> Result<yarm_user_rt::syscall::CapRelinquishOutcome, yarm_user_rt::syscall::SyscallError>
+    {
+        self.relinquished.push(cap);
+        self.relinquish_answer
+            .pop_front()
+            .unwrap_or(Ok(()))
+            .map(|()| yarm_user_rt::syscall::CapRelinquishOutcome {
+                reparented: 1,
+                reclaimed: false,
+            })
+    }
 }
 
 const P1: SessionId = SessionId {
@@ -241,6 +259,8 @@ impl World {
                 dead: BTreeSet::new(),
                 refuse_reply: BTreeSet::new(),
                 replies: Vec::new(),
+                relinquished: Vec::new(),
+                relinquish_answer: VecDeque::new(),
             },
             mounts,
             router: Router::new(),
@@ -919,4 +939,145 @@ fn vc1c_wire_limit_is_respected() {
     assert!(long.len() <= 96);
     assert_eq!(w.statx(P1, &long), Ok(200));
     assert_eq!(w.last_path(VFS_OP_STATX), FILE_A);
+}
+
+// ── VFS-LIFETIME1: VFS gives up its copy of every grant it relays ─────────────────────────────
+
+fn grant(w: &mut World, s: SessionId, fd: u64) -> Option<(VfsCompletion, Vec<u8>, Option<u64>)> {
+    w.send(
+        s,
+        40,
+        request(VFS_OP_FILE_GRANT_RO, &FileGrantRoArgs::new(fd).encode()),
+    )
+}
+
+#[test]
+fn vl1_a_relayed_grant_is_held_until_its_descriptor_closes() {
+    let mut w = World::new();
+    let fa = w.open(P1, FILE_A).unwrap();
+    let (_, _, cap) = grant(&mut w, P1, fa).unwrap();
+    let cap = cap.expect("the client got the grant");
+    assert!(
+        w.io.relinquished.is_empty(),
+        "delivered: held, the client's copy may be in flight"
+    );
+    assert_eq!(w.router.held_grants.held(), 1);
+    // Another request is not the commit point.
+    let _ = w.open(P1, FILE_B).unwrap();
+    assert!(w.io.relinquished.is_empty());
+    assert_eq!(w.close(P1, fa), Ok(()));
+    assert_eq!(
+        w.io.relinquished,
+        alloc::vec![cap],
+        "the close releases exactly that copy, once"
+    );
+    assert_eq!(w.router.held_grants.held(), 0);
+    assert_eq!(w.router.grant_releases.parked(), 0);
+}
+
+#[test]
+fn vl1_a_reclaimed_session_releases_the_grants_of_its_descriptors() {
+    let mut w = World::new();
+    let fa = w.open(P2, FILE_A).unwrap();
+    let (_, _, cap) = grant(&mut w, P2, fa).unwrap();
+    let cap = cap.unwrap();
+    w.io.dead.insert((P2.thread_group_id, P2.incarnation));
+    // The next request from anyone reclaims P2 and closes its descriptor at the backend.
+    let _ = w.statx(P1, FILE_A);
+    assert_eq!(w.io.relinquished, alloc::vec![cap]);
+    assert_eq!(w.router.held_grants.held(), 0);
+}
+
+#[test]
+fn vl1_a_refused_client_reply_releases_vfs_copy_at_once() {
+    let mut w = World::new();
+    let fa = w.open(P1, FILE_A).unwrap();
+    w.io.refuse_reply.insert(w.next_reply);
+    assert!(grant(&mut w, P1, fa).is_none(), "the client got nothing");
+    assert_eq!(
+        w.io.relinquished,
+        alloc::vec![0x9_0000 + HANDLE_BASE],
+        "the undelivered copy goes"
+    );
+    assert_eq!(
+        w.router.held_grants.held(),
+        0,
+        "nothing held for a grant nobody received"
+    );
+}
+
+#[test]
+fn vl1_a_rejected_backend_completion_releases_the_installed_cap_and_relays_none() {
+    let mut w = World::new();
+    let fa = w.open(P1, FILE_A).unwrap();
+    w.io.faults.push_back(Fault::WrongFd);
+    let (c, _, cap) = grant(&mut w, P1, fa).unwrap();
+    assert_eq!(c.status, VFS_STATUS_ERR_BACKEND_MALFORMED);
+    assert_eq!(cap, None, "nothing relayed");
+    assert_eq!(
+        w.io.relinquished,
+        alloc::vec![0x9_0000 + HANDLE_BASE],
+        "the cap the kernel installed goes"
+    );
+    assert_eq!(w.router.held_grants.held(), 0);
+}
+
+#[test]
+fn vl1_a_deferred_release_is_retried_at_the_next_request() {
+    let mut w = World::new();
+    let fa = w.open(P1, FILE_A).unwrap();
+    let (_, _, cap) = grant(&mut w, P1, fa).unwrap();
+    let cap = cap.unwrap();
+    w.io.relinquish_answer
+        .push_back(Err(yarm_user_rt::syscall::SyscallError::WouldBlock));
+    assert_eq!(w.close(P1, fa), Ok(()));
+    assert_eq!(w.router.grant_releases.parked(), 1, "parked, not dropped");
+    let _ = w.open(P1, FILE_B).unwrap();
+    assert_eq!(
+        w.io.relinquished,
+        alloc::vec![cap, cap],
+        "retried once at the next request"
+    );
+    assert_eq!(w.router.grant_releases.parked(), 0);
+}
+
+#[test]
+fn vl1_a_full_table_releases_at_once() {
+    let mut w = World::new();
+    let fa = w.open(P1, FILE_A).unwrap();
+    let mut caps = alloc::vec::Vec::new();
+    for _ in 0..17 {
+        let (_, _, cap) = grant(&mut w, P1, fa).unwrap();
+        caps.push(cap.unwrap());
+    }
+    assert_eq!(w.router.held_grants.held(), 16);
+    assert_eq!(
+        w.io.relinquished,
+        alloc::vec![caps[16]],
+        "the seventeenth goes at once"
+    );
+    assert_eq!(w.close(P1, fa), Ok(()));
+    assert_eq!(
+        w.io.relinquished.len(),
+        17,
+        "the close releases the sixteen held"
+    );
+}
+
+#[test]
+fn vl1_operations_without_a_grant_release_nothing() {
+    let mut w = World::new();
+    let fa = w.open(P1, FILE_A).unwrap();
+    let _ = w.send(
+        P1,
+        40,
+        request(VFS_OP_READ, &ReadWriteArgs::new(fa, 16, 0).encode()),
+    );
+    let _ = w.send(
+        P1,
+        40,
+        request(VFS_OP_CLOSE, &ReadWriteArgs::new(fa, 0, 0).encode()),
+    );
+    assert!(w.io.relinquished.is_empty());
+    assert_eq!(w.router.held_grants.held(), 0);
 }

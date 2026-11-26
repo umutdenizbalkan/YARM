@@ -197,6 +197,31 @@ pub(super) fn handle_transfer_release(
     Ok(())
 }
 
+/// VFS-LIFETIME1 — NR 22 `CapRelinquish`, the broad adapter (hosted builds). The transaction and
+/// every refusal live in [`crate::kernel::boot::cap_relinquish`]; the split route runs the same one.
+pub(super) fn handle_cap_relinquish(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    use crate::kernel::boot::cap_relinquish::{
+        BroadRelinquishOwners, log_relinquish, run_relinquish,
+    };
+    let tid = current_tid(kernel)?;
+    let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let owners = BroadRelinquishOwners {
+        kernel: core::cell::RefCell::new(kernel),
+    };
+    let result = run_relinquish(&owners, tid, cap);
+    log_relinquish(tid, cap, &result);
+    let outcome = result.map_err(|refusal| refusal.syscall_error())?;
+    frame.set_ok(
+        outcome.reparented,
+        usize::from(outcome.reclaimed),
+        crate::kernel::syscall::CAP_RELINQUISH_STATUS_DONE,
+    );
+    Ok(())
+}
+
 pub(super) fn handle_control_plane_set_cnode_slots(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,

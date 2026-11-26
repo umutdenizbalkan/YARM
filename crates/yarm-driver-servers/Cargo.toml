@@ -69,6 +69,13 @@ cap-gen-witness = []
 vfs-mount-witness = []
 # VFS-CORRECT1C: init's, VFS's and ramfs_srv's fd witness; accepted and inert in this package.
 vfs-fd-witness = []
+# VFS-LIFETIME1 — the file-grant lifetime witness (default off): init's cycle driver
+# (control plane), PM's refusal image 14, initramfs's and VFS's handoff injections; the kernel
+# half is the root crate's feature. NC `keep-relay`: VFS omits its release of relayed grants;
+# NC `revoke` is kernel-side (inert here).
+vfs-lifetime-witness = []
+vfs-lifetime-nc-keep-relay = ["vfs-lifetime-witness"]
+vfs-lifetime-nc-revoke = ["vfs-lifetime-witness"]
 # FUTEX-SEAL1: accepted and inert here (init's cell; the kernel side is the root crate's feature).
 futex-seal-witness = []
 # FUTEX-SEAL1: init's per-sequence cell selectors; accepted and inert here.
