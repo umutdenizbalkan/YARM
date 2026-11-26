@@ -710,7 +710,8 @@ fn the_obligations_helper_self_test_passes() {
 
 // ── VFS-LIFETIME1: the lifetime witness's census ─────────────────────────────────────────────
 
-const NR29_REFUSED: &str = "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 cpu=0 result=handled_err code=2";
+const NR29_REFUSED: &str =
+    "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 cpu=0 result=handled_err code=2";
 
 #[test]
 fn vl1_the_lifetime_image_passes_its_own_obligations() {
@@ -720,7 +721,10 @@ fn vl1_the_lifetime_image_passes_its_own_obligations() {
         out.contains("RISCV-STRICT1: workload=vfs-lifetime-witness nr29_owed=10 nr12=1 nr16=1"),
         "{out}"
     );
-    assert!(out.contains("nr29_refused=1") && out.contains("fork_child="), "{out}");
+    assert!(
+        out.contains("nr29_refused=1") && out.contains("fork_child="),
+        "{out}"
+    );
 }
 
 #[test]
