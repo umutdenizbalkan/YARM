@@ -371,7 +371,12 @@ occupant of a reused slot. A full table (16 held grants per relay) releases at o
   they release only after the client's CLOSE.
 
 The live evidence is `scripts/qemu-vfs-lifetime-witness-smoke.sh`, graded by
-`scripts/grade-vfs-lifetime-witness.py`, with two negative controls.
+`scripts/grade-vfs-lifetime-witness.py`, with two negative controls. Its failed handoffs produce
+error lines on purpose, which the core smokes would otherwise reject: five `PM_ELF_ZC_FAIL
+image_id=14` lines, which the strict x86_64 and AArch64 Phase 3B check forbids, and a few lines the
+AArch64 blocker scan flags. The smoke excuses exactly those lines, through
+`WITNESS_ZC_FAIL_EXCLUDE_REGEX` and `WITNESS_BLOCKER_EXCLUDE_REGEX`. The grader's `INJECTED` rule
+requires each excused line to appear exactly as often as the witness causes it, and nowhere else.
 
 ---
 

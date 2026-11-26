@@ -54,8 +54,10 @@ Rules (each failure names its rule):
   INJECTED   each deliberate failure line the smoke excuses from the AArch64 blocker scan appears
              exactly as often as the witness causes it, and no other: two pre-lock stale-reply
              refusals (reason=reply_cap err=InvalidCapability), one VFS_CLIENT_REPLY_REFUSED, five
-             PM_VFS_SPAWN_FAIL all image 14 (four Malformed, one Unsupported) and five matching
-             VL1_PM_SPAWN_REFUSED_EXPECTED.
+             PM_VFS_SPAWN_FAIL all image 14 (four Malformed, one Unsupported), five matching
+             VL1_PM_SPAWN_REFUSED_EXPECTED, and the five image-14 PM_ELF_ZC_FAIL lines the strict
+             core smokes excuse (one grant_ro_malformed, three grant_ro_status, one
+             spawn_from_mo_unsupported) with no other PM_ELF_ZC_FAIL.
 Exit status 0 = sealed, 1 = not sealed. --self-test checks the rules on synthetic boots.
 """
 import argparse
@@ -326,7 +328,15 @@ def grade(lines):
             or sorted(f.get("err") for f in pmexp) != errs:
         fail("INJECTED", f"PM refusals {[(f.get('image_id'), f.get('err')) for f in pmfail]} / expected "
                          f"{[(f.get('image_id'), f.get('err')) for f in pmexp]}")
-    facts["injected"] = f"stale_reply_refusals={len(stale)} vfs_refused={len(refused)} pm_image14={len(pmfail)}"
+    zc = [u[1] for u in (user(l) for l in b.lines) if u and u[1].startswith("PM_ELF_ZC_FAIL ")]
+    zc_ok = re.compile(r"PM_ELF_ZC_FAIL image_id=14 reason=(grant_ro_malformed status=0 has_cap=1|"
+                       r"grant_ro_status status=(5|10) has_cap=0|spawn_from_mo_unsupported)$")
+    zc_reasons = sorted(kv(z).get("reason") for z in zc)
+    if not all(zc_ok.match(z.strip()) for z in zc) or zc_reasons != (
+            ["grant_ro_malformed"] + ["grant_ro_status"] * 3 + ["spawn_from_mo_unsupported"]):
+        fail("INJECTED", f"PM_ELF_ZC_FAIL lines {[z.strip()[:90] for z in zc]} (want the five image-14 handoffs)")
+    facts["injected"] = (f"stale_reply_refusals={len(stale)} vfs_refused={len(refused)} "
+                         f"pm_image14={len(pmfail)} zc_fail_image14={len(zc)}")
 
     vrel = [f for _, _, f in b.users(0, len(b.lines), "VFS_GRANT_RELEASE ") if "parked" in f]
     if vrel and vrel[-1].get("parked") != "0":
@@ -412,23 +422,28 @@ def synthetic(keep_relay=False, revoke=False):
         u(P, "PM_VFS_SPAWN_FAIL image_id=14 err=Malformed")
         u(P, "VL1_PM_SPAWN_REFUSED_EXPECTED image_id=14 err=Malformed")
     u(P, "PM_VFS_SPAWN_FAIL image_id=14 err=Unsupported")
+    u(P, "PM_ELF_ZC_FAIL image_id=14 reason=grant_ro_status status=5 has_cap=0")
     u(N, "VL1_CYCLE label=hop1_undelivered image_id=14 spawned=0 tid=0")
     checkpoint("hop1_undelivered")
     u(I, "INITRAMFS_GRANT_HELD cap=9 handle=2 held=1 inject=2")
     u(V, "VFS_GRANT_RELEASE cap=8 why=rejected_malformed result=Ok(true)")
     u(I, "INITRAMFS_GRANT_RELEASE cap=9 why=closed handle=2 step=Released")
+    u(P, "PM_ELF_ZC_FAIL image_id=14 reason=grant_ro_status status=10 has_cap=0")
     u(N, "VL1_CYCLE label=hop1_rejected image_id=14 spawned=0 tid=0")
     checkpoint("hop1_rejected")
     out.append("IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=18446744073709551615 record_generation=18446744073709551615 replier_tid=10002 reason=reply_cap err=InvalidCapability reply_copies=0 caller_wakes=0")
     u(V, "VFS_CLIENT_REPLY_REFUSED reply_cap=5 err=InvalidCapability")
     u(V, "VFS_GRANT_INJECT kind=stale_reply delivered=0 then_backend_error=1")
     u(V, "VFS_GRANT_RELEASE cap=8 why=reply_refused step=Released parked=0")
+    u(P, "PM_ELF_ZC_FAIL image_id=14 reason=grant_ro_status status=5 has_cap=0")
     u(N, "VL1_CYCLE label=hop2_undelivered image_id=14 spawned=0 tid=0")
     checkpoint("hop2_undelivered")
+    u(P, "PM_ELF_ZC_FAIL image_id=14 reason=grant_ro_malformed status=0 has_cap=1")
     u(P, "PM_GRANT_RELEASE image_id=14 cap=7 why=rejected_completion result=Ok")
     u(N, "VL1_CYCLE label=hop2_rejected image_id=14 spawned=0 tid=0")
     checkpoint("hop2_rejected")
     out.append(f"VL1_GRANT_USE tid={P} image_id=14 cap=7 mo_id=99 cap_refcount=1 map_refcount=0")
+    u(P, "PM_ELF_ZC_FAIL image_id=14 reason=spawn_from_mo_unsupported")
     u(P, "PM_GRANT_RELEASE image_id=14 cap=7 why=spawn_refused result=Ok")
     u(P, "VL1_PM_SPAWN_REFUSED_EXPECTED image_id=14 err=Unsupported")
     u(N, "VL1_CYCLE label=nr29_refused image_id=14 spawned=0 tid=0")
@@ -465,6 +480,10 @@ def self_test():
     f, _ = grade(synthetic() + ["USER_LOG tid=3 msg=PM_VFS_SPAWN_FAIL image_id=7 err=Malformed"])
     if not any(x.startswith("INJECTED") for x in f):
         print("[self-test] another image's refusal did not fail INJECTED:", f)
+        ok = False
+    f, _ = grade(synthetic() + ["USER_LOG tid=3 msg=PM_ELF_ZC_FAIL image_id=7 reason=grant_ro_status status=5 has_cap=0"])
+    if not any(x.startswith("INJECTED") for x in f):
+        print("[self-test] another image's loader failure did not fail INJECTED:", f)
         ok = False
     f, _ = grade(synthetic(revoke=True))
     if not any(x.startswith("SURVIVAL") for x in f):

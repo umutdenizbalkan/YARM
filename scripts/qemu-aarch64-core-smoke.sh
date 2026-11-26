@@ -1104,7 +1104,14 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
 
   # Phase 3B: PM_ELF_ZC_FAIL must be 0 — no ZC loader errors permitted.
   if [[ -f "$LOGFILE" ]]; then
-    ZC_FAIL_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_FAIL" 2>/dev/null || echo 0)
+    # A witness that causes loader failures on purpose names exactly those lines in
+    # WITNESS_ZC_FAIL_EXCLUDE_REGEX (and its own grader counts them); any other still fails.
+    ZC_FAIL_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a "PM_ELF_ZC_FAIL" 2>/dev/null \
+      | { if [[ -n "${WITNESS_ZC_FAIL_EXCLUDE_REGEX:-}" ]]; then rg -a -v -e "$WITNESS_ZC_FAIL_EXCLUDE_REGEX"; else cat; fi; } \
+      | wc -l)
+    if [[ -n "${WITNESS_ZC_FAIL_EXCLUDE_REGEX:-}" ]]; then
+      echo "[info] Phase 3B: PM_ELF_ZC_FAIL lines excused by the witness: $(tr '\r' '\n' <"$LOGFILE" | rg -a -c -e "$WITNESS_ZC_FAIL_EXCLUDE_REGEX" 2>/dev/null || echo 0)"
+    fi
     if [[ "$ZC_FAIL_TOTAL" -eq 0 ]]; then
       echo "[ok] Phase 3B: PM_ELF_ZC_FAIL count=0"
     else

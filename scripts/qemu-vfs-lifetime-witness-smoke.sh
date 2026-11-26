@@ -85,6 +85,10 @@ INJECTED='IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=18446744073709551615 rec
 INJECTED+='|VFS_CLIENT_REPLY_REFUSED reply_cap=[0-9]+ err=InvalidCapability$'
 INJECTED+='|PM_VFS_SPAWN_FAIL image_id=14 err=(Malformed|Unsupported)$'
 INJECTED+='|VL1_PM_SPAWN_REFUSED_EXPECTED image_id=14 err=(Malformed|Unsupported)$'
+# PM's loader-failure line for each of the five image-14 requests, which the strict x86_64 and
+# AArch64 core smokes otherwise forbid (Phase 3B); the grader's INJECTED rule requires exactly
+# these five and no other PM_ELF_ZC_FAIL.
+ZC_INJECTED='PM_ELF_ZC_FAIL image_id=14 reason=(grant_ro_malformed status=0 has_cap=1|grant_ro_status status=(5|10) has_cap=0|spawn_from_mo_unsupported)$'
 note "booting QEMU -smp $SMP"
 env \
   KERNEL_IMAGE="$DEST" \
@@ -96,6 +100,7 @@ env \
   TIMEOUT_SECS="$TIMEOUT_SECS" \
   TERMINAL_IDLE_MARKER="VL1_WITNESS_DONE" \
   WITNESS_BLOCKER_EXCLUDE_REGEX="$INJECTED" \
+  WITNESS_ZC_FAIL_EXCLUDE_REGEX="$ZC_INJECTED" \
   "$SMOKE" >"$LOGDIR/core-smoke.log" 2>&1
 core_rc=$?
 echo "$core_rc" >"$LOGDIR/core-smoke.rc"
