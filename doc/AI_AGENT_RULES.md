@@ -1041,8 +1041,11 @@ acceptance table. Declaring without smoke is a hard violation of §13.
     - settle `queue_non_empty` / `restored`;
     - then deliver one record, linked across CPUs by its (index, generation): queued once on that
       endpoint as a CALL, and bound once in the boot.
-  - **Replies.** A call owes exactly one `resolution=commit` reply terminal. The reply requirement
-    applies only to operations that owe one.
+  - **Replies.** A call owes exactly one committed reply terminal. A payload reply commits in the
+    syscall (`IPCREPLY_DIRECT_TERMINAL_CLAIM … resolution=commit`). A capability-bearing reply
+    commits in its post-work settle, once its copy is delivered (`IPC_REPLY_DIRECT_CAP_SETTLED …
+    terminal_committed=1`). Both go through the same commit, and each counts once. The reply
+    requirement applies only to operations that owe one.
   - **Defects.** Orphans in either direction (a companion with no race, a `queue_non_empty`
     settle with no race) are defects. So is a duplicate publication sharing one recovery, or a
     duplicate commit.

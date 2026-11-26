@@ -23,7 +23,7 @@ order. The checker therefore uses
     `D2_RECV_SPLIT_UNWIND_OK`, `IPC_RECV_BLOCK_SPLIT_SETTLED`), and
   * identity across CPUs: a queued call's reply record (index, generation) links the sender's
     `IPCCALL_QUEUED_SPLIT_OK`, the receiver's `IPC_RECV_REPLY_CAP_RESPONDER_BOUND` and the replier's
-    `IPCREPLY_DIRECT_TERMINAL_CLAIM`.
+    terminal commit (S6).
 Proximity and cross-CPU print order are never used to identify a wait or a message.
 
 Why the recovery delivery is the receiver's FIRST `RESPONDER_BOUND` after the restored settle and
@@ -50,8 +50,13 @@ THE RULE.
          receive names record (i, g); that record has exactly one `IPCCALL_QUEUED_SPLIT_OK`,
          naming E (index and generation), and exactly one `RESPONDER_BOUND` in the boot; and no
          other race is attributed to it;
-      S6 a queued CALL owes a reply: exactly one `IPCREPLY_DIRECT_TERMINAL_CLAIM` for (i, g) with
-         `resolution=commit`. The reply requirement applies only to operations that owe one.
+      S6 a queued CALL owes a reply: exactly one terminal commit for (i, g). A direct reply commits
+         its terminal in one of two places, both through `commit_direct_reply_terminal_split`:
+         a payload reply in the syscall (`IPCREPLY_DIRECT_TERMINAL_CLAIM … resolution=commit`), a
+         capability-bearing reply in the post-work settle once its copy is delivered
+         (`IPC_REPLY_DIRECT_CAP_SETTLED … terminal_committed=1`, DIRECT3-CAP-FINAL). Either counts
+         once; a settle with `terminal_committed=0` is no commit. The reply requirement applies
+         only to operations that owe one.
   O   Orphans, both directions: a companion with no race, and a `queue_non_empty` settle with no
       race, are defects.
   U   Unverified rather than defect, because the trace cannot decide:
@@ -129,6 +134,12 @@ def check_lines(lines):
             d = kv(s)
             key = (d.get("record_index"), d.get("record_generation"))
             (commits if d.get("resolution") == "commit" else releases).setdefault(key, []).append(n)
+        elif s.startswith("IPC_REPLY_DIRECT_CAP_SETTLED"):
+            # VFS-LIFETIME1: a capability-bearing direct reply commits its terminal here, not in
+            # the syscall (S6). Only a committed settle counts.
+            d = kv(s)
+            if d.get("terminal_committed") == "1":
+                commits.setdefault((d.get("record_index"), d.get("record_generation")), []).append(n)
         elif s.startswith("IPC_SEND_SPLIT_DONE") and "result=enqueued" in s:
             noreply_enq.setdefault(kv(s).get("endpoint"), []).append(n)
         elif s.startswith("IPC_REPLY_QUEUED_SPLIT_OK"):
@@ -350,6 +361,12 @@ def _synthetic(two_on_same_endpoint=True):
     ]
 
 
+def is_commit(line):
+    """S6's two commit markers (see the rule)."""
+    return (line.startswith("IPCREPLY_DIRECT_TERMINAL_CLAIM") and "resolution=commit" in line) or \
+        (line.startswith("IPC_REPLY_DIRECT_CAP_SETTLED") and "terminal_committed=1" in line)
+
+
 def self_test(fixtures):
     count = 0
 
@@ -406,9 +423,18 @@ def self_test(fixtures):
     lossy = ["PRINTK_RECORDS_LOST first_seq=5 count=2 total_dropped=2"] + [x for x in syn if x != "D2_RECV_WAITER_RACE_UNWIND tid=100"]
     expect(lossy, "unverified", "S3", "lost records: a missing companion is undecidable")
     expect(["noise"], "ok", None, "no race at all")
+    # VFS-LIFETIME1: a capability-bearing reply commits in its post-work settle, not in the syscall
+    cap2 = ("IPC_REPLY_DIRECT_CAP_SETTLED record_index=5 record_generation=60 replier_tid=100 caller_tid=202 "
+            "consumed=1 replier_revoked=1 caller_revoked=1 terminal_committed=1 result=ok")
+    expect(syn[:c2] + [cap2] + syn[c2 + 1:], "ok", None, "call 2 answered by a capability-bearing reply")
+    expect(syn[:c2] + [cap2.replace("terminal_committed=1", "terminal_committed=0")] + syn[c2 + 1:], "defect", "S6",
+           "a settle that did not commit the terminal is no reply")
+    expect(syn + [cap2], "defect", "S6", "a payload commit and a capability settle for one record")
+    expect(syn[:c2] + [cap2.replace("record_generation=60", "record_generation=61")] + syn[c2 + 1:], "defect", "S6",
+           "a capability settle of another record must not answer call 2")
     n_syn = count
 
-    # (3) the 33 retained controls of the IPC-D2-PUBLISH1 prototype, on the archived fixtures
+    # (3) the 11 retained controls of the IPC-D2-PUBLISH1 prototype, on each archived fixture
     for p in fixtures:
         base = [l for l in norm(open(p, errors="replace").read()) if not l.startswith("#")]
         rep = check_lines(base)
@@ -442,7 +468,7 @@ def self_test(fixtures):
             (drop(enq), "unverified", "U", "the message on the endpoint removed"),
             (drop(bnd), "defect", None, "delivery removed"),
             (base[:bnd + 1] + [base[bnd]] + base[bnd + 1:], "defect", "S5", "double delivery"),
-            ([x for x in base if not ("TERMINAL_CLAIM" in x and f"record_index={rec[0]} record_generation={rec[1]} " in x)],
+            ([x for x in base if not (is_commit(x) and f"record_index={rec[0]} record_generation={rec[1]} " in x)],
              "defect", "S6", "sender never answered"),
             (base[:race + 3] + [f"IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu=0 tid={r} phase=publish outcome=x reason=y"] +
              base[race + 3:], "defect", "F", "fail closed"),
@@ -454,7 +480,7 @@ def self_test(fixtures):
         expect(base + [f"D2_RECV_WAITER_RACE_UNWIND tid={r}"], "defect", "O", f"{p}: orphan companion")
         expect(base[:pair + 1] + base[race:pair + 1] + base[pair + 1:], "defect", "S1",
                f"{p}: duplicate publication sharing one recovery")
-        cm = next(i for i, x in enumerate(base) if "TERMINAL_CLAIM" in x and "resolution=commit" in x and
+        cm = next(i for i, x in enumerate(base) if is_commit(x) and
                   f"record_index={rec[0]} record_generation={rec[1]} " in x)
         expect(base[:cm + 1] + [base[cm]] + base[cm + 1:], "defect", "S6", f"{p}: duplicate terminal commit")
     print(f"D2_PUBLISH_RACE_CHECK_SELF_TEST result=ok synthetic={n_syn} fixtures={len(fixtures)} "

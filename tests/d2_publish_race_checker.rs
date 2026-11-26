@@ -9,6 +9,8 @@
 //!   orphan-companion, duplicate-publication and duplicate-commit controls on each real trace, and
 //!   the synthetic interleaved-calls cases;
 //! * the archived VFS-CORRECT1C SMP2 traces (verbatim extracts): verdict `ok`, every race recovered;
+//! * the VFS-LIFETIME1 RISC-V trace whose recovered delivery is answered by a capability-bearing
+//!   reply, which commits its terminal in the post-work settle: verdict `ok`, the race recovered;
 //! * the gates that must call it: every core and optional-fs smoke, and the fd witness grader.
 
 use std::process::Command;
@@ -29,7 +31,7 @@ fn checker(args: &[&str]) -> (i32, String) {
 }
 
 fn fixtures() -> Vec<String> {
-    ["x86_64", "aarch64", "riscv64"]
+    ["x86_64", "aarch64", "riscv64", "riscv64-cap-reply"]
         .iter()
         .map(|p| format!("{ROOT}/scripts/fixtures/d2-publish-race/{p}.txt"))
         .collect()
@@ -46,12 +48,12 @@ fn the_checker_self_test_passes_every_control() {
         out.contains("D2_PUBLISH_RACE_CHECK_SELF_TEST result=ok"),
         "{out}"
     );
-    assert!(out.contains("fixtures=3"), "{out}");
+    assert!(out.contains("fixtures=4"), "{out}");
 }
 
 #[test]
 fn the_archived_smp2_races_replay_as_recovered() {
-    for (f, races) in fixtures().iter().zip([3usize, 1, 2]) {
+    for (f, races) in fixtures().iter().zip([3usize, 1, 2, 1]) {
         let (rc, out) = checker(&["--quiet", f]);
         assert_eq!(rc, 0, "{f}: {out}");
         assert!(

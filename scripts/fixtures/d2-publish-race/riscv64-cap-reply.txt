@@ -1,0 +1,295 @@
+# VFS-LIFETIME1 fixture: verbatim, in order, from the VFS-LIFETIME1 evidence (wip/vfs-lifetime1-evidence),
+# qual-4/W_life_riscv64/boot.log (sha256 4ab462de0771eba9b4e5d51cd75c71839f28feecd5bbca8e682f30e8c548e376),
+# normalized (tr '\r' '\n'); empty lines dropped. Window (1-based normalized lines): 61529-62396.
+# A split publish race of VFS (10002) whose recovered delivery is a FILE_GRANT_RO call answered by a
+# capability-bearing direct reply: its terminal commits in the post-work settle (IPC_REPLY_DIRECT_CAP_SETTLED).
+IPC_RECV_ENTER tid=10002 cap=65536
+RISCV_S_MODE_IPI_DISPATCH cpu=1 sources=0x1 resume_tid=10010
+YARM_RECV_CORE_ADAPTER kind=legacy_full_path is_kernel_task=false
+IPCCALL_QUEUED_SPLIT_OK tid=10010 endpoint=10 endpoint_generation=1 reply_cap=65557 record_index=1 record_generation=24 len=34 result=ok
+IPC_RECV_AFTER_CAP_OK tid=10002 cap=65536 endpoint=Endpoint { index: 10, generation: 1 }
+YARM_SPLIT_RECV_PROBE step=enter nr=2 cpu=1
+SCHED_BLOCK tid=10002
+YARM_SPLIT_RECV_PROBE step=tid result=ok requester_tid=10010
+D2_RECV_WAITER_TASK_BLOCKED tid=10002 wait_gen=83
+YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=cap_plan result=ok endpoint_idx=1
+IPC_RECV_BLOCKED_STATE_SAVE tid=10002 cap=65536 payload_ptr=0x1c7ffcb8 payload_len=130 meta_ptr=0x1c7ffc20 meta_len=40 abi=recv_v2
+YARM_RECV_CORE_PLAN plan=UserPlainV2Eligible
+D2_PUBLISH_RACE_UNWIND endpoint=split tid=10002
+YARM_RECV_CORE_ADAPTER kind=user_plain_v2
+D2_RECV_WAITER_RACE_UNWIND tid=10002
+YARM_SPLIT_RECV_PROBE step=outcome result=fallback
+IPC_RECV_ENTER tid=10010 cap=65537
+YARM_RECV_CORE_ADAPTER kind=legacy_full_path is_kernel_task=false
+D2_RECV_SPLIT_UNWIND_OK cpu=0 tid=10002 asid=6 via=exact transition=dispatch_incoming from=Runnable status=running placement=current priority=exact
+IPC_RECV_AFTER_CAP_OK tid=10010 cap=65537 endpoint=Endpoint { index: 1, generation: 1 }
+IPC_RECV_BLOCK_SPLIT_SETTLED cpu=0 tid=10002 endpoint=10 reason=queue_non_empty outcome=restored
+SCHED_BLOCK tid=10010
+YARM_SPLIT_RECV_PROBE step=enter nr=2 cpu=0
+D2_RECV_WAITER_TASK_BLOCKED tid=10010 wait_gen=2
+YARM_SPLIT_RECV_PROBE step=tid result=ok requester_tid=10002
+IPC_RECV_BLOCKED_STATE_SAVE tid=10010 cap=65537 payload_ptr=0x7fbff1c6 payload_len=130 meta_ptr=0x7fbff248 meta_len=40 abi=recv_v2
+YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=cap_plan result=ok endpoint_idx=10
+D2_RECV_WAITER_PUBLISH endpoint=1 tid=10010 asid=14 recv_cap=65537
+YARM_RECV_CORE_PLAN plan=UserPlainV2Eligible
+D2_RECV_WAITER_PUBLISHED tid=10010
+YARM_RECV_CORE_ADAPTER kind=user_plain_v2
+IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=10010 caller_asid=14 record_index=1 record_generation=24 replier_tid=0 blocked_recv_generation=2 finite_deadline=0 deadline_reserved=0 result=ok
+IPC_RECV_REPLY_CAP_RESPONDER_BOUND reply_index=1 reply_gen=24 responder_tid=10002 responder_asid=6 result=ok
+IPC_RECV_REPLY_CAP_WAITER_CAP_SET reply_index=1 reply_gen=24 cap=2883589
+YARM_D5_SPLIT_RECORD reply_index=1 reply_gen=24 cap=2883589
+IPC_RECV_BLOCK_REGISTER endpoint=1 tid=10010
+YARM_D5_SPLIT_MATERIALIZE kind=reply receiver_tid=10002 local_cap=2883589
+IPC_REPLY_CAP_ONESHOT_OK receiver_tid=10002 local_reply_cap=2883589
+QUEUE_ADVANCING_DISPATCH_DEFERRED reason=blocking_recv_switch_required tid=10010 cpu=1
+YARM_RECV_CORE_CAP_MATERIALIZE receiver_tid=10002 local_cap=2883589
+IPC_RECV_BOUNDARY_SNAPSHOT_OK receiver_tid=10002 cap=2883589 reply=true
+IPC_RECV_BLOCK_SPLIT_DONE cpu=1 tid=10010 endpoint=1 wait_gen=2 result=blocked
+IPC_RECV_BOUNDARY_GLOBAL_DROPPED_OK
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=1 result=queue_advance_committed outgoing=10010 captured=1 committed=0 a0=65537
+IPC_RECV_BOUNDARY_USER_COPY_SEAM_OK kind=user_plain_v2
+QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=1 reason=publication_committed
+YARM_RECV_CORE_LIVE kind=user_plain_v2
+YARM_RECV_CORE_V2_WRITEBACK result=ok
+IPC_RECV_V2_META_QUEUED_SPLIT_OK len=40
+IPC_RECV_BOUNDARY_SPLIT_DONE result=ok
+YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=writeback result=ok target=user_or_kernel
+YARM_SPLIT_RECV_PROBE step=outcome result=serviced_ok
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+TIMER_SPLIT_TICK_OK cpu=0 tick=590 preempt=0 rearm=1 current=10002
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+D2_RECV_GENUINE_GLOBAL_DROPPED cpu=1
+USER_LOG tid=10002 msg=VFS_RECV_GOT_MSG opcode=25 reply_cap=2883589
+GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcReceiveBlocking
+USER_LOG tid=10002 msg=VFS_FORWARD_CALL op=25 target=initramfs send_cap=65539 reply_cap=65537 instance=1
+D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid=10010
+D2_RECV_GENUINE_DISPATCH_ENTER cpu=1
+D2_RECV_GENUINE_DISPATCH_STEP_SPLIT cpu=1 result=idle incoming=None
+TIMER_SPLIT_TICK_OK cpu=0 tick=591 preempt=0 rearm=1 current=10002
+D2_RECV_GENUINE_DISPATCH_DECLINED cpu=1 reason=idle
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+D2_RECV_GENUINE_IDLE_PROVENANCE_PUBLISHED cpu=1 tid=10010 class=IpcRecv
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+D2_RECV_GENUINE_DISPATCH_DONE result=idle cpu=1
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+RISCV_BLOCKED_IPC_IDLE_PROVENANCE_OK tid=10010 class=IpcRecv
+RISCV_TYPED_IDLE_OUTCOME result=ok reason=BlockedIpcNoRunnable
+RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked
+RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io
+TIMER_SPLIT_TICK_OK cpu=0 tick=592 preempt=0 rearm=1 current=10002
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+IPCCALL_DIRECT_SPLIT_OK caller_tid=10002 server_tid=10000 endpoint=6 endpoint_generation=1 server_reply_cap=2752514 record_index=2 record_generation=45 len=34 result=ok
+YARM_SPLIT_RECV_PROBE step=enter nr=2 cpu=0
+YARM_SPLIT_RECV_PROBE step=tid result=ok requester_tid=10002
+YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=cap_plan result=ok endpoint_idx=11
+YARM_RECV_CORE_PLAN plan=UserPlainV2Eligible
+YARM_RECV_CORE_ADAPTER kind=user_plain_v2
+YARM_SPLIT_RECV_PROBE step=outcome result=fallback
+IPC_RECV_ENTER tid=10002 cap=65537
+YARM_RECV_CORE_ADAPTER kind=legacy_full_path is_kernel_task=false
+IPC_RECV_AFTER_CAP_OK tid=10002 cap=65537 endpoint=Endpoint { index: 11, generation: 1 }
+SCHED_BLOCK tid=10002
+D2_RECV_WAITER_TASK_BLOCKED tid=10002 wait_gen=84
+IPC_RECV_BLOCKED_STATE_SAVE tid=10002 cap=65537 payload_ptr=0x1c7fd270 payload_len=130 meta_ptr=0x1c7fd2f8 meta_len=40 abi=recv_v2
+D2_RECV_WAITER_PUBLISH endpoint=11 tid=10002 asid=6 recv_cap=65537
+D2_RECV_WAITER_PUBLISHED tid=10002
+IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=10002 caller_asid=6 record_index=2 record_generation=45 replier_tid=10000 blocked_recv_generation=84 finite_deadline=0 deadline_reserved=0 result=ok
+IPC_RECV_BLOCK_REGISTER endpoint=11 tid=10002
+QUEUE_ADVANCING_DISPATCH_DEFERRED reason=blocking_recv_switch_required tid=10002 cpu=0
+IPC_RECV_BLOCK_SPLIT_DONE cpu=0 tid=10002 endpoint=11 wait_gen=84 result=blocked
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 cpu=0 result=queue_advance_committed outgoing=10002 captured=1 committed=0 a0=65537
+QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+D2_RECV_GENUINE_GLOBAL_DROPPED cpu=0
+GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcReceiveBlocking
+D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid=10002
+D2_RECV_GENUINE_DISPATCH_ENTER cpu=0
+D2_RECV_GENUINE_DISPATCH_STEP_SPLIT cpu=0 result=switch incoming=Some(2)
+D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=2 count=327
+GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReceiveBlocking result=ok asid=2
+RISCV_STARTUP_ARGS tid=2 entering=10002 a0=9 a1=0 a2=130 a3=3 a4=2141188136 a5=40
+TIMER_SPLIT_TICK_OK cpu=0 tick=593 preempt=0 rearm=1 current=2
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+USER_LOG tid=2 msg=USER_RT_RECV_AFTER_SYSCALL x0=9 x1=0 x2=130 x3=3
+USER_LOG tid=2 msg=SUPERVISOR_CONTROL_POLL_EMPTY
+USER_LOG tid=2 msg=SUPERVISOR_IDLE_WAIT_SELECT mode=control reason=no_managed_records
+USER_LOG tid=2 msg=SUPERVISOR_CONTROL_WAIT_BEGIN timeout=1
+YARM_RECV_CORE_PLAN plan=UserPlainV2Eligible
+YARM_RECV_CORE_ADAPTER kind=user_plain_v2
+IPC_RECV_TIMED_SPLIT_DECLINE cpu=0 tid=2 reason=empty_endpoint_timed parked=0 deadline_armed=0
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+IPC_RECV_AFTER_CAP_OK tid=2 cap=65539 endpoint=Endpoint { index: 4, generation: 1 }
+YARM_RECV_CORE_ADAPTER kind=legacy_timeout is_kernel_task=false blocking=Deadline(594)
+SCHED_BLOCK tid=2
+D2_RECV_WAITER_TASK_BLOCKED tid=2 wait_gen=117
+IPC_RECV_BLOCKED_STATE_SAVE tid=2 cap=65539 payload_ptr=0x7f9fefa6 payload_len=130 meta_ptr=0x7f9ff028 meta_len=40 abi=recv_v2
+D2_RECV_WAITER_PUBLISH endpoint=4 tid=2 asid=2 recv_cap=65539
+D2_RECV_WAITER_PUBLISHED tid=2
+IPC_RECV_BLOCK_REGISTER endpoint=4 tid=2
+QUEUE_ADVANCING_DISPATCH_DEFERRED reason=blocking_recv_switch_required tid=2 cpu=0
+IPC_RECV_BLOCK_SPLIT_DONE cpu=0 tid=2 endpoint=4 wait_gen=117 result=blocked
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=65539
+QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+D2_RECV_GENUINE_GLOBAL_DROPPED cpu=0
+GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcReceiveBlocking
+D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid=2
+D2_RECV_GENUINE_DISPATCH_ENTER cpu=0
+D2_RECV_GENUINE_DISPATCH_STEP_SPLIT cpu=0 result=switch incoming=Some(10000)
+D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=10000 count=328
+GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReceiveBlocking result=ok asid=4
+RISCV_STARTUP_ARGS tid=10000 entering=2 a0=0 a1=482344312 a2=130 a3=482344160 a4=40 a5=0
+TIMER_SPLIT_TICK_OK cpu=0 tick=594 preempt=0 rearm=1 current=10000
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+RISCV_BLOCKED_RETURN_PUBLISHED tid=2 code=9 stored_a0=9 stored_a1=0 stored_arg0=9 stored_arg1=0 result=ok
+U8_RECV_TIMEOUT_SETTLED arch=riscv64 tid=2 asid=2 wait_generation=117 deadline=594 now=594 broad_lock=0 result=ok
+USER_LOG tid=10000 msg=INITRAMFS_SRV_GOT_MSG opcode=25 reply_cap=2752514
+CREATE_INITRAMFS_FILE_SLICE_MO_OK tid=10000 name=etc/vfs-fixture file_len=300 mo_id=24 cap=851971
+CREATE_INITRAMFS_FILE_SLICE_MO_SPLIT_OK tid=10000 mo_id=24 cap=851971 offset=230200 file_len=300 backing=borrowed result=ok
+VL1_LEDGER event=nr28_create tid=10000 mo_id=24 live_slice_mo=1 slice_cap_refs=1 slice_slots=1 links=63 cnodes=15 truncated=0
+VL1_LEDGER_CNODE event=nr28_create pid=0 occupied=15 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=2 occupied=6 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=3 occupied=55 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=1 occupied=21 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10000 occupied=4 slice=1
+VL1_LEDGER_CNODE event=nr28_create pid=10001 occupied=2 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10002 occupied=7 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10003 occupied=2 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10004 occupied=3 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10005 occupied=2 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10006 occupied=2 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10007 occupied=2 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10008 occupied=2 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10009 occupied=2 slice=0
+VL1_LEDGER_CNODE event=nr28_create pid=10010 occupied=22 slice=0
+TIMER_SPLIT_TICK_OK cpu=0 tick=595 preempt=0 rearm=1 current=10000
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+USER_LOG tid=10000 msg=INITRAMFS_FILE_GRANT_RO_REPLY path=etc/vfs-fixture len=300 cap=851971
+IPC_REPLY_DIRECT_CAP_STASH tid=10000 transfer_cap=851971 handle=1900544 endpoint=11 endpoint_generation=1 caller_tid=10002
+DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid=10002
+IPC_REPLY_DIRECT_CAP_PRODUCED record_index=2 record_generation=45 replier_tid=10000 caller_tid=10002 endpoint=11 result=ok
+DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid=10002
+DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocked_waiter_ordinary_cap
+DISPATCH_POST_WORK_CAP_TRANSFER_SEAM_OK kind=blocked_waiter_ordinary_cap local_cap=524295
+IPC_TRANSFER_CAP_MATERIALIZE_OK receiver_tid=10002 local_cap=524295
+IPC_ORDINARY_CAP_OBJECT_IDENTITY receiver_tid=10002 src_endpoint=None dst_endpoint=None match=1
+IPC_ORDINARY_CAP_RIGHTS receiver_tid=10002 dst_rights=Some(5) expected_rights=5 rights_ok=1 object_endpoint=0 reply_object=0 generation=0
+DISPATCH_POST_WORK_USER_COPY_OK kind=blocked_waiter_ordinary_cap
+IPC_REPLY_DIRECT_CAP_SETTLED record_index=2 record_generation=45 replier_tid=10000 caller_tid=10002 consumed=1 replier_revoked=1 caller_revoked=0 terminal_committed=1 result=ok
+IPC_SEND_SPLIT_RECV_V2_CLEAR_WAITER receiver_tid=10002
+SCHED_WAKE_BEGIN tid=10002 old_status=Blocked(EndpointReceive(CapId(65537)))
+SCHED_WAKE_SET_RUNNABLE tid=10002 new_status=Runnable
+SCHED_WAKE_ENQUEUE tid=10002 cpu=0 queue_len=2 reason=pinned
+DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_ordinary_cap
+IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=10002 len=40
+DISPATCH_POST_WORK_DONE kind=blocked_waiter_ordinary_cap result=ok
+RISCV_SPLIT_COMPLETE_POST_WORK_DRAINED nr=7 cpu=0 disposition=no_caller_action
+RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu=0 outgoing=10000
+RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu=0 outgoing=10000
+TIMER_SPLIT_PREEMPT_COMMITTED cpu=0 tick=596 outgoing=10000 preempt=1 rearm=1 broad_lock=0
+TIMER_SPLIT_PREEMPT_ASYNC_TAGGED cpu=0 outgoing=10000 tagged=1 restorable=1
+QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=timer_preempt_committed
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+RISCV_YIELD_DISPATCH_DRAIN_BEGIN cpu=0
+GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=Yield
+RISCV_YIELD_DISPATCH_LOCK_DROPPED_OK cpu=0
+RISCV_YIELD_DISPATCH_REVERIFY_OK outgoing=10000
+YIELD_DISPATCH_DEQUEUE_OK cpu=0 tid=2
+RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu=0 incoming=2
+RISCV_YIELD_DISPATCH_CURRENT_SET_OK cpu=0 incoming=2
+RISCV_YIELD_DISPATCH_RUNNING_OK incoming=2
+RISCV_YIELD_DISPATCH_SATP_OK incoming=2 asid=2
+RISCV_YIELD_DISPATCH_SFENCE_OK incoming=2
+RISCV_YIELD_DISPATCH_FRAME_OK incoming=2
+RISCV_YIELD_DISPATCH_SRET_ARMED incoming=2
+RISCV_YIELD_DISPATCH_DONE result=ok
+GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield result=ok
+RISCV_STARTUP_ARGS tid=2 entering=10000 a0=9 a1=0 a2=130 a3=1 a4=2141188136 a5=40
+TIMER_SPLIT_TICK_OK cpu=0 tick=597 preempt=0 rearm=1 current=2
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+USER_LOG tid=2 msg=USER_RT_RECV_AFTER_SYSCALL x0=9 x1=0 x2=130 x3=1
+TIMER_SPLIT_TICK_OK cpu=0 tick=598 preempt=0 rearm=1 current=2
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+USER_LOG tid=2 msg=SUPERVISOR_CONTROL_WAIT_DONE result=empty
+TIMER_SPLIT_TICK_OK cpu=0 tick=599 preempt=0 rearm=1 current=2
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+USER_LOG tid=2 msg=SUPERVISOR_TICK_ADVANCE tick=58
+USER_LOG tid=2 msg=SUPERVISOR_EVENT_LOOP_TICK tick=58
+TIMER_SPLIT_TICK_OK cpu=0 tick=600 preempt=0 rearm=1 current=2
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+USER_LOG tid=2 msg=SUPERVISOR_CONTROL_POLL_BEGIN
+TIMER_SPLIT_TICK_OK cpu=0 tick=601 preempt=0 rearm=1 current=2
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_RECV_CORE_PLAN plan=UserPlainV2Eligible
+YARM_RECV_CORE_ADAPTER kind=user_plain_v2
+IPC_RECV_TIMED_SPLIT_DECLINE cpu=0 tid=2 reason=empty_endpoint_timed parked=0 deadline_armed=0
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+IPC_RECV_AFTER_CAP_OK tid=2 cap=65539 endpoint=Endpoint { index: 4, generation: 1 }
+YARM_RECV_CORE_ADAPTER kind=legacy_timeout is_kernel_task=false blocking=Deadline(604)
+SCHED_BLOCK tid=2
+D2_RECV_WAITER_TASK_BLOCKED tid=2 wait_gen=118
+IPC_RECV_BLOCKED_STATE_SAVE tid=2 cap=65539 payload_ptr=0x7f9fefa6 payload_len=130 meta_ptr=0x7f9ff028 meta_len=40 abi=recv_v2
+D2_RECV_WAITER_PUBLISH endpoint=4 tid=2 asid=2 recv_cap=65539
+D2_RECV_WAITER_PUBLISHED tid=2
+IPC_RECV_BLOCK_REGISTER endpoint=4 tid=2
+QUEUE_ADVANCING_DISPATCH_DEFERRED reason=blocking_recv_switch_required tid=2 cpu=0
+IPC_RECV_BLOCK_SPLIT_DONE cpu=0 tid=2 endpoint=4 wait_gen=118 result=blocked
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1 committed=0 a0=65539
+QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+D2_RECV_GENUINE_GLOBAL_DROPPED cpu=0
+GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcReceiveBlocking
+D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid=2
+D2_RECV_GENUINE_DISPATCH_ENTER cpu=0
+D2_RECV_GENUINE_DISPATCH_STEP_SPLIT cpu=0 result=switch incoming=Some(10002)
+D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=10002 count=329
+GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReceiveBlocking result=ok asid=6
+RISCV_STARTUP_ARGS tid=10002 entering=2 a0=0 a1=478138992 a2=130 a3=478139128 a4=40 a5=0
+TIMER_SPLIT_TICK_OK cpu=0 tick=602 preempt=0 rearm=1 current=10002
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read
+USER_LOG tid=10002 msg=VFS_BACKEND_REPLY op=25 len=24 sender_tid=10000 transferred_cap=524295
+USER_LOG tid=10002 msg=VFS_FILE_GRANT_RO_RELAY client_fd=3 backend_handle=24 has_cap=1
+USER_LOG tid=10002 msg=VFS_GRANT_INJECT_ARM seen=4 len=300
+IPC_REPLY_DIRECT_CAP_STASH tid=10002 transfer_cap=524295 handle=1966080 endpoint=1 endpoint_generation=1 caller_tid=10010
+DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid=10010
+IPC_REPLY_DIRECT_CAP_PRODUCED record_index=1 record_generation=24 replier_tid=10002 caller_tid=10010 endpoint=1 result=ok
+DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid=10010
+DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocked_waiter_ordinary_cap
+DISPATCH_POST_WORK_CAP_TRANSFER_SEAM_OK kind=blocked_waiter_ordinary_cap local_cap=65558
+IPC_TRANSFER_CAP_MATERIALIZE_OK receiver_tid=10010 local_cap=65558
+IPC_ORDINARY_CAP_OBJECT_IDENTITY receiver_tid=10010 src_endpoint=None dst_endpoint=None match=1
+IPC_ORDINARY_CAP_RIGHTS receiver_tid=10010 dst_rights=Some(5) expected_rights=5 rights_ok=1 object_endpoint=0 reply_object=0 generation=0
+DISPATCH_POST_WORK_USER_COPY_OK kind=blocked_waiter_ordinary_cap
+IPC_REPLY_DIRECT_CAP_SETTLED record_index=1 record_generation=24 replier_tid=10002 caller_tid=10010 consumed=1 replier_revoked=1 caller_revoked=1 terminal_committed=1 result=ok
